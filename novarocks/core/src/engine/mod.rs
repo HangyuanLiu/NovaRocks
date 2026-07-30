@@ -1484,6 +1484,7 @@ impl StandaloneSession {
                 &normalized,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
 
@@ -1994,6 +1995,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -2010,12 +2012,90 @@ impl StandaloneSession {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
         )?;
-        crate::connector::iceberg::catalog::alter_table_schema(
+        crate::connector::iceberg::catalog::schema_update::validate_schema_change_application_guard(
             &self.inner,
-            &stmt,
-            current_catalog,
-            current_database,
+            &target,
+            &stmt.change,
         )?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        let change = match stmt.change {
+            crate::engine::statement::IcebergSchemaChange::AddColumn {
+                parent,
+                name,
+                data_type,
+                default,
+                position,
+            } => {
+                let column = crate::sql::parser::ast::TableColumnDef {
+                    name,
+                    data_type,
+                    nullable: true,
+                    aggregation: None,
+                    default,
+                };
+                novarocks_spi::connector::ConnectorSchemaChange::AddColumn {
+                    parent: novarocks_spi::connector::ConnectorColumnPath {
+                        segments: parent
+                            .segments()
+                            .iter()
+                            .map(|segment| Arc::from(segment.as_str()))
+                            .collect(),
+                    },
+                    column: crate::engine::statement::connector_column(&column)?,
+                    position: connector_schema_position(position),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::DropColumn { path } => {
+                novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
+                    path: connector_schema_path(path),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::RenameColumn { path, new_name } => {
+                novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
+                    path: connector_schema_path(path),
+                    to: Arc::from(new_name),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::ModifyColumn { path, new_type } => {
+                novarocks_spi::connector::ConnectorSchemaChange::ModifyColumn {
+                    path: connector_schema_path(path),
+                    data_type: crate::engine::statement::connector_data_type(&new_type)?,
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::SetNullable { path, nullable } => {
+                novarocks_spi::connector::ConnectorSchemaChange::SetColumnNullability {
+                    path: connector_schema_path(path),
+                    nullable,
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::Reorder { path, position } => {
+                novarocks_spi::connector::ConnectorSchemaChange::ReorderColumn {
+                    path: connector_schema_path(path),
+                    position: connector_schema_position(position),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::UpdateComment { path, comment } => {
+                novarocks_spi::connector::ConnectorSchemaChange::SetColumnComment {
+                    path: connector_schema_path(path),
+                    comment: Arc::from(comment),
+                }
+            }
+        };
+        crate::connector::mutation::execute_catalog_mutation(
+            self.inner.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                changes: vec![change],
+            },
+            connector_context.clone(),
+        )?;
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
     }
 
@@ -2359,6 +2439,41 @@ impl StandaloneSession {
             execution,
             connector_context,
         )
+    }
+}
+
+fn connector_schema_path(
+    path: crate::engine::statement::ColumnPath,
+) -> novarocks_spi::connector::ConnectorColumnPath {
+    novarocks_spi::connector::ConnectorColumnPath {
+        segments: path
+            .segments()
+            .iter()
+            .map(|segment| Arc::from(segment.as_str()))
+            .collect(),
+    }
+}
+
+fn connector_schema_position(
+    position: crate::engine::statement::AddPosition,
+) -> novarocks_spi::connector::ConnectorColumnPosition {
+    match position {
+        crate::engine::statement::AddPosition::Default => {
+            novarocks_spi::connector::ConnectorColumnPosition::Default
+        }
+        crate::engine::statement::AddPosition::First => {
+            novarocks_spi::connector::ConnectorColumnPosition::First
+        }
+        crate::engine::statement::AddPosition::After(column) => {
+            novarocks_spi::connector::ConnectorColumnPosition::After {
+                column: Arc::from(column),
+            }
+        }
+        crate::engine::statement::AddPosition::Before(column) => {
+            novarocks_spi::connector::ConnectorColumnPosition::Before {
+                column: Arc::from(column),
+            }
+        }
     }
 }
 

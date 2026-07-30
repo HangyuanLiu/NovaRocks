@@ -3775,7 +3775,7 @@ pub(crate) fn alter_table_schema(
         );
     }
 
-    protect_schema_change(state, &target, &stmt.change)?;
+    validate_schema_change_application_guard(state, &target, &stmt.change)?;
 
     let entry = {
         let registry = state
@@ -3867,7 +3867,86 @@ pub(crate) fn alter_table_schema(
     Ok(())
 }
 
-fn protect_schema_change(
+/// Provider-owned schema mutation for one already-resolved Iceberg table.
+/// Application-level MV/dependency guards run before this entry point; the
+/// provider retains catalog metadata validation, equality-delete protection,
+/// default-version checks, OCC retry, and cache invalidation.
+pub(crate) fn alter_table_schema_on_entry(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+    change: &IcebergSchemaChange,
+) -> Result<(), String> {
+    reject_reserved_change(change)?;
+    entry.invalidate_table_cache(namespace, table);
+    let loaded = crate::connector::iceberg::catalog::registry::load_table(entry, namespace, table)?;
+    let metadata = loaded.table.metadata();
+    build_updated_schema(metadata.current_schema(), metadata.last_column_id(), change)?;
+    build_property_updates(metadata.properties(), change)?;
+    if let IcebergSchemaChange::DropColumn { path } = change {
+        let equality_delete_columns =
+            crate::connector::iceberg::catalog::registry::current_equality_delete_column_names(
+                &loaded.table,
+            )?;
+        reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &[])?;
+    }
+    if let IcebergSchemaChange::AddColumn {
+        default: Some(literal),
+        data_type,
+        ..
+    } = change
+    {
+        let column_default =
+            crate::sql::literal::default_literal_to_column_default(literal, data_type)?;
+        crate::connector::iceberg::default_value::require_v3_for_column_default(
+            metadata.format_version(),
+            column_default.as_ref(),
+        )?;
+    }
+
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = namespace.to_string();
+    let table_for_retry = table.to_string();
+    let change_for_retry = change.clone();
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry = entry_for_retry.clone();
+                let namespace = namespace_for_retry.clone();
+                let table = table_for_retry.clone();
+                let change = change_for_retry.clone();
+                async move {
+                    entry.invalidate_table_cache(&namespace, &table);
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+                            .map_err(|error| {
+                                iceberg::Error::new(iceberg::ErrorKind::Unexpected, error)
+                            })?;
+                    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry, &namespace, &table,
+                    )
+                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::Unexpected, error))?;
+                    let tx = Transaction::new(&loaded.table);
+                    let tx = SchemaUpdateTxnAction { change }
+                        .apply(tx)
+                        .map_err(|error| {
+                            iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                        })?;
+                    tx.commit(catalog.as_ref()).await.map(|_| ())
+                }
+            })
+            .await
+        })
+        .map_err(|error| format!("alter iceberg schema runtime failed: {error}"))?;
+    entry.invalidate_table_cache(namespace, table);
+    commit_result
+}
+
+/// Enforce frontend-owned guards before a schema mutation reaches the provider.
+///
+/// This deliberately retains MV/dependency policy in the application layer;
+/// the provider owns the external catalog commit and its metadata validation.
+pub(crate) fn validate_schema_change_application_guard(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     change: &IcebergSchemaChange,

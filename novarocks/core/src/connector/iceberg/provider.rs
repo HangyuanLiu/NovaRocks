@@ -1045,6 +1045,33 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 .map(|()| ExternalMutationEffect::Applied)
                 .map_err(map_iceberg_error)
             }
+            ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "schema mutation belongs to another connector instance",
+                    )));
+                }
+                let [change] = changes.as_slice() else {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "Iceberg schema mutation currently requires exactly one change",
+                    )));
+                };
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let change = lower_schema_change(change)?;
+                super::catalog::schema_update::alter_table_schema_on_entry(
+                    &entry,
+                    &table.namespace,
+                    &table.table,
+                    &change,
+                )
+                .map(|()| ExternalMutationEffect::Applied)
+                .map_err(map_iceberg_error)
+            }
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
@@ -1420,6 +1447,92 @@ fn lower_property_changes(
             })
         }
     }
+}
+
+fn lower_schema_change(
+    change: &novarocks_spi::connector::ConnectorSchemaChange,
+) -> Result<crate::engine::statement::IcebergSchemaChange, ConnectorError> {
+    use crate::engine::statement::{AddPosition, ColumnPath, IcebergSchemaChange};
+    use novarocks_spi::connector::{
+        ConnectorColumnPath, ConnectorColumnPosition, ConnectorSchemaChange,
+    };
+
+    fn path(path: &ConnectorColumnPath, allow_empty: bool) -> Result<ColumnPath, ConnectorError> {
+        if path.segments.is_empty() && !allow_empty {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "schema mutation column path must not be empty",
+            ));
+        }
+        Ok(ColumnPath::from_segments(
+            path.segments.iter().map(ToString::to_string).collect(),
+        ))
+    }
+    fn position(position: &ConnectorColumnPosition) -> AddPosition {
+        match position {
+            ConnectorColumnPosition::Default => AddPosition::Default,
+            ConnectorColumnPosition::First => AddPosition::First,
+            ConnectorColumnPosition::After { column } => AddPosition::After(column.to_string()),
+            ConnectorColumnPosition::Before { column } => AddPosition::Before(column.to_string()),
+        }
+    }
+
+    Ok(match change {
+        ConnectorSchemaChange::AddColumn {
+            parent,
+            column,
+            position: column_position,
+        } => {
+            let column = lower_column(column)?;
+            IcebergSchemaChange::AddColumn {
+                parent: path(parent, true)?,
+                name: column.name,
+                data_type: column.data_type,
+                default: column.default,
+                position: position(column_position),
+            }
+        }
+        ConnectorSchemaChange::DropColumn { path: column_path } => {
+            IcebergSchemaChange::DropColumn {
+                path: path(column_path, false)?,
+            }
+        }
+        ConnectorSchemaChange::RenameColumn {
+            path: column_path,
+            to,
+        } => IcebergSchemaChange::RenameColumn {
+            path: path(column_path, false)?,
+            new_name: to.to_string(),
+        },
+        ConnectorSchemaChange::ModifyColumn {
+            path: column_path,
+            data_type,
+        } => IcebergSchemaChange::ModifyColumn {
+            path: path(column_path, false)?,
+            new_type: lower_data_type(data_type)?,
+        },
+        ConnectorSchemaChange::SetColumnNullability {
+            path: column_path,
+            nullable,
+        } => IcebergSchemaChange::SetNullable {
+            path: path(column_path, false)?,
+            nullable: *nullable,
+        },
+        ConnectorSchemaChange::ReorderColumn {
+            path: column_path,
+            position: column_position,
+        } => IcebergSchemaChange::Reorder {
+            path: path(column_path, false)?,
+            position: position(column_position),
+        },
+        ConnectorSchemaChange::SetColumnComment {
+            path: column_path,
+            comment,
+        } => IcebergSchemaChange::UpdateComment {
+            path: path(column_path, false)?,
+            comment: comment.to_string(),
+        },
+    })
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

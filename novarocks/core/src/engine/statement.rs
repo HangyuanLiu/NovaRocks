@@ -982,7 +982,7 @@ pub(crate) fn connector_column(
     })
 }
 
-fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataType, String> {
+pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataType, String> {
     Ok(match data_type {
         SqlType::Boolean => ConnectorDataType::Boolean,
         SqlType::TinyInt => ConnectorDataType::TinyInt,
