@@ -114,6 +114,8 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) terminal_fallback_initial_backoff: Duration,
     pub(crate) terminal_fallback_max_backoff: Duration,
     pub(crate) terminal_retention: Duration,
+    pub(crate) terminal_retained_capacity: usize,
+    pub(crate) terminal_max_retained_bytes: usize,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -149,6 +151,8 @@ impl QueryLifecycleRegistryConfig {
                 runtime.query_control_terminal_fallback_max_backoff_ms,
             ),
             terminal_retention: Duration::from_millis(runtime.query_control_terminal_retention_ms),
+            terminal_retained_capacity: runtime.query_control_terminal_retained_capacity,
+            terminal_max_retained_bytes: runtime.query_control_terminal_max_retained_bytes,
         }
     }
 }
@@ -321,6 +325,8 @@ struct QueryLifecycleRegistryState {
     terminations: u64,
     termination_reasons: [u64; 6],
     pre_init_tombstones: BTreeMap<QueryExecutionId, PreInitTombstone>,
+    terminal_retained: BTreeMap<QueryExecutionId, usize>,
+    terminal_retained_bytes: usize,
 }
 
 struct PreInitTombstone {
@@ -355,6 +361,8 @@ impl Default for QueryLifecycleRegistryState {
             terminations: 0,
             termination_reasons: [0; 6],
             pre_init_tombstones: BTreeMap::new(),
+            terminal_retained: BTreeMap::new(),
+            terminal_retained_bytes: 0,
         }
     }
 }
@@ -532,6 +540,8 @@ impl QueryLifecycleRegistry {
         assert!(!config.terminal_fallback_rpc_timeout.is_zero());
         assert!(config.terminal_fallback_max_attempts > 0);
         assert!(!config.terminal_retention.is_zero());
+        assert!(config.terminal_retained_capacity > 0);
+        assert!(config.terminal_max_retained_bytes > 0);
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -865,7 +875,7 @@ impl QueryLifecycleRegistry {
             )
         })?;
         {
-            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            let state = entry.state.lock().expect("query lifecycle entry lock");
             match state.phase {
                 QueryLifecyclePhase::Initialized => {}
                 QueryLifecyclePhase::TerminalRetained
@@ -1445,6 +1455,7 @@ impl QueryLifecycleRegistry {
                     let mut state = entry.state.lock().expect("query lifecycle entry lock");
                     state.terminal_record = None;
                 }
+                self.release_terminal_record(entry.manifest.execution_id());
                 self.publish_tombstone(
                     &entry,
                     entry.manifest.execution_id(),
@@ -1715,7 +1726,7 @@ impl QueryLifecycleRegistry {
                     "query lifecycle entry is not active",
                 )
             })?;
-        let (record, expected, events) = {
+        let (record, expected) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if state.phase != QueryLifecyclePhase::Running || !state.local_drained_emitted {
                 return Err(QueryLifecycleError::new(
@@ -1741,14 +1752,22 @@ impl QueryLifecycleRegistry {
                 snapshot,
                 self.config.terminal_max_encoded_bytes,
             )?;
+            (record, expected.iter().copied().collect::<Vec<_>>())
+        };
+        self.reserve_terminal_record(execution_id, record.encoded_len())?;
+        let events = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.phase != QueryLifecyclePhase::Running || state.terminal_record.is_some() {
+                self.release_terminal_record(execution_id);
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query lifecycle changed while terminal record was being reserved",
+                ));
+            }
             state.terminal_record = Some(record.clone());
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.terminated_at = Some(self.clock.now());
-            (
-                record,
-                expected.iter().copied().collect::<Vec<_>>(),
-                state.events.clone(),
-            )
+            state.events.clone()
         };
         // All execution-owned resources are detached before the immutable record is delivered.
         self.local_runtime.terminate_query(
@@ -1771,6 +1790,38 @@ impl QueryLifecycleRegistry {
         }
         self.schedule_terminal_fallback(entry, record.snapshot().clone());
         Ok(())
+    }
+
+    fn reserve_terminal_record(
+        &self,
+        execution_id: QueryExecutionId,
+        bytes: usize,
+    ) -> Result<(), QueryLifecycleError> {
+        let mut state = self.state.lock().expect("query lifecycle registry lock");
+        if state.terminal_retained.len() >= self.config.terminal_retained_capacity {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-record capacity is exhausted",
+            ));
+        }
+        if state.terminal_retained_bytes.saturating_add(bytes)
+            > self.config.terminal_max_retained_bytes
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-byte capacity is exhausted",
+            ));
+        }
+        state.terminal_retained.insert(execution_id, bytes);
+        state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn release_terminal_record(&self, execution_id: QueryExecutionId) {
+        let mut state = self.state.lock().expect("query lifecycle registry lock");
+        if let Some(bytes) = state.terminal_retained.remove(&execution_id) {
+            state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_sub(bytes);
+        }
     }
 
     fn schedule_terminal_fallback(
@@ -1877,6 +1928,7 @@ impl QueryLifecycleRegistry {
         }
         state.terminal_record = None;
         drop(state);
+        self.release_terminal_record(ack.execution_id());
         self.publish_tombstone(
             &entry,
             ack.execution_id(),
