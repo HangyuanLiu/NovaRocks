@@ -67,13 +67,14 @@ struct RegisteredConnectorReader {
 struct ConnectorReaderMarker {
     provider_id: String,
     instance_id: String,
+    incarnation: String,
 }
 
 impl ConnectorReaderMarker {
     fn emit(&self, event: &str) {
         println!(
-            "NOVAROCKS_CONNECTOR_READER_{event} provider={} instance={}",
-            self.provider_id, self.instance_id
+            "NOVAROCKS_CONNECTOR_READER_{event} provider={} instance={} incarnation={}",
+            self.provider_id, self.instance_id, self.incarnation
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -625,6 +626,12 @@ impl ConnectorReadBinding {
         }
     }
 
+    fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
+        match self {
+            Self::Execution(binding) => binding.key().incarnation,
+        }
+    }
+
     fn open_reader(
         &self,
         split: &ConnectorSplit,
@@ -806,6 +813,7 @@ impl ScanOp for ConnectorReadScanOp {
             ConnectorReaderMarker {
                 provider_id: self.binding.provider_id().to_string(),
                 instance_id: self.binding.instance_id().as_str().to_string(),
+                incarnation: hex::encode(self.binding.incarnation().to_bytes()),
             }
         });
         let reader = self.reader_group.register(reader, marker)?;
