@@ -2722,7 +2722,6 @@ mod pr3_tests {
     use crate::runtime_filter::port::transport::{
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterIngressResult,
     };
-    use crate::service::grpc_server::decode_test_native_fragment_request;
     use crate::service::native_fragment_ingress::{
         NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
     };
