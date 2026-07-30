@@ -38,7 +38,7 @@ INSERT INTO ${case_db}.heartbeat_loss VALUES (2, 10);
 INSERT INTO ${case_db}.heartbeat_loss VALUES (3, 10);
 
 -- query 5
--- @stop_query_control_heartbeat_be_index=1
+-- @stop_query_control_heartbeat_after_stage_be_index=1
 -- @expect_error=heartbeat
 -- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3
 SELECT COUNT(*)
