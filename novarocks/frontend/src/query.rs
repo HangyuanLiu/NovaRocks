@@ -273,7 +273,7 @@ impl FrontendQuerySession {
                         "invalid group_concat_max_len",
                     )
                 })?;
-                state.execution_settings.set_group_concat_max_len(value)?;
+                state.execution_settings.set_group_concat_max_len(value);
             }
             "pipeline_dop" => {
                 let value = value.parse::<i32>().map_err(|_| {

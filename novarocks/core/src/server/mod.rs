@@ -1391,6 +1391,25 @@ mod legacy {
         value_str.parse::<u64>().ok()
     }
 
+    fn parse_set_i64(query: &str, keyword: &str) -> Option<i64> {
+        let normalized = query.replace('=', " = ");
+        let mut parts = normalized.split_whitespace();
+        let head = parts.next()?;
+        if !head.eq_ignore_ascii_case("set") {
+            return None;
+        }
+        let actual_keyword = parts.next()?;
+        if !actual_keyword.eq_ignore_ascii_case(keyword) {
+            return None;
+        }
+        let next = parts.next()?;
+        let value_str = if next == "=" { parts.next()? } else { next };
+        if parts.next().is_some() {
+            return None;
+        }
+        value_str.parse::<i64>().ok()
+    }
+
     /// Parse `SET <keyword> = <float>`. Uses the same keyword-exact-match logic as
     /// `parse_set_non_negative_integer`: the keyword must be followed by whitespace
     /// or `=`, so `..._min_size` cannot match `..._min_selectivity` and vice versa.
@@ -1446,11 +1465,9 @@ mod legacy {
     }
 
     /// Parse `SET group_concat_max_len = N` and `SET group_concat_max_len=N`.
-    /// `N` must be a non-negative integer and is clamped later by FE-compatible
-    /// lowering rules.
+    /// Signed values are accepted and clamped later by aggregate lowering.
     fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
-        let value = parse_set_non_negative_integer(query, "group_concat_max_len")?;
-        i64::try_from(value).ok()
+        parse_set_i64(query, "group_concat_max_len")
     }
 
     fn apply_broadcast_profile_set(settings: &mut SessionOptimizerSettings, trimmed: &str) -> bool {
@@ -2666,6 +2683,10 @@ mod legacy {
             assert_eq!(
                 parse_set_group_concat_max_len("SET GROUP_CONCAT_MAX_LEN = 0"),
                 Some(0)
+            );
+            assert_eq!(
+                parse_set_group_concat_max_len("SET group_concat_max_len = -121"),
+                Some(-121)
             );
         }
 
