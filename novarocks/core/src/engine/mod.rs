@@ -3577,7 +3577,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         None,
         None,
         None,
-        None,
+        Some(state),
         false,
         Some(&maintenance_execution),
     )
