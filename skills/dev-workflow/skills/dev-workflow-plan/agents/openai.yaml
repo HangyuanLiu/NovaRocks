@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Implementation"
+  short_description: "Create a parallel-ready plan with Codex Plan mode"
+  default_prompt: "Use $dev-workflow-plan in Plan mode to turn this accepted spec into a dependency-aware task graph for parallel sub-agent execution."

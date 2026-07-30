@@ -875,3 +875,42 @@ Any PR that embodies a new design decision or accepts a compromise must add or
 supersede an ADR — use the `/adr` skill (`skills/adr/`, exposed to Claude Code via the
 `.claude/skills/adr` symlink), which embeds the template, numbering, supersede, and
 collision-renumbering rules.
+
+---
+
+## 12. Project Development Workflow
+
+For NovaRocks feature, architecture, roadmap, and refactor work, resolve the
+project documentation root from memory. Use the newest directly applicable,
+existing path; when memory has no usable project documentation path, use
+`<repo-root>/docs/workflow`.
+
+Use the generic skills-only plugin under `skills/dev-workflow/`:
+
+- `dev-workflow`: identify and route the current stage;
+- `dev-workflow-discuss-design`: settle the problem and major design decisions;
+- `dev-workflow-write-spec`: write the accepted design into project docs;
+- `dev-workflow-plan`: plan with Codex Plan mode and persist the
+  approved plan;
+- `dev-workflow-execute`: create a goal and execute continuously through
+  verification;
+- `dev-workflow-finish`: publish and archive only when authorized.
+
+Do not skip the accepted-design and approved-plan gates. Sub-agents are allowed
+in every stage when they provide useful parallel investigation, independent
+verification, isolated implementation, or risk review. The main agent retains
+ownership and verifies their results.
+
+The bundle's
+`skills/dev-workflow/skills/dev-workflow/references/workflow-contract.md` is the
+only development-workflow contract. Do not depend on an external workflow
+document. In Plan mode, produce a task DAG with hard dependencies, parallel
+waves, non-overlapping file ownership, sub-agent scheduling labels, independent
+validation, integration gates, and local commit checkpoints.
+
+Once execution starts, routine implementation difficulties are not reasons to
+stop; pause only for the major decision conditions defined by
+`dev-workflow-execute`. On a task-local development branch, checkpoint commits
+are allowed after a coherent plan section completes or before risky changes.
+The execute stage must never push or open a PR; those actions require explicit
+authorization in `dev-workflow-finish`.

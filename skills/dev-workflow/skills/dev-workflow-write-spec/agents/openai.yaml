@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Spec"
+  short_description: "Write an accepted design into project docs"
+  default_prompt: "Use $dev-workflow-write-spec to turn the accepted design into a project spec."
