@@ -17,4 +17,6 @@
 
 mod control_host;
 
-pub use control_host::{ConnectorControlHost, ConnectorControlRetirement};
+pub use control_host::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};

@@ -49,7 +49,9 @@ use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecyc
 use super::query_registry::FrontendQueryRegistry;
 use super::report::FrontendCoordinatorReportHandler;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-use crate::connector::ConnectorControlHost;
+use crate::connector::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> QueryId;
@@ -113,6 +115,54 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
 
 struct FrontendConnectorBindingInstallObserver {
     control: Arc<ConnectorControlHost>,
+}
+
+struct GrpcConnectorControlRetirementSink;
+
+impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
+    fn retire(&self, retirement: ConnectorControlRetirement) {
+        let endpoints = retirement
+            .installed_backends
+            .iter()
+            .enumerate()
+            .filter_map(|(index, endpoint)| match endpoint.parse::<SocketAddr>() {
+                Ok(endpoint) => Some((index, endpoint)),
+                Err(error) => {
+                    tracing::warn!(
+                        instance_id = %retirement.key.instance_id.as_str(),
+                        incarnation = ?retirement.key.incarnation,
+                        endpoint = %endpoint,
+                        %error,
+                        "connector control retirement skipped an invalid recorded backend endpoint"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let dispatcher = match new_grpc_connector_binding_dispatcher(&endpoints) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                tracing::warn!(
+                    instance_id = %retirement.key.instance_id.as_str(),
+                    incarnation = ?retirement.key.incarnation,
+                    %error,
+                    "connector execution retirement dispatcher could not be composed"
+                );
+                return;
+            }
+        };
+        for (_, endpoint) in endpoints {
+            if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+                tracing::warn!(
+                    instance_id = %retirement.key.instance_id.as_str(),
+                    incarnation = ?retirement.key.incarnation,
+                    %endpoint,
+                    %error,
+                    "connector execution binding retirement was not acknowledged"
+                );
+            }
+        }
+    }
 }
 
 impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
@@ -490,6 +540,7 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
     ) -> Self {
+        connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink));
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,

@@ -29,6 +29,7 @@ use novarocks_spi::connector::{
 #[derive(Clone, Default)]
 pub struct ConnectorControlHost {
     state: Arc<Mutex<ControlHostState>>,
+    retirement_sink: Arc<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
 }
 
 #[derive(Default)]
@@ -60,9 +61,34 @@ pub struct ConnectorControlRetirement {
     pub installed_backends: Vec<String>,
 }
 
+/// Frontend-composed best-effort transport for a retired execution binding.
+/// It deliberately receives only an exact binding key and previously ACKed
+/// endpoints; no connector control or execution object crosses this seam.
+pub trait ConnectorControlRetirementSink: Send + Sync + 'static {
+    fn retire(&self, retirement: ConnectorControlRetirement);
+}
+
 impl ConnectorControlHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_retirement_sink(&self, sink: Arc<dyn ConnectorControlRetirementSink>) {
+        let ready = match self.lock_state() {
+            Ok(mut state) => std::mem::take(&mut state.ready_retires),
+            Err(error) => {
+                tracing::warn!(%error, "connector control retirement sink was not installed");
+                return;
+            }
+        };
+        let Ok(mut slot) = self.retirement_sink.lock() else {
+            return;
+        };
+        *slot = Some(Arc::clone(&sink));
+        drop(slot);
+        for retirement in ready {
+            sink.retire(retirement);
+        }
     }
 
     pub fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
@@ -124,9 +150,11 @@ impl ConnectorControlHost {
             )
         })?;
         generation.state = ControlGenerationState::Retiring;
-        if generation.planning_leases == 0 {
-            queue_retirement(&mut state, key);
-        }
+        let retirement = (generation.planning_leases == 0)
+            .then(|| queue_retirement(&mut state, key))
+            .flatten();
+        drop(state);
+        self.dispatch_retirement(retirement);
         Ok(())
     }
 
@@ -189,8 +217,9 @@ impl ConnectorControlHost {
             (Arc::clone(&generation.binding), key)
         };
         let state = Arc::downgrade(&self.state);
+        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         Ok(ConnectorControlPlanningLease::new(binding, move || {
-            release_planning_lease(&state, key);
+            release_planning_lease(&state, &retirement_sink, key);
         }))
     }
 
@@ -201,6 +230,20 @@ impl ConnectorControlHost {
                 "connector control host lock poisoned",
             )
         })
+    }
+
+    fn dispatch_retirement(&self, retirement: Option<ConnectorControlRetirement>) {
+        let Some(retirement) = retirement else { return };
+        let sink = self
+            .retirement_sink
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(sink) = sink {
+            sink.retire(retirement);
+        } else if let Ok(mut state) = self.lock_state() {
+            state.ready_retires.push(retirement);
+        }
     }
 }
 
@@ -225,26 +268,42 @@ impl ConnectorControlRegistry for ConnectorControlHost {
 
 fn release_planning_lease(
     state: &Weak<Mutex<ControlHostState>>,
+    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     key: ConnectorExecutionBindingKey,
 ) {
-    let Some(state) = state.upgrade() else {
+    let Some(host_state) = state.upgrade() else {
         return;
     };
-    let Ok(mut state) = state.lock() else {
+    let Ok(mut state) = host_state.lock() else {
         return;
     };
     let Some(generation) = state.generations.get_mut(&key) else {
         return;
     };
     generation.planning_leases = generation.planning_leases.saturating_sub(1);
-    if generation.state == ControlGenerationState::Retiring && generation.planning_leases == 0 {
-        queue_retirement(&mut state, key);
+    let retirement = (generation.state == ControlGenerationState::Retiring
+        && generation.planning_leases == 0)
+        .then(|| queue_retirement(&mut state, key))
+        .flatten();
+    drop(state);
+    let Some(retirement) = retirement else { return };
+    let Some(slot) = retirement_sink.upgrade() else {
+        return;
+    };
+    let sink = slot.lock().ok().and_then(|sink| sink.clone());
+    if let Some(sink) = sink {
+        sink.retire(retirement);
+    } else if let Ok(mut state) = host_state.lock() {
+        state.ready_retires.push(retirement);
     }
 }
 
-fn queue_retirement(state: &mut ControlHostState, key: ConnectorExecutionBindingKey) {
+fn queue_retirement(
+    state: &mut ControlHostState,
+    key: ConnectorExecutionBindingKey,
+) -> Option<ConnectorControlRetirement> {
     let Some(generation) = state.generations.remove(&key) else {
-        return;
+        return None;
     };
     debug_assert_eq!(generation.state, ControlGenerationState::Retiring);
     state.retired.insert(key.clone());
@@ -254,10 +313,10 @@ fn queue_retirement(state: &mut ControlHostState, key: ConnectorExecutionBinding
         .unwrap_or_default()
         .into_iter()
         .collect();
-    state.ready_retires.push(ConnectorControlRetirement {
+    Some(ConnectorControlRetirement {
         key,
         installed_backends,
-    });
+    })
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -402,6 +461,45 @@ mod tests {
                 .to_bytes(),
             [8; 16]
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
+
+    impl ConnectorControlRetirementSink for RecordingRetirementSink {
+        fn retire(&self, retirement: ConnectorControlRetirement) {
+            self.0.lock().expect("retirement sink").push(retirement);
+        }
+    }
+
+    #[test]
+    fn retiring_generation_dispatches_when_the_last_planning_lease_drains() {
+        let host = ConnectorControlHost::new();
+        let sink = Arc::new(RecordingRetirementSink::default());
+        host.set_retirement_sink(sink.clone());
+        let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+        host.register(binding(7)).expect("register old generation");
+        let lease = host.acquire_current(&instance_id).expect("planning lease");
+        let old_key = ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        host.record_installed_backend(&old_key, "127.0.0.1:18080")
+            .expect("record ensure ack");
+        host.retire_current(&instance_id)
+            .expect("retire old generation");
+        assert!(sink.0.lock().expect("retirement sink").is_empty());
+
+        drop(lease);
+
+        let dispatched = sink.0.lock().expect("retirement sink");
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].key, old_key);
+        assert_eq!(
+            dispatched[0].installed_backends,
+            vec![String::from("127.0.0.1:18080")]
+        );
+        assert!(host.take_ready_retires().expect("retire queue").is_empty());
     }
 
     fn unsupported() -> ConnectorError {
