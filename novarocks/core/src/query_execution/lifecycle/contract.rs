@@ -568,13 +568,24 @@ pub fn decode_query_stage_request(
             StageFragment::new(plan, instance_params)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    QueryStageRequest::new(
+    let decoded = QueryStageRequest::new(
         decode_required_execution_id(request.execution_id.as_ref())?,
         ParticipantManifestDigest::try_from_slice(&request.init_digest)?,
         StageDigestVersion::try_from_wire(request.stage_digest_version)?,
         StageDigest::try_from_slice(&request.stage_digest)?,
         fragments,
-    )
+    )?;
+    let recomputed = StageDigest::compute_v1(
+        decoded.execution_id(),
+        decoded.init_digest(),
+        decoded.fragments(),
+    )?;
+    if recomputed != decoded.digest() {
+        return Err(QueryLifecycleError::invalid_manifest(
+            "stage digest does not match decoded stage fragment batch",
+        ));
+    }
+    Ok(decoded)
 }
 
 pub fn encode_query_stage_response(response: &QueryStageAck) -> novarocks::StageFragmentsResponse {
@@ -1448,12 +1459,19 @@ mod tests {
 
     #[test]
     fn proto_stage_and_start_round_trip_typed_contracts() {
+        let fragments = vec![stage_fragment(9), stage_fragment(2)];
+        let digest = StageDigest::compute_v1(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            &fragments,
+        )
+        .expect("stage digest");
         let stage = QueryStageRequest::new(
             execution_id(),
             crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
             StageDigestVersion::V1,
-            StageDigest::new([5; 32]),
-            vec![stage_fragment(9), stage_fragment(2)],
+            digest,
+            fragments,
         )
         .expect("valid stage request");
         let decoded_stage = decode_query_stage_request(&encode_query_stage_request(&stage))
@@ -1499,12 +1517,19 @@ mod tests {
 
     #[test]
     fn proto_stage_rejects_unknown_version_and_incomplete_fragment() {
+        let fragments = vec![stage_fragment(2)];
+        let digest = StageDigest::compute_v1(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
+            &fragments,
+        )
+        .expect("stage digest");
         let request = QueryStageRequest::new(
             execution_id(),
             crate::query_execution::lifecycle::ParticipantManifestDigest::new([4; 32]),
             StageDigestVersion::V1,
-            StageDigest::new([5; 32]),
-            vec![stage_fragment(2)],
+            digest,
+            fragments,
         )
         .expect("valid stage request");
         let mut wire = encode_query_stage_request(&request);
@@ -1513,6 +1538,10 @@ mod tests {
 
         let mut wire = encode_query_stage_request(&request);
         wire.fragments[0].plan = None;
+        assert!(decode_query_stage_request(&wire).is_err());
+
+        let mut wire = encode_query_stage_request(&request);
+        wire.stage_digest[0] ^= 0xff;
         assert!(decode_query_stage_request(&wire).is_err());
     }
 }
