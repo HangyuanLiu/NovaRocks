@@ -1477,7 +1477,8 @@ private:
 
 class LakeServiceImpl final : public starrocks::LakeService {
 public:
-    LakeServiceImpl() = default;
+    explicit LakeServiceImpl(const void* lake_service_context)
+            : lake_service_context_(lake_service_context) {}
 
     void publish_version(google::protobuf::RpcController* controller,
                          const starrocks::PublishVersionRequest* request,
@@ -2058,7 +2059,9 @@ public:
     }
 
 private:
-    static bool invoke_publish_version(const starrocks::PublishVersionRequest& request,
+    const void* lake_service_context_;
+
+    bool invoke_publish_version(const starrocks::PublishVersionRequest& request,
                                        starrocks::PublishVersionResponse* response,
                                        std::string* err) {
         if (response == nullptr) {
@@ -2078,7 +2081,8 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_publish_version(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_publish_version(lake_service_context_,
+                                                      reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                       request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2105,7 +2109,7 @@ private:
         return true;
     }
 
-    static bool invoke_publish_log_version(const starrocks::PublishLogVersionRequest& request,
+    bool invoke_publish_log_version(const starrocks::PublishLogVersionRequest& request,
                                            starrocks::PublishLogVersionResponse* response,
                                            std::string* err) {
         if (response == nullptr) {
@@ -2126,7 +2130,7 @@ private:
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
         int32_t rc = novarocks_rs_lake_publish_log_version(
-                reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
+                lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
             take_rust_buf_string(&resp_buf);
@@ -2151,7 +2155,7 @@ private:
         return true;
     }
 
-    static bool invoke_publish_log_version_batch(const starrocks::PublishLogVersionBatchRequest& request,
+    bool invoke_publish_log_version_batch(const starrocks::PublishLogVersionBatchRequest& request,
                                                  starrocks::PublishLogVersionResponse* response,
                                                  std::string* err) {
         if (response == nullptr) {
@@ -2172,7 +2176,7 @@ private:
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
         int32_t rc = novarocks_rs_lake_publish_log_version_batch(
-                reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
+                lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
             take_rust_buf_string(&resp_buf);
@@ -2197,7 +2201,7 @@ private:
         return true;
     }
 
-    static bool invoke_abort_txn(const starrocks::AbortTxnRequest& request,
+    bool invoke_abort_txn(const starrocks::AbortTxnRequest& request,
                                  starrocks::AbortTxnResponse* response,
                                  std::string* err) {
         if (response == nullptr) {
@@ -2217,7 +2221,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_abort_txn(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_abort_txn(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2244,7 +2248,7 @@ private:
         return true;
     }
 
-    static bool invoke_delete_tablet(const starrocks::DeleteTabletRequest& request,
+    bool invoke_delete_tablet(const starrocks::DeleteTabletRequest& request,
                                      starrocks::DeleteTabletResponse* response,
                                      std::string* err) {
         if (response == nullptr) {
@@ -2264,7 +2268,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_delete_tablet(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_delete_tablet(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                     request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2290,7 +2294,7 @@ private:
         return true;
     }
 
-    static bool invoke_delete_data(const starrocks::DeleteDataRequest& request,
+    bool invoke_delete_data(const starrocks::DeleteDataRequest& request,
                                    starrocks::DeleteDataResponse* response,
                                    std::string* err) {
         if (response == nullptr) {
@@ -2310,7 +2314,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_delete_data(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_delete_data(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                   request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2336,7 +2340,7 @@ private:
         return true;
     }
 
-    static bool invoke_get_tablet_stats(const starrocks::TabletStatRequest& request,
+    bool invoke_get_tablet_stats(const starrocks::TabletStatRequest& request,
                                         starrocks::TabletStatResponse* response,
                                         std::string* err) {
         if (response == nullptr) {
@@ -2356,7 +2360,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_get_tablet_stats(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_get_tablet_stats(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                         request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2382,7 +2386,7 @@ private:
         return true;
     }
 
-    static bool invoke_compact(const starrocks::CompactRequest& request,
+    bool invoke_compact(const starrocks::CompactRequest& request,
                                starrocks::CompactResponse* response,
                                std::string* err) {
         if (response == nullptr) {
@@ -2402,7 +2406,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_compact(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_compact(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2428,7 +2432,7 @@ private:
         return true;
     }
 
-    static bool invoke_abort_compaction(const starrocks::AbortCompactionRequest& request,
+    bool invoke_abort_compaction(const starrocks::AbortCompactionRequest& request,
                                         starrocks::AbortCompactionResponse* response,
                                         std::string* err) {
         if (response == nullptr) {
@@ -2448,7 +2452,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_abort_compaction(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_abort_compaction(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                         request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2474,7 +2478,7 @@ private:
         return true;
     }
 
-    static bool invoke_vacuum(const starrocks::VacuumRequest& request,
+    bool invoke_vacuum(const starrocks::VacuumRequest& request,
                               starrocks::VacuumResponse* response,
                               std::string* err) {
         if (response == nullptr) {
@@ -2494,7 +2498,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_vacuum(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_vacuum(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                              request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2520,7 +2524,7 @@ private:
         return true;
     }
 
-    static bool invoke_drop_table(const starrocks::DropTableRequest& request,
+    bool invoke_drop_table(const starrocks::DropTableRequest& request,
                                   starrocks::DropTableResponse* response,
                                   std::string* err) {
         if (response == nullptr) {
@@ -2540,7 +2544,7 @@ private:
 
         NovaRocksRustBuf resp_buf{nullptr, 0};
         NovaRocksRustBuf err_buf{nullptr, 0};
-        int32_t rc = novarocks_rs_lake_drop_table(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+        int32_t rc = novarocks_rs_lake_drop_table(lake_service_context_, reinterpret_cast<const uint8_t*>(request_bytes.data()),
                                                  request_bytes.size(), &resp_buf, &err_buf);
         std::string rust_err = take_rust_buf_string(&err_buf);
         if (rc != 0) {
@@ -2747,6 +2751,10 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         if (err) *err = "fragment service context is null";
         return 1;
     }
+    if (cfg->lake_service_context == nullptr) {
+        if (err) *err = "lake service context is null";
+        return 1;
+    }
     if (g_brpc_started.exchange(true)) {
         if (err) *err = "brpc already started";
         return 2;
@@ -2776,7 +2784,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
 
         auto server = std::make_unique<brpc::Server>();
         auto service = std::make_unique<InternalServiceImpl>(cfg->fragment_service_context);
-        auto lake_service = std::make_unique<LakeServiceImpl>();
+        auto lake_service = std::make_unique<LakeServiceImpl>(cfg->lake_service_context);
         auto query_rpc_pool = std::make_unique<QueryRpcPool>(query_rpc_threads);
         auto fetch_waiter_registry = std::make_unique<FetchWaiterRegistry>(query_rpc_pool.get());
 

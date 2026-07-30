@@ -31,8 +31,15 @@ use crate::connector::starrocks::lake::append_lake_txn_log_with_chunk_rowset;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
-use crate::connector::starrocks::lake::transactions::publish_version;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
+use crate::connector::starrocks::lake::{
+    execute_delete_data, execute_publish_version,
+    service_domain::{DeleteDataCommand, PublishVersionCommand},
+    storage_domain::{
+        StorageBinaryPredicate, StorageDeletePredicate, StorageInPredicate, StorageIsNullPredicate,
+        StorageSchemaKey,
+    },
+};
 use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
@@ -47,9 +54,7 @@ use crate::mv::aggregate_state::mv_agg_state::{self, AggregateMvLayout};
 use crate::mv::persistence::refresh::UpdateStarRocksMvRefreshSummaryRequest;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::{
-    DeleteDataRequest, DeletePredicatePb, PublishVersionRequest, TableSchemaKeyPb,
-};
+use crate::service::grpc_client::proto::starrocks::DeletePredicatePb;
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_starrocks_table_in_catalog;
@@ -1306,18 +1311,47 @@ pub(crate) fn delete_starrocks_table_by_predicate(
         err
     };
 
-    let request = DeleteDataRequest {
+    let command = DeleteDataCommand {
         tablet_ids: tablet_ids.clone(),
         txn_id: Some(prepared.txn_id),
-        delete_predicate: Some(delete_predicate_pb),
-        schema_key: Some(TableSchemaKeyPb {
+        delete_predicate: Some(StorageDeletePredicate {
+            version: delete_predicate_pb.version,
+            sub_predicates: delete_predicate_pb.sub_predicates,
+            in_predicates: delete_predicate_pb
+                .in_predicates
+                .into_iter()
+                .map(|predicate| StorageInPredicate {
+                    column_name: predicate.column_name,
+                    is_not_in: predicate.is_not_in,
+                    values: predicate.values,
+                })
+                .collect(),
+            binary_predicates: delete_predicate_pb
+                .binary_predicates
+                .into_iter()
+                .map(|predicate| StorageBinaryPredicate {
+                    column_name: predicate.column_name,
+                    op: predicate.op,
+                    value: predicate.value,
+                })
+                .collect(),
+            is_null_predicates: delete_predicate_pb
+                .is_null_predicates
+                .into_iter()
+                .map(|predicate| StorageIsNullPredicate {
+                    column_name: predicate.column_name,
+                    is_not_null: predicate.is_not_null,
+                })
+                .collect(),
+        }),
+        schema_key: Some(StorageSchemaKey {
             db_id: Some(plan.db_id),
             table_id: Some(plan.table_id),
             schema_id: plan.tablet_schema.id,
         }),
     };
 
-    let response = crate::connector::starrocks::lake::transactions::delete_data(&request)
+    let response = execute_delete_data(&Default::default(), &command)
         .map_err(|e| abort(prepared.txn_id, e))?;
     if !response.failed_tablets.is_empty() {
         return Err(abort(
@@ -1445,19 +1479,19 @@ pub(crate) fn publish_tablets_at_version(
     base_version: i64,
     commit_version: i64,
 ) -> Result<(), String> {
-    let request = PublishVersionRequest {
+    let command = PublishVersionCommand {
         tablet_ids,
-        txn_ids: vec![txn_id],
+        transaction_ids: vec![txn_id],
         base_version: Some(base_version),
         new_version: Some(commit_version),
         commit_time: None,
         timeout_ms: None,
-        txn_infos: Vec::new(),
+        transactions: Vec::new(),
         rebuild_pindex_tablet_ids: Vec::new(),
         enable_aggregate_publish: None,
         resharding_tablet_infos: Vec::new(),
     };
-    let response = publish_version(&request)?;
+    let response = execute_publish_version(&Default::default(), &command)?;
     if !response.failed_tablets.is_empty() {
         return Err(format!(
             "publish_version failed for tablets {:?}",

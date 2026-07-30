@@ -15,6 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) use crate::connector::starrocks::lake::schema::{
-    create_lake_tablet_from_req, create_lake_tablet_from_req_with_storage_metadata_provider,
-};
+pub(crate) use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req;

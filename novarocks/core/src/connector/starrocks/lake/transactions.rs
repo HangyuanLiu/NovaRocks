@@ -39,6 +39,13 @@ use crate::connector::starrocks::lake::context::{
 use crate::connector::starrocks::lake::replay_policy::{
     MissingTxnLogPolicy, decide_missing_txn_log_policy,
 };
+use crate::connector::starrocks::lake::service_domain::{
+    AbortTransactionCommand, DeleteDataCommand, DeleteTabletsCommand, DropLakeTableCommand,
+    FailedTabletsResult, LakeOkResult, LakeTransactionInfo, LakeTransactionType,
+    PublishLogVersionBatchCommand, PublishLogVersionCommand, PublishVersionCommand,
+    PublishVersionResult, TabletStat, TabletStatsCommand, TabletStatsResult, VacuumCommand,
+    VacuumResult,
+};
 use crate::connector::starrocks::lake::storage_schema_wire::decode_tablet_schema;
 use crate::connector::starrocks::lake::txn_loader::{
     LoadedTxnLog, load_txn_logs_for_publish, load_txn_vlog_for_publish,
@@ -47,6 +54,7 @@ use crate::connector::starrocks::lake::txn_log::{
     build_metadata_object_store_profile_for_partial, ensure_rowset_segment_meta_consistency,
     normalize_rowset_shared_segments, read_txn_log_if_exists, write_txn_log_file,
 };
+use crate::connector::starrocks::ports::LakeStorageDependencies;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::formats::starrocks::writer::bundle_meta::{
@@ -67,15 +75,15 @@ use crate::novarocks_logging::{info, warn};
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
-    AbortTxnRequest, AbortTxnResponse, CombinedTxnLogPb, DeleteDataRequest, DeleteDataResponse,
-    DeletePredicatePb, DeleteTabletRequest, DeleteTabletResponse, DropTableRequest,
-    DropTableResponse, PublishLogVersionBatchRequest, PublishLogVersionRequest,
-    PublishLogVersionResponse, PublishVersionRequest, PublishVersionResponse, RowsetMetadataPb,
+    AbortTxnRequest, AbortTxnResponse, BinaryPredicatePb, CombinedTxnLogPb, DeleteDataRequest,
+    DeleteDataResponse, DeletePredicatePb, DeleteTabletRequest, DeleteTabletResponse,
+    DropTableRequest, DropTableResponse, IdenticalTabletInfoPb, InPredicatePb, IsNullPredicatePb,
+    MergingTabletInfoPb, PUniqueId, PublishLogVersionBatchRequest, PublishLogVersionRequest,
+    PublishVersionRequest, ReshardingTabletInfoPb, RowsetMetadataPb, SplittingTabletInfoPb,
     StatusPb, TableSchemaKeyPb, TabletInfoPb, TabletMetadataPb, TabletStatRequest,
     TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest, VacuumResponse,
-    tablet_stat_response, txn_log_pb,
+    tablet_stat_request, tablet_stat_response, txn_log_pb,
 };
-use crate::service::starlet_metadata;
 use novarocks_fs::FsScheme;
 
 const MAX_PUBLISH_WORKERS: usize = 8;
@@ -83,26 +91,235 @@ const STATUS_CODE_OK: i32 = 0;
 const DEFAULT_GET_TABLET_STATS_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const EMPTY_TXNLOG_TXN_ID: i64 = -1;
 
-pub(crate) fn publish_version(
-    request: &PublishVersionRequest,
-) -> Result<PublishVersionResponse, String> {
-    if request.tablet_ids.is_empty() {
-        return Ok(PublishVersionResponse {
+fn txn_info_pb_from_domain(info: &LakeTransactionInfo) -> TxnInfoPb {
+    TxnInfoPb {
+        txn_id: Some(info.txn_id),
+        commit_time: info.commit_time,
+        combined_txn_log: Some(info.combined_txn_log),
+        txn_type: Some(match info.transaction_type {
+            LakeTransactionType::Normal => TxnTypePb::TxnNormal as i32,
+            LakeTransactionType::Replication => TxnTypePb::TxnReplication as i32,
+            LakeTransactionType::Empty => TxnTypePb::TxnEmpty as i32,
+            LakeTransactionType::TabletReshard => TxnTypePb::TxnTabletReshard as i32,
+            LakeTransactionType::Unknown(value) => value,
+        }),
+        force_publish: Some(info.force_publish),
+        rebuild_pindex: Some(info.rebuild_pindex),
+        gtid: Some(info.gtid),
+        load_ids: info
+            .load_ids
+            .iter()
+            .map(|id| PUniqueId {
+                hi: id.hi,
+                lo: id.lo,
+            })
+            .collect(),
+    }
+}
+
+fn publish_version_request_from_command(command: &PublishVersionCommand) -> PublishVersionRequest {
+    PublishVersionRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_ids: command.transaction_ids.clone(),
+        base_version: command.base_version,
+        new_version: command.new_version,
+        commit_time: command.commit_time,
+        timeout_ms: command.timeout_ms,
+        txn_infos: command
+            .transactions
+            .iter()
+            .map(txn_info_pb_from_domain)
+            .collect(),
+        rebuild_pindex_tablet_ids: command.rebuild_pindex_tablet_ids.clone(),
+        enable_aggregate_publish: command.enable_aggregate_publish,
+        resharding_tablet_infos: command
+            .resharding_tablet_infos
+            .iter()
+            .map(|info| ReshardingTabletInfoPb {
+                splitting_tablet_info: info.splitting.as_ref().map(|value| SplittingTabletInfoPb {
+                    old_tablet_id: value.old_tablet_id,
+                    new_tablet_ids: value.new_tablet_ids.clone(),
+                }),
+                merging_tablet_info: info.merging.as_ref().map(|value| MergingTabletInfoPb {
+                    old_tablet_ids: value.old_tablet_ids.clone(),
+                    new_tablet_id: value.new_tablet_id,
+                }),
+                identical_tablet_info: info.identical.as_ref().map(|value| IdenticalTabletInfoPb {
+                    old_tablet_id: value.old_tablet_id,
+                    new_tablet_id: value.new_tablet_id,
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn publish_log_version_request_from_command(
+    command: &PublishLogVersionCommand,
+) -> PublishLogVersionRequest {
+    PublishLogVersionRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_id: command.transaction_id,
+        version: command.version,
+        txn_info: command.transaction.as_ref().map(txn_info_pb_from_domain),
+    }
+}
+
+fn publish_log_version_batch_request_from_command(
+    command: &PublishLogVersionBatchCommand,
+) -> PublishLogVersionBatchRequest {
+    PublishLogVersionBatchRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_ids: command.transaction_ids.clone(),
+        versions: command.versions.clone(),
+        txn_infos: command
+            .transactions
+            .iter()
+            .map(txn_info_pb_from_domain)
+            .collect(),
+    }
+}
+
+fn abort_txn_request_from_command(command: &AbortTransactionCommand) -> AbortTxnRequest {
+    AbortTxnRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_ids: command.transaction_ids.clone(),
+        skip_cleanup: command.skip_cleanup,
+        txn_types: command
+            .transaction_types
+            .iter()
+            .map(|kind| match kind {
+                LakeTransactionType::Normal => TxnTypePb::TxnNormal as i32,
+                LakeTransactionType::Replication => TxnTypePb::TxnReplication as i32,
+                LakeTransactionType::Empty => TxnTypePb::TxnEmpty as i32,
+                LakeTransactionType::TabletReshard => TxnTypePb::TxnTabletReshard as i32,
+                LakeTransactionType::Unknown(value) => *value,
+            })
+            .collect(),
+        txn_infos: command
+            .transactions
+            .iter()
+            .map(txn_info_pb_from_domain)
+            .collect(),
+    }
+}
+
+fn drop_table_request_from_command(command: &DropLakeTableCommand) -> DropTableRequest {
+    DropTableRequest {
+        tablet_id: command.tablet_id,
+        path: command.path.clone(),
+    }
+}
+
+fn delete_data_request_from_command(command: &DeleteDataCommand) -> DeleteDataRequest {
+    DeleteDataRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_id: command.txn_id,
+        delete_predicate: command
+            .delete_predicate
+            .as_ref()
+            .map(|predicate| DeletePredicatePb {
+                version: predicate.version,
+                sub_predicates: predicate.sub_predicates.clone(),
+                in_predicates: predicate
+                    .in_predicates
+                    .iter()
+                    .map(|value| InPredicatePb {
+                        column_name: value.column_name.clone(),
+                        is_not_in: value.is_not_in,
+                        values: value.values.clone(),
+                    })
+                    .collect(),
+                binary_predicates: predicate
+                    .binary_predicates
+                    .iter()
+                    .map(|value| BinaryPredicatePb {
+                        column_name: value.column_name.clone(),
+                        op: value.op.clone(),
+                        value: value.value.clone(),
+                    })
+                    .collect(),
+                is_null_predicates: predicate
+                    .is_null_predicates
+                    .iter()
+                    .map(|value| IsNullPredicatePb {
+                        column_name: value.column_name.clone(),
+                        is_not_null: value.is_not_null,
+                    })
+                    .collect(),
+            }),
+        schema_key: command.schema_key.as_ref().map(|key| TableSchemaKeyPb {
+            db_id: key.db_id,
+            table_id: key.table_id,
+            schema_id: key.schema_id,
+        }),
+    }
+}
+
+fn vacuum_request_from_command(command: &VacuumCommand) -> VacuumRequest {
+    VacuumRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        min_retain_version: command.min_retain_version,
+        grace_timestamp: command.grace_timestamp,
+        min_active_txn_id: command.min_active_txn_id,
+        delete_txn_log: command.delete_txn_log,
+        partition_id: command.partition_id,
+        tablet_infos: command
+            .tablet_min_versions
+            .iter()
+            .map(|(tablet_id, min_version)| TabletInfoPb {
+                tablet_id: Some(*tablet_id),
+                min_version: *min_version,
+            })
+            .collect(),
+        enable_file_bundling: command.enable_file_bundling,
+        retain_versions: command.retain_versions.clone(),
+    }
+}
+
+fn tablet_stat_request_from_command(command: &TabletStatsCommand) -> TabletStatRequest {
+    TabletStatRequest {
+        tablet_infos: command
+            .tablet_versions
+            .iter()
+            .map(|entry| tablet_stat_request::TabletInfo {
+                tablet_id: Some(entry.tablet_id),
+                version: Some(entry.version),
+            })
+            .collect(),
+        timeout_ms: command.timeout_ms,
+    }
+}
+
+/// Publishes lake metadata from protocol-neutral facts supplied by the
+/// composition root.
+pub fn execute_publish_version(
+    dependencies: &LakeStorageDependencies,
+    command: &PublishVersionCommand,
+) -> Result<PublishVersionResult, String> {
+    warmup_tablet_locations_for_dependencies(dependencies, "publish_version", &command.tablet_ids);
+    publish_version_inner(command, dependencies.storage_metadata.clone())
+}
+
+fn publish_version_inner(
+    command: &PublishVersionCommand,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
+) -> Result<PublishVersionResult, String> {
+    if command.tablet_ids.is_empty() {
+        return Ok(PublishVersionResult {
             failed_tablets: Vec::new(),
             compaction_scores: HashMap::new(),
-            status: None,
             tablet_row_nums: HashMap::new(),
-            tablet_metas: HashMap::new(),
-            tablet_ranges: HashMap::new(),
         });
     }
 
-    let txn_infos = build_publish_txn_infos(request)?;
+    let txn_infos = build_publish_txn_infos(command)?;
     if txn_infos.is_empty() {
         return Err("publish_version requires txn_infos or txn_ids".to_string());
     }
 
-    let new_version = request
+    let new_version = command
         .new_version
         .ok_or_else(|| "publish_version missing new_version".to_string())?;
     if new_version <= 0 {
@@ -110,7 +327,7 @@ pub(crate) fn publish_version(
             "publish_version has invalid new_version={new_version}"
         ));
     }
-    let base_version = request
+    let base_version = command
         .base_version
         .unwrap_or_else(|| new_version.saturating_sub(txn_infos.len() as i64));
     if base_version < 0 {
@@ -134,10 +351,16 @@ pub(crate) fn publish_version(
     let mut failed_tablets = Vec::new();
     let mut successful_tablets = Vec::new();
     let mut tablet_row_nums = HashMap::new();
-    let worker_count = publish_worker_count(request.tablet_ids.len());
+    let worker_count = publish_worker_count(command.tablet_ids.len());
     if worker_count <= 1 {
-        for tablet_id in &request.tablet_ids {
-            let publish_res = publish_one_tablet(*tablet_id, base_version, new_version, &txn_infos);
+        for tablet_id in &command.tablet_ids {
+            let publish_res = publish_one_tablet(
+                *tablet_id,
+                base_version,
+                new_version,
+                &txn_infos,
+                storage_metadata_provider.clone(),
+            );
             collect_publish_result(
                 *tablet_id,
                 publish_res,
@@ -154,9 +377,10 @@ pub(crate) fn publish_version(
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
-                let tablet_ids = &request.tablet_ids;
+                let tablet_ids = &command.tablet_ids;
                 let txn_infos = &txn_infos;
                 let next_idx = &next_idx;
+                let storage_metadata_provider = storage_metadata_provider.clone();
                 handles.push(scope.spawn(move || {
                     let mut local =
                         Vec::with_capacity((tablet_ids.len() / worker_count).saturating_add(1));
@@ -166,8 +390,13 @@ pub(crate) fn publish_version(
                             break;
                         }
                         let tablet_id = tablet_ids[idx];
-                        let publish_res =
-                            publish_one_tablet(tablet_id, base_version, new_version, txn_infos);
+                        let publish_res = publish_one_tablet(
+                            tablet_id,
+                            base_version,
+                            new_version,
+                            txn_infos,
+                            storage_metadata_provider.clone(),
+                        );
                         local.push((tablet_id, publish_res));
                     }
                     local
@@ -204,17 +433,15 @@ pub(crate) fn publish_version(
         txn_infos.len(),
         &mut failed_tablets,
         &mut tablet_row_nums,
+        storage_metadata_provider,
     );
     failed_tablets.sort_unstable();
     failed_tablets.dedup();
 
-    Ok(PublishVersionResponse {
+    Ok(PublishVersionResult {
         failed_tablets,
         compaction_scores: HashMap::new(),
-        status: None,
         tablet_row_nums,
-        tablet_metas: HashMap::new(),
-        tablet_ranges: HashMap::new(),
     })
 }
 
@@ -224,15 +451,27 @@ struct PublishLogVersionStep {
     log_version: i64,
 }
 
-pub(crate) fn publish_log_version(
-    request: &PublishLogVersionRequest,
-) -> Result<PublishLogVersionResponse, String> {
-    if request.tablet_ids.is_empty() {
-        return Ok(PublishLogVersionResponse {
+pub fn execute_publish_log_version(
+    dependencies: &LakeStorageDependencies,
+    command: &PublishLogVersionCommand,
+) -> Result<FailedTabletsResult, String> {
+    warmup_tablet_locations_for_dependencies(
+        dependencies,
+        "publish_log_version",
+        &command.tablet_ids,
+    );
+    publish_log_version_inner(command)
+}
+
+fn publish_log_version_inner(
+    command: &PublishLogVersionCommand,
+) -> Result<FailedTabletsResult, String> {
+    if command.tablet_ids.is_empty() {
+        return Ok(FailedTabletsResult {
             failed_tablets: Vec::new(),
         });
     }
-    let log_version = request
+    let log_version = command
         .version
         .ok_or_else(|| "publish_log_version missing version".to_string())?;
     if log_version <= 0 {
@@ -240,12 +479,15 @@ pub(crate) fn publish_log_version(
             "publish_log_version requires positive version, got {log_version}"
         ));
     }
-    let txn_info = if let Some(info) = request.txn_info.as_ref() {
-        normalize_publish_log_txn_info(info.clone(), "publish_log_version.txn_info")?
+    let txn_info = if let Some(info) = command.transaction.as_ref() {
+        normalize_publish_log_txn_info(
+            txn_info_pb_from_domain(info),
+            "publish_log_version.txn_info",
+        )?
     } else {
         build_publish_log_txn_info_from_txn_id(
-            request
-                .txn_id
+            command
+                .transaction_id
                 .ok_or_else(|| "publish_log_version requires txn_info or txn_id".to_string())?,
         )?
     };
@@ -254,7 +496,7 @@ pub(crate) fn publish_log_version(
         log_version,
     }];
     let mut failed_tablets = Vec::new();
-    for tablet_id in &request.tablet_ids {
+    for tablet_id in &command.tablet_ids {
         if let Err(err) = publish_log_versions_for_tablet(*tablet_id, &steps) {
             warn!(
                 "publish_log_version failed: tablet_id={} version={} error={}",
@@ -264,20 +506,32 @@ pub(crate) fn publish_log_version(
         }
     }
     failed_tablets.sort_unstable();
-    Ok(PublishLogVersionResponse { failed_tablets })
+    Ok(FailedTabletsResult { failed_tablets })
 }
 
-pub(crate) fn publish_log_version_batch(
-    request: &PublishLogVersionBatchRequest,
-) -> Result<PublishLogVersionResponse, String> {
-    if request.tablet_ids.is_empty() {
-        return Ok(PublishLogVersionResponse {
+pub fn execute_publish_log_version_batch(
+    dependencies: &LakeStorageDependencies,
+    command: &PublishLogVersionBatchCommand,
+) -> Result<FailedTabletsResult, String> {
+    warmup_tablet_locations_for_dependencies(
+        dependencies,
+        "publish_log_version_batch",
+        &command.tablet_ids,
+    );
+    publish_log_version_batch_inner(command)
+}
+
+fn publish_log_version_batch_inner(
+    command: &PublishLogVersionBatchCommand,
+) -> Result<FailedTabletsResult, String> {
+    if command.tablet_ids.is_empty() {
+        return Ok(FailedTabletsResult {
             failed_tablets: Vec::new(),
         });
     }
-    let steps = build_publish_log_version_batch_steps(request)?;
+    let steps = build_publish_log_version_batch_steps(command)?;
     let mut failed_tablets = Vec::new();
-    for tablet_id in &request.tablet_ids {
+    for tablet_id in &command.tablet_ids {
         if let Err(err) = publish_log_versions_for_tablet(*tablet_id, &steps) {
             warn!(
                 "publish_log_version_batch failed: tablet_id={} step_count={} error={}",
@@ -289,7 +543,7 @@ pub(crate) fn publish_log_version_batch(
         }
     }
     failed_tablets.sort_unstable();
-    Ok(PublishLogVersionResponse { failed_tablets })
+    Ok(FailedTabletsResult { failed_tablets })
 }
 
 fn build_publish_log_txn_info_from_txn_id(txn_id: i64) -> Result<TxnInfoPb, String> {
@@ -344,25 +598,25 @@ fn normalize_publish_log_txn_info(
 }
 
 fn build_publish_log_version_batch_steps(
-    request: &PublishLogVersionBatchRequest,
+    command: &PublishLogVersionBatchCommand,
 ) -> Result<Vec<PublishLogVersionStep>, String> {
-    if request.versions.is_empty() {
+    if command.versions.is_empty() {
         return Err("publish_log_version_batch requires versions".to_string());
     }
 
-    if !request.txn_infos.is_empty() {
-        if request.txn_infos.len() != request.versions.len() {
+    if !command.transactions.is_empty() {
+        if command.transactions.len() != command.versions.len() {
             return Err(format!(
                 "publish_log_version_batch txn_infos/versions size mismatch: txn_infos={} versions={}",
-                request.txn_infos.len(),
-                request.versions.len()
+                command.transactions.len(),
+                command.versions.len()
             ));
         }
-        let mut steps = Vec::with_capacity(request.versions.len());
-        for (idx, (txn_info, version)) in request
-            .txn_infos
+        let mut steps = Vec::with_capacity(command.versions.len());
+        for (idx, (txn_info, version)) in command
+            .transactions
             .iter()
-            .zip(request.versions.iter())
+            .zip(command.versions.iter())
             .enumerate()
         {
             if *version <= 0 {
@@ -373,7 +627,7 @@ fn build_publish_log_version_batch_steps(
             }
             steps.push(PublishLogVersionStep {
                 txn_info: normalize_publish_log_txn_info(
-                    txn_info.clone(),
+                    txn_info_pb_from_domain(txn_info),
                     &format!("publish_log_version_batch.txn_infos[{idx}]"),
                 )?,
                 log_version: *version,
@@ -382,19 +636,19 @@ fn build_publish_log_version_batch_steps(
         return Ok(steps);
     }
 
-    if !request.txn_ids.is_empty() {
-        if request.txn_ids.len() != request.versions.len() {
+    if !command.transaction_ids.is_empty() {
+        if command.transaction_ids.len() != command.versions.len() {
             return Err(format!(
                 "publish_log_version_batch txn_ids/versions size mismatch: txn_ids={} versions={}",
-                request.txn_ids.len(),
-                request.versions.len()
+                command.transaction_ids.len(),
+                command.versions.len()
             ));
         }
-        let mut steps = Vec::with_capacity(request.versions.len());
-        for (idx, (txn_id, version)) in request
-            .txn_ids
+        let mut steps = Vec::with_capacity(command.versions.len());
+        for (idx, (txn_id, version)) in command
+            .transaction_ids
             .iter()
-            .zip(request.versions.iter())
+            .zip(command.versions.iter())
             .enumerate()
         {
             if *version <= 0 {
@@ -547,6 +801,9 @@ fn finalize_publish_outputs(
     txn_infos_len: usize,
     failed_tablets: &mut Vec<i64>,
     tablet_row_nums: &mut HashMap<i64, i64>,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) {
     let mut persist_groups: HashMap<String, Vec<(i64, PublishOneTabletOutput)>> = HashMap::new();
     for (tablet_id, output) in successful_tablets {
@@ -570,6 +827,7 @@ fn finalize_publish_outputs(
             base_version,
             new_version,
             txn_infos,
+            storage_metadata_provider.clone(),
         ) {
             warn!(
                 "publish_version failed to synthesize untouched sibling tablets for bundle batch: root_path={}, new_version={}, base_version={}, txn_infos_len={}, tablet_count={}, error={}",
@@ -689,6 +947,9 @@ fn synthesize_missing_bundle_siblings(
     base_version: i64,
     new_version: i64,
     txn_infos: &[TxnInfoPb],
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) -> Result<(), String> {
     let sibling_tablet_ids = starlet_shard_registry::select_tablet_ids_by_path(root_path);
     if sibling_tablet_ids.is_empty() {
@@ -704,7 +965,8 @@ fn synthesize_missing_bundle_siblings(
         if present.contains(&tablet_id) {
             continue;
         }
-        let runtime = get_runtime_for_publish(tablet_id, base_version)?;
+        let runtime =
+            get_runtime_for_publish(tablet_id, base_version, storage_metadata_provider.clone())?;
         let mut metadata = if base_version == 0 {
             empty_tablet_metadata(tablet_id)
         } else if let Some((source_version, meta)) = load_bundle_sibling_source_metadata(
@@ -877,7 +1139,18 @@ fn unix_seconds_now() -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
-pub(crate) fn abort_txn(request: &AbortTxnRequest) -> Result<AbortTxnResponse, String> {
+pub fn execute_abort_txn(
+    dependencies: &LakeStorageDependencies,
+    command: &AbortTransactionCommand,
+) -> Result<FailedTabletsResult, String> {
+    warmup_tablet_locations_for_dependencies(dependencies, "abort_txn", &command.tablet_ids);
+    let response = abort_txn_inner(&abort_txn_request_from_command(command))?;
+    Ok(FailedTabletsResult {
+        failed_tablets: response.failed_tablets,
+    })
+}
+
+fn abort_txn_inner(request: &AbortTxnRequest) -> Result<AbortTxnResponse, String> {
     if should_skip_abort_cleanup(request.skip_cleanup) {
         return Ok(AbortTxnResponse {
             failed_tablets: Vec::new(),
@@ -924,7 +1197,20 @@ pub(crate) fn abort_txn(request: &AbortTxnRequest) -> Result<AbortTxnResponse, S
     Ok(AbortTxnResponse { failed_tablets })
 }
 
-pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse, String> {
+pub fn execute_drop_table(
+    dependencies: &LakeStorageDependencies,
+    command: &DropLakeTableCommand,
+) -> Result<LakeOkResult, String> {
+    let tablet_ids = command.tablet_id.into_iter().collect::<Vec<_>>();
+    warmup_tablet_locations_for_dependencies(dependencies, "drop_table", &tablet_ids);
+    drop_table_inner(dependencies, &drop_table_request_from_command(command))?;
+    Ok(LakeOkResult)
+}
+
+fn drop_table_inner(
+    dependencies: &LakeStorageDependencies,
+    request: &DropTableRequest,
+) -> Result<DropTableResponse, String> {
     let tablet_id = request
         .tablet_id
         .filter(|v| *v > 0)
@@ -948,7 +1234,9 @@ pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse
             let Some(request_path) = request_path else {
                 return Err(err);
             };
-            let fallback_s3 = starlet_metadata::retrieve_s3_config_for_path(request_path)?;
+            let fallback_s3 = dependencies
+                .starlet_metadata()
+                .and_then(|provider| provider.retrieve_s3_config_for_path(request_path))?;
             warn!(
                 "drop_table location recovery failed, falling back to request path: tablet_id={}, request_path={}, error={}",
                 tablet_id, request_path, err
@@ -982,7 +1270,18 @@ pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse
     })
 }
 
-pub(crate) fn delete_data(request: &DeleteDataRequest) -> Result<DeleteDataResponse, String> {
+pub fn execute_delete_data(
+    dependencies: &LakeStorageDependencies,
+    command: &DeleteDataCommand,
+) -> Result<FailedTabletsResult, String> {
+    warmup_tablet_locations_for_dependencies(dependencies, "delete_data", &command.tablet_ids);
+    let response = delete_data_inner(&delete_data_request_from_command(command))?;
+    Ok(FailedTabletsResult {
+        failed_tablets: response.failed_tablets,
+    })
+}
+
+fn delete_data_inner(request: &DeleteDataRequest) -> Result<DeleteDataResponse, String> {
     let tablet_ids = normalize_tablet_ids("delete_data", &request.tablet_ids)?;
     let txn_id = request
         .txn_id
@@ -1174,7 +1473,20 @@ fn resolve_delete_data_schema_key(
     ))
 }
 
-pub(crate) fn delete_tablet(request: &DeleteTabletRequest) -> Result<DeleteTabletResponse, String> {
+pub fn execute_delete_tablet(
+    dependencies: &LakeStorageDependencies,
+    command: &DeleteTabletsCommand,
+) -> Result<FailedTabletsResult, String> {
+    warmup_tablet_locations_for_dependencies(dependencies, "delete_tablet", &command.tablet_ids);
+    let response = delete_tablet_inner(&DeleteTabletRequest {
+        tablet_ids: command.tablet_ids.clone(),
+    })?;
+    Ok(FailedTabletsResult {
+        failed_tablets: response.failed_tablets,
+    })
+}
+
+fn delete_tablet_inner(request: &DeleteTabletRequest) -> Result<DeleteTabletResponse, String> {
     let tablet_ids = normalize_tablet_ids("delete_tablet", &request.tablet_ids)?;
     if let Some((root_path, s3_config)) = resolve_delete_tablet_root_location(&tablet_ids)? {
         delete_tablets_in_root(&root_path, &tablet_ids, s3_config.as_ref())?;
@@ -1257,7 +1569,35 @@ fn resolve_delete_tablet_root_location(
     Ok(Some((root_path, s3_config.flatten())))
 }
 
-pub(crate) fn vacuum(request: &VacuumRequest) -> Result<VacuumResponse, String> {
+pub fn execute_vacuum(
+    dependencies: &LakeStorageDependencies,
+    command: &VacuumCommand,
+) -> Result<VacuumResult, String> {
+    let tablet_ids = command
+        .tablet_min_versions
+        .iter()
+        .map(|(tablet_id, _)| *tablet_id)
+        .chain(command.tablet_ids.iter().copied())
+        .collect::<Vec<_>>();
+    warmup_tablet_locations_for_dependencies(dependencies, "vacuum", &tablet_ids);
+    let response = vacuum_inner(&vacuum_request_from_command(command))?;
+    Ok(VacuumResult {
+        vacuumed_files: response.vacuumed_files.unwrap_or(0),
+        vacuumed_file_size: response.vacuumed_file_size.unwrap_or(0),
+        vacuumed_version: response.vacuumed_version.unwrap_or(0),
+        tablet_min_versions: response
+            .tablet_infos
+            .into_iter()
+            .filter_map(|info| {
+                info.tablet_id
+                    .map(|tablet_id| (tablet_id, info.min_version.unwrap_or(0)))
+            })
+            .collect(),
+        extra_file_size: response.extra_file_size.unwrap_or(0),
+    })
+}
+
+fn vacuum_inner(request: &VacuumRequest) -> Result<VacuumResponse, String> {
     let tablet_infos = normalize_vacuum_tablet_infos(request)?;
     if tablet_infos.is_empty() {
         return Ok(VacuumResponse {
@@ -1477,7 +1817,33 @@ pub(crate) fn vacuum(request: &VacuumRequest) -> Result<VacuumResponse, String> 
     })
 }
 
-pub(crate) fn get_tablet_stats(request: &TabletStatRequest) -> Result<TabletStatResponse, String> {
+pub fn execute_get_tablet_stats(
+    dependencies: &LakeStorageDependencies,
+    command: &TabletStatsCommand,
+) -> Result<TabletStatsResult, String> {
+    let tablet_ids = command
+        .tablet_versions
+        .iter()
+        .map(|info| info.tablet_id)
+        .collect::<Vec<_>>();
+    warmup_tablet_locations_for_dependencies(dependencies, "get_tablet_stats", &tablet_ids);
+    let response = get_tablet_stats_inner(&tablet_stat_request_from_command(command))?;
+    Ok(TabletStatsResult {
+        tablet_stats: response
+            .tablet_stats
+            .into_iter()
+            .filter_map(|stat| {
+                stat.tablet_id.map(|tablet_id| TabletStat {
+                    tablet_id,
+                    num_rows: stat.num_rows.unwrap_or(0),
+                    data_size: stat.data_size.unwrap_or(0),
+                })
+            })
+            .collect(),
+    })
+}
+
+fn get_tablet_stats_inner(request: &TabletStatRequest) -> Result<TabletStatResponse, String> {
     if request.tablet_infos.is_empty() {
         return Err("get_tablet_stats missing tablet_infos".to_string());
     }
@@ -1626,6 +1992,14 @@ fn normalize_vacuum_tablet_infos(request: &VacuumRequest) -> Result<Vec<TabletIn
 }
 
 fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
+    warmup_tablet_locations_for_dependencies(&LakeStorageDependencies::default(), op, tablet_ids);
+}
+
+pub(crate) fn warmup_tablet_locations_for_dependencies(
+    dependencies: &LakeStorageDependencies,
+    op: &str,
+    tablet_ids: &[i64],
+) {
     if tablet_ids.is_empty() {
         return;
     }
@@ -1633,7 +2007,17 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
     if missing.is_empty() {
         return;
     }
-    match starlet_metadata::retrieve_shard_infos(&missing) {
+    let provider = match dependencies.starlet_metadata() {
+        Ok(provider) => provider,
+        Err(error) => {
+            warn!(
+                "{op} tablet location warmup has no Starlet metadata provider: missing={:?}, error={}",
+                missing, error
+            );
+            return;
+        }
+    };
+    match provider.retrieve_shard_infos(&missing) {
         Ok(recovered) => {
             if recovered.is_empty() {
                 warn!(
@@ -1642,27 +2026,24 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
                 );
                 return;
             }
-            if recovered.len() < missing.len() {
-                let mut unresolved = missing
-                    .iter()
-                    .copied()
-                    .filter(|tablet_id| !recovered.contains_key(tablet_id))
-                    .collect::<Vec<_>>();
-                unresolved.sort_unstable();
-                unresolved.dedup();
+            let recovered_count = recovered.len();
+            let unresolved = missing
+                .iter()
+                .copied()
+                .filter(|tablet_id| !recovered.contains_key(tablet_id))
+                .collect::<Vec<_>>();
+            starlet_shard_registry::upsert_many_infos(recovered);
+            if !unresolved.is_empty() {
                 warn!(
                     "{op} tablet location warmup partially recovered: recovered={} unresolved={:?}",
-                    recovered.len(),
-                    unresolved
+                    recovered_count, unresolved
                 );
             }
         }
-        Err(err) => {
-            warn!(
-                "{op} tablet location warmup from Starlet metadata failed: missing={:?}, error={}",
-                missing, err
-            );
-        }
+        Err(error) => warn!(
+            "{op} tablet location warmup from Starlet metadata failed: missing={:?}, error={}",
+            missing, error
+        ),
     }
 }
 
@@ -1733,16 +2114,6 @@ pub(crate) fn resolve_tablet_location(
         Ok(runtime) => Ok((runtime.root_path, runtime.s3_config)),
         Err(runtime_err) => {
             let mut infos = starlet_shard_registry::select_infos(&[tablet_id]);
-            if let Some(info) = infos.remove(&tablet_id) {
-                return Ok((info.full_path, info.s3));
-            }
-            if let Err(err) = starlet_metadata::retrieve_shard_infos(&[tablet_id]) {
-                warn!(
-                    "{op} single-tablet Starlet metadata recovery failed: tablet_id={}, error={}",
-                    tablet_id, err
-                );
-            }
-            infos = starlet_shard_registry::select_infos(&[tablet_id]);
             if let Some(info) = infos.remove(&tablet_id) {
                 return Ok((info.full_path, info.s3));
             }
@@ -2229,15 +2600,13 @@ fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), 
 }
 
 #[allow(dead_code)]
-fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInfoPb>, String> {
-    if !request.txn_infos.is_empty() {
-        let mut txn_infos = Vec::with_capacity(request.txn_infos.len());
-        let mut seen_txn_ids = HashSet::with_capacity(request.txn_infos.len());
-        let allow_empty_txnlog_txn = request.txn_infos.len() == 1;
-        for info in &request.txn_infos {
-            let txn_id = info.txn_id.ok_or_else(|| {
-                "publish_version txn_infos contains entry without txn_id".to_string()
-            })?;
+fn build_publish_txn_infos(command: &PublishVersionCommand) -> Result<Vec<TxnInfoPb>, String> {
+    if !command.transactions.is_empty() {
+        let mut txn_infos = Vec::with_capacity(command.transactions.len());
+        let mut seen_txn_ids = HashSet::with_capacity(command.transactions.len());
+        let allow_empty_txnlog_txn = command.transactions.len() == 1;
+        for info in &command.transactions {
+            let txn_id = info.txn_id;
             if txn_id == EMPTY_TXNLOG_TXN_ID {
                 if !allow_empty_txnlog_txn {
                     return Err(
@@ -2245,7 +2614,7 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
                             .to_string(),
                     );
                 }
-                txn_infos.push(info.clone());
+                txn_infos.push(txn_info_pb_from_domain(info));
                 continue;
             }
             if txn_id <= 0 {
@@ -2258,16 +2627,16 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
                     "publish_version txn_infos has duplicate txn_id={txn_id}"
                 ));
             }
-            txn_infos.push(info.clone());
+            txn_infos.push(txn_info_pb_from_domain(info));
         }
         return Ok(txn_infos);
     }
 
-    if !request.txn_ids.is_empty() {
-        let mut txn_infos = Vec::with_capacity(request.txn_ids.len());
-        let mut seen_txn_ids = HashSet::with_capacity(request.txn_ids.len());
-        let allow_empty_txnlog_txn = request.txn_ids.len() == 1;
-        for txn_id in &request.txn_ids {
+    if !command.transaction_ids.is_empty() {
+        let mut txn_infos = Vec::with_capacity(command.transaction_ids.len());
+        let mut seen_txn_ids = HashSet::with_capacity(command.transaction_ids.len());
+        let allow_empty_txnlog_txn = command.transaction_ids.len() == 1;
+        for txn_id in &command.transaction_ids {
             if *txn_id == EMPTY_TXNLOG_TXN_ID {
                 if !allow_empty_txnlog_txn {
                     return Err(
@@ -2277,7 +2646,7 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
                 }
                 txn_infos.push(TxnInfoPb {
                     txn_id: Some(*txn_id),
-                    commit_time: request.commit_time,
+                    commit_time: command.commit_time,
                     combined_txn_log: Some(false),
                     txn_type: Some(TxnTypePb::TxnNormal as i32),
                     force_publish: Some(false),
@@ -2299,7 +2668,7 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
             }
             txn_infos.push(TxnInfoPb {
                 txn_id: Some(*txn_id),
-                commit_time: request.commit_time,
+                commit_time: command.commit_time,
                 combined_txn_log: Some(false),
                 txn_type: Some(TxnTypePb::TxnNormal as i32),
                 force_publish: Some(false),
@@ -2577,6 +2946,9 @@ fn schema_from_metadata(
 fn get_runtime_for_publish(
     tablet_id: i64,
     base_version: i64,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) -> Result<TabletRuntimeEntry, String> {
     if let Ok(runtime) = get_tablet_runtime(tablet_id) {
         return Ok(runtime);
@@ -2599,7 +2971,7 @@ fn get_runtime_for_publish(
                 root_path,
                 schema: snapshot.tablet_schema,
                 s3_config,
-                storage_metadata_provider: None,
+                storage_metadata_provider: storage_metadata_provider.clone(),
             },
         );
     }
@@ -2623,7 +2995,7 @@ fn get_runtime_for_publish(
             root_path,
             schema,
             s3_config,
-            storage_metadata_provider: None,
+            storage_metadata_provider,
         },
     )
 }
@@ -2633,13 +3005,16 @@ fn publish_one_tablet(
     base_version: i64,
     new_version: i64,
     txn_infos: &[TxnInfoPb],
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) -> Result<PublishOneTabletOutput, String> {
     if tablet_id <= 0 {
         return Err(format!(
             "publish_version has non-positive tablet_id={tablet_id}"
         ));
     }
-    let runtime = get_runtime_for_publish(tablet_id, base_version)?;
+    let runtime = get_runtime_for_publish(tablet_id, base_version, storage_metadata_provider)?;
     if is_empty_txnlog_publish(txn_infos) {
         return publish_empty_txnlog_one_tablet(
             tablet_id,
@@ -3619,5 +3994,21 @@ mod publish_domain_bridge_tests {
         assert_eq!(provider.metadata_decodes.load(Ordering::SeqCst), 1);
         assert_eq!(provider.encodes.load(Ordering::SeqCst), 2);
         std::fs::remove_dir_all(&root).expect("remove temporary publish output directory");
+    }
+
+    #[test]
+    fn domain_transaction_preserves_unknown_wire_type() {
+        let info = LakeTransactionInfo {
+            txn_id: 7,
+            commit_time: None,
+            combined_txn_log: false,
+            transaction_type: LakeTransactionType::Unknown(99),
+            force_publish: false,
+            rebuild_pindex: false,
+            gtid: 0,
+            load_ids: Vec::new(),
+        };
+
+        assert_eq!(txn_info_pb_from_domain(&info).txn_type, Some(99));
     }
 }

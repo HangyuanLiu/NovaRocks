@@ -250,7 +250,9 @@ pub(crate) async fn handle_metrics(Query(params): Query<HashMap<String, String>>
     }
 }
 
-pub(crate) fn render_metrics() -> Result<String, String> {
+/// Renders the process metrics in Prometheus text format for any listener
+/// host. The caller owns HTTP route composition.
+pub fn render_metrics() -> Result<String, String> {
     refresh_backend_gauges();
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();
@@ -260,7 +262,8 @@ pub(crate) fn render_metrics() -> Result<String, String> {
     String::from_utf8(buf).map_err(|e| format!("prometheus metrics were not utf-8: {e}"))
 }
 
-pub(crate) fn render_metrics_json() -> Result<String, String> {
+/// Renders the process metrics in the existing JSON form for listener hosts.
+pub fn render_metrics_json() -> Result<String, String> {
     refresh_backend_gauges();
     let mut rows = Vec::new();
     for family in prometheus::gather() {

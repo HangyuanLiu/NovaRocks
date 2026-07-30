@@ -22,10 +22,11 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
-use crate::connector::starrocks::lake::transactions::delete_tablet;
+use crate::connector::starrocks::lake::{
+    execute_delete_tablet, service_domain::DeleteTabletsCommand,
+};
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::parser::ast::{
     ColumnAggregation, ObjectName, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
@@ -807,9 +808,12 @@ fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
     if tablet_ids.is_empty() {
         return;
     }
-    if let Err(err) = delete_tablet(&DeleteTabletRequest {
-        tablet_ids: tablet_ids.to_vec(),
-    }) {
+    if let Err(err) = execute_delete_tablet(
+        &Default::default(),
+        &DeleteTabletsCommand {
+            tablet_ids: tablet_ids.to_vec(),
+        },
+    ) {
         tracing::warn!(
             "StarRocks table create cleanup failed to delete bootstrapped tablets: tablet_ids={:?} error={}",
             tablet_ids,

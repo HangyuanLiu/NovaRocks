@@ -16,13 +16,20 @@
 // under the License.
 
 use arrow::record_batch::RecordBatch;
+use prost::Message;
+use std::sync::Arc;
 
 use crate::connector::starrocks::lake::context::{TabletWriteContext, with_txn_log_append_lock};
+use crate::connector::starrocks::lake::service_domain::{
+    AbortCompactionCommand, CompactTabletsCommand, CompactTabletsResult, CompactionStat,
+    LakeOkResult,
+};
 use crate::connector::starrocks::lake::transactions::resolve_tablet_location;
 use crate::connector::starrocks::lake::txn_log::{
     build_metadata_object_store_profile_for_partial, build_rowset_for_upsert_batch,
     build_tablet_output_schema, write_txn_log_file,
 };
+use crate::connector::starrocks::ports::LakeStorageDependencies;
 use crate::connector::starrocks::schema::StarRocksKeysType;
 use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
 use crate::formats::starrocks::plan::build_native_read_plan;
@@ -33,12 +40,62 @@ use crate::formats::starrocks::writer::parquet::read_bundle_parquet_snapshot_if_
 use crate::novarocks_logging::warn;
 use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortCompactionResponse, CompactRequest, CompactResponse, CompactStat,
-    StatusPb, TxnLogPb, txn_log_pb,
+    StatusPb, TabletParallelConfig, TxnLogPb, txn_log_pb,
 };
 
 const STATUS_CODE_OK: i32 = 0;
 
-pub(crate) fn compact(request: &CompactRequest) -> Result<CompactResponse, String> {
+pub fn execute_compact(
+    dependencies: &LakeStorageDependencies,
+    command: &CompactTabletsCommand,
+) -> Result<CompactTabletsResult, String> {
+    super::transactions::warmup_tablet_locations_for_dependencies(
+        dependencies,
+        "compact",
+        &command.tablet_ids,
+    );
+    let response = compact_inner(
+        &compact_request_from_command(command),
+        dependencies.storage_metadata.clone(),
+    )?;
+    let txn_logs = if response.txn_logs.is_empty() {
+        Vec::new()
+    } else {
+        let provider = dependencies.storage_metadata()?;
+        response
+            .txn_logs
+            .iter()
+            .map(|log| provider.decode_transaction_log(&log.encode_to_vec()))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(CompactTabletsResult {
+        failed_tablets: response.failed_tablets,
+        compact_stats: response
+            .compact_stats
+            .into_iter()
+            .filter_map(|stat| {
+                stat.tablet_id.map(|tablet_id| CompactionStat {
+                    tablet_id,
+                    total_compact_input_file_size: stat.total_compact_input_file_size.unwrap_or(0),
+                    read_segment_count: stat.read_segment_count.unwrap_or(0),
+                    write_segment_count: stat.write_segment_count.unwrap_or(0),
+                    write_segment_bytes: stat.write_segment_bytes.unwrap_or(0),
+                })
+            })
+            .collect(),
+        success_compaction_input_file_size: response
+            .success_compaction_input_file_size
+            .unwrap_or(0),
+        txn_logs,
+    })
+}
+
+fn compact_inner(
+    request: &CompactRequest,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
+) -> Result<CompactResponse, String> {
     let txn_id = request
         .txn_id
         .ok_or_else(|| "compact missing txn_id".to_string())?;
@@ -62,7 +119,13 @@ pub(crate) fn compact(request: &CompactRequest) -> Result<CompactResponse, Strin
     let mut success_compaction_input_file_size = 0_i64;
 
     for tablet_id in &request.tablet_ids {
-        match compact_one_tablet(*tablet_id, txn_id, version, skip_write_txnlog) {
+        match compact_one_tablet(
+            *tablet_id,
+            txn_id,
+            version,
+            skip_write_txnlog,
+            storage_metadata_provider.clone(),
+        ) {
             Ok(result) => {
                 success_compaction_input_file_size = success_compaction_input_file_size
                     .saturating_add(result.success_compaction_input_file_size);
@@ -94,7 +157,35 @@ pub(crate) fn compact(request: &CompactRequest) -> Result<CompactResponse, Strin
     })
 }
 
-pub(crate) fn abort_compaction(
+pub fn execute_abort_compaction(
+    _dependencies: &LakeStorageDependencies,
+    command: &AbortCompactionCommand,
+) -> Result<LakeOkResult, String> {
+    abort_compaction_inner(&AbortCompactionRequest {
+        txn_id: command.txn_id,
+    })?;
+    Ok(LakeOkResult)
+}
+
+fn compact_request_from_command(command: &CompactTabletsCommand) -> CompactRequest {
+    CompactRequest {
+        tablet_ids: command.tablet_ids.clone(),
+        txn_id: command.txn_id,
+        version: command.version,
+        timeout_ms: command.timeout_ms,
+        allow_partial_success: command.allow_partial_success,
+        encryption_meta: command.encryption_meta.clone(),
+        force_base_compaction: command.force_base_compaction,
+        skip_write_txnlog: command.skip_write_txnlog,
+        parallel_config: command.parallel_config.map(|config| TabletParallelConfig {
+            enable_parallel: config.enable_parallel,
+            max_parallel_per_tablet: config.max_parallel_per_tablet,
+            max_bytes_per_subtask: config.max_bytes_per_subtask,
+        }),
+    }
+}
+
+fn abort_compaction_inner(
     request: &AbortCompactionRequest,
 ) -> Result<AbortCompactionResponse, String> {
     let txn_id = request
@@ -122,6 +213,9 @@ fn compact_one_tablet(
     txn_id: i64,
     version: i64,
     skip_write_txnlog: bool,
+    storage_metadata_provider: Option<
+        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    >,
 ) -> Result<CompactOneTabletOutput, String> {
     if tablet_id <= 0 {
         return Err(format!("compact has non-positive tablet_id={tablet_id}"));
@@ -195,7 +289,7 @@ fn compact_one_tablet(
                 tablet_root_path: tablet_root_path.clone(),
                 tablet_schema: tablet_schema.clone(),
                 s3_config,
-                storage_metadata_provider: None,
+                storage_metadata_provider,
                 partial_update: Default::default(),
             };
             let new_rowset = build_rowset_for_upsert_batch(

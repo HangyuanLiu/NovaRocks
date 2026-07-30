@@ -14,12 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(feature = "compat")]
-pub mod backend_service;
 pub mod cluster_heartbeat;
 pub(crate) mod connector_binding;
-#[cfg(feature = "compat")]
-pub mod disk_report;
 #[cfg(feature = "compat")]
 pub mod engine_ffi;
 pub mod fragment_control;
@@ -30,13 +26,12 @@ pub mod grpc_query_lifecycle_client;
 pub(crate) mod grpc_runtime_filter_adapter;
 pub(crate) mod grpc_runtime_filter_sender;
 pub mod grpc_server;
-#[cfg(feature = "compat")]
-pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
 pub(crate) mod internal_rpc_transport;
 pub(crate) mod metrics_http;
 pub use metrics_http::{
     publish_backend_query_lifecycle_metrics, publish_frontend_query_lifecycle_metrics,
+    render_metrics, render_metrics_json,
 };
 pub mod native_fragment_ingress;
 #[cfg(test)]
@@ -44,6 +39,3 @@ pub(crate) mod native_fragment_service_test_fixture;
 pub(crate) mod result_batch_wire;
 pub(crate) mod runtime_filter_envelope_ingress;
 pub(crate) mod standalone_exec_state_reporter;
-#[cfg(feature = "compat")]
-pub mod starlet_metadata;
-pub mod thrift_debug;

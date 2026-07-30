@@ -119,6 +119,20 @@ pub struct LakeAlterTabletTask {
     pub base_table_column_names_len: usize,
 }
 
+/// One protocol-neutral metadata update for a lake tablet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LakeTabletMetadataUpdate {
+    pub tablet_id: i64,
+    pub metadata_update: crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate,
+}
+
+/// Protocol-neutral batch of metadata updates submitted by a lake agent task.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LakeUpdateTabletMetaTask {
+    pub txn_id: i64,
+    pub updates: Vec<LakeTabletMetadataUpdate>,
+}
+
 fn normalize_slot_name(name: &str) -> String {
     let mut s = name.trim();
     if let Some(rest) = s.strip_prefix('`').and_then(|x| x.strip_suffix('`')) {
@@ -412,12 +426,37 @@ pub(crate) fn execute_update_tablet_meta_info_task_with_storage_metadata_provide
         .tablet_meta_infos
         .as_ref()
         .ok_or_else(|| "update_tablet_meta_info missing tablet_meta_infos".to_string())?;
-    for tablet_meta_info in tablet_meta_infos {
-        execute_single_tablet_meta_update(
-            tablet_meta_info,
-            txn_id,
-            storage_metadata_provider.as_ref(),
-        )?;
+    let updates = tablet_meta_infos
+        .iter()
+        .map(|tablet_meta_info| {
+            Ok(LakeTabletMetadataUpdate {
+                tablet_id: tablet_meta_info.tablet_id.ok_or_else(|| {
+                    "update_tablet_meta_info tablet_meta_info missing tablet_id".to_string()
+                })?,
+                metadata_update: build_storage_metadata_update(tablet_meta_info)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    execute_lake_update_tablet_meta_task(
+        LakeUpdateTabletMetaTask { txn_id, updates },
+        storage_metadata_provider,
+    )
+}
+
+/// Executes a normalized lake metadata update task through the explicitly
+/// supplied storage codec.
+pub fn execute_lake_update_tablet_meta_task(
+    task: LakeUpdateTabletMetaTask,
+    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
+) -> Result<(), String> {
+    if task.txn_id <= 0 {
+        return Err(format!(
+            "update_tablet_meta_info has invalid txn_id={}",
+            task.txn_id
+        ));
+    }
+    for update in task.updates {
+        execute_single_tablet_meta_update(update, task.txn_id, storage_metadata_provider.as_ref())?;
     }
     Ok(())
 }
@@ -489,29 +528,23 @@ fn load_tablet_metadata_for_alter_with_retry(
 }
 
 fn execute_single_tablet_meta_update(
-    tablet_meta_info: &TTabletMetaInfo,
+    update: LakeTabletMetadataUpdate,
     txn_id: i64,
     storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<(), String> {
-    let tablet_id = tablet_meta_info
-        .tablet_id
-        .ok_or_else(|| "update_tablet_meta_info tablet_meta_info missing tablet_id".to_string())?;
+    let tablet_id = update.tablet_id;
     if tablet_id <= 0 {
         return Err(format!(
             "update_tablet_meta_info has invalid tablet_id={tablet_id}"
         ));
     }
     let (tablet_root_path, _s3) = resolve_tablet_location("update_tablet_meta_info", tablet_id)?;
-    let updated_schema = tablet_meta_info
-        .tablet_schema
-        .as_ref()
-        .map(build_tablet_schema_from_thrift)
-        .transpose()?;
+    let updated_schema = update.metadata_update.tablet_schema.clone();
     write_update_tablet_meta_txn_log_with_provider(
         &tablet_root_path,
         tablet_id,
         txn_id,
-        build_storage_metadata_update(tablet_meta_info)?,
+        update.metadata_update,
         storage_metadata_provider,
     )?;
     if let Some(schema) = updated_schema.as_ref() {

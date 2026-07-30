@@ -48,7 +48,5 @@ pub use connector::starrocks as novarocks_connector_starrocks;
 
 pub use common::types::{FetchResult, UniqueId};
 pub use service::grpc_server::start_grpc_exchange_server;
-#[cfg(feature = "compat")]
-pub use service::grpc_server::start_grpc_server;
 #[cfg(not(feature = "compat"))]
 pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;

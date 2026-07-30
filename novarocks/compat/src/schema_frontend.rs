@@ -23,7 +23,7 @@ where
 {
     let endpoint = endpoint
         .cloned()
-        .or_else(novarocks::service::disk_report::latest_fe_addr)
+        .or_else(crate::frontend_rpc::latest_fe_addr)
         .ok_or_else(|| {
             "missing FE address for schema scan (coord is absent and heartbeat cache is empty)"
                 .to_string()

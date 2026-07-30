@@ -222,7 +222,8 @@ pub fn upsert_many_infos(entries: impl IntoIterator<Item = (i64, StarletShardInf
     count
 }
 
-pub(crate) fn remove_many(tablet_ids: impl IntoIterator<Item = i64>) -> usize {
+/// Removes shard facts after a Starlet control-plane removal notification.
+pub fn remove_many(tablet_ids: impl IntoIterator<Item = i64>) -> usize {
     let Ok(mut guard) = shard_registry().lock() else {
         return 0;
     };
@@ -244,7 +245,10 @@ pub(crate) fn select_paths(tablet_ids: &[i64]) -> HashMap<i64, String> {
     selected
 }
 
-pub(crate) fn select_infos(tablet_ids: &[i64]) -> HashMap<i64, StarletShardInfo> {
+/// Returns the currently registered shard facts for the requested tablets.
+/// Compat agent-task adapters use this neutral registry lookup while waiting
+/// for an AddShard update to become visible.
+pub fn select_infos(tablet_ids: &[i64]) -> HashMap<i64, StarletShardInfo> {
     let Ok(guard) = shard_registry().lock() else {
         return HashMap::new();
     };

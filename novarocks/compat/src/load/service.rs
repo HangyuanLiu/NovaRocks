@@ -1866,8 +1866,10 @@ pub(crate) fn handle_transaction_op(
     }
 }
 
-impl novarocks::service::backend_service::LoadChannelFinisher for CompatLoadService {
-    fn finish(
+impl CompatLoadService {
+    /// Completes one FE stream-load channel from the compat-owned
+    /// BackendService listener.
+    pub(crate) fn finish_stream_load_channel(
         &self,
         label: Option<&str>,
         table_name: Option<&str>,

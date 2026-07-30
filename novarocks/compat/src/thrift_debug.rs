@@ -1,5 +1,21 @@
-//! Protocol-neutral Thrift diagnostic formatting kept with the remaining
-//! BackendService adapter until RCI-5G moves that service into compat.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Named JSON formatting for compat-owned Thrift diagnostics.
 
 use thrift::protocol::{
     TFieldIdentifier, TListIdentifier, TMapIdentifier, TMessageIdentifier, TOutputProtocol,
@@ -10,7 +26,7 @@ fn maybe_unique_id_uuid(map: &serde_json::Map<String, serde_json::Value>) -> Opt
     if map.len() != 2 || !map.contains_key("hi") || !map.contains_key("lo") {
         return None;
     }
-    Some(crate::common::types::format_uuid(
+    Some(novarocks::common::types::format_uuid(
         map.get("hi")?.as_i64()?,
         map.get("lo")?.as_i64()?,
     ))
@@ -57,10 +73,7 @@ enum Container {
 impl NamedJsonOutputProtocol {
     fn push_value(&mut self, value: serde_json::Value) -> thrift::Result<()> {
         match self.stack.last_mut() {
-            None => {
-                self.root = Some(value);
-                Ok(())
-            }
+            None => self.root = Some(value),
             Some(Container::Struct {
                 fields,
                 current_field,
@@ -71,12 +84,8 @@ impl NamedJsonOutputProtocol {
                         .unwrap_or_else(|| "__unknown_field__".to_string()),
                     value,
                 );
-                Ok(())
             }
-            Some(Container::List(items)) | Some(Container::Set(items)) => {
-                items.push(value);
-                Ok(())
-            }
+            Some(Container::List(items)) | Some(Container::Set(items)) => items.push(value),
             Some(Container::Map {
                 entries,
                 pending_key,
@@ -86,17 +95,17 @@ impl NamedJsonOutputProtocol {
                 } else {
                     *pending_key = Some(value);
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
-    fn pop_container_value(&mut self) -> thrift::Result<serde_json::Value> {
+    fn pop_container_value(&mut self) -> serde_json::Value {
         match self.stack.pop() {
-            None => Ok(serde_json::Value::Null),
-            Some(Container::Struct { fields, .. }) => Ok(serde_json::Value::Object(fields)),
+            None => serde_json::Value::Null,
+            Some(Container::Struct { fields, .. }) => serde_json::Value::Object(fields),
             Some(Container::List(items)) | Some(Container::Set(items)) => {
-                Ok(serde_json::Value::Array(items))
+                serde_json::Value::Array(items)
             }
             Some(Container::Map {
                 entries,
@@ -109,7 +118,7 @@ impl NamedJsonOutputProtocol {
                 if let Some(key) = pending_key {
                     items.push(serde_json::Value::Array(vec![key, serde_json::Value::Null]));
                 }
-                Ok(serde_json::Value::Array(items))
+                serde_json::Value::Array(items)
             }
         }
     }
@@ -130,7 +139,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
         Ok(())
     }
     fn write_struct_end(&mut self) -> thrift::Result<()> {
-        let value = self.pop_container_value()?;
+        let value = self.pop_container_value();
         self.push_value(value)
     }
     fn write_field_begin(&mut self, identifier: &TFieldIdentifier) -> thrift::Result<()> {
@@ -189,7 +198,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
         Ok(())
     }
     fn write_list_end(&mut self) -> thrift::Result<()> {
-        let value = self.pop_container_value()?;
+        let value = self.pop_container_value();
         self.push_value(value)
     }
     fn write_set_begin(&mut self, identifier: &TSetIdentifier) -> thrift::Result<()> {
@@ -198,7 +207,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
         Ok(())
     }
     fn write_set_end(&mut self) -> thrift::Result<()> {
-        let value = self.pop_container_value()?;
+        let value = self.pop_container_value();
         self.push_value(value)
     }
     fn write_map_begin(&mut self, identifier: &TMapIdentifier) -> thrift::Result<()> {
@@ -209,7 +218,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
         Ok(())
     }
     fn write_map_end(&mut self) -> thrift::Result<()> {
-        let value = self.pop_container_value()?;
+        let value = self.pop_container_value();
         self.push_value(value)
     }
     fn flush(&mut self) -> thrift::Result<()> {
@@ -220,7 +229,7 @@ impl TOutputProtocol for NamedJsonOutputProtocol {
     }
 }
 
-pub fn thrift_named_json<T: TSerializable>(value: &T) -> Result<String, String> {
+pub(crate) fn thrift_named_json<T: TSerializable>(value: &T) -> Result<String, String> {
     let mut protocol = NamedJsonOutputProtocol::default();
     value
         .write_to_out_protocol(&mut protocol)
@@ -242,13 +251,10 @@ mod tests {
             "other": {"hi": 1, "lo": 2, "extra": 3}
         });
         rewrite_unique_id_to_uuid(&mut value);
-        assert_eq!(
-            value["query_id"],
-            serde_json::Value::String("019c98a9-3390-7576-977b-33d188ad1f06".to_string())
-        );
+        assert_eq!(value["query_id"], "019c98a9-3390-7576-977b-33d188ad1f06");
         assert_eq!(
             value["fragment_instance_id"],
-            serde_json::Value::String("00000000-0000-0001-0000-000000000002".to_string())
+            "00000000-0000-0001-0000-000000000002"
         );
         assert_eq!(value["other"]["hi"], serde_json::Value::from(1));
     }

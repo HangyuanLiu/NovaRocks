@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::time::{Instant, sleep};
@@ -51,19 +51,6 @@ struct ResolvedRouting {
 #[derive(Default)]
 struct ChannelCache {
     mu: Mutex<HashMap<String, Channel>>,
-}
-
-static STARMGR_STATE: OnceLock<Mutex<StarMgrState>> = OnceLock::new();
-static CHANNEL_CACHE: OnceLock<ChannelCache> = OnceLock::new();
-
-fn state() -> &'static Mutex<StarMgrState> {
-    STARMGR_STATE.get_or_init(|| Mutex::new(StarMgrState::default()))
-}
-
-fn channels() -> &'static ChannelCache {
-    CHANNEL_CACHE.get_or_init(|| ChannelCache {
-        mu: Mutex::new(HashMap::new()),
-    })
 }
 
 fn normalize_optional_text(value: &str) -> Option<String> {
@@ -301,121 +288,124 @@ fn shard_info_to_registry_info(
     Ok((tablet_id, StarletShardInfo::new(full_path, s3)))
 }
 
-pub(crate) fn observe_starlet_service(service_id: &str) {
-    let Some(service_id) = normalize_optional_text(service_id) else {
-        return;
-    };
-    if let Ok(mut guard) = state().lock() {
-        guard.service_id = Some(service_id);
-    }
-}
-
-pub(crate) fn observe_starlet_heartbeat(
-    star_mgr_leader: &str,
-    service_id: &str,
-    worker_group_id: u64,
-    worker_id: u64,
-) {
-    if let Ok(mut guard) = state().lock() {
-        if let Some(leader_addr) = normalize_optional_text(star_mgr_leader) {
-            guard.leader_addr = Some(leader_addr);
-        }
-        if let Some(service_id) = normalize_optional_text(service_id) {
+impl CompatStarletMetadataProvider {
+    fn observe_starlet_service(&self, service_id: &str) {
+        let Some(service_id) = normalize_optional_text(service_id) else {
+            return;
+        };
+        if let Ok(mut guard) = self.state.lock() {
             guard.service_id = Some(service_id);
         }
-        guard.worker_group_id = Some(worker_group_id);
-        guard.worker_id = Some(worker_id);
     }
-}
 
-fn current_state_snapshot() -> StarMgrState {
-    state()
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
-}
+    fn observe_starlet_heartbeat(
+        &self,
+        star_mgr_leader: &str,
+        service_id: &str,
+        worker_group_id: u64,
+        worker_id: u64,
+    ) {
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(leader_addr) = normalize_optional_text(star_mgr_leader) {
+                guard.leader_addr = Some(leader_addr);
+            }
+            if let Some(service_id) = normalize_optional_text(service_id) {
+                guard.service_id = Some(service_id);
+            }
+            guard.worker_group_id = Some(worker_group_id);
+            guard.worker_id = Some(worker_id);
+        }
+    }
 
-async fn wait_for_routing_snapshot() -> Result<StarMgrState, String> {
-    let deadline = Instant::now() + STARMGR_LEADER_WAIT_TIMEOUT;
-    loop {
-        let snapshot = current_state_snapshot();
-        if snapshot
-            .leader_addr
-            .as_ref()
-            .is_some_and(|leader| !leader.trim().is_empty())
+    fn current_state_snapshot(&self) -> StarMgrState {
+        self.state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    async fn wait_for_routing_snapshot(&self) -> Result<StarMgrState, String> {
+        let deadline = Instant::now() + STARMGR_LEADER_WAIT_TIMEOUT;
+        loop {
+            let snapshot = self.current_state_snapshot();
+            if snapshot
+                .leader_addr
+                .as_ref()
+                .is_some_and(|leader| !leader.trim().is_empty())
+            {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "StarManager leader is unknown after waiting {:?}; waiting for StarletHeartbeat to provide star_mgr_leader",
+                    STARMGR_LEADER_WAIT_TIMEOUT
+                ));
+            }
+            sleep(STARMGR_LEADER_WAIT_INTERVAL).await;
+        }
+    }
+
+    fn update_service_id_cache(&self, service_id: String) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.service_id = Some(service_id);
+        }
+    }
+
+    async fn get_channel(&self, leader_addr: &str) -> Result<Channel, String> {
+        if let Some(ch) = self
+            .channels
+            .mu
+            .lock()
+            .map_err(|_| "lock StarManager channel cache failed".to_string())?
+            .get(leader_addr)
+            .cloned()
         {
-            return Ok(snapshot);
+            return Ok(ch);
         }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "StarManager leader is unknown after waiting {:?}; waiting for StarletHeartbeat to provide star_mgr_leader",
-                STARMGR_LEADER_WAIT_TIMEOUT
-            ));
+
+        let endpoint = format!("http://{leader_addr}")
+            .parse::<Endpoint>()
+            .map_err(|e| format!("invalid StarManager endpoint '{leader_addr}': {e}"))?
+            .connect_timeout(GRPC_CONNECT_TIMEOUT)
+            .timeout(GRPC_REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(Duration::from_secs(60)));
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| format!("connect StarManager leader {leader_addr} failed: {e}"))?;
+        self.channels
+            .mu
+            .lock()
+            .map_err(|_| "lock StarManager channel cache failed".to_string())?
+            .insert(leader_addr.to_string(), channel.clone());
+        Ok(channel)
+    }
+
+    fn require_ok_status(status: Option<&staros::StarStatus>, op: &str) -> Result<(), String> {
+        // StarManager uses proto3 responses. Successful replies may omit the zero-value `status`
+        // message entirely, so treat missing status as implicit OK instead of a protocol error.
+        let Some(status) = status else {
+            return Ok(());
+        };
+        if status.status_code == staros::StatusCode::Ok as i32 {
+            return Ok(());
         }
-        sleep(STARMGR_LEADER_WAIT_INTERVAL).await;
-    }
-}
-
-fn update_service_id_cache(service_id: String) {
-    if let Ok(mut guard) = state().lock() {
-        guard.service_id = Some(service_id);
-    }
-}
-
-async fn get_channel(leader_addr: &str) -> Result<Channel, String> {
-    if let Some(ch) = channels()
-        .mu
-        .lock()
-        .map_err(|_| "lock StarManager channel cache failed".to_string())?
-        .get(leader_addr)
-        .cloned()
-    {
-        return Ok(ch);
+        let code = staros::StatusCode::try_from(status.status_code)
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_else(|_| status.status_code.to_string());
+        if status.error_msg.trim().is_empty() {
+            Err(format!("StarManager {op} failed with status_code={code}"))
+        } else {
+            Err(format!(
+                "StarManager {op} failed with status_code={code}: {}",
+                status.error_msg
+            ))
+        }
     }
 
-    let endpoint = format!("http://{leader_addr}")
-        .parse::<Endpoint>()
-        .map_err(|e| format!("invalid StarManager endpoint '{leader_addr}': {e}"))?
-        .connect_timeout(GRPC_CONNECT_TIMEOUT)
-        .timeout(GRPC_REQUEST_TIMEOUT)
-        .tcp_keepalive(Some(Duration::from_secs(60)));
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|e| format!("connect StarManager leader {leader_addr} failed: {e}"))?;
-    channels()
-        .mu
-        .lock()
-        .map_err(|_| "lock StarManager channel cache failed".to_string())?
-        .insert(leader_addr.to_string(), channel.clone());
-    Ok(channel)
-}
-
-fn require_ok_status(status: Option<&staros::StarStatus>, op: &str) -> Result<(), String> {
-    // StarManager uses proto3 responses. Successful replies may omit the zero-value `status`
-    // message entirely, so treat missing status as implicit OK instead of a protocol error.
-    let Some(status) = status else {
-        return Ok(());
-    };
-    if status.status_code == staros::StatusCode::Ok as i32 {
-        return Ok(());
-    }
-    let code = staros::StatusCode::try_from(status.status_code)
-        .map(|v| format!("{v:?}"))
-        .unwrap_or_else(|_| status.status_code.to_string());
-    if status.error_msg.trim().is_empty() {
-        Err(format!("StarManager {op} failed with status_code={code}"))
-    } else {
-        Err(format!(
-            "StarManager {op} failed with status_code={code}: {}",
-            status.error_msg
-        ))
-    }
-}
-
-async fn resolve_routing() -> Result<ResolvedRouting, String> {
-    let snapshot = wait_for_routing_snapshot().await?;
-    let leader_addr = snapshot
+    async fn resolve_routing(&self) -> Result<ResolvedRouting, String> {
+        let snapshot = self.wait_for_routing_snapshot().await?;
+        let leader_addr = snapshot
         .leader_addr
         .filter(|leader| !leader.trim().is_empty())
         .ok_or_else(|| {
@@ -423,190 +413,201 @@ async fn resolve_routing() -> Result<ResolvedRouting, String> {
                 .to_string()
         })?;
 
-    let service_id = match snapshot.service_id {
-        Some(service_id) if !service_id.trim().is_empty() => service_id,
-        _ => {
-            let channel = get_channel(&leader_addr).await?;
-            let mut client = staros::star_manager_client::StarManagerClient::new(channel)
-                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-            let response = client
-                .get_service(staros::GetServiceRequest {
-                    identifier: Some(staros::get_service_request::Identifier::ServiceName(
-                        STARMGR_SERVICE_NAME.to_string(),
-                    )),
-                })
-                .await
-                .map_err(|e| format!("StarManager GetService failed: {e}"))?;
-            let response = response.into_inner();
-            require_ok_status(response.status.as_ref(), "GetService")?;
-            let service_info = response
-                .service_info
-                .ok_or_else(|| "StarManager GetService missing service_info".to_string())?;
-            if service_info.service_id.trim().is_empty() {
-                return Err("StarManager GetService returned empty service_id".to_string());
+        let service_id = match snapshot.service_id {
+            Some(service_id) if !service_id.trim().is_empty() => service_id,
+            _ => {
+                let channel = self.get_channel(&leader_addr).await?;
+                let mut client = staros::star_manager_client::StarManagerClient::new(channel)
+                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                let response = client
+                    .get_service(staros::GetServiceRequest {
+                        identifier: Some(staros::get_service_request::Identifier::ServiceName(
+                            STARMGR_SERVICE_NAME.to_string(),
+                        )),
+                    })
+                    .await
+                    .map_err(|e| format!("StarManager GetService failed: {e}"))?;
+                let response = response.into_inner();
+                Self::require_ok_status(response.status.as_ref(), "GetService")?;
+                let service_info = response
+                    .service_info
+                    .ok_or_else(|| "StarManager GetService missing service_info".to_string())?;
+                if service_info.service_id.trim().is_empty() {
+                    return Err("StarManager GetService returned empty service_id".to_string());
+                }
+                self.update_service_id_cache(service_info.service_id.clone());
+                service_info.service_id
             }
-            update_service_id_cache(service_info.service_id.clone());
-            service_info.service_id
-        }
-    };
-
-    Ok(ResolvedRouting {
-        leader_addr,
-        service_id,
-        worker_group_id: snapshot.worker_group_id.unwrap_or(DEFAULT_WORKER_GROUP_ID),
-    })
-}
-
-async fn retrieve_shard_infos_async(
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, StarletShardInfo>, String> {
-    let routing = resolve_routing().await?;
-    let shard_ids = tablet_ids
-        .iter()
-        .copied()
-        .map(|tablet_id| {
-            u64::try_from(tablet_id)
-                .map_err(|_| format!("tablet_id out of u64 range for GetShard: {tablet_id}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let channel = get_channel(&routing.leader_addr).await?;
-    let mut client = staros::star_manager_client::StarManagerClient::new(channel)
-        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-    let response = client
-        .get_shard(staros::GetShardRequest {
-            service_id: routing.service_id,
-            shard_id: shard_ids,
-            worker_group_id: routing.worker_group_id,
-            no_wait_replica_allocation: false,
-        })
-        .await
-        .map_err(|e| format!("StarManager GetShard failed: {e}"))?;
-    let response = response.into_inner();
-    require_ok_status(response.status.as_ref(), "GetShard")?;
-
-    let mut recovered = HashMap::with_capacity(response.shard_info.len());
-    for shard in &response.shard_info {
-        let (tablet_id, info) = shard_info_to_registry_info(shard)?;
-        recovered.insert(tablet_id, info);
-    }
-    Ok(recovered)
-}
-
-pub(crate) fn retrieve_shard_infos(
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, StarletShardInfo>, String> {
-    let mut deduped = tablet_ids
-        .iter()
-        .copied()
-        .filter(|tablet_id| *tablet_id > 0)
-        .collect::<Vec<_>>();
-    deduped.sort_unstable();
-    deduped.dedup();
-    if deduped.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let recovered = data_block_on(retrieve_shard_infos_async(&deduped))??;
-    if !recovered.is_empty() {
-        let _ = starlet_shard_registry::upsert_many_infos(
-            recovered
-                .iter()
-                .map(|(tablet_id, info)| (*tablet_id, info.clone())),
-        );
-    }
-    Ok(recovered)
-}
-
-async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreConfig>, String> {
-    let Some((target_bucket, target_key)) = split_object_store_path(path) else {
-        return Ok(None);
-    };
-    let routing = resolve_routing().await?;
-    let channel = get_channel(&routing.leader_addr).await?;
-    let mut client = staros::star_manager_client::StarManagerClient::new(channel)
-        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-    let response = client
-        .list_file_store(staros::ListFileStoreRequest {
-            service_id: routing.service_id,
-            fs_type: staros::FileStoreType::S3 as i32,
-        })
-        .await
-        .map_err(|e| format!("StarManager ListFileStore failed: {e}"))?;
-    let response = response.into_inner();
-    require_ok_status(response.status.as_ref(), "ListFileStore")?;
-
-    // Two passes:
-    //   1. The strongest signal is "the requested key sits under this file
-    //      store's path_prefix". Pick the longest matching prefix.
-    //   2. Otherwise fall back to any file store in the same bucket, but
-    //      only if every entry agrees on the cluster-level profile.
-    //
-    // `path_prefix` only feeds the matching here; it is never written into
-    // the returned `S3StoreConfig`.
-    let mut best: Option<(usize, S3StoreConfig)> = None;
-    let mut unique_bucket_cfg: Option<S3StoreConfig> = None;
-    let mut bucket_conflict = false;
-    for fs_info in &response.fs_infos {
-        let Some(record) = parse_s3_config_from_file_store_info(fs_info)? else {
-            continue;
         };
-        if record.cfg.bucket() != target_bucket {
-            continue;
-        }
-        match unique_bucket_cfg.as_ref() {
-            None => unique_bucket_cfg = Some(record.cfg.clone()),
-            Some(existing) if existing == &record.cfg => {}
-            Some(_) => bucket_conflict = true,
-        }
-        if !key_matches_root(&target_key, &record.path_prefix) {
-            continue;
-        }
-        let score = record.path_prefix.len();
-        match &best {
-            Some((best_score, _)) if *best_score >= score => {}
-            _ => best = Some((score, record.cfg)),
-        }
-    }
-    if let Some((_, cfg)) = best {
-        return Ok(Some(cfg));
-    }
-    if !bucket_conflict {
-        return Ok(unique_bucket_cfg);
-    }
-    Ok(None)
-}
 
-pub(crate) fn retrieve_s3_config_for_path(path: &str) -> Result<Option<S3StoreConfig>, String> {
-    data_block_on(retrieve_s3_config_for_path_async(path))?
+        Ok(ResolvedRouting {
+            leader_addr,
+            service_id,
+            worker_group_id: snapshot.worker_group_id.unwrap_or(DEFAULT_WORKER_GROUP_ID),
+        })
+    }
+
+    async fn retrieve_shard_infos_async(
+        &self,
+        tablet_ids: &[i64],
+    ) -> Result<HashMap<i64, StarletShardInfo>, String> {
+        let routing = self.resolve_routing().await?;
+        let shard_ids = tablet_ids
+            .iter()
+            .copied()
+            .map(|tablet_id| {
+                u64::try_from(tablet_id)
+                    .map_err(|_| format!("tablet_id out of u64 range for GetShard: {tablet_id}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let channel = self.get_channel(&routing.leader_addr).await?;
+        let mut client = staros::star_manager_client::StarManagerClient::new(channel)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+        let response = client
+            .get_shard(staros::GetShardRequest {
+                service_id: routing.service_id,
+                shard_id: shard_ids,
+                worker_group_id: routing.worker_group_id,
+                no_wait_replica_allocation: false,
+            })
+            .await
+            .map_err(|e| format!("StarManager GetShard failed: {e}"))?;
+        let response = response.into_inner();
+        Self::require_ok_status(response.status.as_ref(), "GetShard")?;
+
+        let mut recovered = HashMap::with_capacity(response.shard_info.len());
+        for shard in &response.shard_info {
+            let (tablet_id, info) = shard_info_to_registry_info(shard)?;
+            recovered.insert(tablet_id, info);
+        }
+        Ok(recovered)
+    }
+
+    fn retrieve_shard_infos(
+        &self,
+        tablet_ids: &[i64],
+    ) -> Result<HashMap<i64, StarletShardInfo>, String> {
+        let mut deduped = tablet_ids
+            .iter()
+            .copied()
+            .filter(|tablet_id| *tablet_id > 0)
+            .collect::<Vec<_>>();
+        deduped.sort_unstable();
+        deduped.dedup();
+        if deduped.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let recovered = data_block_on(self.retrieve_shard_infos_async(&deduped))??;
+        if !recovered.is_empty() {
+            let _ = starlet_shard_registry::upsert_many_infos(
+                recovered
+                    .iter()
+                    .map(|(tablet_id, info)| (*tablet_id, info.clone())),
+            );
+        }
+        Ok(recovered)
+    }
+
+    async fn retrieve_s3_config_for_path_async(
+        &self,
+        path: &str,
+    ) -> Result<Option<S3StoreConfig>, String> {
+        let Some((target_bucket, target_key)) = split_object_store_path(path) else {
+            return Ok(None);
+        };
+        let routing = self.resolve_routing().await?;
+        let channel = self.get_channel(&routing.leader_addr).await?;
+        let mut client = staros::star_manager_client::StarManagerClient::new(channel)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+        let response = client
+            .list_file_store(staros::ListFileStoreRequest {
+                service_id: routing.service_id,
+                fs_type: staros::FileStoreType::S3 as i32,
+            })
+            .await
+            .map_err(|e| format!("StarManager ListFileStore failed: {e}"))?;
+        let response = response.into_inner();
+        Self::require_ok_status(response.status.as_ref(), "ListFileStore")?;
+
+        // Two passes:
+        //   1. The strongest signal is "the requested key sits under this file
+        //      store's path_prefix". Pick the longest matching prefix.
+        //   2. Otherwise fall back to any file store in the same bucket, but
+        //      only if every entry agrees on the cluster-level profile.
+        //
+        // `path_prefix` only feeds the matching here; it is never written into
+        // the returned `S3StoreConfig`.
+        let mut best: Option<(usize, S3StoreConfig)> = None;
+        let mut unique_bucket_cfg: Option<S3StoreConfig> = None;
+        let mut bucket_conflict = false;
+        for fs_info in &response.fs_infos {
+            let Some(record) = parse_s3_config_from_file_store_info(fs_info)? else {
+                continue;
+            };
+            if record.cfg.bucket() != target_bucket {
+                continue;
+            }
+            match unique_bucket_cfg.as_ref() {
+                None => unique_bucket_cfg = Some(record.cfg.clone()),
+                Some(existing) if existing == &record.cfg => {}
+                Some(_) => bucket_conflict = true,
+            }
+            if !key_matches_root(&target_key, &record.path_prefix) {
+                continue;
+            }
+            let score = record.path_prefix.len();
+            match &best {
+                Some((best_score, _)) if *best_score >= score => {}
+                _ => best = Some((score, record.cfg)),
+            }
+        }
+        if let Some((_, cfg)) = best {
+            return Ok(Some(cfg));
+        }
+        if !bucket_conflict {
+            return Ok(unique_bucket_cfg);
+        }
+        Ok(None)
+    }
+
+    fn retrieve_s3_config_for_path(&self, path: &str) -> Result<Option<S3StoreConfig>, String> {
+        data_block_on(self.retrieve_s3_config_for_path_async(path))?
+    }
 }
 
 use novarocks::connector::starrocks::ports::StarletMetadataProvider;
-use novarocks::service::grpc_server::StarletControl;
 use prost::Message;
+
+use crate::listeners::StarletControl;
 
 pub(crate) fn starlet_metadata_provider() -> std::sync::Arc<dyn StarletMetadataProvider> {
     starlet_metadata_adapter()
 }
 
 pub(crate) fn starlet_metadata_adapter() -> std::sync::Arc<CompatStarletMetadataProvider> {
-    std::sync::Arc::new(CompatStarletMetadataProvider)
+    std::sync::Arc::new(CompatStarletMetadataProvider::default())
 }
 
-pub(crate) struct CompatStarletMetadataProvider;
+#[derive(Default)]
+pub(crate) struct CompatStarletMetadataProvider {
+    state: Mutex<StarMgrState>,
+    channels: ChannelCache,
+}
 
 impl StarletMetadataProvider for CompatStarletMetadataProvider {
     fn retrieve_shard_infos(
         &self,
         tablet_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, StarletShardInfo>, String> {
-        retrieve_shard_infos(tablet_ids)
+        self.retrieve_shard_infos(tablet_ids)
     }
 
     fn retrieve_s3_config_for_path(&self, path: &str) -> Result<Option<S3StoreConfig>, String> {
-        retrieve_s3_config_for_path(path)
+        self.retrieve_s3_config_for_path(path)
     }
 }
 
@@ -621,7 +622,7 @@ impl StarletControl for CompatStarletMetadataProvider {
     }
 
     fn observe_service(&self, service_id: &str) {
-        observe_starlet_service(service_id);
+        self.observe_starlet_service(service_id);
     }
 
     fn observe_heartbeat(
@@ -631,7 +632,7 @@ impl StarletControl for CompatStarletMetadataProvider {
         worker_group_id: u64,
         worker_id: u64,
     ) {
-        observe_starlet_heartbeat(leader_addr, service_id, worker_group_id, worker_id);
+        self.observe_starlet_heartbeat(leader_addr, service_id, worker_group_id, worker_id);
     }
 }
 
@@ -670,7 +671,7 @@ mod tests {
             ..Default::default()
         };
 
-        let control = CompatStarletMetadataProvider;
+        let control = CompatStarletMetadataProvider::default();
         let profile = control
             .parse_file_path_s3_profile(&path_info.encode_to_vec())
             .expect("decode wire profile")
@@ -682,5 +683,22 @@ mod tests {
         assert_eq!(profile.access_key_secret(), "secret");
         assert_eq!(profile.region(), Some("us-east-1"));
         assert_eq!(profile.enable_path_style_access(), Some(true));
+    }
+
+    #[test]
+    fn provider_state_is_not_shared_between_hosts() {
+        let first = CompatStarletMetadataProvider::default();
+        first.observe_starlet_heartbeat("127.0.0.1:9876", "first", 2, 3);
+
+        assert_eq!(
+            first.current_state_snapshot().service_id.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            CompatStarletMetadataProvider::default()
+                .current_state_snapshot()
+                .service_id,
+            None
+        );
     }
 }
