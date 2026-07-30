@@ -39,6 +39,7 @@ fn frontend_facing_view_ports_and_dtos_are_publicly_nameable() {
         sql: "SELECT COUNT(*) AS sale_count FROM sales".to_string(),
         comment: Some("Daily sales".to_string()),
         or_replace: false,
+        if_not_exists: false,
         properties: vec![],
     };
     let resolved = ResolvedExternalView {
@@ -52,6 +53,7 @@ fn frontend_facing_view_ports_and_dtos_are_publicly_nameable() {
     let context = ViewRequestContext {
         current_catalog: Some("rest"),
         current_database: "analytics",
+        connector_context: None,
     };
 
     fn ports_are_object_safe(_service: &dyn ViewService, _engine: &dyn ViewEngine) {}

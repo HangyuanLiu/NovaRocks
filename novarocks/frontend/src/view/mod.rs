@@ -217,7 +217,7 @@ impl FrontendViewService {
         };
         if let Some(target) = iceberg::resolve_external_target(engine, &create_view.name, context)?
         {
-            return iceberg::create_external_view(engine, target, create_view);
+            return iceberg::create_external_view(engine, target, create_view, context);
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
         self.create_session_view(key, create_view.query, create_view.or_replace)?;
@@ -247,7 +247,7 @@ impl FrontendViewService {
         };
         for name in names {
             if let Some(target) = iceberg::resolve_external_target(engine, &name, context)? {
-                iceberg::drop_external_view(engine, &target, if_exists)?;
+                iceberg::drop_external_view(engine, &target, if_exists, context)?;
             } else {
                 self.drop_session_view(&session_view_key(&name, context.current_database)?)?;
             }

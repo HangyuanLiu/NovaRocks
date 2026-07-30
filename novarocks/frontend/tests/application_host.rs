@@ -111,19 +111,36 @@ impl ViewEngine for SessionViewEngine {
         false
     }
 
-    fn table_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+    fn table_exists(
+        &self,
+        _target: &ViewTarget,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, String> {
         unreachable!("session view must not probe external tables")
     }
 
-    fn view_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+    fn view_exists(
+        &self,
+        _target: &ViewTarget,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, String> {
         unreachable!("session view must not probe external views")
     }
 
-    fn create_external_view(&self, _request: CreateExternalViewRequest) -> Result<(), String> {
+    fn create_external_view(
+        &self,
+        _request: CreateExternalViewRequest,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), String> {
         unreachable!("session view must not create external views")
     }
 
-    fn drop_external_view(&self, _target: &ViewTarget) -> Result<(), String> {
+    fn drop_external_view(
+        &self,
+        _target: &ViewTarget,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+        _policy: novarocks_spi::connector::DropPolicy,
+    ) -> Result<(), String> {
         unreachable!("session view must not drop external views")
     }
 
@@ -143,6 +160,7 @@ impl ViewEngine for SessionViewEngine {
         _catalog: &str,
         _database: &str,
         _query: &Query,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         unreachable!("session view must not analyze external views")
     }
@@ -152,6 +170,7 @@ fn view_context() -> ViewRequestContext<'static> {
     ViewRequestContext {
         current_catalog: None,
         current_database: "db",
+        connector_context: None,
     }
 }
 

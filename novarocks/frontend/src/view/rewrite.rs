@@ -275,7 +275,10 @@ fn expand_external_table_factor(
             let Some(target) = external_rewrite_candidate(engine, &parts, context) else {
                 return Ok(());
             };
-            match engine.table_exists(&target) {
+            let Some(connector_context) = context.connector_context else {
+                return Err("external view rewrite requires connector request context".to_string());
+            };
+            match engine.table_exists(&target, connector_context) {
                 Ok(true) | Err(_) => return Ok(()),
                 Ok(false) => {}
             }
@@ -302,6 +305,7 @@ fn expand_external_table_factor(
                 ViewRequestContext {
                     current_catalog: Some(&target.catalog),
                     current_database: &view.default_database,
+                    connector_context: Some(connector_context),
                 },
                 &HashSet::new(),
                 stack,

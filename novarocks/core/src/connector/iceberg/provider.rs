@@ -869,6 +869,23 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     Ok(entry) => entry,
                     Err(error) => return Ok(known_uncommitted(error)),
                 };
+                let table_exists = list_tables(&entry, &view.namespace)
+                    .map_err(map_iceberg_error)
+                    .map(|tables| {
+                        tables
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&view.view))
+                    });
+                match table_exists {
+                    Ok(true) => {
+                        return Ok(known_uncommitted(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "a table with the requested view name already exists",
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Ok(known_uncommitted(error)),
+                }
                 match views::view_exists(&entry, &view.namespace, &view.view) {
                     Ok(true) if policy == CreateOrReplacePolicy::NoOpIfExists => {
                         Ok(ExternalMutationEffect::NoOp)

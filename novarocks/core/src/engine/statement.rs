@@ -970,7 +970,7 @@ fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
     ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())
 }
 
-fn connector_column(
+pub(crate) fn connector_column(
     column: &crate::sql::parser::ast::TableColumnDef,
 ) -> Result<ConnectorColumnDefinition, String> {
     Ok(ConnectorColumnDefinition {

@@ -1049,6 +1049,7 @@ impl StandaloneSession {
                     crate::engine::view::ViewRequestContext {
                         current_catalog,
                         current_database,
+                        connector_context: Some(&connector_context),
                     },
                 )?;
                 self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
@@ -1277,6 +1278,7 @@ impl StandaloneSession {
             crate::engine::view::ViewRequestContext {
                 current_catalog,
                 current_database,
+                connector_context: Some(&connector_context),
             },
         )? {
             return Ok(match result {
@@ -1642,6 +1644,7 @@ impl StandaloneSession {
                     crate::engine::view::ViewRequestContext {
                         current_catalog,
                         current_database,
+                        connector_context: Some(&connector_context),
                     },
                 )?;
                 // Materialize information_schema virtual tables (e.g. `schemata`)
@@ -2943,6 +2946,7 @@ fn prepare_explain_query(
         crate::engine::view::ViewRequestContext {
             current_catalog,
             current_database,
+            connector_context: Some(connector_context),
         },
     )?;
 
