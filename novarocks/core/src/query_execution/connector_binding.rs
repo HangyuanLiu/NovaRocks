@@ -169,6 +169,11 @@ pub(crate) fn compile_install_plan(
                             "scheduled connector split has no prepared read for fragment {fragment_id} node {node_id}"
                         ))
                     })?;
+                if read.planning_lease.is_none() {
+                    return Err(contract_error(format!(
+                        "connector read fragment_id={fragment_id} node_id={node_id} is missing its control planning lease"
+                    )));
+                }
                 let instance_id = read.declaration.descriptor().instance_id.clone();
                 match entry.1.get(&instance_id) {
                     Some(existing) if existing != &read.declaration => {

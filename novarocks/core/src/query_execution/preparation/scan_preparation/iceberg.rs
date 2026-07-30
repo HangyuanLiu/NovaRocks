@@ -84,7 +84,7 @@ pub(super) fn plan_iceberg_connector_read(
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,
-        planning_lease: planned.planning_lease,
+        planning_lease: Some(planned.planning_lease),
     })
 }
 
@@ -117,6 +117,6 @@ pub(super) fn plan_iceberg_delta_connector_read(
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,
-        planning_lease: planned.planning_lease,
+        planning_lease: Some(planned.planning_lease),
     })
 }

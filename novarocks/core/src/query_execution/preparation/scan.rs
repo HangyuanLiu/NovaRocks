@@ -72,7 +72,7 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) batch: ConnectorBatchBudget,
     /// Keeps the exact FE control generation alive through the BE ensure
     /// barrier. It is never encoded into a fragment carrier.
-    pub(crate) planning_lease: ConnectorControlPlanningLease,
+    pub(crate) planning_lease: Option<ConnectorControlPlanningLease>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
