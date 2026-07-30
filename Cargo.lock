@@ -3268,8 +3268,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "novarocks",
- "prost 0.13.5",
  "novarocks-spi",
+ "prost 0.13.5",
  "tokio",
  "tokio-stream",
  "tonic",

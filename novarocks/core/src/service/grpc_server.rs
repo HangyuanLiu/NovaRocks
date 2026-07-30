@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 #[cfg(test)]
-use std::collections::BTreeSet;
 #[cfg(feature = "compat")]
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
@@ -77,9 +76,6 @@ pub use crate::proto;
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CANCEL_FRAGMENT_OK: i32 = 0;
 const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
-#[cfg(test)]
-const CANCEL_FRAGMENT_NOT_OWNED: i32 = 3;
-static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -170,44 +166,6 @@ impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FragmentExecutionIdentity {
-    query_id: crate::common::types::UniqueId,
-    finst_id: crate::common::types::UniqueId,
-}
-
-fn fragment_execution_identity(
-    instance_params: Option<&proto::novarocks::InstanceParams>,
-) -> Option<FragmentExecutionIdentity> {
-    let params = instance_params?;
-    let query_id = params.query_id.as_ref()?;
-    let finst_id = params.fragment_instance_id.as_ref()?;
-    Some(FragmentExecutionIdentity {
-        query_id: crate::common::types::UniqueId {
-            hi: query_id.hi,
-            lo: query_id.lo,
-        },
-        finst_id: crate::common::types::UniqueId {
-            hi: finst_id.hi,
-            lo: finst_id.lo,
-        },
-    })
-}
-
-fn accepted_fragment_execution_identity(
-    result: &Result<(), String>,
-    identity: Option<FragmentExecutionIdentity>,
-) -> Option<FragmentExecutionIdentity> {
-    result.is_ok().then_some(identity).flatten()
-}
-
-fn grpc_submit_accepted_marker(identity: FragmentExecutionIdentity) -> String {
-    format!(
-        "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi={} query_lo={} finst_hi={} finst_lo={}",
-        identity.query_id.hi, identity.query_id.lo, identity.finst_id.hi, identity.finst_id.lo
-    )
-}
-
 fn cancel_finst_marker(
     query_id: crate::common::types::UniqueId,
     finst_id: crate::common::types::UniqueId,
@@ -253,10 +211,6 @@ pub struct GrpcService {
     query_control_shutdown: Option<watch::Receiver<bool>>,
     report_handler: Arc<dyn NativeReportHandler>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
-    #[cfg(test)]
-    execution_owned_finsts: Option<Arc<Mutex<BTreeSet<crate::common::types::UniqueId>>>>,
-    #[cfg(test)]
-    submit_fragment_entry_probe: Option<Arc<AtomicUsize>>,
 }
 
 impl std::fmt::Debug for GrpcService {
@@ -332,10 +286,6 @@ impl GrpcService {
             query_control_shutdown: None,
             report_handler,
             runtime_filter_envelope_ingress,
-            #[cfg(test)]
-            execution_owned_finsts: None,
-            #[cfg(test)]
-            submit_fragment_entry_probe: None,
         }
     }
 
@@ -381,14 +331,7 @@ impl GrpcService {
                 manager.clone(),
             ),
         );
-        service.execution_owned_finsts = Some(Arc::new(Mutex::new(BTreeSet::new())));
         service
-    }
-
-    #[cfg(test)]
-    fn with_submit_fragment_entry_probe(mut self, probe: Arc<AtomicUsize>) -> Self {
-        self.submit_fragment_entry_probe = Some(probe);
-        self
     }
 
     fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
@@ -426,7 +369,6 @@ pub(crate) struct IndependentGrpcRuntimeFilterNode {
 #[cfg(test)]
 struct IndependentGrpcRuntimeFilterResources {
     manager: Arc<crate::runtime::query_context::QueryContextManager>,
-    submit_fragment_entry_probe: Arc<AtomicUsize>,
     shutdown_tx: Option<watch::Sender<bool>>,
     server_handle: Option<JoinHandle<()>>,
     clean_handle: Option<JoinHandle<()>>,
@@ -546,15 +488,12 @@ impl IndependentGrpcRuntimeFilterNode {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let resources = IndependentGrpcRuntimeFilterResources {
             manager,
-            submit_fragment_entry_probe: Arc::new(AtomicUsize::new(0)),
             shutdown_tx: Some(shutdown_tx),
             server_handle: None,
             clean_handle: Some(clean_handle),
         };
         let mut startup = IndependentGrpcRuntimeFilterStartupGuard::new(resources);
         let service_manager = Arc::clone(&startup.resources().manager);
-        let submit_fragment_entry_probe =
-            Arc::clone(&startup.resources().submit_fragment_entry_probe);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let server_handle = std::thread::spawn(move || {
             let _exit = IndependentGrpcServerExitSignal(
@@ -575,8 +514,7 @@ impl IndependentGrpcRuntimeFilterNode {
                 let service = GrpcService::full_execution_with_runtime_filter_manager(
                     Arc::new(AcceptingTestNativeReportHandler),
                     service_manager,
-                )
-                .with_submit_fragment_entry_probe(submit_fragment_entry_probe);
+                );
                 let service =
                     proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service)
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
@@ -614,12 +552,6 @@ impl IndependentGrpcRuntimeFilterNode {
 
     pub(crate) fn manager(&self) -> &Arc<crate::runtime::query_context::QueryContextManager> {
         &self.resources.manager
-    }
-
-    pub(crate) fn submit_fragment_handler_calls(&self) -> usize {
-        self.resources
-            .submit_fragment_entry_probe
-            .load(Ordering::SeqCst)
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), String> {
@@ -840,97 +772,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         )))
     }
 
-    async fn submit_fragment(
-        &self,
-        request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
-    ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
-        self.require_local_execution("SubmitFragment")?;
-        #[cfg(test)]
-        if let Some(probe) = self.submit_fragment_entry_probe.as_ref() {
-            probe.fetch_add(1, Ordering::SeqCst);
-        }
-        let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-        if crate::common::config::debug_emit_grpc_fragment_marker() {
-            println!("NOVAROCKS_GRPC_SUBMIT call={call_index}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        if crate::common::config::debug_fault_inject_submit_fail_after()
-            .is_some_and(|successes| call_index > successes)
-        {
-            return Err(tonic::Status::unavailable(format!(
-                "debug submit fault injected on call {call_index}"
-            )));
-        }
-        let proto::novarocks::SubmitFragmentRequest {
-            plan,
-            instance_params,
-            execution_id,
-        } = request.into_inner();
-        let submission_identity = fragment_execution_identity(instance_params.as_ref());
-        #[cfg(test)]
-        let owned_finst = submission_identity.map(|identity| identity.finst_id);
-        let result = match (plan, instance_params, execution_id) {
-            (Some(plan), Some(instance_params), Some(execution_id)) => {
-                let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
-                    tonic::Status::failed_precondition("native fragment ingress is not configured")
-                })?;
-                tokio::task::spawn_blocking(move || {
-                    internal_rpc::handle_submit_fragment(
-                        ingress.as_ref(),
-                        execution_id,
-                        plan,
-                        instance_params,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    tonic::Status::internal(format!("submit_fragment handler panicked: {e}"))
-                })?
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            }
-            (_, _, None) => Err("SubmitFragmentRequest requires execution_id".to_string()),
-            _ => Err("SubmitFragmentRequest requires native plan and instance_params".to_string()),
-        };
-        let accepted_identity = accepted_fragment_execution_identity(&result, submission_identity);
-        #[cfg(test)]
-        if result.is_ok()
-            && let (Some(owned), Some(finst_id)) =
-                (self.execution_owned_finsts.as_ref(), owned_finst)
-        {
-            owned
-                .lock()
-                .expect("gRPC execution ownership lock")
-                .insert(finst_id);
-        }
-        if crate::common::config::debug_emit_grpc_fragment_marker()
-            && let Some(identity) = accepted_identity
-        {
-            println!("{}", grpc_submit_accepted_marker(identity));
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        if crate::common::config::debug_emit_grpc_fragment_marker()
-            && let Err(error) = &result
-        {
-            println!("NOVAROCKS_GRPC_SUBMIT_REJECTED error={error}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        match result {
-            Ok(()) => Ok(tonic::Response::new(
-                proto::novarocks::SubmitFragmentResponse {
-                    status_code: 0,
-                    message: String::new(),
-                },
-            )),
-            Err(e) => Ok(tonic::Response::new(
-                proto::novarocks::SubmitFragmentResponse {
-                    status_code: 1,
-                    message: e,
-                },
-            )),
-        }
-    }
-
     async fn fetch_result(
         &self,
         request: tonic::Request<proto::novarocks::FetchResultRequest>,
@@ -957,23 +798,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             }
         };
         let call_index = FETCH_RESULT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(test)]
-        if let Some(owned) = self.execution_owned_finsts.as_ref()
-            && !owned
-                .lock()
-                .expect("gRPC execution ownership lock")
-                .contains(&finst_id)
-        {
-            return Ok(tonic::Response::new(
-                proto::novarocks::FetchResultResponse {
-                    status: FetchStatus::Error as i32,
-                    message: format!("fragment instance is not owned by this endpoint: {finst_id}"),
-                    packet_seq: 0,
-                    eos: false,
-                    result_arrow_ipc: vec![],
-                },
-            ));
-        }
         if crate::common::config::debug_fault_inject_fetch_not_ready_count()
             .is_some_and(|limit| call_index <= limit)
         {
@@ -1059,24 +883,6 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             return Ok(tonic::Response::new(
                 proto::novarocks::CancelFragmentResponse {
                     status_code: CANCEL_FRAGMENT_IGNORED_STALE_EPOCH,
-                },
-            ));
-        }
-        #[cfg(test)]
-        if let Some(owned) = self.execution_owned_finsts.as_ref()
-            && req.finst_ids.iter().any(|id| {
-                !owned
-                    .lock()
-                    .expect("gRPC execution ownership lock")
-                    .contains(&crate::common::types::UniqueId {
-                        hi: id.hi,
-                        lo: id.lo,
-                    })
-            })
-        {
-            return Ok(tonic::Response::new(
-                proto::novarocks::CancelFragmentResponse {
-                    status_code: CANCEL_FRAGMENT_NOT_OWNED,
                 },
             ));
         }
