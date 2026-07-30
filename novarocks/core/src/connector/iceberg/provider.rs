@@ -1442,7 +1442,7 @@ pub(crate) fn plan_native_iceberg_read(
     projection: &[usize],
 ) -> Result<PlannedIcebergConnectorRead, String> {
     plan_native_iceberg_read_with_file_override(
-        connectors,
+        controls,
         context,
         table,
         binding,
@@ -1452,7 +1452,7 @@ pub(crate) fn plan_native_iceberg_read(
 }
 
 fn plan_native_iceberg_read_with_file_override(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,

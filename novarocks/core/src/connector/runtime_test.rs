@@ -496,21 +496,9 @@ fn incremental_connector_source_does_not_commit_a_rejected_append() {
 #[test]
 fn connector_storage_tablet_split_preserves_tablet_sidecar() {
     let instance_id = ConnectorInstanceId::parse("test.storage-tablet").expect("instance ID");
-    let instance = Arc::new(
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(FakeRead {
-                instance_id: instance_id.clone(),
-            }),
-        )
-        .expect("connector instance"),
-    );
+    let binding = fake_execution_binding(instance_id.clone());
     let source = ConnectorReadScanSource::new_scheduled(
-        instance,
+        binding,
         vec![ConnectorScheduledSplit::storage_tablet(
             ConnectorSplit::try_new(
                 instance_id,

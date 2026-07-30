@@ -3556,7 +3556,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
-        &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
