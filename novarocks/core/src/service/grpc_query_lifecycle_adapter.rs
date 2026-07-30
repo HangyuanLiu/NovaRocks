@@ -86,7 +86,15 @@ pub(crate) fn handle_abort_query(
     let response = ingress
         .abort_query(request)
         .map_err(status_from_lifecycle_error)?;
+    emit_query_lifecycle_abort_marker();
     Ok(encode_abort_query_response(&response))
+}
+
+fn emit_query_lifecycle_abort_marker() {
+    if crate::common::config::debug_emit_cancel_marker() {
+        println!("NOVAROCKS_QUERY_LIFECYCLE_ABORT");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
 }
 
 pub(crate) async fn handle_query_control_stream(
@@ -276,7 +284,11 @@ async fn run_attached_control_stream(
                     }
                     QueryControlCommand::Abort { reason } => {
                         awaiting_graceful_termination = true;
-                        lease.control().abort(reason)
+                        let result = lease.control().abort(reason);
+                        if result.is_ok() {
+                            emit_query_lifecycle_abort_marker();
+                        }
+                        result
                     }
                     QueryControlCommand::Finalize => {
                         awaiting_graceful_termination = true;

@@ -98,15 +98,13 @@ impl GrpcConnectorBindingControl {
                 "connector binding endpoint mismatch for backend {backend_idx}: configured {configured}, received {endpoint}"
             ));
         }
-        self.clients.get(&backend_idx).ok_or_else(|| {
-            format!("connector binding client for backend {backend_idx} is missing")
-        })
+        self.clients
+            .get(&backend_idx)
+            .ok_or_else(|| format!("connector binding client for backend {backend_idx} is missing"))
     }
 }
 
-impl crate::query_execution::artifact::ConnectorBindingDispatcher
-    for GrpcConnectorBindingControl
-{
+impl crate::query_execution::artifact::ConnectorBindingDispatcher for GrpcConnectorBindingControl {
     fn install(
         &self,
         backend_idx: usize,

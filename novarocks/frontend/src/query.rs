@@ -378,7 +378,8 @@ impl FrontendQuerySession {
         let compiler = self.service.engine.query_compiler();
         let command_executor = self.service.engine.command_executor();
         let query_execution = self.service.query_execution.clone();
-        let query_options = state.execution_settings.query_options();
+        let mut query_options = state.execution_settings.query_options();
+        query_options.apply_sql_hints(&sql);
         let is_query = is_query_statement(&sql);
         let worker = task::spawn_blocking(move || {
             let result = if is_query {

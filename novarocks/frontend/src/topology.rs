@@ -1339,6 +1339,7 @@ impl BackendTopologyPort for ClusterBackendService {
             "GrpcPort",
             "State",
             "ScheduledFragments",
+            "StartEpoch",
         ];
         let mut columns = vec![Vec::<String>::new(); names.len()];
         for (backend_idx, entry) in self.rows() {
@@ -1347,6 +1348,7 @@ impl BackendTopologyPort for ClusterBackendService {
             columns[2].push(entry.endpoint.port().to_string());
             columns[3].push(entry.state.as_str().to_string());
             columns[4].push(entry.scheduled_fragments.to_string());
+            columns[5].push(entry.start_epoch.to_string());
         }
         let arrays = columns
             .into_iter()

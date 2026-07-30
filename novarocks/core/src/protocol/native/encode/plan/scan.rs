@@ -34,7 +34,7 @@ use crate::connector::scan_model::starrocks::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
 };
 use crate::proto::{common, plan};
-use crate::protocol::native::type_mapping::encode_type;
+use crate::protocol::native::type_mapping::{decode_field_type, encode_type};
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
@@ -63,6 +63,7 @@ pub(super) fn encode_scan_node(
             &src.table,
             Some(node_id),
             Some(&src.columns),
+            Some(&columns),
             Some(&required_columns),
             binding,
             ctx,
@@ -218,6 +219,7 @@ pub(super) fn encode_table_def_with_context(
     src: &table_model::TableDef,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
+    scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
@@ -245,8 +247,8 @@ pub(super) fn encode_table_def_with_context(
         source: Some(encode_scan_source(
             &src.source,
             scan_node_id,
+            scan_output_columns,
             scan_required_columns,
-            binding,
             ctx,
         )?),
     })
@@ -613,8 +615,8 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 fn encode_scan_source(
     src: &table_model::ScanSource,
     scan_node_id: Option<i32>,
+    scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
-    binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
@@ -646,8 +648,8 @@ fn encode_scan_source(
                 )
                 .map_err(|_| "connector total payload budget does not fit u64".to_string())?,
                 expected_schema_ipc: encode_connector_expected_schema_ipc(
-                    binding,
-                    scan_required_columns.unwrap_or_default().to_vec(),
+                    scan_output_columns.unwrap_or_default(),
+                    scan_required_columns.unwrap_or_default(),
                 )?,
             })),
         });
@@ -776,30 +778,34 @@ fn encode_scan_source(
 }
 
 fn encode_connector_expected_schema_ipc(
-    binding: Option<&ResolvedScanBinding>,
-    required_columns: Vec<String>,
+    output_columns: &[common::OutputColumn],
+    required_columns: &[String],
 ) -> Result<Vec<u8>, String> {
-    let binding = binding.ok_or_else(|| {
-        "ConnectorReadSource requires a resolved scan binding for its expected schema".to_string()
-    })?;
+    let required = (!required_columns.is_empty()).then(|| {
+        required_columns
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
+    });
     let schema = Schema::new(
-        binding
-            .physical_columns
+        output_columns
             .iter()
             .filter(|column| {
-                required_columns.is_empty()
-                    || required_columns
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.source.name))
+                required
+                    .as_ref()
+                    .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
             })
             .map(|column| {
-                Field::new(
-                    column.source.name.clone(),
-                    column.source.data_type.clone(),
-                    column.source.nullable,
-                )
+                let type_desc = column.r#type.as_ref().ok_or_else(|| {
+                    format!(
+                        "ConnectorReadSource output column {} is missing its type",
+                        column.column_id
+                    )
+                })?;
+                decode_field_type(&column.name, column.nullable, type_desc)
+                    .map_err(|error| format!("decode ConnectorReadSource output schema: {error}"))
             })
-            .collect::<Vec<_>>(),
+            .collect::<Result<Vec<_>, _>>()?,
     );
     let mut writer = StreamWriter::try_new(Vec::new(), &schema)
         .map_err(|error| format!("encode ConnectorReadSource expected schema: {error}"))?;

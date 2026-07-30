@@ -1558,6 +1558,7 @@ path = "{}"
 [debug]
 emit_grpc_fragment_marker = true
 emit_connector_reader_marker = true
+emit_cancel_marker = true
 
 [runtime]
 operator_buffer_chunks = 1
@@ -1661,15 +1662,15 @@ operator_buffer_chunks = 1
     let terminal_reader_output =
         cluster.wait_for_connector_readers_to_close(reader_open_output, Duration::from_secs(10));
     assert!(
-        terminal_reader_output
+        terminal_reader_output.iter().all(|lines| lines
             .iter()
-            .all(|lines| lines.iter().any(|line| line.contains("NOVAROCKS_CANCEL"))),
-        "each BE must receive the formal cancellation control-plane request: {terminal_reader_output:?}"
+            .any(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_ABORT"))),
+        "each BE must accept the lifecycle Abort cancellation request: {terminal_reader_output:?}"
     );
     for lines in &terminal_reader_output {
         let cancel_index = lines
             .iter()
-            .position(|line| line.contains("NOVAROCKS_CANCEL"))
+            .position(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_ABORT"))
             .expect("each BE cancellation marker was asserted above");
         assert!(
             lines[cancel_index + 1..]
@@ -1876,6 +1877,7 @@ fn cross_process_two_be_coordinated_query() {
     let _guard = lock_cluster_mvp();
     let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 2);
     let rows: Vec<i64> = conn
         .query(coordinated_query_sql())
         .expect("coordinated query must succeed on 2-BE cluster");
@@ -1895,6 +1897,7 @@ fn cross_process_two_be_multi_fragment() {
     let _guard = lock_cluster_mvp();
     let cluster = MultiBeClusterHarness::start_n_be(2, "", "");
     let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 2);
     let rows: Vec<i64> = conn
         .query(multi_submit_query_sql())
         .expect("multi-fragment CTE+JOIN query must succeed on 2-BE cluster");

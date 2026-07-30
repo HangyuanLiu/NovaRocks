@@ -190,7 +190,7 @@ impl ControlReadyDistributedQuery {
             Err(error) => {
                 let kind = error.kind();
                 let message = self
-                .query_lifecycle_lease
+                    .query_lifecycle_lease
                     .abort_preserving(error.message().to_string());
                 return Err(DistributedQueryError::new(kind, message));
             }

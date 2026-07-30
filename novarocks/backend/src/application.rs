@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::common::app_config::{self, NovaRocksConfig};
-use novarocks::connector::ConnectorRegistry;
 use novarocks::common::network;
+use novarocks::connector::ConnectorRegistry;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::grpc_server;
 
