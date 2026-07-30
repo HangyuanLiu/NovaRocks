@@ -21,10 +21,24 @@ use crate::connector::starrocks::schema::{
     LakeScanColumnHint, LakeScanTableSchema, StarRocksColumnSchema, StarRocksKeysType,
     StarRocksTabletSchema,
 };
-use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, CompressionTypePb, PersistentIndexTypePb,
-};
 use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+
+// These are StarRocks storage-domain values, not generated protobuf types.
+// The compat storage codec interprets them at the file boundary.
+const COMPRESSION_DEFAULT: i32 = 1;
+const COMPRESSION_NONE: i32 = 2;
+const COMPRESSION_SNAPPY: i32 = 3;
+const COMPRESSION_LZ4_FRAME: i32 = 5;
+const COMPRESSION_ZLIB: i32 = 6;
+const COMPRESSION_ZSTD: i32 = 7;
+const COMPRESSION_GZIP: i32 = 8;
+const COMPRESSION_DEFLATE: i32 = 9;
+const COMPRESSION_BZIP2: i32 = 10;
+const COMPRESSION_BROTLI: i32 = 12;
+const PERSISTENT_INDEX_LOCAL: i32 = 0;
+const PERSISTENT_INDEX_CLOUD_NATIVE: i32 = 1;
+const COMPACTION_STRATEGY_DEFAULT: i32 = 0;
+const COMPACTION_STRATEGY_REAL_TIME: i32 = 1;
 
 pub(crate) fn build_sink_tablet_schema(
     schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
@@ -328,7 +342,7 @@ pub(crate) fn build_create_tablet_schema(
         .compression_type
         .or(schema.compression_type)
         .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
-    let compression_type = map_create_tablet_compression_type(compression)? as i32;
+    let compression_type = map_create_tablet_compression_type(compression)?;
     let compression_level = request
         .compression_level
         .or(schema.compression_level)
@@ -353,7 +367,7 @@ pub(crate) fn build_create_tablet_schema(
     })
 }
 
-pub(crate) fn build_tablet_schema_pb_from_thrift(
+pub(crate) fn build_tablet_schema_from_thrift(
     schema: &crate::thrift::agent_service::TTabletSchema,
 ) -> Result<StarRocksTabletSchema, String> {
     if schema.columns.is_empty() {
@@ -490,7 +504,7 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
     let compression = schema
         .compression_type
         .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
-    let compression_type = map_create_tablet_compression_type(compression)? as i32;
+    let compression_type = map_create_tablet_compression_type(compression)?;
     let compression_level = schema.compression_level.or(Some(-1));
 
     Ok(StarRocksTabletSchema {
@@ -512,10 +526,10 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
     })
 }
 
-pub(crate) fn build_lake_scan_table_schema_from_thrift(
+pub fn build_lake_scan_table_schema_from_thrift(
     schema: &crate::thrift::agent_service::TTabletSchema,
 ) -> Result<LakeScanTableSchema, String> {
-    let tablet_schema = build_tablet_schema_pb_from_thrift(schema)?;
+    let tablet_schema = build_tablet_schema_from_thrift(schema)?;
     let mut column_hints = HashMap::new();
     for column in &schema.columns {
         let normalized_name = column.column_name.trim().to_ascii_lowercase();
@@ -832,38 +846,38 @@ fn map_create_tablet_keys_type(
 
 fn map_create_tablet_compression_type(
     compression_type: crate::thrift::types::TCompressionType,
-) -> Result<CompressionTypePb, String> {
+) -> Result<i32, String> {
     if compression_type == crate::thrift::types::TCompressionType::DEFAULT_COMPRESSION {
-        return Ok(CompressionTypePb::DefaultCompression);
+        return Ok(COMPRESSION_DEFAULT);
     }
     if compression_type == crate::thrift::types::TCompressionType::NO_COMPRESSION {
-        return Ok(CompressionTypePb::NoCompression);
+        return Ok(COMPRESSION_NONE);
     }
     if compression_type == crate::thrift::types::TCompressionType::SNAPPY {
-        return Ok(CompressionTypePb::Snappy);
+        return Ok(COMPRESSION_SNAPPY);
     }
     if compression_type == crate::thrift::types::TCompressionType::LZ4
         || compression_type == crate::thrift::types::TCompressionType::LZ4_FRAME
     {
-        return Ok(CompressionTypePb::Lz4Frame);
+        return Ok(COMPRESSION_LZ4_FRAME);
     }
     if compression_type == crate::thrift::types::TCompressionType::ZLIB {
-        return Ok(CompressionTypePb::Zlib);
+        return Ok(COMPRESSION_ZLIB);
     }
     if compression_type == crate::thrift::types::TCompressionType::ZSTD {
-        return Ok(CompressionTypePb::Zstd);
+        return Ok(COMPRESSION_ZSTD);
     }
     if compression_type == crate::thrift::types::TCompressionType::GZIP {
-        return Ok(CompressionTypePb::Gzip);
+        return Ok(COMPRESSION_GZIP);
     }
     if compression_type == crate::thrift::types::TCompressionType::DEFLATE {
-        return Ok(CompressionTypePb::Deflate);
+        return Ok(COMPRESSION_DEFLATE);
     }
     if compression_type == crate::thrift::types::TCompressionType::BZIP2 {
-        return Ok(CompressionTypePb::Bzip2);
+        return Ok(COMPRESSION_BZIP2);
     }
     if compression_type == crate::thrift::types::TCompressionType::BROTLI {
-        return Ok(CompressionTypePb::Brotli);
+        return Ok(COMPRESSION_BROTLI);
     }
     Err(format!(
         "unsupported create_tablet compression_type={:?}",
@@ -873,12 +887,12 @@ fn map_create_tablet_compression_type(
 
 pub(crate) fn map_create_tablet_persistent_index_type(
     persistent_index_type: crate::thrift::agent_service::TPersistentIndexType,
-) -> Result<PersistentIndexTypePb, String> {
+) -> Result<i32, String> {
     if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::LOCAL {
-        return Ok(PersistentIndexTypePb::Local);
+        return Ok(PERSISTENT_INDEX_LOCAL);
     }
     if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::CLOUD_NATIVE {
-        return Ok(PersistentIndexTypePb::CloudNative);
+        return Ok(PERSISTENT_INDEX_CLOUD_NATIVE);
     }
     Err(format!(
         "unsupported create_tablet persistent_index_type={:?}",
@@ -886,14 +900,16 @@ pub(crate) fn map_create_tablet_persistent_index_type(
     ))
 }
 
+pub(crate) const DEFAULT_COMPACTION_STRATEGY: i32 = COMPACTION_STRATEGY_DEFAULT;
+
 pub(crate) fn map_create_tablet_compaction_strategy(
     compaction_strategy: crate::thrift::agent_service::TCompactionStrategy,
 ) -> Result<i32, String> {
     if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::DEFAULT {
-        return Ok(CompactionStrategyPb::Default as i32);
+        return Ok(COMPACTION_STRATEGY_DEFAULT);
     }
     if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::REAL_TIME {
-        return Ok(CompactionStrategyPb::RealTime as i32);
+        return Ok(COMPACTION_STRATEGY_REAL_TIME);
     }
     Err(format!(
         "unsupported create_tablet compaction_strategy={:?}",
@@ -1322,6 +1338,41 @@ fn eval_texpr_node(
 mod lake_scan_tests {
     use super::*;
     use crate::thrift::{agent_service, descriptors, types};
+
+    #[test]
+    fn storage_domain_enum_values_preserve_starrocks_wire_numbers() {
+        assert_eq!(
+            map_create_tablet_compression_type(types::TCompressionType::LZ4_FRAME)
+                .expect("map LZ4_FRAME"),
+            5
+        );
+        assert_eq!(
+            map_create_tablet_compression_type(types::TCompressionType::ZSTD).expect("map ZSTD"),
+            7
+        );
+        assert_eq!(
+            map_create_tablet_persistent_index_type(agent_service::TPersistentIndexType::LOCAL)
+                .expect("map local index"),
+            0
+        );
+        assert_eq!(
+            map_create_tablet_persistent_index_type(
+                agent_service::TPersistentIndexType::CLOUD_NATIVE,
+            )
+            .expect("map cloud-native index"),
+            1
+        );
+        assert_eq!(
+            map_create_tablet_compaction_strategy(agent_service::TCompactionStrategy::DEFAULT)
+                .expect("map default compaction"),
+            0
+        );
+        assert_eq!(
+            map_create_tablet_compaction_strategy(agent_service::TCompactionStrategy::REAL_TIME)
+                .expect("map real-time compaction"),
+            1
+        );
+    }
 
     #[test]
     fn lake_scan_schema_preserves_missing_wire_unique_id_in_column_hint() {

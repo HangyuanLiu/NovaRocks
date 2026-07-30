@@ -163,6 +163,7 @@ fn lower_supported_schema_scan_node(
         external_dependencies
             .and_then(|draft| draft.frontend_endpoint())
             .cloned(),
+        external_dependencies.and_then(|draft| draft.schema_load_provider()),
     );
     // Route the enriched selection to the instance; bind at materialize time.
     if let Some(scan_ranges) = scan_ranges {

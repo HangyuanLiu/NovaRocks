@@ -16,7 +16,11 @@
 // under the License.
 
 use std::fmt;
+use std::sync::Arc;
 
+use novarocks::connector::starrocks::ports::{
+    LakeMetaStorageResolver, StarletMetadataProvider, StorageMetadataProvider,
+};
 use novarocks::protocol::starrocks::decode::{
     LakeMetaStorageFacts, LakeMetaStorageRequest, StarRocksExternalDependency,
     StarRocksResolvedDependencies, StarRocksResolvedDependencyValue,
@@ -61,6 +65,7 @@ impl std::error::Error for DependencyResolutionError {}
 pub(crate) fn resolve_dependencies(
     requirements: &[StarRocksExternalDependency],
     token: &PrelaunchCancellationToken,
+    lake_meta_resolver: &dyn LakeMetaStorageResolver,
 ) -> Result<StarRocksResolvedDependencies, DependencyResolutionError> {
     resolve_dependencies_with(
         requirements,
@@ -69,8 +74,57 @@ pub(crate) fn resolve_dependencies(
             let address = TNetworkAddress::new(endpoint.host().to_string(), endpoint.port());
             crate::report::fetch_query_profile(&address, query_id)
         },
-        |request| novarocks::connector::starrocks::resolve_lake_meta_storage(request),
+        |request| lake_meta_resolver.resolve(request),
     )
+}
+
+pub(crate) fn lake_meta_storage_resolver(
+    starlet_metadata_provider: Arc<dyn StarletMetadataProvider>,
+    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
+) -> Arc<dyn LakeMetaStorageResolver> {
+    Arc::new(CompatLakeMetaStorageResolver {
+        starlet_metadata_provider,
+        storage_metadata_provider,
+    })
+}
+
+struct CompatLakeMetaStorageResolver {
+    starlet_metadata_provider: Arc<dyn StarletMetadataProvider>,
+    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
+}
+
+impl LakeMetaStorageResolver for CompatLakeMetaStorageResolver {
+    fn resolve(&self, request: &LakeMetaStorageRequest) -> Result<LakeMetaStorageFacts, String> {
+        let table = novarocks::connector::starrocks::fe_v2_meta::LakeTableIdentity {
+            catalog: request.catalog().to_string(),
+            db_name: request.db_name().to_string(),
+            table_name: request.table_name().to_string(),
+            db_id: request.db_id(),
+            table_id: request.table_id(),
+            schema_id: request.schema_id(),
+        };
+        let tablet_ids = request
+            .tablets()
+            .iter()
+            .map(|tablet| tablet.tablet_id())
+            .collect::<Vec<_>>();
+        let tablet_paths = novarocks::connector::starrocks::fe_v2_meta::resolve_tablet_paths_for_lake_meta_scan_with_provider(
+            Some(request.query_id()),
+            &table,
+            &tablet_ids,
+            self.starlet_metadata_provider.as_ref(),
+        )?;
+        let properties =
+            novarocks::connector::starrocks::fe_v2_meta::lake_scan_object_store_properties(
+                &tablet_paths,
+            )?;
+        novarocks::connector::starrocks::lake_meta_storage::materialize_lake_meta_storage_with_metadata_provider(
+            request,
+            &tablet_paths,
+            &properties,
+            self.storage_metadata_provider.as_ref(),
+        )
+    }
 }
 
 pub(crate) fn resolve_dependencies_with<QueryProfileResolver, LakeMetaResolver>(
@@ -127,6 +181,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use novarocks::common::types::UniqueId;
+    use novarocks::connector::starrocks::ports::LakeMetaStorageResolver;
     use novarocks::protocol::starrocks::decode::{
         LakeMetaStorageFacts, LakeMetaStorageRequest, StarRocksExternalDependency,
         StarRocksResolvedDependencyValue,
@@ -134,7 +189,7 @@ mod tests {
     use novarocks::runtime::endpoint::RuntimeEndpoint;
     use novarocks::runtime::query_context::QueryId;
 
-    use super::{DependencyResolutionError, resolve_dependencies_with};
+    use super::{DependencyResolutionError, resolve_dependencies, resolve_dependencies_with};
     use crate::fragment::admission::PrelaunchRegistry;
 
     fn guarded_token(
@@ -177,6 +232,38 @@ mod tests {
                 Vec::new(),
             ),
         }
+    }
+
+    struct RecordingLakeMetaResolver {
+        calls: AtomicUsize,
+    }
+
+    impl LakeMetaStorageResolver for RecordingLakeMetaResolver {
+        fn resolve(
+            &self,
+            request: &LakeMetaStorageRequest,
+        ) -> Result<LakeMetaStorageFacts, String> {
+            assert_eq!(request.table_id(), 2);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LakeMetaStorageFacts::new(23, BTreeMap::new()))
+        }
+    }
+
+    #[test]
+    fn production_dependency_entrypoint_uses_explicit_lake_meta_port() {
+        let (_registry, token, _guard) = guarded_token(UniqueId { hi: 99, lo: 100 });
+        let resolver = RecordingLakeMetaResolver {
+            calls: AtomicUsize::new(0),
+        };
+
+        let resolved = resolve_dependencies(&[lake_meta_dependency(6)], &token, &resolver)
+            .expect("resolve through explicit port");
+
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            resolved.get(6),
+            Some(StarRocksResolvedDependencyValue::LakeMetaStorage(facts)) if facts.total_rows() == 23
+        ));
     }
 
     #[test]

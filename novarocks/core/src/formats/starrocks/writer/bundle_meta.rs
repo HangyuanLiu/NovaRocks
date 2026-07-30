@@ -23,9 +23,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures::TryStreamExt;
 use prost::Message;
 
+use crate::connector::starrocks::lake::storage_domain::{StorageBundleFile, StorageTabletMetadata};
 use crate::connector::starrocks::lake::storage_schema_wire::{
     decode_tablet_schema, encode_tablet_schema,
 };
+use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
 use crate::formats::starrocks::fs_access::resolve_format_path;
 use crate::formats::starrocks::writer::io::read_bytes_if_exists;
@@ -51,6 +53,14 @@ pub struct BundleMetaWriteEntry<'a> {
     pub tablet_id: i64,
     pub schema: &'a StarRocksTabletSchema,
     pub tablet_meta: &'a TabletMetadataPb,
+}
+
+/// Provider-backed bundle writes retain only core storage domain facts. The
+/// compat provider owns the protobuf page encoding at the storage boundary.
+pub struct StorageBundleMetaWriteEntry<'a> {
+    pub tablet_id: i64,
+    pub schema: &'a StarRocksTabletSchema,
+    pub tablet_meta: &'a StorageTabletMetadata,
 }
 
 fn with_bundle_meta_write_lock<T>(
@@ -133,6 +143,179 @@ pub fn write_initial_meta_file(
 ) -> Result<(), String> {
     let meta_path = initial_meta_file_path(tablet_root_path)?;
     write_bytes(&meta_path, tablet_meta.encode_to_vec())
+}
+
+/// Writes a standalone tablet metadata page through the installed storage
+/// boundary codec.  Compat owns the protobuf representation; core only hands
+/// over the domain facts that belong in the page.
+pub fn write_standalone_meta_file_with_provider(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+    tablet_meta: &StorageTabletMetadata,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    let meta_path = standalone_meta_file_path(tablet_root_path, tablet_id, version)?;
+    let bytes = provider.encode_tablet_metadata(tablet_meta).map_err(|error| {
+        format!(
+            "encode standalone tablet metadata failed: tablet_id={tablet_id} version={version} error={error}"
+        )
+    })?;
+    write_bytes(&meta_path, bytes)
+}
+
+/// Writes the initial raw tablet metadata page through the installed storage
+/// boundary codec.  This preserves the StarRocks raw-v1 layout without making
+/// the execution kernel depend on generated protobuf values.
+pub fn write_initial_meta_file_with_provider(
+    tablet_root_path: &str,
+    tablet_meta: &StorageTabletMetadata,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    let meta_path = initial_meta_file_path(tablet_root_path)?;
+    let bytes = provider
+        .encode_tablet_metadata(tablet_meta)
+        .map_err(|error| format!("encode initial tablet metadata failed: {error}"))?;
+    write_bytes(&meta_path, bytes)
+}
+
+/// Reads the latest metadata page as protocol-neutral storage facts.  Compat
+/// supplies the file codec, so this path never materializes generated protobuf
+/// messages inside the storage kernel.
+pub fn load_latest_tablet_metadata_with_provider(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(i64, StorageTabletMetadata), String> {
+    let latest_version = discover_latest_tablet_metadata_version(tablet_root_path, tablet_id)?;
+    let Some(latest_version) = latest_version else {
+        return Ok((
+            0,
+            StorageTabletMetadata {
+                id: Some(tablet_id),
+                ..Default::default()
+            },
+        ));
+    };
+    if latest_version <= 0 {
+        return Ok((
+            0,
+            StorageTabletMetadata {
+                id: Some(tablet_id),
+                ..Default::default()
+            },
+        ));
+    }
+    if let Some(metadata) = load_tablet_metadata_at_version_with_provider(
+        tablet_root_path,
+        tablet_id,
+        latest_version,
+        provider,
+    )? {
+        return Ok((latest_version, metadata));
+    }
+    Ok((
+        0,
+        StorageTabletMetadata {
+            id: Some(tablet_id),
+            ..Default::default()
+        },
+    ))
+}
+
+pub fn load_tablet_metadata_at_version_with_provider(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<Option<StorageTabletMetadata>, String> {
+    if version <= 0 {
+        return Ok(Some(StorageTabletMetadata {
+            id: Some(tablet_id),
+            ..Default::default()
+        }));
+    }
+    for path in metadata_path_candidates(tablet_root_path, tablet_id, tablet_id, version)? {
+        let Some(bytes) = read_bytes_if_exists(&path)? else {
+            continue;
+        };
+        let metadata = provider.decode_tablet_metadata(&bytes).map_err(|error| {
+            format!("decode standalone tablet metadata failed: path={path}, error={error}")
+        })?;
+        validate_storage_metadata_identity(&metadata, tablet_id, version, &path)?;
+        return Ok(Some(metadata));
+    }
+    if version == INITIAL_VERSION {
+        for path in metadata_path_candidates(
+            tablet_root_path,
+            tablet_id,
+            BUNDLE_TABLET_ID,
+            INITIAL_VERSION,
+        )? {
+            let Some(bytes) = read_bytes_if_exists(&path)? else {
+                continue;
+            };
+            match provider.decode_tablet_metadata(&bytes) {
+                Ok(mut metadata) if metadata.version == Some(INITIAL_VERSION) => {
+                    metadata.id = Some(tablet_id);
+                    return Ok(Some(metadata));
+                }
+                Ok(_) | Err(_) => {
+                    let bundle = provider.decode_bundle_file(&bytes).map_err(|error| {
+                        format!("decode initial metadata failed: path={path}, error={error}")
+                    })?;
+                    let page = bundle
+                        .tablet_metadata_pages
+                        .get(&tablet_id)
+                        .ok_or_else(|| {
+                            format!("bundle metadata missing tablet page for tablet_id={tablet_id}")
+                        })?;
+                    let metadata = provider.decode_tablet_metadata(page).map_err(|error| {
+                        format!("decode initial bundle tablet metadata failed: path={path}, error={error}")
+                    })?;
+                    return Ok(Some(metadata));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    let path = bundle_meta_file_path(tablet_root_path, version)?;
+    let Some(bytes) = read_bytes_if_exists(&path)? else {
+        return Ok(None);
+    };
+    let bundle = provider
+        .decode_bundle_file(&bytes)
+        .map_err(|error| format!("decode bundle metadata failed: path={path}, error={error}"))?;
+    let page = bundle
+        .tablet_metadata_pages
+        .get(&tablet_id)
+        .ok_or_else(|| format!("bundle metadata missing tablet page for tablet_id={tablet_id}"))?;
+    let metadata = provider.decode_tablet_metadata(page).map_err(|error| {
+        format!("decode bundle tablet metadata failed: path={path}, error={error}")
+    })?;
+    validate_storage_metadata_identity(&metadata, tablet_id, version, &path)?;
+    Ok(Some(metadata))
+}
+
+fn validate_storage_metadata_identity(
+    metadata: &StorageTabletMetadata,
+    tablet_id: i64,
+    expected_version: i64,
+    path: &str,
+) -> Result<(), String> {
+    if metadata.id != Some(tablet_id) {
+        return Err(format!(
+            "tablet metadata id mismatch: expected={tablet_id} actual={:?} path={path}",
+            metadata.id
+        ));
+    }
+    if metadata.version != Some(expected_version) {
+        return Err(format!(
+            "tablet metadata version mismatch: expected={expected_version} actual={:?} path={path}",
+            metadata.version
+        ));
+    }
+    Ok(())
 }
 
 fn metadata_path_candidates(
@@ -301,6 +484,108 @@ pub fn write_bundle_meta_file_batch(
     })
 }
 
+/// Compat-owned bundle-file framing path.  The core publisher supplies opaque
+/// tablet pages and schema facts; the installed provider owns the StarRocks
+/// bundle protobuf/footer encoding and page-version rewrite.
+pub fn write_bundle_meta_file_with_provider(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+    schema: &StarRocksTabletSchema,
+    tablet_meta: &StorageTabletMetadata,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    write_bundle_meta_file_batch_with_provider(
+        tablet_root_path,
+        version,
+        &[StorageBundleMetaWriteEntry {
+            tablet_id,
+            schema,
+            tablet_meta,
+        }],
+        provider,
+    )
+}
+
+pub fn write_bundle_meta_file_batch_with_provider(
+    tablet_root_path: &str,
+    version: i64,
+    entries: &[StorageBundleMetaWriteEntry<'_>],
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    with_bundle_meta_write_lock(tablet_root_path, version, || {
+        let meta_path = bundle_meta_file_path(tablet_root_path, version)?;
+        let mut tablet_metadata_pages = HashMap::new();
+        let mut tablet_to_schema = HashMap::new();
+        let mut schemas = HashMap::new();
+
+        let mut merge_bundle = |bytes: &[u8], source: &str, bump_to_version: bool| {
+            let bundle = provider.decode_bundle_file(bytes).map_err(|error| {
+                format!("decode existing compat bundle failed: source={source} error={error}")
+            })?;
+            tablet_to_schema.extend(bundle.tablet_to_schema);
+            schemas.extend(bundle.schemas);
+            for (tablet_id, page) in bundle.tablet_metadata_pages {
+                let page = if bump_to_version {
+                    provider
+                        .rewrite_tablet_metadata_version(&page, version)
+                        .map_err(|error| {
+                            format!(
+                                "rewrite existing compat bundle tablet metadata failed: source={source} tablet_id={tablet_id} error={error}"
+                            )
+                        })?
+                } else {
+                    page
+                };
+                tablet_metadata_pages.insert(tablet_id, page);
+            }
+            Ok::<_, String>(())
+        };
+
+        if version > 1 {
+            let previous_meta_path = bundle_meta_file_path(tablet_root_path, version - 1)?;
+            if let Some(previous_bytes) = read_bytes_if_exists(&previous_meta_path)?
+                && !(version - 1 == INITIAL_VERSION
+                    && is_initial_raw_metadata_bytes_with_provider(&previous_bytes, provider)
+                        .unwrap_or(false))
+            {
+                merge_bundle(&previous_bytes, &previous_meta_path, true)?;
+            }
+        }
+        if let Some(existing_bytes) = read_bytes_if_exists(&meta_path)? {
+            merge_bundle(&existing_bytes, &meta_path, false)?;
+        }
+
+        for entry in entries {
+            let schema_id = entry
+                .schema
+                .id
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "bundle schema id is missing".to_string())?;
+            let encoded_metadata = provider.encode_tablet_metadata(entry.tablet_meta).map_err(
+                |error| {
+                    format!(
+                        "encode compat bundle tablet metadata failed: tablet_id={} error={error}",
+                        entry.tablet_id
+                    )
+                },
+            )?;
+            tablet_metadata_pages.insert(entry.tablet_id, encoded_metadata);
+            tablet_to_schema.insert(entry.tablet_id, schema_id);
+            schemas.insert(schema_id, entry.schema.clone());
+        }
+        let bytes = provider.encode_bundle_file(&StorageBundleFile {
+            tablet_metadata_pages,
+            tablet_to_schema,
+            schemas,
+        })?;
+        write_bytes(&meta_path, bytes)
+    })
+}
+
 type BundleWriteState = (
     HashMap<i64, TabletMetadataPb>,
     HashMap<i64, i64>,
@@ -373,6 +658,16 @@ fn load_bundle_meta_write_state(
 
 fn is_initial_raw_metadata_bytes(bytes: &[u8]) -> Result<bool, String> {
     match TabletMetadataPb::decode(bytes) {
+        Ok(metadata) => Ok(metadata.version == Some(INITIAL_VERSION)),
+        Err(_) => Ok(false),
+    }
+}
+
+fn is_initial_raw_metadata_bytes_with_provider(
+    bytes: &[u8],
+    provider: &dyn StorageMetadataProvider,
+) -> Result<bool, String> {
+    match provider.decode_tablet_metadata(bytes) {
         Ok(metadata) => Ok(metadata.version == Some(INITIAL_VERSION)),
         Err(_) => Ok(false),
     }

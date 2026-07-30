@@ -18,12 +18,12 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use crate::thrift::frontend_service::{self, TTrackingLoadInfo};
-use crate::thrift::types;
+use novarocks::thrift::frontend_service::{self, TTrackingLoadInfo};
+use novarocks::thrift::types;
 
-use super::SchemaScanContext;
-use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
-use super::frontend::with_frontend_client;
+use crate::schema_frontend::with_frontend_client;
+use novarocks::connector::schema::SchemaScanContext;
+use novarocks::connector::schema::{SchemaRow, SchemaValue, normalize_column_key};
 
 const TRACKING_LOG_TIMEOUT_SECS: u64 = 5;
 
@@ -53,7 +53,7 @@ pub(crate) fn fetch_rows(
     );
     let response = match with_frontend_client(fe_addr, |client| {
         client
-            .get_tracking_loads(request)
+            .get_tracking_loads(request.clone())
             .map_err(|err| err.to_string())
     }) {
         Ok(response) => response,

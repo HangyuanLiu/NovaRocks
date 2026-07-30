@@ -17,21 +17,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
-use crate::common::types::UniqueId;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
-use crate::connector::starrocks::starmgr;
-use crate::connector::starrocks::table_schema_service;
+use crate::connector::starrocks::ports::StarletMetadataProvider;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::starlet_shard_registry;
 
 #[derive(Clone, Debug)]
-pub(crate) struct LakeTableIdentity {
-    pub(crate) catalog: String,
-    pub(crate) db_name: String,
-    pub(crate) table_name: String,
-    pub(crate) db_id: i64,
-    pub(crate) table_id: i64,
-    pub(crate) schema_id: i64,
+pub struct LakeTableIdentity {
+    pub catalog: String,
+    pub db_name: String,
+    pub table_name: String,
+    pub db_id: i64,
+    pub table_id: i64,
+    pub schema_id: i64,
 }
 
 impl LakeTableIdentity {
@@ -106,6 +104,7 @@ pub(crate) fn resolve_tablet_paths_for_lake_scan(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,
     ranges: &[LakeScanTabletRef],
+    starlet_metadata_provider: Option<&dyn StarletMetadataProvider>,
 ) -> Result<HashMap<i64, String>, String> {
     if ranges.is_empty() {
         return Ok(HashMap::new());
@@ -124,15 +123,17 @@ pub(crate) fn resolve_tablet_paths_for_lake_scan(
             tablet_id: r.tablet_id,
         })
         .collect::<Vec<_>>();
-    resolve_tablet_paths_for_refs(query_id, table, &refs)
+    resolve_tablet_paths_for_refs_with_provider(query_id, table, &refs, starlet_metadata_provider)
 }
 
 pub(crate) fn lake_scan_execution_properties(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,
     ranges: &[LakeScanTabletRef],
+    starlet_metadata_provider: Option<&dyn StarletMetadataProvider>,
 ) -> Result<BTreeMap<String, String>, String> {
-    let tablet_path_map = resolve_tablet_paths_for_lake_scan(query_id, table, ranges)?;
+    let tablet_path_map =
+        resolve_tablet_paths_for_lake_scan(query_id, table, ranges, starlet_metadata_provider)?;
     lake_scan_execution_properties_from_paths(ranges, &tablet_path_map)
 }
 
@@ -193,7 +194,7 @@ pub(crate) fn lake_scan_execution_properties_from_paths(
     Ok(properties)
 }
 
-pub(crate) fn lake_scan_object_store_properties(
+pub fn lake_scan_object_store_properties(
     tablet_path_map: &HashMap<i64, String>,
 ) -> Result<BTreeMap<String, String>, String> {
     if tablet_path_map.is_empty() {
@@ -270,18 +271,57 @@ pub(crate) fn resolve_tablet_paths_for_lake_meta_scan(
     resolve_tablet_paths_for_refs(query_id, table, &refs)
 }
 
+/// Resolves lake-meta paths using an explicitly supplied Starlet metadata
+/// provider. Compat owns the provider's StarOS wire protocol; core keeps only
+/// the cache, normalized paths, and storage execution facts.
+pub fn resolve_tablet_paths_for_lake_meta_scan_with_provider(
+    query_id: Option<QueryId>,
+    table: &LakeTableIdentity,
+    tablet_ids: &[i64],
+    starlet_metadata_provider: &dyn StarletMetadataProvider,
+) -> Result<HashMap<i64, String>, String> {
+    if tablet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if tablet_ids.iter().any(|tablet_id| *tablet_id <= 0) {
+        return Err("lake meta scan contains non-positive tablet_id".to_string());
+    }
+    let refs = tablet_ids
+        .iter()
+        .map(|tablet_id| LakeTabletPartitionRef {
+            tablet_id: *tablet_id,
+        })
+        .collect::<Vec<_>>();
+    resolve_tablet_paths_for_refs_with_provider(
+        query_id,
+        table,
+        &refs,
+        Some(starlet_metadata_provider),
+    )
+}
+
 pub(crate) fn resolve_tablet_paths_for_olap_sink(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,
     refs: &[LakeTabletPartitionRef],
+    starlet_metadata_provider: Option<&dyn StarletMetadataProvider>,
 ) -> Result<HashMap<i64, String>, String> {
-    resolve_tablet_paths_for_refs(query_id, table, refs)
+    resolve_tablet_paths_for_refs_with_provider(query_id, table, refs, starlet_metadata_provider)
 }
 
 fn resolve_tablet_paths_for_refs(
     query_id: Option<QueryId>,
     table: &LakeTableIdentity,
     refs: &[LakeTabletPartitionRef],
+) -> Result<HashMap<i64, String>, String> {
+    resolve_tablet_paths_for_refs_with_provider(query_id, table, refs, None)
+}
+
+fn resolve_tablet_paths_for_refs_with_provider(
+    query_id: Option<QueryId>,
+    table: &LakeTableIdentity,
+    refs: &[LakeTabletPartitionRef],
+    starlet_metadata_provider: Option<&dyn StarletMetadataProvider>,
 ) -> Result<HashMap<i64, String>, String> {
     if refs.is_empty() {
         return Ok(HashMap::new());
@@ -358,7 +398,15 @@ fn resolve_tablet_paths_for_refs(
     let mut starmgr_recovery_error = None;
     let missing_after_metadata = collect_missing_tablet_ids(&requested_tablet_ids, &local_paths);
     if !missing_after_metadata.is_empty() {
-        match recover_missing_paths_from_starmgr(&missing_after_metadata) {
+        let recovery = starlet_metadata_provider
+            .ok_or_else(|| {
+                "Starlet metadata capability is unavailable while recovering missing tablet paths"
+                    .to_string()
+            })
+            .and_then(|provider| {
+                recover_missing_paths_from_provider(provider, &missing_after_metadata)
+            });
+        match recovery {
             Ok(recovered) => {
                 if !recovered.is_empty() {
                     // StarManager already provides the cluster-level S3
@@ -371,10 +419,10 @@ fn resolve_tablet_paths_for_refs(
                         .map(|(tablet_id, info)| {
                             (
                                 *tablet_id,
-                                crate::runtime::starlet_shard_registry::StarletShardInfo {
-                                    full_path: info.full_path.clone(),
-                                    s3: info.s3.clone(),
-                                },
+                                crate::runtime::starlet_shard_registry::StarletShardInfo::new(
+                                    info.full_path().to_string(),
+                                    info.s3().cloned(),
+                                ),
                             )
                         })
                         .collect::<Vec<_>>();
@@ -388,7 +436,7 @@ fn resolve_tablet_paths_for_refs(
                         );
                     }
                     for (tablet_id, info) in recovered {
-                        local_paths.insert(tablet_id, info.full_path);
+                        local_paths.insert(tablet_id, info.full_path().to_string());
                     }
                 }
             }
@@ -426,24 +474,28 @@ fn resolve_tablet_paths_for_refs(
     select_paths_for_refs(local_paths, refs)
 }
 
-fn recover_missing_paths_from_starmgr(
+fn recover_missing_paths_from_provider(
+    provider: &dyn StarletMetadataProvider,
     tablet_ids: &[i64],
 ) -> Result<HashMap<i64, starlet_shard_registry::StarletShardInfo>, String> {
-    let recovered = starmgr::retrieve_shard_infos(tablet_ids)?;
+    let recovered = provider.retrieve_shard_infos(tablet_ids)?;
+    normalize_recovered_paths(recovered)
+}
+
+fn normalize_recovered_paths(
+    recovered: HashMap<i64, starlet_shard_registry::StarletShardInfo>,
+) -> Result<HashMap<i64, starlet_shard_registry::StarletShardInfo>, String> {
     let mut out = HashMap::with_capacity(recovered.len());
     for (tablet_id, info) in recovered {
-        let normalized = normalize_storage_path(&info.full_path).ok_or_else(|| {
+        let normalized = normalize_storage_path(info.full_path()).ok_or_else(|| {
             format!(
                 "StarManager GetShard returned invalid tablet path for tablet_id={tablet_id}: {}",
-                info.full_path
+                info.full_path()
             )
         })?;
         out.insert(
             tablet_id,
-            starlet_shard_registry::StarletShardInfo {
-                full_path: normalized,
-                s3: info.s3,
-            },
+            starlet_shard_registry::StarletShardInfo::new(normalized, info.s3().cloned()),
         );
     }
     Ok(out)
@@ -482,19 +534,6 @@ fn collect_missing_tablet_ids(
     missing.sort_unstable();
     missing.dedup();
     missing
-}
-
-pub(crate) fn fetch_table_schema_for_lake_scan(
-    fe_addr: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
-    db_id: i64,
-    table_id: i64,
-    schema_id: i64,
-    tablet_id: Option<i64>,
-    query_id: Option<UniqueId>,
-) -> Result<crate::connector::starrocks::schema::LakeScanTableSchema, String> {
-    table_schema_service::fetch_table_schema_for_lake_scan(
-        fe_addr, db_id, table_id, schema_id, tablet_id, query_id,
-    )
 }
 
 fn normalize_storage_path(path: &str) -> Option<String> {

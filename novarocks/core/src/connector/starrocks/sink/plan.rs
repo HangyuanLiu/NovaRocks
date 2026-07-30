@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
+use crate::connector::starrocks::ports::SinkFrontendProvider;
 use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
 use crate::connector::starrocks::sink::partition_key::{PartitionExprPlan, PartitionKeyValue};
 use crate::exec::expr::{ExprArena, ExprId};
@@ -99,6 +100,11 @@ pub(crate) struct StarRocksTableSinkDescriptor {
     pub(crate) partition: SinkPartitionDescriptor,
     pub(crate) location: SinkLocationDescriptor,
     pub(crate) nodes: SinkNodesDescriptor,
+    pub(crate) frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
+    pub(crate) starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
+    pub(crate) storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 #[derive(Clone)]
@@ -122,6 +128,11 @@ pub(crate) struct StarRocksSinkDescriptor {
     pub(crate) location: SinkLocationDescriptor,
     pub(crate) nodes: SinkNodesDescriptor,
     pub(crate) frontend: Option<FrontendAddress>,
+    pub(crate) frontend_provider: Option<Arc<dyn SinkFrontendProvider>>,
+    pub(crate) starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
+    pub(crate) storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

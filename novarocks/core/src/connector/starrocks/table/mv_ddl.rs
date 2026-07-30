@@ -26,7 +26,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
-use crate::connector::starrocks::lake::storage_schema_wire::encode_tablet_schema_bytes;
 use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
@@ -63,6 +62,7 @@ use crate::connector::starrocks::table::model::{
 use crate::connector::starrocks::table::schema_adapter::{
     build_create_tablet_request, build_tablet_schema,
 };
+use crate::connector::starrocks::table::schema_payload;
 use crate::engine::mv::lifecycle::MvListRow;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::mv::aggregate_state::mv_shape::{AggregateMvShape, IncrementalMvShape};
@@ -300,17 +300,17 @@ pub(crate) fn create_mv(
         )
         .map_err(|e| format!("create StarRocks materialized view metadata failed: {e}"))?;
     let request_schema = build_tablet_schema(&table_columns, &key_desc, created.schema.schema_id)?;
-    let mut tablet_schema_pb =
-        crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_pb_from_thrift(
+    let mut tablet_schema =
+        crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_from_thrift(
             &request_schema,
         )?;
-    patch_tablet_schema_column_flags(&mut tablet_schema_pb, &physical_columns)?;
+    patch_tablet_schema_column_flags(&mut tablet_schema, &physical_columns)?;
     state
         .starrocks_table_repo
         .update_schema_payload(
             txn.as_mut(),
             created.schema.schema_id,
-            encode_tablet_schema_bytes(&tablet_schema_pb),
+            schema_payload::encode(&tablet_schema)?,
         )
         .map_err(|e| format!("update StarRocks materialized view schema metadata failed: {e}"))?;
     state

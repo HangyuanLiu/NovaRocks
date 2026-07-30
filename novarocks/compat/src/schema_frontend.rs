@@ -1,27 +1,9 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-use crate::common::types::format_uuid;
-use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::service::disk_report;
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
-use crate::thrift::{internal_service, status, status_code, types};
-
-use super::SchemaScanContext;
+use novarocks::common::types::format_uuid;
+use novarocks::connector::schema::SchemaScanContext;
+use novarocks::runtime::endpoint::RuntimeEndpoint;
+use novarocks::thrift::frontend_service::TFrontendServiceSyncClient;
+use novarocks::thrift::types;
+use novarocks::thrift::{frontend_service, internal_service, status, status_code};
 
 const FE_TIMEOUT_SECS: u64 = 5;
 
@@ -32,28 +14,21 @@ pub(crate) fn transport_address(
         .map(|endpoint| types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()))
 }
 
-pub(crate) fn resolve_frontend_addr(
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Option<types::TNetworkAddress> {
-    fe_addr.cloned().or_else(disk_report::latest_fe_addr)
-}
-
 pub(crate) fn with_frontend_client<T, F>(
-    fe_addr: Option<&types::TNetworkAddress>,
-    f: F,
+    endpoint: Option<&types::TNetworkAddress>,
+    operation: F,
 ) -> Result<T, String>
 where
     F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
 {
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
-        "missing FE address for schema scan (coord is absent and heartbeat cache is empty)"
-            .to_string()
-    })?;
-    FrontendRpcManager::shared()
-        .call(FrontendRpcKind::SchemaQuery, &fe_addr, move |client| {
-            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
-        })
-        .map_err(|err| err.to_string())
+    let endpoint = endpoint
+        .cloned()
+        .or_else(novarocks::service::disk_report::latest_fe_addr)
+        .ok_or_else(|| {
+            "missing FE address for schema scan (coord is absent and heartbeat cache is empty)"
+                .to_string()
+        })?;
+    crate::frontend_rpc::with_client(&endpoint, operation)
 }
 
 pub(crate) fn forward_show_result(

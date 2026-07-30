@@ -1207,6 +1207,7 @@ fn write_routed_chunks(
                 &tablet.tablet_root_path,
                 &starrocks_table_config.s3,
             )?,
+            storage_metadata_provider: None,
             partial_update: PartialUpdateWritePolicy::default(),
         };
         // Keep the tablet runtime's schema in lockstep with what we persist,
@@ -1403,6 +1404,7 @@ fn append_empty_txn_logs_for_unwritten_tablets(
                 &tablet.tablet_root_path,
                 &starrocks_table_config.s3,
             )?,
+            storage_metadata_provider: None,
             partial_update: PartialUpdateWritePolicy::default(),
         };
         update_tablet_runtime_schema(tablet.tablet_id, &plan.tablet_schema)?;

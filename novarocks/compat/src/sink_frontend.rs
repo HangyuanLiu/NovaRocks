@@ -1,88 +1,81 @@
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// regarding copyright ownership.  The ASF License, Version 2.0.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
-use crate::common::config;
-use crate::connector::starrocks::sink::partition_key::PartitionKeyValue;
-use crate::connector::starrocks::sink::plan::{
-    CreatePartitionResult, FrontendAddress, SinkNodeInfo, SinkPartitionEntry, SinkPartitionIndex,
-    SinkTabletLocation,
+use novarocks::common::config;
+use novarocks::connector::starrocks::ports::{
+    AutoIncrementRange, AutomaticPartitionEntry, AutomaticPartitionIndex, AutomaticPartitionKey,
+    AutomaticPartitionNode, AutomaticPartitionRequest, AutomaticPartitionResult,
+    AutomaticPartitionTablet, SinkFrontendAddress, SinkFrontendProvider,
 };
-use crate::protocol::starrocks::compat::sink::select_partition_boundary_key;
-use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
-use crate::service::disk_report;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
-use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
-use crate::thrift::status_code;
-use crate::thrift::{exprs, types};
+use novarocks::thrift::frontend_service::{self, TFrontendServiceSyncClient};
+use novarocks::thrift::status_code;
+use novarocks::thrift::{exprs, types};
 
 const CREATE_PARTITION_TRANSPORT_RETRIES: usize = 4;
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
 
-pub(crate) fn frontend_address_from_thrift(addr: &types::TNetworkAddress) -> FrontendAddress {
-    FrontendAddress {
-        hostname: addr.hostname.clone(),
-        port: addr.port,
+pub(crate) fn sink_frontend_provider() -> Arc<dyn SinkFrontendProvider> {
+    Arc::new(CompatSinkFrontendProvider)
+}
+
+struct CompatSinkFrontendProvider;
+
+impl SinkFrontendProvider for CompatSinkFrontendProvider {
+    fn create_automatic_partitions(
+        &self,
+        request: &AutomaticPartitionRequest,
+    ) -> Result<AutomaticPartitionResult, String> {
+        create_automatic_partitions(
+            &request.frontend,
+            request.db_id,
+            request.table_id,
+            request.txn_id,
+            request.is_temp,
+            request.partition_values.clone(),
+        )
+    }
+
+    fn allocate_auto_increment_range(
+        &self,
+        frontend: &SinkFrontendAddress,
+        table_id: i64,
+        rows: usize,
+    ) -> Result<AutoIncrementRange, String> {
+        allocate_auto_increment_interval(frontend, table_id, rows)
     }
 }
 
-pub(crate) fn latest_frontend_address() -> Option<FrontendAddress> {
-    disk_report::latest_fe_addr()
-        .as_ref()
-        .map(frontend_address_from_thrift)
+fn to_thrift_address(addr: &SinkFrontendAddress) -> types::TNetworkAddress {
+    types::TNetworkAddress::new(addr.host.clone(), addr.port)
 }
 
-fn to_thrift_address(addr: &FrontendAddress) -> types::TNetworkAddress {
-    types::TNetworkAddress::new(addr.hostname.clone(), addr.port)
-}
-
-fn with_frontend_client<T, F>(
-    fe_addr: &FrontendAddress,
-    options: FrontendRpcCallOptions,
+fn with_control_client<T, F>(
+    fe_addr: &SinkFrontendAddress,
+    transport_retries: usize,
     f: F,
 ) -> Result<T, String>
 where
     F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
 {
-    let thrift_addr = to_thrift_address(fe_addr);
-    FrontendRpcManager::shared()
-        .call_with_options(
-            FrontendRpcKind::Control,
-            &thrift_addr,
-            options,
-            move |client| f.clone()(client).map_err(FrontendRpcError::from_message_guess),
-        )
-        .map_err(|err| err.to_string())
+    crate::frontend_rpc::with_control_client(&to_thrift_address(fe_addr), transport_retries, f)
 }
 
 pub(crate) fn create_automatic_partitions(
-    fe_addr: &FrontendAddress,
+    fe_addr: &SinkFrontendAddress,
     db_id: i64,
     table_id: i64,
     txn_id: i64,
     is_temp: bool,
     partition_values: Vec<Vec<String>>,
-) -> Result<CreatePartitionResult, String> {
+) -> Result<AutomaticPartitionResult, String> {
     if db_id <= 0 {
         return Err(format!(
             "invalid db_id for automatic partition create: {db_id}"
@@ -114,17 +107,12 @@ pub(crate) fn create_automatic_partitions(
     let deadline = Instant::now() + Duration::from_millis(config::fe_rpc_timeout_ms().max(1));
     let mut service_unavailable_attempts = 0usize;
     loop {
-        let response = with_frontend_client(
-            fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: CREATE_PARTITION_TRANSPORT_RETRIES,
-            },
-            |client| {
+        let response =
+            with_control_client(fe_addr, CREATE_PARTITION_TRANSPORT_RETRIES, |client| {
                 client
                     .create_partition(request.clone())
                     .map_err(|e| format!("createPartition RPC failed: {e}"))
-            },
-        )?;
+            })?;
         let status = response
             .status
             .as_ref()
@@ -155,19 +143,19 @@ pub(crate) fn create_automatic_partitions(
 
 fn create_partition_result_from_wire(
     response: frontend_service::TCreatePartitionResult,
-) -> Result<CreatePartitionResult, String> {
+) -> Result<AutomaticPartitionResult, String> {
     let partitions = response
         .partitions
         .unwrap_or_default()
         .into_iter()
         .map(|part| {
-            Ok(SinkPartitionEntry {
+            Ok(AutomaticPartitionEntry {
                 partition_id: part.id,
                 is_shadow: part.is_shadow_partition.unwrap_or(false),
                 indexes: part
                     .indexes
                     .into_iter()
-                    .map(|idx| SinkPartitionIndex {
+                    .map(|idx| AutomaticPartitionIndex {
                         index_id: idx.index_id,
                         tablet_ids: idx.tablet_ids,
                     })
@@ -188,7 +176,7 @@ fn create_partition_result_from_wire(
         .tablets
         .unwrap_or_default()
         .into_iter()
-        .map(|tablet| SinkTabletLocation {
+        .map(|tablet| AutomaticPartitionTablet {
             tablet_id: tablet.tablet_id,
             node_ids: tablet.node_ids,
         })
@@ -204,13 +192,13 @@ fn create_partition_result_from_wire(
                     node.option
                 )
             })?;
-            Ok(SinkNodeInfo {
+            Ok(AutomaticPartitionNode {
                 id: node.id,
                 option,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(CreatePartitionResult {
+    Ok(AutomaticPartitionResult {
         partitions,
         tablets,
         nodes,
@@ -220,8 +208,8 @@ fn create_partition_result_from_wire(
 fn partition_boundary_key_from_wire(
     key_nodes: Option<&[exprs::TExprNode]>,
     legacy_node: Option<&exprs::TExprNode>,
-) -> Result<Option<Vec<PartitionKeyValue>>, String> {
-    let Some(nodes) = select_partition_boundary_key(key_nodes, legacy_node) else {
+) -> Result<Option<Vec<AutomaticPartitionKey>>, String> {
+    let Some(nodes) = key_nodes.or_else(|| legacy_node.map(std::slice::from_ref)) else {
         return Ok(None);
     };
     if nodes.is_empty() {
@@ -232,7 +220,7 @@ fn partition_boundary_key_from_wire(
 
 fn partition_in_keys_from_wire(
     in_keys: Option<&[Vec<exprs::TExprNode>]>,
-) -> Result<Vec<Vec<PartitionKeyValue>>, String> {
+) -> Result<Vec<Vec<AutomaticPartitionKey>>, String> {
     let Some(in_keys) = in_keys else {
         return Ok(Vec::new());
     };
@@ -243,7 +231,9 @@ fn partition_in_keys_from_wire(
     Ok(out)
 }
 
-fn parse_partition_key_nodes(nodes: &[exprs::TExprNode]) -> Result<Vec<PartitionKeyValue>, String> {
+fn parse_partition_key_nodes(
+    nodes: &[exprs::TExprNode],
+) -> Result<Vec<AutomaticPartitionKey>, String> {
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
         out.push(parse_partition_key_node(node)?);
@@ -251,16 +241,16 @@ fn parse_partition_key_nodes(nodes: &[exprs::TExprNode]) -> Result<Vec<Partition
     Ok(out)
 }
 
-fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue, String> {
+fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<AutomaticPartitionKey, String> {
     match node.node_type {
-        t if t == exprs::TExprNodeType::NULL_LITERAL => Ok(PartitionKeyValue::Null),
+        t if t == exprs::TExprNodeType::NULL_LITERAL => Ok(AutomaticPartitionKey::Null),
         t if t == exprs::TExprNodeType::BOOL_LITERAL => {
             let value = node
                 .bool_literal
                 .as_ref()
                 .ok_or_else(|| "BOOL_LITERAL missing bool_literal payload".to_string())?
                 .value;
-            Ok(PartitionKeyValue::Bool(value))
+            Ok(AutomaticPartitionKey::Bool(value))
         }
         t if t == exprs::TExprNodeType::INT_LITERAL => {
             let value = node
@@ -268,7 +258,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 .as_ref()
                 .ok_or_else(|| "INT_LITERAL missing int_literal payload".to_string())?
                 .value as i128;
-            Ok(PartitionKeyValue::Int(value))
+            Ok(AutomaticPartitionKey::Int(value))
         }
         t if t == exprs::TExprNodeType::LARGE_INT_LITERAL => {
             let value = node
@@ -279,7 +269,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 .trim()
                 .parse::<i128>()
                 .map_err(|_| "LARGE_INT_LITERAL parse failed".to_string())?;
-            Ok(PartitionKeyValue::Int(value))
+            Ok(AutomaticPartitionKey::Int(value))
         }
         t if t == exprs::TExprNodeType::DECIMAL_LITERAL => {
             let text = node
@@ -288,7 +278,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 .ok_or_else(|| "DECIMAL_LITERAL missing decimal_literal payload".to_string())?
                 .value
                 .clone();
-            let DataType::Decimal128(precision, scale) = thrift_desc_to_arrow_type(&node.type_)
+            let DataType::Decimal128(precision, scale) = literal_arrow_type(&node.type_)
                 .ok_or_else(|| {
                     "DECIMAL_LITERAL missing or unsupported type descriptor".to_string()
                 })?
@@ -296,7 +286,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 return Err("DECIMAL_LITERAL type descriptor is not decimal".to_string());
             };
             let value = parse_decimal_literal_value(&text, precision, scale)?;
-            Ok(PartitionKeyValue::Decimal { value, scale })
+            Ok(AutomaticPartitionKey::Decimal { value, scale })
         }
         t if t == exprs::TExprNodeType::STRING_LITERAL
             || t == exprs::TExprNodeType::DATE_LITERAL =>
@@ -314,15 +304,15 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                     .value
                     .clone()
             };
-            match thrift_desc_to_arrow_type(&node.type_) {
-                Some(DataType::Date32) => {
-                    Ok(PartitionKeyValue::Date32(parse_date_literal_days(&value)?))
-                }
+            match literal_arrow_type(&node.type_) {
+                Some(DataType::Date32) => Ok(AutomaticPartitionKey::Date32(
+                    parse_date_literal_days(&value)?,
+                )),
                 Some(DataType::Timestamp(_, _)) | Some(DataType::Time64(_)) => Ok(
-                    PartitionKeyValue::TimestampMicros(parse_datetime_literal_micros(&value)?),
+                    AutomaticPartitionKey::TimestampMicros(parse_datetime_literal_micros(&value)?),
                 ),
-                Some(DataType::Binary) => Ok(PartitionKeyValue::Binary(value.into_bytes())),
-                _ => Ok(PartitionKeyValue::Utf8(value)),
+                Some(DataType::Binary) => Ok(AutomaticPartitionKey::Binary(value.into_bytes())),
+                _ => Ok(AutomaticPartitionKey::Utf8(value)),
             }
         }
         t if t == exprs::TExprNodeType::BINARY_LITERAL => {
@@ -332,7 +322,7 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
                 .ok_or_else(|| "BINARY_LITERAL missing payload".to_string())?
                 .value
                 .clone();
-            Ok(PartitionKeyValue::Binary(value))
+            Ok(AutomaticPartitionKey::Binary(value))
         }
         t if t == exprs::TExprNodeType::FLOAT_LITERAL => {
             let _ = node
@@ -345,6 +335,43 @@ fn parse_partition_key_node(node: &exprs::TExprNode) -> Result<PartitionKeyValue
             "unsupported partition key literal node type: {:?}",
             other
         )),
+    }
+}
+
+fn literal_arrow_type(desc: &types::TTypeDesc) -> Option<DataType> {
+    let scalar = desc.types.as_ref()?.first()?.scalar_type.as_ref()?;
+    match scalar.type_ {
+        primitive if primitive == types::TPrimitiveType::DATE => Some(DataType::Date32),
+        primitive
+            if primitive == types::TPrimitiveType::DATETIME
+                || primitive == types::TPrimitiveType::TIME =>
+        {
+            Some(DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            ))
+        }
+        primitive
+            if primitive == types::TPrimitiveType::BINARY
+                || primitive == types::TPrimitiveType::VARBINARY =>
+        {
+            Some(DataType::Binary)
+        }
+        primitive
+            if primitive == types::TPrimitiveType::DECIMAL
+                || primitive == types::TPrimitiveType::DECIMAL32
+                || primitive == types::TPrimitiveType::DECIMAL64
+                || primitive == types::TPrimitiveType::DECIMAL128 =>
+        {
+            Some(DataType::Decimal128(
+                u8::try_from(scalar.precision?).ok()?,
+                i8::try_from(scalar.scale?).ok()?,
+            ))
+        }
+        primitive if primitive == types::TPrimitiveType::DECIMALV2 => {
+            Some(DataType::Decimal128(27, 9))
+        }
+        _ => None,
     }
 }
 
@@ -446,17 +473,11 @@ fn parse_decimal_literal_value(value: &str, precision: u8, scale: i8) -> Result<
     Ok(unsigned.saturating_mul(sign))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AutoIncrementInterval {
-    pub(crate) next: i64,
-    pub(crate) end: i64,
-}
-
 pub(crate) fn allocate_auto_increment_interval(
-    fe_addr: &FrontendAddress,
+    fe_addr: &SinkFrontendAddress,
     table_id: i64,
     rows: usize,
-) -> Result<AutoIncrementInterval, String> {
+) -> Result<AutoIncrementRange, String> {
     if table_id <= 0 {
         return Err(format!(
             "invalid table_id for auto increment allocation: {table_id}"
@@ -471,7 +492,7 @@ pub(crate) fn allocate_auto_increment_interval(
         table_id: Some(table_id),
         rows: Some(rows_i64),
     };
-    let response = with_frontend_client(fe_addr, FrontendRpcCallOptions::default(), |client| {
+    let response = with_control_client(fe_addr, 1, |client| {
         client
             .alloc_auto_increment_id(request)
             .map_err(|e| format!("alloc_auto_increment_id RPC failed: {e}"))
@@ -481,7 +502,7 @@ pub(crate) fn allocate_auto_increment_interval(
 
 fn auto_increment_interval_from_wire(
     response: frontend_service::TAllocateAutoIncrementIdResult,
-) -> Result<AutoIncrementInterval, String> {
+) -> Result<AutoIncrementRange, String> {
     let status = response
         .status
         .as_ref()
@@ -514,5 +535,5 @@ fn auto_increment_interval_from_wire(
             start, allocated_rows
         )
     })?;
-    Ok(AutoIncrementInterval { next: start, end })
+    Ok(AutoIncrementRange { start, end })
 }

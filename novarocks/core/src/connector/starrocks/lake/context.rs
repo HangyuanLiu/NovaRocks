@@ -29,6 +29,10 @@ pub(crate) struct TabletRuntimeEntry {
     pub(crate) root_path: String,
     pub(crate) schema: StarRocksTabletSchema,
     pub(crate) s3_config: Option<S3StoreConfig>,
+    /// The compat file-boundary codec for this tablet. Native and standalone
+    /// runtimes intentionally leave it unset while they use their local path.
+    pub(crate) storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
 static TABLET_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<i64, TabletRuntimeEntry>>> = OnceLock::new();
@@ -82,7 +86,7 @@ pub(crate) enum PartialUpdateWriteMode {
     ColumnUpdate,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct AutoIncrementWritePolicy {
     pub(crate) null_expr_in_auto_increment: bool,
     pub(crate) miss_auto_increment_column: bool,
@@ -90,6 +94,35 @@ pub(crate) struct AutoIncrementWritePolicy {
     pub(crate) auto_increment_column_name: Option<String>,
     pub(crate) auto_increment_in_sort_key: bool,
     pub(crate) fe_addr: Option<FrontendAddress>,
+    pub(crate) frontend_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>>,
+}
+
+impl std::fmt::Debug for AutoIncrementWritePolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AutoIncrementWritePolicy")
+            .field(
+                "null_expr_in_auto_increment",
+                &self.null_expr_in_auto_increment,
+            )
+            .field(
+                "miss_auto_increment_column",
+                &self.miss_auto_increment_column,
+            )
+            .field("auto_increment_column_idx", &self.auto_increment_column_idx)
+            .field(
+                "auto_increment_column_name",
+                &self.auto_increment_column_name,
+            )
+            .field(
+                "auto_increment_in_sort_key",
+                &self.auto_increment_in_sort_key,
+            )
+            .field("fe_addr", &self.fe_addr)
+            .field("has_frontend_provider", &self.frontend_provider.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +153,7 @@ impl Default for PartialUpdateWritePolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct TabletWriteContext {
     pub(crate) db_id: i64,
     pub(crate) table_id: i64,
@@ -128,7 +161,31 @@ pub(crate) struct TabletWriteContext {
     pub(crate) tablet_root_path: String,
     pub(crate) tablet_schema: StarRocksTabletSchema,
     pub(crate) s3_config: Option<S3StoreConfig>,
+    /// File-boundary storage codec installed by the compat composition root.
+    /// Standalone/native writers intentionally leave this absent and use their
+    /// local metadata path until that owner is migrated as well.
+    pub(crate) storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
     pub(crate) partial_update: PartialUpdateWritePolicy,
+}
+
+impl std::fmt::Debug for TabletWriteContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TabletWriteContext")
+            .field("db_id", &self.db_id)
+            .field("table_id", &self.table_id)
+            .field("tablet_id", &self.tablet_id)
+            .field("tablet_root_path", &self.tablet_root_path)
+            .field("tablet_schema", &self.tablet_schema)
+            .field("s3_config", &self.s3_config)
+            .field(
+                "has_storage_metadata_provider",
+                &self.storage_metadata_provider.is_some(),
+            )
+            .field("partial_update", &self.partial_update)
+            .finish()
+    }
 }
 
 fn normalize_s3_config(cfg: &S3StoreConfig) -> Result<S3StoreConfig, String> {
@@ -219,6 +276,7 @@ pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), St
         root_path: root_path.clone(),
         schema: ctx.tablet_schema.clone(),
         s3_config,
+        storage_metadata_provider: ctx.storage_metadata_provider.clone(),
     };
     cache_tablet_runtime(ctx.tablet_id, entry)?;
     Ok(())

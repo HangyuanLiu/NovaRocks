@@ -36,15 +36,15 @@ use thrift::transport::{
 
 use crate::common::network;
 use crate::connector::starrocks::lake::{
-    create_lake_tablet_from_req, execute_alter_tablet_task,
-    execute_update_tablet_meta_info_task as execute_lake_update_tablet_meta_info_task,
+    create_lake_tablet_from_req_with_storage_metadata_provider,
+    execute_alter_tablet_task_with_storage_metadata_provider,
+    execute_update_tablet_meta_info_task_with_storage_metadata_provider,
 };
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::protocol::starrocks::thrift_codec::thrift_named_json;
 use crate::runtime::starlet_shard_registry;
 use crate::service::disk_report;
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::thrift::master_service;
 use crate::thrift::{
     agent_service,
@@ -82,10 +82,109 @@ pub trait LoadChannelFinisher: Send + Sync + 'static {
     ) -> Result<(), String>;
 }
 
+/// Temporary RCI-5G seam. Compat owns the FE client; BackendService only
+/// describes the one finish-task operation it needs.
+pub trait FinishTaskSender: Send + Sync + 'static {
+    fn send_finish_task(
+        &self,
+        fe_addr: &types::TNetworkAddress,
+        request: &master_service::TFinishTaskRequest,
+    ) -> Result<master_service::TMasterResult, FinishTaskSendError>;
+}
+
+/// Temporary RCI-5G seam. BackendService continues to own Thrift task
+/// dispatch, while compat owns the StarRocks lake-agent protocol adapter.
+/// Generated task values are intentionally contained in this service boundary
+/// and do not enter the connector or storage execution kernel.
+pub trait LakeAgentTaskAdapter: Send + Sync + 'static {
+    fn create_tablet(
+        &self,
+        request: &agent_service::TCreateTabletReq,
+        shard_info: &starlet_shard_registry::StarletShardInfo,
+    ) -> Result<(), String>;
+
+    fn alter_tablet(&self, request: &agent_service::TAlterTabletReqV2) -> Result<(), String>;
+
+    fn update_tablet_meta_info(
+        &self,
+        request: &agent_service::TUpdateTabletMetaInfoReq,
+    ) -> Result<(), String>;
+}
+
+/// Core execution capability used only by the temporary compat lake-agent
+/// adapter. The generated request remains contained at this service boundary.
+pub fn execute_lake_create_tablet(
+    request: &agent_service::TCreateTabletReq,
+    shard_info: &starlet_shard_registry::StarletShardInfo,
+    storage_metadata_provider: Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+) -> Result<(), String> {
+    create_lake_tablet_from_req_with_storage_metadata_provider(
+        request,
+        &shard_info.full_path,
+        shard_info.s3.clone(),
+        storage_metadata_provider,
+    )
+}
+
+/// Core execution capability used only by the temporary compat lake-agent
+/// adapter. RCI-5G removes this callback boundary with BackendService.
+pub fn execute_lake_alter_tablet(
+    request: &agent_service::TAlterTabletReqV2,
+    storage_metadata_provider: Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+) -> Result<(), String> {
+    execute_alter_tablet_task_with_storage_metadata_provider(request, storage_metadata_provider)
+}
+
+/// Core execution capability used only by the temporary compat lake-agent
+/// adapter. RCI-5G removes this callback boundary with BackendService.
+pub fn execute_lake_update_tablet_meta_info(
+    request: &agent_service::TUpdateTabletMetaInfoReq,
+    storage_metadata_provider: Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+) -> Result<(), String> {
+    execute_update_tablet_meta_info_task_with_storage_metadata_provider(
+        request,
+        storage_metadata_provider,
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct FinishTaskSendError {
+    message: String,
+    transport: bool,
+}
+
+impl FinishTaskSendError {
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transport: true,
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transport: false,
+        }
+    }
+
+    pub const fn is_transport(&self) -> bool {
+        self.transport
+    }
+}
+
+impl std::fmt::Display for FinishTaskSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 #[derive(Clone)]
 struct BackendHandler {
     peer: Option<std::net::SocketAddr>,
     load_channel_finisher: Arc<dyn LoadChannelFinisher>,
+    finish_task_sender: Arc<dyn FinishTaskSender>,
+    lake_agent_task_adapter: Arc<dyn LakeAgentTaskAdapter>,
 }
 
 fn stub_status(method: &str) -> TStatus {
@@ -187,9 +286,10 @@ fn build_finish_task_request(
 }
 
 fn send_finish_task_request_once(
+    sender: &dyn FinishTaskSender,
     fe_addr: &types::TNetworkAddress,
     request: &master_service::TFinishTaskRequest,
-) -> Result<master_service::TMasterResult, FrontendRpcError> {
+) -> Result<master_service::TMasterResult, FinishTaskSendError> {
     tracing::debug!(
         signature = request.signature,
         task_type = ?request.task_type,
@@ -197,11 +297,7 @@ fn send_finish_task_request_once(
         req = %json_summary(request),
         "BackendService.finish_task sending request"
     );
-    FrontendRpcManager::shared().call(FrontendRpcKind::Control, fe_addr, |client| {
-        client
-            .finish_task(request.clone())
-            .map_err(FrontendRpcError::from_thrift)
-    })
+    sender.send_finish_task(fe_addr, request)
 }
 
 fn send_finish_task_request_with_retry<Send, Sleep>(
@@ -211,7 +307,7 @@ fn send_finish_task_request_with_retry<Send, Sleep>(
     mut sleep: Sleep,
 ) -> Result<(), String>
 where
-    Send: FnMut() -> Result<master_service::TMasterResult, FrontendRpcError>,
+    Send: FnMut() -> Result<master_service::TMasterResult, FinishTaskSendError>,
     Sleep: FnMut(Duration),
 {
     let mut attempt = 0usize;
@@ -281,6 +377,7 @@ where
 }
 
 fn send_finish_task_to_fe(
+    sender: &dyn FinishTaskSender,
     fe_addr: &types::TNetworkAddress,
     task: &agent_service::TAgentTaskRequest,
     task_status: TStatus,
@@ -290,7 +387,7 @@ fn send_finish_task_to_fe(
     send_finish_task_request_with_retry(
         task.task_type,
         task.signature,
-        || send_finish_task_request_once(fe_addr, &request),
+        || send_finish_task_request_once(sender, fe_addr, &request),
         std::thread::sleep,
     )?;
     tracing::debug!(
@@ -303,16 +400,20 @@ fn send_finish_task_to_fe(
 }
 
 fn send_finish_task(
+    sender: &dyn FinishTaskSender,
     task: &agent_service::TAgentTaskRequest,
     task_status: TStatus,
 ) -> Result<(), String> {
     let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
         "missing FE address for finish_task (heartbeat not received yet)".to_string()
     })?;
-    send_finish_task_to_fe(&fe_addr, task, task_status)
+    send_finish_task_to_fe(sender, &fe_addr, task, task_status)
 }
 
-fn execute_create_tablet_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
+fn execute_create_tablet_task(
+    task: &agent_service::TAgentTaskRequest,
+    lake_agent_task_adapter: &dyn LakeAgentTaskAdapter,
+) -> Result<(), String> {
     let req = task
         .create_tablet_req
         .as_ref()
@@ -333,19 +434,23 @@ fn execute_create_tablet_task(task: &agent_service::TAgentTaskRequest) -> Result
             req.tablet_id, CREATE_TABLET_ADD_SHARD_WAIT_MS
         )
     })?;
-    create_lake_tablet_from_req(req, &shard_info.full_path, shard_info.s3)
+    lake_agent_task_adapter.create_tablet(req, &shard_info)
 }
 
-fn execute_alter_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
+fn execute_alter_task(
+    task: &agent_service::TAgentTaskRequest,
+    lake_agent_task_adapter: &dyn LakeAgentTaskAdapter,
+) -> Result<(), String> {
     let req = task
         .alter_tablet_req_v2
         .as_ref()
         .ok_or_else(|| "alter task missing alter_tablet_req_v2".to_string())?;
-    execute_alter_tablet_task(req)
+    lake_agent_task_adapter.alter_tablet(req)
 }
 
 fn execute_update_tablet_meta_info_task(
     task: &agent_service::TAgentTaskRequest,
+    lake_agent_task_adapter: &dyn LakeAgentTaskAdapter,
 ) -> Result<(), String> {
     let req = task.update_tablet_meta_info_req.as_ref().ok_or_else(|| {
         "update_tablet_meta_info task missing update_tablet_meta_info_req".to_string()
@@ -357,7 +462,7 @@ fn execute_update_tablet_meta_info_task(
         req = %json_summary(req),
         "BackendService.update_tablet_meta_info received request"
     );
-    execute_lake_update_tablet_meta_info_task(req)
+    lake_agent_task_adapter.update_tablet_meta_info(req)
 }
 
 fn execute_drop_auto_increment_map_task(
@@ -391,7 +496,12 @@ fn wait_for_starlet_add_shard(tablet_id: i64) -> Option<starlet_shard_registry::
     }
 }
 
-fn process_submit_task(peer: Option<std::net::SocketAddr>, task: agent_service::TAgentTaskRequest) {
+fn process_submit_task(
+    finish_task_sender: Arc<dyn FinishTaskSender>,
+    lake_agent_task_adapter: Arc<dyn LakeAgentTaskAdapter>,
+    peer: Option<std::net::SocketAddr>,
+    task: agent_service::TAgentTaskRequest,
+) {
     let create_tablet_id = task.create_tablet_req.as_ref().map(|r| r.tablet_id);
     let drop_tablet_id = task.drop_tablet_req.as_ref().map(|r| r.tablet_id);
     tracing::info!(
@@ -403,7 +513,7 @@ fn process_submit_task(peer: Option<std::net::SocketAddr>, task: agent_service::
         "BackendService.submit_tasks accepted task"
     );
 
-    let task_result = execute_backend_task(&task);
+    let task_result = execute_backend_task(&task, lake_agent_task_adapter.as_ref());
 
     if let Err(task_err) = &task_result {
         tracing::warn!(
@@ -425,7 +535,7 @@ fn process_submit_task(peer: Option<std::net::SocketAddr>, task: agent_service::
             Some(err) => internal_error_status(err.clone()),
             None => ok_status(),
         };
-        if let Err(err) = send_finish_task(&task, task_status) {
+        if let Err(err) = send_finish_task(finish_task_sender.as_ref(), &task, task_status) {
             tracing::warn!(
                 peer = ?peer,
                 signature = task.signature,
@@ -449,16 +559,19 @@ fn finish_task_report_times_for_error(task_type: types::TTaskType, error: &str) 
     1
 }
 
-fn execute_backend_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
+fn execute_backend_task(
+    task: &agent_service::TAgentTaskRequest,
+    lake_agent_task_adapter: &dyn LakeAgentTaskAdapter,
+) -> Result<(), String> {
     match task.task_type {
-        types::TTaskType::CREATE => {
-            execute_create_tablet_task(task).map_err(|err| format!("create_tablet failed: {err}"))
+        types::TTaskType::CREATE => execute_create_tablet_task(task, lake_agent_task_adapter)
+            .map_err(|err| format!("create_tablet failed: {err}")),
+        types::TTaskType::ALTER => execute_alter_task(task, lake_agent_task_adapter)
+            .map_err(|err| format!("alter task failed: {err}")),
+        types::TTaskType::UPDATE_TABLET_META_INFO => {
+            execute_update_tablet_meta_info_task(task, lake_agent_task_adapter)
+                .map_err(|err| format!("update_tablet_meta_info failed: {err}"))
         }
-        types::TTaskType::ALTER => {
-            execute_alter_task(task).map_err(|err| format!("alter task failed: {err}"))
-        }
-        types::TTaskType::UPDATE_TABLET_META_INFO => execute_update_tablet_meta_info_task(task)
-            .map_err(|err| format!("update_tablet_meta_info failed: {err}")),
         types::TTaskType::DROP_AUTO_INCREMENT_MAP => execute_drop_auto_increment_map_task(task)
             .map_err(|err| format!("drop_auto_increment_map failed: {err}")),
         other => Err(format!(
@@ -525,7 +638,11 @@ impl BackendServiceSyncHandler for BackendHandler {
             let worker_pool = submit_task_worker_pool();
             for task in tasks {
                 let peer = self.peer;
-                worker_pool.execute(move || process_submit_task(peer, task));
+                let finish_task_sender = Arc::clone(&self.finish_task_sender);
+                let lake_agent_task_adapter = Arc::clone(&self.lake_agent_task_adapter);
+                worker_pool.execute(move || {
+                    process_submit_task(finish_task_sender, lake_agent_task_adapter, peer, task)
+                });
             }
         }
 
@@ -782,6 +899,8 @@ impl BackendServiceSyncHandler for BackendHandler {
 pub fn start_backend_service(
     config: BackendServiceConfig,
     load_channel_finisher: Arc<dyn LoadChannelFinisher>,
+    finish_task_sender: Arc<dyn FinishTaskSender>,
+    lake_agent_task_adapter: Arc<dyn LakeAgentTaskAdapter>,
 ) -> Result<(), String> {
     let host = if config.host.is_empty() {
         "0.0.0.0".to_string()
@@ -821,6 +940,8 @@ pub fn start_backend_service(
                             continue;
                         }
                         let load_channel_finisher = Arc::clone(&load_channel_finisher);
+                        let finish_task_sender = Arc::clone(&finish_task_sender);
+                        let lake_agent_task_adapter = Arc::clone(&lake_agent_task_adapter);
                         worker_pool.execute(move || {
                             let peer = s.peer_addr().ok();
 
@@ -848,6 +969,8 @@ pub fn start_backend_service(
                             let handler = BackendHandler {
                                 peer,
                                 load_channel_finisher,
+                                finish_task_sender,
+                                lake_agent_task_adapter,
                             };
                             let processor = BackendServiceSyncProcessor::new(handler);
 
@@ -948,8 +1071,12 @@ fn join_backend_service_thread(handle: thread::JoinHandle<()>) -> Result<(), Str
 mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+    use crate::thrift::agent_service::{
+        TAgentServiceVersion, TAgentTaskRequest, TUpdateTabletMetaInfoReq,
+    };
     use crate::thrift::backend_service::{BackendServiceSyncHandler, TStreamLoadChannel};
     use crate::thrift::status_code::TStatusCode;
+    use crate::thrift::types::TTaskType;
 
     #[derive(Default)]
     struct RecordingLoadChannelFinisher {
@@ -970,6 +1097,75 @@ mod tests {
                 channel_id,
             ));
             self.error.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    struct UnusedFinishTaskSender;
+
+    impl super::FinishTaskSender for UnusedFinishTaskSender {
+        fn send_finish_task(
+            &self,
+            _fe_addr: &crate::thrift::types::TNetworkAddress,
+            _request: &crate::thrift::master_service::TFinishTaskRequest,
+        ) -> Result<crate::thrift::master_service::TMasterResult, super::FinishTaskSendError>
+        {
+            unreachable!("stream-load channel tests do not finish backend tasks")
+        }
+    }
+
+    struct UnusedLakeAgentTaskAdapter;
+
+    impl super::LakeAgentTaskAdapter for UnusedLakeAgentTaskAdapter {
+        fn create_tablet(
+            &self,
+            _request: &crate::thrift::agent_service::TCreateTabletReq,
+            _shard_info: &crate::runtime::starlet_shard_registry::StarletShardInfo,
+        ) -> Result<(), String> {
+            unreachable!("stream-load channel tests do not execute lake-agent tasks")
+        }
+
+        fn alter_tablet(
+            &self,
+            _request: &crate::thrift::agent_service::TAlterTabletReqV2,
+        ) -> Result<(), String> {
+            unreachable!("stream-load channel tests do not execute lake-agent tasks")
+        }
+
+        fn update_tablet_meta_info(
+            &self,
+            _request: &crate::thrift::agent_service::TUpdateTabletMetaInfoReq,
+        ) -> Result<(), String> {
+            unreachable!("stream-load channel tests do not execute lake-agent tasks")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingLakeAgentTaskAdapter {
+        update_calls: Mutex<usize>,
+    }
+
+    impl super::LakeAgentTaskAdapter for RecordingLakeAgentTaskAdapter {
+        fn create_tablet(
+            &self,
+            _request: &crate::thrift::agent_service::TCreateTabletReq,
+            _shard_info: &crate::runtime::starlet_shard_registry::StarletShardInfo,
+        ) -> Result<(), String> {
+            unreachable!("test only dispatches update_tablet_meta_info")
+        }
+
+        fn alter_tablet(
+            &self,
+            _request: &crate::thrift::agent_service::TAlterTabletReqV2,
+        ) -> Result<(), String> {
+            unreachable!("test only dispatches update_tablet_meta_info")
+        }
+
+        fn update_tablet_meta_info(
+            &self,
+            _request: &crate::thrift::agent_service::TUpdateTabletMetaInfoReq,
+        ) -> Result<(), String> {
+            *self.update_calls.lock().expect("lock update calls") += 1;
+            Ok(())
         }
     }
 
@@ -1041,11 +1237,56 @@ mod tests {
     }
 
     #[test]
+    fn update_tablet_meta_info_dispatches_through_compat_adapter() {
+        let task = TAgentTaskRequest::new(
+            TAgentServiceVersion::V1,
+            TTaskType::UPDATE_TABLET_META_INFO,
+            7,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TUpdateTabletMetaInfoReq::new(None, None, None)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let adapter = RecordingLakeAgentTaskAdapter::default();
+
+        super::execute_backend_task(&task, &adapter).expect("dispatch task");
+
+        assert_eq!(*adapter.update_calls.lock().expect("lock update calls"), 1);
+    }
+
+    #[test]
     fn finish_stream_load_channel_delegates_to_compat_finisher() {
         let finisher = Arc::new(RecordingLoadChannelFinisher::default());
         let handler = super::BackendHandler {
             peer: None,
             load_channel_finisher: finisher.clone(),
+            finish_task_sender: Arc::new(UnusedFinishTaskSender),
+            lake_agent_task_adapter: Arc::new(UnusedLakeAgentTaskAdapter),
         };
 
         let status = handler
@@ -1079,6 +1320,8 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 error: Some("stream load transaction `load-1` does not exist".to_string()),
             }),
+            finish_task_sender: Arc::new(UnusedFinishTaskSender),
+            lake_agent_task_adapter: Arc::new(UnusedLakeAgentTaskAdapter),
         };
 
         let status = handler
@@ -1088,7 +1331,7 @@ mod tests {
         assert_eq!(status.status_code, TStatusCode::TXN_NOT_EXISTS);
         assert_eq!(
             status.error_msgs.as_deref(),
-            Some([String::from("stream load transaction `load-1` does not exist")].as_slice())
+            Some(["stream load transaction `load-1` does not exist".to_string()].as_slice())
         );
     }
 }

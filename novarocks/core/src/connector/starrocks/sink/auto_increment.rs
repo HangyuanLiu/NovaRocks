@@ -18,10 +18,14 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::connector::starrocks::sink::frontend_wire::{
-    AutoIncrementInterval, allocate_auto_increment_interval,
-};
+use crate::connector::starrocks::ports::{SinkFrontendAddress, SinkFrontendProvider};
 use crate::connector::starrocks::sink::plan::FrontendAddress;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutoIncrementInterval {
+    next: i64,
+    end: i64,
+}
 
 static AUTO_INCREMENT_INTERVALS: OnceLock<Mutex<HashMap<i64, AutoIncrementInterval>>> =
     OnceLock::new();
@@ -31,6 +35,7 @@ fn interval_cache() -> &'static Mutex<HashMap<i64, AutoIncrementInterval>> {
 }
 
 pub(crate) fn allocate_auto_increment_ids(
+    provider: Option<&dyn SinkFrontendProvider>,
     fe_addr: &FrontendAddress,
     table_id: i64,
     rows: usize,
@@ -74,7 +79,21 @@ pub(crate) fn allocate_auto_increment_ids(
         }
 
         let request_rows = remaining.max(1024);
-        let interval = allocate_auto_increment_interval(fe_addr, table_id, request_rows)?;
+        let provider = provider.ok_or_else(|| {
+            "OLAP_TABLE_SINK auto_increment requires StarRocks FE capability".to_string()
+        })?;
+        let interval = provider.allocate_auto_increment_range(
+            &SinkFrontendAddress {
+                host: fe_addr.hostname.clone(),
+                port: fe_addr.port,
+            },
+            table_id,
+            request_rows,
+        )?;
+        let interval = AutoIncrementInterval {
+            next: interval.start,
+            end: interval.end,
+        };
         guard.insert(table_id, interval);
     }
 
@@ -87,5 +106,78 @@ pub(crate) fn clear_auto_increment_cache_for_table(table_id: i64) {
     }
     if let Ok(mut guard) = interval_cache().lock() {
         guard.remove(&table_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::starrocks::ports::{
+        AutoIncrementRange, AutomaticPartitionRequest, AutomaticPartitionResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingFrontendProvider {
+        calls: AtomicUsize,
+    }
+
+    impl SinkFrontendProvider for RecordingFrontendProvider {
+        fn create_automatic_partitions(
+            &self,
+            _request: &AutomaticPartitionRequest,
+        ) -> Result<AutomaticPartitionResult, String> {
+            unreachable!("auto increment test does not create partitions")
+        }
+
+        fn allocate_auto_increment_range(
+            &self,
+            _frontend: &SinkFrontendAddress,
+            _table_id: i64,
+            _rows: usize,
+        ) -> Result<AutoIncrementRange, String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(AutoIncrementRange {
+                start: 100,
+                end: 1_124,
+            })
+        }
+    }
+
+    #[test]
+    fn native_mode_rejects_auto_increment_without_frontend_capability() {
+        const TABLE_ID: i64 = 9_001;
+        clear_auto_increment_cache_for_table(TABLE_ID);
+        let frontend = FrontendAddress {
+            hostname: "127.0.0.1".to_string(),
+            port: 9_030,
+        };
+
+        let error = allocate_auto_increment_ids(None, &frontend, TABLE_ID, 1)
+            .expect_err("auto increment must require the injected FE capability");
+
+        assert_eq!(
+            error,
+            "OLAP_TABLE_SINK auto_increment requires StarRocks FE capability"
+        );
+    }
+
+    #[test]
+    fn uses_injected_frontend_provider_for_auto_increment_ranges() {
+        const TABLE_ID: i64 = 9_002;
+        clear_auto_increment_cache_for_table(TABLE_ID);
+        let frontend = FrontendAddress {
+            hostname: "127.0.0.1".to_string(),
+            port: 9_030,
+        };
+        let provider = RecordingFrontendProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        let ids = allocate_auto_increment_ids(Some(&provider), &frontend, TABLE_ID, 3)
+            .expect("injected provider should supply auto increment ids");
+
+        assert_eq!(ids, vec![100, 101, 102]);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        clear_auto_increment_cache_for_table(TABLE_ID);
     }
 }

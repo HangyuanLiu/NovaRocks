@@ -61,6 +61,7 @@ pub struct HeartbeatConfig {
 struct HeartbeatHandler {
     config: HeartbeatConfig,
     start_time: SystemTime,
+    disk_report_sender: Arc<dyn disk_report::DiskReportSender>,
 }
 
 #[derive(Default)]
@@ -105,10 +106,14 @@ fn backend_host_for_fe(advertise_host: &str) -> String {
 }
 
 impl HeartbeatHandler {
-    fn new(config: HeartbeatConfig) -> Self {
+    fn new(
+        config: HeartbeatConfig,
+        disk_report_sender: Arc<dyn disk_report::DiskReportSender>,
+    ) -> Self {
         Self {
             config,
             start_time: SystemTime::now(),
+            disk_report_sender,
         }
     }
 }
@@ -155,6 +160,7 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             None,
         );
         disk_report::maybe_report_disks(
+            Arc::clone(&self.disk_report_sender),
             &master_info.network_address,
             backend_host_for_fe(&self.config.advertise_host),
             self.config.be_port,
@@ -170,7 +176,10 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
     }
 }
 
-pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
+pub fn start_heartbeat_server(
+    config: HeartbeatConfig,
+    disk_report_sender: Arc<dyn disk_report::DiskReportSender>,
+) -> Result<(), String> {
     let host = if config.host.is_empty() {
         "0.0.0.0".to_string()
     } else {
@@ -202,6 +211,7 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
 
     let processor = Arc::new(HeartbeatServiceSyncProcessor::new(HeartbeatHandler::new(
         config,
+        disk_report_sender,
     )));
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);

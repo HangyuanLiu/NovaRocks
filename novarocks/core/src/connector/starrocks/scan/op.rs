@@ -88,7 +88,7 @@ impl StarRocksSchemaColumnHint {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LakeScanSchemaMeta {
     pub db_id: i64,
     pub table_id: i64,
@@ -97,13 +97,57 @@ pub struct LakeScanSchemaMeta {
     pub query_id: Option<UniqueId>,
     pub native_tablet_schema: Option<StarRocksTabletSchema>,
     pub native_column_hints: Option<Vec<StarRocksSchemaColumnHint>>,
+    pub table_schema_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::TableSchemaProvider>>,
+    pub storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for LakeScanSchemaMeta {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LakeScanSchemaMeta")
+            .field("db_id", &self.db_id)
+            .field("table_id", &self.table_id)
+            .field("schema_id", &self.schema_id)
+            .field("fe_addr", &self.fe_addr)
+            .field("query_id", &self.query_id)
+            .field("native_tablet_schema", &self.native_tablet_schema)
+            .field("native_column_hints", &self.native_column_hints)
+            .field(
+                "has_table_schema_provider",
+                &self.table_schema_provider.is_some(),
+            )
+            .field(
+                "has_storage_metadata_provider",
+                &self.storage_metadata_provider.is_some(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct DeferredLakeScanResolution {
     pub(crate) query_id: Option<crate::runtime::query_context::QueryId>,
     pub(crate) table: LakeTableIdentity,
     pub(crate) tablets: Vec<LakeScanTabletRef>,
+    pub(crate) starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
+}
+
+impl std::fmt::Debug for DeferredLakeScanResolution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredLakeScanResolution")
+            .field("query_id", &self.query_id)
+            .field("table", &self.table)
+            .field("tablets", &self.tablets)
+            .field(
+                "has_starlet_metadata_provider",
+                &self.starlet_metadata_provider.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl DeferredLakeScanResolution {
@@ -111,11 +155,15 @@ impl DeferredLakeScanResolution {
         query_id: Option<crate::runtime::query_context::QueryId>,
         table: LakeTableIdentity,
         tablets: Vec<LakeScanTabletRef>,
+        starlet_metadata_provider: Option<
+            Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>,
+        >,
     ) -> Self {
         Self {
             query_id,
             table,
             tablets,
+            starlet_metadata_provider,
         }
     }
 }
@@ -140,6 +188,8 @@ impl LakeScanSchemaMeta {
             }),
             native_tablet_schema: Some(tablet_schema),
             native_column_hints: Some(column_hints),
+            table_schema_provider: None,
+            storage_metadata_provider: None,
         }
     }
 }
@@ -190,8 +240,17 @@ impl StarRocksConnectorInstance {
     }
 
     fn split_for_index(&self, index: usize) -> Result<ConnectorSplit, ConnectorError> {
-        let range = self
-            .ranges
+        let range = self.range_for_index(index)?;
+        ConnectorSplit::try_new(
+            self.instance_id.clone(),
+            format!("starrocks-{}", range.tablet_id),
+            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+            None,
+        )
+    }
+
+    fn range_for_index(&self, index: usize) -> Result<StarRocksScanRange, ConnectorError> {
+        self.ranges
             .lock()
             .map_err(|_| {
                 ConnectorError::new(
@@ -206,13 +265,7 @@ impl StarRocksConnectorInstance {
                     ConnectorErrorKind::InvalidRequest,
                     "StarRocks split index is out of bounds",
                 )
-            })?;
-        ConnectorSplit::try_new(
-            self.instance_id.clone(),
-            format!("starrocks-{}", range.tablet_id),
-            bytes::Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
-            None,
-        )
+            })
     }
 
     fn range_for_split(
@@ -236,22 +289,7 @@ impl StarRocksConnectorInstance {
                 "StarRocks split index overflows usize",
             )
         })?;
-        self.ranges
-            .lock()
-            .map_err(|_| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "StarRocks range lock poisoned",
-                )
-            })?
-            .get(index)
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "StarRocks split index is out of bounds",
-                )
-            })
+        self.range_for_index(index)
     }
 
     fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
@@ -371,9 +409,13 @@ pub(crate) fn plan_starrocks_read_source(
         .len();
     let scheduled = (0..range_count)
         .map(|index| {
-            provider
-                .split_for_index(index)
-                .map(crate::connector::runtime::ConnectorScheduledSplit::plain)
+            let range = provider.range_for_index(index)?;
+            provider.split_for_index(index).map(|split| {
+                crate::connector::runtime::ConnectorScheduledSplit::storage_tablet(
+                    split,
+                    range.tablet_id,
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expected_schema = provider.config.output_chunk_schema.arrow_schema_ref();
@@ -484,6 +526,7 @@ impl StarRocksExecutionContext {
                 deferred.query_id,
                 &deferred.table,
                 &deferred.tablets,
+                deferred.starlet_metadata_provider.as_deref(),
             )?;
             &resolved_properties
         } else {
@@ -859,6 +902,7 @@ mod tests {
                 partition_id: 100,
                 version: 7,
             }],
+            None,
         );
 
         assert_eq!(input.query_id, Some(QueryId { hi: 1, lo: 2 }));

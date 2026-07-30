@@ -1193,6 +1193,11 @@ impl ServerHandle for StarRocksCompatServerHandle {
         self.be_processes[index].log_count(needle)
     }
 
+    fn be_log_contents(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index].log_contents()
+    }
+
     fn run_compat_probe(&self, probe: &str, endpoint: &CompatBeEndpoint) -> Result<()> {
         if !self.endpoints.contains(endpoint) {
             bail!(

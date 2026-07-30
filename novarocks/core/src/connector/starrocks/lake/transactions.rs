@@ -20,6 +20,7 @@ use opendal::ErrorKind;
 use prost::Message;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -28,7 +29,9 @@ use crate::connector::schema;
 use crate::connector::starrocks::fs_access::{StarRocksFsAccess, resolve_tablet_root};
 use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
-use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
+use crate::connector::starrocks::lake::applier::{
+    apply_storage_txn_log_to_metadata, apply_txn_log_to_metadata,
+};
 use crate::connector::starrocks::lake::context::{
     TabletRuntimeEntry, cache_tablet_runtime, get_tablet_runtime, remove_tablet_runtime,
     with_txn_log_append_lock,
@@ -45,13 +48,13 @@ use crate::connector::starrocks::lake::txn_log::{
     normalize_rowset_shared_segments, read_txn_log_if_exists, write_txn_log_file,
 };
 use crate::connector::starrocks::schema::StarRocksTabletSchema;
-use crate::connector::starrocks::starmgr;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::formats::starrocks::writer::bundle_meta::{
-    BundleMetaWriteEntry, decode_bundle_metadata_from_bytes,
+    BundleMetaWriteEntry, StorageBundleMetaWriteEntry, decode_bundle_metadata_from_bytes,
     decode_tablet_metadata_from_bundle_bytes, discover_latest_tablet_metadata_version_at_most,
     empty_tablet_metadata, load_tablet_metadata_at_version, next_rowset_id,
     parse_bundle_version_from_meta_file_name, write_bundle_meta_file, write_bundle_meta_file_batch,
+    write_bundle_meta_file_batch_with_provider, write_bundle_meta_file_with_provider,
 };
 use crate::formats::starrocks::writer::io::{
     delete_path_if_exists, read_bytes_if_exists, write_bytes,
@@ -72,6 +75,7 @@ use crate::service::grpc_client::proto::starrocks::{
     TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest, VacuumResponse,
     tablet_stat_response, txn_log_pb,
 };
+use crate::service::starlet_metadata;
 use novarocks_fs::FsScheme;
 
 const MAX_PUBLISH_WORKERS: usize = 8;
@@ -590,7 +594,55 @@ fn finalize_publish_outputs(
                 tablet_meta: &output.metadata,
             });
         }
-        if let Err(err) = write_bundle_meta_file_batch(&root_path, new_version, &entries) {
+        let write_result = if let Some(provider) = group
+            .first()
+            .and_then(|(_, output)| output.storage_metadata_provider.as_deref())
+        {
+            let domain_metadata = group
+                .iter()
+                .map(|(tablet_id, output)| {
+                    output.storage_metadata.clone().map(Ok).unwrap_or_else(|| {
+                        storage_metadata_for_publish_output(
+                            &output.metadata,
+                            Some(provider),
+                            *tablet_id,
+                        )
+                        .and_then(|metadata| {
+                            metadata.ok_or_else(|| {
+                                format!(
+                                    "compat publish output is missing domain metadata: tablet_id={tablet_id}"
+                                )
+                            })
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>();
+            match domain_metadata {
+                Ok(domain_metadata) => {
+                    let domain_entries = group
+                        .iter()
+                        .zip(&domain_metadata)
+                        .map(
+                            |((tablet_id, output), metadata)| StorageBundleMetaWriteEntry {
+                                tablet_id: *tablet_id,
+                                schema: &output.schema,
+                                tablet_meta: metadata,
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    write_bundle_meta_file_batch_with_provider(
+                        &root_path,
+                        new_version,
+                        &domain_entries,
+                        provider,
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            write_bundle_meta_file_batch(&root_path, new_version, &entries)
+        };
+        if let Err(err) = write_result {
             warn!(
                 "publish_version failed to write final bundle metadata batch: root_path={}, new_version={}, base_version={}, txn_infos_len={}, tablet_count={}, error={}",
                 root_path,
@@ -698,6 +750,11 @@ fn synthesize_missing_bundle_siblings(
         if metadata.next_rowset_id.is_none() {
             metadata.next_rowset_id = Some(next_rowset_id(&metadata.rowsets));
         }
+        let storage_metadata = storage_metadata_for_publish_output(
+            &metadata,
+            runtime.storage_metadata_provider.as_deref(),
+            tablet_id,
+        )?;
         info!(
             target: "novarocks::lake",
             tablet_id,
@@ -712,6 +769,8 @@ fn synthesize_missing_bundle_siblings(
                 root_path: runtime.root_path,
                 schema: runtime.schema,
                 metadata,
+                storage_metadata,
+                storage_metadata_provider: runtime.storage_metadata_provider.clone(),
                 needs_persist: true,
                 cleanup_txn_log_path: None,
             },
@@ -889,7 +948,7 @@ pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse
             let Some(request_path) = request_path else {
                 return Err(err);
             };
-            let fallback_s3 = starmgr::retrieve_s3_config_for_path(request_path)?;
+            let fallback_s3 = starlet_metadata::retrieve_s3_config_for_path(request_path)?;
             warn!(
                 "drop_table location recovery failed, falling back to request path: tablet_id={}, request_path={}, error={}",
                 tablet_id, request_path, err
@@ -1574,7 +1633,7 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
     if missing.is_empty() {
         return;
     }
-    match starmgr::retrieve_shard_infos(&missing) {
+    match starlet_metadata::retrieve_shard_infos(&missing) {
         Ok(recovered) => {
             if recovered.is_empty() {
                 warn!(
@@ -1600,7 +1659,7 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
         }
         Err(err) => {
             warn!(
-                "{op} tablet location warmup from StarManager failed: missing={:?}, error={}",
+                "{op} tablet location warmup from Starlet metadata failed: missing={:?}, error={}",
                 missing, err
             );
         }
@@ -1677,9 +1736,9 @@ pub(crate) fn resolve_tablet_location(
             if let Some(info) = infos.remove(&tablet_id) {
                 return Ok((info.full_path, info.s3));
             }
-            if let Err(err) = starmgr::retrieve_shard_info(tablet_id) {
+            if let Err(err) = starlet_metadata::retrieve_shard_infos(&[tablet_id]) {
                 warn!(
-                    "{op} single-tablet StarManager recovery failed: tablet_id={}, error={}",
+                    "{op} single-tablet Starlet metadata recovery failed: tablet_id={}, error={}",
                     tablet_id, err
                 );
             }
@@ -2318,6 +2377,11 @@ struct PublishTabletState {
     current_base_version: i64,
     new_version: i64,
     metadata: TabletMetadataPb,
+    /// The compat publish state. Transaction-log application mutates this
+    /// domain value for the whole step; `metadata` is synchronized only at
+    /// step boundaries while the native path still needs its legacy shape.
+    storage_metadata:
+        Option<crate::connector::starrocks::lake::storage_domain::StorageTabletMetadata>,
 }
 
 enum PublishInit {
@@ -2331,13 +2395,37 @@ enum TxnStepDecision {
     ReturnPublished(Box<TabletMetadataPb>),
 }
 
-#[derive(Debug)]
 struct PublishOneTabletOutput {
     root_path: String,
     schema: StarRocksTabletSchema,
     metadata: TabletMetadataPb,
+    /// Compat persistence consumes this domain mirror directly. It is created
+    /// once at the output boundary instead of decoding every entry again while
+    /// assembling the final bundle batch.
+    storage_metadata:
+        Option<crate::connector::starrocks::lake::storage_domain::StorageTabletMetadata>,
+    storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
     needs_persist: bool,
     cleanup_txn_log_path: Option<String>,
+}
+
+impl std::fmt::Debug for PublishOneTabletOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishOneTabletOutput")
+            .field("root_path", &self.root_path)
+            .field("schema", &self.schema)
+            .field("metadata", &self.metadata)
+            .field("has_storage_metadata", &self.storage_metadata.is_some())
+            .field(
+                "has_storage_metadata_provider",
+                &self.storage_metadata_provider.is_some(),
+            )
+            .field("needs_persist", &self.needs_persist)
+            .field("cleanup_txn_log_path", &self.cleanup_txn_log_path)
+            .finish()
+    }
 }
 
 fn already_published_output(
@@ -2348,9 +2436,30 @@ fn already_published_output(
         root_path: runtime.root_path.clone(),
         schema: runtime.schema.clone(),
         metadata,
+        storage_metadata: None,
+        storage_metadata_provider: runtime.storage_metadata_provider.clone(),
         needs_persist: false,
         cleanup_txn_log_path: None,
     }
+}
+
+fn storage_metadata_for_publish_output(
+    metadata: &TabletMetadataPb,
+    provider: Option<&dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+    tablet_id: i64,
+) -> Result<Option<crate::connector::starrocks::lake::storage_domain::StorageTabletMetadata>, String>
+{
+    provider
+        .map(|provider| {
+            provider
+                .decode_tablet_metadata(&metadata.encode_to_vec())
+                .map_err(|error| {
+                    format!(
+                        "decode publish output metadata through compat codec failed: tablet_id={tablet_id} error={error}"
+                    )
+                })
+        })
+        .transpose()
 }
 
 fn is_empty_txnlog_publish(txn_infos: &[TxnInfoPb]) -> bool {
@@ -2401,11 +2510,18 @@ fn publish_empty_txnlog_one_tablet(
     if metadata.next_rowset_id.is_none() {
         metadata.next_rowset_id = Some(next_rowset_id(&metadata.rowsets));
     }
+    let storage_metadata = storage_metadata_for_publish_output(
+        &metadata,
+        runtime.storage_metadata_provider.as_deref(),
+        tablet_id,
+    )?;
 
     Ok(PublishOneTabletOutput {
         root_path: runtime.root_path.clone(),
         schema: runtime.schema.clone(),
         metadata,
+        storage_metadata,
+        storage_metadata_provider: runtime.storage_metadata_provider.clone(),
         needs_persist: true,
         cleanup_txn_log_path: None,
     })
@@ -2415,7 +2531,33 @@ fn schema_from_metadata(
     tablet_id: i64,
     version: i64,
     metadata: &TabletMetadataPb,
+    storage_metadata_provider: Option<
+        &dyn crate::connector::starrocks::ports::StorageMetadataProvider,
+    >,
 ) -> Result<StarRocksTabletSchema, String> {
+    if let Some(provider) = storage_metadata_provider {
+        let metadata = provider
+            .decode_tablet_metadata(&metadata.encode_to_vec())
+            .map_err(|error| {
+                format!(
+                    "decode publish schema metadata through compat codec failed: tablet_id={tablet_id} version={version} error={error}"
+                )
+            })?;
+        if let Some(schema) = metadata.schema {
+            return Ok(schema);
+        }
+        if let Some((_, schema)) = metadata
+            .historical_schemas
+            .into_iter()
+            .max_by_key(|(schema_id, _)| *schema_id)
+        {
+            return Ok(schema);
+        }
+        return Err(format!(
+            "publish_version could not recover tablet schema from compat metadata: tablet_id={} version={}",
+            tablet_id, version
+        ));
+    }
     if let Some(schema) = metadata.schema.clone() {
         return decode_tablet_schema(schema);
     }
@@ -2457,6 +2599,7 @@ fn get_runtime_for_publish(
                 root_path,
                 schema: snapshot.tablet_schema,
                 s3_config,
+                storage_metadata_provider: None,
             },
         );
     }
@@ -2473,13 +2616,14 @@ fn get_runtime_for_publish(
             tablet_id, base_version
         )
     })?;
-    let schema = schema_from_metadata(tablet_id, recovery_version, &metadata)?;
+    let schema = schema_from_metadata(tablet_id, recovery_version, &metadata, None)?;
     cache_tablet_runtime(
         tablet_id,
         TabletRuntimeEntry {
             root_path,
             schema,
             s3_config,
+            storage_metadata_provider: None,
         },
     )
 }
@@ -2628,16 +2772,16 @@ fn publish_one_tablet(
                         }
                         current_schema_change_alter_version = Some(alter_version);
                     }
-                    apply_txn_log_to_metadata(
+                    apply_publish_txn_log_to_metadata(
                         &mut state.metadata,
+                        state.storage_metadata.as_mut(),
                         &loaded.log,
                         state.schema_id,
-                        &runtime.schema,
-                        &state.root_path,
-                        runtime.s3_config.as_ref(),
+                        &runtime,
                         apply_version,
                     )?;
                 }
+                sync_publish_storage_metadata_to_pb(&mut state, &runtime)?;
                 let after_rowset_count = state.metadata.rowsets.len();
                 let after_total_rows = tablet_row_count(&state.metadata);
                 let delvec_segment_count = state
@@ -2676,6 +2820,7 @@ fn publish_one_tablet(
                 }
             }
             TxnStepDecision::SkipTxn => {
+                refresh_publish_storage_metadata_from_pb(&mut state, &runtime)?;
                 info!(
                     target: "novarocks::lake",
                     tablet_id,
@@ -2726,6 +2871,7 @@ fn publish_one_tablet(
     )?;
 
     finalize_publish_metadata(&mut state, txn_infos);
+    sync_publish_storage_metadata_to_pb(&mut state, &runtime)?;
 
     let cleanup_txn_log_path = if should_cleanup_txn_log_after_publish(txn_infos) {
         let txn_id = txn_infos[0]
@@ -2735,19 +2881,26 @@ fn publish_one_tablet(
     } else {
         None
     };
-    let persisted_schema = schema_from_metadata(tablet_id, new_version, &state.metadata)?;
+    let persisted_schema = if let Some(storage_metadata) = state.storage_metadata.as_ref() {
+        schema_from_storage_metadata(tablet_id, new_version, storage_metadata)?
+    } else {
+        schema_from_metadata(tablet_id, new_version, &state.metadata, None)?
+    };
     cache_tablet_runtime(
         tablet_id,
         TabletRuntimeEntry {
             root_path: state.root_path.clone(),
             schema: persisted_schema.clone(),
             s3_config: runtime.s3_config.clone(),
+            storage_metadata_provider: runtime.storage_metadata_provider.clone(),
         },
     )?;
     Ok(PublishOneTabletOutput {
         root_path: state.root_path,
         schema: persisted_schema,
         metadata: state.metadata,
+        storage_metadata: state.storage_metadata,
+        storage_metadata_provider: runtime.storage_metadata_provider.clone(),
         needs_persist: true,
         cleanup_txn_log_path,
     })
@@ -2817,6 +2970,11 @@ fn initialize_publish_state(
         .id
         .filter(|v| *v > 0)
         .ok_or_else(|| format!("tablet schema id is missing for tablet_id={tablet_id}"))?;
+    let storage_metadata = storage_metadata_for_publish_output(
+        &metadata,
+        runtime.storage_metadata_provider.as_deref(),
+        tablet_id,
+    )?;
     Ok(PublishInit::Ready(PublishTabletState {
         tablet_id,
         root_path: runtime.root_path.clone(),
@@ -2824,6 +2982,7 @@ fn initialize_publish_state(
         current_base_version,
         new_version,
         metadata,
+        storage_metadata,
     }))
 }
 
@@ -2985,13 +3144,40 @@ fn apply_schema_change_vlogs_if_needed(
     if state.metadata.next_rowset_id.is_none() {
         state.metadata.next_rowset_id = Some(next_rowset_id(&state.metadata.rowsets));
     }
-    write_bundle_meta_file(
-        &state.root_path,
-        state.tablet_id,
-        alter_version,
-        &runtime.schema,
-        &state.metadata,
-    )?;
+    if let Some(provider) = runtime.storage_metadata_provider.as_deref() {
+        let domain_metadata = state.storage_metadata.as_mut().ok_or_else(|| {
+            "schema-change vlog has compat provider but no publish storage state".to_string()
+        })?;
+        domain_metadata.id = Some(state.tablet_id);
+        domain_metadata.version = Some(alter_version);
+        if domain_metadata.next_rowset_id.is_none() {
+            domain_metadata.next_rowset_id = Some(
+                domain_metadata
+                    .rowsets
+                    .iter()
+                    .filter_map(|rowset| rowset.id)
+                    .max()
+                    .map(|value| value.saturating_add(1))
+                    .unwrap_or(0),
+            );
+        }
+        write_bundle_meta_file_with_provider(
+            &state.root_path,
+            state.tablet_id,
+            alter_version,
+            &runtime.schema,
+            &domain_metadata,
+            provider,
+        )?;
+    } else {
+        write_bundle_meta_file(
+            &state.root_path,
+            state.tablet_id,
+            alter_version,
+            &runtime.schema,
+            &state.metadata,
+        )?;
+    }
     state.current_base_version = alter_version;
 
     for version in (alter_version + 1)..state.new_version {
@@ -3002,18 +3188,125 @@ fn apply_schema_change_vlogs_if_needed(
                 state.tablet_id, version, alter_version, state.new_version
             )
         })?;
-        apply_txn_log_to_metadata(
+        apply_publish_txn_log_to_metadata(
             &mut state.metadata,
+            state.storage_metadata.as_mut(),
             &vlog.log,
             state.schema_id,
-            &runtime.schema,
-            &state.root_path,
-            runtime.s3_config.as_ref(),
+            runtime,
             version,
         )?;
         state.current_base_version = version;
     }
+    sync_publish_storage_metadata_to_pb(state, runtime)?;
     Ok(())
+}
+
+fn sync_publish_storage_metadata_to_pb(
+    state: &mut PublishTabletState,
+    runtime: &TabletRuntimeEntry,
+) -> Result<(), String> {
+    let Some(metadata) = state.storage_metadata.as_ref() else {
+        return Ok(());
+    };
+    let provider = runtime
+        .storage_metadata_provider
+        .as_deref()
+        .ok_or_else(|| {
+            "publish storage domain state is present without a compat metadata provider".to_string()
+        })?;
+    let encoded = provider.encode_tablet_metadata(metadata).map_err(|error| {
+        format!("encode publish storage state through compat codec failed: {error}")
+    })?;
+    state.metadata = TabletMetadataPb::decode(encoded.as_slice()).map_err(|error| {
+        format!("decode encoded publish storage state for legacy mirror failed: {error}")
+    })?;
+    Ok(())
+}
+
+fn refresh_publish_storage_metadata_from_pb(
+    state: &mut PublishTabletState,
+    runtime: &TabletRuntimeEntry,
+) -> Result<(), String> {
+    let Some(provider) = runtime.storage_metadata_provider.as_deref() else {
+        return Ok(());
+    };
+    state.storage_metadata = Some(
+        provider
+            .decode_tablet_metadata(&state.metadata.encode_to_vec())
+            .map_err(|error| {
+                format!("decode publish legacy mirror through compat codec failed: {error}")
+            })?,
+    );
+    Ok(())
+}
+
+/// Applies one log to the domain state retained for a compat publish step.
+/// The legacy protobuf mirror is updated once at the step boundary.
+fn apply_publish_txn_log_to_metadata(
+    metadata: &mut TabletMetadataPb,
+    storage_metadata: Option<
+        &mut crate::connector::starrocks::lake::storage_domain::StorageTabletMetadata,
+    >,
+    txn_log: &TxnLogPb,
+    default_schema_id: i64,
+    runtime: &TabletRuntimeEntry,
+    apply_version: i64,
+) -> Result<(), String> {
+    if let Some(domain_metadata) = storage_metadata {
+        let provider = runtime
+            .storage_metadata_provider
+            .as_deref()
+            .ok_or_else(|| {
+                "publish storage domain state is present without a compat metadata provider"
+                    .to_string()
+            })?;
+        let domain_log = provider
+            .decode_transaction_log(&txn_log.encode_to_vec())
+            .map_err(|error| {
+                format!("decode publish transaction log through compat codec failed: {error}")
+            })?;
+        apply_storage_txn_log_to_metadata(
+            domain_metadata,
+            &domain_log,
+            default_schema_id,
+            &runtime.schema,
+            &runtime.root_path,
+            runtime.s3_config.as_ref(),
+            apply_version,
+        )?;
+        return Ok(());
+    }
+    apply_txn_log_to_metadata(
+        metadata,
+        txn_log,
+        default_schema_id,
+        &runtime.schema,
+        &runtime.root_path,
+        runtime.s3_config.as_ref(),
+        apply_version,
+    )
+}
+
+fn schema_from_storage_metadata(
+    tablet_id: i64,
+    version: i64,
+    metadata: &crate::connector::starrocks::lake::storage_domain::StorageTabletMetadata,
+) -> Result<StarRocksTabletSchema, String> {
+    if let Some(schema) = metadata.schema.clone() {
+        return Ok(schema);
+    }
+    if let Some((_, schema)) = metadata
+        .historical_schemas
+        .iter()
+        .max_by_key(|(schema_id, _)| *schema_id)
+    {
+        return Ok(schema.clone());
+    }
+    Err(format!(
+        "publish_version could not recover tablet schema from compat metadata: tablet_id={} version={}",
+        tablet_id, version
+    ))
 }
 
 fn finalize_publish_metadata(state: &mut PublishTabletState, txn_infos: &[TxnInfoPb]) {
@@ -3027,6 +3320,27 @@ fn finalize_publish_metadata(state: &mut PublishTabletState, txn_infos: &[TxnInf
     }
     if state.metadata.next_rowset_id.is_none() {
         state.metadata.next_rowset_id = Some(next_rowset_id(&state.metadata.rowsets));
+    }
+    if let Some(storage_metadata) = state.storage_metadata.as_mut() {
+        storage_metadata.id = Some(state.tablet_id);
+        storage_metadata.version = Some(state.new_version);
+        if let Some(commit_time) = txn_infos.last().and_then(|v| v.commit_time) {
+            storage_metadata.commit_time = Some(commit_time);
+        }
+        if let Some(gtid) = txn_infos.last().and_then(|v| v.gtid) {
+            storage_metadata.gtid = Some(gtid);
+        }
+        if storage_metadata.next_rowset_id.is_none() {
+            storage_metadata.next_rowset_id = Some(
+                storage_metadata
+                    .rowsets
+                    .iter()
+                    .filter_map(|rowset| rowset.id)
+                    .max()
+                    .map(|value| value.saturating_add(1))
+                    .unwrap_or(0),
+            );
+        }
     }
 }
 
@@ -3069,4 +3383,241 @@ fn should_cleanup_txn_log_after_publish(txn_infos: &[TxnInfoPb]) -> bool {
 fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
     error.contains("bundle metadata missing tablet page for tablet_id=")
         || error.contains("bundle metadata does not contain tablet page:")
+}
+
+#[cfg(test)]
+mod publish_domain_bridge_tests {
+    use super::*;
+    use crate::connector::starrocks::lake::storage_domain::{
+        StorageBundleFile, StorageBundleMetadata, StorageCombinedTransactionLog, StorageRowset,
+        StorageSchemaKey, StorageTabletMetadata, StorageTransactionLog, StorageWriteOperation,
+    };
+    use crate::connector::starrocks::ports::StorageMetadataProvider;
+    use crate::connector::starrocks::schema::{
+        StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
+    };
+    use crate::service::grpc_client::proto::starrocks::RowsetMetadataPb;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BridgeProvider {
+        encodes: AtomicUsize,
+        metadata_decodes: AtomicUsize,
+    }
+
+    impl StorageMetadataProvider for BridgeProvider {
+        fn encode_tablet_schema(&self, _: &StarRocksTabletSchema) -> Result<Vec<u8>, String> {
+            Err("unused test provider method".to_string())
+        }
+
+        fn decode_tablet_schema(&self, _: &[u8]) -> Result<StarRocksTabletSchema, String> {
+            Err("unused test provider method".to_string())
+        }
+
+        fn decode_tablet_metadata(&self, _bytes: &[u8]) -> Result<StorageTabletMetadata, String> {
+            self.metadata_decodes.fetch_add(1, Ordering::SeqCst);
+            Ok(StorageTabletMetadata {
+                id: Some(9),
+                next_rowset_id: Some(2),
+                schema: Some(test_schema()),
+                ..StorageTabletMetadata::default()
+            })
+        }
+
+        fn encode_tablet_metadata(
+            &self,
+            metadata: &StorageTabletMetadata,
+        ) -> Result<Vec<u8>, String> {
+            self.encodes.fetch_add(1, Ordering::SeqCst);
+            Ok(TabletMetadataPb {
+                id: metadata.id,
+                next_rowset_id: metadata.next_rowset_id,
+                rowsets: metadata
+                    .rowsets
+                    .iter()
+                    .map(|rowset| RowsetMetadataPb {
+                        id: rowset.id,
+                        segments: rowset.segments.clone(),
+                        num_rows: rowset.num_rows,
+                        ..RowsetMetadataPb::default()
+                    })
+                    .collect(),
+                ..TabletMetadataPb::default()
+            }
+            .encode_to_vec())
+        }
+
+        fn decode_transaction_log(&self, _bytes: &[u8]) -> Result<StorageTransactionLog, String> {
+            Ok(StorageTransactionLog {
+                tablet_id: Some(9),
+                txn_id: Some(11),
+                write: Some(StorageWriteOperation {
+                    schema_key: Some(StorageSchemaKey {
+                        schema_id: Some(7),
+                        ..StorageSchemaKey::default()
+                    }),
+                    rowset: Some(StorageRowset {
+                        segments: vec!["segment.dat".to_string()],
+                        num_rows: Some(3),
+                        ..StorageRowset::default()
+                    }),
+                    ..StorageWriteOperation::default()
+                }),
+                ..StorageTransactionLog::default()
+            })
+        }
+
+        fn decode_bundle_metadata(&self, _: &[u8]) -> Result<StorageBundleMetadata, String> {
+            Err("unused test provider method".to_string())
+        }
+        fn decode_bundle_file(&self, _: &[u8]) -> Result<StorageBundleFile, String> {
+            Err("unused test provider method".to_string())
+        }
+        fn encode_bundle_file(&self, _: &StorageBundleFile) -> Result<Vec<u8>, String> {
+            Ok(b"bundle".to_vec())
+        }
+        fn rewrite_tablet_metadata_version(&self, _: &[u8], _: i64) -> Result<Vec<u8>, String> {
+            Err("unused test provider method".to_string())
+        }
+        fn encode_transaction_log(&self, _: &StorageTransactionLog) -> Result<Vec<u8>, String> {
+            Err("unused test provider method".to_string())
+        }
+        fn decode_combined_transaction_log(
+            &self,
+            _: &[u8],
+        ) -> Result<StorageCombinedTransactionLog, String> {
+            Err("unused test provider method".to_string())
+        }
+        fn encode_combined_transaction_log(
+            &self,
+            _: &StorageCombinedTransactionLog,
+        ) -> Result<Vec<u8>, String> {
+            Err("unused test provider method".to_string())
+        }
+    }
+
+    fn test_schema() -> StarRocksTabletSchema {
+        StarRocksTabletSchema {
+            id: Some(7),
+            keys_type: Some(StarRocksKeysType::Duplicate),
+            column: vec![StarRocksColumnSchema {
+                unique_id: 1,
+                name: Some("k1".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_key: Some(true),
+                ..StarRocksColumnSchema::default()
+            }],
+            ..StarRocksTabletSchema::default()
+        }
+    }
+
+    #[test]
+    fn compat_publish_uses_storage_domain_applier_for_non_primary_write() {
+        let provider = Arc::new(BridgeProvider {
+            encodes: AtomicUsize::new(0),
+            metadata_decodes: AtomicUsize::new(0),
+        });
+        let runtime = TabletRuntimeEntry {
+            root_path: "/tmp/tablet".to_string(),
+            schema: test_schema(),
+            s3_config: None,
+            storage_metadata_provider: Some(provider.clone()),
+        };
+        let mut metadata = TabletMetadataPb {
+            id: Some(9),
+            ..TabletMetadataPb::default()
+        };
+        let mut storage_metadata = StorageTabletMetadata {
+            id: Some(9),
+            next_rowset_id: Some(2),
+            schema: Some(test_schema()),
+            ..StorageTabletMetadata::default()
+        };
+        let txn_log = TxnLogPb {
+            tablet_id: Some(9),
+            txn_id: Some(11),
+            ..TxnLogPb::default()
+        };
+
+        apply_publish_txn_log_to_metadata(
+            &mut metadata,
+            Some(&mut storage_metadata),
+            &txn_log,
+            7,
+            &runtime,
+            3,
+        )
+        .expect("apply through compat storage domain");
+
+        assert_eq!(provider.encodes.load(Ordering::SeqCst), 0);
+        assert_eq!(storage_metadata.next_rowset_id, Some(3));
+        assert_eq!(storage_metadata.rowsets.len(), 1);
+        assert_eq!(storage_metadata.rowsets[0].id, Some(2));
+        assert_eq!(storage_metadata.rowsets[0].segments, ["segment.dat"]);
+    }
+
+    #[test]
+    fn compat_final_bundle_backfills_synthesized_sibling_domain_metadata() {
+        let provider = Arc::new(BridgeProvider {
+            encodes: AtomicUsize::new(0),
+            metadata_decodes: AtomicUsize::new(0),
+        });
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-compat-publish-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let root = root.to_string_lossy().into_owned();
+        let metadata = TabletMetadataPb {
+            id: Some(9),
+            version: Some(2),
+            ..TabletMetadataPb::default()
+        };
+        let output = PublishOneTabletOutput {
+            root_path: root.clone(),
+            schema: test_schema(),
+            metadata,
+            storage_metadata: Some(StorageTabletMetadata {
+                id: Some(9),
+                version: Some(2),
+                schema: Some(test_schema()),
+                ..StorageTabletMetadata::default()
+            }),
+            storage_metadata_provider: Some(provider.clone()),
+            needs_persist: true,
+            cleanup_txn_log_path: None,
+        };
+        let sibling = PublishOneTabletOutput {
+            root_path: root.clone(),
+            schema: test_schema(),
+            metadata: TabletMetadataPb {
+                id: Some(10),
+                version: Some(2),
+                ..TabletMetadataPb::default()
+            },
+            storage_metadata: None,
+            storage_metadata_provider: None,
+            needs_persist: true,
+            cleanup_txn_log_path: None,
+        };
+        let mut failed = Vec::new();
+        let mut tablet_row_nums = HashMap::new();
+
+        finalize_publish_outputs(
+            vec![(9, output), (10, sibling)],
+            0,
+            2,
+            &[],
+            0,
+            &mut failed,
+            &mut tablet_row_nums,
+        );
+
+        assert!(failed.is_empty(), "unexpected publish failure: {failed:?}");
+        assert_eq!(provider.metadata_decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.encodes.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(&root).expect("remove temporary publish output directory");
+    }
 }

@@ -21,9 +21,9 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tonic::transport::{Channel, Endpoint};
 
-use crate::proto::staros;
-use crate::runtime::global_async_runtime::data_block_on;
-use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
+use novarocks::proto::staros;
+use novarocks::runtime::global_async_runtime::data_block_on;
+use novarocks::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 
 const STARMGR_SERVICE_NAME: &str = "starrocks";
 const DEFAULT_WORKER_GROUP_ID: u64 = 0;
@@ -213,14 +213,14 @@ pub(crate) fn parse_s3_config_from_file_path_info(
     };
     let region = normalize_region(&s3.region);
 
-    Ok(Some(S3StoreConfig {
-        endpoint: endpoint.to_string(),
+    Ok(Some(S3StoreConfig::new(
+        endpoint,
         bucket,
         access_key_id,
         access_key_secret,
         region,
         enable_path_style_access,
-    }))
+    )))
 }
 
 /// Parsed StarOS FileStore record used by `retrieve_s3_config_for_path_async`
@@ -267,14 +267,14 @@ fn parse_s3_config_from_file_store_info(
     };
 
     Ok(Some(FileStoreS3Record {
-        cfg: S3StoreConfig {
-            endpoint: endpoint.to_string(),
-            bucket: bucket.to_string(),
+        cfg: S3StoreConfig::new(
+            endpoint,
+            bucket,
             access_key_id,
             access_key_secret,
-            region: normalize_region(&s3.region),
+            normalize_region(&s3.region),
             enable_path_style_access,
-        },
+        ),
         path_prefix: s3.path_prefix.trim_matches('/').to_string(),
     }))
 }
@@ -298,13 +298,7 @@ fn shard_info_to_registry_info(
         ));
     }
     let s3 = parse_s3_config_from_file_path_info(path_info)?;
-    Ok((
-        tablet_id,
-        StarletShardInfo {
-            full_path: full_path.to_string(),
-            s3,
-        },
-    ))
+    Ok((tablet_id, StarletShardInfo::new(full_path, s3)))
 }
 
 pub(crate) fn observe_starlet_service(service_id: &str) {
@@ -525,11 +519,6 @@ pub(crate) fn retrieve_shard_infos(
     Ok(recovered)
 }
 
-pub(crate) fn retrieve_shard_info(tablet_id: i64) -> Result<Option<StarletShardInfo>, String> {
-    let recovered = retrieve_shard_infos(&[tablet_id])?;
-    Ok(recovered.get(&tablet_id).cloned())
-}
-
 async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreConfig>, String> {
     let Some((target_bucket, target_key)) = split_object_store_path(path) else {
         return Ok(None);
@@ -564,7 +553,7 @@ async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreC
         let Some(record) = parse_s3_config_from_file_store_info(fs_info)? else {
             continue;
         };
-        if record.cfg.bucket != target_bucket {
+        if record.cfg.bucket() != target_bucket {
             continue;
         }
         match unique_bucket_cfg.as_ref() {
@@ -592,4 +581,106 @@ async fn retrieve_s3_config_for_path_async(path: &str) -> Result<Option<S3StoreC
 
 pub(crate) fn retrieve_s3_config_for_path(path: &str) -> Result<Option<S3StoreConfig>, String> {
     data_block_on(retrieve_s3_config_for_path_async(path))?
+}
+
+use novarocks::connector::starrocks::ports::StarletMetadataProvider;
+use novarocks::service::grpc_server::StarletControl;
+use prost::Message;
+
+pub(crate) fn starlet_metadata_provider() -> std::sync::Arc<dyn StarletMetadataProvider> {
+    starlet_metadata_adapter()
+}
+
+pub(crate) fn starlet_metadata_adapter() -> std::sync::Arc<CompatStarletMetadataProvider> {
+    std::sync::Arc::new(CompatStarletMetadataProvider)
+}
+
+pub(crate) struct CompatStarletMetadataProvider;
+
+impl StarletMetadataProvider for CompatStarletMetadataProvider {
+    fn retrieve_shard_infos(
+        &self,
+        tablet_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, StarletShardInfo>, String> {
+        retrieve_shard_infos(tablet_ids)
+    }
+
+    fn retrieve_s3_config_for_path(&self, path: &str) -> Result<Option<S3StoreConfig>, String> {
+        retrieve_s3_config_for_path(path)
+    }
+}
+
+impl StarletControl for CompatStarletMetadataProvider {
+    fn parse_file_path_s3_profile(
+        &self,
+        encoded_file_path: &[u8],
+    ) -> Result<Option<S3StoreConfig>, String> {
+        let path_info = staros::FilePathInfo::decode(encoded_file_path)
+            .map_err(|error| format!("decode StarOS FilePathInfo failed: {error}"))?;
+        parse_s3_config_from_file_path_info(&path_info)
+    }
+
+    fn observe_service(&self, service_id: &str) {
+        observe_starlet_service(service_id);
+    }
+
+    fn observe_heartbeat(
+        &self,
+        leader_addr: &str,
+        service_id: &str,
+        worker_group_id: u64,
+        worker_id: u64,
+    ) {
+        observe_starlet_heartbeat(leader_addr, service_id, worker_group_id, worker_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_decodes_add_shard_s3_profile_from_opaque_wire_bytes() {
+        let path_info = staros::FilePathInfo {
+            fs_info: Some(staros::FileStoreInfo {
+                fs_type: staros::FileStoreType::S3 as i32,
+                s3_fs_info: Some(staros::S3FileStoreInfo {
+                    bucket: "lake".to_string(),
+                    region: "us-east-1".to_string(),
+                    endpoint: "http://minio:9000".to_string(),
+                    credential: Some(staros::AwsCredentialInfo {
+                        credential: Some(
+                            staros::aws_credential_info::Credential::SimpleCredential(
+                                staros::AwsSimpleCredentialInfo {
+                                    access_key: "access".to_string(),
+                                    access_key_secret: "secret".to_string(),
+                                    encrypted: false,
+                                },
+                            ),
+                        ),
+                    }),
+                    path_prefix: "warehouse".to_string(),
+                    partitioned_prefix_enabled: false,
+                    num_partitioned_prefix: 0,
+                    path_style_access: 1,
+                }),
+                ..Default::default()
+            }),
+            full_path: "s3://lake/warehouse/tablet-1".to_string(),
+            ..Default::default()
+        };
+
+        let control = CompatStarletMetadataProvider;
+        let profile = control
+            .parse_file_path_s3_profile(&path_info.encode_to_vec())
+            .expect("decode wire profile")
+            .expect("S3 profile");
+
+        assert_eq!(profile.endpoint(), "http://minio:9000");
+        assert_eq!(profile.bucket(), "lake");
+        assert_eq!(profile.access_key_id(), "access");
+        assert_eq!(profile.access_key_secret(), "secret");
+        assert_eq!(profile.region(), Some("us-east-1"));
+        assert_eq!(profile.enable_path_style_access(), Some(true));
+    }
 }

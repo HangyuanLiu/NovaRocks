@@ -41,6 +41,7 @@ pub(crate) mod provider;
 pub(crate) mod refresh_pin_adapter;
 pub(crate) mod scan_adapter;
 pub(crate) mod schema_adapter;
+pub(crate) mod schema_payload;
 pub(crate) mod txn;
 
 pub(crate) use catalog::{

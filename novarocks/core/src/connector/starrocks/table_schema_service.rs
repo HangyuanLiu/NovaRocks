@@ -21,29 +21,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use moka::sync::Cache;
 
 use crate::common::config;
-use crate::common::types::UniqueId;
-use crate::connector::starrocks::lake::schema_adapter::build_lake_scan_table_schema_from_thrift;
+use crate::connector::starrocks::ports::{
+    ConnectorWireError, ConnectorWireErrorKind, TableSchemaProvider, TableSchemaRequest,
+    TableSchemaRequestSource,
+};
 use crate::connector::starrocks::schema::LakeScanTableSchema;
-use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::service::disk_report;
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::thrift::agent_service::TTabletSchema;
-use crate::thrift::frontend_service;
-use crate::thrift::status::TStatus;
-use crate::thrift::status_code;
-use crate::thrift::types;
-
-#[derive(Clone, Debug)]
-pub(crate) struct TableSchemaFetchRequest {
-    pub(crate) fe_addr: types::TNetworkAddress,
-    pub(crate) db_id: i64,
-    pub(crate) table_id: i64,
-    pub(crate) schema_id: i64,
-    pub(crate) source: frontend_service::TTableSchemaRequestSource,
-    pub(crate) tablet_id: Option<i64>,
-    pub(crate) query_id: Option<types::TUniqueId>,
-    pub(crate) txn_id: Option<i64>,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct TableSchemaCacheKey {
@@ -52,58 +34,8 @@ struct TableSchemaCacheKey {
     schema_id: i64,
 }
 
-#[derive(Clone, Debug)]
-struct TableSchemaError {
-    kind: TableSchemaErrorKind,
-    message: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TableSchemaErrorKind {
-    Transport,
-    TableNotFound,
-    Other,
-}
-
-impl TableSchemaError {
-    fn other(message: impl Into<String>) -> Self {
-        Self {
-            kind: TableSchemaErrorKind::Other,
-            message: message.into(),
-        }
-    }
-
-    fn table_not_found(message: impl Into<String>) -> Self {
-        Self {
-            kind: TableSchemaErrorKind::TableNotFound,
-            message: message.into(),
-        }
-    }
-
-    fn is_transport(&self) -> bool {
-        self.kind == TableSchemaErrorKind::Transport
-    }
-
-    fn is_table_not_found(&self) -> bool {
-        self.kind == TableSchemaErrorKind::TableNotFound
-    }
-}
-
-impl From<FrontendRpcError> for TableSchemaError {
-    fn from(value: FrontendRpcError) -> Self {
-        if value.is_transport() {
-            Self {
-                kind: TableSchemaErrorKind::Transport,
-                message: value.to_string(),
-            }
-        } else {
-            Self::other(value.to_string())
-        }
-    }
-}
-
 pub(crate) struct TableSchemaService {
-    cache: Cache<TableSchemaCacheKey, TTabletSchema>,
+    cache: Cache<TableSchemaCacheKey, LakeScanTableSchema>,
     flights: SingleFlightGroup,
     max_retries: usize,
 }
@@ -126,20 +58,19 @@ impl TableSchemaService {
 
     pub(crate) fn fetch(
         &self,
-        request: TableSchemaFetchRequest,
-        local_schema: Option<&TTabletSchema>,
-    ) -> Result<TTabletSchema, String> {
-        self.fetch_with_loader(request, local_schema, |request| self.fetch_remote(request))
+        request: TableSchemaRequest,
+        provider: &dyn TableSchemaProvider,
+    ) -> Result<LakeScanTableSchema, String> {
+        self.fetch_with_loader(request, |request| provider.fetch_table_schema(request))
     }
 
     fn fetch_with_loader<F>(
         &self,
-        request: TableSchemaFetchRequest,
-        local_schema: Option<&TTabletSchema>,
+        request: TableSchemaRequest,
         mut load_remote: F,
-    ) -> Result<TTabletSchema, String>
+    ) -> Result<LakeScanTableSchema, String>
     where
-        F: FnMut(&TableSchemaFetchRequest) -> Result<TTabletSchema, TableSchemaError>,
+        F: FnMut(&TableSchemaRequest) -> Result<LakeScanTableSchema, ConnectorWireError>,
     {
         validate_request(&request)?;
         let cache_key = TableSchemaCacheKey {
@@ -148,26 +79,11 @@ impl TableSchemaService {
             schema_id: request.schema_id,
         };
 
-        if let Some(schema) = local_schema.filter(|schema| schema.id == Some(request.schema_id)) {
-            tracing::debug!(
-                target: "novarocks::schema",
-                event = "local_hit",
-                fe_addr = %format_addr(&request.fe_addr),
-                db_id = request.db_id,
-                table_id = request.table_id,
-                schema_id = request.schema_id,
-                source = %source_label(request.source),
-                "Resolved table schema from local metadata"
-            );
-            self.cache.insert(cache_key, schema.clone());
-            return Ok(schema.clone());
-        }
-
         if let Some(schema) = self.cache.get(&cache_key) {
             tracing::debug!(
                 target: "novarocks::schema",
                 event = "cache_hit",
-                fe_addr = %format_addr(&request.fe_addr),
+                fe_addr = %format_addr(&request.endpoint),
                 db_id = request.db_id,
                 table_id = request.table_id,
                 schema_id = request.schema_id,
@@ -185,7 +101,7 @@ impl TableSchemaService {
                 tracing::debug!(
                     target: "novarocks::schema",
                     event = "isolated_retry",
-                    fe_addr = %format_addr(&request.fe_addr),
+                    fe_addr = %format_addr(&request.endpoint),
                     db_id = request.db_id,
                     table_id = request.table_id,
                     schema_id = request.schema_id,
@@ -199,7 +115,7 @@ impl TableSchemaService {
                 tracing::debug!(
                     target: "novarocks::schema",
                     event = "singleflight_shared",
-                    fe_addr = %format_addr(&request.fe_addr),
+                    fe_addr = %format_addr(&request.endpoint),
                     db_id = request.db_id,
                     table_id = request.table_id,
                     schema_id = request.schema_id,
@@ -214,11 +130,16 @@ impl TableSchemaService {
                     self.cache.insert(cache_key, schema.clone());
                     return Ok(schema);
                 }
-                Err(err) if err.is_transport() || err.is_table_not_found() => {
-                    return Err(err.message);
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ConnectorWireErrorKind::Transport | ConnectorWireErrorKind::NotFound
+                    ) =>
+                {
+                    return Err(err.to_string());
                 }
                 Err(err) => {
-                    last_error = Some(err.message);
+                    last_error = Some(err.to_string());
                 }
             }
         }
@@ -227,78 +148,16 @@ impl TableSchemaService {
             "FE getTableSchema failed without a terminal error message".to_string()
         }))
     }
-
-    fn fetch_remote(
-        &self,
-        request: &TableSchemaFetchRequest,
-    ) -> Result<TTabletSchema, TableSchemaError> {
-        let rpc_request = frontend_service::TBatchGetTableSchemaRequest {
-            requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-                schema_key: Some(crate::thrift::descriptors::TTableSchemaKey {
-                    db_id: Some(request.db_id),
-                    table_id: Some(request.table_id),
-                    schema_id: Some(request.schema_id),
-                }),
-                source: Some(request.source),
-                tablet_id: request.tablet_id,
-                query_id: request.query_id.clone(),
-                txn_id: request.txn_id,
-            }]),
-        };
-        let response = FrontendRpcManager::shared()
-            .call(FrontendRpcKind::SchemaMeta, &request.fe_addr, |client| {
-                client
-                    .get_table_schema(rpc_request.clone())
-                    .map_err(FrontendRpcError::from_thrift)
-            })
-            .map_err(TableSchemaError::from)?;
-
-        let top_status = response.status.as_ref().ok_or_else(|| {
-            TableSchemaError::other("FE getTableSchema returned empty top-level status")
-        })?;
-        ensure_ok_status(
-            top_status,
-            "FE getTableSchema returned non-OK top-level status",
-        )?;
-
-        let mut responses = response.responses.unwrap_or_default();
-        if responses.len() != 1 {
-            return Err(TableSchemaError::other(format!(
-                "FE getTableSchema returned unexpected response count: expected=1 actual={}",
-                responses.len()
-            )));
-        }
-        let item = responses
-            .pop()
-            .ok_or_else(|| TableSchemaError::other("FE getTableSchema returned empty responses"))?;
-        let item_status = item.status.as_ref().ok_or_else(|| {
-            TableSchemaError::other("FE getTableSchema response item missing status")
-        })?;
-        ensure_ok_status(
-            item_status,
-            "FE getTableSchema response item returned non-OK",
-        )?;
-        item.schema.ok_or_else(|| {
-            TableSchemaError::other("FE getTableSchema response item missing schema")
-        })
-    }
-}
-
-fn scan_frontend_transport_address(
-    fe_addr: Option<&RuntimeEndpoint>,
-) -> Option<types::TNetworkAddress> {
-    fe_addr
-        .map(|endpoint| types::TNetworkAddress::new(endpoint.host().to_string(), endpoint.port()))
-        .or_else(disk_report::latest_fe_addr)
 }
 
 pub(crate) fn fetch_table_schema_for_lake_scan(
-    fe_addr: Option<&RuntimeEndpoint>,
+    provider: Option<&dyn TableSchemaProvider>,
+    endpoint: Option<&crate::runtime::endpoint::RuntimeEndpoint>,
     db_id: i64,
     table_id: i64,
     schema_id: i64,
     tablet_id: Option<i64>,
-    query_id: Option<UniqueId>,
+    query_id: Option<crate::common::types::UniqueId>,
 ) -> Result<LakeScanTableSchema, String> {
     let query_id = query_id.ok_or_else(|| {
         format!(
@@ -306,27 +165,30 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
             db_id, table_id, schema_id
         )
     })?;
-    let fe_addr = scan_frontend_transport_address(fe_addr).ok_or_else(|| {
-        "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
-            .to_string()
+    let provider = provider.ok_or_else(|| {
+        "StarRocks table schema capability is unavailable for this fragment".to_string()
     })?;
-    let schema = TableSchemaService::shared().fetch(
-        TableSchemaFetchRequest {
-            fe_addr,
+    let endpoint = endpoint
+        .ok_or_else(|| "missing FE address for getTableSchema (coord is absent)".to_string())?;
+    TableSchemaService::shared().fetch(
+        TableSchemaRequest {
+            endpoint: crate::connector::starrocks::ports::FrontendEndpoint {
+                host: endpoint.host().to_string(),
+                port: endpoint.port(),
+            },
             db_id,
             table_id,
             schema_id,
-            source: frontend_service::TTableSchemaRequestSource::SCAN,
+            source: TableSchemaRequestSource::Scan,
             tablet_id,
-            query_id: Some(types::TUniqueId::new(query_id.hi, query_id.lo)),
+            query_id: Some(query_id),
             txn_id: None,
         },
-        None,
-    )?;
-    build_lake_scan_table_schema_from_thrift(&schema)
+        provider,
+    )
 }
 
-fn validate_request(request: &TableSchemaFetchRequest) -> Result<(), String> {
+fn validate_request(request: &TableSchemaRequest) -> Result<(), String> {
     if request.schema_id <= 0 {
         return Err(format!(
             "invalid schema_id for FE getTableSchema: db_id={} table_id={} schema_id={}",
@@ -334,7 +196,7 @@ fn validate_request(request: &TableSchemaFetchRequest) -> Result<(), String> {
         ));
     }
     match request.source {
-        frontend_service::TTableSchemaRequestSource::SCAN => {
+        TableSchemaRequestSource::Scan => {
             if request.query_id.is_none() {
                 return Err(format!(
                     "missing query_id for FE getTableSchema scan request: db_id={} table_id={} schema_id={}",
@@ -342,7 +204,7 @@ fn validate_request(request: &TableSchemaFetchRequest) -> Result<(), String> {
                 ));
             }
         }
-        frontend_service::TTableSchemaRequestSource::LOAD => {
+        TableSchemaRequestSource::Load => {
             if request.txn_id.is_none() {
                 return Err(format!(
                     "missing txn_id for FE getTableSchema load request: db_id={} table_id={} schema_id={}",
@@ -350,58 +212,15 @@ fn validate_request(request: &TableSchemaFetchRequest) -> Result<(), String> {
                 ));
             }
         }
-        _ => {
-            return Err(format!(
-                "unsupported table schema request source: {}",
-                request.source.0
-            ));
-        }
     }
     Ok(())
 }
 
-fn ensure_ok_status(status: &TStatus, context: &str) -> Result<(), TableSchemaError> {
-    if status.status_code == status_code::TStatusCode::OK {
-        return Ok(());
-    }
-    let detail = status
-        .error_msgs
-        .as_ref()
-        .map(|msgs| msgs.join("; "))
-        .unwrap_or_default();
-    let message = if detail.is_empty() {
-        format!("{context}: {:?}", status)
-    } else {
-        format!("{context}: status={:?}, error={detail}", status.status_code)
-    };
-    if is_table_not_found_status(status) {
-        Err(TableSchemaError::table_not_found(message))
-    } else {
-        Err(TableSchemaError::other(message))
-    }
-}
-
-fn is_table_not_found_status(status: &TStatus) -> bool {
-    if status.status_code == status_code::TStatusCode::NOT_FOUND {
-        return true;
-    }
-    status
-        .error_msgs
-        .as_ref()
-        .map(|msgs| {
-            msgs.iter().any(|msg| {
-                let lower = msg.to_ascii_lowercase();
-                lower.contains("table") && lower.contains("not found")
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn build_flight_key(request: &TableSchemaFetchRequest, isolated_retry: bool) -> String {
+fn build_flight_key(request: &TableSchemaRequest, isolated_retry: bool) -> String {
     if !isolated_retry {
         return format!(
             "shared:{}:{}:{}:{}:{}",
-            format_addr(&request.fe_addr),
+            format_addr(&request.endpoint),
             request.db_id,
             request.table_id,
             request.schema_id,
@@ -409,7 +228,7 @@ fn build_flight_key(request: &TableSchemaFetchRequest, isolated_retry: bool) -> 
         );
     }
     match request.source {
-        frontend_service::TTableSchemaRequestSource::SCAN => {
+        TableSchemaRequestSource::Scan => {
             let query_id = request
                 .query_id
                 .as_ref()
@@ -417,41 +236,32 @@ fn build_flight_key(request: &TableSchemaFetchRequest, isolated_retry: bool) -> 
                 .unwrap_or_else(|| "missing".to_string());
             format!(
                 "isolated-scan:{}:{}:{}:{}:{}",
-                format_addr(&request.fe_addr),
+                format_addr(&request.endpoint),
                 request.db_id,
                 request.table_id,
                 request.schema_id,
                 query_id
             )
         }
-        frontend_service::TTableSchemaRequestSource::LOAD => format!(
+        TableSchemaRequestSource::Load => format!(
             "isolated-load:{}:{}:{}:{}:{}",
-            format_addr(&request.fe_addr),
+            format_addr(&request.endpoint),
             request.db_id,
             request.table_id,
             request.schema_id,
             request.txn_id.unwrap_or_default()
         ),
-        _ => format!(
-            "isolated-unknown:{}:{}:{}:{}:{}",
-            format_addr(&request.fe_addr),
-            request.db_id,
-            request.table_id,
-            request.schema_id,
-            request.source.0
-        ),
     }
 }
 
-fn format_addr(fe_addr: &types::TNetworkAddress) -> String {
-    format!("{}:{}", fe_addr.hostname, fe_addr.port)
+fn format_addr(endpoint: &crate::connector::starrocks::ports::FrontendEndpoint) -> String {
+    format!("{}:{}", endpoint.host, endpoint.port)
 }
 
-fn source_label(source: frontend_service::TTableSchemaRequestSource) -> &'static str {
+fn source_label(source: TableSchemaRequestSource) -> &'static str {
     match source {
-        frontend_service::TTableSchemaRequestSource::SCAN => "SCAN",
-        frontend_service::TTableSchemaRequestSource::LOAD => "LOAD",
-        _ => "UNKNOWN",
+        TableSchemaRequestSource::Scan => "SCAN",
+        TableSchemaRequestSource::Load => "LOAD",
     }
 }
 
@@ -467,7 +277,7 @@ struct SingleFlightEntry {
 
 enum SingleFlightState {
     Running,
-    Ready(Result<TTabletSchema, TableSchemaError>),
+    Ready(Result<LakeScanTableSchema, ConnectorWireError>),
 }
 
 impl Default for SingleFlightEntry {
@@ -480,9 +290,13 @@ impl Default for SingleFlightEntry {
 }
 
 impl SingleFlightGroup {
-    fn execute<F>(&self, key: String, op: F) -> (Result<TTabletSchema, TableSchemaError>, bool)
+    fn execute<F>(
+        &self,
+        key: String,
+        op: F,
+    ) -> (Result<LakeScanTableSchema, ConnectorWireError>, bool)
     where
-        F: FnOnce() -> Result<TTabletSchema, TableSchemaError>,
+        F: FnOnce() -> Result<LakeScanTableSchema, ConnectorWireError>,
     {
         let (entry, shared) = {
             let mut guard = self.entries.lock().expect("table schema flights lock");
@@ -521,5 +335,76 @@ impl SingleFlightGroup {
             guard.remove(&key);
         }
         (result, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::connector::starrocks::ports::FrontendEndpoint;
+
+    struct RecordingProvider {
+        calls: AtomicUsize,
+    }
+
+    impl TableSchemaProvider for RecordingProvider {
+        fn fetch_table_schema(
+            &self,
+            _request: &TableSchemaRequest,
+        ) -> Result<LakeScanTableSchema, ConnectorWireError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(LakeScanTableSchema::default())
+        }
+    }
+
+    fn scan_request() -> TableSchemaRequest {
+        TableSchemaRequest {
+            endpoint: FrontendEndpoint {
+                host: "fe-1".to_string(),
+                port: 9020,
+            },
+            db_id: 1,
+            table_id: 2,
+            schema_id: 3,
+            source: TableSchemaRequestSource::Scan,
+            tablet_id: Some(4),
+            query_id: Some(crate::common::types::UniqueId { hi: 5, lo: 6 }),
+            txn_id: None,
+        }
+    }
+
+    #[test]
+    fn cache_hit_does_not_call_table_schema_provider_again() {
+        let service = TableSchemaService::new();
+        let provider = RecordingProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        service
+            .fetch(scan_request(), &provider)
+            .expect("first provider fetch");
+        service
+            .fetch(scan_request(), &provider)
+            .expect("cached schema fetch");
+
+        assert_eq!(provider.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn unavailable_provider_error_is_terminal() {
+        let service = TableSchemaService::new();
+        let provider = |_request: &TableSchemaRequest| {
+            Err(ConnectorWireError::new(
+                ConnectorWireErrorKind::Unavailable,
+                "StarRocks table schema capability is unavailable",
+            ))
+        };
+
+        let error = service
+            .fetch_with_loader(scan_request(), provider)
+            .expect_err("unavailable provider must fail");
+        assert_eq!(error, "StarRocks table schema capability is unavailable");
     }
 }

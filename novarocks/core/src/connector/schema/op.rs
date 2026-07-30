@@ -33,14 +33,6 @@ use super::be_compaction_stats_store;
 use super::be_tablet_write_log_store;
 use super::be_txn_store;
 use super::chunk_builder::{SchemaRow, SchemaValue, build_chunk, normalize_column_key};
-#[cfg(feature = "compat")]
-use super::fe_tables;
-#[cfg(feature = "compat")]
-use super::frontend;
-#[cfg(feature = "compat")]
-use super::load_tracking_logs;
-#[cfg(feature = "compat")]
-use super::loads;
 use super::{BeSchemaTable, SchemaScanContext, SchemaTable};
 
 const DEFAULT_CHUNK_ROWS: usize = 4096;
@@ -52,6 +44,7 @@ pub(crate) struct SchemaScanOp {
     output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
     fe_addr: Option<RuntimeEndpoint>,
+    schema_load_provider: Option<Arc<dyn super::SchemaLoadProvider>>,
 }
 
 impl SchemaScanOp {
@@ -61,6 +54,7 @@ impl SchemaScanOp {
         output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
         fe_addr: Option<RuntimeEndpoint>,
+        schema_load_provider: Option<Arc<dyn super::SchemaLoadProvider>>,
     ) -> Self {
         Self {
             table,
@@ -68,19 +62,28 @@ impl SchemaScanOp {
             output_chunk_schema,
             should_scan,
             fe_addr,
+            schema_load_provider,
         }
     }
 
     fn collect_rows(&self) -> Result<Vec<SchemaRow>, String> {
-        #[cfg(feature = "compat")]
-        let fe_addr = frontend::transport_address(self.fe_addr.as_ref());
         let mut rows = match &self.table {
             #[cfg(feature = "compat")]
-            SchemaTable::Loads => loads::fetch_rows(&self.context, fe_addr.as_ref())?,
+            SchemaTable::Loads => self
+                .schema_load_provider
+                .as_ref()
+                .ok_or_else(|| {
+                    "StarRocks schema-load capability is unavailable for this fragment".to_string()
+                })?
+                .fetch_load_rows(&self.context, self.fe_addr.as_ref())?,
             #[cfg(feature = "compat")]
-            SchemaTable::LoadTrackingLogs => {
-                load_tracking_logs::fetch_rows(&self.context, fe_addr.as_ref())?
-            }
+            SchemaTable::LoadTrackingLogs => self
+                .schema_load_provider
+                .as_ref()
+                .ok_or_else(|| {
+                    "StarRocks schema-load capability is unavailable for this fragment".to_string()
+                })?
+                .fetch_tracking_load_log_rows(&self.context, self.fe_addr.as_ref())?,
             #[cfg(feature = "compat")]
             SchemaTable::AnalyzeStatus
             | SchemaTable::CharacterSets
@@ -132,9 +135,13 @@ impl SchemaScanOp {
             | SchemaTable::SchemaPrivileges
             | SchemaTable::GrantsToRoles
             | SchemaTable::GrantsToUsers
-            | SchemaTable::RoleEdges => {
-                fe_tables::fetch_rows(&self.table, &self.context, fe_addr.as_ref())?
-            }
+            | SchemaTable::RoleEdges => self
+                .schema_load_provider
+                .as_ref()
+                .ok_or_else(|| {
+                    "StarRocks schema-table capability is unavailable for this fragment".to_string()
+                })?
+                .fetch_fe_table_rows(&self.table, &self.context, self.fe_addr.as_ref())?,
             SchemaTable::Be(BeSchemaTable::TabletWriteLog) => {
                 be_tablet_write_log_store::snapshot(&self.context)
                     .into_iter()
@@ -690,6 +697,7 @@ pub(crate) struct SchemaScanSource {
     context: SchemaScanContext,
     output_chunk_schema: ChunkSchemaRef,
     fe_addr: Option<RuntimeEndpoint>,
+    schema_load_provider: Option<Arc<dyn super::SchemaLoadProvider>>,
 }
 
 impl SchemaScanSource {
@@ -698,12 +706,14 @@ impl SchemaScanSource {
         context: SchemaScanContext,
         output_chunk_schema: ChunkSchemaRef,
         fe_addr: Option<RuntimeEndpoint>,
+        schema_load_provider: Option<Arc<dyn super::SchemaLoadProvider>>,
     ) -> Self {
         Self {
             table,
             context,
             output_chunk_schema,
             fe_addr,
+            schema_load_provider,
         }
     }
 }
@@ -720,6 +730,7 @@ impl ScanSource for SchemaScanSource {
             Arc::clone(&self.output_chunk_schema),
             should_scan,
             self.fe_addr.clone(),
+            self.schema_load_provider.clone(),
         )))
     }
 }
@@ -779,6 +790,7 @@ mod tests {
             Arc::new(ChunkSchema::empty()),
             true,
             Some(endpoint),
+            None,
         );
     }
 
@@ -821,6 +833,7 @@ mod tests {
             ctx("be_tablet_write_log"),
             chunk_schema,
             true,
+            None,
             None,
         );
         let mut iter = op
@@ -895,6 +908,7 @@ mod tests {
             ctx("be_tablet_write_log"),
             chunk_schema,
             None,
+            None,
         );
 
         let morsel = || ScanMorsel::Schema {
@@ -943,7 +957,14 @@ mod tests {
         let chunk_schema =
             ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
                 .expect("chunk schema");
-        let op = SchemaScanOp::new(SchemaTable::Loads, ctx("loads"), chunk_schema, true, None);
+        let op = SchemaScanOp::new(
+            SchemaTable::Loads,
+            ctx("loads"),
+            chunk_schema,
+            true,
+            None,
+            None,
+        );
 
         let err = match op.execute_iter(
             ScanMorsel::Schema {

@@ -15,31 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::types::UniqueId;
 use crate::connector::starrocks::schema::{
     StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType, StarRocksScalarType,
     StarRocksStructField, StarRocksTabletIndex, StarRocksTabletSchema, StarRocksTypeDesc,
     StarRocksTypeNode,
 };
 use crate::service::grpc_client::proto::starrocks::{
-    AggStateDescPb, ColumnPb, KeysType, PScalarType, PStructField, PTypeDesc, PTypeNode, PUniqueId,
+    AggStateDescPb, ColumnPb, KeysType, PScalarType, PStructField, PTypeDesc, PTypeNode,
     TabletIndexPb, TabletSchemaPb,
 };
 use prost::Message;
-
-pub(crate) fn encode_unique_id(value: UniqueId) -> PUniqueId {
-    PUniqueId {
-        hi: value.hi,
-        lo: value.lo,
-    }
-}
-
-pub(crate) fn decode_unique_id(value: &PUniqueId) -> UniqueId {
-    UniqueId {
-        hi: value.hi,
-        lo: value.lo,
-    }
-}
 
 pub(crate) fn encode_tablet_schema_bytes(schema: &StarRocksTabletSchema) -> Vec<u8> {
     encode_tablet_schema(schema).encode_to_vec()

@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
@@ -118,6 +119,12 @@ pub struct LakeMetaTabletRequest {
     pub(crate) row_count_hint: Option<i64>,
 }
 
+impl LakeMetaTabletRequest {
+    pub const fn tablet_id(&self) -> i64 {
+        self.tablet_id
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LakeMetaStorageRequest {
     id: u64,
@@ -160,6 +167,38 @@ impl LakeMetaStorageRequest {
             tablets,
             columns,
         }
+    }
+
+    pub const fn table_id(&self) -> i64 {
+        self.table_id
+    }
+
+    pub const fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub const fn db_id(&self) -> i64 {
+        self.db_id
+    }
+
+    pub const fn schema_id(&self) -> i64 {
+        self.schema_id
+    }
+
+    pub fn tablets(&self) -> &[LakeMetaTabletRequest] {
+        &self.tablets
     }
 
     pub fn id(&self) -> u64 {
@@ -228,6 +267,14 @@ impl StarRocksResolvedDependencies {
 
 pub struct StarRocksExternalDependencyDraft {
     frontend_endpoint: Option<RuntimeEndpoint>,
+    table_schema_provider: Option<Arc<dyn crate::connector::starrocks::ports::TableSchemaProvider>>,
+    schema_load_provider: Option<Arc<dyn crate::connector::schema::SchemaLoadProvider>>,
+    sink_frontend_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>>,
+    starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
+    storage_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>>,
     resolved_query_profiles: BTreeMap<String, String>,
     resolved_lake_meta_storage: BTreeMap<u64, LakeMetaStorageFacts>,
     requirements: RefCell<BTreeMap<u64, StarRocksExternalDependency>>,
@@ -244,6 +291,39 @@ impl StarRocksExternalDependencyDraft {
     ) -> Self {
         Self {
             frontend_endpoint,
+            table_schema_provider: None,
+            schema_load_provider: None,
+            sink_frontend_provider: None,
+            starlet_metadata_provider: None,
+            storage_metadata_provider: None,
+            resolved_query_profiles,
+            resolved_lake_meta_storage: BTreeMap::new(),
+            requirements: RefCell::new(BTreeMap::new()),
+            query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
+            query_profile_patches: RefCell::new(Vec::new()),
+            #[cfg(feature = "compat")]
+            lake_meta_values_patches: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn new_with_table_schema_provider(
+        frontend_endpoint: Option<RuntimeEndpoint>,
+        resolved_query_profiles: BTreeMap<String, String>,
+        table_schema_provider: Option<
+            Arc<dyn crate::connector::starrocks::ports::TableSchemaProvider>,
+        >,
+        schema_load_provider: Option<Arc<dyn crate::connector::schema::SchemaLoadProvider>>,
+        sink_frontend_provider: Option<
+            Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>,
+        >,
+    ) -> Self {
+        Self {
+            frontend_endpoint,
+            table_schema_provider,
+            schema_load_provider,
+            sink_frontend_provider,
+            starlet_metadata_provider: None,
+            storage_metadata_provider: None,
             resolved_query_profiles,
             resolved_lake_meta_storage: BTreeMap::new(),
             requirements: RefCell::new(BTreeMap::new()),
@@ -261,6 +341,11 @@ impl StarRocksExternalDependencyDraft {
     ) -> Self {
         Self {
             frontend_endpoint,
+            table_schema_provider: None,
+            schema_load_provider: None,
+            sink_frontend_provider: None,
+            starlet_metadata_provider: None,
+            storage_metadata_provider: None,
             resolved_query_profiles,
             resolved_lake_meta_storage,
             requirements: RefCell::new(BTreeMap::new()),
@@ -273,6 +358,56 @@ impl StarRocksExternalDependencyDraft {
 
     pub(crate) fn frontend_endpoint(&self) -> Option<&RuntimeEndpoint> {
         self.frontend_endpoint.as_ref()
+    }
+
+    pub(crate) fn table_schema_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::starrocks::ports::TableSchemaProvider>> {
+        self.table_schema_provider.clone()
+    }
+
+    pub(crate) fn schema_load_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::schema::SchemaLoadProvider>> {
+        self.schema_load_provider.clone()
+    }
+
+    pub(crate) fn sink_frontend_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>> {
+        self.sink_frontend_provider.clone()
+    }
+
+    pub(crate) fn with_starlet_metadata_provider(
+        mut self,
+        starlet_metadata_provider: Option<
+            Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>,
+        >,
+    ) -> Self {
+        self.starlet_metadata_provider = starlet_metadata_provider;
+        self
+    }
+
+    pub(crate) fn starlet_metadata_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>> {
+        self.starlet_metadata_provider.clone()
+    }
+
+    pub(crate) fn with_storage_metadata_provider(
+        mut self,
+        storage_metadata_provider: Option<
+            Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
+        >,
+    ) -> Self {
+        self.storage_metadata_provider = storage_metadata_provider;
+        self
+    }
+
+    pub(crate) fn storage_metadata_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>> {
+        self.storage_metadata_provider.clone()
     }
 
     pub(crate) fn query_profile(&self, query_id: &str) -> Result<String, String> {

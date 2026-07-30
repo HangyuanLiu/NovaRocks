@@ -17,11 +17,20 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::novarocks_logging::{debug, warn};
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
-use crate::thrift::{master_service, status_code, types};
+use crate::thrift::{master_service, types};
+
+/// Temporary RCI-5G seam. Core builds neutral disk facts while compat owns
+/// the FE wire transport and status decoding.
+pub trait DiskReportSender: Send + Sync + 'static {
+    fn send_disk_report(
+        &self,
+        fe_addr: &types::TNetworkAddress,
+        request: &master_service::TReportRequest,
+    ) -> Result<(), String>;
+}
 
 #[derive(Debug, Default)]
 struct ReportState {
@@ -73,6 +82,7 @@ fn hash_path(path: &str) -> i64 {
 }
 
 fn send_report(
+    sender: &dyn DiskReportSender,
     fe_addr: &types::TNetworkAddress,
     backend_host: String,
     be_port: u16,
@@ -111,20 +121,11 @@ fn send_report(
         None,
     );
 
-    let result = FrontendRpcManager::shared()
-        .call(FrontendRpcKind::Control, fe_addr, |client| {
-            client
-                .report(request.clone())
-                .map_err(FrontendRpcError::from_thrift)
-        })
-        .map_err(|e| e.to_string())?;
-    if result.status.status_code != status_code::TStatusCode::OK {
-        return Err(format!("FE returned error: {:?}", result.status));
-    }
-    Ok(())
+    sender.send_disk_report(fe_addr, &request)
 }
 
 pub(crate) fn maybe_report_disks(
+    sender: Arc<dyn DiskReportSender>,
     fe_addr: &types::TNetworkAddress,
     backend_host: String,
     be_port: u16,
@@ -158,7 +159,7 @@ pub(crate) fn maybe_report_disks(
     drop(guard);
 
     std::thread::spawn(move || {
-        let result = send_report(&fe_addr, backend_host, be_port, http_port);
+        let result = send_report(sender.as_ref(), &fe_addr, backend_host, be_port, http_port);
         let mut guard = state().lock().expect("disk report state lock");
         guard.in_flight = false;
         guard.reported = result.is_ok();
@@ -170,7 +171,7 @@ pub(crate) fn maybe_report_disks(
     });
 }
 
-pub(crate) fn latest_fe_addr() -> Option<types::TNetworkAddress> {
+pub fn latest_fe_addr() -> Option<types::TNetworkAddress> {
     let guard = state().lock().ok()?;
     guard.fe_addr.clone()
 }

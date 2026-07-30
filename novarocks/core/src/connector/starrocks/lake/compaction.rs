@@ -195,6 +195,7 @@ fn compact_one_tablet(
                 tablet_root_path: tablet_root_path.clone(),
                 tablet_schema: tablet_schema.clone(),
                 s3_config,
+                storage_metadata_provider: None,
                 partial_update: Default::default(),
             };
             let new_rowset = build_rowset_for_upsert_batch(

@@ -4,11 +4,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::frontend_rpc;
 use novarocks::UniqueId;
 use novarocks::common::config;
 use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::query_context::QueryId;
-use novarocks::service::frontend_rpc;
 use novarocks::thrift::{frontend_service, status, status_code, types};
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;

@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 
-use crate::connector::starrocks::lake::storage_schema_wire::decode_unique_id;
 use crate::connector::starrocks::lake::txn_log::{
     read_combined_txn_log_if_exists, read_txn_log_if_exists,
 };
@@ -44,7 +43,10 @@ pub(crate) fn load_txn_logs_for_publish(
         let mut logs = Vec::with_capacity(txn_info.load_ids.len());
         let mut seen_paths = HashSet::with_capacity(txn_info.load_ids.len());
         for load_id in &txn_info.load_ids {
-            let load_id = decode_unique_id(load_id);
+            let load_id = crate::common::types::UniqueId {
+                hi: load_id.hi,
+                lo: load_id.lo,
+            };
             let path =
                 txn_log_file_path_with_load_id(tablet_root_path, tablet_id, txn_id, &load_id)?;
             if !seen_paths.insert(path.clone()) {

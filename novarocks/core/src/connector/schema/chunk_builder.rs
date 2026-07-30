@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum SchemaValue {
+pub enum SchemaValue {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
@@ -36,9 +36,9 @@ pub(crate) enum SchemaValue {
     TimestampMicrosecond(i64),
 }
 
-pub(crate) type SchemaRow = HashMap<String, SchemaValue>;
+pub type SchemaRow = HashMap<String, SchemaValue>;
 
-pub(crate) fn normalize_column_key(name: &str) -> String {
+pub fn normalize_column_key(name: &str) -> String {
     name.trim().to_ascii_uppercase()
 }
 

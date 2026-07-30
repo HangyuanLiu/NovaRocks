@@ -15,19 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::build_native_object_store_profile_from_properties;
-use crate::connector::starrocks::fe_v2_meta::{
-    LakeTableIdentity, lake_scan_object_store_properties, resolve_tablet_paths_for_lake_meta_scan,
-};
+use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::connector::starrocks::schema::{StarRocksColumnSchema, StarRocksTabletSchema};
 use crate::formats::starrocks::metadata::{
-    StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
+    StarRocksTabletSnapshot, load_bundle_segment_footers,
+    load_tablet_snapshot_with_metadata_provider,
 };
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
@@ -40,25 +39,15 @@ struct LoadedTabletSnapshot {
     snapshot: StarRocksTabletSnapshot,
 }
 
-pub fn resolve_lake_meta_storage(
+/// Materializes lake-meta facts through the compat-owned storage wire codec.
+/// The core kernel still owns object-store reads and Arrow materialization, but
+/// does not parse StarRocks storage protobuf in this path.
+pub fn materialize_lake_meta_storage_with_metadata_provider(
     request: &LakeMetaStorageRequest,
+    tablet_paths: &HashMap<i64, String>,
+    properties: &BTreeMap<String, String>,
+    metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<LakeMetaStorageFacts, String> {
-    let table = LakeTableIdentity {
-        catalog: request.catalog.clone(),
-        db_name: request.db_name.clone(),
-        table_name: request.table_name.clone(),
-        db_id: request.db_id,
-        table_id: request.table_id,
-        schema_id: request.schema_id,
-    };
-    let tablet_ids = request
-        .tablets
-        .iter()
-        .map(|tablet| tablet.tablet_id)
-        .collect::<Vec<_>>();
-    let tablet_paths =
-        resolve_tablet_paths_for_lake_meta_scan(Some(request.query_id), &table, &tablet_ids)?;
-    let properties = lake_scan_object_store_properties(&tablet_paths)?;
     let object_store_profile = build_native_object_store_profile_from_properties(&properties)?;
 
     let mut total_rows = 0u128;
@@ -72,12 +61,14 @@ pub fn resolve_lake_meta_storage(
         })?;
         let should_load_snapshot = !request.columns.is_empty() || tablet.row_count_hint.is_none();
         if should_load_snapshot {
-            match load_tablet_snapshot(
+            let snapshot = load_tablet_snapshot_with_metadata_provider(
                 tablet.tablet_id,
                 tablet.version,
                 tablet_root_path,
                 object_store_profile.as_ref(),
-            ) {
+                metadata_provider,
+            );
+            match snapshot {
                 Ok(snapshot) => {
                     total_rows = total_rows
                         .checked_add(u128::from(snapshot.total_num_rows))

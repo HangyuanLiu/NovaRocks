@@ -22,9 +22,9 @@ use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError,
     ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReadSelector,
-    ConnectorReaderMetricsSnapshot, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-    ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead, ConnectorReaderMetricsSnapshot,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
 use super::runtime::{
@@ -32,11 +32,8 @@ use super::runtime::{
     ConnectorSplitAppend, IncrementalConnectorSplitAdapter,
 };
 use crate::common::ids::SlotId;
-use crate::connector::file_execution::FileScanRange;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::exec::node::scan::{
-    BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanOp, ScanSource,
-};
+use crate::exec::node::scan::{BoundScanRanges, IncrementalScanRange, ScanMorsel, ScanSource};
 
 struct FakeReader {
     batches: Vec<Result<Option<RecordBatch>, ConnectorError>>,
@@ -555,4 +552,54 @@ fn incremental_connector_source_does_not_commit_a_rejected_append() {
     op.build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])
         .expect_err("duplicate split IDs must fail");
     assert_eq!(*commit_calls.lock().expect("commit calls"), 0);
+}
+
+#[test]
+fn connector_storage_tablet_split_preserves_tablet_sidecar() {
+    let instance_id = ConnectorInstanceId::parse("test.storage-tablet").expect("instance ID");
+    let instance = Arc::new(
+        ConnectorInstance::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            None,
+            Arc::new(FakeRead {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .expect("connector instance"),
+    );
+    let source = ConnectorReadScanSource::new_scheduled(
+        instance,
+        vec![ConnectorScheduledSplit::storage_tablet(
+            ConnectorSplit::try_new(
+                instance_id,
+                "storage-tablet-0",
+                bytes::Bytes::new(),
+                Some(1),
+            )
+            .expect("split"),
+            42,
+        )],
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            batch: ConnectorBatchBudget {
+                max_rows: std::num::NonZeroUsize::new(128).expect("rows"),
+                max_bytes: std::num::NonZeroUsize::new(1024).expect("bytes"),
+            },
+            context: request_context(),
+        },
+        chunk_schema(),
+    );
+    let op = source.bind(BoundScanRanges::None).expect("bind source");
+    let morsel = op.build_morsels().expect("morsel").morsels.remove(0);
+    assert!(matches!(
+        morsel,
+        ScanMorsel::ConnectorSplit { index: 0, .. }
+    ));
+    assert_eq!(
+        op.storage_tablet_id(&morsel).expect("tablet sidecar"),
+        Some(42)
+    );
 }

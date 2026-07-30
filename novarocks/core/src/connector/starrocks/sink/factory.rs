@@ -34,8 +34,10 @@ use crate::connector::starrocks::lake::TabletWriteContext;
 use crate::connector::starrocks::lake::context::{
     AutoIncrementWritePolicy, PartialUpdateWritePolicy, get_tablet_runtime,
 };
+use crate::connector::starrocks::ports::{
+    AutomaticPartitionKey, AutomaticPartitionRequest, AutomaticPartitionResult, SinkFrontendAddress,
+};
 use crate::connector::starrocks::schema::{StarRocksKeysType, StarRocksTabletSchema};
-use crate::connector::starrocks::sink::frontend_wire::create_automatic_partitions;
 use crate::connector::starrocks::sink::operator::{
     OlapSinkFinalizeSharedState, OlapTableSinkOperator,
 };
@@ -43,8 +45,10 @@ use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, build_partition_key_source, build_slot_name_map, resolve_slot_ids_by_names,
 };
 use crate::connector::starrocks::sink::plan::{
-    FrontendAddress, SinkIndexDescriptor, SinkOutputProjectionPlan, SinkPredicatePlan,
-    SinkSchemaDescriptor, SinkSlotDescriptor, StarRocksSinkDescriptor, StarRocksSinkFactoryInput,
+    CreatePartitionResult, FrontendAddress, SinkIndexDescriptor, SinkNodeInfo,
+    SinkOutputProjectionPlan, SinkPartitionEntry, SinkPartitionIndex, SinkPredicatePlan,
+    SinkSchemaDescriptor, SinkSlotDescriptor, SinkTabletLocation, StarRocksSinkDescriptor,
+    StarRocksSinkFactoryInput,
 };
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing_for_index_id};
 use crate::exec::pipeline::operator::Operator;
@@ -90,6 +94,8 @@ pub(crate) struct OlapTableSinkPlan {
     pub(crate) auto_increment_output_slot_id: Option<SlotId>,
     pub(crate) null_expr_in_auto_increment: bool,
     pub(crate) miss_auto_increment_column: bool,
+    pub(crate) starlet_metadata_provider:
+        Option<Arc<dyn crate::connector::starrocks::ports::StarletMetadataProvider>>,
 }
 
 #[derive(Clone)]
@@ -124,6 +130,7 @@ pub(crate) struct AutomaticPartitionPlan {
     pub(crate) txn_id: i64,
     pub(crate) dynamic_overwrite: bool,
     pub(crate) fe_addr: FrontendAddress,
+    pub(crate) frontend_provider: Arc<dyn crate::connector::starrocks::ports::SinkFrontendProvider>,
     pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
     pub(crate) partition_slot_ids: Vec<SlotId>,
@@ -216,7 +223,12 @@ impl OlapTableSinkFactory {
         if all_refs.is_empty() {
             return Err("OLAP_TABLE_SINK resolved empty tablet refs for write targets".to_string());
         }
-        let path_map = resolve_tablet_paths_for_olap_sink(None, &table_identity, &all_refs)?;
+        let path_map = resolve_tablet_paths_for_olap_sink(
+            None,
+            &table_identity,
+            &all_refs,
+            descriptor.starlet_metadata_provider.as_deref(),
+        )?;
         let shard_infos =
             starlet_shard_registry::select_infos(&all_tablets.into_iter().collect::<Vec<_>>());
 
@@ -286,6 +298,7 @@ impl OlapTableSinkFactory {
                             tablet_root_path: tablet_root_path.clone(),
                             tablet_schema: tablet_schema.clone(),
                             s3_config,
+                            storage_metadata_provider: descriptor.storage_metadata_provider.clone(),
                             partial_update: PartialUpdateWritePolicy {
                                 mode: partial_mode.clone(),
                                 merge_condition: merge_condition.clone(),
@@ -347,6 +360,7 @@ impl OlapTableSinkFactory {
             },
             null_expr_in_auto_increment: descriptor.null_expr_in_auto_increment,
             miss_auto_increment_column: descriptor.miss_auto_increment_column,
+            starlet_metadata_provider: descriptor.starlet_metadata_provider.clone(),
         };
 
         Ok(Self {
@@ -389,15 +403,23 @@ fn maybe_create_automatic_partitions_for_literal_insert(
         partition_values = ?partition_values,
         "OLAP_TABLE_SINK attempting FE createPartition for automatic partition"
     );
-    let response = create_automatic_partitions(
-        &fe_addr,
-        descriptor.db_id,
-        descriptor.table_id,
-        descriptor.txn_id,
-        descriptor.dynamic_overwrite,
-        vec![partition_values],
-    )
-    .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
+    let provider = descriptor.frontend_provider.as_ref().ok_or_else(|| {
+        "OLAP_TABLE_SINK automatic partition requires StarRocks FE capability".to_string()
+    })?;
+    let response = provider
+        .create_automatic_partitions(&AutomaticPartitionRequest {
+            frontend: SinkFrontendAddress {
+                host: fe_addr.hostname.clone(),
+                port: fe_addr.port,
+            },
+            db_id: descriptor.db_id,
+            table_id: descriptor.table_id,
+            txn_id: descriptor.txn_id,
+            is_temp: descriptor.dynamic_overwrite,
+            partition_values: vec![partition_values],
+        })
+        .map(automatic_partition_result_from_port)
+        .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
     info!(
         target: "novarocks::starrocks::sink",
         table_id = descriptor.table_id,
@@ -445,6 +467,93 @@ fn maybe_create_automatic_partitions_for_literal_insert(
     }
 
     Ok(())
+}
+
+pub(crate) fn automatic_partition_result_from_port(
+    result: AutomaticPartitionResult,
+) -> CreatePartitionResult {
+    CreatePartitionResult {
+        partitions: result
+            .partitions
+            .into_iter()
+            .map(|partition| SinkPartitionEntry {
+                partition_id: partition.partition_id,
+                is_shadow: partition.is_shadow,
+                indexes: partition
+                    .indexes
+                    .into_iter()
+                    .map(|index| SinkPartitionIndex {
+                        index_id: index.index_id,
+                        tablet_ids: index.tablet_ids,
+                    })
+                    .collect(),
+                start_key: partition
+                    .start_key
+                    .map(automatic_partition_key_list_from_port),
+                end_key: partition
+                    .end_key
+                    .map(automatic_partition_key_list_from_port),
+                in_keys: partition
+                    .in_keys
+                    .into_iter()
+                    .map(automatic_partition_key_list_from_port)
+                    .collect(),
+            })
+            .collect(),
+        tablets: result
+            .tablets
+            .into_iter()
+            .map(|tablet| SinkTabletLocation {
+                tablet_id: tablet.tablet_id,
+                node_ids: tablet.node_ids,
+            })
+            .collect(),
+        nodes: result
+            .nodes
+            .into_iter()
+            .map(|node| SinkNodeInfo {
+                id: node.id,
+                option: node.option,
+            })
+            .collect(),
+    }
+}
+
+fn automatic_partition_key_list_from_port(
+    keys: Vec<AutomaticPartitionKey>,
+) -> Vec<crate::connector::starrocks::sink::partition_key::PartitionKeyValue> {
+    keys
+        .into_iter()
+        .map(|key| match key {
+            AutomaticPartitionKey::Null => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Null
+            }
+            AutomaticPartitionKey::Bool(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Bool(value)
+            }
+            AutomaticPartitionKey::Int(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Int(value)
+            }
+            AutomaticPartitionKey::Date32(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Date32(value)
+            }
+            AutomaticPartitionKey::TimestampMicros(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::TimestampMicros(value)
+            }
+            AutomaticPartitionKey::Decimal { value, scale } => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Decimal {
+                    value,
+                    scale,
+                }
+            }
+            AutomaticPartitionKey::Utf8(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Utf8(value)
+            }
+            AutomaticPartitionKey::Binary(value) => {
+                crate::connector::starrocks::sink::partition_key::PartitionKeyValue::Binary(value)
+            }
+        })
+        .collect()
 }
 
 fn build_auto_partition_plan(
@@ -501,6 +610,12 @@ fn build_auto_partition_plan(
             descriptor.table_id, descriptor.txn_id
         )
     })?;
+    let frontend_provider = descriptor.frontend_provider.clone().ok_or_else(|| {
+        format!(
+            "OLAP_TABLE_SINK automatic partition requires StarRocks FE capability: table_id={} txn_id={}",
+            descriptor.table_id, descriptor.txn_id
+        )
+    })?;
 
     Ok(Some(AutomaticPartitionPlan {
         db_id: descriptor.db_id,
@@ -508,6 +623,7 @@ fn build_auto_partition_plan(
         txn_id: descriptor.txn_id,
         dynamic_overwrite: descriptor.dynamic_overwrite,
         fe_addr,
+        frontend_provider,
         partition_key_source,
         partition_column_names,
         partition_slot_ids,
@@ -756,6 +872,7 @@ fn resolve_auto_increment_write_policy(
         auto_increment_column_name,
         auto_increment_in_sort_key,
         fe_addr: descriptor.frontend.clone(),
+        frontend_provider: descriptor.frontend_provider.clone(),
     })
 }
 
