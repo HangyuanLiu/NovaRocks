@@ -1121,6 +1121,9 @@ fn build_table_payload(
             table.serialized_metadata_rows = Some(rows);
         }
     }
+    let hidden_columns = super::catalog::backend::hidden_internal_column_names_from_metadata(
+        metadata_table.metadata(),
+    );
     let metadata_columns = table_def
         .iceberg_row_lineage_metadata_columns
         .iter()
@@ -1148,6 +1151,7 @@ fn build_table_payload(
         prepared_files,
         explicit_files: None,
         logical_type_columns,
+        hidden_columns,
     })
 }
 
@@ -1162,6 +1166,8 @@ struct TablePayload {
     explicit_files: Option<Vec<IcebergDataFileInfo>>,
     #[serde(default)]
     logical_type_columns: BTreeMap<String, String>,
+    #[serde(default)]
+    hidden_columns: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1270,7 +1276,15 @@ pub(crate) fn load_table_def_at(
             &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
         )?
     };
-    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns);
+    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
+        .into_iter()
+        .filter(|column| {
+            !payload
+                .hidden_columns
+                .iter()
+                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
+        })
+        .collect();
     let table_def = crate::sql::planner::table::TableDef {
         name: payload.table,
         columns,
@@ -1503,6 +1517,7 @@ fn plan_native_iceberg_read_with_file_override(
                 explicit_files: use_explicit_files
                     .then(|| explicit_files.expect("non-empty explicit files").to_vec()),
                 logical_type_columns: BTreeMap::new(),
+                hidden_columns: Vec::new(),
             },
             "table handle",
             context.max_handle_payload_bytes(),
