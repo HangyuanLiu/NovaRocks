@@ -168,9 +168,8 @@ pub(crate) fn execute_delete_statement(
     }
 
     let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &registry,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,
@@ -337,9 +336,8 @@ fn run_delete_dv_write_transaction(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &registry,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,

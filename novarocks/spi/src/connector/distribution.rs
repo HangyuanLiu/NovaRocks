@@ -21,8 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
-    ConnectorProviderId, ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
 };
 
 /// Largest provider-owned declaration accepted by the process binding control
@@ -56,16 +55,17 @@ impl Default for ConnectorInstanceIncarnation {
     }
 }
 
-/// A redacted, bounded declaration used to install the same logical instance
-/// into another BE process before fragment dispatch.
+/// Bounded provider declaration carried only by the execution-binding control
+/// plane. It has no credentials, client, or runtime object and identifies one
+/// exact logical binding generation.
 #[derive(Clone, Eq, PartialEq)]
-pub struct ConnectorInstanceDeclaration {
+pub struct ConnectorExecutionDeclaration {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
     payload: Bytes,
 }
 
-impl ConnectorInstanceDeclaration {
+impl ConnectorExecutionDeclaration {
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
@@ -75,7 +75,7 @@ impl ConnectorInstanceDeclaration {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 format!(
-                    "connector instance declaration payload exceeds {MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES} bytes"
+                    "connector execution declaration payload exceeds {MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES} bytes"
                 ),
             ));
         }
@@ -94,12 +94,17 @@ impl ConnectorInstanceDeclaration {
         self.incarnation
     }
 
+    pub fn binding_key(&self) -> ConnectorExecutionBindingKey {
+        ConnectorExecutionBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        }
+    }
+
     pub fn payload(&self) -> &Bytes {
         &self.payload
     }
 
-    /// Stable content digest for idempotent install comparison. It is safe to
-    /// log this digest; the provider payload itself intentionally is not.
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.descriptor.provider_id.as_str().as_bytes());
@@ -112,37 +117,15 @@ impl ConnectorInstanceDeclaration {
     }
 }
 
-impl fmt::Debug for ConnectorInstanceDeclaration {
+impl fmt::Debug for ConnectorExecutionDeclaration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ConnectorInstanceDeclaration")
+            .debug_struct("ConnectorExecutionDeclaration")
             .field("descriptor", &self.descriptor)
             .field("incarnation", &self.incarnation)
             .field("payload_len", &self.payload.len())
             .finish()
     }
-}
-
-/// Capability of a full/planning instance to describe the corresponding
-/// read-only instance that must be installed into remote BE processes.
-pub trait ConnectorInstanceDistribution: Send + Sync {
-    fn declaration(
-        &self,
-        context: &ConnectorRequestContext,
-    ) -> Result<ConnectorInstanceDeclaration, ConnectorError>;
-}
-
-/// Startup-composed provider factory for a read-only connector instance.
-/// Implementations resolve credentials and clients only from local process
-/// bindings, never from the declaration payload.
-pub trait ConnectorInstanceInstaller: Send + Sync {
-    fn provider_id(&self) -> &ConnectorProviderId;
-
-    fn install(
-        &self,
-        declaration: &ConnectorInstanceDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<ConnectorInstance, ConnectorError>;
 }
 
 #[cfg(test)]
@@ -159,7 +142,7 @@ mod tests {
 
     #[test]
     fn declaration_debug_is_redacted_and_digest_is_stable() {
-        let declaration = ConnectorInstanceDeclaration::try_new(
+        let declaration = ConnectorExecutionDeclaration::try_new(
             descriptor(),
             ConnectorInstanceIncarnation::from_bytes([7; 16]),
             Bytes::from_static(b"secret=must-not-appear"),
@@ -172,7 +155,7 @@ mod tests {
 
     #[test]
     fn declaration_rejects_oversized_payload() {
-        let error = ConnectorInstanceDeclaration::try_new(
+        let error = ConnectorExecutionDeclaration::try_new(
             descriptor(),
             ConnectorInstanceIncarnation::from_bytes([8; 16]),
             Bytes::from(vec![
@@ -183,5 +166,23 @@ mod tests {
         .err()
         .expect("oversized declaration must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn execution_declaration_is_redacted_and_has_a_typed_binding_key() {
+        let declaration = ConnectorExecutionDeclaration::try_new(
+            descriptor(),
+            ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            Bytes::from_static(b"secret=must-not-appear"),
+        )
+        .expect("bounded execution declaration");
+
+        let debug = format!("{declaration:?}");
+        assert!(!debug.contains("must-not-appear"));
+        assert_eq!(
+            declaration.binding_key().instance_id.as_str(),
+            "catalog.analytics"
+        );
+        assert_eq!(declaration.binding_key().incarnation.to_bytes(), [9; 16]);
     }
 }

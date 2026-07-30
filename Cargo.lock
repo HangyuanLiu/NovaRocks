@@ -3265,6 +3265,7 @@ dependencies = [
 name = "novarocks-backend"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks",
  "novarocks-spi",
  "tokio",

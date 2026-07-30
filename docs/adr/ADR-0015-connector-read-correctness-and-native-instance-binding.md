@@ -1,5 +1,5 @@
 ---
-id: ADR-0014
+id: ADR-0015
 title: "Connector-owned read correctness with pre-dispatch native instance binding"
 domain: [provider-spi, distributed-query-lifecycle]
 status: active

@@ -17,7 +17,6 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
-#[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
@@ -25,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::query_execution::artifact::{
-    ConnectorBindingDispatcher, DispatchingConnectorBindingBarrier, PreparedNativeExecutionParts,
+    ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
+    DispatchingConnectorBindingBarrier, PreparedNativeExecutionParts,
     new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
@@ -49,6 +49,9 @@ use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecyc
 use super::query_registry::FrontendQueryRegistry;
 use super::report::FrontendCoordinatorReportHandler;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+use crate::connector::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> QueryId;
@@ -93,11 +96,84 @@ struct TestConnectorBindingDispatcher;
 impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
     fn install(
         &self,
+        _execution_id: QueryExecutionId,
         _backend_idx: usize,
         _endpoint: SocketAddr,
-        _declaration: &novarocks_spi::connector::ConnectorInstanceDeclaration,
+        _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    fn retire(
+        &self,
+        _endpoint: SocketAddr,
+        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct FrontendConnectorBindingInstallObserver {
+    control: Arc<ConnectorControlHost>,
+}
+
+struct GrpcConnectorControlRetirementSink;
+
+impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
+    fn retire(&self, retirement: ConnectorControlRetirement) {
+        let endpoints = retirement
+            .installed_backends
+            .iter()
+            .enumerate()
+            .filter_map(|(index, endpoint)| match endpoint.parse::<SocketAddr>() {
+                Ok(endpoint) => Some((index, endpoint)),
+                Err(error) => {
+                    tracing::warn!(
+                        instance_id = %retirement.key.instance_id.as_str(),
+                        incarnation = ?retirement.key.incarnation,
+                        endpoint = %endpoint,
+                        %error,
+                        "connector control retirement skipped an invalid recorded backend endpoint"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let dispatcher = match new_grpc_connector_binding_dispatcher(&endpoints) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                tracing::warn!(
+                    instance_id = %retirement.key.instance_id.as_str(),
+                    incarnation = ?retirement.key.incarnation,
+                    %error,
+                    "connector execution retirement dispatcher could not be composed"
+                );
+                return;
+            }
+        };
+        for (_, endpoint) in endpoints {
+            if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+                tracing::warn!(
+                    instance_id = %retirement.key.instance_id.as_str(),
+                    incarnation = ?retirement.key.incarnation,
+                    %endpoint,
+                    %error,
+                    "connector execution binding retirement was not acknowledged"
+                );
+            }
+        }
+    }
+}
+
+impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
+    fn installed(
+        &self,
+        endpoint: std::net::SocketAddr,
+        declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
+    ) -> Result<(), String> {
+        self.control
+            .record_installed_backend(&declaration.binding_key(), endpoint.to_string())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -453,6 +529,7 @@ pub struct FrontendDistributedQueryCoordinator {
     runtime_filter_worker_count: NonZeroUsize,
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
+    connector_control: Arc<ConnectorControlHost>,
 }
 
 impl FrontendDistributedQueryCoordinator {
@@ -461,7 +538,9 @@ impl FrontendDistributedQueryCoordinator {
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         backend_topology: novarocks::query_execution::backend::BackendTopologyService,
+        connector_control: Arc<ConnectorControlHost>,
     ) -> Self {
+        connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink));
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
                 advertised_report_host,
@@ -473,6 +552,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(UniqueQueryIdSource::default()),
             registry: Arc::new(FrontendQueryRegistry::default()),
+            connector_control,
         }
     }
 
@@ -523,6 +603,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
+            connector_control: Arc::new(ConnectorControlHost::new()),
         }
     }
 
@@ -556,6 +637,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::default()),
+            connector_control: Arc::new(ConnectorControlHost::new()),
         }
     }
 
@@ -578,6 +660,42 @@ impl FrontendDistributedQueryCoordinator {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.execute_request(request)
+    }
+
+    fn dispatch_ready_connector_retires(&self, dispatcher: &dyn ConnectorBindingDispatcher) {
+        let ready = match self.connector_control.take_ready_retires() {
+            Ok(ready) => ready,
+            Err(error) => {
+                tracing::warn!(error = %error, "connector control retirement queue is unavailable");
+                return;
+            }
+        };
+        for retirement in ready {
+            for endpoint in retirement.installed_backends {
+                let endpoint = match endpoint.parse::<SocketAddr>() {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        tracing::warn!(
+                            instance_id = %retirement.key.instance_id.as_str(),
+                            incarnation = ?retirement.key.incarnation,
+                            endpoint = %endpoint,
+                            %error,
+                            "connector control retirement skipped an invalid recorded backend endpoint"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+                    tracing::warn!(
+                        instance_id = %retirement.key.instance_id.as_str(),
+                        incarnation = ?retirement.key.incarnation,
+                        %endpoint,
+                        %error,
+                        "connector execution binding retirement was not acknowledged"
+                    );
+                }
+            }
+        }
     }
 
     fn execute_request(
@@ -607,6 +725,9 @@ impl FrontendDistributedQueryCoordinator {
         };
         #[cfg(not(test))]
         let backend_services = production_backend_services(parts.topology.targets())?;
+        self.dispatch_ready_connector_retires(
+            backend_services.connector_binding_dispatcher.as_ref(),
+        );
         let dispatcher = Arc::clone(&backend_services.dispatcher);
         let _query = self
             .registry
@@ -657,12 +778,19 @@ impl FrontendDistributedQueryCoordinator {
             self.report_endpoint.resolve()?,
             dispatcher.needs_fragment_status_report() || intent == DistributedQueryIntent::Profile,
         )?;
-        let connector_bindings =
-            DispatchingConnectorBindingBarrier::new(backend_services.connector_binding_dispatcher);
+        let connector_binding_dispatcher =
+            Arc::clone(&backend_services.connector_binding_dispatcher);
+        let connector_bindings = DispatchingConnectorBindingBarrier::with_observer(
+            Arc::clone(&connector_binding_dispatcher),
+            Arc::new(FrontendConnectorBindingInstallObserver {
+                control: Arc::clone(&self.connector_control),
+            }),
+        );
         let execution = scheduled
             .initialize_query(init_options, &lifecycle_barrier)?
             .prepare_connector_bindings(&connector_bindings)?
             .assemble()?;
+        self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
         let PreparedNativeExecutionParts {
             submissions,
             root_fetch,

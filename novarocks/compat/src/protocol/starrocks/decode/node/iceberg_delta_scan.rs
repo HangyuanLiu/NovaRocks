@@ -39,8 +39,8 @@ use novarocks::connector::iceberg::delta::{
     DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
     PositionDeleteSourceData,
 };
-use novarocks::connector::iceberg::{COMPAT_ICEBERG_INSTANCE_ID, build_compat_delta_read_splits};
-use novarocks::connector::runtime::ConnectorReadScanSource;
+use novarocks::connector::iceberg::build_compat_delta_read_splits;
+use novarocks::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
@@ -49,8 +49,9 @@ use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks::thrift::descriptors;
 use novarocks::thrift::plan_nodes;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionBinding,
+    ConnectorOpenReaderRequest, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 struct CompatIcebergDeltaCancellation {
@@ -70,7 +71,7 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     node: &plan_nodes::TPlanNode,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     out_layout: Layout,
-    connectors: &novarocks::novarocks_connectors::ConnectorRegistry,
+    iceberg_execution: Option<Arc<ConnectorExecutionBinding>>,
     query_id: Option<QueryId>,
     scan_ranges: Option<ScanRangeCarrier<'_>>,
     query_options: &QueryOptions,
@@ -123,11 +124,8 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let scan_ranges = scan_ranges.ok_or_else(|| {
         "ICEBERG_DELTA_SCAN_NODE requires scan-range carrier for connector binding".to_string()
     })?;
-    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
-        .map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
-        .map_err(|error| format!("compat Iceberg startup instance is unavailable: {error}"))?;
+    let iceberg_execution = iceberg_execution
+        .ok_or_else(|| "compat Iceberg execution binding is unavailable".to_string())?;
     let rows = query_options
         .batch_size()
         .and_then(|value| usize::try_from(value).ok())
@@ -145,20 +143,26 @@ pub(crate) fn lower_iceberg_delta_scan_node(
     let splits = build_compat_delta_read_splits(change_files, delete_side_payload)
         .map_err(|error| error.to_string())?;
     scan_ranges.capture(node.node_id, BoundScanRanges::None);
-    let scan = novarocks::exec::node::scan::ScanNode::new(Arc::new(ConnectorReadScanSource::new(
-        instance,
-        splits,
-        ConnectorOpenReaderRequest {
-            expected_schema: provider_schema.arrow_schema_ref(),
-            batch: ConnectorBatchBudget {
-                max_rows: rows,
-                max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
-                    .expect("SPI handle maximum is nonzero"),
+    let scheduled = splits
+        .into_iter()
+        .map(ConnectorScheduledSplit::plain)
+        .collect();
+    let scan = novarocks::exec::node::scan::ScanNode::new(Arc::new(
+        ConnectorReadScanSource::new_scheduled_execution(
+            iceberg_execution,
+            scheduled,
+            ConnectorOpenReaderRequest {
+                expected_schema: provider_schema.arrow_schema_ref(),
+                batch: ConnectorBatchBudget {
+                    max_rows: rows,
+                    max_bytes: NonZeroUsize::new(MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES)
+                        .expect("SPI handle maximum is nonzero"),
+                },
+                context,
             },
-            context,
-        },
-        provider_schema,
-    )))
+            provider_schema,
+        ),
+    ))
     .with_node_id(node.node_id)
     .with_output_chunk_schema(output_chunk_schema)
     .with_accept_empty_scan_ranges(true);

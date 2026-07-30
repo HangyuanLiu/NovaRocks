@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::ConnectorRegistry;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
     ResolvedAnalyzerTable, TableLookupMode,
@@ -29,7 +28,7 @@ use novarocks_catalog::table::CatalogTable;
 pub(crate) struct CatalogServiceProvider<'a> {
     current_catalog: Option<&'a str>,
     service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
-    connectors: &'a ConnectorRegistry,
+    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 }
@@ -38,14 +37,14 @@ impl<'a> CatalogServiceProvider<'a> {
     pub(crate) fn new(
         current_catalog: Option<&'a str>,
         service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
-        connectors: &'a ConnectorRegistry,
+        controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
         lookup_mode: TableLookupMode,
     ) -> Self {
         Self {
             current_catalog,
             service,
-            connectors,
+            controls,
             connector_context,
             lookup_mode,
         }
@@ -78,7 +77,7 @@ impl<'a> CatalogServiceProvider<'a> {
             Some(catalog) => match self.lookup_mode {
                 TableLookupMode::SchemaOnly => {
                     let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
-                        self.connectors,
+                        self.controls,
                         self.connector_context.clone(),
                         catalog,
                         database,
@@ -92,7 +91,7 @@ impl<'a> CatalogServiceProvider<'a> {
                 }
                 TableLookupMode::ExplainStats => {
                     let (planner, _) = crate::connector::iceberg::provider::load_schema_table_def(
-                        self.connectors,
+                        self.controls,
                         self.connector_context.clone(),
                         catalog,
                         database,
@@ -123,7 +122,7 @@ impl<'a> CatalogServiceProvider<'a> {
                 .expect("catalog service local read lock")
                 .get(database, table),
             Some(catalog) => crate::connector::iceberg::provider::load_metadata_table_def(
-                self.connectors,
+                self.controls,
                 self.connector_context.clone(),
                 catalog,
                 database,

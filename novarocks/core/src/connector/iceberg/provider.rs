@@ -32,12 +32,13 @@ use novarocks_fs::{
     FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceDistribution, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorInstanceInstaller, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
-    ConnectorReadSelector, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
+    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit,
     ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
 };
@@ -83,11 +84,11 @@ struct IcebergInstanceDistribution {
     incarnation: ConnectorInstanceIncarnation,
 }
 
-impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
+impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
     fn declaration(
         &self,
         context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorInstanceDeclaration, ConnectorError> {
+    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         if context.cancellation().is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
@@ -100,16 +101,15 @@ impl ConnectorInstanceDistribution for IcebergInstanceDistribution {
                 "connector request deadline elapsed",
             ));
         }
-        let payload = IcebergDeclarationV1 {
-            version: ICEBERG_DECLARATION_V1,
-            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
-        };
-        ConnectorInstanceDeclaration::try_new(
+        ConnectorExecutionDeclaration::try_new(
             self.descriptor.clone(),
             self.incarnation,
             encode_payload(
-                &payload,
-                "Iceberg instance declaration",
+                &IcebergDeclarationV1 {
+                    version: ICEBERG_DECLARATION_V1,
+                    access_binding: DEFAULT_ACCESS_BINDING.to_string(),
+                },
+                "Iceberg execution declaration",
                 novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             )?,
         )
@@ -245,22 +245,20 @@ impl IcebergConnectorInstaller {
 /// access binding used by distributed instance installation.  The identity is
 /// intentionally not query-local and carries no catalog client or credential
 /// in a fragment payload.
-pub(crate) fn compose_compat_read_instance(
+/// Compose the compat Iceberg reader as a BE-only execution binding. Compat
+/// has no catalog metadata capability and must never manufacture one.
+pub(crate) fn compose_compat_execution_binding(
     binding: IcebergReadBinding,
-) -> Result<ConnectorInstance, ConnectorError> {
+) -> Result<ConnectorExecutionBinding, ConnectorError> {
     let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
-    let descriptor = ConnectorInstanceDescriptor {
-        provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
-        instance_id: instance_id.clone(),
+    let key = ConnectorExecutionBindingKey {
+        instance_id,
+        incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
     };
-    ConnectorInstance::try_new(
-        descriptor,
-        None,
-        Arc::new(IcebergReadOnlyConnectorInstance {
-            instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
-            binding,
-        }),
+    ConnectorExecutionBinding::try_new(
+        ConnectorProviderId::parse(PROVIDER_ID)?,
+        key.clone(),
+        Arc::new(IcebergReadOnlyConnectorInstance { key, binding }),
     )
 }
 
@@ -362,16 +360,16 @@ pub fn build_compat_delta_read_splits(
         .collect()
 }
 
-impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
+impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
     fn provider_id(&self) -> &ConnectorProviderId {
         &self.provider_id
     }
 
     fn install(
         &self,
-        declaration: &ConnectorInstanceDeclaration,
+        declaration: &ConnectorExecutionDeclaration,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorInstance, ConnectorError> {
+    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
         if declaration.descriptor().provider_id != self.provider_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -379,12 +377,12 @@ impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
             ));
         }
         let payload: IcebergDeclarationV1 =
-            decode_payload(declaration.payload(), "Iceberg instance declaration")?;
+            decode_payload(declaration.payload(), "Iceberg execution declaration")?;
         if payload.version != ICEBERG_DECLARATION_V1 {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!(
-                    "unsupported Iceberg instance declaration version {}",
+                    "unsupported Iceberg execution declaration version {}",
                     payload.version
                 ),
             ));
@@ -395,12 +393,15 @@ impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
                 "Iceberg declaration access binding does not match BE startup binding",
             ));
         }
-        let reader = Arc::new(IcebergReadOnlyConnectorInstance {
-            instance_id: declaration.descriptor().instance_id.clone(),
-            incarnation: declaration.incarnation(),
-            binding: self.binding.clone(),
-        });
-        ConnectorInstance::try_new(declaration.descriptor().clone(), None, reader)
+        let key = declaration.binding_key();
+        ConnectorExecutionBinding::try_new(
+            self.provider_id.clone(),
+            key.clone(),
+            Arc::new(IcebergReadOnlyConnectorInstance {
+                key,
+                binding: self.binding.clone(),
+            }),
+        )
     }
 }
 
@@ -408,38 +409,11 @@ impl ConnectorInstanceInstaller for IcebergConnectorInstaller {
 /// planning are deliberately unsupported; once the provider reader is wired,
 /// `open_reader` will consume the opaque, fully planned Iceberg split.
 struct IcebergReadOnlyConnectorInstance {
-    instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    key: ConnectorExecutionBindingKey,
     binding: IcebergReadBinding,
 }
 
-impl ConnectorRead for IcebergReadOnlyConnectorInstance {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
-
-    fn begin_scan(
-        &self,
-        _table: &ConnectorTableHandle,
-        _request: ConnectorBeginScanRequest,
-    ) -> Result<ConnectorScan, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "BE read-only Iceberg instances do not plan scans",
-        ))
-    }
-
-    fn plan_splits(
-        &self,
-        _scan: &ConnectorScanHandle,
-        _request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "BE read-only Iceberg instances do not plan splits",
-        ))
-    }
-
+impl IcebergReadOnlyConnectorInstance {
     fn open_reader(
         &self,
         split: &ConnectorSplit,
@@ -457,7 +431,7 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
                 "connector request deadline elapsed",
             ));
         }
-        ensure_owner(split.owner(), &self.instance_id)?;
+        ensure_owner(split.owner(), &self.key.instance_id)?;
         let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
         if payload.version != ICEBERG_SPLIT_V1 {
             return Err(ConnectorError::new(
@@ -465,8 +439,8 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
                 format!("unsupported Iceberg split version {}", payload.version),
             ));
         }
-        if payload.owner_instance_id != self.instance_id.as_str()
-            || payload.incarnation != self.incarnation.to_bytes()
+        if payload.owner_instance_id != self.key.instance_id.as_str()
+            || payload.incarnation != self.key.incarnation.to_bytes()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -492,39 +466,58 @@ impl ConnectorRead for IcebergReadOnlyConnectorInstance {
     }
 }
 
+impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        self.open_reader(split, request)
+    }
+}
+
 #[derive(Clone)]
-pub(crate) struct IcebergConnectorInstance {
+pub(crate) struct IcebergControlProvider {
     instance_id: ConnectorInstanceId,
     incarnation: ConnectorInstanceIncarnation,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
     snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
 
-impl IcebergConnectorInstance {
-    pub(crate) fn new(
+impl IcebergControlProvider {
+    /// Creates the FE-only control binding for a logical Iceberg catalog. The
+    /// implementation remains in core until SPI-5, but its runtime capability
+    /// aggregate no longer needs to cross into a BE process.
+    pub(crate) fn new_control(
         instance_id: ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
-    ) -> Result<ConnectorInstance, ConnectorError> {
+    ) -> Result<ConnectorControlBinding, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
-            provider_id: novarocks_spi::connector::ConnectorProviderId::parse(PROVIDER_ID)?,
+            provider_id: ConnectorProviderId::parse(PROVIDER_ID)?,
             instance_id: instance_id.clone(),
         };
         let incarnation = ConnectorInstanceIncarnation::new();
         let provider = Arc::new(Self {
-            instance_id: instance_id.clone(),
+            instance_id,
             incarnation,
             registry,
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
         });
-        ConnectorInstance::try_new(descriptor.clone(), Some(provider.clone()), provider).map(
-            |instance| {
-                instance.with_distribution(Arc::new(IcebergInstanceDistribution {
-                    descriptor,
-                    incarnation,
-                }))
-            },
+        ConnectorControlBinding::try_new(
+            descriptor.clone(),
+            incarnation,
+            provider.clone(),
+            provider,
+            Arc::new(IcebergInstanceDistribution {
+                descriptor,
+                incarnation,
+            }),
         )
     }
 
@@ -797,7 +790,7 @@ impl SnapshotMembershipCache {
     }
 }
 
-impl ConnectorMetadata for IcebergConnectorInstance {
+impl ConnectorMetadata for IcebergControlProvider {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.instance_id
     }
@@ -884,7 +877,7 @@ impl ConnectorMetadata for IcebergConnectorInstance {
     }
 }
 
-impl ConnectorRead for IcebergConnectorInstance {
+impl ConnectorScanPlanning for IcebergControlProvider {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.instance_id
     }
@@ -1025,78 +1018,6 @@ impl ConnectorRead for IcebergConnectorInstance {
             )?;
         }
         Ok(splits)
-    }
-
-    fn open_reader(
-        &self,
-        split: &ConnectorSplit,
-        request: novarocks_spi::connector::ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        self.validate_context(&request.context)?;
-        ensure_owner(split.owner(), &self.instance_id)?;
-        let split: SplitPayload = decode_payload(split.payload(), "split")?;
-        let entry = self.entry(self.instance_id.as_str())?;
-        let output_schema =
-            self.schema_for(&entry, &split.namespace, &split.table, &split.projection)?;
-        if output_schema.as_ref() != request.expected_schema.as_ref() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg reader expected schema does not match its scan projection",
-            ));
-        }
-        let loaded =
-            load_table(&entry, &split.namespace, &split.table).map_err(map_iceberg_error)?;
-        if let Some(snapshot_id) = split.snapshot_id {
-            let table_uuid = split.table_uuid.as_deref().ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg snapshot split is missing its table incarnation",
-                )
-            })?;
-            if loaded.table.metadata().uuid().to_string() != table_uuid {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg split belongs to a different table incarnation",
-                ));
-            }
-            if loaded
-                .table
-                .metadata()
-                .snapshot_by_id(snapshot_id)
-                .is_none()
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "Iceberg split references an expired snapshot",
-                ));
-            }
-            let membership = self.snapshot_membership(
-                &entry,
-                &split.namespace,
-                &split.table,
-                table_uuid,
-                snapshot_id,
-            )?;
-            let belongs_to_snapshot =
-                membership.contains(&SnapshotFileIdentity::from(&split.data_file));
-            if !belongs_to_snapshot {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg split data file does not belong to its pinned snapshot",
-                ));
-            }
-        }
-        let binding = IcebergReadBinding::default_binding(loaded.object_store_config.clone())?;
-        let file_context = binding.file_read_context(
-            novarocks_fs::FileCancellation::new(),
-            request.context.deadline(),
-        )?;
-        Ok(Box::new(IcebergBatchReader::try_new(
-            &split.data_file,
-            binding.resolve_access(&split.data_file.path)?,
-            request,
-            file_context,
-        )?))
     }
 }
 
@@ -1282,17 +1203,17 @@ fn default_iceberg_split_version() -> u16 {
 }
 
 pub(crate) fn load_schema_table_def(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
 ) -> Result<(crate::sql::planner::table::TableDef, Option<i32>), String> {
-    load_table_def_at(connectors, context, catalog, namespace, table, None, true)
+    load_table_def_at(controls, context, catalog, namespace, table, None, true)
 }
 
 pub(crate) fn load_table_def_at(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
@@ -1305,12 +1226,12 @@ pub(crate) fn load_table_def_at(
     };
 
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
-    let metadata = instance
+    let metadata = lease
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -1340,34 +1261,14 @@ pub(crate) fn load_table_def_at(
     let files = if schema_only {
         Vec::new()
     } else {
-        let planned = if snapshot_id.is_some() {
-            plan_native_iceberg_read_with_file_override(
-                connectors,
-                context,
-                &table_info,
-                binding,
-                None,
-                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-            )?
-        } else {
-            plan_native_iceberg_read(
-                connectors,
-                context,
-                &table_info,
-                binding,
-                &payload.prepared_files,
-                &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-            )?
-        };
-        planned
-            .splits
-            .iter()
-            .map(|split| {
-                decode_payload::<SplitPayload>(split.payload(), "split")
-                    .map(|payload| payload.data_file)
-                    .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        plan_scan_files(
+            controls,
+            context,
+            &table_info,
+            binding,
+            &payload.prepared_files,
+            &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
+        )?
     };
     let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns);
     let table_def = crate::sql::planner::table::TableDef {
@@ -1385,7 +1286,7 @@ pub(crate) fn load_table_def_at(
 }
 
 pub(crate) fn load_metadata_table_def(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
@@ -1396,13 +1297,13 @@ pub(crate) fn load_metadata_table_def(
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
     let alias = format!("{table}${}", metadata_table_name(&metadata_table_type));
-    let metadata = instance
+    let metadata = lease
+        .binding()
         .metadata()
-        .ok_or_else(|| format!("connector instance {catalog} has no metadata capability"))?
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -1501,7 +1402,7 @@ fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'sta
 }
 
 pub(crate) fn plan_scan_files(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -1509,7 +1410,7 @@ pub(crate) fn plan_scan_files(
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
     let planned = plan_native_iceberg_read(
-        connectors,
+        controls,
         context,
         table,
         binding,
@@ -1533,7 +1434,7 @@ pub(crate) fn plan_scan_files(
 /// planning so native execution never reconstructs an Iceberg file scan in
 /// core.
 pub(crate) fn plan_native_iceberg_read(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -1541,7 +1442,7 @@ pub(crate) fn plan_native_iceberg_read(
     projection: &[usize],
 ) -> Result<PlannedIcebergConnectorRead, String> {
     plan_native_iceberg_read_with_file_override(
-        connectors,
+        controls,
         context,
         table,
         binding,
@@ -1551,7 +1452,7 @@ pub(crate) fn plan_native_iceberg_read(
 }
 
 fn plan_native_iceberg_read_with_file_override(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -1562,17 +1463,12 @@ fn plan_native_iceberg_read_with_file_override(
 
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let lease = controls
+        .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
-    let distribution = instance.distribution().ok_or_else(|| {
-        format!(
-            "Iceberg connector instance {} cannot be distributed to native backends",
-            instance_id.as_str()
-        )
-    })?;
-    let declaration = distribution
-        .declaration(&context)
+    let control_binding = lease.binding();
+    let declaration = control_binding
+        .execution_declaration(&context)
         .map_err(|error| error.to_string())?;
     let table_handle = ConnectorTableHandle::try_new(
         instance_id.clone(),
@@ -1598,8 +1494,8 @@ fn plan_native_iceberg_read_with_file_override(
         .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    let scan = instance
-        .read()
+    let scan = control_binding
+        .planning()
         .begin_scan(
             &table_handle,
             novarocks_spi::connector::ConnectorBeginScanRequest {
@@ -1626,8 +1522,8 @@ fn plan_native_iceberg_read_with_file_override(
             },
         )
         .map_err(|error| error.to_string())?;
-    let splits = instance
-        .read()
+    let splits = control_binding
+        .planning()
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
@@ -1639,12 +1535,13 @@ fn plan_native_iceberg_read_with_file_override(
         .map_err(|error| error.to_string())?;
     if splits
         .iter()
-        .any(|split| split.owner() != &instance.descriptor().instance_id)
+        .any(|split| split.owner() != &control_binding.descriptor().instance_id)
     {
         return Err("Iceberg connector planned a split for another instance".to_string());
     }
     Ok(PlannedIcebergConnectorRead {
         declaration,
+        planning_lease: lease,
         scan,
         splits,
         batch: novarocks_spi::connector::ConnectorBatchBudget {
@@ -1661,14 +1558,14 @@ fn plan_native_iceberg_read_with_file_override(
 /// splits.  Delta retains its logical planner identity; no native carrier or
 /// core scan operator receives a role-specific file/deletion payload.
 pub(crate) fn plan_native_iceberg_delta_read(
-    connectors: &crate::connector::ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     sources: &[super::delta::DeltaSourceFile],
     delete_side: Option<&super::delta::DeltaScanDeleteSide>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     let mut planned = plan_native_iceberg_read(
-        connectors,
+        controls,
         context.clone(),
         table,
         super::scan_model::IcebergDataFileBinding::ExplicitFiles,
@@ -1728,7 +1625,8 @@ pub(crate) fn plan_native_iceberg_delta_read(
 }
 
 pub(crate) struct PlannedIcebergConnectorRead {
-    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) declaration: ConnectorExecutionDeclaration,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
     pub(crate) batch: novarocks_spi::connector::ConnectorBatchBudget,
@@ -2024,15 +1922,15 @@ mod tests {
 
     #[test]
     fn compat_splits_are_owned_by_the_startup_iceberg_instance() {
-        let instance = compose_compat_read_instance(
+        let instance = compose_compat_execution_binding(
             IcebergReadBinding::default_binding(None).expect("compose compat Iceberg binding"),
         )
         .expect("compose compat Iceberg instance");
         assert_eq!(
-            instance.descriptor().instance_id.as_str(),
+            instance.key().instance_id.as_str(),
             COMPAT_ICEBERG_INSTANCE_ID
         );
-        assert_eq!(instance.descriptor().provider_id.as_str(), PROVIDER_ID);
+        assert_eq!(instance.provider_id().as_str(), PROVIDER_ID);
 
         let splits = build_compat_read_splits(vec![IcebergDataFileInfo::for_test(
             "file:///tmp/compat.parquet",
@@ -2137,7 +2035,7 @@ mod tests {
             .expect("scan payload"),
         )
         .expect("scan handle");
-        let provider = IcebergConnectorInstance {
+        let provider = IcebergControlProvider {
             instance_id,
             incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
@@ -2146,16 +2044,16 @@ mod tests {
             )),
         };
 
-        let error = provider
-            .plan_splits(
-                &scan,
-                ConnectorSplitPlanningRequest {
-                    target_parallelism: std::num::NonZeroUsize::new(1).expect("parallelism"),
-                    max_split_bytes: None,
-                    context,
-                },
-            )
-            .expect_err("aggregate split budget must reject the plan");
+        let error = ConnectorScanPlanning::plan_splits(
+            &provider,
+            &scan,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: std::num::NonZeroUsize::new(1).expect("parallelism"),
+                max_split_bytes: None,
+                context,
+            },
+        )
+        .expect_err("aggregate split budget must reject the plan");
 
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     }
@@ -2189,7 +2087,7 @@ pub(crate) fn register_planned_table_files_fixture(
         seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
     }
 
-    impl ConnectorRead for Fixture {
+    impl ConnectorScanPlanning for Fixture {
         fn instance_id(&self) -> &ConnectorInstanceId {
             &self.instance_id
         }
@@ -2275,15 +2173,44 @@ pub(crate) fn register_planned_table_files_fixture(
                 })
                 .collect()
         }
+    }
 
-        fn open_reader(
-            &self,
-            _: &ConnectorSplit,
-            _: novarocks_spi::connector::ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+    impl ConnectorMetadata for Fixture {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance_id
+        }
+
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                "planned-files fixture does not open readers",
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn list_tables(
+            &self,
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
+            ))
+        }
+
+        fn load_table(
+            &self,
+            _: ConnectorTableRequest,
+        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "planned-files fixture does not implement metadata",
             ))
         }
     }
@@ -2300,14 +2227,17 @@ pub(crate) fn register_planned_table_files_fixture(
         instance_id,
     };
     let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
-    registry
-        .register_connector_instance(
-            ConnectorInstance::try_new(descriptor.clone(), None, read)
-                .expect("fixture connector instance")
-                .with_distribution(Arc::new(IcebergInstanceDistribution {
-                    descriptor,
-                    incarnation,
-                })),
+    registry.register_fixture_control(
+        ConnectorControlBinding::try_new(
+            descriptor.clone(),
+            incarnation,
+            read.clone(),
+            read,
+            Arc::new(IcebergInstanceDistribution {
+                descriptor,
+                incarnation,
+            }),
         )
-        .expect("register planned-files fixture");
+        .expect("fixture connector control binding"),
+    );
 }

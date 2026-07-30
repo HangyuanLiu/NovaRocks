@@ -1789,6 +1789,167 @@ emit_connector_reader_marker = true
 }
 
 #[test]
+fn cross_process_three_be_connector_generation_replacement_drains_old_readers() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let metadata_dir =
+        tempfile::tempdir_in(runtime_dir()).expect("create generation metadata directory");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_connector_reader_marker = true
+
+[runtime]
+operator_buffer_chunks = 1
+"#,
+        &metadata_config,
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create generation warehouse");
+    let mut control = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut control, 3);
+    let create_catalog = || {
+        format!(
+            r#"CREATE EXTERNAL CATALOG generation_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        )
+    };
+    control
+        .query_drop(create_catalog())
+        .expect("create first generation catalog");
+    control
+        .query_drop("CREATE DATABASE generation_catalog.generation_db")
+        .expect("create generation database");
+    control
+        .query_drop("CREATE TABLE generation_catalog.generation_db.data (v BIGINT)")
+        .expect("create generation table");
+    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+        control
+            .query_drop(format!(
+                "INSERT INTO generation_catalog.generation_db.data \
+                 SELECT generate_series FROM TABLE(generate_series({range}))"
+            ))
+            .expect("write generation data file");
+    }
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+
+    let (target_ready_tx, target_ready_rx) = mpsc::sync_channel(1);
+    let (target_done_tx, target_done_rx) = mpsc::sync_channel(1);
+    let (target_release_tx, target_release_rx) = mpsc::sync_channel(0);
+    let fe_mysql = cluster.fe_mysql_port();
+    let target = std::thread::spawn(move || {
+        let mut conn = connect_mysql(fe_mysql);
+        target_ready_tx
+            .send(conn.connection_id())
+            .expect("publish old-generation target connection id");
+        let result = conn.query::<i64, _>(
+            "SELECT t.s FROM (SELECT sleep(10) AS s FROM generation_catalog.generation_db.data) AS t \
+             CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)",
+        );
+        target_done_tx
+            .send(result)
+            .expect("publish old-generation target result");
+        target_release_rx
+            .recv()
+            .expect("release old-generation target connection");
+    });
+    let target_connection_id = target_ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old-generation target connection id");
+    let old_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg instance=generation_catalog",
+        Duration::from_secs(10),
+    );
+    let old_incarnations = old_output
+        .iter()
+        .map(|lines| {
+            lines
+                .iter()
+                .find_map(|line| line.split("incarnation=").nth(1))
+                .expect("old reader marker must identify its execution incarnation")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let old_reader_counts = old_output
+        .iter()
+        .map(|lines| {
+            let opens = lines
+                .iter()
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                .count();
+            let closes = lines
+                .iter()
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                .count();
+            (opens, closes)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        old_reader_counts
+            .iter()
+            .all(|(opens, closes)| *opens > *closes),
+        "each BE must retain an old-generation reader while the replacement is published: counts={old_reader_counts:?}; stdout={old_output:?}"
+    );
+    assert!(
+        target_done_rx.try_recv().is_err(),
+        "old-generation query must still hold readers while replacement is published"
+    );
+
+    control
+        .query_drop("DROP CATALOG generation_catalog")
+        .expect("retire first catalog generation while its readers drain");
+    control
+        .query_drop(create_catalog())
+        .expect("create replacement catalog generation");
+    let rows: Vec<i64> = control
+        .query("SELECT count(*) FROM generation_catalog.generation_db.data")
+        .expect("new generation must read existing Iceberg data");
+    assert_eq!(rows, vec![300_000]);
+    let new_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg instance=generation_catalog",
+        Duration::from_secs(10),
+    );
+    for (old, lines) in old_incarnations.iter().zip(&new_output) {
+        let observed_replacement = lines
+            .iter()
+            .filter_map(|line| line.split("incarnation=").nth(1))
+            .any(|incarnation| incarnation != old);
+        assert!(
+            observed_replacement,
+            "each BE must resolve Q2 through the replacement execution generation: {lines:?}"
+        );
+    }
+
+    control
+        .query_drop(format!("KILL QUERY {target_connection_id}"))
+        .expect("terminate old-generation query after replacement read");
+    let target_error = target_done_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("old-generation query must terminate")
+        .expect_err("old-generation query must not succeed after KILL QUERY");
+    assert_mysql_server_error(target_error, 1317);
+    target_release_tx
+        .send(())
+        .expect("release old-generation target connection");
+    target
+        .join()
+        .expect("old-generation target thread must join");
+}
+
+#[test]
 fn three_be_partial_submit_failure_cancels_attempted_fragments() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {

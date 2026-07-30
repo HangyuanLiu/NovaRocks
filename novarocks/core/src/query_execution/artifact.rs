@@ -56,7 +56,8 @@ use crate::sql::planner::distributed::{
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
-    ConnectorBindingInstallLease, ConnectorBindingInstallPlan, DispatchingConnectorBindingBarrier,
+    ConnectorBindingInstallLease, ConnectorBindingInstallObserver, ConnectorBindingInstallPlan,
+    DispatchingConnectorBindingBarrier, NoopConnectorBindingInstallObserver,
     new_grpc_connector_binding_dispatcher,
 };
 pub type FragmentId = u32;
@@ -185,7 +186,7 @@ impl ControlReadyDistributedQuery {
             &self.prepared,
             &self.schedule.inner,
         )?;
-        let connector_binding_lease = match barrier.install_all(plan) {
+        let connector_binding_lease = match barrier.install_all(self.schedule.execution_id, plan) {
             Ok(lease) => lease,
             Err(error) => {
                 let kind = error.kind();

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::engine::{
     StandaloneState, StatementResult, delete_catalog_attachment_if_needed,
-    unregister_iceberg_connector_instance,
+    retire_iceberg_control_binding,
 };
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
@@ -845,7 +845,7 @@ pub(crate) fn execute_create_database_statement(
     // When IF NOT EXISTS is specified, skip creation if the namespace already exists.
     if if_not_exists
         && crate::connector::metadata_namespace_exists(
-            &state.connectors.read().expect("connector registry read"),
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,
@@ -930,7 +930,7 @@ pub(crate) fn execute_create_table_statement(
             // exists. CTAS has its own existence check in `iceberg_ctas`.
             if stmt.if_not_exists
                 && crate::connector::metadata_table_exists(
-                    &state.connectors.read().expect("connector registry read"),
+                    state.connector_control.as_ref(),
                     connector_context.clone(),
                     &target.catalog,
                     &target.namespace,
@@ -981,7 +981,7 @@ pub(crate) fn execute_drop_catalog_statement(
         Ok(()) => {
             drop(guard);
             let normalized_catalog = normalize_identifier(catalog_name)?;
-            unregister_iceberg_connector_instance(state, &normalized_catalog)?;
+            retire_iceberg_control_binding(state, &normalized_catalog)?;
             delete_catalog_attachment_if_needed(state, &normalized_catalog)?;
             state
                 .catalog_service
@@ -1010,7 +1010,7 @@ pub(crate) fn execute_drop_database_statement(
         .catalog_backend(target.backend_name)?;
     if target.backend_name == "iceberg"
         && !crate::connector::metadata_namespace_exists(
-            &state.connectors.read().expect("connector registry read"),
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,
@@ -1213,9 +1213,8 @@ pub(crate) fn execute_truncate_table_statement(
         ));
     }
     let resolved_table = {
-        let reg = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &reg,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,

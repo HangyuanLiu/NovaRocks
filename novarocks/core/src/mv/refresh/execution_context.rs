@@ -1410,6 +1410,7 @@ mod tests {
                     &refresh_ctx.rewrite,
                 );
                 let connectors = crate::connector::ConnectorRegistry::default();
+                let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
                 let physical_plan =
                     crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
                         .expect("convert optimizer physical plan");
@@ -1419,6 +1420,7 @@ mod tests {
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
                     &connectors,
+                    &controls,
                     &crate::connector::test_request_context(),
                     Some(&refresh_ctx),
                 )

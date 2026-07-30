@@ -13564,11 +13564,6 @@ fn execute_imv_change_stream_writer(
         .read()
         .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?
         .get(&target.catalog)?;
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let connector_context = refresh_plan
         .mv_refresh_ctx
         .and_then(|ctx| ctx.connector_context.as_ref())
@@ -13577,7 +13572,7 @@ fn execute_imv_change_stream_writer(
         })?;
     crate::connector::validate_request_context(connector_context)?;
     let resolved = crate::connector::metadata_load_table(
-        &connectors_snapshot,
+        state.connector_control.as_ref(),
         connector_context.clone(),
         &target.catalog,
         &target.namespace,
@@ -17785,7 +17780,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::FixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17880,7 +17877,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::FixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17928,7 +17927,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::FixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17981,7 +17982,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::FixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -19202,9 +19205,8 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let connectors = env.state.connectors.read().expect("connector registry");
         let resolved = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19216,7 +19218,7 @@ mod tests {
         assert_eq!(resolved.table, "mv_orders");
 
         let (schema_table, schema_id) = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19229,7 +19231,7 @@ mod tests {
 
         let legacy_alias_name = ["__nr", "_mv_", "mv_orders"].concat();
         let missing_schema_err = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -19243,7 +19245,7 @@ mod tests {
         );
 
         let missing_target_err = crate::connector::metadata_load_table(
-            &connectors,
+            env.state.connector_control.as_ref(),
             crate::connector::test_request_context(),
             "ice",
             "analytics",
@@ -20619,7 +20621,7 @@ mod tests {
     #[test]
     fn cancelled_refresh_plan_does_not_run_recovery_mutations() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        crate::engine::register_iceberg_connector_instance(&env.state, "ice")
+        crate::engine::register_iceberg_control_binding(&env.state, "ice")
             .expect("register Iceberg connector instance");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");

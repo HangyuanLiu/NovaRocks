@@ -46,6 +46,7 @@ use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_role
 pub(crate) fn prepare_fragments(
     plan: &crate::sql::planner::distributed::DistributedPlan,
     connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn scan::ScanBindingResolver>,
 ) -> Result<PreparedFragmentSet, String> {
@@ -111,7 +112,7 @@ pub(crate) fn prepare_fragments(
             plan.runtime_filter_graph(),
             plan.fragments(),
         )?;
-    let scan_bindings = prepare_scan_bindings(plan, connectors, context, resolver)?;
+    let scan_bindings = prepare_scan_bindings(plan, connectors, controls, context, resolver)?;
 
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
@@ -567,9 +568,12 @@ mod tests {
                 .fragment_output_columns(9)
                 .is_none()
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         )
@@ -590,9 +594,12 @@ mod tests {
         crate::sql::planner::distributed::test_support::remove_fragment_output_for_test(
             &mut plan, 7,
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         ) {
@@ -617,9 +624,12 @@ mod tests {
                     vec![BindingId::new(1), BindingId::new(2)];
             },
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         )

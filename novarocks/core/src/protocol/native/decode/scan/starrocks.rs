@@ -123,20 +123,15 @@ pub(super) fn lower_starrocks_scan(
             topn_filter_column_map: HashMap::new(),
         };
         let query_options = ctx.query_options().cloned().unwrap_or_default();
-        let source = plan_native_starrocks_read_source(
-            ctx.connectors()?,
-            ctx.query_id(),
-            node.node_id,
-            cfg,
-            &query_options,
-        )
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "source",
-                error,
-            )
-        })?;
+        let source =
+            plan_native_starrocks_read_source(ctx.query_id(), node.node_id, cfg, &query_options)
+                .map_err(|error| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InvalidValue,
+                        "source",
+                        error,
+                    )
+                })?;
         ctx.capture_scan_ranges(node.node_id, crate::exec::node::scan::BoundScanRanges::None);
         let scan_node = crate::exec::node::scan::ScanNode::new(source)
             .with_node_id(node.node_id)

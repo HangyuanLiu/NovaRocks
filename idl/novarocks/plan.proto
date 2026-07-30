@@ -1006,7 +1006,7 @@ message ScanSource {
 }
 
 // A provider-neutral, already-planned connector read. The opaque handles are
-// decoded only by the selected ConnectorInstance. Metadata resolution and
+// decoded only by the selected ConnectorExecutionBinding. Metadata resolution and
 // split planning occur before this carrier is emitted; core retains split
 // scheduling, batching, cancellation, and Chunk adaptation ownership.
 message ConnectorReadSource {
@@ -1018,8 +1018,9 @@ message ConnectorReadSource {
   uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
   uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
   reserved 8;
-  reserved "provider_id"; // host lookup is keyed only by instance_id.
+  reserved "provider_id"; // host lookup uses instance_id plus incarnation.
   bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
+  bytes instance_incarnation = 10; // exactly 16 bytes; resolves one execution binding generation.
 }
 
 // One scheduled split in a ConnectorReadSource.

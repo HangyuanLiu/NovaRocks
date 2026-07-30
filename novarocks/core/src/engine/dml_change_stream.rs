@@ -119,9 +119,8 @@ pub(crate) fn build_dml_change_stream_write_plan(
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
     let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &registry,
+            state.connector_control.as_ref(),
             crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

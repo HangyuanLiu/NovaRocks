@@ -27,13 +27,11 @@ mod file_scan;
 mod hash_join;
 pub(crate) mod hdfs_scan;
 mod iceberg_delta_scan;
-mod jdbc_scan;
 #[cfg(feature = "compat")]
 mod lake_meta_scan;
 #[cfg(feature = "compat")]
 mod lake_scan;
 mod lookup;
-mod mysql_scan;
 mod nestloop_join;
 mod project;
 mod raw_values;
@@ -54,10 +52,10 @@ use novarocks::exec::node::filter::FilterNode;
 use novarocks::exec::node::limit::LimitNode;
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::novarocks_connectors::ConnectorRegistry;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
@@ -117,6 +115,7 @@ pub(crate) struct StarRocksPlanDecodeContext<'a> {
     batch_sender_counts: &'a HashMap<i32, usize>,
     query_options: novarocks::runtime::query_options::QueryOptions,
     decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+    compat_iceberg_execution: Option<&'a Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
 }
 
 impl<'a> StarRocksPlanDecodeContext<'a> {
@@ -136,6 +135,9 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
         batch_sender_counts: &'a HashMap<i32, usize>,
         query_options: novarocks::runtime::query_options::QueryOptions,
         decode_facts: &'a crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
+        compat_iceberg_execution: Option<
+            &'a Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+        >,
     ) -> Self {
         Self {
             query_id,
@@ -148,6 +150,7 @@ impl<'a> StarRocksPlanDecodeContext<'a> {
             batch_sender_counts,
             query_options,
             decode_facts,
+            compat_iceberg_execution,
         }
     }
 }
@@ -168,13 +171,11 @@ pub(crate) use file_scan::{
 pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
-pub(crate) use jdbc_scan::lower_jdbc_scan_node;
 #[cfg(feature = "compat")]
 pub(crate) use lake_meta_scan::{LakeMetaValuesPatch, lower_lake_meta_scan_node};
 #[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
 pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
-pub(crate) use mysql_scan::lower_mysql_scan_node;
 pub(crate) use nestloop_join::lower_nestloop_join_node;
 pub(crate) use project::lower_project_node;
 pub(crate) use raw_values::lower_raw_values_node;
@@ -250,7 +251,6 @@ pub(crate) fn lower_plan(
     query_global_dict_exprs: Option<&BTreeMap<i32, exprs::TExpr>>,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
@@ -283,7 +283,6 @@ pub(crate) fn lower_plan(
         &query_global_dict_map,
         context,
         db_name,
-        connectors,
         layout_hints,
         &global_common_slot_map,
         last_query_id,
@@ -369,7 +368,6 @@ fn lower_node(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -432,7 +430,6 @@ fn lower_node(
             query_global_dict_map,
             context,
             db_name,
-            connectors,
             layout_hints,
             global_common_slot_map,
             last_query_id,
@@ -458,7 +455,6 @@ fn lower_node_with_children(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -474,7 +470,6 @@ fn lower_node_with_children(
         query_global_dict_map,
         context,
         db_name,
-        connectors,
         layout_hints,
         global_common_slot_map,
         last_query_id,
@@ -493,7 +488,6 @@ fn lower_node_with_children_typed(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -658,15 +652,9 @@ fn lower_node_with_children_typed(
             t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
                 lower_fetch_node(children, node, out_layout, desc_tbl)?
             }
-            t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => lower_mysql_scan_node(
-                node,
-                desc_tbl,
-                tuple_slots,
-                &context.query_options,
-                connectors,
-                context.query_id,
-                context.scan_ranges,
-            )?,
+            t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => {
+                return Err("MYSQL_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".to_string().into());
+            }
             t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
                 node,
                 desc_tbl,
@@ -680,18 +668,9 @@ fn lower_node_with_children_typed(
                 out_layout,
                 node_path.clone(),
             )?,
-            t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => lower_jdbc_scan_node(
-                node,
-                desc_tbl,
-                tuple_slots,
-                layout_hints,
-                &context.query_options,
-                connectors,
-                db_name,
-                context.decode_facts,
-                context.query_id,
-                context.scan_ranges,
-            )?,
+            t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => {
+                return Err("JDBC_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".to_string().into());
+            }
             t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
                 node,
                 desc_tbl,
@@ -699,7 +678,7 @@ fn lower_node_with_children_typed(
                 layout_hints,
                 context.scan_ranges,
                 &context.query_options,
-                connectors,
+                context.compat_iceberg_execution.cloned(),
                 query_global_dict_map,
                 out_layout,
                 context.decode_facts,
@@ -717,7 +696,7 @@ fn lower_node_with_children_typed(
                     node,
                     desc_tbl,
                     out_layout,
-                    connectors,
+                    context.compat_iceberg_execution.cloned(),
                     context.query_id,
                     context.scan_ranges,
                     &context.query_options,
@@ -738,7 +717,6 @@ fn lower_node_with_children_typed(
                         context.query_id,
                         &context.query_options,
                         arena,
-                        connectors,
                         query_global_dict_map,
                         db_name,
                         fe_addr,
@@ -784,7 +762,6 @@ fn lower_node_with_children_typed(
                         tuple_slots,
                         layout_hints,
                         &context.query_options,
-                        connectors,
                         query_global_dict_map,
                     )?
                 }

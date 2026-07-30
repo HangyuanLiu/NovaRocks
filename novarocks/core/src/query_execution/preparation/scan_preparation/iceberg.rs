@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::ConnectorRegistry;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
@@ -53,7 +52,7 @@ pub(crate) fn build_iceberg_metadata_scan_range_params()
 /// Native scheduling owns only the resulting SPI identities and byte-size
 /// hints; it must not lower these splits back into `FileScanRange`.
 pub(super) fn plan_iceberg_connector_read(
-    connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
@@ -73,7 +72,7 @@ pub(super) fn plan_iceberg_connector_read(
         })
         .collect::<Vec<_>>();
     let planned = crate::connector::iceberg::provider::plan_native_iceberg_read(
-        connectors,
+        controls,
         context,
         &files.table,
         files.binding,
@@ -85,6 +84,7 @@ pub(super) fn plan_iceberg_connector_read(
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,
+        planning_lease: Some(planned.planning_lease),
     })
 }
 
@@ -92,7 +92,7 @@ pub(super) fn plan_iceberg_connector_read(
 /// splits.  Core keeps the logical `IcebergDeltaTable` identity for planning,
 /// but it does not retain a delta physical reader or a delete-side decoder.
 pub(super) fn plan_iceberg_delta_connector_read(
-    connectors: &ConnectorRegistry,
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
@@ -106,7 +106,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         );
     };
     let planned = crate::connector::iceberg::provider::plan_native_iceberg_delta_read(
-        connectors,
+        controls,
         context,
         table,
         &delta.runtime_plan.change_files,
@@ -117,5 +117,6 @@ pub(super) fn plan_iceberg_delta_connector_read(
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,
+        planning_lease: Some(planned.planning_lease),
     })
 }

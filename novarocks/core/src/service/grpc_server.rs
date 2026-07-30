@@ -1172,29 +1172,32 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         ))
     }
 
-    async fn install_connector_instance(
+    async fn ensure_connector_execution_binding(
         &self,
-        request: tonic::Request<proto::novarocks::InstallConnectorInstanceRequest>,
-    ) -> Result<tonic::Response<proto::novarocks::InstallConnectorInstanceResponse>, tonic::Status>
-    {
-        self.require_local_execution("InstallConnectorInstance")?;
+        request: tonic::Request<proto::novarocks::EnsureConnectorExecutionBindingRequest>,
+    ) -> Result<
+        tonic::Response<proto::novarocks::EnsureConnectorExecutionBindingResponse>,
+        tonic::Status,
+    > {
+        self.require_local_execution("EnsureConnectorExecutionBinding")?;
         let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("connector binding ingress is not configured")
         })?;
         let request = request.into_inner();
         let result = tokio::task::spawn_blocking(move || {
-            let declaration = crate::service::connector_binding::decode_install_request(request)
-                .map_err(|error| error.to_string())?;
+            let (execution_id, declaration) =
+                crate::service::connector_binding::decode_ensure_request(request)
+                    .map_err(|error| error.to_string())?;
             let context = crate::service::connector_binding::install_request_context()
                 .map_err(|error| error.to_string())?;
             ingress
-                .install_connector_instance(declaration, context)
+                .ensure_connector_execution_binding(execution_id, declaration, context)
                 .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| {
             tonic::Status::internal(format!(
-                "install_connector_instance handler panicked: {error}"
+                "ensure_connector_execution_binding handler panicked: {error}"
             ))
         })?;
         let (status_code, message) = match result {
@@ -1202,35 +1205,36 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             Err(error) => (1, error),
         };
         Ok(tonic::Response::new(
-            proto::novarocks::InstallConnectorInstanceResponse {
+            proto::novarocks::EnsureConnectorExecutionBindingResponse {
                 status_code,
                 message,
             },
         ))
     }
 
-    async fn retire_connector_instance(
+    async fn retire_connector_execution_binding(
         &self,
-        request: tonic::Request<proto::novarocks::RetireConnectorInstanceRequest>,
-    ) -> Result<tonic::Response<proto::novarocks::RetireConnectorInstanceResponse>, tonic::Status>
-    {
-        self.require_local_execution("RetireConnectorInstance")?;
+        request: tonic::Request<proto::novarocks::RetireConnectorExecutionBindingRequest>,
+    ) -> Result<
+        tonic::Response<proto::novarocks::RetireConnectorExecutionBindingResponse>,
+        tonic::Status,
+    > {
+        self.require_local_execution("RetireConnectorExecutionBinding")?;
         let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("connector binding ingress is not configured")
         })?;
         let request = request.into_inner();
         let result = tokio::task::spawn_blocking(move || {
-            let (instance_id, incarnation) =
-                crate::service::connector_binding::decode_retire_request(request)
-                    .map_err(|error| error.to_string())?;
+            let key = crate::service::connector_binding::decode_retire_request(request)
+                .map_err(|error| error.to_string())?;
             ingress
-                .retire_connector_instance(instance_id, incarnation)
+                .retire_connector_execution_binding(key)
                 .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| {
             tonic::Status::internal(format!(
-                "retire_connector_instance handler panicked: {error}"
+                "retire_connector_execution_binding handler panicked: {error}"
             ))
         })?;
         let (status_code, message) = match result {
@@ -1238,7 +1242,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             Err(error) => (1, error),
         };
         Ok(tonic::Response::new(
-            proto::novarocks::RetireConnectorInstanceResponse {
+            proto::novarocks::RetireConnectorExecutionBindingResponse {
                 status_code,
                 message,
             },

@@ -26,6 +26,7 @@ use novarocks_state_store::{
     StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
 };
 
+use crate::connector::ConnectorControlHost;
 use crate::coordinator::{
     BackendQueryActivity, FrontendCoordinatorReportHandler, FrontendDistributedQueryCoordinator,
 };
@@ -91,6 +92,7 @@ impl fmt::Display for FrontendApplicationError {
 impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
+    connector_control: Arc<ConnectorControlHost>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     view_service: Option<Arc<dyn novarocks::engine::view::ViewService>>,
     table_maintenance_service:
@@ -133,6 +135,7 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
     ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
+            connector_control: Arc::new(ConnectorControlHost::new()),
             statistics_service: None,
             view_service: None,
             table_maintenance_service: None,
@@ -288,6 +291,13 @@ impl FrontendApplicationHost {
         self.execution_role
     }
 
+    pub fn connector_control_registry(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
+        Arc::clone(&self.connector_control)
+            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+    }
+
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
         self.state_store_host
             .as_ref()
@@ -412,6 +422,7 @@ impl FrontendApplicationHost {
             execution.configured_report_port,
             execution.runtime_filter_worker_count,
             self.backend_topology_port(),
+            Arc::clone(&self.connector_control),
         ));
         self.topology()
             .attach_query_events(Arc::new(coordinator.backend_query_activity()));

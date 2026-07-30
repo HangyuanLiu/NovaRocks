@@ -61,13 +61,15 @@ service NovaRocksGrpc {
   rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
   rpc QueryControlStream(stream QueryControlRequest)
       returns (stream QueryControlResponse);
-  // Coordinator installs a provider-owned, credential-free connector instance
-  // declaration before any fragment using that instance is submitted.
-  rpc InstallConnectorInstance(InstallConnectorInstanceRequest)
-      returns (InstallConnectorInstanceResponse);
-  // Best-effort resource retirement for one previously installed instance.
-  rpc RetireConnectorInstance(RetireConnectorInstanceRequest)
-      returns (RetireConnectorInstanceResponse);
+  // Coordinator ensures a provider-owned, credential-free BE execution
+  // binding and acquires its query lifecycle lease before any fragment using
+  // that exact generation is submitted.
+  rpc EnsureConnectorExecutionBinding(EnsureConnectorExecutionBindingRequest)
+      returns (EnsureConnectorExecutionBindingResponse);
+  // Best-effort resource retirement for one previously ensured execution
+  // binding generation. Existing query leases may drain.
+  rpc RetireConnectorExecutionBinding(RetireConnectorExecutionBindingRequest)
+      returns (RetireConnectorExecutionBindingResponse);
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
@@ -448,24 +450,25 @@ message CancelFragmentResponse {
 // Control-plane-only declaration. `provider_id` selects a startup-composed
 // installer and never appears in a fragment carrier. `declaration_payload`
 // is provider-owned, bounded, opaque, and credential-free.
-message InstallConnectorInstanceRequest {
-  string provider_id = 1;
-  string instance_id = 2;
-  bytes incarnation = 3;          // exactly 16 UUID-v7 bytes
-  bytes declaration_payload = 4;  // <= 64 KiB
+message EnsureConnectorExecutionBindingRequest {
+  QueryExecutionId execution_id = 1;
+  string provider_id = 2;
+  string instance_id = 3;
+  bytes incarnation = 4;          // exactly 16 UUID-v7 bytes
+  bytes declaration_payload = 5;  // <= 64 KiB
 }
 
-message InstallConnectorInstanceResponse {
-  int32 status_code = 1;  // 0 == installed or already installed
+message EnsureConnectorExecutionBindingResponse {
+  int32 status_code = 1;  // 0 == ensured and query leased
   string message = 2;
 }
 
-message RetireConnectorInstanceRequest {
+message RetireConnectorExecutionBindingRequest {
   string instance_id = 1;
   bytes incarnation = 2;  // exactly 16 UUID-v7 bytes
 }
 
-message RetireConnectorInstanceResponse {
+message RetireConnectorExecutionBindingResponse {
   int32 status_code = 1;  // 0 == retirement accepted
   string message = 2;
 }

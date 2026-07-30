@@ -1,5 +1,5 @@
 ---
-id: ADR-0013
+id: ADR-0014
 title: "Connector-neutral file access and columnar decoding foundation"
 domain: [provider-spi, filesystem]
 status: active

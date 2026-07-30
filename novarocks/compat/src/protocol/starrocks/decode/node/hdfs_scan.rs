@@ -162,7 +162,7 @@ fn provider_schema_for_compat_iceberg(
 }
 
 fn plan_compat_iceberg_data_read_source(
-    connectors: &ConnectorRegistry,
+    iceberg_execution: Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
     query_id: QueryId,
     output_schema: ChunkSchemaRef,
     files: Vec<IcebergDataFileInfo>,
@@ -170,11 +170,6 @@ fn plan_compat_iceberg_data_read_source(
     row_position: Option<&RowPositionSpec>,
     query_options: &QueryOptions,
 ) -> Result<CompatIcebergDataReadPlan, String> {
-    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)
-        .map_err(|error| error.to_string())?;
-    let instance = connectors
-        .connector_instance(&instance_id)
-        .map_err(|error| format!("compat Iceberg startup instance is unavailable: {error}"))?;
     let rows = query_options
         .batch_size()
         .and_then(|value| usize::try_from(value).ok())
@@ -195,8 +190,8 @@ fn plan_compat_iceberg_data_read_source(
             if ids.len() != splits.len() {
                 return Err("compat Iceberg row-position split count mismatch".to_string());
             }
-            Some(ConnectorRowPositionLookup::new(
-                Arc::clone(&instance),
+            Some(ConnectorRowPositionLookup::new_execution(
+                Arc::clone(&iceberg_execution),
                 ids.into_iter().zip(splits.iter().cloned()).collect(),
             ))
         }
@@ -220,8 +215,8 @@ fn plan_compat_iceberg_data_read_source(
         })
         .collect();
     Ok(CompatIcebergDataReadPlan {
-        source: Arc::new(ConnectorReadScanSource::new_scheduled(
-            instance,
+        source: Arc::new(ConnectorReadScanSource::new_scheduled_execution(
+            iceberg_execution,
             scheduled,
             ConnectorOpenReaderRequest {
                 expected_schema: provider_schema.arrow_schema_ref(),
@@ -780,7 +775,7 @@ pub(crate) fn lower_hdfs_scan_node(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     scan_ranges: Option<ScanRangeCarrier>,
     query_opts: &QueryOptions,
-    connectors: &ConnectorRegistry,
+    iceberg_execution: Option<Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,
     decode_facts: &crate::protocol::starrocks::decode::instance::StarRocksDecodeFacts,
@@ -1356,14 +1351,9 @@ pub(crate) fn lower_hdfs_scan_node(
             output_columns,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
-        let source = plan_compat_iceberg_metadata_read_source(
-            connectors,
-            query_id,
-            node.node_id,
-            cfg,
-            query_opts,
-        )
-        .map_err(|error| error.to_string())?;
+        let source =
+            plan_compat_iceberg_metadata_read_source(query_id, node.node_id, cfg, query_opts)
+                .map_err(|error| error.to_string())?;
         scan_ranges.capture(node.node_id, BoundScanRanges::None);
         let scan = ScanNode::new(source)
             .with_node_id(node.node_id)
@@ -1394,7 +1384,9 @@ pub(crate) fn lower_hdfs_scan_node(
                 .collect::<Vec<_>>()
         });
         let planned = plan_compat_iceberg_data_read_source(
-            connectors,
+            iceberg_execution
+                .clone()
+                .ok_or_else(|| "compat Iceberg execution binding is unavailable".to_string())?,
             query_id,
             output_chunk_schema.clone(),
             iceberg_files,

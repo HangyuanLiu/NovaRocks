@@ -149,10 +149,10 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use novarocks_spi::connector::{
-        ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorInstance,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorOpenReaderRequest,
-        ConnectorProviderId, ConnectorRead, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-        ConnectorSplitPlanningRequest, ConnectorTableHandle,
+        ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
+        ConnectorExecutionBindingKey, ConnectorExecutionResolver, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorOpenReaderRequest, ConnectorProviderId,
+        ConnectorReadExecution, ConnectorSplit,
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -301,28 +301,12 @@ mod tests {
     }
 
     struct NativeCarrierTestRead {
-        instance_id: ConnectorInstanceId,
+        key: ConnectorExecutionBindingKey,
     }
 
-    impl ConnectorRead for NativeCarrierTestRead {
-        fn instance_id(&self) -> &ConnectorInstanceId {
-            &self.instance_id
-        }
-
-        fn begin_scan(
-            &self,
-            _table: &ConnectorTableHandle,
-            _request: ConnectorBeginScanRequest,
-        ) -> Result<ConnectorScan, ConnectorError> {
-            unreachable!("native carrier starts after split planning")
-        }
-
-        fn plan_splits(
-            &self,
-            _scan: &ConnectorScanHandle,
-            _request: ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-            unreachable!("native carrier starts after split planning")
+    impl ConnectorReadExecution for NativeCarrierTestRead {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
         }
 
         fn open_reader(
@@ -334,22 +318,40 @@ mod tests {
         }
     }
 
-    fn connector_read_registry(instance_id: &str) -> Arc<ConnectorRegistry> {
+    struct TestExecutionResolver {
+        binding: Option<Arc<ConnectorExecutionBinding>>,
+    }
+
+    impl ConnectorExecutionResolver for TestExecutionResolver {
+        fn resolve(
+            &self,
+            key: &ConnectorExecutionBindingKey,
+        ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError> {
+            self.binding
+                .as_ref()
+                .filter(|binding| binding.key() == key)
+                .cloned()
+                .ok_or_else(|| {
+                    ConnectorError::new(ConnectorErrorKind::NotFound, "test binding is absent")
+                })
+        }
+    }
+
+    fn connector_read_resolver(instance_id: &str) -> Arc<dyn ConnectorExecutionResolver> {
         let instance_id = ConnectorInstanceId::parse(instance_id).expect("instance ID");
-        let instance = ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("test").expect("provider ID"),
-                instance_id: instance_id.clone(),
-            },
-            None,
-            Arc::new(NativeCarrierTestRead { instance_id }),
+        let key = ConnectorExecutionBindingKey {
+            instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        let binding = ConnectorExecutionBinding::try_new(
+            ConnectorProviderId::parse("test").expect("provider ID"),
+            key.clone(),
+            Arc::new(NativeCarrierTestRead { key }),
         )
-        .expect("connector instance");
-        let mut registry = ConnectorRegistry::new();
-        registry
-            .register_connector_instance(instance)
-            .expect("register connector instance");
-        Arc::new(registry)
+        .expect("execution binding");
+        Arc::new(TestExecutionResolver {
+            binding: Some(Arc::new(binding)),
+        })
     }
 
     #[test]
@@ -357,6 +359,7 @@ mod tests {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "test.native".to_string(),
+                instance_incarnation: vec![7; 16],
                 scan_payload: vec![0],
                 splits: vec![plan::ConnectorReadSplit {
                     split_id: "split-1".to_string(),
@@ -371,7 +374,7 @@ mod tests {
             },
         ));
         let context = NativePlanDecodeContext::default()
-            .with_connector_registry(connector_read_registry("test.native"))
+            .with_execution_resolver(connector_read_resolver("test.native"))
             .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 9 });
         let decoded = decode_node(&node, &mut ExprArena::default(), &context)
             .expect("decode ConnectorReadSource");
@@ -402,6 +405,7 @@ mod tests {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "test.native".to_string(),
+                instance_incarnation: vec![7; 16],
                 scan_payload: Vec::new(),
                 splits: Vec::new(),
                 max_batch_rows: 0,
@@ -412,7 +416,7 @@ mod tests {
             },
         ));
         let context = NativePlanDecodeContext::default()
-            .with_connector_registry(connector_read_registry("test.native"))
+            .with_execution_resolver(connector_read_resolver("test.native"))
             .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 10 });
         let error = decode_node(&node, &mut ExprArena::default(), &context)
             .expect_err("zero batch budget must fail native decoding");
@@ -431,6 +435,7 @@ mod tests {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "test.native".to_string(),
+                instance_incarnation: vec![7; 16],
                 scan_payload: vec![0],
                 splits: vec![plan::ConnectorReadSplit {
                     split_id: "file-1".to_string(),
@@ -445,7 +450,7 @@ mod tests {
             },
         ));
         let context = NativePlanDecodeContext::default()
-            .with_connector_registry(connector_read_registry("test.native"))
+            .with_execution_resolver(connector_read_resolver("test.native"))
             .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 11 });
         let decoded = decode_node(&node, &mut ExprArena::default(), &context)
             .expect("decode ConnectorReadSource with opaque provider splits");
@@ -468,6 +473,7 @@ mod tests {
         let node = scan_node(plan::scan_source::Kind::ConnectorRead(
             plan::ConnectorReadSource {
                 instance_id: "unknown.native".to_string(),
+                instance_incarnation: vec![7; 16],
                 scan_payload: Vec::new(),
                 splits: vec![plan::ConnectorReadSplit {
                     split_id: "file-1".to_string(),
@@ -482,7 +488,7 @@ mod tests {
             },
         ));
         let context = NativePlanDecodeContext::default()
-            .with_connector_registry(Arc::new(ConnectorRegistry::new()))
+            .with_execution_resolver(Arc::new(TestExecutionResolver { binding: None }))
             .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
         let error = decode_node(&node, &mut ExprArena::default(), &context)
             .expect_err("unknown instances must not be materialized by native decoding");

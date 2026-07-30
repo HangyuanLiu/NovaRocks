@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod application;
+pub mod connector;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;

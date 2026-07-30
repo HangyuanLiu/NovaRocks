@@ -16,28 +16,36 @@
 // under the License.
 
 mod context;
+mod control;
 mod distribution;
 mod error;
+mod execution;
 mod handle;
 mod identity;
-mod instance;
 mod metadata;
 mod read;
 
 pub mod conformance;
 
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
+pub use control::{
+    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
+    ConnectorControlResolver, ConnectorExecutionDistribution, ConnectorScanPlanning,
+};
 pub use distribution::{
-    ConnectorInstanceDeclaration, ConnectorInstanceDistribution, ConnectorInstanceIncarnation,
-    ConnectorInstanceInstaller, MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
+    ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,
+    MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
 };
 pub use error::{ConnectorError, ConnectorErrorKind};
+pub use execution::{
+    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
+    ConnectorExecutionResolver, ConnectorReadExecution,
+};
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
-pub use instance::ConnectorInstance;
 pub use metadata::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
     ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -45,6 +53,6 @@ pub use metadata::{
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorOpenReaderRequest, ConnectorRead, ConnectorReadSelector,
-    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorSplitPlanningRequest,
+    ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
+    ConnectorScan, ConnectorSplitPlanningRequest,
 };

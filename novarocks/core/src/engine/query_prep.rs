@@ -362,7 +362,7 @@ fn rewrite_time_travel_in_factor(
                     .expect("standalone connector registry read lock")
                     .clone();
                 let (table_def, _) = crate::connector::iceberg::provider::load_table_def_at(
-                    &connectors,
+                    state.connector_control.as_ref(),
                     connector_context.clone(),
                     &target.catalog,
                     &target.namespace,
@@ -468,7 +468,7 @@ pub(crate) fn materialize_external_schema_table_for_statement(
     drop_local_table_registration_if_exists(state, &target.namespace, &target.table)?;
 
     let (mut table_def, _) = crate::connector::iceberg::provider::load_schema_table_def(
-        &connectors,
+        state.connector_control.as_ref(),
         crate::connector::connector_request_context(
             None,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

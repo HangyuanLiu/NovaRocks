@@ -397,9 +397,8 @@ fn drive_data_write(
     // path — this is the same path used by run_insert and returns the
     // ResolvedTable that execute_iceberg_insert_or_overwrite expects.
     let resolved = {
-        let reg = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &reg,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,

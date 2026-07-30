@@ -92,6 +92,7 @@ pub struct BackendApplicationHost {
     ready_marker: String,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+    execution_host: Arc<crate::ConnectorExecutionHost>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
 }
 
@@ -107,6 +108,7 @@ impl fmt::Debug for BackendApplicationHost {
 struct BackendApplicationServices {
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
+    execution_host: Arc<crate::ConnectorExecutionHost>,
 }
 
 struct QueryLifecycleSweepTask {
@@ -159,7 +161,11 @@ fn compose_backend_application_services(
     config: &NovaRocksConfig,
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let controls = Arc::new(FragmentControlRegistry::default());
-    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
+    let execution_host = Arc::new(crate::ConnectorExecutionHost::new());
+    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
+        Arc::clone(&controls),
+        Arc::clone(&execution_host),
+    ));
     let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound(
         novarocks::runtime::start_epoch::start_epoch(),
         local_runtime,
@@ -172,16 +178,24 @@ fn compose_backend_application_services(
             format!("resolve connector startup object-store binding: {error}"),
         )
     })?;
-    novarocks::connector::compose_backend_connector_installers(
-        connector_registry.as_ref(),
-        default_object_store,
-    )
-    .map_err(|error| {
-        BackendApplicationError::new(
-            BackendApplicationErrorKind::Configuration,
-            format!("compose connector instance installers: {error}"),
-        )
-    })?;
+    for installer in
+        novarocks::connector::compose_backend_connector_execution_installers(default_object_store)
+            .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("compose connector execution installers: {error}"),
+            )
+        })?
+    {
+        execution_host
+            .register_installer(installer)
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("register connector execution installer: {error}"),
+                )
+            })?;
+    }
     let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
         grpc_exchange_transmitter(),
         grpc_fragment_lookup_client(),
@@ -190,10 +204,12 @@ fn compose_backend_application_services(
         controls,
         Arc::clone(&query_lifecycle_registry),
         connector_registry,
+        Arc::clone(&execution_host),
     ));
     Ok(BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
+        execution_host,
     })
 }
 
@@ -234,11 +250,17 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        let execution_shutdown = self
+            .execution_host
+            .shutdown()
+            .map_err(|error| error.to_string());
         let resource_result = stop_backend_resources();
         let sweep_result = self.query_lifecycle_sweep.stop();
-        combine_shutdown_results(sweep_result, resource_result).map_err(|error| {
-            BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
-        })
+        combine_shutdown_results(sweep_result, resource_result)
+            .and_then(|()| execution_shutdown)
+            .map_err(|error| {
+                BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
+            })
     }
 
     fn open_with_readiness_timeout(
@@ -311,6 +333,7 @@ impl BackendApplicationHost {
             ),
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
+            execution_host: services.execution_host,
             query_lifecycle_sweep,
         })
     }

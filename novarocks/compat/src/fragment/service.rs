@@ -74,7 +74,6 @@ pub struct CompatFragmentService {
     report_service: Arc<CompatReportService>,
     load_registry: Arc<CompatLoadRegistry>,
     load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
-    connectors: Arc<novarocks::connector::ConnectorRegistry>,
     lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
     table_schema_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
@@ -85,6 +84,8 @@ pub struct CompatFragmentService {
         Option<Arc<dyn novarocks::connector::starrocks::ports::StarletMetadataProvider>>,
     storage_metadata_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>>,
+    compat_iceberg_execution:
+        Arc<OnceLock<Arc<novarocks_spi::connector::ConnectorExecutionBinding>>>,
 }
 
 impl CompatFragmentService {
@@ -190,13 +191,13 @@ impl CompatFragmentService {
             report_service,
             load_registry,
             load_tracking_sink,
-            connectors: Arc::new(novarocks::connector::ConnectorRegistry::default()),
             lake_meta_resolver,
             table_schema_provider,
             schema_load_provider,
             sink_frontend_provider,
             starlet_metadata_provider,
             storage_metadata_provider,
+            compat_iceberg_execution: Arc::new(OnceLock::new()),
         }
     }
 
@@ -207,10 +208,11 @@ impl CompatFragmentService {
         &self,
         default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
     ) -> Result<(), String> {
-        novarocks::connector::compose_backend_connector_installers(
-            self.connectors.as_ref(),
-            default_object_store,
-        )
+        let binding =
+            novarocks::connector::compose_compat_iceberg_execution_binding(default_object_store)?;
+        self.compat_iceberg_execution
+            .set(Arc::new(binding))
+            .map_err(|_| "compat Iceberg execution binding is already composed".to_string())
     }
 
     pub fn submit_exec_batch_plan_fragments(&self, thrift_bytes: &[u8]) -> Result<usize, String> {
@@ -773,7 +775,6 @@ fn prepare_starrocks_draft(
     group_execution_scan_dop: Option<i32>,
     batch_exchange_sender_counts: &HashMap<i32, usize>,
     typed_result_sink: bool,
-    connectors: &novarocks::connector::ConnectorRegistry,
     table_schema_provider: Option<
         Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
     >,
@@ -787,6 +788,7 @@ fn prepare_starrocks_draft(
     storage_metadata_provider: Option<
         Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
     >,
+    compat_iceberg_execution: Option<&Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
@@ -814,12 +816,12 @@ fn prepare_starrocks_draft(
         batch_exchange_sender_counts,
         typed_result_sink,
         facts: &facts,
-        connectors,
         table_schema_provider,
         schema_load_provider,
         sink_frontend_provider,
         starlet_metadata_provider,
         storage_metadata_provider,
+        compat_iceberg_execution,
     })
     .map_err(|error| error.to_string())?;
     Ok(StarRocksFragmentDraftEnvelope {
@@ -1926,12 +1928,12 @@ fn submit_exec_batch_plan_fragments_with(
             entry.9,
             &sender_counts,
             entry.10,
-            service.connectors.as_ref(),
             service.table_schema_provider.clone(),
             service.schema_load_provider.clone(),
             service.sink_frontend_provider.clone(),
             service.starlet_metadata_provider.clone(),
             service.storage_metadata_provider.clone(),
+            service.compat_iceberg_execution.get(),
         )?);
     }
     token.check(0).map_err(|error| error.to_string())?;
@@ -2021,12 +2023,12 @@ fn submit_exec_plan_fragment_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
-        service.connectors.as_ref(),
         service.table_schema_provider.clone(),
         service.schema_load_provider.clone(),
         service.sink_frontend_provider.clone(),
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
+        service.compat_iceberg_execution.get(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
@@ -2089,12 +2091,12 @@ fn execute_plan_fragment_sync_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
-        service.connectors.as_ref(),
         service.table_schema_provider.clone(),
         service.schema_load_provider.clone(),
         service.sink_frontend_provider.clone(),
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
+        service.compat_iceberg_execution.get(),
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;

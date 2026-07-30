@@ -29,7 +29,6 @@ pub(crate) fn lower_starrocks_scan_node(
     _tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     _layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     _query_opts: &QueryOptions,
-    _connectors: &ConnectorRegistry,
     _query_global_dict_map: &QueryGlobalDictMap,
 ) -> Result<Lowered, String> {
     if node.num_children != 0 {

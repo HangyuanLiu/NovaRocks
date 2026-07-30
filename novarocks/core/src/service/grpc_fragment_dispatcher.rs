@@ -39,14 +39,15 @@ use crate::exec::chunk::Chunk;
 use crate::exec::chunk::ChunkSchema;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
-    CancelFragmentRequest, FetchResultRequest, InstallConnectorInstanceRequest,
-    QueryExecutionId as ProtoQueryExecutionId, SubmitFragmentRequest,
-    fetch_result_response::Status as FetchStatus,
+    CancelFragmentRequest, EnsureConnectorExecutionBindingRequest, FetchResultRequest,
+    QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
+    SubmitFragmentRequest, fetch_result_response::Status as FetchStatus,
 };
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::fragment_transport::{
     FetchOutcome, FetchedQueryBatch, FragmentDispatcher, NativeFragmentEnvelope,
 };
+use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
@@ -107,27 +108,67 @@ impl GrpcConnectorBindingControl {
 impl crate::query_execution::artifact::ConnectorBindingDispatcher for GrpcConnectorBindingControl {
     fn install(
         &self,
+        execution_id: QueryExecutionId,
         backend_idx: usize,
         endpoint: SocketAddr,
-        declaration: &novarocks_spi::connector::ConnectorInstanceDeclaration,
+        declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         let client = self.client_and_endpoint(backend_idx, endpoint)?;
-        let request = InstallConnectorInstanceRequest {
+        let request = EnsureConnectorExecutionBindingRequest {
+            execution_id: Some(ProtoQueryExecutionId {
+                query_id: Some(ProtoUniqueId {
+                    hi: execution_id.query_id().high(),
+                    lo: execution_id.query_id().low(),
+                }),
+                attempt_id: execution_id.attempt_id().get(),
+            }),
             provider_id: declaration.descriptor().provider_id.as_str().to_string(),
             instance_id: declaration.descriptor().instance_id.as_str().to_string(),
             incarnation: declaration.incarnation().to_bytes().to_vec(),
             declaration_payload: declaration.payload().to_vec(),
         };
         let response = client
-            .blocking_install_connector_instance(request)
+            .blocking_ensure_connector_execution_binding(request)
             .map_err(|error| {
                 format!(
-                    "connector binding install RPC failed for BE[{backend_idx}] ({endpoint}): {error}"
+                    "connector execution binding ensure RPC failed for BE[{backend_idx}] ({endpoint}): {error}"
                 )
             })?;
         if response.status_code != 0 {
             return Err(format!(
-                "connector binding install was rejected by BE[{backend_idx}] ({endpoint}): {}",
+                "connector execution binding ensure was rejected by BE[{backend_idx}] ({endpoint}): {}",
+                response.message
+            ));
+        }
+        Ok(())
+    }
+
+    fn retire(
+        &self,
+        endpoint: SocketAddr,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<(), String> {
+        let client = self
+            .endpoints
+            .iter()
+            .find_map(|(backend_idx, configured)| (*configured == endpoint).then_some(backend_idx))
+            .and_then(|backend_idx| self.clients.get(backend_idx))
+            .ok_or_else(|| {
+                format!(
+                    "connector retirement endpoint {endpoint} is absent from configured backend snapshot"
+                )
+            })?;
+        let response = client
+            .blocking_retire_connector_execution_binding(RetireConnectorExecutionBindingRequest {
+                instance_id: key.instance_id.as_str().to_string(),
+                incarnation: key.incarnation.to_bytes().to_vec(),
+            })
+            .map_err(|error| {
+                format!("connector execution binding retire RPC failed for {endpoint}: {error}")
+            })?;
+        if response.status_code != 0 {
+            return Err(format!(
+                "connector execution binding retirement was rejected by {endpoint}: {}",
                 response.message
             ));
         }
@@ -437,11 +478,11 @@ mod tests {
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
         BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
+        EnsureConnectorExecutionBindingRequest, EnsureConnectorExecutionBindingResponse,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
-        HeartbeatRequest, HeartbeatResponse, InstallConnectorInstanceRequest,
-        InstallConnectorInstanceResponse, ReportExecStatusRequest, ReportExecStatusResponse,
-        RetireConnectorInstanceRequest, RetireConnectorInstanceResponse, SubmitFragmentRequest,
-        SubmitFragmentResponse,
+        HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
+        RetireConnectorExecutionBindingRequest, RetireConnectorExecutionBindingResponse,
+        SubmitFragmentRequest, SubmitFragmentResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -598,17 +639,17 @@ mod tests {
             Err(Status::unimplemented("mock"))
         }
 
-        async fn install_connector_instance(
+        async fn ensure_connector_execution_binding(
             &self,
-            _request: Request<InstallConnectorInstanceRequest>,
-        ) -> Result<Response<InstallConnectorInstanceResponse>, Status> {
+            _request: Request<EnsureConnectorExecutionBindingRequest>,
+        ) -> Result<Response<EnsureConnectorExecutionBindingResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 
-        async fn retire_connector_instance(
+        async fn retire_connector_execution_binding(
             &self,
-            _request: Request<RetireConnectorInstanceRequest>,
-        ) -> Result<Response<RetireConnectorInstanceResponse>, Status> {
+            _request: Request<RetireConnectorExecutionBindingRequest>,
+        ) -> Result<Response<RetireConnectorExecutionBindingResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 

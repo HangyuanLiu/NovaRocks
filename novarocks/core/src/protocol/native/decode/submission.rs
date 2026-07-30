@@ -81,6 +81,20 @@ pub(crate) fn decode_fragment_submission_with_connectors(
     instance_params: &novarocks::InstanceParams,
     connectors: Arc<crate::connector::ConnectorRegistry>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    decode_fragment_submission_with_connectors_and_execution_resolver(
+        fragment,
+        instance_params,
+        connectors,
+        Arc::new(MissingExecutionResolver),
+    )
+}
+
+pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
+    fragment: &plan::PlanFragment,
+    instance_params: &novarocks::InstanceParams,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let instance_parts = decode_instance_parts(instance_params)?;
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = fragment.root.as_ref().ok_or_else(|| {
@@ -128,7 +142,8 @@ pub(crate) fn decode_fragment_submission_with_connectors(
         connectors,
         instance_parts.query_id,
         instance_parts.fragment_instance_id,
-    );
+    )
+    .with_execution_resolver(execution_resolver);
     let mut runtime_filter_ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
@@ -180,6 +195,23 @@ pub(crate) fn decode_fragment_submission_with_connectors(
     let submission = FragmentSubmission::try_new(Arc::new(program), instance)
         .map_err(NativeFragmentDecodeError::Binding)?;
     Ok(DecodedNativeFragment::new(submission, metadata))
+}
+
+struct MissingExecutionResolver;
+
+impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionResolver {
+    fn resolve(
+        &self,
+        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "native ConnectorReadSource execution resolver is not configured",
+        ))
+    }
 }
 
 pub(crate) fn decode_query_execution_id(

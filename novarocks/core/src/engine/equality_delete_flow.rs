@@ -186,9 +186,8 @@ fn run_equality_delete_distributed_transaction(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
-        let registry = state.connectors.read().expect("connector registry read");
         crate::connector::metadata_load_table(
-            &registry,
+            state.connector_control.as_ref(),
             connector_context.clone(),
             &target.catalog,
             &target.namespace,

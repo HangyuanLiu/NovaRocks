@@ -26,17 +26,15 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
-    ConnectorError, ConnectorErrorKind, ConnectorInstance, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorRead,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use iceberg::spec::{SnapshotRetention, TableMetadata};
 
 use crate::common::ids::SlotId;
-use crate::connector::ConnectorRegistry;
 use crate::connector::runtime::ConnectorReadScanSource;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::ScanSource;
@@ -213,43 +211,27 @@ impl IcebergMetadataConnectorInstance {
             })
     }
 
-    fn connector_instance(self: Arc<Self>) -> Result<ConnectorInstance, ConnectorError> {
-        ConnectorInstance::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse(ICEBERG_METADATA_SPI_PROVIDER_ID)?,
-                instance_id: self.instance_id.clone(),
-            },
-            None,
-            self,
+    fn execution_binding(self: Arc<Self>) -> Result<ConnectorExecutionBinding, ConnectorError> {
+        let key = ConnectorExecutionBindingKey {
+            instance_id: self.instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::new(),
+        };
+        ConnectorExecutionBinding::try_new(
+            ConnectorProviderId::parse(ICEBERG_METADATA_SPI_PROVIDER_ID)?,
+            key.clone(),
+            Arc::new(IcebergMetadataExecution { key, reader: self }),
         )
     }
 }
 
-impl ConnectorRead for IcebergMetadataConnectorInstance {
-    fn instance_id(&self) -> &ConnectorInstanceId {
-        &self.instance_id
-    }
+struct IcebergMetadataExecution {
+    key: ConnectorExecutionBindingKey,
+    reader: Arc<IcebergMetadataConnectorInstance>,
+}
 
-    fn begin_scan(
-        &self,
-        _: &ConnectorTableHandle,
-        _: ConnectorBeginScanRequest,
-    ) -> Result<ConnectorScan, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg metadata reads are decoder-planned",
-        ))
-    }
-
-    fn plan_splits(
-        &self,
-        _: &ConnectorScanHandle,
-        _: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg metadata reads are decoder-planned",
-        ))
+impl ConnectorReadExecution for IcebergMetadataExecution {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
     }
 
     fn open_reader(
@@ -257,8 +239,8 @@ impl ConnectorRead for IcebergMetadataConnectorInstance {
         split: &ConnectorSplit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        let range = self.range_for_split(split)?;
-        let mut config = self.config.clone();
+        let range = self.reader.range_for_split(split)?;
+        let mut config = self.reader.config.clone();
         config.ranges = vec![range];
         let reader = IcebergMetadataReader::new(config)
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
@@ -326,7 +308,6 @@ impl ConnectorCancellation for IcebergMetadataQueryCancellation {
 }
 
 pub(crate) fn plan_iceberg_metadata_read_source(
-    _connectors: &ConnectorRegistry,
     instance_id: ConnectorInstanceId,
     config: IcebergMetadataScanConfig,
     batch: ConnectorBatchBudget,
@@ -362,9 +343,9 @@ pub(crate) fn plan_iceberg_metadata_read_source(
         )
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
     );
-    let instance = Arc::clone(&provider).connector_instance()?;
-    Ok(Arc::new(ConnectorReadScanSource::new_scheduled(
-        Arc::new(instance),
+    let binding = Arc::new(Arc::clone(&provider).execution_binding()?);
+    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_execution(
+        binding,
         scheduled,
         ConnectorOpenReaderRequest {
             expected_schema: output_schema,
@@ -400,7 +381,6 @@ fn metadata_budget_and_context(
 }
 
 pub(crate) fn plan_native_iceberg_metadata_read_source(
-    connectors: &ConnectorRegistry,
     query_id: Option<QueryId>,
     node_id: i32,
     config: IcebergMetadataScanConfig,
@@ -411,7 +391,6 @@ pub(crate) fn plan_native_iceberg_metadata_read_source(
         .map(|query_id| query_id.to_string())
         .unwrap_or_else(|| "unidentified".to_string());
     plan_iceberg_metadata_read_source(
-        connectors,
         ConnectorInstanceId::parse(&format!("iceberg.metadata.native.{query_label}.{node_id}"))?,
         config,
         batch,
@@ -420,7 +399,6 @@ pub(crate) fn plan_native_iceberg_metadata_read_source(
 }
 
 pub fn plan_compat_iceberg_metadata_read_source(
-    connectors: &ConnectorRegistry,
     query_id: Option<QueryId>,
     node_id: i32,
     config: IcebergMetadataScanConfig,
@@ -431,7 +409,6 @@ pub fn plan_compat_iceberg_metadata_read_source(
         .map(|query_id| query_id.to_string())
         .unwrap_or_else(|| "unidentified".to_string());
     plan_iceberg_metadata_read_source(
-        connectors,
         ConnectorInstanceId::parse(&format!("iceberg.metadata.compat.{query_label}.{node_id}"))?,
         config,
         batch,

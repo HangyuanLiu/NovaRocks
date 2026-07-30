@@ -29,7 +29,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
-use novarocks_spi::connector::{ConnectorInstance, ConnectorSplit};
+use novarocks_spi::connector::{ConnectorExecutionBinding, ConnectorSplit};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -141,13 +141,16 @@ pub struct ConnectorRowPosition {
 /// instance owns every table-format read semantic.
 #[derive(Clone)]
 pub struct ConnectorRowPositionLookup {
-    pub(crate) instance: Arc<ConnectorInstance>,
+    pub(crate) binding: Arc<ConnectorExecutionBinding>,
     pub(crate) splits: HashMap<i32, ConnectorSplit>,
 }
 
 impl ConnectorRowPositionLookup {
-    pub fn new(instance: Arc<ConnectorInstance>, splits: HashMap<i32, ConnectorSplit>) -> Self {
-        Self { instance, splits }
+    pub fn new_execution(
+        binding: Arc<ConnectorExecutionBinding>,
+        splits: HashMap<i32, ConnectorSplit>,
+    ) -> Self {
+        Self { binding, splits }
     }
 
     pub fn splits(&self) -> impl Iterator<Item = (&i32, &ConnectorSplit)> {

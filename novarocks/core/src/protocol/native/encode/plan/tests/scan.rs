@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
+    ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorScan,
     ConnectorScanHandle,
 };
@@ -160,7 +160,7 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
 fn planned_connector_read_for_test()
 -> crate::query_execution::preparation::scan::PlannedConnectorRead {
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let declaration = ConnectorInstanceDeclaration::try_new(
+    let declaration = ConnectorExecutionDeclaration::try_new(
         ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
             instance_id: instance_id.clone(),
@@ -181,6 +181,7 @@ fn planned_connector_read_for_test()
             max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
         },
+        planning_lease: None,
     }
 }
 

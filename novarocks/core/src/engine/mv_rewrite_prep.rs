@@ -233,7 +233,7 @@ fn build_candidate(
         .expect("standalone connector registry read lock")
         .clone();
     let (target_table, _) = crate::connector::iceberg::provider::load_schema_table_def(
-        &connectors,
+        state.connector_control.as_ref(),
         crate::connector::connector_request_context(
             None,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

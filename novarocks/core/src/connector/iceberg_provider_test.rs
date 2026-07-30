@@ -19,17 +19,17 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation, ConnectorInstanceId,
-    ConnectorInstanceInstaller, ConnectorListTablesRequest, ConnectorNamespaceIdentity,
-    ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorRequestContext,
-    ConnectorSplitPlanningRequest, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation,
+    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorNamespaceIdentity, ConnectorOpenReaderRequest,
+    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
 use super::iceberg::catalog::{IcebergCatalogRegistry, create_namespace};
 use super::iceberg::provider::{
-    IcebergConnectorInstaller, IcebergConnectorInstance, IcebergReadBinding,
+    IcebergConnectorInstaller, IcebergControlProvider, IcebergReadBinding,
 };
 use crate::sql::{Literal, TableColumnDef};
 use novarocks_catalog::schema::SqlType;
@@ -100,53 +100,38 @@ fn registry_with_table() -> (Arc<RwLock<IcebergCatalogRegistry>>, tempfile::Temp
     (registry, warehouse)
 }
 
+fn install_execution(
+    control: &novarocks_spi::connector::ConnectorControlBinding,
+) -> ConnectorExecutionBinding {
+    let declaration = control
+        .execution_declaration(&context())
+        .expect("create secret-free declaration");
+    IcebergConnectorInstaller::new(
+        IcebergReadBinding::default_binding(None).expect("build read binding"),
+    )
+    .install(&declaration, &context())
+    .expect("install read-only Iceberg execution binding")
+}
+
 #[test]
 fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergConnectorInstance::new(instance_id, registry)
-        .expect("planning Iceberg connector instance");
+    let control = IcebergControlProvider::new_control(instance_id, registry)
+        .expect("planning Iceberg control binding");
 
-    let declaration = instance
-        .distribution()
-        .expect("Iceberg planning instance is distributable")
-        .declaration(&context())
+    let declaration = control
+        .execution_declaration(&context())
         .expect("create secret-free declaration");
     let declaration_debug = format!("{declaration:?}");
     assert!(!declaration_debug.contains("warehouse"));
     assert!(!declaration_debug.contains("access_key"));
 
-    let installer = IcebergConnectorInstaller::new(
-        IcebergReadBinding::default_binding(None).expect("build read binding"),
-    );
-    let read_only = installer
-        .install(&declaration, &context())
-        .expect("install read-only Iceberg instance");
-    assert_eq!(read_only.descriptor(), declaration.descriptor());
-    assert!(read_only.metadata().is_none());
-    let error = match read_only.read().begin_scan(
-        &novarocks_spi::connector::ConnectorTableHandle::try_new(
-            declaration.descriptor().instance_id.clone(),
-            bytes::Bytes::new(),
-        )
-        .expect("table handle"),
-        ConnectorBeginScanRequest {
-            projection: Vec::new(),
-            selector: ConnectorReadSelector::Current,
-            limit: None,
-            batch: ConnectorBatchBudget {
-                max_rows: NonZeroUsize::new(1).expect("nonzero rows"),
-                max_bytes: NonZeroUsize::new(1).expect("nonzero bytes"),
-            },
-            context: context(),
-        },
-    ) {
-        Ok(_) => panic!("read-only BE instance must not plan scans"),
-        Err(error) => error,
-    };
+    let execution = install_execution(&control);
+    assert_eq!(execution.key(), &declaration.binding_key());
     assert_eq!(
-        error.kind(),
-        novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        execution.provider_id(),
+        &declaration.descriptor().provider_id
     );
 }
 
@@ -154,11 +139,10 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
 fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let planning = IcebergConnectorInstance::new(instance_id.clone(), registry)
-        .expect("planning Iceberg connector instance");
+    let planning = IcebergControlProvider::new_control(instance_id.clone(), registry)
+        .expect("planning Iceberg control binding");
     let resolved = planning
         .metadata()
-        .expect("planning instance metadata")
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
@@ -170,7 +154,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         })
         .expect("load table");
     let scan = planning
-        .read()
+        .planning()
         .begin_scan(
             &resolved.table,
             ConnectorBeginScanRequest {
@@ -186,7 +170,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         )
         .expect("begin scan");
     let split = planning
-        .read()
+        .planning()
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
@@ -197,16 +181,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         )
         .expect("plan split")
         .remove(0);
-    let declaration = planning
-        .distribution()
-        .expect("distributable planning instance")
-        .declaration(&context())
-        .expect("declaration");
-    let installed = IcebergConnectorInstaller::new(
-        IcebergReadBinding::default_binding(None).expect("build read binding"),
-    )
-    .install(&declaration, &context())
-    .expect("install read-only instance");
+    let installed = install_execution(&planning);
 
     let mut reader = installed
         .read()
@@ -313,9 +288,9 @@ fn force_current_snapshot_id(
 fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     let (registry, warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergConnectorInstance::new(instance_id.clone(), registry)
-        .expect("iceberg connector instance");
-    let metadata = instance.metadata().expect("metadata capability");
+    let instance = IcebergControlProvider::new_control(instance_id.clone(), registry)
+        .expect("Iceberg control binding");
+    let metadata = instance.metadata();
     let namespace = ConnectorNamespaceIdentity {
         instance_id: instance_id.clone(),
         namespace: Arc::from("db"),
@@ -346,7 +321,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     assert_eq!(resolved.schema.fields().len(), 1);
 
     let scan = instance
-        .read()
+        .planning()
         .begin_scan(
             &resolved.table,
             ConnectorBeginScanRequest {
@@ -362,7 +337,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         )
         .expect("begin scan");
     let splits = instance
-        .read()
+        .planning()
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
@@ -384,7 +359,8 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         "file:///warehouse/db/orders/not-in-snapshot.parquet",
     )
     .expect("corrupt split fixture");
-    let error = match instance.read().open_reader(
+    let execution = install_execution(&instance);
+    let error = match execution.read().open_reader(
         &corrupt_split,
         ConnectorOpenReaderRequest {
             expected_schema: Arc::clone(&resolved.schema),
@@ -407,7 +383,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
         "unexpected corrupt split error: {error}"
     );
     for _ in 0..2 {
-        let mut reader = instance
+        let mut reader = execution
             .read()
             .open_reader(
                 &splits[0],
@@ -440,8 +416,8 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         .get("ice")
         .expect("catalog entry");
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
-    let instance = IcebergConnectorInstance::new(instance_id.clone(), Arc::clone(&registry))
-        .expect("iceberg connector instance");
+    let instance = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
+        .expect("Iceberg control binding");
     let table_identity = ConnectorTableIdentity {
         instance_id: instance_id.clone(),
         namespace: Arc::from("db"),
@@ -449,7 +425,6 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
     };
     let resolved = instance
         .metadata()
-        .expect("metadata capability")
         .load_table(ConnectorTableRequest {
             table: table_identity.clone(),
             resolution: ConnectorTableResolution::StrictBaseTable,
@@ -457,7 +432,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         })
         .expect("load original table");
     let scan = instance
-        .read()
+        .planning()
         .begin_scan(
             &resolved.table,
             ConnectorBeginScanRequest {
@@ -473,7 +448,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         )
         .expect("begin original scan");
     let stale_split = instance
-        .read()
+        .planning()
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
@@ -538,7 +513,8 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         "fixture must reproduce numeric snapshot-ID reuse"
     );
 
-    let error = match instance.read().open_reader(
+    let execution = install_execution(&instance);
+    let error = match execution.read().open_reader(
         &stale_split,
         ConnectorOpenReaderRequest {
             expected_schema: Arc::clone(&resolved.schema),
@@ -559,7 +535,6 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
 
     let current = instance
         .metadata()
-        .expect("metadata capability")
         .load_table(ConnectorTableRequest {
             table: table_identity,
             resolution: ConnectorTableResolution::StrictBaseTable,
@@ -567,7 +542,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         })
         .expect("load current table");
     let current_scan = instance
-        .read()
+        .planning()
         .begin_scan(
             &current.table,
             ConnectorBeginScanRequest {
@@ -583,7 +558,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         )
         .expect("begin current scan");
     let current_split = instance
-        .read()
+        .planning()
         .plan_splits(
             &current_scan.handle,
             ConnectorSplitPlanningRequest {
@@ -594,7 +569,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         )
         .expect("plan current splits")
         .remove(0);
-    let mut reader = instance
+    let mut reader = execution
         .read()
         .open_reader(
             &current_split,
