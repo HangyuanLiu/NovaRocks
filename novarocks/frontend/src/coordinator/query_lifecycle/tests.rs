@@ -83,6 +83,7 @@ struct RecordingSessionState {
     commands: Vec<QueryControlCommand>,
     events: VecDeque<Result<QueryControlEvent, QueryLifecycleTransportError>>,
     send_errors: VecDeque<QueryLifecycleTransportError>,
+    terminal_snapshot: Option<novarocks::query_execution::lifecycle::QueryTerminalSnapshot>,
 }
 
 impl RecordingSession {
@@ -91,6 +92,20 @@ impl RecordingSession {
     ) -> Self {
         let state = RecordingSessionState {
             events: events.into_iter().collect(),
+            ..RecordingSessionState::default()
+        };
+        Self {
+            state: Arc::new((Mutex::new(state), Condvar::new())),
+        }
+    }
+
+    fn with_terminal_snapshot(
+        events: impl IntoIterator<Item = Result<QueryControlEvent, QueryLifecycleTransportError>>,
+        terminal_snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+    ) -> Self {
+        let state = RecordingSessionState {
+            events: events.into_iter().collect(),
+            terminal_snapshot: Some(terminal_snapshot),
             ..RecordingSessionState::default()
         };
         Self {
@@ -130,6 +145,13 @@ impl QueryControlSession for RecordingSession {
             QueryControlCommand::Heartbeat { .. } | QueryControlCommand::TerminalAck { .. } => None,
         };
         state.commands.push(command);
+        if matches!(terminal, Some(QueryTerminationReason::CoordinatorFinalize))
+            && let Some(snapshot) = state.terminal_snapshot.clone()
+        {
+            state
+                .events
+                .push_back(Ok(QueryControlEvent::TerminalSnapshot { snapshot }));
+        }
         if let Some(reason) = terminal {
             state
                 .events
@@ -197,7 +219,20 @@ impl RecordingTransport {
                     QueryInitOutcome::Applied,
                 ))]),
             );
-            let session = RecordingSession::with_events([Ok(QueryControlEvent::ControlReady)]);
+            let snapshot = novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                plan.execution_id(),
+                participant.backend().clone(),
+                participant.digest(),
+                Vec::new(),
+            )
+            .expect("recording terminal snapshot");
+            let session = RecordingSession::with_terminal_snapshot(
+                [
+                    Ok(QueryControlEvent::ControlReady),
+                    Ok(QueryControlEvent::LocalDrained),
+                ],
+                snapshot,
+            );
             state.attach_results.insert(
                 backend_idx,
                 VecDeque::from([Ok(Arc::new(session.clone()) as Arc<dyn QueryControlSession>)]),
@@ -512,22 +547,37 @@ struct HeartbeatGateSessionState {
     ready_sent: bool,
     events: VecDeque<QueryControlEvent>,
     commands: Vec<QueryControlCommand>,
+    terminal_snapshot: Option<novarocks::query_execution::lifecycle::QueryTerminalSnapshot>,
 }
 
 impl HeartbeatGateSession {
-    fn early(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+    fn early(
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        terminal_snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+    ) -> Self {
         Self {
             gate,
             wait_for_heartbeat_before_ready: false,
-            state: Arc::new(Mutex::new(HeartbeatGateSessionState::default())),
+            state: Arc::new(Mutex::new(HeartbeatGateSessionState {
+                events: VecDeque::new(),
+                terminal_snapshot: Some(terminal_snapshot),
+                ..HeartbeatGateSessionState::default()
+            })),
         }
     }
 
-    fn slow(gate: Arc<(Mutex<bool>, Condvar)>) -> Self {
+    fn slow(
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        terminal_snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot,
+    ) -> Self {
         Self {
             gate,
             wait_for_heartbeat_before_ready: true,
-            state: Arc::new(Mutex::new(HeartbeatGateSessionState::default())),
+            state: Arc::new(Mutex::new(HeartbeatGateSessionState {
+                events: VecDeque::new(),
+                terminal_snapshot: Some(terminal_snapshot),
+                ..HeartbeatGateSessionState::default()
+            })),
         }
     }
 
@@ -562,6 +612,13 @@ impl QueryControlSession for HeartbeatGateSession {
                     });
             }
             QueryControlCommand::Finalize => {
+                let snapshot = state
+                    .terminal_snapshot
+                    .clone()
+                    .expect("heartbeat fixture terminal snapshot");
+                state
+                    .events
+                    .push_back(QueryControlEvent::TerminalSnapshot { snapshot });
                 state
                     .events
                     .push_back(QueryControlEvent::TerminationAccepted {
@@ -582,6 +639,7 @@ impl QueryControlSession for HeartbeatGateSession {
             let mut state = self.state.lock().expect("heartbeat gate state");
             if !state.ready_sent && !self.wait_for_heartbeat_before_ready {
                 state.ready_sent = true;
+                state.events.push_back(QueryControlEvent::LocalDrained);
                 return Ok(QueryControlEvent::ControlReady);
             }
             if let Some(event) = state.events.pop_front() {
@@ -599,6 +657,7 @@ impl QueryControlSession for HeartbeatGateSession {
                 let mut state = self.state.lock().expect("heartbeat gate state");
                 if !state.ready_sent {
                     state.ready_sent = true;
+                    state.events.push_back(QueryControlEvent::LocalDrained);
                     return Ok(QueryControlEvent::ControlReady);
                 }
                 if let Some(event) = state.events.pop_front() {
@@ -618,9 +677,19 @@ fn early_control_ready_session_is_heartbeated_while_other_attach_is_slow() {
     let plan = query_init_plan(None);
     let (transport, _) = RecordingTransport::ready(&plan);
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
-    let early = HeartbeatGateSession::early(Arc::clone(&gate));
-    let slow = HeartbeatGateSession::slow(Arc::clone(&gate));
-    let peer = HeartbeatGateSession::early(Arc::clone(&gate));
+    let terminal_snapshot = |backend_idx| {
+        let participant = plan.participant(backend_idx).expect("fixture participant");
+        novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+            plan.execution_id(),
+            participant.backend().clone(),
+            participant.digest(),
+            Vec::new(),
+        )
+        .expect("heartbeat fixture terminal snapshot")
+    };
+    let early = HeartbeatGateSession::early(Arc::clone(&gate), terminal_snapshot(0));
+    let slow = HeartbeatGateSession::slow(Arc::clone(&gate), terminal_snapshot(1));
+    let peer = HeartbeatGateSession::early(Arc::clone(&gate), terminal_snapshot(2));
     {
         let mut state = transport.state.lock().expect("recording transport lock");
         state.attach_results.insert(
@@ -1481,9 +1550,11 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     .expect("live lifecycle config");
     let barrier = FrontendQueryLifecycleBarrier::new(Arc::clone(&transport), registry, live_config);
 
-    barrier
+    let lease = barrier
         .initialize_all(plan)
-        .expect("Init and ControlReady cross the generated gRPC service")
+        .expect("Init and ControlReady cross the generated gRPC service");
+    ingress.send_control_event(QueryControlEvent::LocalDrained);
+    lease
         .finalize()
         .expect("Finalize crosses the same control stream");
     let abort_ack = transport
@@ -1977,6 +2048,14 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
                 gate: self.gate.clone(),
                 manual_heartbeat_acks: self.manual_heartbeat_acks,
                 manual_terminal_acks: self.manual_terminal_acks,
+                execution_id: attach.execution_id(),
+                backend: self
+                    .initialized_backend
+                    .lock()
+                    .expect("initialized backend")
+                    .clone()
+                    .expect("InitQuery precedes attach"),
+                digest: attach.digest(),
             }),
             events: receiver,
         })
@@ -1989,6 +2068,9 @@ struct LiveBackendControl {
     gate: Option<Arc<LiveHeartbeatGate>>,
     manual_heartbeat_acks: bool,
     manual_terminal_acks: bool,
+    execution_id: QueryExecutionId,
+    backend: ParticipantBackendIdentity,
+    digest: novarocks::query_execution::lifecycle::ParticipantManifestDigest,
 }
 
 impl BackendQueryControl for LiveBackendControl {
@@ -2016,6 +2098,19 @@ impl BackendQueryControl for LiveBackendControl {
         if self.manual_terminal_acks {
             return Ok(());
         }
+        self.events
+            .try_send(QueryControlEvent::TerminalSnapshot {
+                snapshot: novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+                    self.execution_id,
+                    self.backend.clone(),
+                    self.digest,
+                    Vec::new(),
+                )
+                .map_err(|error| {
+                    QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
+                })?,
+            })
+            .map_err(live_control_error)?;
         self.events
             .try_send(QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorAbort,

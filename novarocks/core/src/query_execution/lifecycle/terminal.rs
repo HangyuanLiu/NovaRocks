@@ -368,6 +368,12 @@ impl QueryTerminalSet {
         &self.snapshots
     }
 
+    pub fn fragments(&self) -> impl Iterator<Item = &FragmentTerminalSnapshot> {
+        self.snapshots
+            .iter()
+            .flat_map(QueryTerminalSnapshot::fragments)
+    }
+
     pub fn is_success(&self) -> bool {
         self.snapshots.iter().all(QueryTerminalSnapshot::is_success)
     }

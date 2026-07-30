@@ -63,10 +63,15 @@ struct RecordingQueryLifecycleGuard {
 }
 
 impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
-    fn finalize(mut self: Box<Self>) -> Result<(), DistributedQueryError> {
+    fn finalize(
+        mut self: Box<Self>,
+    ) -> Result<crate::query_execution::lifecycle::QueryTerminalSet, DistributedQueryError> {
         self.armed = false;
         self.finalizes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(
+            crate::query_execution::lifecycle::QueryTerminalSet::new(Vec::new())
+                .expect("an empty test terminal set is valid"),
+        )
     }
 
     fn abort_preserving(mut self: Box<Self>, primary_error: String) -> String {

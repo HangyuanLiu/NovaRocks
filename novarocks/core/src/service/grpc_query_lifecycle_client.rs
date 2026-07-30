@@ -300,9 +300,11 @@ impl QueryControlSession for GrpcQueryControlSession {
                     "query control command stream is closed",
                 ),
             })?;
-        state
-            .pending
-            .push_back(PendingQueryControlCommand::from(&command));
+        if !matches!(command, QueryControlCommand::TerminalAck { .. }) {
+            state
+                .pending
+                .push_back(PendingQueryControlCommand::from(&command));
+        }
         Ok(())
     }
 

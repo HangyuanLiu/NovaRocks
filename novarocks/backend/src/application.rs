@@ -10,7 +10,7 @@ use novarocks::connector::ConnectorRegistry;
 use novarocks::query_execution::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlAttachment, QueryInitAck, QueryInitRequest,
     QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
-    QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
+    QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::grpc_server;
@@ -296,10 +296,26 @@ impl BackendApplicationHost {
         config: BackendServerConfig,
         native_report_handler: Arc<dyn NativeReportHandler>,
     ) -> Result<Self, BackendApplicationError> {
+        Self::open_with_native_report_handler_and_terminal_ingress(
+            config,
+            native_report_handler,
+            None,
+        )
+    }
+
+    /// The combined all-in-one process still delivers terminal facts through
+    /// the generated gRPC service.  The FE-owned ingress is supplied only at
+    /// this composition root; a standalone BE must not accept terminal reports.
+    pub fn open_with_native_report_handler_and_terminal_ingress(
+        config: BackendServerConfig,
+        native_report_handler: Arc<dyn NativeReportHandler>,
+        terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+    ) -> Result<Self, BackendApplicationError> {
         Self::open_with_readiness_timeout_and_report_handler(
             config,
             READINESS_TIMEOUT,
             native_report_handler,
+            terminal_ingress,
         )
     }
 
@@ -343,6 +359,7 @@ impl BackendApplicationHost {
             config,
             readiness_timeout,
             backend_native_report_handler(),
+            None,
         )
     }
 
@@ -350,6 +367,7 @@ impl BackendApplicationHost {
         config: BackendServerConfig,
         readiness_timeout: Duration,
         native_report_handler: Arc<dyn NativeReportHandler>,
+        terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Result<Self, BackendApplicationError> {
         let config = config.config;
         app_config::install_preloaded_config(config.clone());
@@ -374,12 +392,13 @@ impl BackendApplicationHost {
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
-        grpc_server::start_grpc_exchange_server(
+        grpc_server::start_grpc_exchange_server_with_terminal_ingress(
             &bind_host,
             grpc_port,
             native_fragment_service.clone(),
             services.query_lifecycle_ingress.clone(),
             native_report_handler,
+            terminal_ingress,
         )
         .map_err(|error| {
             let _ = query_lifecycle_sweep.stop();

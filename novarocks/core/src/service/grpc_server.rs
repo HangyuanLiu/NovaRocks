@@ -1616,11 +1616,33 @@ pub fn start_grpc_exchange_server(
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
+    start_grpc_exchange_server_with_terminal_ingress(
+        host,
+        port,
+        native_fragment_ingress,
+        query_lifecycle_ingress,
+        report_handler,
+        None,
+    )
+}
+
+/// Starts a native fragment endpoint with an optional FE-owned terminal
+/// fallback ingress.  Backend-only and compat composition deliberately pass
+/// `None`, so their endpoint rejects `ReportQueryTerminal`.
+pub fn start_grpc_exchange_server_with_terminal_ingress(
+    host: &str,
+    port: u16,
+    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+) -> Result<(), String> {
     start_standalone_grpc_server(
         host,
         port,
         StandaloneGrpcMode::FullExecution(native_fragment_ingress, query_lifecycle_ingress),
         report_handler,
+        terminal_ingress,
     )
 }
 
@@ -1630,7 +1652,13 @@ pub fn start_grpc_report_server(
     port: u16,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
-    start_standalone_grpc_server(host, port, StandaloneGrpcMode::ReportOnly, report_handler)
+    start_standalone_grpc_server(
+        host,
+        port,
+        StandaloneGrpcMode::ReportOnly,
+        report_handler,
+        None,
+    )
 }
 
 fn start_standalone_grpc_server(
@@ -1638,6 +1666,7 @@ fn start_standalone_grpc_server(
     port: u16,
     mode: StandaloneGrpcMode,
     report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
 ) -> Result<(), String> {
     {
         let mut state = grpc_server_state()
@@ -1697,9 +1726,11 @@ fn start_standalone_grpc_server(
                 let mut shutdown = shutdown_rx.clone();
                 let query_control_shutdown = shutdown_rx.clone();
 
-                let svc = mode
-                    .service(report_handler)
-                    .with_query_control_shutdown(query_control_shutdown);
+                let mut svc = mode.service(report_handler);
+                if let Some(terminal_ingress) = terminal_ingress {
+                    svc = svc.with_terminal_ingress(terminal_ingress);
+                }
+                let svc = svc.with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);

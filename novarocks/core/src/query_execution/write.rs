@@ -23,6 +23,7 @@ use crate::common::types::UniqueId;
 use crate::proto::{common, novarocks};
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
 use crate::runtime::profile::RuntimeProfileTree;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -292,6 +293,61 @@ impl WriteReportBuilder {
             }
             self.failure.get_or_insert_with(|| {
                 "write report builder received conflicting final writer output".into()
+            });
+            return Ok(());
+        }
+        self.completed.insert(key, output);
+        Ok(())
+    }
+
+    /// Applies an immutable QLC-4 terminal fact.  Native `ReportExecStatus`
+    /// remains a compatibility observation stream; it is intentionally not
+    /// needed to decide whether a writer completed.
+    pub fn apply_terminal(
+        &mut self,
+        fragment: &FragmentTerminalSnapshot,
+    ) -> Result<(), DistributedQueryError> {
+        let key = WriterKey {
+            query_id: self.write_id,
+            fragment_instance_id: fragment.fragment_instance_id(),
+            backend_num: fragment.backend_num(),
+        };
+        let Some((writer_id, fragment_id)) = self.expected.get(&key).copied() else {
+            return Ok(());
+        };
+        if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
+            self.failure
+                .get_or_insert_with(|| match fragment.outcome() {
+                    FragmentTerminalOutcome::Failed { code, detail } => {
+                        format!("native writer failed with {code}: {detail}")
+                    }
+                    FragmentTerminalOutcome::Cancelled { detail } => {
+                        format!("native writer cancelled: {detail}")
+                    }
+                    FragmentTerminalOutcome::IncompleteDrain { detail } => {
+                        format!("native writer drain was incomplete: {detail}")
+                    }
+                    FragmentTerminalOutcome::Succeeded => unreachable!(),
+                });
+            return Ok(());
+        }
+        let sink = fragment.sink();
+        let output = WriterCommitInput {
+            writer_id,
+            fragment_id,
+            writer_key: key.clone(),
+            iceberg_commits: sink.iceberg_commits.clone(),
+            load_counters: BTreeMap::new(),
+            loaded_rows: sink.load_stats.loaded_rows,
+            loaded_bytes: sink.load_stats.loaded_bytes,
+            filtered_rows: sink.load_stats.filtered_rows,
+        };
+        if let Some(existing) = self.completed.get(&key) {
+            if existing == &output {
+                return Ok(());
+            }
+            self.failure.get_or_insert_with(|| {
+                "write terminal set contains conflicting writer output".into()
             });
             return Ok(());
         }

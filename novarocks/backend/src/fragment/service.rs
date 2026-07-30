@@ -385,7 +385,14 @@ impl NativeFragmentService {
                         fragment_instance_id.lo
                     );
                 }
-                consume_terminal_fact(running, token, queries, lifecycle, execution_id);
+                consume_terminal_fact(
+                    running,
+                    token,
+                    queries,
+                    lifecycle,
+                    execution_id,
+                    backend_num,
+                );
             })
             .map_err(|error| {
                 NativeFragmentIngressError::new(format!(
@@ -535,7 +542,14 @@ impl NativeFragmentService {
                         }
                     }
                 }
-                consume_terminal_fact(running, token, queries, lifecycle, execution_id);
+                consume_terminal_fact(
+                    running,
+                    token,
+                    queries,
+                    lifecycle,
+                    execution_id,
+                    backend_num,
+                );
             })
             .map_err(|error| {
                 NativeFragmentIngressError::new(format!(
@@ -687,6 +701,7 @@ fn consume_terminal_fact(
     queries: NativeFragmentQueryRuntime,
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
+    backend_num: i32,
 ) {
     let fact = running.join();
     let query_id = fact.query_id();
@@ -698,7 +713,7 @@ fn consume_terminal_fact(
     // QLC-4 transfers the final facts to the query lifecycle before any
     // reporter or sink registry cleanup. Native ReportExecStatus remains a
     // periodic observation channel and must not own query completion.
-    lifecycle.record_fragment_terminal_fact(execution_id, fact, 0, sink);
+    lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
     native_fragment_report::unregister(fragment_instance_id);
     let report_decision = queries.finish_fragment_for_report(query_id);
     queries.unregister_fragment(fragment_instance_id);
@@ -1310,6 +1325,7 @@ mod tests {
             service.queries.clone(),
             Arc::clone(&service.lifecycle),
             execution_id,
+            0,
         );
 
         assert!(

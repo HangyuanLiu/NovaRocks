@@ -33,7 +33,7 @@ use super::manifest::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
 };
-use super::{QueryExecutionId, QueryLifecycleTarget, StageParticipantBinding};
+use super::{QueryExecutionId, QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -369,7 +369,7 @@ pub trait QueryInitBarrier: Send + Sync + 'static {
 }
 
 pub trait QueryLifecycleLeaseGuard: Send + 'static {
-    fn finalize(self: Box<Self>) -> Result<(), DistributedQueryError>;
+    fn finalize(self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError>;
 
     fn abort_preserving(self: Box<Self>, primary_error: String) -> String;
 }
@@ -384,7 +384,7 @@ impl QueryLifecycleLease {
         Self { guard: Some(guard) }
     }
 
-    pub fn finalize(mut self) -> Result<(), DistributedQueryError> {
+    pub fn finalize(mut self) -> Result<QueryTerminalSet, DistributedQueryError> {
         self.guard
             .take()
             .expect("query lifecycle lease is consumed exactly once")

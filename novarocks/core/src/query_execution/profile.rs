@@ -21,6 +21,7 @@ use crate::runtime::profile::{
 use std::collections::HashMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::write::NativeExecutionReport;
 
@@ -54,6 +55,29 @@ impl ProfileReportBuilder {
         if let Some(profile) = profile {
             self.profiles.push(profile);
         }
+        Ok(())
+    }
+
+    /// Profiles are a terminal contribution when profiling is enabled.  A
+    /// missing contribution is therefore an explicit lifecycle failure rather
+    /// than an empty best-effort profile result.
+    pub fn apply_terminal(
+        &mut self,
+        fragment: &FragmentTerminalSnapshot,
+    ) -> Result<(), DistributedQueryError> {
+        if !matches!(fragment.outcome(), FragmentTerminalOutcome::Succeeded) {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                "fragment terminal snapshot reports a non-successful outcome",
+            ));
+        }
+        let profile = fragment.profile().cloned().ok_or_else(|| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                "profile-enabled fragment terminal snapshot is missing its final profile",
+            )
+        })?;
+        self.profiles.push(profile);
         Ok(())
     }
 

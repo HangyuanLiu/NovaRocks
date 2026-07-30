@@ -408,6 +408,35 @@ impl NovaRocksGrpcRemoteClient {
         })?
     }
 
+    pub fn blocking_report_query_terminal_with_timeout(
+        &self,
+        req: proto::novarocks::ReportQueryTerminalRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::ReportQueryTerminalResponse, String> {
+        data_block_on(async {
+            let deadline_at = tokio::time::Instant::now() + timeout;
+            let mut client = self
+                .make_deadline_async_client("report_query_terminal", deadline_at)
+                .await?;
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "report_query_terminal deadline exceeded before unary RPC submission"
+                        .to_string(),
+                );
+            }
+            let mut request = Request::new(req);
+            request.set_timeout(remaining);
+            tokio::time::timeout_at(deadline_at, client.report_query_terminal(request))
+                .await
+                .map_err(|_| {
+                    "report_query_terminal deadline exceeded during unary RPC".to_string()
+                })?
+                .map(|response| response.into_inner())
+                .map_err(|error| format!("report_query_terminal rpc failed: {error}"))
+        })?
+    }
+
     pub fn blocking_batch_report_exec_status(
         &self,
         req: proto::novarocks::BatchReportExecStatusRequest,

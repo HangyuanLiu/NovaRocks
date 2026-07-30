@@ -722,7 +722,7 @@ impl AttemptControl {
         }
     }
 
-    pub fn finalize(&self) -> Result<(), DistributedQueryError> {
+    pub fn finalize(&self) -> Result<QueryTerminalSet, DistributedQueryError> {
         self.state
             .compare_exchange(ACTIVE, FINALIZING, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -737,6 +737,8 @@ impl AttemptControl {
                 )
             })?;
         self.stop_supervisor();
+        self.wait_for_all_drained(self.config.terminal_drain_timeout())
+            .map_err(failed)?;
         let sessions = self.sessions();
         let errors = std::thread::scope(|scope| {
             let handles = sessions
@@ -746,18 +748,7 @@ impl AttemptControl {
                         session
                             .session
                             .send(QueryControlCommand::Finalize)
-                            .map_err(|error| error.to_string())?;
-                        match self.wait_for_termination(
-                            session.target.backend_idx(),
-                            self.config.attach_timeout(),
-                        ) {
-                            Ok(QueryTerminationReason::CoordinatorFinalize) => Ok(()),
-                            Ok(reason) => Err(format!(
-                                "backend {} accepted finalize with unexpected reason {reason:?}",
-                                session.target.backend_idx()
-                            )),
-                            Err(error) => Err(error),
-                        }
+                            .map_err(|error| error.to_string())
                     })
                 })
                 .collect::<Vec<_>>();
@@ -772,6 +763,9 @@ impl AttemptControl {
         });
         self.metrics.attempt_terminated();
         if errors.is_empty() {
+            let terminal_set = self
+                .wait_for_all_snapshots(self.config.terminal_ack_timeout())
+                .map_err(failed)?;
             self.state.store(FINALIZED, Ordering::Release);
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
@@ -779,7 +773,7 @@ impl AttemptControl {
                 attempt_id = self.execution_id.attempt_id().get(),
                 "frontend query lifecycle finalized"
             );
-            Ok(())
+            Ok(terminal_set)
         } else {
             self.state.store(ABORTED, Ordering::Release);
             let primary = format!("query lifecycle finalize failed: {}", errors.join("; "));
@@ -825,6 +819,15 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 ) =>
             {
                 continue;
+            }
+            Err(error)
+                if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed)
+                    && control.terminal_set().is_ok() =>
+            {
+                // The stream's terminal send side may close immediately after
+                // accepting the ACK.  Once every immutable snapshot is stored,
+                // transport closure cannot revoke that completed terminal set.
+                return;
             }
             Err(error) => {
                 control.record_reader_failure(format!(
@@ -1088,7 +1091,7 @@ impl FrontendQueryLifecycleLeaseGuard {
 }
 
 impl QueryLifecycleLeaseGuard for FrontendQueryLifecycleLeaseGuard {
-    fn finalize(mut self: Box<Self>) -> Result<(), DistributedQueryError> {
+    fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
         self.stop_and_join();
         self.control.finalize()
     }

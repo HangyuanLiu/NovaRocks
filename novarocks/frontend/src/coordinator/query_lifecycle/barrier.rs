@@ -44,6 +44,8 @@ pub(crate) struct FrontendQueryLifecycleConfig {
     attach_timeout: Duration,
     stage_rpc_timeout: Duration,
     start_rpc_timeout: Duration,
+    terminal_drain_timeout: Duration,
+    terminal_ack_timeout: Duration,
 }
 
 impl FrontendQueryLifecycleConfig {
@@ -77,6 +79,8 @@ impl FrontendQueryLifecycleConfig {
             attach_timeout,
             stage_rpc_timeout: Duration::from_secs(5),
             start_rpc_timeout: Duration::from_secs(2),
+            terminal_drain_timeout: attach_timeout,
+            terminal_ack_timeout: attach_timeout,
         })
     }
 
@@ -92,6 +96,21 @@ impl FrontendQueryLifecycleConfig {
         }
         self.stage_rpc_timeout = stage_rpc_timeout;
         self.start_rpc_timeout = start_rpc_timeout;
+        Ok(self)
+    }
+
+    pub(crate) fn with_terminal_timeouts(
+        mut self,
+        terminal_drain_timeout: Duration,
+        terminal_ack_timeout: Duration,
+    ) -> Result<Self, DistributedQueryError> {
+        if terminal_drain_timeout.is_zero() || terminal_ack_timeout.is_zero() {
+            return Err(contract_error(
+                "frontend terminal drain and ACK timeouts must be nonzero",
+            ));
+        }
+        self.terminal_drain_timeout = terminal_drain_timeout;
+        self.terminal_ack_timeout = terminal_ack_timeout;
         Ok(self)
     }
 
@@ -117,6 +136,14 @@ impl FrontendQueryLifecycleConfig {
 
     pub(super) const fn start_rpc_timeout(self) -> Duration {
         self.start_rpc_timeout
+    }
+
+    pub(super) const fn terminal_drain_timeout(self) -> Duration {
+        self.terminal_drain_timeout
+    }
+
+    pub(super) const fn terminal_ack_timeout(self) -> Duration {
+        self.terminal_ack_timeout
     }
 }
 

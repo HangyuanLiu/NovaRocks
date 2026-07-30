@@ -266,35 +266,8 @@ async fn run_attached_control_stream(
         return;
     }
 
-    let mut awaiting_graceful_termination = false;
     let mut heartbeat_stop_logged = false;
     loop {
-        if awaiting_graceful_termination {
-            let event = tokio::select! {
-                biased;
-                _ = wait_for_query_control_shutdown(&mut shutdown) => break,
-                event = events.recv() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let termination_accepted =
-                matches!(event, QueryControlEvent::TerminationAccepted { .. });
-            if !send_control_response(
-                &outbound,
-                Ok(encode_query_control_event(&event)),
-                &mut shutdown,
-            )
-            .await
-            {
-                break;
-            }
-            if termination_accepted {
-                lease.mark_graceful();
-                break;
-            }
-            continue;
-        }
         tokio::select! {
             biased;
             _ = wait_for_query_control_shutdown(&mut shutdown) => {
@@ -368,17 +341,13 @@ async fn run_attached_control_stream(
                         }
                     }
                     QueryControlCommand::Abort { reason } => {
-                        awaiting_graceful_termination = true;
                         let result = lease.control().abort(reason);
                         if result.is_ok() {
                             emit_query_lifecycle_abort_marker();
                         }
                         result
                     }
-                    QueryControlCommand::Finalize => {
-                        awaiting_graceful_termination = true;
-                        lease.control().finalize()
-                    }
+                    QueryControlCommand::Finalize => lease.control().finalize(),
                     QueryControlCommand::TerminalAck { ack } => lease.control().terminal_ack(ack),
                 };
                 if let Err(error) = result {
@@ -395,8 +364,6 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                let termination_accepted =
-                    matches!(event, QueryControlEvent::TerminationAccepted { .. });
                 if !send_control_response(
                     &outbound,
                     Ok(encode_query_control_event(&event)),
@@ -404,10 +371,6 @@ async fn run_attached_control_stream(
                 )
                 .await
                 {
-                    break;
-                }
-                if termination_accepted {
-                    lease.mark_graceful();
                     break;
                 }
             }
