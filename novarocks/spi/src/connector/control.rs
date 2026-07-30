@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use super::{
     ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
+    ConnectorCatalogMutation, ConnectorCatalogMutationResolver, ConnectorMetadata,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
     ConnectorSplitPlanningRequest, ConnectorTableHandle,
 };
 
@@ -60,6 +61,7 @@ pub struct ConnectorControlBinding {
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
+    mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
 }
 
 impl ConnectorControlBinding {
@@ -69,6 +71,7 @@ impl ConnectorControlBinding {
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
     ) -> Result<Self, ConnectorError> {
         if metadata.instance_id() != &descriptor.instance_id {
             return Err(ConnectorError::new(
@@ -82,12 +85,21 @@ impl ConnectorControlBinding {
                 "connector scan planning capability owner does not match its control binding",
             ));
         }
+        if let Some(mutation) = &mutation
+            && (mutation.descriptor() != &descriptor || mutation.incarnation() != incarnation)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector mutation capability owner does not match its control binding generation",
+            ));
+        }
         Ok(Self {
             descriptor,
             incarnation,
             metadata,
             planning,
             distribution,
+            mutation,
         })
     }
 
@@ -105,6 +117,10 @@ impl ConnectorControlBinding {
 
     pub fn planning(&self) -> &Arc<dyn ConnectorScanPlanning> {
         &self.planning
+    }
+
+    pub fn mutation(&self) -> Option<&Arc<dyn ConnectorCatalogMutation>> {
+        self.mutation.as_ref()
     }
 
     pub fn execution_declaration(
@@ -136,7 +152,7 @@ pub trait ConnectorControlResolver: Send + Sync {
 
 /// Lifecycle port owned by the frontend composition root. Core may register
 /// or retire a logical control generation, but it never owns the registry.
-pub trait ConnectorControlRegistry: ConnectorControlResolver {
+pub trait ConnectorControlRegistry: ConnectorControlResolver + ConnectorCatalogMutationResolver {
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;
 
     fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError>;

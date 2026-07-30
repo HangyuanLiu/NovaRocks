@@ -17,9 +17,11 @@
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
     ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -165,5 +167,40 @@ fn request_context_allows_a_query_budget_for_multiple_handles() {
     assert_eq!(
         context.max_total_payload_bytes(),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES * 2
+    );
+}
+
+#[test]
+fn external_mutation_evidence_is_bounded_and_redacted() {
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+        instance_id: ConnectorInstanceId::parse("lake.catalog").expect("instance ID"),
+    };
+    let evidence = ExternalMutationEvidence::try_new(
+        1,
+        descriptor,
+        ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        ConnectorMutationOperationId::from_bytes([9; 16]),
+        "create-table",
+        Bytes::from_static(b"secret-provider-payload"),
+    )
+    .expect("bounded evidence");
+    assert_eq!(evidence.digest(), evidence.digest());
+    let debug = format!("{evidence:?}");
+    assert!(debug.contains("provider_payload_len"));
+    assert!(!debug.contains("secret-provider-payload"));
+
+    assert_eq!(
+        ExternalMutationEvidence::try_new(
+            1,
+            evidence.descriptor().clone(),
+            evidence.incarnation(),
+            evidence.operation_id(),
+            evidence.operation_kind(),
+            Bytes::from(vec![0; MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1]),
+        )
+        .expect_err("oversized evidence must fail")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted,
     );
 }
