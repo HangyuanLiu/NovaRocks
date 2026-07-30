@@ -57,6 +57,29 @@ pub(super) enum NativeFragmentLifecycleEvent {
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
 
+#[cfg(debug_assertions)]
+fn runner_stage_prepare_failure() -> Result<
+    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
+    NativeFragmentIngressError,
+> {
+    let Some(root) = app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(None);
+    };
+    novarocks::common::query_lifecycle_fault::claim_stage_prepare_failure(root)
+        .map_err(NativeFragmentIngressError::new)
+}
+
+#[cfg(not(debug_assertions))]
+fn runner_stage_prepare_failure() -> Result<
+    Option<novarocks::common::query_lifecycle_fault::StagePrepareFailure>,
+    NativeFragmentIngressError,
+> {
+    Ok(None)
+}
+
 pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
     lifecycle: Arc<QueryLifecycleRegistry>,
@@ -191,7 +214,26 @@ impl NativeFragmentService {
         fragments: &[StageFragment],
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
-        for fragment in fragments {
+        let injected_failure = runner_stage_prepare_failure()?;
+        for (index, fragment) in fragments.iter().enumerate() {
+            if injected_failure
+                .as_ref()
+                .is_some_and(|failure| failure.ordinal == index.saturating_add(1))
+            {
+                let failure = injected_failure.expect("checked injected Stage failure");
+                eprintln!(
+                    "NOVAROCKS_STAGE_PREPARE_FAILED execution_id={}:{}:{} ordinal={} token={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    failure.ordinal,
+                    failure.token
+                );
+                return Err(NativeFragmentIngressError::new(format!(
+                    "runner-owned Stage prepare failure at ordinal {}",
+                    failure.ordinal
+                )));
+            }
             let request = NativeFragmentRequest::try_decode(
                 execution_id,
                 fragment.plan().clone(),

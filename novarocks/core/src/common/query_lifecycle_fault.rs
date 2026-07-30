@@ -28,7 +28,9 @@ pub enum QueryLifecycleFaultKind {
     InitAckDrop,
     StageAckDrop,
     StartAckDrop,
+    StartAckSuppress,
     HeartbeatStop,
+    HeartbeatStopAfterStage,
     RestartAfterInitAck,
 }
 
@@ -38,7 +40,9 @@ impl QueryLifecycleFaultKind {
             Self::InitAckDrop => "init-ack-drop",
             Self::StageAckDrop => "stage-ack-drop",
             Self::StartAckDrop => "start-ack-drop",
+            Self::StartAckSuppress => "start-ack-suppress",
             Self::HeartbeatStop => "heartbeat-stop",
+            Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
         }
     }
@@ -53,12 +57,43 @@ pub struct QueryLifecycleFaultScope {
     pub start_epoch: u64,
 }
 
+/// Runner-owned one-shot failure for a local Stage build. Unlike ACK faults,
+/// this is intentionally claimed by the backend that wins the first Stage
+/// build; the selected fragment ordinal is local to that Stage bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagePrepareFailure {
+    pub token: String,
+    pub ordinal: usize,
+}
+
 pub fn arm_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.arm", kind.file_stem()))
 }
 
 pub fn trigger_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {
     root.join(format!("be-{backend_index}.{}.trigger", kind.file_stem()))
+}
+
+pub fn claim_stage_prepare_failure(root: &Path) -> Result<Option<StagePrepareFailure>, String> {
+    let path = root.join("stage-prepare-fail.trigger");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let fields = parse_fields(&contents)?;
+    let failure = StagePrepareFailure {
+        token: required_token(&fields)?,
+        ordinal: required_usize(&fields, "ordinal")?,
+    };
+    if failure.ordinal == 0 {
+        return Err("stage prepare fault ordinal must be at least one".to_string());
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(Some(failure)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("consume {}: {error}", path.display())),
+    }
 }
 
 pub fn bind_armed_fault(

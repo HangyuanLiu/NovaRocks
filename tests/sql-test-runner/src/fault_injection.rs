@@ -356,6 +356,11 @@ where
             ready_count: usize,
             connection_id: u32,
         },
+        KillQueryAtLifecyclePhase {
+            phase: crate::types::QueryLifecyclePhase,
+            connection_id: u32,
+        },
+        KillFrontendAtLifecyclePhase(crate::types::QueryLifecyclePhase),
     }
 
     enum FaultBaseline {
@@ -368,6 +373,11 @@ where
             index: usize,
             token: String,
             start_epoch: u64,
+        },
+        FrontendPhase {
+            phase: crate::types::QueryLifecyclePhase,
+            fe_crash: bool,
+            marker_count: u64,
         },
     }
 
@@ -394,6 +404,20 @@ where
                     })
             })
             .transpose()?,
+        meta.kill_query_at_lifecycle_phase
+            .map(|phase| {
+                query_connection_id
+                    .map(|connection_id| PostQueryFault::KillQueryAtLifecyclePhase {
+                        phase,
+                        connection_id,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "kill_query_at_lifecycle_phase requires the target query connection id"
+                    ))
+            })
+            .transpose()?,
+        meta.kill_fe_at_lifecycle_phase
+            .map(PostQueryFault::KillFrontendAtLifecyclePhase),
     ]
     .into_iter()
     .flatten()
@@ -468,6 +492,16 @@ where
                     start_epoch: server.backend_start_epoch(index)?,
                 }
             }
+            PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
+            | PostQueryFault::KillFrontendAtLifecyclePhase(phase) => FaultBaseline::FrontendPhase {
+                phase,
+                fe_crash: matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
+                marker_count: lifecycle_phase_marker_count(
+                    &server.fe_log_contents()?,
+                    phase,
+                    matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
+                )? as u64,
+            },
         }
     };
     let fault_state = Arc::new(ActiveQueryFaultState::new());
@@ -536,6 +570,14 @@ where
                                 && line.contains(&format!("token={token}"))
                         })
                     }
+                    FaultBaseline::FrontendPhase {
+                        phase,
+                        fe_crash,
+                        marker_count,
+                    } => {
+                        lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase, *fe_crash)?
+                            > *marker_count as usize
+                    }
                 }
             };
             if ready {
@@ -555,6 +597,20 @@ where
                     ) => fresh_fe_control_ready_execution(
                         &server.fe_log_contents()?,
                         *ready_count as usize,
+                    )?,
+                    (
+                        FaultBaseline::FrontendPhase {
+                            phase,
+                            fe_crash,
+                            marker_count,
+                        },
+                        PostQueryFault::KillQueryAtLifecyclePhase { .. }
+                        | PostQueryFault::KillFrontendAtLifecyclePhase(_),
+                    ) => fresh_lifecycle_phase_execution(
+                        &server.fe_log_contents()?,
+                        *marker_count as usize,
+                        *phase,
+                        *fe_crash,
                     )?,
                     _ => None,
                 };
@@ -613,6 +669,18 @@ where
                         }
                         PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
                             server.kill_query_until(connection_id, deadline)?
+                        }
+                        PostQueryFault::KillQueryAtLifecyclePhase {
+                            phase,
+                            connection_id,
+                        } => {
+                            server.kill_query_until(connection_id, deadline)?;
+                            server.release_query_lifecycle_phase_fault(phase, false)?;
+                        }
+                        PostQueryFault::KillFrontendAtLifecyclePhase(phase) => {
+                            server.kill_fe()?;
+                            server.release_query_lifecycle_phase_fault(phase, true)?;
+                            server.restart_fe_until(deadline)?;
                         }
                         PostQueryFault::KillFrontendAfterControlReady(_) => {
                             server.kill_fe()?;
@@ -814,6 +882,55 @@ fn fresh_fe_control_ready_execution(log: &str, baseline: usize) -> Result<Option
     };
     if executions.iter().any(|execution| execution != first) {
         bail!("fresh FE ControlReady markers span multiple executions: {executions:?}");
+    }
+    Ok(Some(first.clone()))
+}
+
+fn lifecycle_phase_marker_count(
+    log: &str,
+    phase: crate::types::QueryLifecyclePhase,
+    fe_crash: bool,
+) -> Result<usize> {
+    let action = if fe_crash { "kill_fe" } else { "kill_query" };
+    let markers = log
+        .lines()
+        .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
+        .filter(|line| {
+            marker_field(line, "phase").as_deref() == Some(phase.as_str())
+                && marker_field(line, "action").as_deref() == Some(action)
+        })
+        .collect::<Vec<_>>();
+    if markers
+        .iter()
+        .any(|line| marker_field(line, "token").is_none())
+    {
+        bail!("lifecycle phase marker has no token: {markers:?}");
+    }
+    Ok(markers.len())
+}
+
+fn fresh_lifecycle_phase_execution(
+    log: &str,
+    baseline: usize,
+    phase: crate::types::QueryLifecyclePhase,
+    fe_crash: bool,
+) -> Result<Option<String>> {
+    let action = if fe_crash { "kill_fe" } else { "kill_query" };
+    let executions = log
+        .lines()
+        .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
+        .filter(|line| {
+            marker_field(line, "phase").as_deref() == Some(phase.as_str())
+                && marker_field(line, "action").as_deref() == Some(action)
+        })
+        .skip(baseline)
+        .filter_map(|line| marker_field(line, "execution_id"))
+        .collect::<Vec<_>>();
+    let Some(first) = executions.first() else {
+        return Ok(None);
+    };
+    if executions.iter().any(|execution| execution != first) {
+        bail!("fresh lifecycle phase markers span multiple executions: {executions:?}");
     }
     Ok(Some(first.clone()))
 }

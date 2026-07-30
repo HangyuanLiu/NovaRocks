@@ -297,7 +297,11 @@ fn bind_query_lifecycle_fault_scopes(
             .map_err(|_| contract_error("backend index does not fit u64"))?;
         for kind in [
             QueryLifecycleFaultKind::InitAckDrop,
+            QueryLifecycleFaultKind::StageAckDrop,
+            QueryLifecycleFaultKind::StartAckDrop,
+            QueryLifecycleFaultKind::StartAckSuppress,
             QueryLifecycleFaultKind::HeartbeatStop,
+            QueryLifecycleFaultKind::HeartbeatStopAfterStage,
             QueryLifecycleFaultKind::RestartAfterInitAck,
         ] {
             if let Some(scope) = bind_armed_fault(

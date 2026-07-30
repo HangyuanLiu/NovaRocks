@@ -352,6 +352,7 @@ impl QueryLaunchBarrier for FrontendQueryLifecycleBarrier {
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(reason));
         }
+        record_lifecycle_phase_marker("staging", batches)?;
         let mut failures = std::thread::scope(|scope| {
             let handles = batches
                 .iter()
@@ -369,16 +370,21 @@ impl QueryLaunchBarrier for FrontendQueryLifecycleBarrier {
                 .collect::<Vec<_>>()
         });
         failures.sort_by_key(|(backend, _)| *backend);
-        failures
+        let outcome = failures
             .into_iter()
             .next()
-            .map_or(Ok(()), |(_, error)| Err(failed(error)))
+            .map_or(Ok(()), |(_, error)| Err(failed(error)));
+        if outcome.is_ok() {
+            record_lifecycle_phase_marker("staged", batches)?;
+        }
+        outcome
     }
 
     fn start_all(&self, batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(reason));
         }
+        record_lifecycle_phase_marker("starting", batches)?;
         let mut failures = std::thread::scope(|scope| {
             let handles = batches
                 .iter()
@@ -396,10 +402,14 @@ impl QueryLaunchBarrier for FrontendQueryLifecycleBarrier {
                 .collect::<Vec<_>>()
         });
         failures.sort_by_key(|(backend, _)| *backend);
-        failures
+        let outcome = failures
             .into_iter()
             .next()
-            .map_or(Ok(()), |(_, error)| Err(failed(error)))
+            .map_or(Ok(()), |(_, error)| Err(failed(error)));
+        if outcome.is_ok() {
+            record_lifecycle_phase_marker("running", batches)?;
+        }
+        outcome
     }
 }
 
@@ -500,6 +510,77 @@ fn validate_start_ack(
             ),
         ));
     }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn record_lifecycle_phase_marker(
+    phase: &str,
+    batches: &[StageBatch],
+) -> Result<(), DistributedQueryError> {
+    let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
+        return Ok(());
+    };
+    let Some(root) = novarocks::common::app_config::config()
+        .ok()
+        .and_then(|config| config.debug.query_lifecycle_fault_dir())
+    else {
+        return Ok(());
+    };
+    for (kind, action) in [("kill-query", "kill_query"), ("fe-crash", "kill_fe")] {
+        let path = root.join(format!("{kind}-at-{phase}.trigger"));
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(contract_error(format!(
+                    "read runner-owned lifecycle phase trigger {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let fields = contents
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<BTreeMap<_, _>>();
+        let token = fields
+            .get("token")
+            .copied()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| contract_error("runner-owned lifecycle phase trigger has no token"))?;
+        if fields.get("phase").copied() != Some(phase) || fields.len() != 2 {
+            return Err(contract_error(format!(
+                "runner-owned lifecycle phase trigger {} has invalid contents",
+                path.display()
+            )));
+        }
+        eprintln!(
+            "NOVAROCKS_QUERY_LIFECYCLE_PHASE execution_id={}:{}:{} phase={} action={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            phase,
+            action,
+            token
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if path.exists() {
+            return Err(failed(format!(
+                "timed out waiting for runner to execute {action} at lifecycle phase {phase}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn record_lifecycle_phase_marker(
+    _phase: &str,
+    _batches: &[StageBatch],
+) -> Result<(), DistributedQueryError> {
     Ok(())
 }
 

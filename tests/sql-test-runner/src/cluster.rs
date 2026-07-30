@@ -321,6 +321,16 @@ pub(crate) trait ServerHandle: Send {
     fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
         Ok(())
     }
+    fn release_query_lifecycle_phase_fault(
+        &mut self,
+        phase: QueryLifecyclePhase,
+        fe_crash: bool,
+    ) -> Result<()> {
+        bail!(
+            "lifecycle phase fault release is unsupported by this server mode (phase={}, fe_crash={fe_crash})",
+            phase.as_str()
+        )
+    }
     fn armed_query_lifecycle_fault_token(
         &self,
         index: usize,
@@ -1448,6 +1458,27 @@ impl ServerHandle for CrossProcessServerHandle {
                 .display()
         );
         Ok(())
+    }
+
+    fn release_query_lifecycle_phase_fault(
+        &mut self,
+        phase: QueryLifecyclePhase,
+        fe_crash: bool,
+    ) -> Result<()> {
+        let path = if fe_crash {
+            self.query_lifecycle_fault_files
+                .fe_crash_at_phase_path(phase)
+        } else {
+            self.query_lifecycle_fault_files
+                .kill_query_at_phase_path(phase)
+        };
+        remove_fragment_failure_file(&path).with_context(|| {
+            format!(
+                "release {} lifecycle phase fault {}",
+                if fe_crash { "FE crash" } else { "KILL QUERY" },
+                phase.as_str()
+            )
+        })
     }
 
     fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
