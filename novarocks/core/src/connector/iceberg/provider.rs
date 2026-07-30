@@ -1409,12 +1409,22 @@ pub(crate) fn plan_scan_files(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
-    let planned = plan_native_iceberg_read(
+    // Schema metadata does not carry data-file planning results.  A
+    // time-travel table therefore has an ExplicitFiles binding with an empty
+    // placeholder here; it must still ask the provider to enumerate the
+    // table's already-pinned snapshot rather than treating that placeholder
+    // as an explicitly empty scan.
+    let file_override = (!matches!(
+        binding,
+        super::scan_model::IcebergDataFileBinding::ExplicitFiles
+    ) || !explicit_files.is_empty())
+    .then_some(explicit_files);
+    let planned = plan_native_iceberg_read_with_file_override(
         controls,
         context,
         table,
         binding,
-        explicit_files,
+        file_override,
         projection,
     )?;
     planned

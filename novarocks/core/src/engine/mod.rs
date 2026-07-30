@@ -1329,6 +1329,7 @@ impl StandaloneSession {
                     None,
                     None,
                     Some(&self.inner),
+                    true,
                     false,
                     Some(request_context.execution()),
                 )?;
@@ -3579,6 +3580,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         None,
         Some(state),
         false,
+        false,
         Some(&maintenance_execution),
     )
 }
@@ -4073,6 +4075,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         None,
         mv_rewrite_state,
+        true,
         false,
         None,
     )
@@ -4107,6 +4110,7 @@ fn execute_query_with_catalog_provider_with_execution(
         None,
         None,
         mv_rewrite_state,
+        true,
         false,
         Some(execution),
     )
@@ -4189,6 +4193,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
+        true,
         mv_refresh_ctx.is_some(),
         None,
     )
@@ -4226,6 +4231,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         mv_refresh_ctx,
         None,
         None,
+        false,
         false,
         None,
     )
@@ -4353,6 +4359,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    allow_mv_rewrite_candidates: bool,
     run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
@@ -4370,6 +4377,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
+        allow_mv_rewrite_candidates,
         run_imv_rewrite,
         execution,
     )?;
@@ -4395,6 +4403,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    allow_mv_rewrite_candidates: bool,
     run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
@@ -4443,7 +4452,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
     // queries never rewrite onto the MV they are computing.
     let mv_candidates = match mv_rewrite_state {
-        Some(state) if mv_refresh_ctx.is_none() => {
+        Some(state) if allow_mv_rewrite_candidates && mv_refresh_ctx.is_none() => {
             crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
                 state,
                 analyzer_catalog,
