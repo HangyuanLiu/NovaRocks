@@ -59,7 +59,7 @@ use crate::runtime::starlet_shard_registry;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 use crate::service::grpc_query_lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    status_from_lifecycle_error,
+    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
 };
 use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
@@ -1283,6 +1283,37 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 .map_err(|error| {
                     tonic::Status::internal(format!("init_query handler panicked: {error}"))
                 })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn stage_fragments(
+        &self,
+        request: tonic::Request<proto::novarocks::StageFragmentsRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::StageFragmentsResponse>, tonic::Status> {
+        let ingress = self.require_query_lifecycle("StageFragments")?;
+        let request = request.into_inner();
+        let response =
+            tokio::task::spawn_blocking(move || handle_stage_fragments(ingress.as_ref(), request))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("stage_fragments handler panicked: {error}"))
+                })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn start_prepared_query(
+        &self,
+        request: tonic::Request<proto::novarocks::StartPreparedQueryRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::StartPreparedQueryResponse>, tonic::Status> {
+        let ingress = self.require_query_lifecycle("StartPreparedQuery")?;
+        let request = request.into_inner();
+        let response = tokio::task::spawn_blocking(move || {
+            handle_start_prepared_query(ingress.as_ref(), request)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("start_prepared_query handler panicked: {error}"))
+        })??;
         Ok(tonic::Response::new(response))
     }
 

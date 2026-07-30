@@ -175,6 +175,64 @@ impl NovaRocksGrpcRemoteClient {
             .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
     }
 
+    pub(crate) async fn stage_fragments_async(
+        &self,
+        request: proto::novarocks::StageFragmentsRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::StageFragmentsResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("stage_fragments", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "stage_fragments deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.stage_fragments(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "stage_fragments deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
+    pub(crate) async fn start_prepared_query_async(
+        &self,
+        request: proto::novarocks::StartPreparedQueryRequest,
+        timeout: Duration,
+    ) -> Result<proto::novarocks::StartPreparedQueryResponse, QueryLifecycleRpcError> {
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        let mut client = self
+            .make_deadline_async_client("start_prepared_query", deadline_at)
+            .await
+            .map_err(QueryLifecycleRpcError::PreSubmission)?;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(QueryLifecycleRpcError::PreSubmission(
+                "start_prepared_query deadline exceeded before unary RPC submission".to_string(),
+            ));
+        }
+        let mut request = Request::new(request);
+        request.set_timeout(remaining);
+        tokio::time::timeout_at(deadline_at, client.start_prepared_query(request))
+            .await
+            .map_err(|_| {
+                QueryLifecycleRpcError::PostSubmissionDeadlineExceeded(
+                    "start_prepared_query deadline exceeded during unary RPC".to_string(),
+                )
+            })?
+            .map(|response| response.into_inner())
+            .map_err(QueryLifecycleRpcError::PostSubmissionStatus)
+    }
+
     pub(crate) async fn abort_query_async(
         &self,
         request: proto::novarocks::AbortQueryRequest,

@@ -26,6 +26,7 @@ use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder
 
 const PLAN_FIELD: u32 = 1;
 const INSTANCE_PARAMS_FIELD: u32 = 2;
+const STAGE_FRAGMENTS_FIELD: u32 = 5;
 const RETIRED_RUNTIME_FILTER_PARAMS_FIELD: u32 = 7;
 const PLAN_RUNTIME_FILTER_BINDINGS_FIELD: u32 = 10;
 const RUNTIME_FILTER_TABLE_BINDING_FIELD: u32 = 2;
@@ -40,8 +41,8 @@ const PRODUCER_AGGREGATE_TOPN_KEY_FIELD: u32 = 4;
 /// producer target oneofs: accepting either would make invalid raw wire appear
 /// to satisfy the current contract after unknown-field or oneof information is
 /// discarded. The decoder therefore inspects only the affected paths in raw
-/// `SubmitFragmentRequest` bytes before delegating to Prost. No legacy payload
-/// is decoded or carried.
+/// `SubmitFragmentRequest` and `StageFragmentsRequest` bytes before delegating
+/// to Prost. No legacy payload is decoded or carried.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeProstCodec<T, U> {
     marker: PhantomData<(T, U)>,
@@ -131,14 +132,23 @@ where
     type Error = Status;
 
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        if TypeId::of::<U>() == TypeId::of::<crate::proto::novarocks::SubmitFragmentRequest>() {
+        let is_submit_fragment =
+            TypeId::of::<U>() == TypeId::of::<crate::proto::novarocks::SubmitFragmentRequest>();
+        let is_stage_fragments =
+            TypeId::of::<U>() == TypeId::of::<crate::proto::novarocks::StageFragmentsRequest>();
+        if is_submit_fragment || is_stage_fragments {
             let bytes = source.chunk();
             if bytes.len() != source.remaining() {
                 return Err(Status::internal(
-                    "SubmitFragmentRequest protobuf is not contiguous",
+                    "native fragment request protobuf is not contiguous",
                 ));
             }
-            match scan_submit_fragment_request(bytes) {
+            let result = if is_submit_fragment {
+                scan_submit_fragment_request(bytes)
+            } else {
+                scan_stage_fragments_request(bytes)
+            };
+            match result {
                 Ok(()) | Err(WireScanError::Decode(_)) => {}
                 Err(WireScanError::RetiredInstanceParamsField) => {
                     return Err(retired_instance_params_field_status());
@@ -161,6 +171,19 @@ where
 
 pub(crate) fn validate_submit_fragment_request_wire(bytes: &[u8]) -> Result<(), Status> {
     match scan_submit_fragment_request(bytes) {
+        Ok(()) => Ok(()),
+        Err(WireScanError::RetiredInstanceParamsField) => {
+            Err(retired_instance_params_field_status())
+        }
+        Err(WireScanError::AmbiguousProducerBindingTarget) => {
+            Err(ambiguous_producer_binding_target_status())
+        }
+        Err(WireScanError::Decode(error)) => Err(Status::internal(error.to_string())),
+    }
+}
+
+pub(crate) fn validate_stage_fragments_request_wire(bytes: &[u8]) -> Result<(), Status> {
+    match scan_stage_fragments_request(bytes) {
         Ok(()) => Ok(()),
         Err(WireScanError::RetiredInstanceParamsField) => {
             Err(retired_instance_params_field_status())
@@ -199,6 +222,43 @@ fn scan_submit_fragment_request(bytes: &[u8]) -> Result<(), WireScanError> {
                 INSTANCE_PARAMS_FIELD => {
                     let instance_params = take_length_delimited(&mut cursor)?;
                     scan_instance_params(instance_params)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        skip_field(wire_type, field, &mut cursor, context.clone())?;
+    }
+    Ok(())
+}
+
+fn scan_stage_fragments_request(bytes: &[u8]) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if field == STAGE_FRAGMENTS_FIELD && wire_type == WireType::LengthDelimited {
+            scan_stage_fragment(take_length_delimited(&mut cursor)?)?;
+            continue;
+        }
+        skip_field(wire_type, field, &mut cursor, context.clone())?;
+    }
+    Ok(())
+}
+
+fn scan_stage_fragment(bytes: &[u8]) -> Result<(), WireScanError> {
+    let mut cursor = bytes;
+    let context = DecodeContext::default();
+    while cursor.has_remaining() {
+        let (field, wire_type) = decode_key(&mut cursor)?;
+        if wire_type == WireType::LengthDelimited {
+            match field {
+                PLAN_FIELD => {
+                    scan_plan_fragment(take_length_delimited(&mut cursor)?)?;
+                    continue;
+                }
+                INSTANCE_PARAMS_FIELD => {
+                    scan_instance_params(take_length_delimited(&mut cursor)?)?;
                     continue;
                 }
                 _ => {}
@@ -332,7 +392,7 @@ impl std::fmt::Display for WireScanError {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_submit_fragment_request_wire;
+    use super::{validate_stage_fragments_request_wire, validate_submit_fragment_request_wire};
     use prost::Message;
 
     fn submit_with_instance(instance: &[u8]) -> Vec<u8> {
@@ -350,6 +410,11 @@ mod tests {
         wire
     }
 
+    fn stage_with_instance(instance: &[u8]) -> Vec<u8> {
+        let stage_fragment = length_delimited(INSTANCE_PARAMS_FIELD, instance);
+        length_delimited(STAGE_FRAGMENTS_FIELD, &stage_fragment)
+    }
+
     #[test]
     fn legacy_instance_params_tag_seven_is_rejected_for_every_valid_wire_type() {
         for wire_type in 0_u8..=5 {
@@ -360,6 +425,14 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::InvalidArgument);
             assert!(error.message().contains("tag 7"), "{error}");
         }
+    }
+
+    #[test]
+    fn stage_scanner_rejects_retired_instance_params_tag_in_nested_fragments() {
+        let error = validate_stage_fragments_request_wire(&stage_with_instance(&[0x3a, 0]))
+            .expect_err("nested retired tag must be rejected before Prost drops it");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("tag 7"), "{error}");
     }
 
     #[test]

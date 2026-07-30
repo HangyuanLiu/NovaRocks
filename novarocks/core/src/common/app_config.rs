@@ -769,6 +769,10 @@ pub struct RuntimeConfig {
     pub query_control_init_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_attach_timeout_ms")]
     pub query_control_attach_timeout_ms: u64,
+    #[serde(default = "default_query_control_stage_rpc_timeout_ms")]
+    pub query_control_stage_rpc_timeout_ms: u64,
+    #[serde(default = "default_query_control_start_rpc_timeout_ms")]
+    pub query_control_start_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_pre_start_timeout_ms")]
     pub query_control_pre_start_timeout_ms: u64,
     #[serde(default = "default_query_control_tombstone_retention_ms")]
@@ -777,6 +781,16 @@ pub struct RuntimeConfig {
     pub query_control_tombstone_capacity: usize,
     #[serde(default = "default_query_control_max_active_entries")]
     pub query_control_max_active_entries: usize,
+    #[serde(default = "default_query_control_stage_max_encoded_bytes")]
+    pub query_control_stage_max_encoded_bytes: usize,
+    #[serde(default = "default_query_control_stage_max_fragments")]
+    pub query_control_stage_max_fragments: usize,
+    #[serde(default = "default_query_control_max_active_staging")]
+    pub query_control_max_active_staging: usize,
+    #[serde(default = "default_query_control_stage_max_inflight_encoded_bytes")]
+    pub query_control_stage_max_inflight_encoded_bytes: usize,
+    #[serde(default = "default_query_control_stage_max_dormant_workers")]
+    pub query_control_stage_max_dormant_workers: usize,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -1019,6 +1033,14 @@ fn default_query_control_attach_timeout_ms() -> u64 {
     5_000
 }
 
+fn default_query_control_stage_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_query_control_start_rpc_timeout_ms() -> u64 {
+    2_000
+}
+
 fn default_query_control_pre_start_timeout_ms() -> u64 {
     30_000
 }
@@ -1033,6 +1055,26 @@ fn default_query_control_tombstone_capacity() -> usize {
 
 fn default_query_control_max_active_entries() -> usize {
     4_096
+}
+
+fn default_query_control_stage_max_encoded_bytes() -> usize {
+    48 * 1024 * 1024
+}
+
+fn default_query_control_stage_max_fragments() -> usize {
+    256
+}
+
+fn default_query_control_max_active_staging() -> usize {
+    32
+}
+
+fn default_query_control_stage_max_inflight_encoded_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
+fn default_query_control_stage_max_dormant_workers() -> usize {
+    512
 }
 
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
@@ -1054,6 +1096,14 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.query_control_attach_timeout_ms,
         ),
         (
+            "runtime.query_control_stage_rpc_timeout_ms",
+            runtime.query_control_stage_rpc_timeout_ms,
+        ),
+        (
+            "runtime.query_control_start_rpc_timeout_ms",
+            runtime.query_control_start_rpc_timeout_ms,
+        ),
+        (
             "runtime.query_control_pre_start_timeout_ms",
             runtime.query_control_pre_start_timeout_ms,
         ),
@@ -1072,6 +1122,51 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     }
     if runtime.query_control_max_active_entries == 0 {
         bail!("runtime.query_control_max_active_entries must be greater than 0");
+    }
+    let nonzero_limits = [
+        (
+            "runtime.query_control_stage_max_encoded_bytes",
+            runtime.query_control_stage_max_encoded_bytes,
+        ),
+        (
+            "runtime.query_control_stage_max_fragments",
+            runtime.query_control_stage_max_fragments,
+        ),
+        (
+            "runtime.query_control_max_active_staging",
+            runtime.query_control_max_active_staging,
+        ),
+        (
+            "runtime.query_control_stage_max_inflight_encoded_bytes",
+            runtime.query_control_stage_max_inflight_encoded_bytes,
+        ),
+        (
+            "runtime.query_control_stage_max_dormant_workers",
+            runtime.query_control_stage_max_dormant_workers,
+        ),
+    ];
+    for (field, value) in nonzero_limits {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    const TONIC_MAX_STAGE_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+    if runtime.query_control_stage_max_encoded_bytes >= TONIC_MAX_STAGE_REQUEST_BYTES {
+        bail!(
+            "runtime.query_control_stage_max_encoded_bytes must be smaller than the 64MiB gRPC limit"
+        );
+    }
+    if runtime.query_control_stage_max_inflight_encoded_bytes
+        < runtime.query_control_stage_max_encoded_bytes
+    {
+        bail!(
+            "runtime.query_control_stage_max_inflight_encoded_bytes must be at least runtime.query_control_stage_max_encoded_bytes"
+        );
+    }
+    if runtime.query_control_stage_max_dormant_workers < runtime.query_control_stage_max_fragments {
+        bail!(
+            "runtime.query_control_stage_max_dormant_workers must be at least runtime.query_control_stage_max_fragments"
+        );
     }
     let minimum_timeout = runtime
         .query_control_heartbeat_interval_ms
@@ -1282,10 +1377,19 @@ impl Default for RuntimeConfig {
             query_control_heartbeat_timeout_ms: default_query_control_heartbeat_timeout_ms(),
             query_control_init_rpc_timeout_ms: default_query_control_init_rpc_timeout_ms(),
             query_control_attach_timeout_ms: default_query_control_attach_timeout_ms(),
+            query_control_stage_rpc_timeout_ms: default_query_control_stage_rpc_timeout_ms(),
+            query_control_start_rpc_timeout_ms: default_query_control_start_rpc_timeout_ms(),
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
             query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
             query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
             query_control_max_active_entries: default_query_control_max_active_entries(),
+            query_control_stage_max_encoded_bytes: default_query_control_stage_max_encoded_bytes(),
+            query_control_stage_max_fragments: default_query_control_stage_max_fragments(),
+            query_control_max_active_staging: default_query_control_max_active_staging(),
+            query_control_stage_max_inflight_encoded_bytes:
+                default_query_control_stage_max_inflight_encoded_bytes(),
+            query_control_stage_max_dormant_workers:
+                default_query_control_stage_max_dormant_workers(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
@@ -1838,10 +1942,23 @@ mod tests {
         assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_init_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_attach_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_stage_rpc_timeout_ms, 5_000);
+        assert_eq!(runtime.query_control_start_rpc_timeout_ms, 2_000);
         assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
         assert_eq!(runtime.query_control_tombstone_retention_ms, 120_000);
         assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
         assert_eq!(runtime.query_control_max_active_entries, 4_096);
+        assert_eq!(
+            runtime.query_control_stage_max_encoded_bytes,
+            48 * 1024 * 1024
+        );
+        assert_eq!(runtime.query_control_stage_max_fragments, 256);
+        assert_eq!(runtime.query_control_max_active_staging, 32);
+        assert_eq!(
+            runtime.query_control_stage_max_inflight_encoded_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(runtime.query_control_stage_max_dormant_workers, 512);
     }
 
     #[test]

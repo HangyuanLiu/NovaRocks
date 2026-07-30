@@ -58,6 +58,11 @@ service NovaRocksGrpc {
   // Coordinator establishes and owns one backend-local query attempt before
   // any native fragment is accepted.
   rpc InitQuery(InitQueryRequest) returns (InitQueryResponse);
+  // Coordinator atomically prepares every fragment assigned to one participant.
+  // A later StartPreparedQuery releases the participant-local start gate.
+  rpc StageFragments(StageFragmentsRequest) returns (StageFragmentsResponse);
+  rpc StartPreparedQuery(StartPreparedQueryRequest)
+      returns (StartPreparedQueryResponse);
   rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
   rpc QueryControlStream(stream QueryControlRequest)
       returns (stream QueryControlResponse);
@@ -164,6 +169,66 @@ message InitQueryResponse {
   QueryExecutionId execution_id = 1;
   bytes init_digest = 2;
   QueryInitOutcome outcome = 3;
+}
+
+enum StageFragmentsOutcome {
+  STAGE_FRAGMENTS_OUTCOME_UNSPECIFIED = 0;
+  STAGE_FRAGMENTS_APPLIED = 1;
+  STAGE_FRAGMENTS_ALREADY_APPLIED = 2;
+  STAGE_FRAGMENTS_REJECTED_CONFLICT = 3;
+  STAGE_FRAGMENTS_REJECTED_INVALID_STATE = 4;
+  STAGE_FRAGMENTS_REJECTED_INVALID_BATCH = 5;
+  STAGE_FRAGMENTS_REJECTED_CAPACITY = 6;
+  STAGE_FRAGMENTS_REJECTED_TERMINATED = 7;
+  STAGE_FRAGMENTS_REJECTED_LOCAL_FAILURE = 8;
+}
+
+enum StartPreparedQueryOutcome {
+  START_PREPARED_QUERY_OUTCOME_UNSPECIFIED = 0;
+  START_PREPARED_QUERY_APPLIED = 1;
+  START_PREPARED_QUERY_ALREADY_STARTED = 2;
+  START_PREPARED_QUERY_REJECTED_NOT_STAGED = 3;
+  START_PREPARED_QUERY_REJECTED_CONFLICT = 4;
+  START_PREPARED_QUERY_REJECTED_TERMINATED = 5;
+}
+
+// One static plan plus the dynamic parameters for one exact fragment instance.
+message StageFragment {
+  novarocks.plan.PlanFragment plan = 1;
+  InstanceParams instance_params = 2;
+}
+
+// The immutable complete fragment set prepared by one lifecycle participant.
+// The digest is over the canonical semantic projection, never the outer RPC
+// wire bytes. An empty fragment list is valid for service-only participants.
+message StageFragmentsRequest {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  uint32 stage_digest_version = 3;
+  bytes stage_digest = 4;
+  repeated StageFragment fragments = 5;
+}
+
+message StageFragmentsResponse {
+  QueryExecutionId execution_id = 1;
+  uint32 stage_digest_version = 2;
+  bytes stage_digest = 3;
+  StageFragmentsOutcome outcome = 4;
+  string detail = 5;
+}
+
+message StartPreparedQueryRequest {
+  QueryExecutionId execution_id = 1;
+  uint32 stage_digest_version = 2;
+  bytes stage_digest = 3;
+}
+
+message StartPreparedQueryResponse {
+  QueryExecutionId execution_id = 1;
+  uint32 stage_digest_version = 2;
+  bytes stage_digest = 3;
+  StartPreparedQueryOutcome outcome = 4;
+  string detail = 5;
 }
 
 message AbortQueryRequest {

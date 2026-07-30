@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -977,7 +977,7 @@ fn encode_iceberg_data_file_info(
                 entries: stats
                     .iter()
                     .map(|(name, stats)| (name.clone(), encode_iceberg_column_stats(stats)))
-                    .collect::<HashMap<_, _>>(),
+                    .collect::<BTreeMap<_, _>>(),
             }),
         partition_spec_id: src.partition_spec_id,
         partition_key: src.partition_key.clone(),

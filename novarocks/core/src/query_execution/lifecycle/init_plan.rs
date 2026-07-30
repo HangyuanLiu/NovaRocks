@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
@@ -28,11 +29,11 @@ use crate::query_execution::schedule::FragmentLifecycleProjection;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_options::QueryOptions;
 
-use super::QueryExecutionId;
 use super::manifest::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
 };
+use super::{QueryExecutionId, QueryLifecycleTarget, StageParticipantBinding};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -227,6 +228,50 @@ impl QueryInitPlan {
         self.participants
     }
 
+    /// Captures participant facts that must outlive consumption of the Init
+    /// plan by the control-ready barrier. QLC-3 never re-resolves topology for
+    /// Stage/Start after this point.
+    pub fn stage_participant_bindings(
+        &self,
+    ) -> Result<Vec<StageParticipantBinding>, DistributedQueryError> {
+        self.participants
+            .iter()
+            .map(|participant| {
+                let endpoint_ip = participant
+                    .backend()
+                    .endpoint()
+                    .host()
+                    .parse::<IpAddr>()
+                    .map_err(|error| {
+                        contract_error(format!(
+                            "query stage backend {} endpoint is not an IP address: {error}",
+                            participant.backend_idx()
+                        ))
+                    })?;
+                StageParticipantBinding::new(
+                    QueryLifecycleTarget::new(
+                        participant.backend_idx(),
+                        SocketAddr::new(endpoint_ip, participant.backend().endpoint().port()),
+                        participant.backend().start_epoch(),
+                    ),
+                    participant.digest(),
+                    participant.manifest().roles().iter().copied(),
+                    participant
+                        .manifest()
+                        .expected_fragment_instance_ids()
+                        .iter()
+                        .copied(),
+                )
+                .map_err(|error| {
+                    contract_error(format!(
+                        "query stage participant {} is invalid: {error}",
+                        participant.backend_idx()
+                    ))
+                })
+            })
+            .collect()
+    }
+
     #[cfg(feature = "query-execution-contract-test-support")]
     pub fn from_manifests_for_contract_test(
         execution_id: QueryExecutionId,
@@ -351,6 +396,15 @@ impl QueryLifecycleLease {
             .take()
             .expect("query lifecycle lease is consumed exactly once")
             .abort_preserving(primary_error)
+    }
+}
+
+impl Drop for QueryLifecycleLease {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            let _ = guard
+                .abort_preserving("query lifecycle lease dropped before completion".to_string());
+        }
     }
 }
 

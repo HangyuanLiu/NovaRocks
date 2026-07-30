@@ -22,8 +22,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::proto::novarocks;
 use crate::query_execution::lifecycle::contract::{
     decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
-    decode_query_init_request, encode_abort_query_response, encode_query_control_event,
-    encode_query_init_response,
+    decode_query_init_request, decode_query_stage_request, decode_query_start_request,
+    encode_abort_query_response, encode_query_control_event, encode_query_init_response,
+    encode_query_stage_response, encode_query_start_response,
 };
 use crate::query_execution::lifecycle::{
     BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryInitOutcome,
@@ -95,6 +96,58 @@ fn emit_query_lifecycle_abort_marker() {
         println!("NOVAROCKS_QUERY_LIFECYCLE_ABORT");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
+}
+
+pub(crate) fn handle_stage_fragments(
+    ingress: &dyn QueryLifecycleIngress,
+    request: novarocks::StageFragmentsRequest,
+) -> Result<novarocks::StageFragmentsResponse, tonic::Status> {
+    let request = decode_query_stage_request(&request).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
+    let response = ingress.stage_fragments(request);
+    if response.outcome().is_staged()
+        && let Some(scope) =
+            claim_backend_fault(QueryLifecycleFaultKind::StageAckDrop, execution_id)?
+    {
+        eprintln!(
+            "NOVAROCKS_STAGE_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned StageAck response dropped after staging",
+        ));
+    }
+    Ok(encode_query_stage_response(&response))
+}
+
+pub(crate) fn handle_start_prepared_query(
+    ingress: &dyn QueryLifecycleIngress,
+    request: novarocks::StartPreparedQueryRequest,
+) -> Result<novarocks::StartPreparedQueryResponse, tonic::Status> {
+    let request = decode_query_start_request(&request).map_err(status_from_lifecycle_error)?;
+    let execution_id = request.execution_id();
+    let response = ingress.start_prepared_query(request);
+    if response.outcome().is_running()
+        && let Some(scope) =
+            claim_backend_fault(QueryLifecycleFaultKind::StartAckDrop, execution_id)?
+    {
+        eprintln!(
+            "NOVAROCKS_START_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned StartAck response dropped after release",
+        ));
+    }
+    Ok(encode_query_start_response(&response))
 }
 
 pub(crate) async fn handle_query_control_stream(

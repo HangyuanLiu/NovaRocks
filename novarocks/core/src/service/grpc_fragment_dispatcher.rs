@@ -625,6 +625,20 @@ mod tests {
             Err(Status::unimplemented("mock"))
         }
 
+        async fn stage_fragments(
+            &self,
+            _request: Request<proto::novarocks::StageFragmentsRequest>,
+        ) -> Result<Response<proto::novarocks::StageFragmentsResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn start_prepared_query(
+            &self,
+            _request: Request<proto::novarocks::StartPreparedQueryRequest>,
+        ) -> Result<Response<proto::novarocks::StartPreparedQueryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
         async fn abort_query(
             &self,
             _request: Request<proto::novarocks::AbortQueryRequest>,
