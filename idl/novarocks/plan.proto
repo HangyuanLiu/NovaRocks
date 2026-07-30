@@ -1020,6 +1020,7 @@ message ConnectorReadSource {
   reserved 8;
   reserved "provider_id"; // host lookup is keyed only by instance_id.
   bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
+  bytes instance_incarnation = 10; // exactly 16 bytes; resolves one execution binding generation.
 }
 
 // One scheduled split in a ConnectorReadSource.

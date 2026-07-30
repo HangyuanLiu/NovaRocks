@@ -26,8 +26,9 @@ use std::time::Instant;
 use arrow::ipc::reader::StreamReader;
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorOpenReaderRequest, ConnectorRequestContext,
+    ConnectorScanHandle, ConnectorSplit,
 };
 
 use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
@@ -68,6 +69,23 @@ pub(super) fn lower_connector_read_scan(
             error.to_string(),
         )
     })?;
+    let incarnation = ConnectorInstanceIncarnation::from_bytes(
+        source
+            .instance_incarnation
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "instance_incarnation",
+                    "ConnectorReadSource instance_incarnation must contain exactly 16 bytes",
+                )
+            })?,
+    );
+    let binding_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation,
+    };
     let batch = ConnectorBatchBudget {
         max_rows: required_nonzero_usize(source.max_batch_rows, "max_batch_rows")?,
         max_bytes: required_nonzero_usize(source.max_batch_bytes, "max_batch_bytes")?,
@@ -167,9 +185,9 @@ pub(super) fn lower_connector_read_scan(
         output_schema.arrow_schema_ref().as_ref(),
         request_context.max_handle_payload_bytes(),
     )?;
-    let connectors = ctx.connectors()?;
-    let instance = connectors
-        .connector_instance(&instance_id)
+    let binding = ctx
+        .execution_resolver()?
+        .resolve(&binding_key)
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,
@@ -191,8 +209,8 @@ pub(super) fn lower_connector_read_scan(
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let source = Arc::new(ConnectorReadScanSource::new_scheduled(
-        instance,
+    let source = Arc::new(ConnectorReadScanSource::new_scheduled_execution(
+        binding,
         scheduled,
         request,
         output_schema.clone(),

@@ -633,6 +633,7 @@ fn encode_scan_source(
                     .instance_id
                     .as_str()
                     .to_string(),
+                instance_incarnation: planned.declaration.incarnation().to_bytes().to_vec(),
                 scan_payload: planned.scan.handle.payload().to_vec(),
                 splits: Vec::new(),
                 max_batch_rows: u64::try_from(planned.batch.max_rows.get())

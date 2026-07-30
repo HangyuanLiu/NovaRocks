@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorInstance, ConnectorOpenReaderRequest,
+    ConnectorBatchReader, ConnectorExecutionBinding, ConnectorInstance, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
@@ -598,13 +598,48 @@ impl Drop for ConnectorBatchReaderIter {
 /// The source owns no provider-specific type.  Wire decoders resolve the
 /// opaque split to its typed host instance, while core owns scheduling and
 /// adapts the returned Arrow batches into `Chunk`s.
-pub struct ConnectorReadScanSource {
-    instance: Arc<ConnectorInstance>,
+pub(crate) struct ConnectorReadScanSource {
+    binding: ConnectorReadBinding,
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     reader_group: Arc<ConnectorReaderGroup>,
+}
+
+#[derive(Clone)]
+enum ConnectorReadBinding {
+    /// Transitional source used only while non-Iceberg compat/legacy readers
+    /// migrate in SPI-4B/4C. Native ConnectorReadSource never selects it.
+    Legacy(Arc<ConnectorInstance>),
+    Execution(Arc<ConnectorExecutionBinding>),
+}
+
+impl ConnectorReadBinding {
+    fn instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
+        match self {
+            Self::Legacy(instance) => &instance.descriptor().instance_id,
+            Self::Execution(binding) => &binding.key().instance_id,
+        }
+    }
+
+    fn provider_id(&self) -> &str {
+        match self {
+            Self::Legacy(instance) => instance.descriptor().provider_id.as_str(),
+            Self::Execution(binding) => binding.provider_id().as_str(),
+        }
+    }
+
+    fn open_reader(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, novarocks_spi::connector::ConnectorError> {
+        match self {
+            Self::Legacy(instance) => instance.read().open_reader(split, request),
+            Self::Execution(binding) => binding.read().open_reader(split, request),
+        }
+    }
 }
 
 impl ConnectorReadScanSource {
@@ -615,7 +650,7 @@ impl ConnectorReadScanSource {
         chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
-            instance,
+            binding: ConnectorReadBinding::Legacy(instance),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(
                 plain_scheduled(splits),
                 false,
@@ -636,7 +671,7 @@ impl ConnectorReadScanSource {
         has_more: bool,
     ) -> Self {
         Self {
-            instance,
+            binding: ConnectorReadBinding::Legacy(instance),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(
                 plain_scheduled(splits),
                 has_more,
@@ -655,7 +690,7 @@ impl ConnectorReadScanSource {
         chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
-            instance,
+            binding: ConnectorReadBinding::Legacy(instance),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
             request,
             chunk_schema,
@@ -674,11 +709,27 @@ impl ConnectorReadScanSource {
         has_more: bool,
     ) -> Self {
         Self {
-            instance,
+            binding: ConnectorReadBinding::Legacy(instance),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
             request,
             chunk_schema,
             incremental,
+            reader_group: Arc::new(ConnectorReaderGroup::default()),
+        }
+    }
+
+    pub(crate) fn new_scheduled_execution(
+        binding: Arc<ConnectorExecutionBinding>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        Self {
+            binding: ConnectorReadBinding::Execution(binding),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
+            request,
+            chunk_schema,
+            incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
@@ -690,7 +741,7 @@ impl ScanSource for ConnectorReadScanSource {
             return Err("SPI connector scan source requires an empty range binding".to_string());
         }
         Ok(Arc::new(ConnectorReadScanOp {
-            instance: Arc::clone(&self.instance),
+            binding: self.binding.clone(),
             splits: Arc::clone(&self.splits),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
@@ -701,7 +752,7 @@ impl ScanSource for ConnectorReadScanSource {
 }
 
 struct ConnectorReadScanOp {
-    instance: Arc<ConnectorInstance>,
+    binding: ConnectorReadBinding,
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
@@ -735,14 +786,13 @@ impl ScanOp for ConnectorReadScanOp {
             .map(|scheduled| scheduled.split.clone())
             .ok_or_else(|| format!("SPI connector scan split index {index} is out of bounds"))?;
         let reader = self
-            .instance
-            .read()
+            .binding
             .open_reader(&split, self.request.clone())
             .map_err(|error| error.to_string())?;
         let marker = crate::common::config::debug_emit_connector_reader_marker().then(|| {
             ConnectorReaderMarker {
-                provider_id: self.instance.descriptor().provider_id.as_str().to_string(),
-                instance_id: self.instance.descriptor().instance_id.as_str().to_string(),
+                provider_id: self.binding.provider_id().to_string(),
+                instance_id: self.binding.instance_id().as_str().to_string(),
             }
         });
         let reader = self.reader_group.register(reader, marker)?;
@@ -803,7 +853,7 @@ impl ScanOp for ConnectorReadScanOp {
         }
         let append = adapter.prepare_incremental_ranges(ranges)?;
         let (appended, has_more) = append.scheduled();
-        let expected_owner = &self.instance.descriptor().instance_id;
+        let expected_owner = self.binding.instance_id();
         let start = state.scheduled.len();
         let mut appended_ids = BTreeSet::new();
         let append_payload_bytes = appended.iter().try_fold(0usize, |total, scheduled| {

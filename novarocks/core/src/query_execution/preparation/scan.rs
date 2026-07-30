@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorInstanceDeclaration, ConnectorScan, ConnectorSplit,
+    ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorScan, ConnectorSplit,
 };
 
 use crate::connector::iceberg::scan_model::{
@@ -65,7 +65,7 @@ pub(crate) struct ResolvedIcebergDeltaScan {
 /// scheduling hints, and native-carrier assembly.
 #[derive(Clone)]
 pub(crate) struct PlannedConnectorRead {
-    pub(crate) declaration: ConnectorInstanceDeclaration,
+    pub(crate) declaration: ConnectorExecutionDeclaration,
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
     pub(crate) batch: ConnectorBatchBudget,

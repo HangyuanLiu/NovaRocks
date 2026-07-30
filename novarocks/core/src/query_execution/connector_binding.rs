@@ -25,9 +25,10 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use novarocks_spi::connector::{ConnectorInstanceDeclaration, ConnectorInstanceId};
+use novarocks_spi::connector::{ConnectorExecutionDeclaration, ConnectorInstanceId};
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 
@@ -44,7 +45,7 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
 pub struct ConnectorBindingBackendInstallPlan {
     backend_idx: usize,
     endpoint: SocketAddr,
-    declarations: Vec<ConnectorInstanceDeclaration>,
+    declarations: Vec<ConnectorExecutionDeclaration>,
 }
 
 impl ConnectorBindingBackendInstallPlan {
@@ -56,7 +57,7 @@ impl ConnectorBindingBackendInstallPlan {
         self.endpoint
     }
 
-    pub fn declarations(&self) -> &[ConnectorInstanceDeclaration] {
+    pub fn declarations(&self) -> &[ConnectorExecutionDeclaration] {
         &self.declarations
     }
 }
@@ -89,9 +90,10 @@ impl ConnectorBindingInstallPlan {
 pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
     fn install(
         &self,
+        execution_id: QueryExecutionId,
         backend_idx: usize,
         endpoint: SocketAddr,
-        declaration: &ConnectorInstanceDeclaration,
+        declaration: &ConnectorExecutionDeclaration,
     ) -> Result<(), String>;
 }
 
@@ -125,6 +127,7 @@ impl ConnectorBindingInstallLease {
 pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
     fn install_all(
         &self,
+        execution_id: QueryExecutionId,
         plan: ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError>;
 }
@@ -141,7 +144,7 @@ pub(crate) fn compile_install_plan(
         usize,
         (
             SocketAddr,
-            BTreeMap<ConnectorInstanceId, ConnectorInstanceDeclaration>,
+            BTreeMap<ConnectorInstanceId, ConnectorExecutionDeclaration>,
         ),
     > = BTreeMap::new();
 
@@ -233,12 +236,18 @@ impl DispatchingConnectorBindingBarrier {
 impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
     fn install_all(
         &self,
+        execution_id: QueryExecutionId,
         plan: ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
         for backend in plan.backends() {
             for declaration in backend.declarations() {
                 self.dispatcher
-                    .install(backend.backend_idx(), backend.endpoint(), declaration)
+                    .install(
+                        execution_id,
+                        backend.backend_idx(),
+                        backend.endpoint(),
+                        declaration,
+                    )
                     .map_err(|error| {
                         failed(format!(
                             "connector instance '{}' installation on BE[{}] ({}) failed: {error}",
@@ -257,6 +266,8 @@ impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
 mod tests {
     use std::sync::Mutex;
 
+    use crate::query_execution::contract::QueryId;
+    use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorProviderId,
@@ -264,8 +275,8 @@ mod tests {
 
     use super::*;
 
-    fn declaration(instance_id: &str) -> ConnectorInstanceDeclaration {
-        ConnectorInstanceDeclaration::try_new(
+    fn declaration(instance_id: &str) -> ConnectorExecutionDeclaration {
+        ConnectorExecutionDeclaration::try_new(
             ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
                 instance_id: ConnectorInstanceId::parse(instance_id).unwrap(),
@@ -284,9 +295,10 @@ mod tests {
     impl ConnectorBindingDispatcher for RecordingDispatcher {
         fn install(
             &self,
+            _execution_id: QueryExecutionId,
             backend_idx: usize,
             endpoint: SocketAddr,
-            declaration: &ConnectorInstanceDeclaration,
+            declaration: &ConnectorExecutionDeclaration,
         ) -> Result<(), String> {
             let mut installs = self.installs.lock().unwrap();
             if self.fail_on == Some(installs.len()) {
@@ -324,7 +336,7 @@ mod tests {
         };
 
         barrier
-            .install_all(plan)
+            .install_all(execution_id(), plan)
             .expect("all installs ACK")
             .release();
         assert_eq!(dispatcher.installs.lock().unwrap().len(), 3);
@@ -345,8 +357,18 @@ mod tests {
             }],
         };
 
-        let error = barrier.install_all(plan).expect_err("second install fails");
+        let error = barrier
+            .install_all(execution_id(), plan)
+            .expect_err("second install fails");
         assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
         assert_eq!(dispatcher.installs.lock().unwrap().len(), 1);
+    }
+
+    fn execution_id() -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(7, 9),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id")
     }
 }

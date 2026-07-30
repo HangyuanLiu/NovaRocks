@@ -81,7 +81,12 @@ pub(super) fn plan_iceberg_connector_read(
         &projection,
     )?;
     Ok(PlannedConnectorRead {
-        declaration: planned.declaration,
+        declaration: novarocks_spi::connector::ConnectorExecutionDeclaration::try_new(
+            planned.declaration.descriptor().clone(),
+            planned.declaration.incarnation(),
+            planned.declaration.payload().clone(),
+        )
+        .map_err(|error| error.to_string())?,
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,
@@ -113,7 +118,12 @@ pub(super) fn plan_iceberg_delta_connector_read(
         delta.runtime_plan.delete_side.as_ref(),
     )?;
     Ok(PlannedConnectorRead {
-        declaration: planned.declaration,
+        declaration: novarocks_spi::connector::ConnectorExecutionDeclaration::try_new(
+            planned.declaration.descriptor().clone(),
+            planned.declaration.incarnation(),
+            planned.declaration.payload().clone(),
+        )
+        .map_err(|error| error.to_string())?,
         scan: planned.scan,
         splits: planned.splits,
         batch: planned.batch,

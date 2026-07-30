@@ -32,8 +32,8 @@ use novarocks_fs::{
     FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorControlBinding, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
     ConnectorInstance, ConnectorInstanceDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceDistribution, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -294,10 +294,7 @@ pub(crate) fn compose_compat_read_instance(
     ConnectorInstance::try_new(
         descriptor,
         None,
-        Arc::new(IcebergReadOnlyConnectorInstance {
-            key,
-            binding,
-        }),
+        Arc::new(IcebergReadOnlyConnectorInstance { key, binding }),
     )
 }
 
@@ -314,10 +311,7 @@ pub(crate) fn compose_compat_execution_binding(
     ConnectorExecutionBinding::try_new(
         ConnectorProviderId::parse(PROVIDER_ID)?,
         key.clone(),
-        Arc::new(IcebergReadOnlyConnectorInstance {
-            key,
-            binding,
-        }),
+        Arc::new(IcebergReadOnlyConnectorInstance { key, binding }),
     )
 }
 
@@ -2317,16 +2311,16 @@ mod tests {
             )),
         };
 
-        let error = provider
-            .plan_splits(
-                &scan,
-                ConnectorSplitPlanningRequest {
-                    target_parallelism: std::num::NonZeroUsize::new(1).expect("parallelism"),
-                    max_split_bytes: None,
-                    context,
-                },
-            )
-            .expect_err("aggregate split budget must reject the plan");
+        let error = ConnectorRead::plan_splits(
+            &provider,
+            &scan,
+            ConnectorSplitPlanningRequest {
+                target_parallelism: std::num::NonZeroUsize::new(1).expect("parallelism"),
+                max_split_bytes: None,
+                context,
+            },
+        )
+        .expect_err("aggregate split budget must reject the plan");
 
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     }

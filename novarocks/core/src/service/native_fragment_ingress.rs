@@ -23,7 +23,7 @@ use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
 use crate::proto;
 use crate::protocol::native::decode::{
-    decode_fragment_submission_with_connectors, decode_query_execution_id,
+    decode_fragment_submission_with_connectors_and_execution_resolver, decode_query_execution_id,
 };
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -38,6 +38,15 @@ pub struct NativeFragmentRequest {
     report_endpoint: Option<RuntimeEndpoint>,
 }
 
+/// Decode the query identity before choosing the query-scoped BE execution
+/// resolver. This is transport validation only; it does not resolve or install
+/// any Connector binding.
+pub fn decode_native_query_execution_id(
+    execution_id: &proto::novarocks::QueryExecutionId,
+) -> Result<QueryExecutionId, NativeFragmentIngressError> {
+    decode_query_execution_id(execution_id).map_err(NativeFragmentIngressError::new)
+}
+
 impl NativeFragmentRequest {
     pub fn try_decode_wire(
         execution_id: proto::novarocks::QueryExecutionId,
@@ -45,9 +54,31 @@ impl NativeFragmentRequest {
         instance_params: proto::novarocks::InstanceParams,
         connectors: Arc<crate::connector::ConnectorRegistry>,
     ) -> Result<Self, NativeFragmentIngressError> {
+        Self::try_decode_wire_with_execution_resolver(
+            execution_id,
+            fragment,
+            instance_params,
+            connectors,
+            Arc::new(MissingExecutionResolver),
+        )
+    }
+
+    pub fn try_decode_wire_with_execution_resolver(
+        execution_id: proto::novarocks::QueryExecutionId,
+        fragment: proto::plan::PlanFragment,
+        instance_params: proto::novarocks::InstanceParams,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
+        execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    ) -> Result<Self, NativeFragmentIngressError> {
         let execution_id =
             decode_query_execution_id(&execution_id).map_err(NativeFragmentIngressError::new)?;
-        Self::try_decode(execution_id, fragment, instance_params, connectors)
+        Self::try_decode_with_execution_resolver(
+            execution_id,
+            fragment,
+            instance_params,
+            connectors,
+            execution_resolver,
+        )
     }
 
     pub fn try_decode(
@@ -56,9 +87,29 @@ impl NativeFragmentRequest {
         instance_params: proto::novarocks::InstanceParams,
         connectors: Arc<crate::connector::ConnectorRegistry>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let decoded =
-            decode_fragment_submission_with_connectors(&fragment, &instance_params, connectors)
-                .map_err(NativeFragmentIngressError::new)?;
+        Self::try_decode_with_execution_resolver(
+            execution_id,
+            fragment,
+            instance_params,
+            connectors,
+            Arc::new(MissingExecutionResolver),
+        )
+    }
+
+    pub fn try_decode_with_execution_resolver(
+        execution_id: QueryExecutionId,
+        fragment: proto::plan::PlanFragment,
+        instance_params: proto::novarocks::InstanceParams,
+        connectors: Arc<crate::connector::ConnectorRegistry>,
+        execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    ) -> Result<Self, NativeFragmentIngressError> {
+        let decoded = decode_fragment_submission_with_connectors_and_execution_resolver(
+            &fragment,
+            &instance_params,
+            connectors,
+            execution_resolver,
+        )
+        .map_err(NativeFragmentIngressError::new)?;
         let (submission, metadata) = decoded.into_parts();
         if execution_id.query_id().high() != submission.instance().query_id().hi()
             || execution_id.query_id().low() != submission.instance().query_id().lo()
@@ -139,6 +190,23 @@ impl NativeFragmentRequest {
 
     fn query_options(&self) -> &QueryOptions {
         self.submission.instance().runtime_options().query_options()
+    }
+}
+
+struct MissingExecutionResolver;
+
+impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionResolver {
+    fn resolve(
+        &self,
+        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "native ConnectorReadSource execution resolver is not configured",
+        ))
     }
 }
 
@@ -224,9 +292,10 @@ impl fmt::Display for NativeFragmentIngressError {
 impl std::error::Error for NativeFragmentIngressError {}
 
 pub trait NativeFragmentIngress: Send + Sync + 'static {
-    fn install_connector_instance(
+    fn ensure_connector_execution_binding(
         &self,
-        _declaration: novarocks_spi::connector::ConnectorInstanceDeclaration,
+        _execution_id: QueryExecutionId,
+        _declaration: novarocks_spi::connector::ConnectorExecutionDeclaration,
         _context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), NativeFragmentIngressError> {
         Err(NativeFragmentIngressError::new(
@@ -234,10 +303,9 @@ pub trait NativeFragmentIngress: Send + Sync + 'static {
         ))
     }
 
-    fn retire_connector_instance(
+    fn retire_connector_execution_binding(
         &self,
-        _instance_id: novarocks_spi::connector::ConnectorInstanceId,
-        _incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+        _key: novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), NativeFragmentIngressError> {
         Err(NativeFragmentIngressError::new(
             "connector binding ingress is not configured",

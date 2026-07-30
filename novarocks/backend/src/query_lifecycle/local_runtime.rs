@@ -25,6 +25,7 @@ use novarocks::query_execution::lifecycle::{
 };
 use novarocks::runtime::native_query_lifecycle::NativeQueryLifecycleRuntime;
 
+use crate::ConnectorExecutionHost;
 use crate::fragment::control::FragmentControlRegistry;
 
 use super::registry::QueryLifecycleLocalRuntime;
@@ -32,13 +33,18 @@ use super::registry::QueryLifecycleLocalRuntime;
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
     runtime: NativeQueryLifecycleRuntime,
     controls: Arc<FragmentControlRegistry>,
+    execution_host: Arc<ConnectorExecutionHost>,
 }
 
 impl NativeQueryLifecycleLocalRuntime {
-    pub(crate) fn new(controls: Arc<FragmentControlRegistry>) -> Self {
+    pub(crate) fn new(
+        controls: Arc<FragmentControlRegistry>,
+        execution_host: Arc<ConnectorExecutionHost>,
+    ) -> Self {
         Self {
             runtime: NativeQueryLifecycleRuntime::global(),
             controls,
+            execution_host,
         }
     }
 }
@@ -77,6 +83,10 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls.cancel_many(&fragment_instance_ids, detail);
+        // Query lifecycle is the sole terminal authority for execution
+        // leases. Releasing here covers Finalize, Abort, deadline, KILL QUERY
+        // and BE shutdown without a second connector-specific release RPC.
+        let _ = self.execution_host.release_query(execution_id);
         if fragment_failure_test_markers_enabled() {
             for finst_id in fragment_instance_ids {
                 eprintln!(

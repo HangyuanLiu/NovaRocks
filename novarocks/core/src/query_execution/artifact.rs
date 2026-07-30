@@ -185,7 +185,7 @@ impl ControlReadyDistributedQuery {
             &self.prepared,
             &self.schedule.inner,
         )?;
-        let connector_binding_lease = match barrier.install_all(plan) {
+        let connector_binding_lease = match barrier.install_all(self.schedule.execution_id, plan) {
             Ok(lease) => lease,
             Err(error) => {
                 let kind = error.kind();

@@ -79,7 +79,7 @@ pub(crate) struct DecodedNode {
     pub output_schema: ChunkSchemaRef,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct NativePlanDecodeContext {
     exchange_inputs: ExchangeInputAssignments,
     /// Transient enrichment INPUT: FE-decoded `ScanRangeParams` per scan node.
@@ -93,6 +93,7 @@ pub(crate) struct NativePlanDecodeContext {
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
+    execution_resolver: Option<Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
 }
@@ -105,6 +106,7 @@ impl Default for NativePlanDecodeContext {
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
             connectors: None,
+            execution_resolver: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(crate::common::types::UniqueId {
                 hi: 0,
@@ -129,9 +131,18 @@ impl NativePlanDecodeContext {
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
             connectors: Some(connectors),
+            execution_resolver: None,
             query_id: Some(query_id),
             fragment_instance_id,
         }
+    }
+
+    pub(crate) fn with_execution_resolver(
+        mut self,
+        resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    ) -> Self {
+        self.execution_resolver = Some(resolver);
+        self
     }
 
     /// Record a scan node's enriched connector ranges (produced during node
@@ -244,6 +255,21 @@ impl NativePlanDecodeContext {
                 crate::protocol::common::error::ProtocolErrorKind::MissingField,
                 "connector_registry",
                 "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
+            )
+        })
+    }
+
+    pub(crate) fn execution_resolver(
+        &self,
+    ) -> Result<
+        &dyn novarocks_spi::connector::ConnectorExecutionResolver,
+        super::error::NativeFragmentLeafDecodeError,
+    > {
+        self.execution_resolver.as_deref().ok_or_else(|| {
+            super::error::NativeFragmentLeafDecodeError::at_field(
+                crate::protocol::common::error::ProtocolErrorKind::MissingField,
+                "connector_execution_resolver",
+                "native ConnectorReadSource requires a query-scoped execution resolver",
             )
         })
     }

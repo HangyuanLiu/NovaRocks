@@ -81,6 +81,7 @@ struct NoopConnectorBindingBarrier;
 impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
     fn install_all(
         &self,
+        _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
         _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
         Ok(ConnectorBindingInstallLease)
