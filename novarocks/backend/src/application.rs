@@ -175,7 +175,6 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
         self.registry.attach_control(attach)
     }
->>>>>>> 7be599577 (feat: build atomic backend stage workspaces)
 }
 
 struct QueryLifecycleSweepTask {
