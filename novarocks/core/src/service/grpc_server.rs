@@ -1077,6 +1077,22 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 
+    async fn report_query_terminal(
+        &self,
+        _request: tonic::Request<proto::novarocks::ReportQueryTerminalRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::ReportQueryTerminalResponse>, tonic::Status> {
+        // QLC-4 wires this endpoint separately from NativeReportHandler.  A
+        // process that has not installed the FE-owned terminal ingress must
+        // reject the fallback rather than accidentally accepting it as a
+        // fragment report.
+        Ok(tonic::Response::new(
+            proto::novarocks::ReportQueryTerminalResponse {
+                outcome: proto::novarocks::ReportQueryTerminalOutcome::RejectedGone as i32,
+                detail: "query terminal ingress is not installed for this role".to_string(),
+            },
+        ))
+    }
+
     async fn report_exec_status(
         &self,
         request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,

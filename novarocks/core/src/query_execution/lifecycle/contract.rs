@@ -30,6 +30,7 @@ use super::stage::{
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
     QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
 };
+use super::terminal::{QueryTerminalSnapshot, QueryTerminalSnapshotDigest};
 use crate::common::types::UniqueId;
 use crate::proto::{common, filter, novarocks};
 
@@ -79,11 +80,13 @@ impl std::fmt::Display for QueryLifecycleError {
 
 impl std::error::Error for QueryLifecycleError {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum QueryControlEvent {
     ControlReady,
     HeartbeatAck { sequence: u64 },
     LocalFailure { code: String, detail: String },
+    LocalDrained,
+    TerminalSnapshot { snapshot: QueryTerminalSnapshot },
     TerminationAccepted { reason: QueryTerminationReason },
 }
 
@@ -92,6 +95,77 @@ pub enum QueryControlCommand {
     Heartbeat { sequence: u64, sent_mono_ns: u64 },
     Abort { reason: String },
     Finalize,
+    TerminalAck { ack: QueryTerminalAck },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryTerminalAck {
+    execution_id: QueryExecutionId,
+    init_digest: ParticipantManifestDigest,
+    version: u32,
+    digest: QueryTerminalSnapshotDigest,
+}
+
+impl QueryTerminalAck {
+    pub const fn new(
+        execution_id: QueryExecutionId,
+        init_digest: ParticipantManifestDigest,
+        version: u32,
+        digest: QueryTerminalSnapshotDigest,
+    ) -> Self {
+        Self { execution_id, init_digest, version, digest }
+    }
+
+    pub const fn from_snapshot(snapshot: &QueryTerminalSnapshot) -> Self {
+        Self::new(snapshot.execution_id(), snapshot.init_digest(), snapshot.version(), snapshot.digest())
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId { self.execution_id }
+    pub const fn init_digest(&self) -> ParticipantManifestDigest { self.init_digest }
+    pub const fn version(&self) -> u32 { self.version }
+    pub const fn digest(&self) -> QueryTerminalSnapshotDigest { self.digest }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTerminalReportOutcome {
+    Accepted,
+    AlreadyAccepted,
+    RejectedConflict,
+    RejectedGone,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryTerminalReportAck {
+    outcome: QueryTerminalReportOutcome,
+    detail: String,
+}
+
+impl QueryTerminalReportAck {
+    pub fn new(outcome: QueryTerminalReportOutcome, detail: impl Into<String>) -> Self {
+        Self { outcome, detail: detail.into() }
+    }
+    pub const fn outcome(&self) -> QueryTerminalReportOutcome { self.outcome }
+    pub fn detail(&self) -> &str { &self.detail }
+}
+
+/// FE-owned ingress for immutable terminal snapshots.  It is intentionally
+/// distinct from fragment `NativeReportHandler` and from FE-to-BE lifecycle RPCs.
+pub trait QueryTerminalIngress: Send + Sync + 'static {
+    fn report_query_terminal(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
+}
+
+/// BE-owned fallback transport.  Delivery never reconnects or recreates the
+/// control session; it only reports the already frozen snapshot.
+pub trait QueryTerminalFallbackTransport: Send + Sync + 'static {
+    fn report_query_terminal(
+        &self,
+        target: QueryLifecycleTarget,
+        snapshot: QueryTerminalSnapshot,
+        timeout: Duration,
+    ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError>;
 }
 
 pub trait QueryLifecycleTransport: Send + Sync + 'static {
@@ -256,6 +330,13 @@ pub trait BackendQueryControl: Send + Sync + 'static {
     fn abort(&self, reason: String) -> Result<(), QueryLifecycleError>;
 
     fn finalize(&self) -> Result<(), QueryLifecycleError>;
+
+    fn terminal_ack(&self, _ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
+        Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Terminated,
+            "query terminal acknowledgement is not supported by this lifecycle owner",
+        ))
+    }
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError>;
 }
@@ -739,6 +820,16 @@ pub fn encode_query_control_command(
         QueryControlCommand::Finalize => {
             novarocks::query_control_request::Command::Finalize(novarocks::QueryControlFinalize {})
         }
+        QueryControlCommand::TerminalAck { ack } => {
+            novarocks::query_control_request::Command::TerminalAck(
+                novarocks::QueryControlTerminalAck {
+                    execution_id: Some(encode_execution_id(ack.execution_id())),
+                    init_digest: ack.init_digest().as_bytes().to_vec(),
+                    snapshot_version: ack.version(),
+                    snapshot_digest: ack.digest().as_bytes().to_vec(),
+                },
+            )
+        }
     };
     novarocks::QueryControlRequest {
         command: Some(command),
@@ -764,6 +855,16 @@ pub fn decode_query_control_command(
         }
         Some(novarocks::query_control_request::Command::Finalize(_)) => {
             Ok(QueryControlCommand::Finalize)
+        }
+        Some(novarocks::query_control_request::Command::TerminalAck(ack)) => {
+            Ok(QueryControlCommand::TerminalAck {
+                ack: QueryTerminalAck::new(
+                    decode_required_execution_id(ack.execution_id.as_ref())?,
+                    ParticipantManifestDigest::try_from_slice(&ack.init_digest)?,
+                    ack.snapshot_version,
+                    QueryTerminalSnapshotDigest::try_from_slice(&ack.snapshot_digest)?,
+                ),
+            })
         }
         Some(novarocks::query_control_request::Command::Abort(_)) => Err(
             QueryLifecycleError::invalid_manifest("query control abort reason must not be empty"),
@@ -795,6 +896,16 @@ pub fn encode_query_control_event(event: &QueryControlEvent) -> novarocks::Query
                     code: code.clone(),
                     detail: detail.clone(),
                 },
+            )
+        }
+        QueryControlEvent::LocalDrained => {
+            novarocks::query_control_response::Event::LocalDrained(
+                novarocks::QueryControlLocalDrained {},
+            )
+        }
+        QueryControlEvent::TerminalSnapshot { snapshot } => {
+            novarocks::query_control_response::Event::TerminalSnapshot(
+                encode_query_terminal_snapshot(snapshot),
             )
         }
         QueryControlEvent::TerminationAccepted { reason } => {
@@ -833,6 +944,14 @@ pub fn decode_query_control_event(
                 reason: decode_termination_reason(accepted.reason)?,
             })
         }
+        Some(novarocks::query_control_response::Event::LocalDrained(_)) => {
+            Ok(QueryControlEvent::LocalDrained)
+        }
+        Some(novarocks::query_control_response::Event::TerminalSnapshot(snapshot)) => {
+            Ok(QueryControlEvent::TerminalSnapshot {
+                snapshot: decode_query_terminal_snapshot(snapshot)?,
+            })
+        }
         Some(novarocks::query_control_response::Event::LocalFailure(_)) => {
             Err(QueryLifecycleError::invalid_manifest(
                 "local failure code and detail must not be empty",
@@ -842,6 +961,49 @@ pub fn decode_query_control_event(
             "query control event is required",
         )),
     }
+}
+
+pub fn encode_query_terminal_snapshot(snapshot: &QueryTerminalSnapshot) -> novarocks::QueryTerminalSnapshot {
+    use crate::runtime::sink_commit::{SinkLoadStats, TabletCommitInfo, TabletFailInfo};
+    let fragments = snapshot.fragments().iter().map(|fragment| {
+        let (outcome, error_code, error_detail) = match fragment.outcome() {
+            super::terminal::FragmentTerminalOutcome::Succeeded => (1, String::new(), String::new()),
+            super::terminal::FragmentTerminalOutcome::Failed { code, detail } => (2, code.clone(), detail.clone()),
+            super::terminal::FragmentTerminalOutcome::Cancelled { detail } => (3, "CANCELLED".to_string(), detail.clone()),
+            super::terminal::FragmentTerminalOutcome::IncompleteDrain { detail } => (4, "INCOMPLETE_DRAIN".to_string(), detail.clone()),
+        };
+        novarocks::QueryTerminalFragmentSnapshot {
+            fragment_instance_id: Some(common::UniqueId { hi: fragment.fragment_instance_id().hi, lo: fragment.fragment_instance_id().lo }),
+            backend_num: fragment.backend_num(), outcome, error_code, error_detail,
+            iceberg_commits: fragment.sink().iceberg_commits.clone(),
+            tablet_commit_infos: fragment.sink().tablet_commit_infos.iter().map(|value| novarocks::QueryTerminalTabletInfo { tablet_id: value.tablet_id, backend_id: value.backend_id }).collect(),
+            tablet_fail_infos: fragment.sink().tablet_fail_infos.iter().map(|value| novarocks::QueryTerminalTabletInfo { tablet_id: value.tablet_id, backend_id: value.backend_id }).collect(),
+            load_stats: Some(novarocks::QueryTerminalLoadStats { loaded_rows: fragment.sink().load_stats.loaded_rows, loaded_bytes: fragment.sink().load_stats.loaded_bytes, filtered_rows: fragment.sink().load_stats.filtered_rows }),
+            profile: fragment.profile().map(|profile| profile.to_proto()),
+        }
+    }).collect();
+    novarocks::QueryTerminalSnapshot { version: snapshot.version(), execution_id: Some(encode_execution_id(snapshot.execution_id())), backend: Some(encode_backend_identity(snapshot.backend())), init_digest: snapshot.init_digest().as_bytes().to_vec(), digest: snapshot.digest().as_bytes().to_vec(), fragments }
+}
+
+pub fn decode_query_terminal_snapshot(value: &novarocks::QueryTerminalSnapshot) -> Result<QueryTerminalSnapshot, QueryLifecycleError> {
+    use crate::runtime::sink_commit::{SinkCommitReportSnapshot, SinkLoadStats, TabletCommitInfo, TabletFailInfo};
+    let fragments = value.fragments.iter().map(|fragment| {
+        let id = fragment.fragment_instance_id.as_ref().ok_or_else(|| QueryLifecycleError::invalid_manifest("terminal fragment instance id is required"))?;
+        let outcome = match fragment.outcome {
+            1 => super::terminal::FragmentTerminalOutcome::Succeeded,
+            2 if !fragment.error_code.trim().is_empty() => super::terminal::FragmentTerminalOutcome::Failed { code: fragment.error_code.clone(), detail: fragment.error_detail.clone() },
+            3 => super::terminal::FragmentTerminalOutcome::Cancelled { detail: fragment.error_detail.clone() },
+            4 => super::terminal::FragmentTerminalOutcome::IncompleteDrain { detail: fragment.error_detail.clone() },
+            _ => return Err(QueryLifecycleError::invalid_manifest("invalid terminal fragment outcome")),
+        };
+        let stats = fragment.load_stats.as_ref().ok_or_else(|| QueryLifecycleError::invalid_manifest("terminal fragment load stats are required"))?;
+        let sink = SinkCommitReportSnapshot { iceberg_commits: fragment.iceberg_commits.clone(), tablet_commit_infos: fragment.tablet_commit_infos.iter().map(|value| TabletCommitInfo { tablet_id: value.tablet_id, backend_id: value.backend_id }).collect(), tablet_fail_infos: fragment.tablet_fail_infos.iter().map(|value| TabletFailInfo { tablet_id: value.tablet_id, backend_id: value.backend_id }).collect(), load_stats: SinkLoadStats { loaded_rows: stats.loaded_rows, loaded_bytes: stats.loaded_bytes, filtered_rows: stats.filtered_rows } };
+        let profile = fragment.profile.as_ref().map(crate::runtime::profile::RuntimeProfileTree::from_proto).transpose().map_err(QueryLifecycleError::invalid_manifest)?;
+        super::terminal::FragmentTerminalSnapshot::new(crate::common::types::UniqueId { hi: id.hi, lo: id.lo }, fragment.backend_num, outcome, sink, profile)
+    }).collect::<Result<Vec<_>, _>>()?;
+    let snapshot = QueryTerminalSnapshot::new(decode_required_execution_id(value.execution_id.as_ref())?, decode_backend_identity(value.backend.as_ref().ok_or_else(|| QueryLifecycleError::invalid_manifest("terminal backend identity is required"))?)?, ParticipantManifestDigest::try_from_slice(&value.init_digest)?, fragments)?;
+    if value.version != snapshot.version() || QueryTerminalSnapshotDigest::try_from_slice(&value.digest)? != snapshot.digest() { return Err(QueryLifecycleError::new(QueryLifecycleErrorCode::Conflict, "terminal snapshot wire content has invalid version or digest")); }
+    Ok(snapshot)
 }
 
 fn encode_participant_manifest(

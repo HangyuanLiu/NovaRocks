@@ -63,6 +63,10 @@ service NovaRocksGrpc {
   rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
   rpc QueryControlStream(stream QueryControlRequest)
       returns (stream QueryControlResponse);
+  // BE -> FE fallback delivery for one immutable terminal participant snapshot.
+  // This is not control-stream recovery and never recreates an execution attempt.
+  rpc ReportQueryTerminal(ReportQueryTerminalRequest)
+      returns (ReportQueryTerminalResponse);
   // Coordinator ensures a provider-owned, credential-free BE execution
   // binding and acquires its query lifecycle lease before any fragment using
   // that exact generation is submitted.
@@ -256,12 +260,20 @@ message QueryControlAbort {
 
 message QueryControlFinalize {}
 
+message QueryControlTerminalAck {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  uint32 snapshot_version = 3;
+  bytes snapshot_digest = 4;
+}
+
 message QueryControlRequest {
   oneof command {
     QueryControlAttach attach = 1;
     QueryControlHeartbeat heartbeat = 2;
     QueryControlAbort abort = 3;
     QueryControlFinalize finalize = 4;
+    QueryControlTerminalAck terminal_ack = 5;
   }
 }
 
@@ -280,13 +292,75 @@ message QueryControlTerminationAccepted {
   QueryTerminationReason reason = 1;
 }
 
+message QueryControlLocalDrained {}
+
 message QueryControlResponse {
   oneof event {
     QueryControlReady control_ready = 1;
     QueryControlHeartbeatAck heartbeat_ack = 2;
     QueryControlLocalFailure local_failure = 3;
     QueryControlTerminationAccepted termination_accepted = 4;
+    QueryControlLocalDrained local_drained = 5;
+    QueryTerminalSnapshot terminal_snapshot = 6;
   }
+}
+
+enum QueryTerminalFragmentOutcome {
+  QUERY_TERMINAL_FRAGMENT_OUTCOME_UNSPECIFIED = 0;
+  QUERY_TERMINAL_FRAGMENT_OUTCOME_SUCCEEDED = 1;
+  QUERY_TERMINAL_FRAGMENT_OUTCOME_FAILED = 2;
+  QUERY_TERMINAL_FRAGMENT_OUTCOME_CANCELLED = 3;
+  QUERY_TERMINAL_FRAGMENT_OUTCOME_INCOMPLETE_DRAIN = 4;
+}
+
+message QueryTerminalTabletInfo {
+  int64 tablet_id = 1;
+  int64 backend_id = 2;
+}
+
+message QueryTerminalLoadStats {
+  int64 loaded_rows = 1;
+  int64 loaded_bytes = 2;
+  int64 filtered_rows = 3;
+}
+
+message QueryTerminalFragmentSnapshot {
+  novarocks.common.UniqueId fragment_instance_id = 1;
+  int32 backend_num = 2;
+  QueryTerminalFragmentOutcome outcome = 3;
+  string error_code = 4;
+  string error_detail = 5;
+  repeated IcebergCommitInfo iceberg_commits = 6;
+  repeated QueryTerminalTabletInfo tablet_commit_infos = 7;
+  repeated QueryTerminalTabletInfo tablet_fail_infos = 8;
+  QueryTerminalLoadStats load_stats = 9;
+  RuntimeProfileTree profile = 10;
+}
+
+message QueryTerminalSnapshot {
+  uint32 version = 1;
+  QueryExecutionId execution_id = 2;
+  ParticipantBackendIdentity backend = 3;
+  bytes init_digest = 4;
+  bytes digest = 5;
+  repeated QueryTerminalFragmentSnapshot fragments = 6;
+}
+
+message ReportQueryTerminalRequest {
+  QueryTerminalSnapshot snapshot = 1;
+}
+
+enum ReportQueryTerminalOutcome {
+  REPORT_QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0;
+  REPORT_QUERY_TERMINAL_OUTCOME_ACCEPTED = 1;
+  REPORT_QUERY_TERMINAL_OUTCOME_ALREADY_ACCEPTED = 2;
+  REPORT_QUERY_TERMINAL_OUTCOME_REJECTED_CONFLICT = 3;
+  REPORT_QUERY_TERMINAL_OUTCOME_REJECTED_GONE = 4;
+}
+
+message ReportQueryTerminalResponse {
+  ReportQueryTerminalOutcome outcome = 1;
+  string detail = 2;
 }
 
 // One exchange shuffle chunk in flight from a sender to a receiver instance.

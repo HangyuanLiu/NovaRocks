@@ -53,7 +53,7 @@ pub struct TabletFailInfo {
 ///
 /// The runtime owns this data; protocol adapters are responsible for encoding
 /// it into their respective report wire formats.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SinkCommitReportSnapshot {
     pub iceberg_commits: Vec<IcebergCommitInfo>,
     pub tablet_commit_infos: Vec<TabletCommitInfo>,

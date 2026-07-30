@@ -410,6 +410,7 @@ enum PendingQueryControlCommand {
     Heartbeat { sequence: u64 },
     Abort,
     Finalize,
+    TerminalAck,
 }
 
 impl From<&QueryControlCommand> for PendingQueryControlCommand {
@@ -420,6 +421,7 @@ impl From<&QueryControlCommand> for PendingQueryControlCommand {
             },
             QueryControlCommand::Abort { .. } => Self::Abort,
             QueryControlCommand::Finalize => Self::Finalize,
+            QueryControlCommand::TerminalAck { .. } => Self::TerminalAck,
         }
     }
 }
@@ -450,12 +452,7 @@ fn prepare_query_control_event(
         },
         Err(error) => Err(error),
     };
-    let terminal = matches!(
-        next,
-        Ok(QueryControlEvent::LocalFailure { .. })
-            | Ok(QueryControlEvent::TerminationAccepted { .. })
-            | Err(_)
-    );
+    let terminal = matches!(next, Ok(QueryControlEvent::LocalFailure { .. }) | Err(_));
     if terminal {
         let terminal_error = terminal_command_error(&next);
         state.close(terminal_error);
@@ -468,7 +465,10 @@ fn validate_query_control_event(
     state: &mut QueryControlCommandState,
 ) -> Result<(), QueryLifecycleTransportError> {
     match event {
-        QueryControlEvent::ControlReady | QueryControlEvent::LocalFailure { .. } => Ok(()),
+        QueryControlEvent::ControlReady
+        | QueryControlEvent::LocalFailure { .. }
+        | QueryControlEvent::LocalDrained
+        | QueryControlEvent::TerminalSnapshot { .. } => Ok(()),
         QueryControlEvent::HeartbeatAck { sequence } => match state.pending.front() {
             Some(PendingQueryControlCommand::Heartbeat {
                 sequence: expected,
