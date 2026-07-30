@@ -17785,7 +17785,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::LegacyFixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17880,7 +17882,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::LegacyFixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17928,7 +17932,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::LegacyFixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {
@@ -17981,7 +17987,9 @@ mod tests {
                 .catalog_service
                 .register_catalog(crate::sql::catalog::build_iceberg_catalog(
                     catalog,
-                    connectors.clone(),
+                    Arc::new(crate::connector::LegacyFixtureControlResolver::new(
+                        connectors.clone(),
+                    )),
                 ));
         }
         IcebergMvTestState {

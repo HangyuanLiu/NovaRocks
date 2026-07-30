@@ -47,9 +47,11 @@ fn prepare_scan_bindings(
     connectors: &ConnectorRegistry,
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+    let controls = crate::connector::LegacyFixtureControlResolver::new(connectors.clone());
     super::prepare_scan_bindings(
         plan,
         connectors,
+        &controls,
         &crate::connector::test_request_context(),
         resolver,
     )

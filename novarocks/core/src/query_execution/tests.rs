@@ -183,9 +183,12 @@ fn real_execution_artifacts() -> (
         edges: Vec::new(),
         runtime_filter_graph: Default::default(),
     };
+    let registry = crate::connector::ConnectorRegistry::new();
+    let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &plan,
-        &crate::connector::ConnectorRegistry::new(),
+        &registry,
+        &controls,
         &crate::connector::test_request_context(),
         None,
     )

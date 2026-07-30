@@ -59,9 +59,11 @@ fn build_for_test(
     String,
 > {
     let _ = request.catalog;
+    let controls = crate::connector::LegacyFixtureControlResolver::new(request.connectors.clone());
     let prepared = prepare_fragments(
         request.distributed_plan,
         request.connectors,
+        &controls,
         &crate::connector::test_request_context(),
         request.scan_binding_resolver,
     )?;

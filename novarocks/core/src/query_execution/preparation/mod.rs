@@ -568,9 +568,12 @@ mod tests {
                 .fragment_output_columns(9)
                 .is_none()
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         )
@@ -591,9 +594,12 @@ mod tests {
         crate::sql::planner::distributed::test_support::remove_fragment_output_for_test(
             &mut plan, 7,
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         ) {
@@ -618,9 +624,12 @@ mod tests {
                     vec![BindingId::new(1), BindingId::new(2)];
             },
         );
+        let registry = crate::connector::ConnectorRegistry::new();
+        let controls = crate::connector::LegacyFixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &crate::connector::ConnectorRegistry::new(),
+            &registry,
+            &controls,
             &crate::connector::test_request_context(),
             None,
         )
