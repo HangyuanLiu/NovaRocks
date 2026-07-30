@@ -948,7 +948,7 @@ fn join_backend_service_thread(handle: thread::JoinHandle<()>) -> Result<(), Str
 mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-    use crate::thrift::backend_service::TStreamLoadChannel;
+    use crate::thrift::backend_service::{BackendServiceSyncHandler, TStreamLoadChannel};
     use crate::thrift::status_code::TStatusCode;
 
     #[derive(Default)]
