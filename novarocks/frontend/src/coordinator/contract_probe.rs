@@ -41,7 +41,8 @@ mod tests {
     use novarocks::query_execution::lifecycle::{
         ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
         QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome, QueryInitRequest,
-        QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError,
+        QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck,
+        QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
         QueryTerminationAck, QueryTerminationReason,
     };
     use novarocks::query_execution::write::NativeExecutionReport;
@@ -447,6 +448,48 @@ mod tests {
             }))
         }
 
+        fn stage_fragments(
+            &self,
+            target: QueryLifecycleTarget,
+            request: &QueryStageRequest,
+            _timeout: Duration,
+        ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+            let (lock, ready) = &*self.state;
+            let mut state = lock.lock().expect("all-ready boundary");
+            if !state.first_submit_entered {
+                state.first_submit_entered = true;
+                state.all_ready_at_first_submit =
+                    !state.initialized.is_empty() && state.ready == state.initialized;
+                ready.notify_all();
+                while !state.release_first_submit {
+                    state = ready.wait(state).expect("release first StageFragments");
+                }
+            }
+            drop(state);
+            Ok(QueryStageAck::new(
+                request.execution_id(),
+                request.digest_version(),
+                request.digest(),
+                QueryStageOutcome::Applied,
+                format!("backend {} staged", target.backend_idx()),
+            ))
+        }
+
+        fn start_prepared_query(
+            &self,
+            _target: QueryLifecycleTarget,
+            request: &QueryStartRequest,
+            _timeout: Duration,
+        ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+            Ok(QueryStartAck::new(
+                request.execution_id(),
+                request.digest_version(),
+                request.digest(),
+                QueryStartOutcome::Applied,
+                "test participant started",
+            ))
+        }
+
         fn abort_query(
             &self,
             _target: QueryLifecycleTarget,
@@ -545,16 +588,9 @@ mod tests {
             .expect("frontend executes fixture");
 
         assert_result_outcome_preserved(outcome, 1).expect("engine consumes Result payload");
-        assert!(!dispatcher.submissions.lock().unwrap().is_empty());
+        assert!(dispatcher.submissions.lock().unwrap().is_empty());
         let reporting = dispatcher.submission_reporting.lock().unwrap();
-        assert!(reporting.iter().all(|(has_endpoint, _)| *has_endpoint));
-        assert_eq!(
-            reporting
-                .iter()
-                .filter(|(_, typed_result_sink)| *typed_result_sink)
-                .count(),
-            1
-        );
+        assert!(reporting.is_empty());
         assert!(!dispatcher.fetches.lock().unwrap().is_empty());
     }
 

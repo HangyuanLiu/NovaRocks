@@ -394,6 +394,42 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         }))
     }
 
+    fn stage_fragments(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryStageAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(novarocks::query_execution::lifecycle::QueryStageAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStageOutcome::Applied,
+            "test participant staged",
+        ))
+    }
+
+    fn start_prepared_query(
+        &self,
+        _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
+        request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+        _timeout: Duration,
+    ) -> Result<
+        novarocks::query_execution::lifecycle::QueryStartAck,
+        novarocks::query_execution::lifecycle::QueryLifecycleTransportError,
+    > {
+        Ok(novarocks::query_execution::lifecycle::QueryStartAck::new(
+            request.execution_id(),
+            request.digest_version(),
+            request.digest(),
+            novarocks::query_execution::lifecycle::QueryStartOutcome::Applied,
+            "test participant started",
+        ))
+    }
+
     fn abort_query(
         &self,
         _target: novarocks::query_execution::lifecycle::QueryLifecycleTarget,
