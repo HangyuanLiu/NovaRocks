@@ -7,6 +7,11 @@ use std::time::{Duration, Instant};
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::connector::ConnectorRegistry;
+use novarocks::query_execution::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryControlAttachment, QueryInitAck, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
+    QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
+};
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::service::grpc_server;
 
@@ -109,6 +114,68 @@ struct BackendApplicationServices {
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+}
+
+/// Backend composition root for the QLC-3 Stage/Start transaction.  The
+/// registry owns lifecycle linearization while the fragment service owns
+/// dormant local workers; neither exposes a direct production submit path.
+struct BackendStageLifecycleIngress {
+    registry: Arc<QueryLifecycleRegistry>,
+    fragments: Arc<NativeFragmentService>,
+}
+
+impl QueryLifecycleIngress for BackendStageLifecycleIngress {
+    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
+        self.registry.bind_backend_identity(backend_id)
+    }
+
+    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+        self.registry.init_query(request)
+    }
+
+    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
+        match self.registry.begin_stage(request.clone()) {
+            crate::query_lifecycle::StageBuildDecision::Complete(ack) => ack,
+            crate::query_lifecycle::StageBuildDecision::Build(permit) => {
+                let execution_id = request.execution_id();
+                let build = self.fragments.stage_fragments(
+                    execution_id,
+                    request.fragments(),
+                    permit.gate(),
+                );
+                match build {
+                    Ok(()) => permit.commit(),
+                    Err(error) => QueryStageAck::new(
+                        execution_id,
+                        request.digest_version(),
+                        request.digest(),
+                        QueryStageOutcome::RejectedLocalFailure,
+                        error.to_string(),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
+        self.registry.start_prepared_query(request)
+    }
+
+    fn abort_query(
+        &self,
+        request: QueryAbortRequest,
+    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+        self.registry.abort_query(request)
+    }
+
+    fn attach_control(
+        &self,
+        attach: QueryControlAttach,
+    ) -> Result<QueryControlAttachment, QueryLifecycleError> {
+        self.registry.attach_control(attach)
+    }
+>>>>>>> 7be599577 (feat: build atomic backend stage workspaces)
 }
 
 struct QueryLifecycleSweepTask {
@@ -206,10 +273,16 @@ fn compose_backend_application_services(
         connector_registry,
         Arc::clone(&execution_host),
     ));
+    let query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress> =
+        Arc::new(BackendStageLifecycleIngress {
+            registry: Arc::clone(&query_lifecycle_registry),
+            fragments: Arc::clone(&native_fragment_service),
+        });
     Ok(BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
         execution_host,
+        query_lifecycle_ingress,
     })
 }
 
@@ -306,7 +379,7 @@ impl BackendApplicationHost {
             &bind_host,
             grpc_port,
             native_fragment_service.clone(),
-            services.query_lifecycle_registry.clone(),
+            services.query_lifecycle_ingress.clone(),
             native_report_handler,
         )
         .map_err(|error| {

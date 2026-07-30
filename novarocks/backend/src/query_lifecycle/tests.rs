@@ -19,13 +19,16 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
+use novarocks::proto::{common, novarocks as proto_novarocks, plan};
 use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
     AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
     ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryTerminationReason, RuntimeFilterContribution,
+    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
+    QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
+    StageDigestVersion, StageFragment,
 };
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -449,6 +452,159 @@ fn attach_control(
                 .expect("valid control attach"),
         )
         .expect("control attaches")
+}
+
+fn stage_fragment(instance_id: UniqueId) -> StageFragment {
+    StageFragment::new(
+        plan::PlanFragment::default(),
+        proto_novarocks::InstanceParams {
+            fragment_instance_id: Some(common::UniqueId {
+                hi: instance_id.hi,
+                lo: instance_id.lo,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("valid stage fragment")
+}
+
+fn stage_request(
+    request: &QueryInitRequest,
+    digest_byte: u8,
+    instances: &[UniqueId],
+) -> QueryStageRequest {
+    QueryStageRequest::new(
+        request.manifest().execution_id(),
+        request.digest(),
+        StageDigestVersion::V1,
+        StageDigest::new([digest_byte; 32]),
+        instances.iter().copied().map(stage_fragment).collect(),
+    )
+    .expect("valid stage request")
+}
+
+#[test]
+fn stage_and_start_are_idempotent_after_control_ready() {
+    let expected = [UniqueId { hi: 8, lo: 1 }, UniqueId { hi: 8, lo: 2 }];
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = fragment_init_request_fixture(1_801, &expected);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 4, &[expected[1], expected[0]]);
+
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+    assert_eq!(
+        registry.phase(request.manifest().execution_id()),
+        Some(QueryLifecyclePhase::Staged)
+    );
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::AlreadyApplied
+    );
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 5, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedConflict
+    );
+
+    let start = QueryStartRequest::new(
+        request.manifest().execution_id(),
+        StageDigestVersion::V1,
+        stage.digest(),
+    );
+    assert_eq!(
+        registry.start_prepared_query(start).outcome(),
+        QueryStartOutcome::Applied
+    );
+    assert_eq!(
+        registry.phase(request.manifest().execution_id()),
+        Some(QueryLifecyclePhase::Running)
+    );
+    assert_eq!(
+        registry.start_prepared_query(start).outcome(),
+        QueryStartOutcome::AlreadyStarted
+    );
+}
+
+#[test]
+fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
+    let expected = [UniqueId { hi: 9, lo: 1 }];
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = fragment_init_request_fixture(1_802, &expected);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedInvalidState
+    );
+    let _attachment = attach_control(&registry, &request);
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &[]))
+            .outcome(),
+        QueryStageOutcome::RejectedInvalidBatch
+    );
+
+    let mismatched_digest = QueryStageRequest::new(
+        request.manifest().execution_id(),
+        novarocks::query_execution::lifecycle::ParticipantManifestDigest::new([7; 32]),
+        StageDigestVersion::V1,
+        StageDigest::new([1; 32]),
+        expected.iter().copied().map(stage_fragment).collect(),
+    )
+    .expect("well formed mismatched stage request");
+    assert_eq!(
+        registry.stage_fragments(mismatched_digest).outcome(),
+        QueryStageOutcome::RejectedConflict
+    );
+}
+
+#[test]
+fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(1_803, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let _attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 6, &[]);
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                request.manifest().execution_id(),
+                request.digest(),
+                "abort staged service participant",
+            )
+            .expect("valid abort"),
+        )
+        .expect("abort accepted");
+    assert_eq!(
+        registry
+            .start_prepared_query(QueryStartRequest::new(
+                request.manifest().execution_id(),
+                StageDigestVersion::V1,
+                stage.digest(),
+            ))
+            .outcome(),
+        QueryStartOutcome::RejectedTerminated
+    );
 }
 
 #[test]

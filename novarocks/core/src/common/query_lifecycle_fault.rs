@@ -26,6 +26,8 @@ use crate::query_execution::lifecycle::QueryExecutionId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleFaultKind {
     InitAckDrop,
+    StageAckDrop,
+    StartAckDrop,
     HeartbeatStop,
     RestartAfterInitAck,
 }
@@ -34,6 +36,8 @@ impl QueryLifecycleFaultKind {
     pub const fn file_stem(self) -> &'static str {
         match self {
             Self::InitAckDrop => "init-ack-drop",
+            Self::StageAckDrop => "stage-ack-drop",
+            Self::StartAckDrop => "start-ack-drop",
             Self::HeartbeatStop => "heartbeat-stop",
             Self::RestartAfterInitAck => "restart-after-init-ack",
         }
