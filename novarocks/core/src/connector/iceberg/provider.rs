@@ -46,7 +46,7 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
     ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
     CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,7 @@ const PROVIDER_ID: &str = "iceberg";
 const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
 const ICEBERG_DECLARATION_V1: u16 = 1;
 const DEFAULT_ACCESS_BINDING: &str = "default";
+const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
 /// Compat has no NovaRocks catalog instance identity on the wire.  Its
 /// read-only Iceberg binding is therefore composed once per BE process, not
 /// synthesized for each query or inferred from an HDFS path.
@@ -497,6 +498,47 @@ pub(crate) struct IcebergControlProvider {
     snapshot_memberships: Arc<SnapshotMembershipCache>,
 }
 
+/// Provider-private, bounded evidence used only to decide an ambiguous
+/// external catalog commit. It intentionally contains no catalog handle,
+/// credentials, parser AST, or runtime object.
+#[derive(Deserialize, Serialize)]
+struct IcebergMutationEvidenceV1 {
+    version: u16,
+    target: IcebergMutationEvidenceTarget,
+}
+
+#[derive(Deserialize, Serialize)]
+enum IcebergMutationEvidenceTarget {
+    Namespace {
+        namespace: String,
+        should_exist: bool,
+    },
+    Table {
+        namespace: String,
+        table: String,
+        should_exist: bool,
+        before_uuid: Option<String>,
+    },
+    View {
+        namespace: String,
+        view: String,
+        should_exist: bool,
+    },
+    TableVersion {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        before_metadata_location: Option<String>,
+    },
+    Ref {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        ref_name: String,
+        expected_snapshot_id: Option<i64>,
+    },
+}
+
 impl IcebergControlProvider {
     /// Creates the FE-only control binding for a logical Iceberg catalog. The
     /// implementation remains in core until SPI-5, but its runtime capability
@@ -557,6 +599,157 @@ impl IcebergControlProvider {
             ));
         }
         Ok(())
+    }
+
+    fn mutation_evidence(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        operation: &ConnectorCatalogMutationOperation,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        use novarocks_spi::connector::ConnectorRefAction;
+
+        let table_before = |namespace: &str,
+                            table: &str|
+         -> Result<Option<(String, Option<String>)>, ConnectorError> {
+            let entry = self.entry(self.instance_id.as_str())?;
+            let exists = list_tables(&entry, namespace)
+                .map_err(map_iceberg_error)?
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(table));
+            if !exists {
+                return Ok(None);
+            }
+            let loaded = load_table(&entry, namespace, table).map_err(map_iceberg_error)?;
+            Ok(Some((
+                loaded.table.metadata().uuid().to_string(),
+                loaded.table.metadata_location().map(ToString::to_string),
+            )))
+        };
+
+        let target = match operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. } => {
+                IcebergMutationEvidenceTarget::Namespace {
+                    namespace: namespace.namespace.to_string(),
+                    should_exist: true,
+                }
+            }
+            ConnectorCatalogMutationOperation::DropNamespace { namespace, .. } => {
+                IcebergMutationEvidenceTarget::Namespace {
+                    namespace: namespace.namespace.to_string(),
+                    should_exist: false,
+                }
+            }
+            ConnectorCatalogMutationOperation::CreateTable { table, .. } => {
+                IcebergMutationEvidenceTarget::Table {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    should_exist: true,
+                    before_uuid: table_before(&table.namespace, &table.table)?
+                        .map(|(uuid, _)| uuid),
+                }
+            }
+            ConnectorCatalogMutationOperation::DropTable { table, .. } => {
+                IcebergMutationEvidenceTarget::Table {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    should_exist: false,
+                    before_uuid: table_before(&table.namespace, &table.table)?
+                        .map(|(uuid, _)| uuid),
+                }
+            }
+            ConnectorCatalogMutationOperation::CreateView { view, .. } => {
+                IcebergMutationEvidenceTarget::View {
+                    namespace: view.namespace.to_string(),
+                    view: view.view.to_string(),
+                    should_exist: true,
+                }
+            }
+            ConnectorCatalogMutationOperation::DropView { view, .. } => {
+                IcebergMutationEvidenceTarget::View {
+                    namespace: view.namespace.to_string(),
+                    view: view.view.to_string(),
+                    should_exist: false,
+                }
+            }
+            ConnectorCatalogMutationOperation::AlterSchema { table, .. }
+            | ConnectorCatalogMutationOperation::AlterPartitionSpec { table, .. }
+            | ConnectorCatalogMutationOperation::AlterProperties { table, .. } => {
+                let Some((table_uuid, before_metadata_location)) =
+                    table_before(&table.namespace, &table.table)?
+                else {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "Iceberg table does not exist for catalog mutation evidence",
+                    ));
+                };
+                IcebergMutationEvidenceTarget::TableVersion {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    table_uuid,
+                    before_metadata_location,
+                }
+            }
+            ConnectorCatalogMutationOperation::AlterRef { table, action } => {
+                let Some((table_uuid, _)) = table_before(&table.namespace, &table.table)? else {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "Iceberg table does not exist for ref mutation evidence",
+                    ));
+                };
+                let entry = self.entry(self.instance_id.as_str())?;
+                let loaded = load_table(&entry, &table.namespace, &table.table)
+                    .map_err(map_iceberg_error)?;
+                let (ref_name, expected_snapshot_id) = match action {
+                    ConnectorRefAction::Create {
+                        name, snapshot_id, ..
+                    } => (
+                        name.to_string(),
+                        snapshot_id.or_else(|| loaded.table.metadata().current_snapshot_id()),
+                    ),
+                    ConnectorRefAction::Drop { name, .. } => (name.to_string(), None),
+                    ConnectorRefAction::FastForwardBranch {
+                        target_branch,
+                        source_snapshot_id,
+                        ..
+                    } => (target_branch.to_string(), Some(*source_snapshot_id)),
+                };
+                IcebergMutationEvidenceTarget::Ref {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    table_uuid,
+                    ref_name,
+                    expected_snapshot_id,
+                }
+            }
+        };
+        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+            version: ICEBERG_MUTATION_EVIDENCE_VERSION,
+            target,
+        })
+        .map_err(|error| internal(format!("encode Iceberg mutation evidence: {error}")))?;
+        ExternalMutationEvidence::try_new(
+            ICEBERG_MUTATION_EVIDENCE_VERSION,
+            self.descriptor.clone(),
+            self.incarnation,
+            operation_id,
+            operation.kind(),
+            Bytes::from(payload),
+        )
+    }
+
+    fn receipt(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        operation_kind: &str,
+        provider_version: Option<Bytes>,
+    ) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
+        ConnectorCatalogMutationReceipt::try_new(
+            self.descriptor.clone(),
+            self.incarnation,
+            operation_id,
+            operation_kind,
+            provider_version,
+        )
     }
 
     fn table_payload(&self, table: &ConnectorTableHandle) -> Result<TablePayload, ConnectorError> {
@@ -712,397 +905,433 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
             return Ok(known_uncommitted(error));
         }
         let operation_kind = request.operation.kind();
-        let result = match request.operation {
-            ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
-                if namespace.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "namespace mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                match namespace_exists(&entry, &namespace.namespace) {
-                    Ok(true) if policy == CreatePolicy::NoOpIfExists => {
-                        Ok(ExternalMutationEffect::NoOp)
+        let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
+            Ok(evidence) => evidence,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        let result = (|| -> Result<ExternalMutationEffect, ConnectorError> {
+            match request.operation {
+                ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
+                    if namespace.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "namespace mutation belongs to another connector instance",
+                        ));
                     }
-                    Ok(true) => Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "namespace already exists",
-                    )),
-                    Ok(false) => create_namespace(&entry, &namespace.namespace)
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    match namespace_exists(&entry, &namespace.namespace) {
+                        Ok(true) if policy == CreatePolicy::NoOpIfExists => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(true) => Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "namespace already exists",
+                        )),
+                        Ok(false) => create_namespace(&entry, &namespace.namespace)
+                            .map(|()| ExternalMutationEffect::Applied)
+                            .map_err(map_iceberg_error),
+                        Err(error) => Err(map_iceberg_error(error)),
+                    }
+                }
+                ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
+                    if namespace.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "namespace mutation belongs to another connector instance",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    match namespace_exists(&entry, &namespace.namespace) {
+                        Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(false) => Err(ConnectorError::new(
+                            ConnectorErrorKind::NotFound,
+                            "namespace does not exist",
+                        )),
+                        Ok(true) => drop_namespace(&entry, &namespace.namespace)
+                            .map(|()| ExternalMutationEffect::Applied)
+                            .map_err(map_iceberg_error),
+                        Err(error) => Err(map_iceberg_error(error)),
+                    }
+                }
+                ConnectorCatalogMutationOperation::CreateTable {
+                    table,
+                    columns,
+                    key,
+                    partitioning,
+                    properties,
+                    policy,
+                } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "table mutation belongs to another connector instance",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let existing = list_tables(&entry, &table.namespace)
+                        .map_err(map_iceberg_error)
+                        .map(|tables| {
+                            tables
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
+                        });
+                    match existing {
+                        Ok(true) if policy == CreatePolicy::NoOpIfExists => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(true) => Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "table already exists",
+                        )),
+                        Ok(false) => create_table(
+                            &entry,
+                            &table.namespace,
+                            &table.table,
+                            &columns
+                                .iter()
+                                .map(lower_column)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            key.as_ref().map(lower_key).transpose()?.as_ref(),
+                            &partitioning
+                                .iter()
+                                .map(lower_partition)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            &properties
+                                .iter()
+                                .map(|(key, value)| (key.to_string(), value.to_string()))
+                                .collect::<Vec<_>>(),
+                        )
                         .map(|()| ExternalMutationEffect::Applied)
                         .map_err(map_iceberg_error),
-                    Err(error) => Err(map_iceberg_error(error)),
-                }
-            }
-            ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
-                if namespace.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "namespace mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                match namespace_exists(&entry, &namespace.namespace) {
-                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
-                        Ok(ExternalMutationEffect::NoOp)
+                        Err(error) => Err(error),
                     }
-                    Ok(false) => Err(ConnectorError::new(
-                        ConnectorErrorKind::NotFound,
-                        "namespace does not exist",
-                    )),
-                    Ok(true) => drop_namespace(&entry, &namespace.namespace)
+                }
+                ConnectorCatalogMutationOperation::DropTable { table, policy, .. } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "table mutation belongs to another connector instance",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let existing = list_tables(&entry, &table.namespace)
+                        .map_err(map_iceberg_error)
+                        .map(|tables| {
+                            tables
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
+                        });
+                    match existing {
+                        Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(false) => Err(ConnectorError::new(
+                            ConnectorErrorKind::NotFound,
+                            "table does not exist",
+                        )),
+                        Ok(true) => drop_table(&entry, &table.namespace, &table.table)
+                            .map(|()| ExternalMutationEffect::Applied)
+                            .map_err(map_iceberg_error),
+                        Err(error) => Err(error),
+                    }
+                }
+                ConnectorCatalogMutationOperation::CreateView {
+                    view,
+                    columns,
+                    definition,
+                    comment,
+                    properties,
+                    policy,
+                } => {
+                    if view.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "view mutation belongs to another connector instance",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let table_exists = list_tables(&entry, &view.namespace)
+                        .map_err(map_iceberg_error)
+                        .map(|tables| {
+                            tables
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(&view.view))
+                        });
+                    match table_exists {
+                        Ok(true) => {
+                            return Err(ConnectorError::new(
+                                ConnectorErrorKind::InvalidRequest,
+                                "a table with the requested view name already exists",
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match views::view_exists(&entry, &view.namespace, &view.view) {
+                        Ok(true) if policy == CreateOrReplacePolicy::NoOpIfExists => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(true) if policy == CreateOrReplacePolicy::FailIfExists => {
+                            Err(ConnectorError::new(
+                                ConnectorErrorKind::InvalidRequest,
+                                "view already exists",
+                            ))
+                        }
+                        Ok(existing) => views::create_view(
+                            &entry,
+                            &view.namespace,
+                            &view.view,
+                            &columns
+                                .iter()
+                                .map(lower_column)
+                                .collect::<Result<Vec<_>, _>>()?,
+                            &definition.sql,
+                            comment.as_deref(),
+                            existing && policy == CreateOrReplacePolicy::ReplaceIfExists,
+                            &properties
+                                .iter()
+                                .map(|(key, value)| (key.to_string(), value.to_string()))
+                                .collect::<Vec<_>>(),
+                        )
                         .map(|()| ExternalMutationEffect::Applied)
                         .map_err(map_iceberg_error),
-                    Err(error) => Err(map_iceberg_error(error)),
-                }
-            }
-            ConnectorCatalogMutationOperation::CreateTable {
-                table,
-                columns,
-                key,
-                partitioning,
-                properties,
-                policy,
-            } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "table mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let existing = list_tables(&entry, &table.namespace)
-                    .map_err(map_iceberg_error)
-                    .map(|tables| {
-                        tables
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
-                    });
-                match existing {
-                    Ok(true) if policy == CreatePolicy::NoOpIfExists => {
-                        Ok(ExternalMutationEffect::NoOp)
+                        Err(error) => Err(map_iceberg_error(error)),
                     }
-                    Ok(true) => Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "table already exists",
-                    )),
-                    Ok(false) => create_table(
+                }
+                ConnectorCatalogMutationOperation::DropView { view, policy } => {
+                    if view.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "view mutation belongs to another connector instance",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    match views::view_exists(&entry, &view.namespace, &view.view) {
+                        Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                            Ok(ExternalMutationEffect::NoOp)
+                        }
+                        Ok(false) => Err(ConnectorError::new(
+                            ConnectorErrorKind::NotFound,
+                            "view does not exist",
+                        )),
+                        Ok(true) => views::drop_view(&entry, &view.namespace, &view.view)
+                            .map(|()| ExternalMutationEffect::Applied)
+                            .map_err(map_iceberg_error),
+                        Err(error) => Err(map_iceberg_error(error)),
+                    }
+                }
+                ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "partition mutation belongs to another connector instance",
+                        ));
+                    }
+                    if add.len() + drop.len() != 1 {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "Iceberg partition mutation requires exactly one add or drop transform",
+                        ));
+                    }
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let field = add
+                        .first()
+                        .or_else(|| drop.first())
+                        .expect("validated non-empty partition mutation");
+                    let stmt = if add.is_empty() {
+                        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                        table: crate::sql::parser::ast::ObjectName {
+                            parts: vec![table.namespace.to_string(), table.table.to_string()],
+                        },
+                        field: lower_partition(field)?,
+                    }
+                    } else {
+                        crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                            table: crate::sql::parser::ast::ObjectName {
+                                parts: vec![table.namespace.to_string(), table.table.to_string()],
+                            },
+                            field: lower_partition(field)?,
+                        }
+                    };
+                    super::catalog::registry::alter_partition_spec(
                         &entry,
                         &table.namespace,
                         &table.table,
-                        &columns
-                            .iter()
-                            .map(lower_column)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        key.as_ref().map(lower_key).transpose()?.as_ref(),
-                        &partitioning
-                            .iter()
-                            .map(lower_partition)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        &properties
-                            .iter()
-                            .map(|(key, value)| (key.to_string(), value.to_string()))
-                            .collect::<Vec<_>>(),
+                        stmt,
                     )
                     .map(|()| ExternalMutationEffect::Applied)
-                    .map_err(map_iceberg_error),
-                    Err(error) => Err(error),
-                }
-            }
-            ConnectorCatalogMutationOperation::DropTable { table, policy, .. } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "table mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let existing = list_tables(&entry, &table.namespace)
                     .map_err(map_iceberg_error)
-                    .map(|tables| {
-                        tables
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
-                    });
-                match existing {
-                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
-                        Ok(ExternalMutationEffect::NoOp)
-                    }
-                    Ok(false) => Err(ConnectorError::new(
-                        ConnectorErrorKind::NotFound,
-                        "table does not exist",
-                    )),
-                    Ok(true) => drop_table(&entry, &table.namespace, &table.table)
-                        .map(|()| ExternalMutationEffect::Applied)
-                        .map_err(map_iceberg_error),
-                    Err(error) => Err(error),
                 }
-            }
-            ConnectorCatalogMutationOperation::CreateView {
-                view,
-                columns,
-                definition,
-                comment,
-                properties,
-                policy,
-            } => {
-                if view.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "view mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let table_exists = list_tables(&entry, &view.namespace)
-                    .map_err(map_iceberg_error)
-                    .map(|tables| {
-                        tables
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(&view.view))
-                    });
-                match table_exists {
-                    Ok(true) => {
-                        return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorCatalogMutationOperation::AlterRef { table, action } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
                             ConnectorErrorKind::InvalidRequest,
-                            "a table with the requested view name already exists",
-                        )));
+                            "ref mutation belongs to another connector instance",
+                        ));
                     }
-                    Ok(false) => {}
-                    Err(error) => return Ok(known_uncommitted(error)),
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let loaded = load_table(&entry, &table.namespace, &table.table)
+                        .map_err(map_iceberg_error)?;
+                    let action = lower_ref_action(
+                        action,
+                        loaded.table.metadata(),
+                        &table.namespace,
+                        &table.table,
+                        self.instance_id.as_str(),
+                    )?;
+                    let catalog = super::catalog::registry::build_iceberg_catalog(&entry)
+                        .map_err(map_iceberg_error)?;
+                    super::catalog::registry::block_on_iceberg(async {
+                        super::commit::execute_ref_action(catalog.as_ref(), &action).await
+                    })
+                    .map_err(|error| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::Internal,
+                            format!("execute Iceberg ref mutation runtime: {error}"),
+                        )
+                    })?
+                    .map(|outcome| match outcome {
+                        super::commit::RefActionOutcome::Committed => {
+                            ExternalMutationEffect::Applied
+                        }
+                        super::commit::RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
+                    })
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
                 }
-                match views::view_exists(&entry, &view.namespace, &view.view) {
-                    Ok(true) if policy == CreateOrReplacePolicy::NoOpIfExists => {
-                        Ok(ExternalMutationEffect::NoOp)
-                    }
-                    Ok(true) if policy == CreateOrReplacePolicy::FailIfExists => {
-                        Err(ConnectorError::new(
+                ConnectorCatalogMutationOperation::AlterProperties { table, changes } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
                             ConnectorErrorKind::InvalidRequest,
-                            "view already exists",
-                        ))
+                            "property mutation belongs to another connector instance",
+                        ));
                     }
-                    Ok(existing) => views::create_view(
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let operation = lower_property_changes(&changes)?;
+                    super::catalog::schema_update::alter_table_properties_on_entry(
                         &entry,
-                        &view.namespace,
-                        &view.view,
-                        &columns
-                            .iter()
-                            .map(lower_column)
-                            .collect::<Result<Vec<_>, _>>()?,
-                        &definition.sql,
-                        comment.as_deref(),
-                        existing && policy == CreateOrReplacePolicy::ReplaceIfExists,
-                        &properties
-                            .iter()
-                            .map(|(key, value)| (key.to_string(), value.to_string()))
-                            .collect::<Vec<_>>(),
+                        &table.namespace,
+                        &table.table,
+                        &operation,
                     )
                     .map(|()| ExternalMutationEffect::Applied)
-                    .map_err(map_iceberg_error),
-                    Err(error) => Err(map_iceberg_error(error)),
+                    .map_err(map_iceberg_error)
                 }
-            }
-            ConnectorCatalogMutationOperation::DropView { view, policy } => {
-                if view.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "view mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                match views::view_exists(&entry, &view.namespace, &view.view) {
-                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
-                        Ok(ExternalMutationEffect::NoOp)
+                ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
+                    if table.instance_id != self.instance_id {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "schema mutation belongs to another connector instance",
+                        ));
                     }
-                    Ok(false) => Err(ConnectorError::new(
-                        ConnectorErrorKind::NotFound,
-                        "view does not exist",
-                    )),
-                    Ok(true) => views::drop_view(&entry, &view.namespace, &view.view)
-                        .map(|()| ExternalMutationEffect::Applied)
-                        .map_err(map_iceberg_error),
-                    Err(error) => Err(map_iceberg_error(error)),
-                }
-            }
-            ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "partition mutation belongs to another connector instance",
-                    )));
-                }
-                if add.len() + drop.len() != 1 {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "Iceberg partition mutation requires exactly one add or drop transform",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let field = add
-                    .first()
-                    .or_else(|| drop.first())
-                    .expect("validated non-empty partition mutation");
-                let stmt = if add.is_empty() {
-                    crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
-                        table: crate::sql::parser::ast::ObjectName {
-                            parts: vec![table.namespace.to_string(), table.table.to_string()],
-                        },
-                        field: lower_partition(field)?,
-                    }
-                } else {
-                    crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
-                        table: crate::sql::parser::ast::ObjectName {
-                            parts: vec![table.namespace.to_string(), table.table.to_string()],
-                        },
-                        field: lower_partition(field)?,
-                    }
-                };
-                super::catalog::registry::alter_partition_spec(
-                    &entry,
-                    &table.namespace,
-                    &table.table,
-                    stmt,
-                )
-                .map(|()| ExternalMutationEffect::Applied)
-                .map_err(map_iceberg_error)
-            }
-            ConnectorCatalogMutationOperation::AlterRef { table, action } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "ref mutation belongs to another connector instance",
-                    )));
-                }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let loaded = load_table(&entry, &table.namespace, &table.table)
-                    .map_err(map_iceberg_error)?;
-                let action = lower_ref_action(
-                    action,
-                    loaded.table.metadata(),
-                    &table.namespace,
-                    &table.table,
-                    self.instance_id.as_str(),
-                )?;
-                let catalog = super::catalog::registry::build_iceberg_catalog(&entry)
-                    .map_err(map_iceberg_error)?;
-                super::catalog::registry::block_on_iceberg(async {
-                    super::commit::execute_ref_action(catalog.as_ref(), &action).await
-                })
-                .map_err(|error| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Internal,
-                        format!("execute Iceberg ref mutation runtime: {error}"),
+                    let [change] = changes.as_slice() else {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::Unsupported,
+                            "Iceberg schema mutation currently requires exactly one change",
+                        ));
+                    };
+                    let entry = match self.entry(self.instance_id.as_str()) {
+                        Ok(entry) => entry,
+                        Err(error) => return Err(error),
+                    };
+                    let change = lower_schema_change(change)?;
+                    super::catalog::schema_update::alter_table_schema_on_entry(
+                        &entry,
+                        &table.namespace,
+                        &table.table,
+                        &change,
                     )
-                })?
-                .map(|outcome| match outcome {
-                    super::commit::RefActionOutcome::Committed => ExternalMutationEffect::Applied,
-                    super::commit::RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
-                })
-                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
-            }
-            ConnectorCatalogMutationOperation::AlterProperties { table, changes } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "property mutation belongs to another connector instance",
-                    )));
+                    .map(|()| ExternalMutationEffect::Applied)
+                    .map_err(map_iceberg_error)
                 }
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let operation = lower_property_changes(&changes)?;
-                super::catalog::schema_update::alter_table_properties_on_entry(
-                    &entry,
-                    &table.namespace,
-                    &table.table,
-                    &operation,
-                )
-                .map(|()| ExternalMutationEffect::Applied)
-                .map_err(map_iceberg_error)
+                _ => Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
+                )),
             }
-            ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
-                if table.instance_id != self.instance_id {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "schema mutation belongs to another connector instance",
-                    )));
-                }
-                let [change] = changes.as_slice() else {
-                    return Ok(known_uncommitted(ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        "Iceberg schema mutation currently requires exactly one change",
-                    )));
-                };
-                let entry = match self.entry(self.instance_id.as_str()) {
-                    Ok(entry) => entry,
-                    Err(error) => return Ok(known_uncommitted(error)),
-                };
-                let change = lower_schema_change(change)?;
-                super::catalog::schema_update::alter_table_schema_on_entry(
-                    &entry,
-                    &table.namespace,
-                    &table.table,
-                    &change,
-                )
-                .map(|()| ExternalMutationEffect::Applied)
-                .map_err(map_iceberg_error)
-            }
-            _ => Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
-            )),
-        };
+        })();
         match result {
             Ok(effect) => Ok(ExternalMutationOutcome::KnownCommitted {
                 effect,
-                receipt: ConnectorCatalogMutationReceipt::try_new(
-                    self.descriptor.clone(),
-                    self.incarnation,
-                    request.operation_id,
-                    operation_kind,
-                    None,
-                )?,
+                receipt: self.receipt(request.operation_id, operation_kind, None)?,
                 finalization: ExternalMutationFinalization::Complete,
             }),
+            Err(error) if mutation_commit_may_be_unknown(error.kind()) => {
+                Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        mutation_failure_kind(error.kind()),
+                        error.to_string(),
+                    ),
+                    evidence,
+                })
+            }
             Err(error) => Ok(known_uncommitted(error)),
         }
     }
 
     fn reconcile(
         &self,
-        _request: ConnectorCatalogMutationReconcileRequest,
+        request: ConnectorCatalogMutationReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-        Ok(ExternalMutationOutcome::KnownUncommitted {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Unsupported,
-                "Iceberg mutation did not produce reconcilable evidence",
-            ),
-        })
+        if let Err(error) = self.validate_context(&request.context) {
+            return Ok(known_uncommitted(error));
+        }
+        let decoded: IcebergMutationEvidenceV1 =
+            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("decode Iceberg mutation evidence: {error}"),
+                )
+            })?;
+        if decoded.version != ICEBERG_MUTATION_EVIDENCE_VERSION
+            || request.evidence.schema_version() != ICEBERG_MUTATION_EVIDENCE_VERSION
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "unsupported Iceberg mutation evidence version",
+            ));
+        }
+        let entry = match self.entry(self.instance_id.as_str()) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        mutation_failure_kind(error.kind()),
+                        error.to_string(),
+                    ),
+                    evidence: request.evidence,
+                });
+            }
+        };
+        reconcile_iceberg_mutation_evidence(self, &entry, decoded.target, request.evidence)
     }
 }
 
@@ -1129,6 +1358,192 @@ fn mutation_failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKi
         ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
         ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
         ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
+    }
+}
+
+fn mutation_commit_may_be_unknown(kind: ConnectorErrorKind) -> bool {
+    matches!(
+        kind,
+        ConnectorErrorKind::Unavailable
+            | ConnectorErrorKind::DeadlineExceeded
+            | ConnectorErrorKind::Cancelled
+            | ConnectorErrorKind::Internal
+    )
+}
+
+fn load_existing_table_for_reconcile(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+) -> Result<Option<super::catalog::IcebergLoadedTable>, ConnectorError> {
+    let exists = list_tables(entry, namespace)
+        .map_err(map_iceberg_error)?
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(table));
+    if !exists {
+        return Ok(None);
+    }
+    entry.invalidate_table_cache(namespace, table);
+    load_table(entry, namespace, table)
+        .map(Some)
+        .map_err(map_iceberg_error)
+}
+
+fn reconcile_iceberg_mutation_evidence(
+    provider: &IcebergControlProvider,
+    entry: &IcebergCatalogEntry,
+    target: IcebergMutationEvidenceTarget,
+    evidence: ExternalMutationEvidence,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    let operation_id = evidence.operation_id();
+    let operation_kind = evidence.operation_kind().to_string();
+    let known_committed = |effect| {
+        provider
+            .receipt(operation_id, &operation_kind, None)
+            .map(|receipt| ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization: ExternalMutationFinalization::Complete,
+            })
+    };
+    let unknown = |error: ConnectorError| ExternalMutationOutcome::CommitUnknown {
+        failure: ConnectorMutationFailure::new(
+            mutation_failure_kind(error.kind()),
+            error.to_string(),
+        ),
+        evidence: evidence.clone(),
+    };
+    let uncommitted = |message: String| ExternalMutationOutcome::KnownUncommitted {
+        failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Conflict, message),
+    };
+
+    match target {
+        IcebergMutationEvidenceTarget::Namespace {
+            namespace,
+            should_exist,
+        } => match namespace_exists(entry, &namespace).map_err(map_iceberg_error) {
+            Ok(exists) if exists == should_exist => {
+                known_committed(ExternalMutationEffect::Applied)
+            }
+            Ok(_) => Ok(uncommitted(format!(
+                "authoritative namespace state for `{namespace}` does not match mutation"
+            ))),
+            Err(error) => Ok(unknown(error)),
+        },
+        IcebergMutationEvidenceTarget::Table {
+            namespace,
+            table,
+            should_exist,
+            before_uuid,
+        } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
+            Ok(current) if should_exist && current.is_some() => {
+                known_committed(ExternalMutationEffect::Applied)
+            }
+            Ok(None) if !should_exist => known_committed(ExternalMutationEffect::Applied),
+            Ok(Some(current)) if !should_exist => {
+                if before_uuid.as_deref()
+                    == Some(current.table.metadata().uuid().to_string().as_str())
+                {
+                    Ok(uncommitted(format!(
+                        "authoritative table `{namespace}.{table}` still has its pre-mutation identity"
+                    )))
+                } else {
+                    Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Conflict,
+                            "table name was reused with a different identity during reconciliation",
+                        ),
+                        evidence,
+                    })
+                }
+            }
+            Ok(None) => Ok(uncommitted(format!(
+                "authoritative table `{namespace}.{table}` is absent"
+            ))),
+            Ok(Some(_)) => Ok(uncommitted(format!(
+                "authoritative table `{namespace}.{table}` does not match mutation"
+            ))),
+            Err(error) => Ok(unknown(error)),
+        },
+        IcebergMutationEvidenceTarget::View {
+            namespace,
+            view,
+            should_exist,
+        } => match views::view_exists(entry, &namespace, &view).map_err(map_iceberg_error) {
+            Ok(exists) if exists == should_exist => {
+                known_committed(ExternalMutationEffect::Applied)
+            }
+            Ok(_) => Ok(uncommitted(format!(
+                "authoritative view state for `{namespace}.{view}` does not match mutation"
+            ))),
+            Err(error) => Ok(unknown(error)),
+        },
+        IcebergMutationEvidenceTarget::TableVersion {
+            namespace,
+            table,
+            table_uuid,
+            before_metadata_location,
+        } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
+            Ok(Some(current)) if current.table.metadata().uuid().to_string() == table_uuid => {
+                if current.table.metadata_location().map(str::to_string) != before_metadata_location
+                {
+                    known_committed(ExternalMutationEffect::Applied)
+                } else {
+                    Ok(uncommitted(format!(
+                        "authoritative metadata version for `{namespace}.{table}` did not advance"
+                    )))
+                }
+            }
+            Ok(Some(_)) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "table identity changed during mutation reconciliation",
+                ),
+                evidence,
+            }),
+            Ok(None) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "table disappeared during mutation reconciliation",
+                ),
+                evidence,
+            }),
+            Err(error) => Ok(unknown(error)),
+        },
+        IcebergMutationEvidenceTarget::Ref {
+            namespace,
+            table,
+            table_uuid,
+            ref_name,
+            expected_snapshot_id,
+        } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
+            Ok(Some(current)) if current.table.metadata().uuid().to_string() == table_uuid => {
+                let metadata = current.table.metadata();
+                let actual_snapshot_id = if ref_name.eq_ignore_ascii_case("main") {
+                    metadata.current_snapshot_id()
+                } else {
+                    metadata
+                        .refs()
+                        .get(&ref_name)
+                        .map(|reference| reference.snapshot_id)
+                };
+                if actual_snapshot_id == expected_snapshot_id {
+                    known_committed(ExternalMutationEffect::Applied)
+                } else {
+                    Ok(uncommitted(format!(
+                        "authoritative ref `{ref_name}` does not match mutation target"
+                    )))
+                }
+            }
+            Ok(Some(_)) | Ok(None) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "table identity changed during ref reconciliation",
+                ),
+                evidence,
+            }),
+            Err(error) => Ok(unknown(error)),
+        },
     }
 }
 
@@ -2667,6 +3082,66 @@ mod tests {
             max_total_payload_bytes,
         )
         .expect("connector request context")
+    }
+
+    fn mutation_provider_without_catalog() -> IcebergControlProvider {
+        let instance_id = ConnectorInstanceId::parse("ice.test").expect("instance ID");
+        IcebergControlProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
+                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
+            )),
+        }
+    }
+
+    #[test]
+    fn unavailable_mutation_returns_identity_bound_reconcilable_evidence() {
+        let provider = mutation_provider_without_catalog();
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id,
+                target: ConnectorExecutionBindingKey {
+                    instance_id: provider.instance_id.clone(),
+                    incarnation: provider.incarnation,
+                },
+                operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                        instance_id: provider.instance_id.clone(),
+                        namespace: Arc::from("db"),
+                    },
+                    policy: CreatePolicy::FailIfExists,
+                },
+                context: context_with_payload_budgets(1024, 1024),
+            })
+            .expect("provider contract");
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
+            panic!("unavailable provider must preserve reconciliation evidence")
+        };
+        assert_eq!(evidence.schema_version(), ICEBERG_MUTATION_EVIDENCE_VERSION);
+        assert_eq!(evidence.descriptor(), provider.descriptor());
+        assert_eq!(evidence.incarnation(), provider.incarnation());
+        assert_eq!(evidence.operation_id(), operation_id);
+        assert_eq!(evidence.operation_kind(), "create-namespace");
+        assert!(format!("{evidence:?}").contains("provider_payload_len"));
+        assert!(!format!("{evidence:?}").contains("\"namespace\""));
+
+        let reconciled = provider
+            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                evidence,
+                context: context_with_payload_budgets(1024, 1024),
+            })
+            .expect("reconcile contract");
+        assert!(matches!(
+            reconciled,
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
     }
 
     #[test]
