@@ -1489,7 +1489,12 @@ impl StandaloneSession {
         // ALTER TABLE ... ADD/DROP PARTITION COLUMN ...
         if looks_like_alter_partition_column(&normalized) {
             let stmt = parse_alter_partition_column_sql(&normalized)?;
-            return self.handle_alter_partition_spec(stmt, current_catalog, current_database);
+            return self.handle_alter_partition_spec(
+                stmt,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // SHOW CREATE TABLE ...
@@ -2001,6 +2006,7 @@ impl StandaloneSession {
         stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let table_name = match &stmt {
             crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
@@ -2029,17 +2035,39 @@ impl StandaloneSession {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
         )?;
-        let backend = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend(target.backend_name)?;
-        backend.alter_iceberg_partition_spec(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            stmt,
+        let adding = matches!(
+            &stmt,
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
+        );
+        let transform = match &stmt {
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                field,
+                ..
+            }
+            | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                field,
+                ..
+            } => connector_partition_transform(&field),
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.inner.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                add: if adding {
+                    vec![transform.clone()]
+                } else {
+                    Vec::new()
+                },
+                drop: if adding { Vec::new() } else { vec![transform] },
+            },
+            connector_context.clone(),
         )?;
         crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
@@ -2294,6 +2322,47 @@ impl StandaloneSession {
             execution,
             connector_context,
         )
+    }
+}
+
+fn connector_partition_transform(
+    field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
+) -> novarocks_spi::connector::ConnectorPartitionTransform {
+    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+    use novarocks_spi::connector::ConnectorPartitionTransform;
+
+    match field {
+        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Bucket {
+            column,
+            num_buckets,
+        } => ConnectorPartitionTransform::Bucket {
+            column: Arc::from(column.as_str()),
+            num_buckets: *num_buckets,
+        },
+        IcebergPartitionFieldExpr::Truncate { column, width } => {
+            ConnectorPartitionTransform::Truncate {
+                column: Arc::from(column.as_str()),
+                width: *width,
+            }
+        }
+        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
+            column: Arc::from(column.as_str()),
+        },
     }
 }
 

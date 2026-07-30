@@ -942,6 +942,51 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     Err(error) => Err(map_iceberg_error(error)),
                 }
             }
+            ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "partition mutation belongs to another connector instance",
+                    )));
+                }
+                if add.len() + drop.len() != 1 {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "Iceberg partition mutation requires exactly one add or drop transform",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let field = add
+                    .first()
+                    .or_else(|| drop.first())
+                    .expect("validated non-empty partition mutation");
+                let stmt = if add.is_empty() {
+                    crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                        table: crate::sql::parser::ast::ObjectName {
+                            parts: vec![table.namespace.to_string(), table.table.to_string()],
+                        },
+                        field: lower_partition(field)?,
+                    }
+                } else {
+                    crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                        table: crate::sql::parser::ast::ObjectName {
+                            parts: vec![table.namespace.to_string(), table.table.to_string()],
+                        },
+                        field: lower_partition(field)?,
+                    }
+                };
+                super::catalog::registry::alter_partition_spec(
+                    &entry,
+                    &table.namespace,
+                    &table.table,
+                    stmt,
+                )
+                .map(|()| ExternalMutationEffect::Applied)
+                .map_err(map_iceberg_error)
+            }
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),

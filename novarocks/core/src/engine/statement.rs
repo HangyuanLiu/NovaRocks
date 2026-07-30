@@ -1171,20 +1171,6 @@ pub(crate) fn execute_drop_database_statement(
 ) -> Result<StatementResult, String> {
     let target =
         crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
-    if target.backend_name == "iceberg"
-        && !crate::connector::metadata_namespace_exists(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            &target.catalog,
-            &target.namespace,
-        )?
-    {
-        return if if_exists {
-            Ok(StatementResult::Ok)
-        } else {
-            Err(format!("unknown database `{}`", name.parts.join(".")))
-        };
-    }
     if target.backend_name == "iceberg" {
         crate::engine::mv::dependency::ensure_no_iceberg_mv_targets_in_scope(
             state,
@@ -1198,16 +1184,57 @@ pub(crate) fn execute_drop_database_statement(
         )?;
     }
     if force {
-        // FORCE is still decomposed by the legacy route until the view-aware
-        // application-level sequence is migrated as one unit.
-        let backend = state
-            .connectors
+        let entry = state
+            .iceberg_catalogs
             .read()
-            .expect("connector registry read")
-            .catalog_backend(target.backend_name)?;
-        return backend
-            .drop_namespace(&target.catalog, &target.namespace, true)
-            .map(|()| StatementResult::Ok);
+            .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
+            .get(&target.catalog)?;
+        let mut tables =
+            crate::connector::iceberg::catalog::registry::list_tables(&entry, &target.namespace)?;
+        tables.sort();
+        let mut views =
+            crate::connector::iceberg::catalog::views::list_views(&entry, &target.namespace)?;
+        views.sort();
+        let instance_id = mutation_instance_id(&target.catalog)?;
+        for table in tables {
+            crate::connector::mutation::execute_catalog_mutation(
+                state.connector_control.as_ref(),
+                &instance_id,
+                ConnectorCatalogMutationOperation::DropTable {
+                    table: ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from(target.namespace.as_str()),
+                        table: Arc::from(table.as_str()),
+                    },
+                    policy: DropPolicy::FailIfMissing,
+                    data_disposition: ConnectorDropTableDataDisposition::Purge,
+                },
+                connector_context.clone(),
+            )?;
+            state
+                .catalog_service
+                .invalidate_table(&target.catalog, &target.namespace, &table)?;
+            crate::engine::query_prep::drop_local_table_registration_if_exists(
+                state,
+                &target.namespace,
+                &table,
+            )?;
+        }
+        for view in views {
+            crate::connector::mutation::execute_catalog_mutation(
+                state.connector_control.as_ref(),
+                &instance_id,
+                ConnectorCatalogMutationOperation::DropView {
+                    view: novarocks_spi::connector::ConnectorViewIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from(target.namespace.as_str()),
+                        view: Arc::from(view.as_str()),
+                    },
+                    policy: DropPolicy::FailIfMissing,
+                },
+                connector_context.clone(),
+            )?;
+        }
     }
     let instance_id = mutation_instance_id(&target.catalog)?;
     crate::connector::mutation::execute_catalog_mutation(
