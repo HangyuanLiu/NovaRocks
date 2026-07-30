@@ -190,6 +190,14 @@ fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
     let config_dir = TempDir::new().expect("create standalone server config dir");
     let config_path = config_dir.path().join("novarocks.toml");
     let state_store_path = config_dir.path().join("frontend-state.sqlite");
+    let endpoint =
+        std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+    let access_key_id = s3_test_value("AWS_S3_ACCESS_KEY_ID", "MINIO_ROOT_USER", "admin");
+    let access_key_secret = s3_test_value(
+        "AWS_S3_SECRET_ACCESS_KEY",
+        "MINIO_ROOT_PASSWORD",
+        "admin123",
+    );
     std::fs::write(
         &config_path,
         format!(
@@ -206,6 +214,12 @@ deployment_owner = "all-in-one"
 [standalone_server]
 mysql_port = {mysql_port}
 user = "root"
+
+[connector.object_store]
+endpoint = "{endpoint}"
+access_key_id = "{access_key_id}"
+access_key_secret = "{access_key_secret}"
+enable_path_style_access = true
 "#,
             state_store_path.display(),
         ),
@@ -558,13 +572,17 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
              USE db1;\
              CREATE TABLE tbl (id int, name string);\
              INSERT INTO tbl VALUES (1, 'a'), (2, 'b');\
-             SELECT name FROM tbl WHERE id = 2;\
-             SET catalog default_catalog;\
-             DROP TABLE ice.db1.tbl FORCE;\
-             DROP DATABASE ice.db1;",
+             SELECT name FROM tbl WHERE id = 2;",
         )
         .expect("execute multi-statement iceberg step");
     assert_eq!(rows, vec![(Some("b".to_string()),)]);
+
+    conn.query_drop(
+        "SET catalog default_catalog;\
+         DROP TABLE ice.db1.tbl FORCE;\
+         DROP DATABASE ice.db1;",
+    )
+    .expect("clean up iceberg catalog objects");
 }
 
 #[test]

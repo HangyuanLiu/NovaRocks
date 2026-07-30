@@ -6037,6 +6037,7 @@ path = "{metadata_path}"
                 "GrpcPort",
                 "State",
                 "ScheduledFragments",
+                "StartEpoch",
             ]
         );
     }

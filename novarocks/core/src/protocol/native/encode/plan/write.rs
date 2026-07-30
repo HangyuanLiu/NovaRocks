@@ -107,6 +107,7 @@ pub(super) fn encode_iceberg_write_sink_spec(
             None,
             None,
             None,
+            None,
             ctx,
         )?),
         iceberg: Some(encode_iceberg_table_info(&src.iceberg)?),

@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_catalog::schema::SqlType;
 use novarocks_fs::{
     FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
     FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
@@ -572,18 +573,42 @@ impl IcebergConnectorInstance {
         projection: &[usize],
     ) -> Result<SchemaRef, ConnectorError> {
         let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
-        let schema =
+        let storage_schema =
             iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
                 .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
-        let fields = projection
-            .iter()
+        let indexes = if projection.is_empty() {
+            (0..storage_schema.fields().len()).collect::<Vec<_>>()
+        } else {
+            projection.to_vec()
+        };
+        let fields = indexes
+            .into_iter()
             .map(|index| {
-                schema.fields().get(*index).cloned().ok_or_else(|| {
+                let storage_field = storage_schema.fields().get(index).ok_or_else(|| {
                     ConnectorError::new(
                         ConnectorErrorKind::InvalidRequest,
                         format!("Iceberg projection index {index} is outside the table schema"),
                     )
-                })
+                })?;
+                let logical_column = loaded
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(storage_field.name()))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            format!(
+                                "Iceberg table schema field {} is missing its logical column definition",
+                                storage_field.name()
+                            ),
+                        )
+                    })?;
+                Ok(Arc::new(
+                    storage_field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(logical_column.data_type.clone()),
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Arc::new(Schema::new(fields)))
@@ -827,10 +852,7 @@ impl ConnectorMetadata for IcebergConnectorInstance {
             resolve_table_request(&requested_table, request.resolution)?;
         let loaded =
             load_table(&entry, &request.table.namespace, &table_name).map_err(map_iceberg_error)?;
-        let schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
-                .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?,
-        );
+        let schema = self.schema_for(&entry, &request.table.namespace, &table_name, &[])?;
         let version = Some(Bytes::copy_from_slice(
             &loaded.table.metadata().current_schema_id().to_le_bytes(),
         ));
@@ -1115,6 +1137,15 @@ fn build_table_payload(
     loaded: super::catalog::IcebergLoadedTable,
     metadata_table_type: Option<super::IcebergMetadataTableType>,
 ) -> Result<TablePayload, ConnectorError> {
+    let logical_type_columns = loaded
+        .logical_types
+        .iter()
+        .filter_map(|(column_name, logical_type)| match logical_type {
+            SqlType::Bitmap => Some((column_name.to_lowercase(), "bitmap".to_string())),
+            SqlType::Hll => Some((column_name.to_lowercase(), "hll".to_string())),
+            _ => None,
+        })
+        .collect();
     let mut prepared_files = Vec::new();
     let metadata_table = loaded.table.clone();
     let metadata_file_io = metadata_table.file_io().clone();
@@ -1195,6 +1226,7 @@ fn build_table_payload(
         metadata_table_type,
         prepared_files,
         explicit_files: None,
+        logical_type_columns,
     })
 }
 
@@ -1207,6 +1239,8 @@ struct TablePayload {
     metadata_table_type: Option<super::IcebergMetadataTableType>,
     prepared_files: Vec<IcebergDataFileInfo>,
     explicit_files: Option<Vec<IcebergDataFileInfo>>,
+    #[serde(default)]
+    logical_type_columns: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1335,18 +1369,7 @@ pub(crate) fn load_table_def_at(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    let columns = metadata
-        .schema
-        .fields()
-        .iter()
-        .map(|field| novarocks_catalog::schema::ColumnDef {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect();
+    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns);
     let table_def = crate::sql::planner::table::TableDef {
         name: payload.table,
         columns,
@@ -1403,18 +1426,7 @@ fn table_def_from_metadata(
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
     Ok(crate::sql::planner::table::TableDef {
         name: payload.table,
-        columns: metadata
-            .schema
-            .fields()
-            .iter()
-            .map(|field| novarocks_catalog::schema::ColumnDef {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                write_default: None,
-                logical_type: None,
-            })
-            .collect(),
+        columns: columns_from_metadata(&metadata.schema, &payload.logical_type_columns),
         iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
         source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
             table: table_info,
@@ -1423,6 +1435,33 @@ fn table_def_from_metadata(
             binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         },
     })
+}
+
+fn columns_from_metadata(
+    schema: &Schema,
+    logical_type_columns: &BTreeMap<String, String>,
+) -> Vec<novarocks_catalog::schema::ColumnDef> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let logical_type = match logical_type_columns
+                .get(&field.name().to_lowercase())
+                .map(String::as_str)
+            {
+                Some("bitmap") => Some(SqlType::Bitmap),
+                Some("hll") => Some(SqlType::Hll),
+                _ => None,
+            };
+            novarocks_catalog::schema::ColumnDef {
+                name: field.name().to_string(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                write_default: None,
+                logical_type,
+            }
+        })
+        .collect()
 }
 
 fn iceberg_metadata_columns(
@@ -1551,6 +1590,7 @@ fn plan_native_iceberg_read_with_file_override(
                 )
                 .then(|| explicit_files.map(ToOwned::to_owned))
                 .flatten(),
+                logical_type_columns: BTreeMap::new(),
             },
             "table handle",
             context.max_handle_payload_bytes(),
@@ -2083,6 +2123,7 @@ mod tests {
                         metadata_table_type: None,
                         prepared_files: Vec::new(),
                         explicit_files: Some(files),
+                        logical_type_columns: BTreeMap::new(),
                     },
                     snapshot_id: None,
                     table_uuid: None,

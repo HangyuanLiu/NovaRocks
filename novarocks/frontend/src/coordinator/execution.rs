@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::query_execution::artifact::{
-    ConnectorBindingDispatcher, DispatchingConnectorBindingBarrier,
-    PreparedNativeExecutionParts, new_grpc_connector_binding_dispatcher,
+    ConnectorBindingDispatcher, DispatchingConnectorBindingBarrier, PreparedNativeExecutionParts,
+    new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::QueryCancellationView;

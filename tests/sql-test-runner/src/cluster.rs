@@ -686,6 +686,26 @@ fn render_cross_process_launch_config(
     let root = value
         .as_table_mut()
         .context("rendered cross-process launch config root must be a TOML table")?;
+
+    // `role = fe` persists backend membership in StateStore.  Isolating only
+    // `[metadata].path` leaves an ephemeral SQL-test FE restoring membership
+    // rows from a previous launch, whose dynamically allocated BE endpoints
+    // are necessarily stale.
+    if role == ClusterProcessRole::Fe {
+        let state_store = root
+            .get_mut("state_store")
+            .and_then(Value::as_table_mut)
+            .context("cross-process FE config requires [state_store]")?;
+        state_store.insert(
+            "path".to_string(),
+            Value::String(
+                runtime_dir
+                    .join("frontend-state.sqlite")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+    }
     if query_lifecycle_faults_enabled {
         let debug = table_mut(root, "debug");
         debug.insert(
@@ -2549,11 +2569,19 @@ exec_node_output = true
             first_runtime.join("metadata.sqlite").to_str()
         );
         assert_eq!(
+            first["state_store"]["path"].as_str(),
+            first_runtime.join("frontend-state.sqlite").to_str()
+        );
+        assert_eq!(
             second["metadata"]["path"].as_str(),
             second_runtime.join("metadata.sqlite").to_str()
         );
+        assert_eq!(
+            second["state_store"]["path"].as_str(),
+            second_runtime.join("frontend-state.sqlite").to_str()
+        );
         assert_ne!(
-            first["metadata"]["path"], second["metadata"]["path"],
+            first["state_store"]["path"], second["state_store"]["path"],
             "ephemeral clusters must not restore stale backend rows from another launch"
         );
         assert!(

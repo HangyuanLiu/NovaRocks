@@ -44,6 +44,14 @@ pub struct QueryOptions {
 }
 
 impl QueryOptions {
+    /// Applies the per-statement optimizer hints that affect runtime
+    /// expression semantics. These hints must be attached before a query is
+    /// prepared so that every distributed fragment receives the same options.
+    pub fn apply_sql_hints(&mut self, sql: &str) {
+        self.allow_throw_exception =
+            crate::sql::parser::set_var_hint::extract_allow_throw_exception(sql);
+    }
+
     pub const fn enable_profile(&self) -> bool {
         self.enable_profile
     }

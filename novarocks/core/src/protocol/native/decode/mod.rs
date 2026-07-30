@@ -46,7 +46,9 @@ pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_prog
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use submission::decode_fragment_submission;
-pub(crate) use submission::{decode_fragment_submission_with_connectors, decode_query_execution_id};
+pub(crate) use submission::{
+    decode_fragment_submission_with_connectors, decode_query_execution_id,
+};
 
 #[cfg(test)]
 mod tests {
