@@ -66,7 +66,7 @@ use crate::connector::iceberg::sink_plan::{
     PositionDeleteDataFilePartition,
 };
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -1346,7 +1346,16 @@ fn align_arrays_to_schema(
                 return Ok(array);
             }
 
-            let casted = cast(array.as_ref(), target_type).map_err(|e| {
+            let casted = if matches!(
+                target_type,
+                DataType::FixedSizeBinary(width)
+                    if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+            ) {
+                cast_with_special_rules(&array, target_type)
+            } else {
+                cast(array.as_ref(), target_type).map_err(|e| e.to_string())
+            }
+            .map_err(|e| {
                 format!(
                     "iceberg sink cast failed at column index {} name={} from {:?} to {:?}: {}",
                     idx,
@@ -2478,7 +2487,9 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
+    use arrow::array::{
+        Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::basic::Compression;
@@ -3800,6 +3811,31 @@ mod tests {
         assert_eq!(out.value(0), 1);
         assert!(out.is_null(1));
         assert_eq!(out.value(2), 2);
+    }
+
+    #[test]
+    fn test_align_arrays_to_schema_casts_int64_to_largeint() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c0",
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+            true,
+        )]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(-1), None, Some(2)]))];
+
+        let aligned = align_arrays_to_schema(arrays, &schema).expect("align arrays");
+        let out = aligned[0]
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint array");
+        assert_eq!(
+            novarocks_types::largeint::value_at(out, 0).expect("first value"),
+            -1
+        );
+        assert!(out.is_null(1));
+        assert_eq!(
+            novarocks_types::largeint::value_at(out, 2).expect("last value"),
+            2
+        );
     }
 
     #[test]

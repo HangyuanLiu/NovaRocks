@@ -1716,7 +1716,7 @@ fn clear_grpc_server_startup_reservation() {
 mod tests {
     use super::{
         IndependentGrpcRuntimeFilterNode, IndependentGrpcStartupProbe, ensure_bindable,
-        parse_grpc_bind_addr, validate_grpc_ports,
+        parse_grpc_bind_addr,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::Arc;
