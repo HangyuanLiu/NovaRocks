@@ -422,6 +422,7 @@ impl FrontendApplicationHost {
             execution.configured_report_port,
             execution.runtime_filter_worker_count,
             self.backend_topology_port(),
+            Arc::clone(&self.connector_control),
         ));
         self.topology()
             .attach_query_events(Arc::new(coordinator.backend_query_activity()));

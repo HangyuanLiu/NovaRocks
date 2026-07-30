@@ -56,7 +56,8 @@ use crate::sql::planner::distributed::{
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
-    ConnectorBindingInstallLease, ConnectorBindingInstallPlan, DispatchingConnectorBindingBarrier,
+    ConnectorBindingInstallLease, ConnectorBindingInstallObserver, ConnectorBindingInstallPlan,
+    DispatchingConnectorBindingBarrier, NoopConnectorBindingInstallObserver,
     new_grpc_connector_binding_dispatcher,
 };
 pub type FragmentId = u32;

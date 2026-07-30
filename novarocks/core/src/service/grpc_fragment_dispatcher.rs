@@ -40,8 +40,8 @@ use crate::exec::chunk::ChunkSchema;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
     CancelFragmentRequest, EnsureConnectorExecutionBindingRequest, FetchResultRequest,
-    QueryExecutionId as ProtoQueryExecutionId, SubmitFragmentRequest,
-    fetch_result_response::Status as FetchStatus,
+    QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
+    SubmitFragmentRequest, fetch_result_response::Status as FetchStatus,
 };
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::fragment_transport::{
@@ -137,6 +137,38 @@ impl crate::query_execution::artifact::ConnectorBindingDispatcher for GrpcConnec
         if response.status_code != 0 {
             return Err(format!(
                 "connector execution binding ensure was rejected by BE[{backend_idx}] ({endpoint}): {}",
+                response.message
+            ));
+        }
+        Ok(())
+    }
+
+    fn retire(
+        &self,
+        endpoint: SocketAddr,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<(), String> {
+        let client = self
+            .endpoints
+            .iter()
+            .find_map(|(backend_idx, configured)| (*configured == endpoint).then_some(backend_idx))
+            .and_then(|backend_idx| self.clients.get(backend_idx))
+            .ok_or_else(|| {
+                format!(
+                    "connector retirement endpoint {endpoint} is absent from configured backend snapshot"
+                )
+            })?;
+        let response = client
+            .blocking_retire_connector_execution_binding(RetireConnectorExecutionBindingRequest {
+                instance_id: key.instance_id.as_str().to_string(),
+                incarnation: key.incarnation.to_bytes().to_vec(),
+            })
+            .map_err(|error| {
+                format!("connector execution binding retire RPC failed for {endpoint}: {error}")
+            })?;
+        if response.status_code != 0 {
+            return Err(format!(
+                "connector execution binding retirement was rejected by {endpoint}: {}",
                 response.message
             ));
         }

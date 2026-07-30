@@ -25,7 +25,9 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use novarocks_spi::connector::{ConnectorExecutionDeclaration, ConnectorInstanceId};
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceId,
+};
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::QueryExecutionId;
@@ -95,6 +97,34 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
         endpoint: SocketAddr,
         declaration: &ConnectorExecutionDeclaration,
     ) -> Result<(), String>;
+
+    /// Best-effort process binding retirement. Query lease release remains
+    /// solely owned by the established query terminal lifecycle.
+    fn retire(
+        &self,
+        endpoint: SocketAddr,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<(), String>;
+}
+
+/// Frontend-local observer for successful ensure acknowledgements.  It is
+/// deliberately separate from the transport port: core owns neither the
+/// control-generation registry nor any catalog lifecycle state.
+pub trait ConnectorBindingInstallObserver: Send + Sync + 'static {
+    fn installed(
+        &self,
+        endpoint: SocketAddr,
+        declaration: &ConnectorExecutionDeclaration,
+    ) -> Result<(), String>;
+}
+
+#[derive(Default)]
+pub struct NoopConnectorBindingInstallObserver;
+
+impl ConnectorBindingInstallObserver for NoopConnectorBindingInstallObserver {
+    fn installed(&self, _: SocketAddr, _: &ConnectorExecutionDeclaration) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Build the production gRPC control adapter for an immutable backend
@@ -230,11 +260,25 @@ fn placement_socket_addr(
 /// ambiguity is safe and does not manufacture a second registry entry.
 pub struct DispatchingConnectorBindingBarrier {
     dispatcher: Arc<dyn ConnectorBindingDispatcher>,
+    observer: Arc<dyn ConnectorBindingInstallObserver>,
 }
 
 impl DispatchingConnectorBindingBarrier {
     pub fn new(dispatcher: Arc<dyn ConnectorBindingDispatcher>) -> Self {
-        Self { dispatcher }
+        Self {
+            dispatcher,
+            observer: Arc::new(NoopConnectorBindingInstallObserver),
+        }
+    }
+
+    pub fn with_observer(
+        dispatcher: Arc<dyn ConnectorBindingDispatcher>,
+        observer: Arc<dyn ConnectorBindingInstallObserver>,
+    ) -> Self {
+        Self {
+            dispatcher,
+            observer,
+        }
     }
 }
 
@@ -256,6 +300,16 @@ impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
                     .map_err(|error| {
                         failed(format!(
                             "connector instance '{}' installation on BE[{}] ({}) failed: {error}",
+                            declaration.descriptor().instance_id.as_str(),
+                            backend.backend_idx(),
+                            backend.endpoint()
+                        ))
+                    })?;
+                self.observer
+                    .installed(backend.endpoint(), declaration)
+                    .map_err(|error| {
+                        failed(format!(
+                            "connector instance '{}' installation acknowledgement could not be recorded for BE[{}] ({}): {error}",
                             declaration.descriptor().instance_id.as_str(),
                             backend.backend_idx(),
                             backend.endpoint()
@@ -314,6 +368,14 @@ mod tests {
                 endpoint,
                 declaration.descriptor().instance_id.as_str().to_string(),
             ));
+            Ok(())
+        }
+
+        fn retire(
+            &self,
+            _endpoint: SocketAddr,
+            _key: &ConnectorExecutionBindingKey,
+        ) -> Result<(), String> {
             Ok(())
         }
     }
