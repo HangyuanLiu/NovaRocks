@@ -370,6 +370,22 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnectorControlRegistry {
+    fn acquire_current_mutation(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "test connector control registry has no active mutation binding",
+        ))
+    }
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
     fn register(
         &self,
