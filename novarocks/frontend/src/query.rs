@@ -209,11 +209,30 @@ impl FrontendQuerySession {
             return Ok(true);
         };
         if raw_name.trim().starts_with('@') && !raw_name.trim().starts_with("@@") {
+            let value = if let Some(inner_query) = parenthesized_query(raw_value) {
+                match self.execute_admitted(inner_query.to_string()).await? {
+                    StatementResult::Query(result) => {
+                        novarocks::runtime::user_variable::query_result_to_user_variable_literal(
+                            &result,
+                        )
+                        .map_err(|message| {
+                            QueryServiceError::new(QueryServiceErrorKind::Internal, message)
+                        })?
+                    }
+                    StatementResult::Ok => {
+                        return Err(QueryServiceError::new(
+                            QueryServiceErrorKind::InvalidValue,
+                            "user variable assignment query did not return a value",
+                        ));
+                    }
+                }
+            } else {
+                raw_value.trim().to_string()
+            };
             let mut state = self.state.lock().map_err(poisoned_state)?;
-            state.user_variables.insert(
-                raw_name.trim().to_ascii_lowercase(),
-                raw_value.trim().to_string(),
-            );
+            state
+                .user_variables
+                .insert(raw_name.trim().to_ascii_lowercase(), value);
             return Ok(true);
         }
         let name = raw_name
@@ -421,6 +440,13 @@ impl FrontendQuerySession {
             }
         }
     }
+}
+
+fn parenthesized_query(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let lower = inner.to_ascii_lowercase();
+    (lower.starts_with("select ") || lower.starts_with("with ")).then_some(inner)
 }
 
 fn execute_prepared_query(
@@ -788,5 +814,20 @@ mod tests {
             cancellation_error(QueryCancellationReason::ClientDisconnected).kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn parenthesized_query_accepts_scalar_selects_and_ctes() {
+        assert_eq!(parenthesized_query("(SELECT 1)"), Some("SELECT 1"));
+        assert_eq!(
+            parenthesized_query(" (WITH values_cte AS (SELECT 1) SELECT * FROM values_cte) "),
+            Some("WITH values_cte AS (SELECT 1) SELECT * FROM values_cte")
+        );
+    }
+
+    #[test]
+    fn parenthesized_query_rejects_non_query_expressions() {
+        assert_eq!(parenthesized_query("(array[1, 2])"), None);
+        assert_eq!(parenthesized_query("SELECT 1"), None);
     }
 }

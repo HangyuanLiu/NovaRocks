@@ -33,6 +33,7 @@ pub mod profile;
 pub mod query_context;
 pub mod query_options;
 pub mod query_result;
+pub mod user_variable;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
 pub mod result_buffer;
