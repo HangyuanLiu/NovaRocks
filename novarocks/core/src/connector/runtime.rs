@@ -733,6 +733,25 @@ impl ConnectorReadScanSource {
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_scheduled_execution_with_incremental(
+        binding: Arc<ConnectorExecutionBinding>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            binding: ConnectorReadBinding::Execution(binding),
+            splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
+            request,
+            chunk_schema,
+            incremental,
+            reader_group: Arc::new(ConnectorReaderGroup::default()),
+        }
+    }
 }
 
 impl ScanSource for ConnectorReadScanSource {

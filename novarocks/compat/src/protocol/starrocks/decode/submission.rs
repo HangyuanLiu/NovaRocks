@@ -77,10 +77,6 @@ pub(crate) struct StarRocksDecodeInput<'a> {
     pub(crate) batch_exchange_sender_counts: &'a HashMap<i32, usize>,
     pub(crate) typed_result_sink: bool,
     pub(crate) facts: &'a StarRocksDecodeFacts,
-    /// Process-scoped connector host injected by application composition.
-    /// HDFS_SCAN_NODE is only a wire label and must never cause a decoder to
-    /// construct a query-local connector registry.
-    pub(crate) connectors: &'a novarocks::connector::ConnectorRegistry,
     pub(crate) table_schema_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
     pub(crate) schema_load_provider:
@@ -621,7 +617,6 @@ fn decode_draft_parts(
         input.fragment.query_global_dict_exprs.as_ref(),
         &plan_context,
         input.db_name,
-        input.connectors,
         &layout_hints,
         last_query_id,
         Some(dependencies),
@@ -1495,7 +1490,6 @@ mod tests {
             batch_exchange_sender_counts: &EMPTY_BATCH_SENDERS,
             typed_result_sink: false,
             facts: &EMPTY_DECODE_FACTS,
-            connectors: test_connectors(),
             table_schema_provider: None,
             schema_load_provider: None,
             sink_frontend_provider: None,
@@ -1503,15 +1497,6 @@ mod tests {
             storage_metadata_provider: None,
             compat_iceberg_execution: None,
         }
-    }
-
-    fn test_connectors() -> &'static novarocks::connector::ConnectorRegistry {
-        static CONNECTORS: std::sync::OnceLock<novarocks::connector::ConnectorRegistry> =
-            std::sync::OnceLock::new();
-        CONNECTORS.get_or_init(|| {
-            novarocks::connector::ConnectorRegistry::for_compat_iceberg_decode_test()
-                .expect("compose compat Iceberg test connector registry")
-        })
     }
 
     #[test]

@@ -52,7 +52,6 @@ use novarocks::exec::node::filter::FilterNode;
 use novarocks::exec::node::limit::LimitNode;
 use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::novarocks_connectors::ConnectorRegistry;
 use novarocks::runtime::scan_range::ScanRangeParams;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -252,7 +251,6 @@ pub(crate) fn lower_plan(
     query_global_dict_exprs: Option<&BTreeMap<i32, exprs::TExpr>>,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,
@@ -285,7 +283,6 @@ pub(crate) fn lower_plan(
         &query_global_dict_map,
         context,
         db_name,
-        connectors,
         layout_hints,
         &global_common_slot_map,
         last_query_id,
@@ -371,7 +368,6 @@ fn lower_node(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -434,7 +430,6 @@ fn lower_node(
             query_global_dict_map,
             context,
             db_name,
-            connectors,
             layout_hints,
             global_common_slot_map,
             last_query_id,
@@ -460,7 +455,6 @@ fn lower_node_with_children(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -476,7 +470,6 @@ fn lower_node_with_children(
         query_global_dict_map,
         context,
         db_name,
-        connectors,
         layout_hints,
         global_common_slot_map,
         last_query_id,
@@ -495,7 +488,6 @@ fn lower_node_with_children_typed(
     query_global_dict_map: &QueryGlobalDictMap,
     context: &StarRocksPlanDecodeContext<'_>,
     db_name: Option<&str>,
-    connectors: &ConnectorRegistry,
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
@@ -661,7 +653,7 @@ fn lower_node_with_children_typed(
                 lower_fetch_node(children, node, out_layout, desc_tbl)?
             }
             t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => {
-                return Err("MYSQL_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".into());
+                return Err("MYSQL_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".to_string().into());
             }
             t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
                 node,
@@ -677,7 +669,7 @@ fn lower_node_with_children_typed(
                 node_path.clone(),
             )?,
             t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => {
-                return Err("JDBC_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".into());
+                return Err("JDBC_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".to_string().into());
             }
             t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
                 node,
@@ -725,7 +717,6 @@ fn lower_node_with_children_typed(
                         context.query_id,
                         &context.query_options,
                         arena,
-                        connectors,
                         query_global_dict_map,
                         db_name,
                         fe_addr,
@@ -771,7 +762,6 @@ fn lower_node_with_children_typed(
                         tuple_slots,
                         layout_hints,
                         &context.query_options,
-                        connectors,
                         query_global_dict_map,
                     )?
                 }

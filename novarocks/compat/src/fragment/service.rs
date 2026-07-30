@@ -74,7 +74,6 @@ pub struct CompatFragmentService {
     report_service: Arc<CompatReportService>,
     load_registry: Arc<CompatLoadRegistry>,
     load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
-    connectors: Arc<novarocks::connector::ConnectorRegistry>,
     lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
     table_schema_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
@@ -192,7 +191,6 @@ impl CompatFragmentService {
             report_service,
             load_registry,
             load_tracking_sink,
-            connectors: Arc::new(novarocks::connector::ConnectorRegistry::default()),
             lake_meta_resolver,
             table_schema_provider,
             schema_load_provider,
@@ -210,10 +208,6 @@ impl CompatFragmentService {
         &self,
         default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
     ) -> Result<(), String> {
-        novarocks::connector::compose_backend_connector_installers(
-            self.connectors.as_ref(),
-            default_object_store.clone(),
-        )?;
         let binding =
             novarocks::connector::compose_compat_iceberg_execution_binding(default_object_store)?;
         self.compat_iceberg_execution
@@ -781,7 +775,6 @@ fn prepare_starrocks_draft(
     group_execution_scan_dop: Option<i32>,
     batch_exchange_sender_counts: &HashMap<i32, usize>,
     typed_result_sink: bool,
-    connectors: &novarocks::connector::ConnectorRegistry,
     table_schema_provider: Option<
         Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
     >,
@@ -823,7 +816,6 @@ fn prepare_starrocks_draft(
         batch_exchange_sender_counts,
         typed_result_sink,
         facts: &facts,
-        connectors,
         table_schema_provider,
         schema_load_provider,
         sink_frontend_provider,
@@ -1936,7 +1928,6 @@ fn submit_exec_batch_plan_fragments_with(
             entry.9,
             &sender_counts,
             entry.10,
-            service.connectors.as_ref(),
             service.table_schema_provider.clone(),
             service.schema_load_provider.clone(),
             service.sink_frontend_provider.clone(),
@@ -2032,7 +2023,6 @@ fn submit_exec_plan_fragment_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
-        service.connectors.as_ref(),
         service.table_schema_provider.clone(),
         service.schema_load_provider.clone(),
         service.sink_frontend_provider.clone(),
@@ -2101,7 +2091,6 @@ fn execute_plan_fragment_sync_with(
         one.group_execution_scan_dop,
         &HashMap::new(),
         one.novarocks_typed_result_sink.unwrap_or(false),
-        service.connectors.as_ref(),
         service.table_schema_provider.clone(),
         service.schema_load_provider.clone(),
         service.sink_frontend_provider.clone(),

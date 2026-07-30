@@ -65,7 +65,6 @@ pub(crate) fn lower_lake_scan_node(
     query_id: Option<QueryId>,
     query_opts: &QueryOptions,
     arena: &mut ExprArena,
-    connectors: &ConnectorRegistry,
     query_global_dict_map: &QueryGlobalDictMap,
     db_name_hint: Option<&str>,
     external_dependencies: Option<
@@ -515,9 +514,8 @@ pub(crate) fn lower_lake_scan_node(
         lake_schema_meta: cfg.lake_schema_meta.clone(),
     });
 
-    let source =
-        plan_compat_starrocks_read_source(connectors, query_id, node.node_id, cfg, query_opts)
-            .map_err(|error| error.to_string())?;
+    let source = plan_compat_starrocks_read_source(query_id, node.node_id, cfg, query_opts)
+        .map_err(|error| error.to_string())?;
     scan_ranges.capture(
         node.node_id,
         novarocks::exec::node::scan::BoundScanRanges::None,
