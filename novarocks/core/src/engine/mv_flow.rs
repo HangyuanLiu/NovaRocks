@@ -535,7 +535,9 @@ pub(crate) fn drop_mv(
     current_catalog: Option<&str>,
     db: &str,
     stmt: &DropMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
         current_catalog,
         db,
@@ -553,6 +555,7 @@ pub(crate) fn drop_mv(
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
         current_database: db.to_string(),
+        connector_context: connector_context.clone(),
     })?;
     Ok(StatementResult::Ok)
 }

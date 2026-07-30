@@ -2791,9 +2791,13 @@ pub(crate) fn dispatch_statement(
                 Err(error) => Err(error.to_string()),
             }
         }
-        Statement::DropMaterializedView(stmt) => {
-            crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
-        }
+        Statement::DropMaterializedView(stmt) => crate::engine::mv_flow::drop_mv(
+            state,
+            current_catalog,
+            current_database,
+            &stmt,
+            connector_context,
+        ),
         Statement::AlterMaterializedView(stmt) => {
             crate::engine::mv_flow::alter_mv_with_connector_context(
                 state,

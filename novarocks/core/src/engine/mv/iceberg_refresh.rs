@@ -14911,29 +14911,51 @@ pub(crate) async fn write_chunks_as_iceberg_data_files(
     write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
 
+#[cfg(test)]
 pub(crate) fn drop_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    drop_iceberg_mv_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        stmt,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn drop_iceberg_mv_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &DropMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
     if !preflight_iceberg_mv_drop(state, &target, stmt.if_exists)? {
         return Ok(StatementResult::Ok);
     }
 
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
-    };
-    crate::connector::iceberg::catalog::registry::drop_table(
-        &entry,
-        &target.namespace,
-        &target.table,
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+            data_disposition: novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+        },
+        connector_context.clone(),
     )?;
     drop_iceberg_mv_metadata(state, &target)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(

@@ -36,11 +36,12 @@ pub(crate) struct CreateMvRequest {
     pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct DropMvRequest {
     pub stmt: DropMaterializedViewStmt,
     pub current_catalog: Option<String>,
     pub current_database: String,
+    pub connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
 #[derive(Clone, Debug)]
