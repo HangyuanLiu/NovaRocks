@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use novarocks::runtime::fragment::{DormantFragmentHandle, RunningFragmentHandle};
 
 pub(super) const FRAGMENT_EXECUTOR_FAILURE_MESSAGE: &str =
