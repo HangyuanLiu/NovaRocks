@@ -65,6 +65,7 @@ pub(super) fn encode_scan_node(
             Some(&src.columns),
             Some(&columns),
             Some(&required_columns),
+            Some(&src.variant_columns),
             binding,
             ctx,
         )?),
@@ -221,6 +222,7 @@ pub(super) fn encode_table_def_with_context(
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
+    scan_variant_columns: Option<&[crate::sql::common::ScanVariantColumn]>,
     binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -249,6 +251,7 @@ pub(super) fn encode_table_def_with_context(
             scan_node_id,
             scan_output_columns,
             scan_required_columns,
+            scan_variant_columns.unwrap_or_default(),
             ctx,
         )?),
     })
@@ -617,6 +620,7 @@ fn encode_scan_source(
     scan_node_id: Option<i32>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
+    scan_variant_columns: &[crate::sql::common::ScanVariantColumn],
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
@@ -652,6 +656,7 @@ fn encode_scan_source(
                     scan_output_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
                     iceberg_schema_for_connector_source(src),
+                    scan_variant_columns,
                 )?,
             })),
         });
@@ -794,6 +799,7 @@ fn encode_connector_expected_schema_ipc(
     output_columns: &[common::OutputColumn],
     required_columns: &[String],
     iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
+    variant_columns: &[crate::sql::common::ScanVariantColumn],
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
         required_columns
@@ -801,12 +807,28 @@ fn encode_connector_expected_schema_ipc(
             .map(|name| name.to_ascii_lowercase())
             .collect::<HashSet<_>>()
     });
+    let synthetic_ids = variant_columns
+        .iter()
+        .map(|column| column.synthetic_column_id)
+        .collect::<HashSet<_>>();
+    let required_variant_source_ids = variant_columns
+        .iter()
+        .filter(|column| {
+            required.as_ref().is_none_or(|required| {
+                required.contains(&column.synthetic_column.to_ascii_lowercase())
+            })
+        })
+        .map(|column| column.source_column_id)
+        .collect::<HashSet<_>>();
     let selected = output_columns
         .iter()
         .filter(|column| {
-            required
-                .as_ref()
-                .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
+            !synthetic_ids.contains(&crate::sql::column_id::ColumnId(column.column_id))
+                && (required
+                    .as_ref()
+                    .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
+                    || required_variant_source_ids
+                        .contains(&crate::sql::column_id::ColumnId(column.column_id)))
         })
         .map(|column| {
             let type_desc = column.r#type.as_ref().ok_or_else(|| {

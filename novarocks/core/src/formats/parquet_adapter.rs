@@ -52,7 +52,7 @@ use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::scan::RuntimeFilterContext;
 use novarocks_fs::DataCacheContext;
 pub use variant_pruning::VariantPathPruningPredicate;
-use variant_read::{
+pub(crate) use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,
     materialize_variant_path_columns,
 };
@@ -680,7 +680,10 @@ fn align_iceberg_array_to_field(
     }
 }
 
-fn build_iceberg_default_array(target_field: &Field, row_count: usize) -> Result<ArrayRef, String> {
+pub(crate) fn build_iceberg_default_array(
+    target_field: &Field,
+    row_count: usize,
+) -> Result<ArrayRef, String> {
     use crate::connector::iceberg::default_value::literal_to_constant_array;
     use crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY;
     use iceberg::spec::Literal;

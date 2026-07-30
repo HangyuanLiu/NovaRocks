@@ -118,10 +118,22 @@ pub(crate) fn lower_scan_node(
             }
         }
         plan::scan_source::Kind::ConnectorRead(source) => {
-            reject_variant_columns_for_source(scan, "ConnectorReadSource")
-                .map_err(|error| error.into_native(path.clone()))?;
-            generic::lower_connector_read_scan(node, scan, source, &output_columns, ctx, arena)
-                .map_err(|error| error.into_native(source_path.field("connector_read")))
+            let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
+                scan,
+                table,
+                output_columns.columns(),
+            )
+            .map_err(|error| error.into_native(path.clone()))?;
+            generic::lower_connector_read_scan(
+                node,
+                scan,
+                source,
+                &output_columns,
+                variant_path_plan,
+                ctx,
+                arena,
+            )
+            .map_err(|error| error.into_native(source_path.field("connector_read")))
         }
     }
 }

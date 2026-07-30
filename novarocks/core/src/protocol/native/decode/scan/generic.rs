@@ -31,11 +31,17 @@ use novarocks_spi::connector::{
     ConnectorScanHandle, ConnectorSplit,
 };
 
-use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
+use crate::common::ids::SlotId;
+use crate::connector::runtime::{
+    ConnectorBatchTransform, ConnectorReadScanSource, ConnectorScheduledSplit,
+};
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::formats::parquet::{
+    ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
+};
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -43,6 +49,7 @@ use crate::runtime::query_options::query_expire_durations;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};
+use super::variant_path::NativeVariantPathPlan;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
 
 struct NativeQueryCancellation {
@@ -60,6 +67,7 @@ pub(super) fn lower_connector_read_scan(
     scan: &plan::ScanNode,
     source: &plan::ConnectorReadSource,
     output_columns: &DecodedScanOutputColumns,
+    variant_path_plan: NativeVariantPathPlan,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
@@ -181,13 +189,49 @@ pub(super) fn lower_connector_read_scan(
 
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
-    let expected_schema = decode_expected_schema_ipc(
-        &source.expected_schema_ipc,
-        output_schema.arrow_schema_ref().as_ref(),
-        request_context.max_handle_payload_bytes(),
-    )?;
-    let output_schema =
-        output_schema_with_connector_fields(&output_schema, expected_schema.as_ref())?;
+    let expected_schema = if variant_path_plan.specs.is_empty() {
+        decode_expected_schema_ipc(
+            &source.expected_schema_ipc,
+            output_schema.arrow_schema_ref().as_ref(),
+            request_context.max_handle_payload_bytes(),
+        )?
+    } else {
+        decode_connector_schema_ipc(
+            &source.expected_schema_ipc,
+            request_context.max_handle_payload_bytes(),
+        )?
+    };
+    let (output_schema, batch_transform) = if variant_path_plan.specs.is_empty() {
+        (
+            output_schema_with_connector_fields(&output_schema, expected_schema.as_ref())?,
+            None,
+        )
+    } else {
+        let read_slot_ids = connector_read_slot_ids(scan, expected_schema.as_ref())?;
+        validate_variant_path_read_slots(&variant_path_plan.specs, &read_slot_ids)?;
+        let variant_slot_kinds = output_schema
+            .slot_ids()
+            .iter()
+            .map(|slot_id| {
+                variant_path_plan
+                    .specs
+                    .iter()
+                    .any(|spec| spec.source_slot_id == *slot_id)
+                    .then_some(ParquetSlotKind::Variant)
+                    .unwrap_or(ParquetSlotKind::Regular)
+            })
+            .collect();
+        let output_slot_ids = output_schema.slot_ids().to_vec();
+        (
+            output_schema,
+            Some(ConnectorVariantPathTransform {
+                read_slot_ids,
+                output_slot_ids,
+                specs: variant_path_plan.specs,
+                output_slot_kinds: variant_slot_kinds,
+            }),
+        )
+    };
     let binding = ctx
         .execution_resolver()?
         .resolve(&binding_key)
@@ -207,17 +251,21 @@ pub(super) fn lower_connector_read_scan(
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     let request = ConnectorOpenReaderRequest {
-        expected_schema: output_schema.arrow_schema_ref(),
+        expected_schema,
         batch,
         context: request_context,
     };
     let predicate = lower_scan_predicate(scan, arena, &layout)?;
-    let source = Arc::new(ConnectorReadScanSource::new_scheduled_execution(
-        binding,
-        scheduled,
-        request,
-        output_schema.clone(),
-    ));
+    let source = Arc::new(
+        ConnectorReadScanSource::new_scheduled_execution_with_batch_transform(
+            binding,
+            scheduled,
+            request,
+            output_schema.clone(),
+            batch_transform
+                .map(|transform| Arc::new(transform) as Arc<dyn ConnectorBatchTransform>),
+        ),
+    );
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
     let scan_node = crate::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
@@ -232,6 +280,83 @@ pub(super) fn lower_connector_read_scan(
         layout,
         output_schema,
     })
+}
+
+#[derive(Clone)]
+struct ConnectorVariantPathTransform {
+    read_slot_ids: Vec<SlotId>,
+    output_slot_ids: Vec<SlotId>,
+    specs: Vec<VariantPathSpec>,
+    output_slot_kinds: Vec<ParquetSlotKind>,
+}
+
+impl ConnectorVariantPathTransform {
+    fn apply(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String> {
+        materialize_variant_path_columns(
+            batch,
+            &self.read_slot_ids,
+            &self.output_slot_ids,
+            &self.specs,
+        )
+        .and_then(|batch| convert_variant_columns(&self.output_slot_kinds, batch))
+    }
+}
+
+impl ConnectorBatchTransform for ConnectorVariantPathTransform {
+    fn transform(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String> {
+        self.apply(batch)
+    }
+}
+
+fn connector_read_slot_ids(
+    scan: &plan::ScanNode,
+    schema: &arrow::datatypes::Schema,
+) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            scan.columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(field.name()))
+                .map(|column| SlotId::new(column.column_id))
+                .ok_or_else(|| {
+                    NativeFragmentLeafDecodeError::at_field(
+                        ProtocolErrorKind::InconsistentFields,
+                        "expected_schema_ipc",
+                        format!(
+                            "ConnectorReadSource expected Arrow field `{}` is not a ScanNode column",
+                            field.name()
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn validate_variant_path_read_slots(
+    specs: &[VariantPathSpec],
+    read_slot_ids: &[SlotId],
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    for spec in specs {
+        if !read_slot_ids.contains(&spec.source_read_slot_id) {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "expected_schema_ipc",
+                format!(
+                    "ConnectorReadSource expected Arrow schema omits VARIANT source `{}` for output `{}`",
+                    spec.source_name, spec.output_name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn decode_expected_schema_ipc(
@@ -272,6 +397,35 @@ fn decode_expected_schema_ipc(
         ));
     }
     Ok(reader.schema())
+}
+
+fn decode_connector_schema_ipc(
+    encoded: &[u8],
+    max_bytes: usize,
+) -> Result<arrow::datatypes::SchemaRef, NativeFragmentLeafDecodeError> {
+    if encoded.is_empty() {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "expected_schema_ipc",
+            "ConnectorReadSource requires an expected Arrow schema",
+        ));
+    }
+    if encoded.len() > max_bytes {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::OutOfRange,
+            "expected_schema_ipc",
+            format!("ConnectorReadSource expected Arrow schema exceeds handle budget {max_bytes}"),
+        ));
+    }
+    StreamReader::try_new(Cursor::new(encoded), None)
+        .map(|reader| reader.schema())
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "expected_schema_ipc",
+                format!("decode ConnectorReadSource expected Arrow schema: {error}"),
+            )
+        })
 }
 
 fn output_schema_with_connector_fields(

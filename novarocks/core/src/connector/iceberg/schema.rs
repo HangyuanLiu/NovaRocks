@@ -120,6 +120,14 @@ pub fn build_projected_output_schema(
             fields.push(Field::new(column.name.clone(), DataType::Boolean, false));
             continue;
         }
+        if is_virtual_projection_column(&column.name) {
+            fields.push(Field::new(
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            ));
+            continue;
+        }
         if let Some(field) = build_reserved_row_lineage_projected_field(column)? {
             fields.push(field);
             continue;
@@ -160,6 +168,14 @@ pub(crate) fn build_projected_output_schema_from_descriptor(
     for column in columns {
         if column.name == VIRTUAL_COUNT_COLUMN {
             fields.push(Field::new(column.name.clone(), DataType::Boolean, false));
+            continue;
+        }
+        if is_virtual_projection_column(&column.name) {
+            fields.push(Field::new(
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            ));
             continue;
         }
         if let Some(field) = build_reserved_row_lineage_projected_field(column)? {
@@ -240,7 +256,7 @@ pub(crate) fn build_projected_output_schema_from_scan_model(
 }
 
 fn is_virtual_projection_column(name: &str) -> bool {
-    matches!(name, "_file" | "_pos" | "__change_op")
+    matches!(name, "_file" | "_pos" | "__change_op") || name.starts_with("__nr_var_")
 }
 
 fn schema_field_descriptor_from_scan_model(
@@ -567,6 +583,40 @@ mod tests {
                 .metadata()
                 .contains_key(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
             "__change_op is synthetic and must not claim an Iceberg field id"
+        );
+    }
+
+    #[test]
+    fn scan_model_projection_accepts_variant_path_synthetic_column() {
+        let iceberg_schema = IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "v".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            }],
+        };
+
+        let projected = build_projected_output_schema_from_scan_model(
+            &iceberg_schema,
+            &[IcebergArrowColumn {
+                name: "__nr_var_v_0".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            }],
+        )
+        .expect("synthetic VARIANT projection must not require an Iceberg field descriptor");
+
+        let field = projected.field(0);
+        assert_eq!(field.name(), "__nr_var_v_0");
+        assert_eq!(field.data_type(), &DataType::Int64);
+        assert!(field.is_nullable());
+        assert!(
+            !field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY),
+            "synthetic VARIANT output must not claim the source field ID"
         );
     }
 

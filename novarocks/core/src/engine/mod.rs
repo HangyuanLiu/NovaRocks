@@ -2295,6 +2295,9 @@ impl StandaloneSession {
             .expect("standalone iceberg catalog write lock");
         let created = !guard.contains_catalog(&stmt.name)?;
         guard.create_catalog(&stmt.name, &stmt.properties)?;
+        if !created {
+            return Ok(StatementResult::Ok);
+        }
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
         if let Err(error) = register_iceberg_control_binding(&self.inner, &normalized_catalog) {
@@ -2307,12 +2310,6 @@ impl StandaloneSession {
             }
             return Err(error);
         }
-        let connectors = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read lock")
-            .clone();
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
@@ -6242,6 +6239,14 @@ path = "{metadata_path}"
             warehouse.path().display()
         );
         engine.session().execute(&sql).expect("create catalog");
+        engine
+            .session()
+            .execute(&sql.replacen(
+                "CREATE EXTERNAL CATALOG",
+                "CREATE EXTERNAL CATALOG IF NOT EXISTS",
+                1,
+            ))
+            .expect("CREATE CATALOG IF NOT EXISTS must keep the active control binding");
 
         let registry = engine
             .inner
