@@ -580,6 +580,7 @@ impl IcebergControlProvider {
             .map_err(|error| internal(format!("iceberg catalog registry read lock: {error}")))?
             .get(catalog)
             .map_err(map_iceberg_error)
+            .map_err(ConnectorError::with_retryable_before_progress)
     }
 
     fn validate_context(
@@ -1284,7 +1285,10 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                 receipt: self.receipt(request.operation_id, operation_kind, None)?,
                 finalization: ExternalMutationFinalization::Complete,
             }),
-            Err(error) if mutation_commit_may_be_unknown(error.kind()) => {
+            Err(error)
+                if mutation_commit_may_be_unknown(error.kind())
+                    && !error.retryable_before_progress() =>
+            {
                 Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         mutation_failure_kind(error.kind()),
@@ -3101,7 +3105,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_mutation_returns_identity_bound_reconcilable_evidence() {
+    fn dispatch_failure_is_known_uncommitted_before_catalog_commit() {
         let provider = mutation_provider_without_catalog();
         let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
         let outcome = provider
@@ -3121,9 +3125,22 @@ mod tests {
                 context: context_with_payload_budgets(1024, 1024),
             })
             .expect("provider contract");
-        let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
-            panic!("unavailable provider must preserve reconciliation evidence")
-        };
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { .. }
+        ));
+        let evidence = provider
+            .mutation_evidence(
+                operation_id,
+                &ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                        instance_id: provider.instance_id.clone(),
+                        namespace: Arc::from("db"),
+                    },
+                    policy: CreatePolicy::FailIfExists,
+                },
+            )
+            .expect("evidence does not require a catalog access");
         assert_eq!(evidence.schema_version(), ICEBERG_MUTATION_EVIDENCE_VERSION);
         assert_eq!(evidence.descriptor(), provider.descriptor());
         assert_eq!(evidence.incarnation(), provider.incarnation());
@@ -3131,17 +3148,6 @@ mod tests {
         assert_eq!(evidence.operation_kind(), "create-namespace");
         assert!(format!("{evidence:?}").contains("provider_payload_len"));
         assert!(!format!("{evidence:?}").contains("\"namespace\""));
-
-        let reconciled = provider
-            .reconcile(ConnectorCatalogMutationReconcileRequest {
-                evidence,
-                context: context_with_payload_budgets(1024, 1024),
-            })
-            .expect("reconcile contract");
-        assert!(matches!(
-            reconciled,
-            ExternalMutationOutcome::CommitUnknown { .. }
-        ));
     }
 
     #[test]
