@@ -1,0 +1,4 @@
+interface:
+  display_name: "Development Workflow"
+  short_description: "Route development work through explicit stages"
+  default_prompt: "Use $dev-workflow to drive this change through the correct development stage."

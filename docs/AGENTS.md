@@ -23,6 +23,10 @@ under the License.
 
 ## 目录规则
 
+`dev-workflow` 在当前请求和 memory 都没有可用外部文档根时，以 `docs/workflow/` 为 fallback `DOC_ROOT`。
+该目录使用自身的 `specs/`、`plans/`、`archive/` 和可选 `umbrella/` 布局；此时不要把这些文件重定向到
+`docs/design/`。
+
 1. `docs/design/` 一级目录只能包含两个子目录：
    - `docs/design/specs/`
    - `docs/design/plans/`

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Execute Plan"
+  short_description: "Execute a plan under a persistent goal"
+  default_prompt: "Use $dev-workflow-execute to dispatch ready plan tasks to sub-agents, integrate them, and verify the approved plan."

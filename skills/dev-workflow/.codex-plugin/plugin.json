@@ -1,0 +1,24 @@
+{
+  "name": "dev-workflow",
+  "version": "0.1.0",
+  "description": "Goal-driven design and development workflows",
+  "author": {
+    "name": "Dev Workflow"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Development Workflow",
+    "shortDescription": "Discuss, specify, plan, execute, and finish changes.",
+    "longDescription": "A self-contained development workflow with memory-resolved documentation, parallel-ready Plan mode task graphs, persistent goals, sub-agent execution, local checkpoint commits, and explicit publication gates.",
+    "developerName": "Dev Workflow",
+    "category": "Productivity",
+    "capabilities": [
+      "Design",
+      "Planning",
+      "Implementation"
+    ],
+    "defaultPrompt": [
+      "Drive this change through discussion, a parallel-ready plan, goal execution, and verification."
+    ]
+  }
+}

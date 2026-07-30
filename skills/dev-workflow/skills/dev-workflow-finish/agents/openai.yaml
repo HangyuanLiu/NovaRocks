@@ -1,0 +1,4 @@
+interface:
+  display_name: "Finish Change"
+  short_description: "Verify, publish, and archive a change"
+  default_prompt: "Use $dev-workflow-finish to finish and publish this verified change."

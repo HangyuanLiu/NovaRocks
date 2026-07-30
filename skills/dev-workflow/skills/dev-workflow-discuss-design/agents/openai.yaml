@@ -1,0 +1,4 @@
+interface:
+  display_name: "Discuss Design"
+  short_description: "Clarify a problem and settle design decisions"
+  default_prompt: "Use $dev-workflow-discuss-design to investigate and discuss this problem before writing a spec."
