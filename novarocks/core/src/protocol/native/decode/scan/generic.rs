@@ -32,6 +32,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::runtime::{ConnectorReadScanSource, ConnectorScheduledSplit};
+use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -180,11 +181,13 @@ pub(super) fn lower_connector_read_scan(
 
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
-    validate_expected_schema_ipc(
+    let expected_schema = decode_expected_schema_ipc(
         &source.expected_schema_ipc,
         output_schema.arrow_schema_ref().as_ref(),
         request_context.max_handle_payload_bytes(),
     )?;
+    let output_schema =
+        output_schema_with_connector_fields(&output_schema, expected_schema.as_ref())?;
     let binding = ctx
         .execution_resolver()?
         .resolve(&binding_key)
@@ -231,11 +234,11 @@ pub(super) fn lower_connector_read_scan(
     })
 }
 
-fn validate_expected_schema_ipc(
+fn decode_expected_schema_ipc(
     encoded: &[u8],
     expected: &arrow::datatypes::Schema,
     max_bytes: usize,
-) -> Result<(), NativeFragmentLeafDecodeError> {
+) -> Result<arrow::datatypes::SchemaRef, NativeFragmentLeafDecodeError> {
     if encoded.is_empty() {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::MissingField,
@@ -257,7 +260,7 @@ fn validate_expected_schema_ipc(
             format!("decode ConnectorReadSource expected Arrow schema: {error}"),
         )
     })?;
-    if reader.schema().as_ref() != expected {
+    if !schema_matches_connector_contract(reader.schema().as_ref(), expected) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "expected_schema_ipc",
@@ -268,7 +271,82 @@ fn validate_expected_schema_ipc(
             ),
         ));
     }
-    Ok(())
+    Ok(reader.schema())
+}
+
+fn output_schema_with_connector_fields(
+    output_schema: &ChunkSchema,
+    expected: &arrow::datatypes::Schema,
+) -> Result<Arc<ChunkSchema>, NativeFragmentLeafDecodeError> {
+    let slots = output_schema
+        .slots()
+        .iter()
+        .zip(expected.fields())
+        .map(|(slot, field)| slot.with_field(field.as_ref().clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "expected_schema_ipc",
+                format!("apply ConnectorReadSource expected Arrow schema: {error}"),
+            )
+        })?;
+    ChunkSchema::try_new_with_schema_metadata(slots, expected.metadata().clone())
+        .map(Arc::new)
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                "expected_schema_ipc",
+                format!("build ConnectorReadSource output schema: {error}"),
+            )
+        })
+}
+
+fn schema_matches_connector_contract(
+    carrier: &arrow::datatypes::Schema,
+    output: &arrow::datatypes::Schema,
+) -> bool {
+    carrier.fields().len() == output.fields().len()
+        && carrier
+            .fields()
+            .iter()
+            .zip(output.fields())
+            .all(|(carrier, output)| field_matches_connector_contract(carrier, output))
+}
+
+fn field_matches_connector_contract(
+    carrier: &arrow::datatypes::Field,
+    output: &arrow::datatypes::Field,
+) -> bool {
+    carrier.name() == output.name()
+        && carrier.is_nullable() == output.is_nullable()
+        && data_type_matches_connector_contract(carrier.data_type(), output.data_type())
+}
+
+fn data_type_matches_connector_contract(
+    carrier: &arrow::datatypes::DataType,
+    output: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+
+    match (carrier, output) {
+        (DataType::Struct(carrier), DataType::Struct(output)) => {
+            carrier.len() == output.len()
+                && carrier
+                    .iter()
+                    .zip(output.iter())
+                    .all(|(carrier, output)| field_matches_connector_contract(carrier, output))
+        }
+        (DataType::List(carrier), DataType::List(output))
+        | (DataType::LargeList(carrier), DataType::LargeList(output))
+        | (DataType::FixedSizeList(carrier, _), DataType::FixedSizeList(output, _)) => {
+            field_matches_connector_contract(carrier, output)
+        }
+        (DataType::Map(carrier, carrier_sorted), DataType::Map(output, output_sorted)) => {
+            carrier_sorted == output_sorted && field_matches_connector_contract(carrier, output)
+        }
+        _ => carrier == output,
+    }
 }
 
 fn required_nonzero_usize(

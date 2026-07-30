@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use super::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use crate::exec::row_position::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
@@ -183,6 +184,78 @@ pub(crate) fn build_projected_output_schema_from_descriptor(
         fields.push(field);
     }
     Ok(Some(Arc::new(Schema::new(fields))))
+}
+
+/// Builds an Arrow projection from the schema descriptor retained by the
+/// native scan model.  The connector carrier must keep these IDs intact so a
+/// reader can resolve renamed fields in older data files by Iceberg field ID.
+pub(crate) fn build_projected_output_schema_from_scan_model(
+    iceberg_schema: &IcebergSchemaDef,
+    columns: &[IcebergArrowColumn],
+) -> Result<SchemaRef, String> {
+    let descriptor = IcebergSchemaDescriptor {
+        fields: iceberg_schema
+            .fields
+            .iter()
+            .map(schema_field_descriptor_from_scan_model)
+            .collect(),
+    };
+    let fields = columns
+        .iter()
+        .map(|column| {
+            if column.name == VIRTUAL_COUNT_COLUMN {
+                return Ok(Field::new(column.name.clone(), DataType::Boolean, false));
+            }
+            if is_virtual_projection_column(&column.name) {
+                return Ok(Field::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                ));
+            }
+            if let Some(field) = build_reserved_row_lineage_projected_field(column)? {
+                return Ok(field);
+            }
+            let schema_field = descriptor
+                .fields
+                .iter()
+                .find(|field| field.name == column.name)
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg projected column {} missing schema field descriptor",
+                        column.name
+                    )
+                })?;
+            apply_field_id_recursive(
+                Field::new(
+                    column.name.clone(),
+                    column.data_type.clone(),
+                    column.nullable,
+                ),
+                schema_field,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn is_virtual_projection_column(name: &str) -> bool {
+    matches!(name, "_file" | "_pos" | "__change_op")
+}
+
+fn schema_field_descriptor_from_scan_model(
+    field: &IcebergSchemaFieldDef,
+) -> IcebergSchemaFieldDescriptor {
+    IcebergSchemaFieldDescriptor {
+        name: field.name.clone(),
+        field_id: Some(field.field_id),
+        children: field
+            .children
+            .iter()
+            .map(schema_field_descriptor_from_scan_model)
+            .collect(),
+        initial_default_json: field.initial_default_json.clone(),
+    }
 }
 
 fn build_reserved_row_lineage_projected_field(

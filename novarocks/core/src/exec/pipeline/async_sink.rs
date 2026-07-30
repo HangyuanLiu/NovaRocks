@@ -207,11 +207,7 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
     }
 
     fn is_finished(&self) -> bool {
-        // "No more input needed": true once finishing was requested, or once the
-        // background fully completed / errored / was canceled. Together with
-        // pending_finish() this lets the driver enter DriverState::PendingFinish
-        // during the async tail and reach Finished only after it clears.
-        self.finishing || self.shared.finished.load(Ordering::Acquire)
+        self.shared.finished.load(Ordering::Acquire)
     }
 
     fn pending_finish(&self) -> bool {

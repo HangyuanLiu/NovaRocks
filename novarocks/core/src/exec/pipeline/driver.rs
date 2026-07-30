@@ -528,6 +528,9 @@ impl PipelineDriver {
     }
 
     fn process_inner(&mut self, time_slice: Duration) -> DriverState {
+        if let Some(err) = self.runtime_state.error() {
+            return self.finish_with_state(DriverState::Failed(err));
+        }
         if let Some(final_state) = self.pending_finish_state.clone() {
             if self.has_pending_finish() {
                 self.state = DriverState::PendingFinish;
@@ -549,7 +552,7 @@ impl PipelineDriver {
                 return self.state.clone();
             }
 
-            if self.is_finished() {
+            if self.is_finished() || self.has_pending_finish() {
                 return self.finish_with_state(DriverState::Finished);
             }
 

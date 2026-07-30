@@ -467,7 +467,13 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                 poller.add_pending_finish(task);
             }
             DriverState::Finished => {
-                task.driver_finished();
+                if task.has_pending_finish() {
+                    // A terminal driver state must not complete the fragment while an
+                    // asynchronous operator is still publishing its final output.
+                    poller.add_pending_finish(task);
+                } else {
+                    task.driver_finished();
+                }
             }
             DriverState::Canceled => {
                 task.fail("pipeline driver canceled".to_string());

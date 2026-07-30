@@ -143,7 +143,7 @@ fn reject_variant_columns_for_source(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
@@ -318,6 +318,27 @@ mod tests {
         }
     }
 
+    struct SchemaRecordingRead {
+        key: ConnectorExecutionBindingKey,
+        expected_schema: Arc<Mutex<Option<Arc<Schema>>>>,
+    }
+
+    impl ConnectorReadExecution for SchemaRecordingRead {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+
+        fn open_reader(
+            &self,
+            _split: &ConnectorSplit,
+            request: ConnectorOpenReaderRequest,
+        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+            *self.expected_schema.lock().expect("expected schema lock") =
+                Some(request.expected_schema);
+            Ok(Box::new(EmptyConnectorReader))
+        }
+    }
+
     struct TestExecutionResolver {
         binding: Option<Arc<ConnectorExecutionBinding>>,
     }
@@ -347,6 +368,29 @@ mod tests {
             ConnectorProviderId::parse("test").expect("provider ID"),
             key.clone(),
             Arc::new(NativeCarrierTestRead { key }),
+        )
+        .expect("execution binding");
+        Arc::new(TestExecutionResolver {
+            binding: Some(Arc::new(binding)),
+        })
+    }
+
+    fn schema_recording_connector_read_resolver(
+        instance_id: &str,
+        expected_schema: Arc<Mutex<Option<Arc<Schema>>>>,
+    ) -> Arc<dyn ConnectorExecutionResolver> {
+        let instance_id = ConnectorInstanceId::parse(instance_id).expect("instance ID");
+        let key = ConnectorExecutionBindingKey {
+            instance_id,
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        let binding = ConnectorExecutionBinding::try_new(
+            ConnectorProviderId::parse("test").expect("provider ID"),
+            key.clone(),
+            Arc::new(SchemaRecordingRead {
+                key,
+                expected_schema,
+            }),
         )
         .expect("execution binding");
         Arc::new(TestExecutionResolver {
@@ -398,6 +442,72 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("read typed split");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn native_connector_read_carrier_preserves_field_metadata_for_provider_readers() {
+        let mut metadata = HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "42".to_string());
+        let schema = Schema::new(vec![
+            Field::new("renamed_amount", DataType::Float64, true).with_metadata(metadata),
+        ]);
+        let mut writer = StreamWriter::try_new(Vec::new(), &schema).expect("schema IPC writer");
+        writer.finish().expect("finish schema IPC writer");
+        let node = scan_node_with(
+            vec![output_column(1, "renamed_amount", DataType::Float64)],
+            Vec::new(),
+            Vec::new(),
+            plan::scan_source::Kind::ConnectorRead(plan::ConnectorReadSource {
+                instance_id: "test.native".to_string(),
+                instance_incarnation: vec![7; 16],
+                scan_payload: vec![0],
+                splits: vec![plan::ConnectorReadSplit {
+                    split_id: "split-1".to_string(),
+                    split_payload: vec![1],
+                    estimated_bytes: Some(1),
+                }],
+                max_batch_rows: 128,
+                max_batch_bytes: 4096,
+                max_handle_payload_bytes: 1024,
+                max_total_payload_bytes: 4096,
+                expected_schema_ipc: writer.get_ref().clone(),
+            }),
+        );
+        let recorded = Arc::new(Mutex::new(None));
+        let context = NativePlanDecodeContext::default()
+            .with_execution_resolver(schema_recording_connector_read_resolver(
+                "test.native",
+                Arc::clone(&recorded),
+            ))
+            .with_query_id(crate::runtime::query_context::QueryId { hi: 7, lo: 12 });
+        let decoded = decode_node(&node, &mut ExprArena::default(), &context)
+            .expect("decode ConnectorReadSource");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("expected decoded scan node");
+        };
+        scan.source()
+            .bind(context.captured_ranges_for_test(node.node_id))
+            .expect("bind generic connector source")
+            .execute_iter(
+                ScanMorsel::ConnectorSplit {
+                    index: 0,
+                    row_position: None,
+                },
+                None,
+                None,
+            )
+            .expect("open typed reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read typed split");
+        let recorded = recorded
+            .lock()
+            .expect("expected schema lock")
+            .clone()
+            .expect("provider expected schema");
+        assert_eq!(
+            recorded.field(0).metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"42".to_string())
+        );
     }
 
     #[test]

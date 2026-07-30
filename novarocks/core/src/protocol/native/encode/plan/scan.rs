@@ -651,6 +651,7 @@ fn encode_scan_source(
                 expected_schema_ipc: encode_connector_expected_schema_ipc(
                     scan_output_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
+                    iceberg_schema_for_connector_source(src),
                 )?,
             })),
         });
@@ -778,9 +779,21 @@ fn encode_scan_source(
     })
 }
 
+fn iceberg_schema_for_connector_source(
+    source: &table_model::ScanSource,
+) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
+    match source {
+        table_model::ScanSource::IcebergDataFiles { table, .. }
+        | table_model::ScanSource::IcebergDeltaTable { table, .. }
+        | table_model::ScanSource::IcebergVersionTable { table, .. } => Some(&table.schema),
+        _ => None,
+    }
+}
+
 fn encode_connector_expected_schema_ipc(
     output_columns: &[common::OutputColumn],
     required_columns: &[String],
+    iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
         required_columns
@@ -788,26 +801,42 @@ fn encode_connector_expected_schema_ipc(
             .map(|name| name.to_ascii_lowercase())
             .collect::<HashSet<_>>()
     });
-    let schema = Schema::new(
-        output_columns
+    let selected = output_columns
+        .iter()
+        .filter(|column| {
+            required
+                .as_ref()
+                .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
+        })
+        .map(|column| {
+            let type_desc = column.r#type.as_ref().ok_or_else(|| {
+                format!(
+                    "ConnectorReadSource output column {} is missing its type",
+                    column.column_id
+                )
+            })?;
+            decode_field_type(&column.name, column.nullable, type_desc)
+                .map_err(|error| format!("decode ConnectorReadSource output schema: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = if let Some(iceberg_schema) = iceberg_schema {
+        let columns = selected
             .iter()
-            .filter(|column| {
-                required
-                    .as_ref()
-                    .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
+            .map(|field| crate::connector::iceberg::IcebergArrowColumn {
+                name: field.name().to_string(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
             })
-            .map(|column| {
-                let type_desc = column.r#type.as_ref().ok_or_else(|| {
-                    format!(
-                        "ConnectorReadSource output column {} is missing its type",
-                        column.column_id
-                    )
-                })?;
-                decode_field_type(&column.name, column.nullable, type_desc)
-                    .map_err(|error| format!("decode ConnectorReadSource output schema: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    );
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::build_projected_output_schema_from_scan_model(
+            iceberg_schema,
+            &columns,
+        )?
+        .as_ref()
+        .clone()
+    } else {
+        Schema::new(selected)
+    };
     let mut writer = StreamWriter::try_new(Vec::new(), &schema)
         .map_err(|error| format!("encode ConnectorReadSource expected schema: {error}"))?;
     writer

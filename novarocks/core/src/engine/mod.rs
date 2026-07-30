@@ -105,7 +105,6 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
-use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use novarocks_catalog::partition::LegacyRangePartition;
 
 #[cfg(feature = "compat")]
@@ -2002,14 +2001,21 @@ impl StandaloneSession {
     }
 
     fn is_query_sql(sql: &str) -> bool {
-        matches!(
-            sql.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "select" | "with" | "explain"
-        )
+        let mut words = sql.split_whitespace();
+        match words.next().map(|word| word.to_ascii_lowercase()) {
+            Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
+            Some(keyword) if keyword == "explain" => {
+                let mut target = words.next().map(|word| word.to_ascii_lowercase());
+                while matches!(
+                    target.as_deref(),
+                    Some("analyze" | "verbose" | "costs" | "logical")
+                ) {
+                    target = words.next().map(|word| word.to_ascii_lowercase());
+                }
+                matches!(target.as_deref(), Some("select" | "with"))
+            }
+            _ => false,
+        }
     }
 
     /// Handle ALTER TABLE ... ADD FILES FROM '...'

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
+use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::engine::{PreparedQueryOperation, StandaloneNovaRocks, StatementResult};
 use novarocks::query_execution::backend::BackendTopologyService;
 use novarocks::query_execution::cancellation::QueryCancellationReason;
@@ -187,6 +188,9 @@ impl FrontendQuerySession {
         if self.apply_session_set(trimmed).await? {
             return Ok(StatementResult::Ok);
         }
+        if let Some(error) = admin_raise_engine_error(trimmed)? {
+            return Err(error);
+        }
         self.execute_admitted(trimmed.to_string()).await
     }
 
@@ -326,17 +330,7 @@ impl FrontendQuerySession {
                     .optimizer_settings
                     .set_enable_ukfk_opt(parse_bool(value)?);
             }
-            "cbo_broadcast_backend_count" => {
-                state
-                    .optimizer_settings
-                    .set_broadcast_backend_count(value.parse().map_err(|_| {
-                        QueryServiceError::new(
-                            QueryServiceErrorKind::InvalidValue,
-                            "invalid cbo_broadcast_backend_count",
-                        )
-                    })?);
-            }
-            _ => {}
+            _ => apply_optimizer_session_set(&mut state.optimizer_settings, &name, value)?,
         }
         Ok(true)
     }
@@ -714,12 +708,193 @@ fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
 }
 
 fn is_query_statement(sql: &str) -> bool {
-    let keyword = sql
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(keyword.as_str(), "select" | "with" | "explain")
+    let mut words = sql.split_whitespace();
+    match words.next().map(|word| word.to_ascii_lowercase()) {
+        Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
+        Some(keyword) if keyword == "explain" => {
+            let mut target = words.next().map(|word| word.to_ascii_lowercase());
+            while matches!(
+                target.as_deref(),
+                Some("analyze" | "verbose" | "costs" | "logical")
+            ) {
+                target = words.next().map(|word| word.to_ascii_lowercase());
+            }
+            matches!(target.as_deref(), Some("select" | "with"))
+        }
+        _ => false,
+    }
+}
+
+fn apply_optimizer_session_set(
+    settings: &mut SessionOptimizerSettings,
+    name: &str,
+    value: &str,
+) -> Result<(), QueryServiceError> {
+    let parse_bool_value = || parse_bool(value);
+    let parse_u64_value = || {
+        value.parse::<u64>().map_err(|_| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::InvalidValue,
+                format!("invalid {name}"),
+            )
+        })
+    };
+    let parse_f64_value = || {
+        value.parse::<f64>().map_err(|_| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::InvalidValue,
+                format!("invalid {name}"),
+            )
+        })
+    };
+    let parse_usize_value = || {
+        value.parse::<usize>().map_err(|_| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::InvalidValue,
+                format!("invalid {name}"),
+            )
+        })
+    };
+
+    match name {
+        "cbo_broadcast_backend_count" => {
+            settings.set_broadcast_backend_count(parse_f64_value()?);
+        }
+        "cbo_broadcast_node_mem_budget_bytes" => {
+            settings.cbo_broadcast_node_mem_budget_bytes = Some(parse_f64_value()?);
+        }
+        "global_runtime_filter_build_max_size" => {
+            settings.rf_build_max_bytes = Some(parse_u64_value()?);
+        }
+        "global_runtime_filter_build_min_size" => {
+            settings.rf_build_min_bytes = Some(parse_u64_value()?);
+        }
+        "global_runtime_filter_probe_min_size" => {
+            settings.rf_probe_min_bytes = Some(parse_u64_value()?);
+        }
+        "global_runtime_filter_probe_min_selectivity" => {
+            settings.rf_probe_min_selectivity = Some(parse_f64_value()?);
+        }
+        "cbo_max_reorder_node_use_exhaustive" => {
+            settings.max_reorder_node_use_exhaustive = Some(parse_usize_value()?);
+        }
+        "cbo_max_reorder_node_use_dp" => {
+            settings.max_reorder_node_use_dp = Some(parse_usize_value()?);
+        }
+        "cbo_max_reorder_node_use_greedy" => {
+            settings.max_reorder_node_use_greedy = Some(parse_usize_value()?);
+        }
+        "cbo_max_reorder_node" => {
+            settings.max_reorder_node = Some(parse_usize_value()?);
+        }
+        "enable_query_rewrite_table_prune" => {
+            settings.enable_query_rewrite_table_prune = parse_bool_value()?;
+        }
+        "enable_cbo_table_prune" => {
+            settings.enable_cbo_table_prune = parse_bool_value()?;
+        }
+        "enable_table_prune_on_update" => {
+            settings.enable_table_prune_on_update = parse_bool_value()?;
+        }
+        "enable_common_subexpr_reuse" => {
+            settings.enable_common_subexpr_reuse = Some(parse_bool_value()?);
+        }
+        "enable_global_runtime_filter" => {
+            settings.enable_global_runtime_filter = Some(parse_bool_value()?);
+        }
+        "enable_materialized_view_rewrite" => {
+            settings.enable_materialized_view_rewrite = Some(parse_bool_value()?);
+        }
+        "cbo_enable_dp_join_reorder" => {
+            settings.enable_dp_join_reorder = Some(parse_bool_value()?);
+        }
+        "cbo_enable_greedy_join_reorder" => {
+            settings.enable_greedy_join_reorder = Some(parse_bool_value()?);
+        }
+        "enable_global_runtime_filter_cross_exchange" => {
+            settings.allow_cross_exchange_rf = Some(parse_bool_value()?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, QueryServiceError> {
+    let parts = sql.split_whitespace().collect::<Vec<_>>();
+    if !matches!(parts.as_slice(), [admin, raise, engine, error, _]
+        if admin.eq_ignore_ascii_case("admin")
+            && raise.eq_ignore_ascii_case("raise")
+            && engine.eq_ignore_ascii_case("engine")
+            && error.eq_ignore_ascii_case("error"))
+    {
+        return Ok(None);
+    }
+    let [_, _, _, _, raw_code] = parts.as_slice() else {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
+        ));
+    };
+    let raw_code = raw_code
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+        .or_else(|| {
+            raw_code
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+        })
+        .ok_or_else(|| {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
+            )
+        })?;
+    let code = EngineErrorCode::parse(raw_code).ok_or_else(|| {
+        QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            format!("unknown engine error code: {raw_code}"),
+        )
+    })?;
+    let error = match code {
+        EngineErrorCode::UnsupportedDistributedDmlShape => {
+            EngineError::unsupported_distributed_dml_shape(
+                "ADMIN RAISE ENGINE ERROR",
+                "forced P8 SQL runner error-code smoke",
+            )
+        }
+        EngineErrorCode::IcebergWriteDescriptorMismatch => {
+            EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::UnsupportedPositionDeleteDescriptor => {
+            EngineError::unsupported_position_delete_descriptor(
+                "forced position-delete descriptor error-code smoke",
+            )
+        }
+        EngineErrorCode::CommitKnownUncommitted => {
+            EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::CommitUnknown => {
+            EngineError::commit_unknown("forced P8 SQL runner error-code smoke")
+        }
+        EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
+            EngineError::commit_known_committed_finalize_failed(
+                "forced P8 SQL runner error-code smoke",
+            )
+        }
+        EngineErrorCode::ProtocolDecodeError => {
+            EngineError::protocol_decode("forced P8 SQL runner error-code smoke")
+        }
+        _ => {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                format!("unsupported engine error code for ADMIN RAISE ENGINE ERROR: {raw_code}"),
+            ));
+        }
+    };
+    Ok(Some(QueryServiceError::new(
+        QueryServiceErrorKind::Unsupported,
+        error.to_bracketed_user_message(),
+    )))
 }
 
 fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {
@@ -829,5 +1004,50 @@ mod tests {
     fn parenthesized_query_rejects_non_query_expressions() {
         assert_eq!(parenthesized_query("(array[1, 2])"), None);
         assert_eq!(parenthesized_query("SELECT 1"), None);
+    }
+
+    #[test]
+    fn optimizer_session_settings_preserve_frontend_admission_contract() {
+        let mut settings = SessionOptimizerSettings::default();
+        apply_optimizer_session_set(&mut settings, "cbo_broadcast_node_mem_budget_bytes", "0")
+            .expect("broadcast budget setting");
+        apply_optimizer_session_set(
+            &mut settings,
+            "global_runtime_filter_probe_min_selectivity",
+            "0.0",
+        )
+        .expect("runtime filter selectivity setting");
+        apply_optimizer_session_set(&mut settings, "enable_common_subexpr_reuse", "false")
+            .expect("cse setting");
+        apply_optimizer_session_set(&mut settings, "cbo_max_reorder_node_use_exhaustive", "2")
+            .expect("join reorder setting");
+
+        assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(0.0));
+        assert_eq!(settings.rf_probe_min_selectivity, Some(0.0));
+        assert_eq!(settings.enable_common_subexpr_reuse, Some(false));
+        assert_eq!(settings.max_reorder_node_use_exhaustive, Some(2));
+    }
+
+    #[test]
+    fn explain_refresh_is_a_command_but_explain_select_is_a_query() {
+        assert!(is_query_statement("EXPLAIN VERBOSE SELECT 1"));
+        assert!(is_query_statement(
+            "EXPLAIN ANALYZE WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
+        assert!(!is_query_statement("EXPLAIN REFRESH MATERIALIZED VIEW mv"));
+    }
+
+    #[test]
+    fn admin_raise_engine_error_keeps_the_engine_code_visible() {
+        let error =
+            admin_raise_engine_error("ADMIN RAISE ENGINE ERROR 'UnsupportedDistributedDmlShape'")
+                .expect("parse command")
+                .expect("recognized command");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("[UnsupportedDistributedDmlShape]")
+        );
     }
 }

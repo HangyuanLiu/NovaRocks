@@ -765,7 +765,12 @@ where
         delete_file_path_normalizer,
     )?;
     if !puffin_dels.is_empty() {
-        let puffin_dels = normalize_delete_file_paths(&puffin_dels, delete_file_path_normalizer)?;
+        // Validate the object-store domain, but retain the logical URI for
+        // FsAccessHandle::bind_location. The normalized path is relative to
+        // the object-store operator and cannot be bound as a file location.
+        for delete in &puffin_dels {
+            delete_file_path_normalizer(&delete.delete_file_path)?;
+        }
         let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, factory))
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
