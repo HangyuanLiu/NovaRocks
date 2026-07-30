@@ -18,7 +18,6 @@ pub(crate) mod backend;
 pub mod file_execution;
 pub(crate) mod host;
 pub mod iceberg;
-pub mod jdbc;
 pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;
@@ -243,7 +242,6 @@ pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
-pub use jdbc::JdbcScanConfig;
 #[cfg(feature = "compat")]
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 

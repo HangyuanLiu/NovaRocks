@@ -775,7 +775,6 @@ pub(crate) fn lower_hdfs_scan_node(
     layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     scan_ranges: Option<ScanRangeCarrier>,
     query_opts: &QueryOptions,
-    connectors: &ConnectorRegistry,
     iceberg_execution: Option<Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
     query_global_dict_map: &QueryGlobalDictMap,
     mut out_layout: Layout,

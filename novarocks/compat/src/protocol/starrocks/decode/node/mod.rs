@@ -27,13 +27,11 @@ mod file_scan;
 mod hash_join;
 pub(crate) mod hdfs_scan;
 mod iceberg_delta_scan;
-mod jdbc_scan;
 #[cfg(feature = "compat")]
 mod lake_meta_scan;
 #[cfg(feature = "compat")]
 mod lake_scan;
 mod lookup;
-mod mysql_scan;
 mod nestloop_join;
 mod project;
 mod raw_values;
@@ -174,13 +172,11 @@ pub(crate) use file_scan::{
 pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
-pub(crate) use jdbc_scan::lower_jdbc_scan_node;
 #[cfg(feature = "compat")]
 pub(crate) use lake_meta_scan::{LakeMetaValuesPatch, lower_lake_meta_scan_node};
 #[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
 pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
-pub(crate) use mysql_scan::lower_mysql_scan_node;
 pub(crate) use nestloop_join::lower_nestloop_join_node;
 pub(crate) use project::lower_project_node;
 pub(crate) use raw_values::lower_raw_values_node;
@@ -664,15 +660,9 @@ fn lower_node_with_children_typed(
             t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
                 lower_fetch_node(children, node, out_layout, desc_tbl)?
             }
-            t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => lower_mysql_scan_node(
-                node,
-                desc_tbl,
-                tuple_slots,
-                &context.query_options,
-                connectors,
-                context.query_id,
-                context.scan_ranges,
-            )?,
+            t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => {
+                return Err("MYSQL_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".into());
+            }
             t if t == plan_nodes::TPlanNodeType::FILE_SCAN_NODE => lower_file_scan_node(
                 node,
                 desc_tbl,
@@ -686,18 +676,9 @@ fn lower_node_with_children_typed(
                 out_layout,
                 node_path.clone(),
             )?,
-            t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => lower_jdbc_scan_node(
-                node,
-                desc_tbl,
-                tuple_slots,
-                layout_hints,
-                &context.query_options,
-                connectors,
-                db_name,
-                context.decode_facts,
-                context.query_id,
-                context.scan_ranges,
-            )?,
+            t if t == plan_nodes::TPlanNodeType::JDBC_SCAN_NODE => {
+                return Err("JDBC_SCAN_NODE is unsupported; compat supports only internal tables and explicit Iceberg descriptors".into());
+            }
             t if t == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE => lower_hdfs_scan_node(
                 node,
                 desc_tbl,
@@ -705,7 +686,6 @@ fn lower_node_with_children_typed(
                 layout_hints,
                 context.scan_ranges,
                 &context.query_options,
-                connectors,
                 context.compat_iceberg_execution.cloned(),
                 query_global_dict_map,
                 out_layout,

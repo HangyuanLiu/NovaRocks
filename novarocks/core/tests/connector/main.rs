@@ -14,14 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Integration tests for connectors (JDBC, Iceberg).
-
-use std::sync::Arc;
+//! Integration tests for supported connector infrastructure.
 
 use crate::common::TestConfig;
-use arrow::datatypes::{DataType, Field};
 use novarocks::connector;
-use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -47,29 +43,6 @@ fn test_connector_registry_new() {
     // Test creating a new empty registry
     let registry = connector::ConnectorRegistry::new();
     let _ = registry;
-}
-
-#[test]
-fn test_jdbc_connector_module() {
-    let cfg = novarocks::novarocks_connector_jdbc::JdbcScanConfig {
-        jdbc_url: "jdbc:sqlite::memory:".to_string(),
-        jdbc_user: None,
-        jdbc_passwd: None,
-        table: "lineorder".to_string(),
-        columns: vec!["lo_orderkey".to_string()],
-        filters: vec![],
-        limit: Some(1),
-        chunk_schema: Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                novarocks::common::ids::SlotId::new(1),
-                Field::new("lo_orderkey", DataType::Int64, true),
-                None,
-                None,
-            )])
-            .expect("chunk schema"),
-        ),
-    };
-    assert_eq!(cfg.table, "lineorder");
 }
 
 #[test]
