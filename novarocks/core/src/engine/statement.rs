@@ -30,10 +30,17 @@ use crate::engine::{
 };
 use crate::sql::parser::ast::{CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName};
 use crate::sql::parser::dialect::StarRocksDialect;
+use bytes::Bytes;
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::identifier::resolve_local_table_name;
 use novarocks_catalog::partition::LegacyRangePartition;
 use novarocks_catalog::schema::SqlType;
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
+    ConnectorDataType, ConnectorDefaultValue, ConnectorInstanceId, ConnectorNamespaceIdentity,
+    ConnectorPartitionTransform, ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind,
+    CreatePolicy,
+};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -837,23 +844,23 @@ pub(crate) fn execute_create_database_statement(
 ) -> Result<StatementResult, String> {
     let target =
         crate::engine::backend_resolver::resolve_namespace_target(state, name, current_catalog)?;
-    let backend = state
-        .connectors
-        .read()
-        .expect("connector registry read")
-        .catalog_backend(target.backend_name)?;
-    // When IF NOT EXISTS is specified, skip creation if the namespace already exists.
-    if if_not_exists
-        && crate::connector::metadata_namespace_exists(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            &target.catalog,
-            &target.namespace,
-        )?
-    {
-        return Ok(StatementResult::Ok);
-    }
-    backend.create_namespace(&target.catalog, &target.namespace)?;
+    let instance_id = mutation_instance_id(&target.catalog)?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        ConnectorCatalogMutationOperation::CreateNamespace {
+            namespace: ConnectorNamespaceIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace),
+            },
+            policy: if if_not_exists {
+                CreatePolicy::NoOpIfExists
+            } else {
+                CreatePolicy::FailIfExists
+            },
+        },
+        connector_context.clone(),
+    )?;
     Ok(StatementResult::Ok)
 }
 
@@ -921,37 +928,198 @@ pub(crate) fn execute_create_table_statement(
                 current_catalog,
                 current_database,
             )?;
-            let backend = state
-                .connectors
-                .read()
-                .expect("connector registry read")
-                .catalog_backend(target.backend_name)?;
-            // Honour `IF NOT EXISTS`: skip creation when the table already
-            // exists. CTAS has its own existence check in `iceberg_ctas`.
-            if stmt.if_not_exists
-                && crate::connector::metadata_table_exists(
-                    state.connector_control.as_ref(),
-                    connector_context.clone(),
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                )?
-            {
-                return Ok(StatementResult::Ok);
-            }
-            backend.create_table(crate::connector::backend::CreateTableRequest {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-                columns,
-                key_desc,
-                bucket_count,
-                partition_fields,
-                properties,
-            })?;
+            let instance_id = mutation_instance_id(&target.catalog)?;
+            let _ = bucket_count;
+            crate::connector::mutation::execute_catalog_mutation(
+                state.connector_control.as_ref(),
+                &instance_id,
+                ConnectorCatalogMutationOperation::CreateTable {
+                    table: ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from(target.namespace),
+                        table: Arc::from(target.table),
+                    },
+                    columns: columns
+                        .iter()
+                        .map(connector_column)
+                        .collect::<Result<_, _>>()?,
+                    key: key_desc.as_ref().map(connector_table_key),
+                    partitioning: partition_fields
+                        .iter()
+                        .map(connector_partition_transform)
+                        .collect(),
+                    properties: properties
+                        .into_iter()
+                        .map(|(key, value)| (Arc::from(key), Arc::from(value)))
+                        .collect(),
+                    policy: if stmt.if_not_exists {
+                        CreatePolicy::NoOpIfExists
+                    } else {
+                        CreatePolicy::FailIfExists
+                    },
+                },
+                connector_context.clone(),
+            )?;
             let _ = legacy_range_partitions;
             Ok(StatementResult::Ok)
         }
+    }
+}
+
+fn mutation_instance_id(catalog: &str) -> Result<ConnectorInstanceId, String> {
+    ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())
+}
+
+fn connector_column(
+    column: &crate::sql::parser::ast::TableColumnDef,
+) -> Result<ConnectorColumnDefinition, String> {
+    Ok(ConnectorColumnDefinition {
+        name: Arc::from(column.name.as_str()),
+        data_type: connector_data_type(&column.data_type)?,
+        nullable: column.nullable,
+        aggregation: column.aggregation.map(connector_column_aggregation),
+        default: column.default.as_ref().map(connector_default).transpose()?,
+    })
+}
+
+fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataType, String> {
+    Ok(match data_type {
+        SqlType::Boolean => ConnectorDataType::Boolean,
+        SqlType::TinyInt => ConnectorDataType::TinyInt,
+        SqlType::SmallInt => ConnectorDataType::SmallInt,
+        SqlType::Int => ConnectorDataType::Int,
+        SqlType::BigInt => ConnectorDataType::BigInt,
+        SqlType::LargeInt => ConnectorDataType::LargeInt,
+        SqlType::Float => ConnectorDataType::Float,
+        SqlType::Double => ConnectorDataType::Double,
+        SqlType::Decimal { precision, scale } => ConnectorDataType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        SqlType::String => ConnectorDataType::String,
+        SqlType::Json => ConnectorDataType::Json,
+        SqlType::Binary => ConnectorDataType::Binary,
+        SqlType::Bitmap => ConnectorDataType::Bitmap,
+        SqlType::Hll => ConnectorDataType::Hll,
+        SqlType::Date => ConnectorDataType::Date,
+        SqlType::DateTime => ConnectorDataType::DateTime,
+        SqlType::DateTimeNs => ConnectorDataType::DateTimeNs,
+        SqlType::Time => ConnectorDataType::Time,
+        SqlType::Array(element) => {
+            ConnectorDataType::Array(Box::new(connector_data_type(element)?))
+        }
+        SqlType::Map(key, value) => ConnectorDataType::Map(
+            Box::new(connector_data_type(key)?),
+            Box::new(connector_data_type(value)?),
+        ),
+        SqlType::Struct(fields) => ConnectorDataType::Struct(
+            fields
+                .iter()
+                .map(|(name, data_type)| {
+                    Ok(novarocks_spi::connector::ConnectorStructField {
+                        name: Arc::from(name.as_str()),
+                        data_type: connector_data_type(data_type)?,
+                        // SQL's current struct AST has no child-nullability bit.
+                        nullable: true,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+        ),
+        SqlType::Variant => ConnectorDataType::Variant,
+    })
+}
+
+fn connector_default(value: &DefaultLiteral) -> Result<ConnectorDefaultValue, String> {
+    Ok(match value {
+        DefaultLiteral::Null => ConnectorDefaultValue::Null,
+        DefaultLiteral::Bool(value) => ConnectorDefaultValue::Bool(*value),
+        DefaultLiteral::Int(value) => ConnectorDefaultValue::Int(*value),
+        DefaultLiteral::Float(value) => ConnectorDefaultValue::Float(*value),
+        DefaultLiteral::Decimal { unscaled, scale } => ConnectorDefaultValue::Decimal {
+            unscaled: *unscaled,
+            scale: *scale,
+        },
+        DefaultLiteral::String(value) => ConnectorDefaultValue::String(Arc::from(value.as_str())),
+        DefaultLiteral::Date(value) => ConnectorDefaultValue::Date(*value),
+        DefaultLiteral::DateTime(value) => ConnectorDefaultValue::DateTime(*value),
+        DefaultLiteral::Binary(value) => {
+            ConnectorDefaultValue::Binary(Bytes::copy_from_slice(value))
+        }
+    })
+}
+
+fn connector_column_aggregation(
+    aggregation: crate::sql::parser::ast::ColumnAggregation,
+) -> ConnectorColumnAggregation {
+    match aggregation {
+        crate::sql::parser::ast::ColumnAggregation::Sum => ConnectorColumnAggregation::Sum,
+        crate::sql::parser::ast::ColumnAggregation::Min => ConnectorColumnAggregation::Min,
+        crate::sql::parser::ast::ColumnAggregation::Max => ConnectorColumnAggregation::Max,
+        crate::sql::parser::ast::ColumnAggregation::Replace => ConnectorColumnAggregation::Replace,
+        crate::sql::parser::ast::ColumnAggregation::ReplaceIfNotNull => {
+            ConnectorColumnAggregation::ReplaceIfNotNull
+        }
+        crate::sql::parser::ast::ColumnAggregation::BitmapUnion => {
+            ConnectorColumnAggregation::BitmapUnion
+        }
+        crate::sql::parser::ast::ColumnAggregation::HllUnion => {
+            ConnectorColumnAggregation::HllUnion
+        }
+    }
+}
+
+fn connector_table_key(key: &crate::sql::parser::ast::TableKeyDesc) -> ConnectorTableKey {
+    ConnectorTableKey {
+        kind: match key.kind {
+            crate::sql::parser::ast::TableKeyKind::Duplicate => ConnectorTableKeyKind::Duplicate,
+            crate::sql::parser::ast::TableKeyKind::Unique => ConnectorTableKeyKind::Unique,
+            crate::sql::parser::ast::TableKeyKind::Aggregate => ConnectorTableKeyKind::Aggregate,
+            crate::sql::parser::ast::TableKeyKind::Primary => ConnectorTableKeyKind::Primary,
+        },
+        columns: key
+            .columns
+            .iter()
+            .map(|column| Arc::from(column.as_str()))
+            .collect(),
+    }
+}
+
+fn connector_partition_transform(
+    field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
+) -> ConnectorPartitionTransform {
+    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+    match field {
+        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Bucket {
+            column,
+            num_buckets,
+        } => ConnectorPartitionTransform::Bucket {
+            column: Arc::from(column.as_str()),
+            num_buckets: *num_buckets,
+        },
+        IcebergPartitionFieldExpr::Truncate { column, width } => {
+            ConnectorPartitionTransform::Truncate {
+                column: Arc::from(column.as_str()),
+                width: *width,
+            }
+        }
+        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
+            column: Arc::from(column.as_str()),
+        },
     }
 }
 

@@ -19,9 +19,9 @@
 #[cfg(test)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{Arc, RwLock, Weak};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -317,7 +317,7 @@ impl Default for StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
-            connector_control: Arc::new(TestConnectorControlRegistry),
+            connector_control: Arc::new(TestConnectorControlRegistry::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
@@ -351,21 +351,38 @@ impl Default for StandaloneState {
 }
 
 #[cfg(test)]
-struct TestConnectorControlRegistry;
+#[derive(Default)]
+struct TestConnectorControlRegistry {
+    bindings: Mutex<
+        std::collections::HashMap<
+            novarocks_spi::connector::ConnectorInstanceId,
+            Arc<novarocks_spi::connector::ConnectorControlBinding>,
+        >,
+    >,
+}
 
 #[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControlRegistry {
     fn acquire_current(
         &self,
-        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
         novarocks_spi::connector::ConnectorControlPlanningLease,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            "test connector control registry has no active binding",
-        ))
+        let binding = self
+            .bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    "test connector control registry has no active binding",
+                )
+            })?;
+        Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
     }
 }
 
@@ -373,15 +390,35 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
 impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnectorControlRegistry {
     fn acquire_current_mutation(
         &self,
-        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
         novarocks_spi::connector::ConnectorCatalogMutationLease,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            "test connector control registry has no active mutation binding",
-        ))
+        let binding = self
+            .bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    "test connector control registry has no active mutation binding",
+                )
+            })?;
+        let mutation = binding.mutation().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no mutation capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            binding.descriptor().clone(),
+            binding.incarnation(),
+            mutation,
+            || {},
+        )
     }
 }
 
@@ -389,15 +426,23 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
 impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
     fn register(
         &self,
-        _binding: novarocks_spi::connector::ConnectorControlBinding,
+        binding: novarocks_spi::connector::ConnectorControlBinding,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .insert(binding.descriptor().instance_id.clone(), Arc::new(binding));
         Ok(())
     }
 
     fn retire_current(
         &self,
-        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .remove(instance_id);
         Ok(())
     }
 }
@@ -5425,7 +5470,7 @@ mod tests {
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             Arc::new(super::TestNativeReportHandler),
             crate::query_execution::control::QueryControlService::for_test(),
-            Arc::new(super::TestConnectorControlRegistry),
+            Arc::new(super::TestConnectorControlRegistry::default()),
             0,
         )
     }

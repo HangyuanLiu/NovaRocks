@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 pub(crate) mod backend;
-pub(crate) mod mutation;
 pub mod file_execution;
 pub mod iceberg;
+pub(crate) mod mutation;
 pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;

@@ -32,21 +32,28 @@ use novarocks_fs::{
     FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
-    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
+    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
+    ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorControlBinding,
+    ConnectorDataType, ConnectorDefaultValue, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use serde::{Deserialize, Serialize};
 
 use super::catalog::IcebergCatalogEntry;
 use super::catalog::registry::{
-    IcebergCatalogRegistry, extract_data_files_with_stats_at, list_tables, load_table,
+    IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
+    extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
 };
 use super::reader::IcebergBatchReader;
 use super::scan_model::IcebergDataFileInfo;
@@ -482,6 +489,7 @@ impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
 
 #[derive(Clone)]
 pub(crate) struct IcebergControlProvider {
+    descriptor: ConnectorInstanceDescriptor,
     instance_id: ConnectorInstanceId,
     incarnation: ConnectorInstanceIncarnation,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
@@ -502,6 +510,7 @@ impl IcebergControlProvider {
         };
         let incarnation = ConnectorInstanceIncarnation::new();
         let provider = Arc::new(Self {
+            descriptor: descriptor.clone(),
             instance_id,
             incarnation,
             registry,
@@ -513,12 +522,12 @@ impl IcebergControlProvider {
             descriptor.clone(),
             incarnation,
             provider.clone(),
-            provider,
+            provider.clone(),
             Arc::new(IcebergInstanceDistribution {
                 descriptor,
                 incarnation,
             }),
-            None,
+            Some(provider),
         )
     }
 
@@ -683,6 +692,378 @@ impl IcebergControlProvider {
                 })
         })
     }
+}
+
+impl ConnectorCatalogMutation for IcebergControlProvider {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn execute(
+        &self,
+        request: ConnectorCatalogMutationRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        if let Err(error) = self.validate_context(&request.context) {
+            return Ok(known_uncommitted(error));
+        }
+        let operation_kind = request.operation.kind();
+        let result = match request.operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
+                if namespace.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "namespace mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                match namespace_exists(&entry, &namespace.namespace) {
+                    Ok(true) if policy == CreatePolicy::NoOpIfExists => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(true) => Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "namespace already exists",
+                    )),
+                    Ok(false) => create_namespace(&entry, &namespace.namespace)
+                        .map(|()| ExternalMutationEffect::Applied)
+                        .map_err(map_iceberg_error),
+                    Err(error) => Err(map_iceberg_error(error)),
+                }
+            }
+            ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
+                if namespace.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "namespace mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                match namespace_exists(&entry, &namespace.namespace) {
+                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(false) => Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "namespace does not exist",
+                    )),
+                    Ok(true) => drop_namespace(&entry, &namespace.namespace)
+                        .map(|()| ExternalMutationEffect::Applied)
+                        .map_err(map_iceberg_error),
+                    Err(error) => Err(map_iceberg_error(error)),
+                }
+            }
+            ConnectorCatalogMutationOperation::CreateTable {
+                table,
+                columns,
+                key,
+                partitioning,
+                properties,
+                policy,
+            } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "table mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let existing = list_tables(&entry, &table.namespace)
+                    .map_err(map_iceberg_error)
+                    .map(|tables| {
+                        tables
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
+                    });
+                match existing {
+                    Ok(true) if policy == CreatePolicy::NoOpIfExists => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(true) => Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "table already exists",
+                    )),
+                    Ok(false) => create_table(
+                        &entry,
+                        &table.namespace,
+                        &table.table,
+                        &columns
+                            .iter()
+                            .map(lower_column)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        key.as_ref().map(lower_key).transpose()?.as_ref(),
+                        &partitioning
+                            .iter()
+                            .map(lower_partition)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        &properties
+                            .iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .map(|()| ExternalMutationEffect::Applied)
+                    .map_err(map_iceberg_error),
+                    Err(error) => Err(error),
+                }
+            }
+            ConnectorCatalogMutationOperation::DropTable { table, policy, .. } => {
+                if table.instance_id != self.instance_id {
+                    return Ok(known_uncommitted(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "table mutation belongs to another connector instance",
+                    )));
+                }
+                let entry = match self.entry(self.instance_id.as_str()) {
+                    Ok(entry) => entry,
+                    Err(error) => return Ok(known_uncommitted(error)),
+                };
+                let existing = list_tables(&entry, &table.namespace)
+                    .map_err(map_iceberg_error)
+                    .map(|tables| {
+                        tables
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
+                    });
+                match existing {
+                    Ok(false) if policy == DropPolicy::NoOpIfMissing => {
+                        Ok(ExternalMutationEffect::NoOp)
+                    }
+                    Ok(false) => Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "table does not exist",
+                    )),
+                    Ok(true) => drop_table(&entry, &table.namespace, &table.table)
+                        .map(|()| ExternalMutationEffect::Applied)
+                        .map_err(map_iceberg_error),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("Iceberg catalog mutation `{operation_kind}` is not implemented"),
+            )),
+        };
+        match result {
+            Ok(effect) => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt: ConnectorCatalogMutationReceipt::try_new(
+                    self.descriptor.clone(),
+                    self.incarnation,
+                    request.operation_id,
+                    operation_kind,
+                    None,
+                )?,
+                finalization: ExternalMutationFinalization::Complete,
+            }),
+            Err(error) => Ok(known_uncommitted(error)),
+        }
+    }
+
+    fn reconcile(
+        &self,
+        _request: ConnectorCatalogMutationReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unsupported,
+                "Iceberg mutation did not produce reconcilable evidence",
+            ),
+        })
+    }
+}
+
+fn known_uncommitted(
+    error: ConnectorError,
+) -> ExternalMutationOutcome<ConnectorCatalogMutationReceipt> {
+    ExternalMutationOutcome::KnownUncommitted {
+        failure: ConnectorMutationFailure::new(
+            mutation_failure_kind(error.kind()),
+            error.to_string(),
+        ),
+    }
+}
+
+fn mutation_failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
+    match kind {
+        ConnectorErrorKind::InvalidRequest => ConnectorMutationFailureKind::InvalidRequest,
+        ConnectorErrorKind::NotFound => ConnectorMutationFailureKind::NotFound,
+        ConnectorErrorKind::PermissionDenied => ConnectorMutationFailureKind::PermissionDenied,
+        ConnectorErrorKind::Unsupported => ConnectorMutationFailureKind::Unsupported,
+        ConnectorErrorKind::Cancelled => ConnectorMutationFailureKind::Cancelled,
+        ConnectorErrorKind::DeadlineExceeded => ConnectorMutationFailureKind::DeadlineExceeded,
+        ConnectorErrorKind::ResourceExhausted => ConnectorMutationFailureKind::ResourceExhausted,
+        ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
+        ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
+        ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
+    }
+}
+
+fn lower_column(
+    column: &ConnectorColumnDefinition,
+) -> Result<crate::sql::parser::ast::TableColumnDef, ConnectorError> {
+    Ok(crate::sql::parser::ast::TableColumnDef {
+        name: column.name.to_string(),
+        data_type: lower_data_type(&column.data_type)?,
+        nullable: column.nullable,
+        aggregation: column.aggregation.map(|aggregation| match aggregation {
+            ConnectorColumnAggregation::Sum => crate::sql::parser::ast::ColumnAggregation::Sum,
+            ConnectorColumnAggregation::Min => crate::sql::parser::ast::ColumnAggregation::Min,
+            ConnectorColumnAggregation::Max => crate::sql::parser::ast::ColumnAggregation::Max,
+            ConnectorColumnAggregation::Replace => {
+                crate::sql::parser::ast::ColumnAggregation::Replace
+            }
+            ConnectorColumnAggregation::ReplaceIfNotNull => {
+                crate::sql::parser::ast::ColumnAggregation::ReplaceIfNotNull
+            }
+            ConnectorColumnAggregation::BitmapUnion => {
+                crate::sql::parser::ast::ColumnAggregation::BitmapUnion
+            }
+            ConnectorColumnAggregation::HllUnion => {
+                crate::sql::parser::ast::ColumnAggregation::HllUnion
+            }
+        }),
+        default: column.default.as_ref().map(lower_default).transpose()?,
+    })
+}
+
+fn lower_data_type(data_type: &ConnectorDataType) -> Result<SqlType, ConnectorError> {
+    Ok(match data_type {
+        ConnectorDataType::Boolean => SqlType::Boolean,
+        ConnectorDataType::TinyInt => SqlType::TinyInt,
+        ConnectorDataType::SmallInt => SqlType::SmallInt,
+        ConnectorDataType::Int => SqlType::Int,
+        ConnectorDataType::BigInt => SqlType::BigInt,
+        ConnectorDataType::LargeInt => SqlType::LargeInt,
+        ConnectorDataType::Float => SqlType::Float,
+        ConnectorDataType::Double => SqlType::Double,
+        ConnectorDataType::Decimal { precision, scale } => SqlType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        ConnectorDataType::String => SqlType::String,
+        ConnectorDataType::Binary => SqlType::Binary,
+        ConnectorDataType::Json => SqlType::Json,
+        ConnectorDataType::Bitmap => SqlType::Bitmap,
+        ConnectorDataType::Hll => SqlType::Hll,
+        ConnectorDataType::Date => SqlType::Date,
+        ConnectorDataType::DateTime => SqlType::DateTime,
+        ConnectorDataType::DateTimeNs => SqlType::DateTimeNs,
+        ConnectorDataType::Time => SqlType::Time,
+        ConnectorDataType::Array(element) => SqlType::Array(Box::new(lower_data_type(element)?)),
+        ConnectorDataType::Map(key, value) => SqlType::Map(
+            Box::new(lower_data_type(key)?),
+            Box::new(lower_data_type(value)?),
+        ),
+        ConnectorDataType::Struct(fields) => SqlType::Struct(
+            fields
+                .iter()
+                .map(|field| Ok((field.name.to_string(), lower_data_type(&field.data_type)?)))
+                .collect::<Result<_, ConnectorError>>()?,
+        ),
+        ConnectorDataType::Variant => SqlType::Variant,
+    })
+}
+
+fn lower_default(
+    value: &ConnectorDefaultValue,
+) -> Result<crate::sql::parser::ast::DefaultLiteral, ConnectorError> {
+    Ok(match value {
+        ConnectorDefaultValue::Null => crate::sql::parser::ast::DefaultLiteral::Null,
+        ConnectorDefaultValue::Bool(value) => crate::sql::parser::ast::DefaultLiteral::Bool(*value),
+        ConnectorDefaultValue::Int(value) => crate::sql::parser::ast::DefaultLiteral::Int(*value),
+        ConnectorDefaultValue::Float(value) => {
+            crate::sql::parser::ast::DefaultLiteral::Float(*value)
+        }
+        ConnectorDefaultValue::Decimal { unscaled, scale } => {
+            crate::sql::parser::ast::DefaultLiteral::Decimal {
+                unscaled: *unscaled,
+                scale: *scale,
+            }
+        }
+        ConnectorDefaultValue::String(value) => {
+            crate::sql::parser::ast::DefaultLiteral::String(value.to_string())
+        }
+        ConnectorDefaultValue::Date(value) => crate::sql::parser::ast::DefaultLiteral::Date(*value),
+        ConnectorDefaultValue::DateTime(value) => {
+            crate::sql::parser::ast::DefaultLiteral::DateTime(*value)
+        }
+        ConnectorDefaultValue::Binary(value) => {
+            crate::sql::parser::ast::DefaultLiteral::Binary(value.to_vec())
+        }
+    })
+}
+
+fn lower_key(
+    key: &novarocks_spi::connector::ConnectorTableKey,
+) -> Result<crate::sql::parser::ast::TableKeyDesc, ConnectorError> {
+    Ok(crate::sql::parser::ast::TableKeyDesc {
+        kind: match key.kind {
+            novarocks_spi::connector::ConnectorTableKeyKind::Duplicate => {
+                crate::sql::parser::ast::TableKeyKind::Duplicate
+            }
+            novarocks_spi::connector::ConnectorTableKeyKind::Unique => {
+                crate::sql::parser::ast::TableKeyKind::Unique
+            }
+            novarocks_spi::connector::ConnectorTableKeyKind::Aggregate => {
+                crate::sql::parser::ast::TableKeyKind::Aggregate
+            }
+            novarocks_spi::connector::ConnectorTableKeyKind::Primary => {
+                crate::sql::parser::ast::TableKeyKind::Primary
+            }
+        },
+        columns: key.columns.iter().map(ToString::to_string).collect(),
+    })
+}
+
+fn lower_partition(
+    transform: &ConnectorPartitionTransform,
+) -> Result<crate::sql::parser::ast::IcebergPartitionFieldExpr, ConnectorError> {
+    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+    Ok(match transform {
+        ConnectorPartitionTransform::Identity { column } => IcebergPartitionFieldExpr::Identity {
+            column: column.to_string(),
+        },
+        ConnectorPartitionTransform::Year { column } => IcebergPartitionFieldExpr::Year {
+            column: column.to_string(),
+        },
+        ConnectorPartitionTransform::Month { column } => IcebergPartitionFieldExpr::Month {
+            column: column.to_string(),
+        },
+        ConnectorPartitionTransform::Day { column } => IcebergPartitionFieldExpr::Day {
+            column: column.to_string(),
+        },
+        ConnectorPartitionTransform::Hour { column } => IcebergPartitionFieldExpr::Hour {
+            column: column.to_string(),
+        },
+        ConnectorPartitionTransform::Bucket {
+            column,
+            num_buckets,
+        } => IcebergPartitionFieldExpr::Bucket {
+            column: column.to_string(),
+            num_buckets: *num_buckets,
+        },
+        ConnectorPartitionTransform::Truncate { column, width } => {
+            IcebergPartitionFieldExpr::Truncate {
+                column: column.to_string(),
+                width: *width,
+            }
+        }
+        ConnectorPartitionTransform::Void { column } => IcebergPartitionFieldExpr::Void {
+            column: column.to_string(),
+        },
+    })
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2070,6 +2451,10 @@ mod tests {
         )
         .expect("scan handle");
         let provider = IcebergControlProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider"),
+                instance_id: instance_id.clone(),
+            },
             instance_id,
             incarnation: ConnectorInstanceIncarnation::from_bytes([0; 16]),
             registry: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),

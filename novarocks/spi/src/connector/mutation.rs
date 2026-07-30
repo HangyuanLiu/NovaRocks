@@ -26,9 +26,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorNamespaceIdentity, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorNamespaceIdentity,
+    ConnectorRequestContext, ConnectorTableIdentity,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -101,7 +101,10 @@ pub struct ConnectorMutationFailure {
 
 impl ConnectorMutationFailure {
     pub fn new(kind: ConnectorMutationFailureKind, message: impl Into<Arc<str>>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 
     pub const fn kind(&self) -> ConnectorMutationFailureKind {
@@ -175,7 +178,7 @@ pub enum ConnectorDataType {
     LargeInt,
     Float,
     Double,
-    Decimal { precision: u8, scale: u8 },
+    Decimal { precision: u8, scale: i8 },
     String,
     Binary,
     Json,
@@ -259,13 +262,32 @@ pub enum ConnectorPartitionTransform {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectorSchemaChange {
-    AddColumn { column: ConnectorColumnDefinition },
-    DropColumn { name: Arc<str>, if_exists: bool },
-    RenameColumn { from: Arc<str>, to: Arc<str> },
-    ModifyColumn { column: ConnectorColumnDefinition },
-    SetColumnNullability { name: Arc<str>, nullable: bool },
-    ReorderColumn { name: Arc<str>, after: Option<Arc<str>> },
-    SetColumnComment { name: Arc<str>, comment: Option<Arc<str>> },
+    AddColumn {
+        column: ConnectorColumnDefinition,
+    },
+    DropColumn {
+        name: Arc<str>,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: Arc<str>,
+        to: Arc<str>,
+    },
+    ModifyColumn {
+        column: ConnectorColumnDefinition,
+    },
+    SetColumnNullability {
+        name: Arc<str>,
+        nullable: bool,
+    },
+    ReorderColumn {
+        name: Arc<str>,
+        after: Option<Arc<str>>,
+    },
+    SetColumnComment {
+        name: Arc<str>,
+        comment: Option<Arc<str>>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,8 +332,14 @@ pub enum ConnectorDropTableDataDisposition {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectorCatalogMutationOperation {
-    CreateNamespace { namespace: ConnectorNamespaceIdentity, policy: CreatePolicy },
-    DropNamespace { namespace: ConnectorNamespaceIdentity, policy: DropPolicy },
+    CreateNamespace {
+        namespace: ConnectorNamespaceIdentity,
+        policy: CreatePolicy,
+    },
+    DropNamespace {
+        namespace: ConnectorNamespaceIdentity,
+        policy: DropPolicy,
+    },
     CreateTable {
         table: ConnectorTableIdentity,
         columns: Vec<ConnectorColumnDefinition>,
@@ -333,15 +361,27 @@ pub enum ConnectorCatalogMutationOperation {
         properties: Vec<(Arc<str>, Arc<str>)>,
         policy: CreateOrReplacePolicy,
     },
-    DropView { view: ConnectorViewIdentity, policy: DropPolicy },
-    AlterSchema { table: ConnectorTableIdentity, changes: Vec<ConnectorSchemaChange> },
+    DropView {
+        view: ConnectorViewIdentity,
+        policy: DropPolicy,
+    },
+    AlterSchema {
+        table: ConnectorTableIdentity,
+        changes: Vec<ConnectorSchemaChange>,
+    },
     AlterPartitionSpec {
         table: ConnectorTableIdentity,
         add: Vec<ConnectorPartitionTransform>,
         drop: Vec<ConnectorPartitionTransform>,
     },
-    AlterProperties { table: ConnectorTableIdentity, changes: Vec<ConnectorPropertyChange> },
-    AlterRef { table: ConnectorTableIdentity, action: ConnectorRefAction },
+    AlterProperties {
+        table: ConnectorTableIdentity,
+        changes: Vec<ConnectorPropertyChange>,
+    },
+    AlterRef {
+        table: ConnectorTableIdentity,
+        action: ConnectorRefAction,
+    },
 }
 
 impl ConnectorCatalogMutationOperation {
@@ -386,27 +426,53 @@ impl ConnectorCatalogMutationReceipt {
         operation_kind: impl Into<Arc<str>>,
         provider_version: Option<Bytes>,
     ) -> Result<Self, ConnectorError> {
-        if provider_version.as_ref().is_some_and(|value| value.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES) {
-            return Err(ConnectorError::new(ConnectorErrorKind::ResourceExhausted, "connector mutation receipt version exceeds the evidence limit"));
+        if provider_version
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector mutation receipt version exceeds the evidence limit",
+            ));
         }
-        Ok(Self { descriptor, incarnation, operation_id, operation_kind: operation_kind.into(), provider_version })
+        Ok(Self {
+            descriptor,
+            incarnation,
+            operation_id,
+            operation_kind: operation_kind.into(),
+            provider_version,
+        })
     }
 
-    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor { &self.descriptor }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation { self.incarnation }
-    pub const fn operation_id(&self) -> ConnectorMutationOperationId { self.operation_id }
-    pub fn operation_kind(&self) -> &str { &self.operation_kind }
-    pub fn provider_version(&self) -> Option<&Bytes> { self.provider_version.as_ref() }
+    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+    pub const fn operation_id(&self) -> ConnectorMutationOperationId {
+        self.operation_id
+    }
+    pub fn operation_kind(&self) -> &str {
+        &self.operation_kind
+    }
+    pub fn provider_version(&self) -> Option<&Bytes> {
+        self.provider_version.as_ref()
+    }
 }
 
 impl fmt::Debug for ConnectorCatalogMutationReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("ConnectorCatalogMutationReceipt")
+        formatter
+            .debug_struct("ConnectorCatalogMutationReceipt")
             .field("descriptor", &self.descriptor)
             .field("incarnation", &self.incarnation)
             .field("operation_id", &self.operation_id)
             .field("operation_kind", &self.operation_kind)
-            .field("provider_version_len", &self.provider_version.as_ref().map(Bytes::len))
+            .field(
+                "provider_version_len",
+                &self.provider_version.as_ref().map(Bytes::len),
+            )
             .finish()
     }
 }
@@ -431,17 +497,39 @@ impl ExternalMutationEvidence {
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         if provider_payload.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
-            return Err(ConnectorError::new(ConnectorErrorKind::ResourceExhausted, "external mutation evidence exceeds 64 KiB"));
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "external mutation evidence exceeds 64 KiB",
+            ));
         }
-        Ok(Self { schema_version, descriptor, incarnation, operation_id, operation_kind: operation_kind.into(), provider_payload })
+        Ok(Self {
+            schema_version,
+            descriptor,
+            incarnation,
+            operation_id,
+            operation_kind: operation_kind.into(),
+            provider_payload,
+        })
     }
 
-    pub const fn schema_version(&self) -> u16 { self.schema_version }
-    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor { &self.descriptor }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation { self.incarnation }
-    pub const fn operation_id(&self) -> ConnectorMutationOperationId { self.operation_id }
-    pub fn operation_kind(&self) -> &str { &self.operation_kind }
-    pub fn provider_payload(&self) -> &Bytes { &self.provider_payload }
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+    pub const fn operation_id(&self) -> ConnectorMutationOperationId {
+        self.operation_id
+    }
+    pub fn operation_kind(&self) -> &str {
+        &self.operation_kind
+    }
+    pub fn provider_payload(&self) -> &Bytes {
+        &self.provider_payload
+    }
 
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -461,7 +549,8 @@ impl ExternalMutationEvidence {
 
 impl fmt::Debug for ExternalMutationEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("ExternalMutationEvidence")
+        formatter
+            .debug_struct("ExternalMutationEvidence")
             .field("schema_version", &self.schema_version)
             .field("descriptor", &self.descriptor)
             .field("incarnation", &self.incarnation)
@@ -523,7 +612,10 @@ impl ConnectorCatalogMutationLease {
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
         if mutation.descriptor() != &descriptor || mutation.incarnation() != incarnation {
-            return Err(ConnectorError::new(ConnectorErrorKind::InvalidRequest, "connector mutation capability does not match its lease generation"));
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector mutation capability does not match its lease generation",
+            ));
         }
         Ok(Self {
             descriptor,
@@ -535,8 +627,12 @@ impl ConnectorCatalogMutationLease {
         })
     }
 
-    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor { &self.descriptor }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation { self.incarnation }
+    pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
 
     pub fn execute(
         &self,
@@ -560,16 +656,27 @@ impl ConnectorCatalogMutationLease {
         Ok(outcome)
     }
 
-    fn validate_request(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
-        if request.target.instance_id != self.descriptor.instance_id || request.target.incarnation != self.incarnation {
-            return Err(ConnectorError::new(ConnectorErrorKind::InvalidRequest, "connector mutation request does not match its lease generation"));
+    fn validate_request(
+        &self,
+        request: &ConnectorCatalogMutationRequest,
+    ) -> Result<(), ConnectorError> {
+        if request.target.instance_id != self.descriptor.instance_id
+            || request.target.incarnation != self.incarnation
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector mutation request does not match its lease generation",
+            ));
         }
         Ok(())
     }
 
     fn validate_evidence(&self, evidence: &ExternalMutationEvidence) -> Result<(), ConnectorError> {
         if evidence.descriptor() != &self.descriptor || evidence.incarnation() != self.incarnation {
-            return Err(ConnectorError::new(ConnectorErrorKind::InvalidRequest, "external mutation evidence does not match its lease generation"));
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "external mutation evidence does not match its lease generation",
+            ));
         }
         Ok(())
     }
@@ -582,14 +689,26 @@ impl ConnectorCatalogMutationLease {
     ) -> Result<(), ConnectorError> {
         match outcome {
             ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
-                if receipt.descriptor() != &self.descriptor || receipt.incarnation() != self.incarnation || receipt.operation_id() != operation_id || receipt.operation_kind() != operation_kind {
-                    return Err(ConnectorError::new(ConnectorErrorKind::InvalidRequest, "connector mutation receipt does not match its request"));
+                if receipt.descriptor() != &self.descriptor
+                    || receipt.incarnation() != self.incarnation
+                    || receipt.operation_id() != operation_id
+                    || receipt.operation_kind() != operation_kind
+                {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "connector mutation receipt does not match its request",
+                    ));
                 }
             }
             ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
                 self.validate_evidence(evidence)?;
-                if evidence.operation_id() != operation_id || evidence.operation_kind() != operation_kind {
-                    return Err(ConnectorError::new(ConnectorErrorKind::InvalidRequest, "external mutation evidence does not match its request"));
+                if evidence.operation_id() != operation_id
+                    || evidence.operation_kind() != operation_kind
+                {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "external mutation evidence does not match its request",
+                    ));
                 }
             }
             ExternalMutationOutcome::KnownUncommitted { .. } => {}
@@ -600,7 +719,11 @@ impl ConnectorCatalogMutationLease {
 
 impl Drop for MutationLeaseRelease {
     fn drop(&mut self) {
-        let Ok(mut release) = self.release.lock() else { return; };
-        if let Some(release) = release.take() { release(); }
+        let Ok(mut release) = self.release.lock() else {
+            return;
+        };
+        if let Some(release) = release.take() {
+            release();
+        }
     }
 }

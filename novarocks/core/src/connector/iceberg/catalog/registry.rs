@@ -632,12 +632,9 @@ pub(crate) fn create_table(
         table_creation.build()
     };
 
-    // For Hadoop catalogs, ensure the namespace exists before table creation.
-    // Remote catalogs (REST / Hive) manage namespace separately via CREATE DATABASE.
-    if !entry.uses_remote_catalog() {
-        let _ =
-            block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
-    }
+    // Namespace creation is a separate externally-visible mutation.  In
+    // particular, CREATE TABLE must not make a missing namespace observable
+    // as a successful side effect on Hadoop catalogs.
     block_on_iceberg(async { catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("create iceberg table failed: {e}"))?;

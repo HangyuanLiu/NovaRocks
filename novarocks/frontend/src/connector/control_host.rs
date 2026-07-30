@@ -238,17 +238,29 @@ impl ConnectorControlHost {
             let key = state.active.get(instance_id).cloned().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
-                    format!("connector control instance `{}` is not active", instance_id.as_str()),
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
                 )
             })?;
             let generation = state.generations.get_mut(&key).ok_or_else(|| {
-                ConnectorError::new(ConnectorErrorKind::Internal, "active connector control generation is missing")
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "active connector control generation is missing",
+                )
             })?;
             if generation.state != ControlGenerationState::Active {
-                return Err(ConnectorError::new(ConnectorErrorKind::Unavailable, "connector control generation is retiring"));
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
             }
             let mutation = generation.binding.mutation().cloned().ok_or_else(|| {
-                ConnectorError::new(ConnectorErrorKind::Unsupported, "connector control generation has no catalog mutation capability")
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no catalog mutation capability",
+                )
             })?;
             generation.mutation_leases = generation.mutation_leases.saturating_add(1);
             (
@@ -363,9 +375,15 @@ fn release_mutation_lease(
     retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     key: ConnectorExecutionBindingKey,
 ) {
-    let Some(host_state) = state.upgrade() else { return; };
-    let Ok(mut state) = host_state.lock() else { return; };
-    let Some(generation) = state.generations.get_mut(&key) else { return; };
+    let Some(host_state) = state.upgrade() else {
+        return;
+    };
+    let Ok(mut state) = host_state.lock() else {
+        return;
+    };
+    let Some(generation) = state.generations.get_mut(&key) else {
+        return;
+    };
     generation.mutation_leases = generation.mutation_leases.saturating_sub(1);
     let retirement = (generation.state == ControlGenerationState::Retiring
         && generation.planning_leases == 0
@@ -373,9 +391,15 @@ fn release_mutation_lease(
         .then(|| queue_retirement(&mut state, key))
         .flatten();
     drop(state);
-    let Some(retirement) = retirement else { return; };
-    let Some(slot) = retirement_sink.upgrade() else { return; };
-    let Ok(slot) = slot.lock() else { return; };
+    let Some(retirement) = retirement else {
+        return;
+    };
+    let Some(slot) = retirement_sink.upgrade() else {
+        return;
+    };
+    let Ok(slot) = slot.lock() else {
+        return;
+    };
     let sink = slot.clone();
     if let Some(sink) = sink {
         drop(slot);

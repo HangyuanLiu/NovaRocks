@@ -61,9 +61,9 @@ pub use mutation::{
     ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyChange,
     ConnectorRefAction, ConnectorRefKind, ConnectorSchemaChange, ConnectorStructField,
     ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewDefinition, ConnectorViewDialect,
-    ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,

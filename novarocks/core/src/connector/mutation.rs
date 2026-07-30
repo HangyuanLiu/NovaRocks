@@ -72,11 +72,22 @@ fn resolve_outcome(
         outcome => outcome,
     };
     match outcome {
-        ExternalMutationOutcome::KnownCommitted { effect, receipt, finalization } => {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } => {
             if let ExternalMutationFinalization::Failed(failure) = &finalization {
-                return Err(EngineError::commit_known_committed_finalize_failed(failure.to_string()).to_string());
+                return Err(EngineError::commit_known_committed_finalize_failed(
+                    failure.to_string(),
+                )
+                .to_string());
             }
-            Ok(CompletedCatalogMutation { effect, receipt, finalization })
+            Ok(CompletedCatalogMutation {
+                effect,
+                receipt,
+                finalization,
+            })
         }
         ExternalMutationOutcome::KnownUncommitted { failure } => {
             Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
@@ -96,18 +107,20 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
         ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-        ConnectorCatalogMutationResolver, ConnectorError,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorProviderId,
-        ConnectorRequestContext, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
-        ExternalMutationFinalization, ExternalMutationOutcome,
+        ConnectorCatalogMutationResolver, ConnectorError, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationFailure,
+        ConnectorMutationFailureKind, ConnectorProviderId, ConnectorRequestContext, CreatePolicy,
+        ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+        ExternalMutationOutcome,
     };
 
     use super::*;
 
     struct NeverCancelled;
     impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool { false }
+        fn is_cancelled(&self) -> bool {
+            false
+        }
     }
 
     struct UnknownMutation {
@@ -116,18 +129,46 @@ mod tests {
     }
 
     impl ConnectorCatalogMutation for UnknownMutation {
-        fn descriptor(&self) -> &ConnectorInstanceDescriptor { &self.descriptor }
-        fn incarnation(&self) -> ConnectorInstanceIncarnation { self.incarnation }
-        fn execute(&self, request: ConnectorCatalogMutationRequest) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+            self.incarnation
+        }
+        fn execute(
+            &self,
+            request: ConnectorCatalogMutationRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
             Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Unavailable, "response lost"),
-                evidence: ExternalMutationEvidence::try_new(1, self.descriptor.clone(), self.incarnation, request.operation_id, request.operation.kind(), Bytes::from_static(b"test"))?,
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "response lost",
+                ),
+                evidence: ExternalMutationEvidence::try_new(
+                    1,
+                    self.descriptor.clone(),
+                    self.incarnation,
+                    request.operation_id,
+                    request.operation.kind(),
+                    Bytes::from_static(b"test"),
+                )?,
             })
         }
-        fn reconcile(&self, request: ConnectorCatalogMutationReconcileRequest) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        fn reconcile(
+            &self,
+            request: ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
+        {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
-                receipt: ConnectorCatalogMutationReceipt::try_new(self.descriptor.clone(), self.incarnation, request.evidence.operation_id(), request.evidence.operation_kind(), None)?,
+                receipt: ConnectorCatalogMutationReceipt::try_new(
+                    self.descriptor.clone(),
+                    self.incarnation,
+                    request.evidence.operation_id(),
+                    request.evidence.operation_kind(),
+                    None,
+                )?,
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
@@ -135,8 +176,17 @@ mod tests {
 
     struct Resolver(Arc<UnknownMutation>);
     impl ConnectorCatalogMutationResolver for Resolver {
-        fn acquire_current_mutation(&self, _instance_id: &ConnectorInstanceId) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError> {
-            novarocks_spi::connector::ConnectorCatalogMutationLease::new(self.0.descriptor.clone(), self.0.incarnation, self.0.clone(), || {})
+        fn acquire_current_mutation(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+                self.0.descriptor.clone(),
+                self.0.incarnation,
+                self.0.clone(),
+                || {},
+            )
         }
     }
 
@@ -146,16 +196,29 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance"),
         };
-        let mutation = Arc::new(UnknownMutation { descriptor: descriptor.clone(), incarnation: ConnectorInstanceIncarnation::from_bytes([3; 16]) });
+        let mutation = Arc::new(UnknownMutation {
+            descriptor: descriptor.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([3; 16]),
+        });
         let result = execute_catalog_mutation(
             &Resolver(mutation),
             &descriptor.instance_id,
             ConnectorCatalogMutationOperation::CreateNamespace {
-                namespace: novarocks_spi::connector::ConnectorNamespaceIdentity { instance_id: descriptor.instance_id.clone(), namespace: Arc::from("db") },
+                namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                    instance_id: descriptor.instance_id.clone(),
+                    namespace: Arc::from("db"),
+                },
                 policy: CreatePolicy::FailIfExists,
             },
-            ConnectorRequestContext::try_new(Instant::now() + Duration::from_secs(1), Arc::new(NeverCancelled), 1024, 1024).expect("context"),
-        ).expect("reconciled committed result");
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(NeverCancelled),
+                1024,
+                1024,
+            )
+            .expect("context"),
+        )
+        .expect("reconciled committed result");
         assert_eq!(result.effect, ExternalMutationEffect::Applied);
     }
 }

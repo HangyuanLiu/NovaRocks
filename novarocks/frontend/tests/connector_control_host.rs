@@ -22,15 +22,15 @@ use novarocks_frontend::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReconcileRequest,
-    ConnectorCatalogMutationRequest, ConnectorCatalogMutationResolver, ConnectorControlBinding,
-    ConnectorControlResolver, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
+    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
+    ConnectorCatalogMutationResolver, ConnectorControlBinding, ConnectorControlResolver,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan,
     ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorCatalogMutationReceipt, ExternalMutationOutcome,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationOutcome,
 };
 
 struct TestControl {
@@ -169,7 +169,10 @@ fn binding_with_mutation(incarnation: u8) -> ConnectorControlBinding {
         provider.clone(),
         provider.clone(),
         provider,
-        Some(Arc::new(TestMutation { descriptor, incarnation })),
+        Some(Arc::new(TestMutation {
+            descriptor,
+            incarnation,
+        })),
     )
     .expect("control binding with mutation")
 }
@@ -217,18 +220,24 @@ fn lease_drain_dispatches_retirement_to_installed_backends() {
 fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    host.register(binding(7)).expect("register no-mutation generation");
+    host.register(binding(7))
+        .expect("register no-mutation generation");
     let error = match host.acquire_current_mutation(&instance_id) {
         Ok(_) => panic!("missing capability must fail"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-    host.retire_current(&instance_id).expect("retire no-mutation generation");
+    host.retire_current(&instance_id)
+        .expect("retire no-mutation generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
-    host.register(binding_with_mutation(8)).expect("register replacement generation");
+    host.register(binding_with_mutation(8))
+        .expect("register replacement generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
-    let mutation = host.acquire_current_mutation(&instance_id).expect("mutation lease");
-    host.retire_current(&instance_id).expect("retire generation");
+    let mutation = host
+        .acquire_current_mutation(&instance_id)
+        .expect("mutation lease");
+    host.retire_current(&instance_id)
+        .expect("retire generation");
     assert!(host.take_ready_retires().expect("retire queue").is_empty());
     drop(planning);
     assert!(host.take_ready_retires().expect("retire queue").is_empty());

@@ -18,11 +18,11 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorCatalogMutation, ConnectorCatalogMutationResolver, ConnectorMetadata,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplit,
-    ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorTableHandle,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -152,7 +152,9 @@ pub trait ConnectorControlResolver: Send + Sync {
 
 /// Lifecycle port owned by the frontend composition root. Core may register
 /// or retire a logical control generation, but it never owns the registry.
-pub trait ConnectorControlRegistry: ConnectorControlResolver + ConnectorCatalogMutationResolver {
+pub trait ConnectorControlRegistry:
+    ConnectorControlResolver + ConnectorCatalogMutationResolver
+{
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;
 
     fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError>;
