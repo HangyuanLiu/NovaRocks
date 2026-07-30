@@ -23,7 +23,8 @@ use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
     QueryControlAttach, QueryControlEvent, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
-    QueryLifecycleLease,
+    QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStageOutcome, QueryStartAck,
+    QueryStartOutcome, StageBatch,
 };
 
 use super::QueryLifecycleTransport;
@@ -42,6 +43,8 @@ pub(crate) struct FrontendQueryLifecycleConfig {
     heartbeat_timeout: Duration,
     init_rpc_timeout: Duration,
     attach_timeout: Duration,
+    stage_rpc_timeout: Duration,
+    start_rpc_timeout: Duration,
 }
 
 impl FrontendQueryLifecycleConfig {
@@ -73,7 +76,24 @@ impl FrontendQueryLifecycleConfig {
             heartbeat_timeout,
             init_rpc_timeout,
             attach_timeout,
+            stage_rpc_timeout: Duration::from_secs(5),
+            start_rpc_timeout: Duration::from_secs(2),
         })
+    }
+
+    pub(crate) fn with_stage_start_timeouts(
+        mut self,
+        stage_rpc_timeout: Duration,
+        start_rpc_timeout: Duration,
+    ) -> Result<Self, DistributedQueryError> {
+        if stage_rpc_timeout.is_zero() || start_rpc_timeout.is_zero() {
+            return Err(contract_error(
+                "frontend Stage/Start RPC timeouts must be nonzero",
+            ));
+        }
+        self.stage_rpc_timeout = stage_rpc_timeout;
+        self.start_rpc_timeout = start_rpc_timeout;
+        Ok(self)
     }
 
     pub(super) const fn heartbeat_interval(self) -> Duration {
@@ -90,6 +110,14 @@ impl FrontendQueryLifecycleConfig {
 
     pub(super) const fn attach_timeout(self) -> Duration {
         self.attach_timeout
+    }
+
+    pub(super) const fn stage_rpc_timeout(self) -> Duration {
+        self.stage_rpc_timeout
+    }
+
+    pub(super) const fn start_rpc_timeout(self) -> Duration {
+        self.start_rpc_timeout
     }
 }
 
@@ -317,6 +345,162 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
 
         Ok(pre_ready_guard.into_lease())
     }
+}
+
+impl QueryLaunchBarrier for FrontendQueryLifecycleBarrier {
+    fn stage_all(&self, batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
+        if let Some(reason) = self.cancellation_message() {
+            return Err(failed(reason));
+        }
+        let mut failures = std::thread::scope(|scope| {
+            let handles = batches
+                .iter()
+                .map(|batch| {
+                    scope.spawn(move || stage_one(self.transport.as_ref(), batch, self.config))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err((backend, error))) => Some((backend, error)),
+                    Err(_) => Some((usize::MAX, "StageFragments worker panicked".to_string())),
+                })
+                .collect::<Vec<_>>()
+        });
+        failures.sort_by_key(|(backend, _)| *backend);
+        failures
+            .into_iter()
+            .next()
+            .map_or(Ok(()), |(_, error)| Err(failed(error)))
+    }
+
+    fn start_all(&self, batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
+        if let Some(reason) = self.cancellation_message() {
+            return Err(failed(reason));
+        }
+        let mut failures = std::thread::scope(|scope| {
+            let handles = batches
+                .iter()
+                .map(|batch| {
+                    scope.spawn(move || start_one(self.transport.as_ref(), batch, self.config))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err((backend, error))) => Some((backend, error)),
+                    Err(_) => Some((usize::MAX, "StartPreparedQuery worker panicked".to_string())),
+                })
+                .collect::<Vec<_>>()
+        });
+        failures.sort_by_key(|(backend, _)| *backend);
+        failures
+            .into_iter()
+            .next()
+            .map_or(Ok(()), |(_, error)| Err(failed(error)))
+    }
+}
+
+fn stage_one(
+    transport: &dyn QueryLifecycleTransport,
+    batch: &StageBatch,
+    config: FrontendQueryLifecycleConfig,
+) -> Result<(), (usize, String)> {
+    let target = batch.binding().target();
+    let request = batch.request();
+    let first = transport.stage_fragments(target, request, config.stage_rpc_timeout());
+    let ack = match first {
+        Ok(ack) => ack,
+        Err(error) if error.is_unknown_stage_or_start_outcome() => transport
+            .stage_fragments(target, request, config.stage_rpc_timeout())
+            .map_err(|retry| (target.backend_idx(), format!(
+                "backend {} StageFragments retry failed after unknown outcome ({error}): {retry}",
+                target.backend_idx()
+            )))?,
+        Err(error) => return Err((target.backend_idx(), format!(
+            "backend {} StageFragments failed: {error}", target.backend_idx()
+        ))),
+    };
+    validate_stage_ack(target.backend_idx(), request, &ack)
+}
+
+fn start_one(
+    transport: &dyn QueryLifecycleTransport,
+    batch: &StageBatch,
+    config: FrontendQueryLifecycleConfig,
+) -> Result<(), (usize, String)> {
+    let target = batch.binding().target();
+    let request = batch.start_request();
+    let first = transport.start_prepared_query(target, &request, config.start_rpc_timeout());
+    let ack = match first {
+        Ok(ack) => ack,
+        Err(error) if error.is_unknown_stage_or_start_outcome() => transport
+            .start_prepared_query(target, &request, config.start_rpc_timeout())
+            .map_err(|retry| (target.backend_idx(), format!(
+                "backend {} StartPreparedQuery retry failed after unknown outcome ({error}): {retry}",
+                target.backend_idx()
+            )))?,
+        Err(error) => return Err((target.backend_idx(), format!(
+            "backend {} StartPreparedQuery failed: {error}", target.backend_idx()
+        ))),
+    };
+    validate_start_ack(target.backend_idx(), &request, &ack)
+}
+
+fn validate_stage_ack(
+    backend_idx: usize,
+    request: &novarocks::query_execution::lifecycle::QueryStageRequest,
+    ack: &QueryStageAck,
+) -> Result<(), (usize, String)> {
+    if ack.execution_id() != request.execution_id()
+        || ack.digest_version() != request.digest_version()
+        || ack.digest() != request.digest()
+    {
+        return Err((
+            backend_idx,
+            format!("backend {backend_idx} StageFragments ACK echo mismatch"),
+        ));
+    }
+    if !ack.outcome().is_staged() {
+        return Err((
+            backend_idx,
+            format!(
+                "backend {backend_idx} StageFragments rejected with {:?}: {}",
+                ack.outcome(),
+                ack.detail()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_start_ack(
+    backend_idx: usize,
+    request: &novarocks::query_execution::lifecycle::QueryStartRequest,
+    ack: &QueryStartAck,
+) -> Result<(), (usize, String)> {
+    if ack.execution_id() != request.execution_id()
+        || ack.digest_version() != request.digest_version()
+        || ack.digest() != request.digest()
+    {
+        return Err((
+            backend_idx,
+            format!("backend {backend_idx} StartPreparedQuery ACK echo mismatch"),
+        ));
+    }
+    if !ack.outcome().is_running() {
+        return Err((
+            backend_idx,
+            format!(
+                "backend {backend_idx} StartPreparedQuery rejected with {:?}: {}",
+                ack.outcome(),
+                ack.detail()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn init_all(
