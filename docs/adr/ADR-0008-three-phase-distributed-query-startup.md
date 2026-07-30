@@ -10,7 +10,7 @@ provenance:
   - "discussion: 2026-07-27 three-phase distributed query startup"
 code-anchors:
   - "novarocks/frontend/src/coordinator/execution.rs (FrontendDistributedQueryCoordinator::execute_request)"
-  - "novarocks/core/src/query_execution/fragment_transport.rs (FragmentDispatcher::submit_fragment)"
+  - "novarocks/core/src/query_execution/artifact.rs (StagePreparedDistributedQuery)"
   - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry)"
 ---
 
@@ -21,11 +21,11 @@ NovaRocks 的分布式查询应如何在所有参与方建立 query-level 控制
 
 ## 背景与执行事实
 
-当前 `FrontendDistributedQueryCoordinator::execute_request` 位于
-`novarocks/frontend/src/coordinator/execution.rs`，并通过
-`novarocks/core/src/query_execution/fragment_transport.rs` 中的 `FragmentDispatcher::submit_fragment` 逐个提交
-fragment。提交成功的 fragment 可以先于同一 BE 的其余 fragment 进入执行；如果后续提交失败或 unary RPC 的结果未知，
-coordinator 无法仅凭已返回的 ACK 证明该 BE 获得了完整的本地 fragment 集合，也无法撤销已经对外可见的局部构建。
+`FrontendDistributedQueryCoordinator::execute_request` 位于
+`novarocks/frontend/src/coordinator/execution.rs`。native production path 先由
+`novarocks/core/src/query_execution/artifact.rs` 冻结每个 participant 的精确 Stage batch，再依次经过全部
+`StageFragments` ACK 与全部 `StartPreparedQuery` ACK；不再通过 `FragmentDispatcher::submit_fragment` 逐个启动
+fragment。BE 在同一 batch 的 dormant worker 共享 `StartGate`，因此 Stage 成功但 Start 之前 driver 不可调度。
 
 BE 的 query-level participant entry 由
 `novarocks/backend/src/query_lifecycle/registry.rs` 中的 `QueryLifecycleRegistry` 管理，本地 query-scoped 执行资源仍由
