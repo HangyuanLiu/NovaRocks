@@ -112,7 +112,7 @@ core 只通过一对一 typed engine port 保留 query、connector 和 external 
 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque handles，不以 service locator、core callback、
 metadata fallback 或公共 SPI 模糊 owner。
 
-- ADR-0017 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
+- ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 
 ### table-maintenance
 

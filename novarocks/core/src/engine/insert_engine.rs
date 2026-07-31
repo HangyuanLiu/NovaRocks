@@ -231,7 +231,7 @@ pub enum IcebergWriteReport {
 }
 
 /// Transitional one-to-one core domain port used by frontend DML.
-// Design: ADR-0017 (docs/adr/ADR-0017-frontend-insert-application-owner.md)
+// Design: ADR-0019 (docs/adr/ADR-0019-frontend-insert-application-owner.md)
 pub trait InsertEngine: StatisticsEngine + Send + Sync {
     fn resolve_target(&self, request: ResolveInsertTarget) -> Result<ResolvedInsertTarget, String>;
 

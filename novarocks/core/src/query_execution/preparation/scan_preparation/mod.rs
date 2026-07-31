@@ -187,7 +187,7 @@ fn prepare_scan_node(
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
         ResolvedScanExecution::IcebergFiles(files) => {
-            // Design: ADR-0017 (docs/adr/ADR-0017-static-connector-predicate-disposition.md)
+            // Design: ADR-0018 (docs/adr/ADR-0018-static-connector-predicate-disposition.md)
             let static_predicates = options
                 .enable_connector_static_predicate_pushdown
                 .then(|| {
