@@ -252,6 +252,10 @@ if ! (
 fi
 
 run_cargo_gates_text="$(declare -f run_cargo_gates)"
+if ! grep -q 'tools/ci/check-generated-artifacts.sh' <<<"$run_cargo_gates_text"; then
+  echo "local-full-ci must run the generated artifact hygiene guard" >&2
+  exit 1
+fi
 if grep -q -- '--features compat' <<<"$run_cargo_gates_text"; then
   echo "default cargo gates must not build or test compat" >&2
   exit 1
