@@ -637,6 +637,7 @@ mod tests {
             novarocks::query_execution::lifecycle::QueryLifecycleError,
         > {
             let (events, receiver) = tokio::sync::mpsc::channel(32);
+            let (_observations, observations) = tokio::sync::watch::channel(None);
             events
                 .try_send(novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady)
                 .expect("publish test ControlReady");
@@ -644,6 +645,7 @@ mod tests {
                 novarocks::query_execution::lifecycle::QueryControlAttachment {
                     control: Arc::new(ReadyQueryControl { events }),
                     events: receiver,
+                    observations,
                 },
             )
         }

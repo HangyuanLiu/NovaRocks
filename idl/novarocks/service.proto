@@ -294,6 +294,21 @@ message QueryControlTerminationAccepted {
 
 message QueryControlLocalDrained {}
 
+// Best-effort, typed native fragment observation carried by the active query
+// control stream. It is deliberately independent from terminal delivery: a
+// dropped or stale observation never changes query correctness.
+message FragmentLiveObservation {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  ParticipantBackendIdentity backend = 3;
+  novarocks.common.UniqueId fragment_instance_id = 4;
+  uint64 sequence = 5;
+  uint64 input_rows = 6;
+  uint64 output_rows = 7;
+  uint64 elapsed_ms = 8;
+  optional RuntimeProfileTree profile = 9;
+}
+
 message QueryControlResponse {
   oneof event {
     QueryControlReady control_ready = 1;
@@ -302,6 +317,7 @@ message QueryControlResponse {
     QueryControlTerminationAccepted termination_accepted = 4;
     QueryControlLocalDrained local_drained = 5;
     QueryTerminalSnapshot terminal_snapshot = 6;
+    FragmentLiveObservation fragment_observation = 7;
   }
 }
 

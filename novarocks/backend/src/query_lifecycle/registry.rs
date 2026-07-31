@@ -24,17 +24,19 @@ use novarocks::UniqueId;
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, FragmentTerminalOutcome, FragmentTerminalSnapshot,
-    ImmutableQueryTerminalRecord, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
-    QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
-    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
+    BackendQueryControl, FragmentLiveObservation, FragmentTerminalOutcome,
+    FragmentTerminalSnapshot, ImmutableQueryTerminalRecord, ParticipantManifestDigest,
+    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
+    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+    QueryLifecycleTransportError, QueryLifecycleTransportErrorKind, QueryStageAck,
+    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
+    QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
     QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
+use novarocks::runtime::profile::RuntimeProfileTree;
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use prost::Message;
 
@@ -896,6 +898,7 @@ impl QueryLifecycleRegistry {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(
             CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
         );
+        let (observations_tx, observations_rx) = tokio::sync::watch::channel(None);
         events_tx
             .try_send(QueryControlEvent::ControlReady)
             .map_err(|error| {
@@ -959,6 +962,7 @@ impl QueryLifecycleRegistry {
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
+            state.observations = Some(observations_tx);
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
@@ -996,7 +1000,79 @@ impl QueryLifecycleRegistry {
                 execution_id: attach.execution_id(),
             }),
             events: events_rx,
+            observations: observations_rx,
         })
+    }
+
+    /// Publishes a best-effort, latest-only fragment observation. This path is
+    /// intentionally unable to wait on transport I/O or mutate correctness
+    /// state: a full/stalled stream may lose observations but must still carry
+    /// heartbeat acknowledgements, drain barriers, and terminal facts.
+    pub(crate) fn publish_fragment_observation(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        input_rows: u64,
+        output_rows: u64,
+        elapsed_ms: u64,
+        profile: Option<RuntimeProfileTree>,
+    ) -> bool {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return false;
+        };
+        let (sender, observation) = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if !matches!(
+                state.phase,
+                QueryLifecyclePhase::ControlAttached
+                    | QueryLifecyclePhase::Staging
+                    | QueryLifecyclePhase::Staged
+                    | QueryLifecyclePhase::Running
+            ) || !entry
+                .manifest
+                .expected_fragment_instance_ids()
+                .contains(&fragment_instance_id)
+            {
+                return false;
+            }
+            let sequence = state
+                .observation_sequences
+                .get(&fragment_instance_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(1);
+            let Some(sequence) = sequence else {
+                return false;
+            };
+            let Some(sender) = state.observations.clone() else {
+                return false;
+            };
+            let observation = FragmentLiveObservation::new(
+                execution_id,
+                entry.digest,
+                entry.manifest.backend().clone(),
+                fragment_instance_id,
+                sequence,
+                input_rows,
+                output_rows,
+                elapsed_ms,
+                profile,
+            )
+            .expect("registry-owned fragment observation is structurally valid");
+            state
+                .observation_sequences
+                .insert(fragment_instance_id, sequence);
+            (sender, observation)
+        };
+        sender.send_replace(Some(observation));
+        true
     }
 
     pub(crate) fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {

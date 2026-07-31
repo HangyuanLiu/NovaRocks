@@ -474,7 +474,10 @@ fn validate_query_control_event(
         QueryControlEvent::ControlReady
         | QueryControlEvent::LocalFailure { .. }
         | QueryControlEvent::LocalDrained
-        | QueryControlEvent::TerminalSnapshot { .. } => Ok(()),
+        | QueryControlEvent::TerminalSnapshot { .. }
+        // Live observations are best-effort telemetry. They are deliberately
+        // not coupled to the command/ack state machine.
+        | QueryControlEvent::FragmentObservation { .. } => Ok(()),
         QueryControlEvent::HeartbeatAck { sequence } => match state.pending.front() {
             Some(PendingQueryControlCommand::Heartbeat { sequence: expected })
                 if sequence == expected =>
@@ -1097,6 +1100,7 @@ mod tests {
                 ));
             }
             let (events, receiver) = tokio::sync::mpsc::channel(32);
+            let (_observations, observations) = tokio::sync::watch::channel(None);
             events
                 .try_send(QueryControlEvent::ControlReady)
                 .expect("ControlReady");
@@ -1106,6 +1110,7 @@ mod tests {
                     gate: self.gate.clone(),
                 }),
                 events: receiver,
+                observations,
             })
         }
     }

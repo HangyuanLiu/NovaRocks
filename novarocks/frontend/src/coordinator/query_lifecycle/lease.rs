@@ -23,13 +23,13 @@ use std::time::{Duration, Instant};
 
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::metrics::FrontendQueryLifecycleMetricsSnapshot;
+use novarocks::query_execution::lifecycle::{
+    FragmentLiveObservation, ParticipantManifestDigest, QueryAbortRequest, QueryControlCommand,
+    QueryControlEvent, QueryExecutionId, QueryLifecycleAbortOutcome, QueryLifecycleLease,
+    QueryLifecycleLeaseGuard, QueryTerminalSet, QueryTerminalSnapshot, QueryTerminationReason,
+};
 #[cfg(debug_assertions)]
 use novarocks::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
-use novarocks::query_execution::lifecycle::{
-    ParticipantManifestDigest, QueryAbortRequest, QueryControlCommand, QueryControlEvent,
-    QueryExecutionId, QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
-    QueryTerminalSet, QueryTerminalSnapshot, QueryTerminationReason,
-};
 
 use super::barrier::FrontendQueryLifecycleConfig;
 use super::manifest::MaterializedParticipant;
@@ -102,6 +102,39 @@ struct TerminalState {
     snapshots: BTreeMap<usize, QueryTerminalSnapshot>,
     reader_failure: Option<String>,
     stop_readers: bool,
+}
+
+/// Bounded, best-effort live state received on the participant's control
+/// stream. It is deliberately separate from terminal state: no observation is
+/// allowed to affect query completion or its primary failure.
+#[derive(Default)]
+struct FragmentObservationState {
+    latest: BTreeMap<(usize, novarocks::UniqueId), FragmentLiveObservation>,
+    accepted: u64,
+    idempotent: u64,
+    stale: u64,
+    conflict: u64,
+    rejected: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FragmentObservationStoreOutcome {
+    Accepted,
+    Idempotent,
+    Stale,
+    Conflict,
+    Rejected,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FragmentObservationSnapshot {
+    pub latest: BTreeMap<(usize, novarocks::UniqueId), FragmentLiveObservation>,
+    pub accepted: u64,
+    pub idempotent: u64,
+    pub stale: u64,
+    pub conflict: u64,
+    pub rejected: u64,
 }
 
 /// The result of storing a participant terminal snapshot.  The distinction is
@@ -261,6 +294,7 @@ pub(super) struct AttemptControl {
     primary_error: Mutex<Option<String>>,
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
+    observations: Mutex<FragmentObservationState>,
     readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
@@ -286,6 +320,7 @@ impl AttemptControl {
             primary_error: Mutex::new(None),
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
+            observations: Mutex::new(FragmentObservationState::default()),
             readers: Mutex::new(Vec::new()),
             metrics,
         })
@@ -307,6 +342,108 @@ impl AttemptControl {
                 .cloned()
                 .map(|participant| (participant.target.backend_idx(), participant)),
         );
+    }
+
+    /// Applies a best-effort live observation after checking that it belongs to
+    /// the active participant and to one of the exact fragment instances
+    /// frozen in that participant's manifest. This never reports a lifecycle
+    /// failure: stale or malformed telemetry is observable only through the
+    /// bounded state counters.
+    pub(super) fn store_fragment_observation(
+        &self,
+        session: &ActiveSession,
+        observation: FragmentLiveObservation,
+    ) -> FragmentObservationStoreOutcome {
+        let backend_idx = session.target.backend_idx();
+        let participant = self
+            .attempted
+            .lock()
+            .expect("attempted participant set")
+            .get(&backend_idx)
+            .cloned();
+        let valid = participant.is_some_and(|participant| {
+            participant.target == session.target
+                && participant.digest == session.digest
+                && participant.request.manifest().execution_id() == self.execution_id
+                && observation.execution_id() == self.execution_id
+                && observation.init_digest() == participant.digest
+                && observation.backend() == participant.request.manifest().backend()
+                && participant
+                    .request
+                    .manifest()
+                    .expected_fragment_instance_ids()
+                    .contains(&observation.fragment_instance_id())
+        });
+        if !valid {
+            return self
+                .record_fragment_observation_outcome(FragmentObservationStoreOutcome::Rejected);
+        }
+
+        // A terminal snapshot is the immutable authority for its participant.
+        // Keep the last live sample for diagnostics, but fence all later
+        // updates rather than allowing telemetry to race terminal finalization.
+        if self
+            .terminal
+            .0
+            .lock()
+            .expect("query terminal state")
+            .snapshots
+            .contains_key(&backend_idx)
+        {
+            return self
+                .record_fragment_observation_outcome(FragmentObservationStoreOutcome::Rejected);
+        }
+
+        let key = (backend_idx, observation.fragment_instance_id());
+        let outcome = {
+            let mut state = self.observations.lock().expect("fragment observations");
+            match state.latest.get(&key) {
+                None => {
+                    state.latest.insert(key, observation);
+                    FragmentObservationStoreOutcome::Accepted
+                }
+                Some(existing) if observation.sequence() > existing.sequence() => {
+                    state.latest.insert(key, observation);
+                    FragmentObservationStoreOutcome::Accepted
+                }
+                Some(existing) if observation.sequence() < existing.sequence() => {
+                    FragmentObservationStoreOutcome::Stale
+                }
+                Some(existing) if existing == &observation => {
+                    FragmentObservationStoreOutcome::Idempotent
+                }
+                Some(_) => FragmentObservationStoreOutcome::Conflict,
+            }
+        };
+        self.record_fragment_observation_outcome(outcome)
+    }
+
+    fn record_fragment_observation_outcome(
+        &self,
+        outcome: FragmentObservationStoreOutcome,
+    ) -> FragmentObservationStoreOutcome {
+        let mut state = self.observations.lock().expect("fragment observations");
+        match outcome {
+            FragmentObservationStoreOutcome::Accepted => state.accepted += 1,
+            FragmentObservationStoreOutcome::Idempotent => state.idempotent += 1,
+            FragmentObservationStoreOutcome::Stale => state.stale += 1,
+            FragmentObservationStoreOutcome::Conflict => state.conflict += 1,
+            FragmentObservationStoreOutcome::Rejected => state.rejected += 1,
+        }
+        outcome
+    }
+
+    #[cfg(test)]
+    pub(super) fn fragment_observation_snapshot(&self) -> FragmentObservationSnapshot {
+        let state = self.observations.lock().expect("fragment observations");
+        FragmentObservationSnapshot {
+            latest: state.latest.clone(),
+            accepted: state.accepted,
+            idempotent: state.idempotent,
+            stale: state.stale,
+            conflict: state.conflict,
+            rejected: state.rejected,
+        }
     }
 
     pub fn add_session(self: &Arc<Self>, session: ActiveSession) {
@@ -1086,6 +1223,10 @@ impl AttemptControl {
                     .termination_accepted
                     .insert(session.target.backend_idx(), reason);
                 self.terminal.1.notify_all();
+                Ok(())
+            }
+            QueryControlEvent::FragmentObservation { observation } => {
+                let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
             QueryControlEvent::TerminalSnapshot { snapshot } => {

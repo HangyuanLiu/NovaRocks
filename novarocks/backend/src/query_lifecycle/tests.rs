@@ -820,6 +820,58 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
 }
 
 #[test]
+fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let fragment = UniqueId { hi: 81, lo: 82 };
+    let request = fragment_init_request_fixture(181, &[fragment]);
+    let current_execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+
+    assert!(registry.publish_fragment_observation(current_execution_id, fragment, 1, 2, 3, None));
+    assert!(registry.publish_fragment_observation(current_execution_id, fragment, 4, 5, 6, None));
+    assert!(
+        attachment
+            .observations
+            .has_changed()
+            .expect("observation sender lives")
+    );
+    let observation = attachment
+        .observations
+        .borrow_and_update()
+        .clone()
+        .expect("latest observation");
+    assert_eq!(observation.sequence(), 2);
+    assert_eq!(observation.input_rows(), 4);
+    assert_eq!(observation.output_rows(), 5);
+    assert_eq!(observation.elapsed_ms(), 6);
+
+    assert!(matches!(
+        attachment.events.try_recv(),
+        Ok(QueryControlEvent::ControlReady)
+    ));
+    assert!(!registry.publish_fragment_observation(
+        execution_id(181, ATTEMPT_1 + 1),
+        fragment,
+        0,
+        0,
+        0,
+        None,
+    ));
+    assert!(!registry.publish_fragment_observation(
+        current_execution_id,
+        UniqueId { hi: 90, lo: 91 },
+        0,
+        0,
+        0,
+        None,
+    ));
+}
+
+#[test]
 fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
     let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);

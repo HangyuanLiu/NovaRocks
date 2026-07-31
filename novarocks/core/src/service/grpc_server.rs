@@ -2364,6 +2364,7 @@ mod pr3_tests {
                 ));
             }
             let (events, receiver) = tokio::sync::mpsc::channel(16);
+            let (_observations, observations) = tokio::sync::watch::channel(None);
             events
                 .try_send(QueryControlEvent::ControlReady)
                 .expect("recording ControlReady");
@@ -2373,6 +2374,7 @@ mod pr3_tests {
                     coordinator_lost: Arc::clone(&self.coordinator_lost),
                 }),
                 events: receiver,
+                observations,
             })
         }
     }

@@ -295,6 +295,11 @@ impl NativeFragmentService {
         let query_mem_tracker = admission.query_mem_tracker();
         let fragment_mem_tracker = admission.fragment_mem_tracker();
         let failure_injection_eligible = !request.uses_result_sink();
+        let event_sink = crate::fragment::lifecycle_fragment_event_sink(
+            Arc::clone(&self.lifecycle),
+            execution_id,
+            profiler.clone(),
+        );
         let dormant = prepare_fragment(
             request.into_submission(),
             admission.into_prepare_context(
@@ -302,7 +307,7 @@ impl NativeFragmentService {
                 Arc::clone(&self.exchange_transmitter),
                 Arc::clone(&self.lookup_client),
                 Arc::clone(&self.result_writer),
-                Arc::clone(&self.event_sink),
+                event_sink,
             ),
         )
         .map_err(NativeFragmentIngressError::new)?;
@@ -447,6 +452,11 @@ impl NativeFragmentService {
         let query_mem_tracker = admission.query_mem_tracker();
         let fragment_mem_tracker = admission.fragment_mem_tracker();
         let failure_injection_eligible = !request.uses_result_sink();
+        let event_sink = crate::fragment::lifecycle_fragment_event_sink(
+            Arc::clone(&self.lifecycle),
+            execution_id,
+            profiler.clone(),
+        );
         let dormant = prepare_fragment(
             request.into_submission(),
             admission.into_prepare_context(
@@ -454,7 +464,7 @@ impl NativeFragmentService {
                 Arc::clone(&self.exchange_transmitter),
                 Arc::clone(&self.lookup_client),
                 Arc::clone(&self.result_writer),
-                Arc::clone(&self.event_sink),
+                event_sink,
             ),
         )
         .map_err(NativeFragmentIngressError::new)?;

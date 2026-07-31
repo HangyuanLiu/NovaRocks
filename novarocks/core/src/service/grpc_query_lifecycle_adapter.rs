@@ -216,6 +216,7 @@ pub(crate) async fn handle_query_control_stream(
         inbound,
         lease,
         attachment.events,
+        attachment.observations,
         outbound_tx,
         shutdown,
         heartbeat_stop,
@@ -229,6 +230,9 @@ async fn run_attached_control_stream(
     mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
     mut lease: CoordinatorLease,
     mut events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    mut observations: tokio::sync::watch::Receiver<
+        Option<crate::query_execution::lifecycle::FragmentLiveObservation>,
+    >,
     outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
@@ -394,6 +398,27 @@ async fn run_attached_control_stream(
                 if !send_control_response(
                     &outbound,
                     Ok(encode_query_control_event(&event)),
+                    &mut shutdown,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            changed = observations.changed() => {
+                if changed.is_err() {
+                    // The lifecycle entry owns the sender. Its removal cannot
+                    // invalidate correctness delivery already in flight.
+                    continue;
+                }
+                let Some(observation) = observations.borrow_and_update().clone() else {
+                    continue;
+                };
+                if !send_control_response(
+                    &outbound,
+                    Ok(encode_query_control_event(
+                        &QueryControlEvent::FragmentObservation { observation },
+                    )),
                     &mut shutdown,
                 )
                 .await
