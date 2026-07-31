@@ -17,6 +17,7 @@
 
 pub(crate) mod decode;
 pub(crate) mod encode;
+pub(crate) mod query_options_contract;
 pub(crate) mod runtime_filter_contract_codec;
 mod runtime_filter_install;
 pub(crate) mod type_encode;
