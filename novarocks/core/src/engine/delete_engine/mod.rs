@@ -97,7 +97,10 @@ pub struct PreparedDelete {
 }
 
 pub enum DeleteWriteReport {
-    Aborted { reason: String, has_staged_files: bool },
+    Aborted {
+        reason: String,
+        has_staged_files: bool,
+    },
     NoOp,
     CommitRequired(Arc<dyn DeleteCommit>),
 }
@@ -181,7 +184,9 @@ impl DeleteEngine for Arc<StandaloneState> {
         {
             return Ok(DeleteWriteReport::NoOp);
         }
-        Ok(DeleteWriteReport::CommitRequired(Arc::new(CoreDeleteCommit { input })))
+        Ok(DeleteWriteReport::CommitRequired(Arc::new(
+            CoreDeleteCommit { input },
+        )))
     }
 
     fn commit_delete(
@@ -195,12 +200,15 @@ impl DeleteEngine for Arc<StandaloneState> {
                 crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
             )
         })?;
-        let commit = commit.as_any().downcast_ref::<CoreDeleteCommit>().ok_or_else(|| {
-            CommitServiceError::known_uncommitted(
-                "foreign DELETE commit handle".to_string(),
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreDeleteCommit>()
+            .ok_or_else(|| {
+                CommitServiceError::known_uncommitted(
+                    "foreign DELETE commit handle".to_string(),
+                    crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+                )
+            })?;
         prepared.execution.commit(&commit.input)
     }
 
@@ -215,22 +223,37 @@ struct CorePreparedDelete {
 }
 
 impl DeletePrepared for CorePreparedDelete {
-    fn as_any(&self) -> &dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
-struct CoreDeleteCommit { input: WriteCommitInput }
+struct CoreDeleteCommit {
+    input: WriteCommitInput,
+}
 
 impl DeleteCommit for CoreDeleteCommit {
-    fn as_any(&self) -> &dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 pub(crate) fn prepared_delete(
     operation: DeleteOperation,
     execution: Arc<dyn PreparedDeleteExecution>,
 ) -> PreparedDelete {
-    PreparedDelete { operation: operation.clone(), handle: Arc::new(CorePreparedDelete { operation, execution }) }
+    PreparedDelete {
+        operation: operation.clone(),
+        handle: Arc::new(CorePreparedDelete {
+            operation,
+            execution,
+        }),
+    }
 }
 
 fn downcast_prepared(prepared: &dyn DeletePrepared) -> Result<&CorePreparedDelete, String> {
-    prepared.as_any().downcast_ref::<CorePreparedDelete>().ok_or_else(|| "foreign DELETE prepared handle".to_string())
+    prepared
+        .as_any()
+        .downcast_ref::<CorePreparedDelete>()
+        .ok_or_else(|| "foreign DELETE prepared handle".to_string())
 }

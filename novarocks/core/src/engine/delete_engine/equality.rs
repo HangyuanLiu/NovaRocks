@@ -32,13 +32,13 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec,
 };
+use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
-use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
+use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
-use crate::engine::StandaloneState;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
@@ -239,12 +239,12 @@ fn prepare_equality_delete_distributed_write(
         snapshot_properties: BTreeMap::new(),
     };
     let attempt_id = format!(
-            "{}.{}.{}:equality-delete:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        );
+        "{}.{}.{}:equality-delete:{}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        uuid::Uuid::new_v4()
+    );
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -256,8 +256,12 @@ fn prepare_equality_delete_distributed_write(
     };
     Ok(prepared_delete(
         DeleteOperation {
-            catalog: target.catalog.clone(), namespace: target.namespace.clone(), table: target.table.clone(),
-            target_ref: "main".to_string(), attempt_id, commit_op_kind: CommitOpKind::RowDelta,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            target_ref: "main".to_string(),
+            attempt_id,
+            commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id: current_snapshot_id,
         },
         Arc::new(executor),

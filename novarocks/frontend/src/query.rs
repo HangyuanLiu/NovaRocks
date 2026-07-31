@@ -1058,19 +1058,27 @@ mod tests {
     struct TestDeletePrepared;
 
     impl DeletePrepared for TestDeletePrepared {
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     impl DeleteEngine for RecordingDeleteEngine {
-        fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
+        fn prepare_delete(
+            &self,
+            request: PrepareDeleteRequest<'_>,
+        ) -> Result<PreparedDelete, String> {
             self.executions
                 .lock()
                 .expect("delete executions")
                 .push(request.execution);
             Ok(PreparedDelete {
                 operation: DeleteOperation {
-                    catalog: "ice".to_string(), namespace: "db".to_string(), table: "t".to_string(),
-                    target_ref: "main".to_string(), attempt_id: "test-delete".to_string(),
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "t".to_string(),
+                    target_ref: "main".to_string(),
+                    attempt_id: "test-delete".to_string(),
                     commit_op_kind: novarocks::connector::iceberg::commit::CommitOpKind::RowDelta,
                     base_snapshot_id: None,
                 },

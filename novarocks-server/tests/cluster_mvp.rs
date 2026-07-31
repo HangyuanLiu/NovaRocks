@@ -2387,6 +2387,138 @@ fn cross_process_three_be_frontend_insert_service_lifecycle() {
 
 #[cfg(unix)]
 #[test]
+fn cross_process_three_be_frontend_delete_service_lifecycle() {
+    let _guard = lock_cluster_mvp();
+    let fixture_dir = tempfile::tempdir_in(runtime_dir()).expect("create DELETE lifecycle fixture");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create DELETE lifecycle warehouse");
+    let mut cluster = MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata(
+        &state_store_path,
+        &metadata_path,
+        "frontend-delete-lifecycle",
+    );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG delete_lifecycle_ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    )).expect("create DELETE lifecycle catalog");
+    conn.query_drop("CREATE DATABASE delete_lifecycle_ice.ns")
+        .expect("create namespace");
+    conn.query_drop(
+        "CREATE TABLE delete_lifecycle_ice.ns.orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create v3 row-lineage table");
+    conn.query_drop("INSERT INTO delete_lifecycle_ice.ns.orders VALUES (1, 10), (2, 20), (3, 30)")
+        .expect("seed DELETE lifecycle rows");
+    let scheduled_before = scheduled_fragments(&mut conn);
+
+    conn.query_drop("DELETE FROM delete_lifecycle_ice.ns.orders WHERE id = 1")
+        .expect("execute standard DELETE through frontend DML service");
+    let scheduled_after_standard = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_standard > scheduled_before,
+        "standard DELETE must schedule fragments"
+    );
+
+    conn.query_drop(
+        "ALTER TABLE delete_lifecycle_ice.ns.orders \
+         ADD EQUALITY DELETE (id) VALUES (2)",
+    )
+    .expect("execute equality DELETE through frontend DML service");
+    let scheduled_after_equality = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_equality > scheduled_after_standard,
+        "equality DELETE must schedule fragments"
+    );
+
+    let snapshots_before_noop: Vec<i64> = conn
+        .query("SELECT count(*) FROM delete_lifecycle_ice.ns.orders$snapshots")
+        .expect("count snapshots before no-op DELETE");
+    conn.query_drop("DELETE FROM delete_lifecycle_ice.ns.orders WHERE id = 999")
+        .expect("execute no-op DELETE");
+    let snapshots_after_noop: Vec<i64> = conn
+        .query("SELECT count(*) FROM delete_lifecycle_ice.ns.orders$snapshots")
+        .expect("count snapshots after no-op DELETE");
+    assert_eq!(
+        snapshots_after_noop, snapshots_before_noop,
+        "no-match DELETE must not commit a snapshot"
+    );
+    let rows: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM delete_lifecycle_ice.ns.orders ORDER BY id")
+        .expect("read remaining DELETE lifecycle rows");
+    assert_eq!(rows, vec![(3, 30)]);
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored: Vec<(i32, i32)> = conn
+        .query("SELECT id, amount FROM delete_lifecycle_ice.ns.orders ORDER BY id")
+        .expect("read DELETE lifecycle table after FE restart");
+    assert_eq!(restored, vec![(3, 30)]);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build StateStore inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(
+                &state_store_path,
+                "frontend-delete-lifecycle",
+            )),
+            frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid StateStore inspection backend config"),
+        ))
+        .expect("reopen DML StateStore");
+    let operations = host
+        .dml_service()
+        .list_operations()
+        .expect("list durable DELETE operations");
+    let row_deltas = operations
+        .iter()
+        .filter(|operation| operation.operation_kind == OperationKind::RowDelta)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        row_deltas.len(),
+        3,
+        "standard, equality, and no-op DELETE must be journaled"
+    );
+    assert_eq!(
+        row_deltas
+            .iter()
+            .filter(|operation| operation.state == OperationState::Finalized)
+            .count(),
+        2
+    );
+    assert_eq!(
+        row_deltas
+            .iter()
+            .filter(|operation| operation.state == OperationState::Aborted)
+            .count(),
+        1
+    );
+    runtime
+        .block_on(host.shutdown())
+        .expect("inspection host shutdown");
+}
+
+#[cfg(unix)]
+#[test]
 fn cross_process_three_be_insert_without_state_store_fails_before_side_effect() {
     let _guard = lock_cluster_mvp();
     let fixture_dir =

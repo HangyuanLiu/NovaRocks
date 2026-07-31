@@ -43,25 +43,29 @@ use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
 };
+#[cfg(test)]
 use crate::connector::iceberg::delete_visibility::{
-    ExistingDeleteVisibility, ExistingDeleteVisibilityByDataFile, ReferencedDataFilePartition,
-    ReferencedDataFilePartitions, data_file_row_is_visible, insert_referenced_data_file_partition,
-    load_existing_delete_visibility_by_data_file, load_existing_delete_visibility_by_data_file_at,
+    ExistingDeleteVisibility, ReferencedDataFilePartition, ReferencedDataFilePartitions,
+    insert_referenced_data_file_partition, load_existing_delete_visibility_by_data_file,
+    load_existing_delete_visibility_by_data_file_at,
     load_existing_delete_visibility_from_descriptors, load_referenced_data_file_partitions,
     load_referenced_data_file_partitions_at,
 };
+use crate::connector::iceberg::delete_visibility::{
+    ExistingDeleteVisibilityByDataFile, data_file_row_is_visible,
+};
 use crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
+use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
-use crate::engine::StandaloneState;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
@@ -385,12 +389,12 @@ fn prepare_delete_dv_write(
         snapshot_properties: BTreeMap::new(),
     };
     let attempt_id = format!(
-            "{}.{}.{}:delete-dv:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        );
+        "{}.{}.{}:delete-dv:{}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        uuid::Uuid::new_v4()
+    );
     let executor = DistributedDvDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -402,8 +406,12 @@ fn prepare_delete_dv_write(
     };
     Ok(prepared_delete(
         DeleteOperation {
-            catalog: target.catalog.clone(), namespace: target.namespace.clone(), table: target.table.clone(),
-            target_ref: target_ref.to_string(), attempt_id, commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            target_ref: target_ref.to_string(),
+            attempt_id,
+            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
         },
         Arc::new(executor),
@@ -440,12 +448,12 @@ fn prepare_delete_write(
         snapshot_properties: BTreeMap::new(),
     };
     let attempt_id = format!(
-            "{}.{}.{}:delete:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        );
+        "{}.{}.{}:delete:{}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        uuid::Uuid::new_v4()
+    );
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -457,8 +465,12 @@ fn prepare_delete_write(
     };
     Ok(prepared_delete(
         DeleteOperation {
-            catalog: target.catalog.clone(), namespace: target.namespace.clone(), table: target.table.clone(),
-            target_ref: target_ref.to_string(), attempt_id, commit_op_kind: CommitOpKind::RowDelta,
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            target_ref: target_ref.to_string(),
+            attempt_id,
+            commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id,
         },
         Arc::new(executor),

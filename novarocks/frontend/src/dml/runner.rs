@@ -18,8 +18,8 @@
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-    OperationFact, OperationState, WriteTransactionOutcome, WriteTransactionSpec,
+    CleanupAttempt, CommitOutcome, CommitServiceError, CreatePreparingRequest, OperationFact,
+    OperationState, WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::now_unix_millis;
 use crate::dml::reconcile;
