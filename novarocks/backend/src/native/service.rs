@@ -441,16 +441,25 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         let snapshot = request.into_inner().snapshot.ok_or_else(|| {
             tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
         })?;
-        let snapshot = decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let snapshot =
+            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
         let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
             .await
-            .map_err(|error| tonic::Status::internal(format!("query terminal ingress panicked: {error}")))?
+            .map_err(|error| {
+                tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
+            })?
             .map_err(status_from_lifecycle_error)?;
         let outcome = match ack.outcome() {
             QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted => proto::ReportQueryTerminalOutcome::AlreadyAccepted,
-            QueryTerminalReportOutcome::RejectedConflict => proto::ReportQueryTerminalOutcome::RejectedConflict,
-            QueryTerminalReportOutcome::RejectedGone => proto::ReportQueryTerminalOutcome::RejectedGone,
+            QueryTerminalReportOutcome::AlreadyAccepted => {
+                proto::ReportQueryTerminalOutcome::AlreadyAccepted
+            }
+            QueryTerminalReportOutcome::RejectedConflict => {
+                proto::ReportQueryTerminalOutcome::RejectedConflict
+            }
+            QueryTerminalReportOutcome::RejectedGone => {
+                proto::ReportQueryTerminalOutcome::RejectedGone
+            }
         };
         Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
             outcome: outcome as i32,
