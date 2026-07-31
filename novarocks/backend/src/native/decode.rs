@@ -41,6 +41,7 @@ use super::exchange::BackendNativeExchangeContractDecoder;
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
 use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
+use super::scan_contract::BackendNativeScanSourceContractDecoder;
 use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
 
 pub(crate) struct NativeFragmentRequest {
@@ -120,6 +121,7 @@ impl NativeFragmentRequest {
             instance,
             &instance_params,
             &BackendNativeFragmentSinkAssignmentDecoder,
+            &BackendNativeScanSourceContractDecoder,
             &BackendNativeExchangeContractDecoder,
             &BackendNativeRuntimeFilterContractDecoder,
             connectors,

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::connector::ConnectorRegistry;
 use crate::exec::fragment::program::{
-    ExchangeInputContract, FragmentNodeId, RuntimeFilterContract,
+    ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
 };
 use crate::proto::novarocks;
 use crate::proto::plan;
@@ -114,6 +114,16 @@ pub trait NativeExchangeContractDecoder: Send + Sync {
     ) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, ProtocolError>;
 }
 
+/// Backend-owned static scan-source contract decoder invoked before scan-range
+/// assignments are cross-checked.
+pub trait NativeScanSourceContractDecoder: Send + Sync {
+    fn decode_scan_source_contracts(
+        &self,
+        root: &plan::DistributedNode,
+        path: crate::protocol::FieldPath,
+    ) -> Result<BTreeMap<FragmentNodeId, ScanSourceContract>, ProtocolError>;
+}
+
 pub struct AssembledNativeFragmentSubmission {
     submission: FragmentSubmission,
     backend_num: i32,
@@ -131,6 +141,7 @@ pub fn assemble_fragment_submission_for_backend(
     instance: NativeFragmentInstanceInput,
     sink_assignment_params: &novarocks::InstanceParams,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
+    scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
     runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
     connectors: Arc<ConnectorRegistry>,
@@ -141,6 +152,7 @@ pub fn assemble_fragment_submission_for_backend(
         instance,
         sink_assignment_params,
         sink_assignment_decoder,
+        scan_source_contract_decoder,
         exchange_contract_decoder,
         runtime_filter_contract_decoder,
         connectors,

@@ -32,6 +32,7 @@ use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
     NativeExchangeContractDecoder, NativeFragmentInstanceInput,
     NativeFragmentSinkAssignmentDecoder, NativeRuntimeFilterContractDecoder,
+    NativeScanSourceContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -94,6 +95,7 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         connectors,
         execution_resolver,
         |sink| decode_fragment_sink_assignment(sink, instance_params),
+        |root, path| decode_scan_source_contracts(root, path),
         |root, path| decode_exchange_contracts(root, path),
         |fragment| decode_runtime_filter_contract(fragment),
     )
@@ -104,6 +106,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     instance_parts: NativeFragmentInstanceInput,
     instance_params: &novarocks::InstanceParams,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
+    scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
     runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
     connectors: Arc<crate::connector::ConnectorRegistry>,
@@ -117,6 +120,11 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
         |sink| {
             sink_assignment_decoder
                 .decode_sink_assignment(sink, instance_params)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        |root, path| {
+            scan_source_contract_decoder
+                .decode_scan_source_contracts(root, path)
                 .map_err(NativeFragmentDecodeError::from)
         },
         |root, path| {
@@ -138,6 +146,13 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
     decode_sink_assignment: F,
+    decode_scan_source_contracts: impl FnOnce(
+        &plan::DistributedNode,
+        FieldPath,
+    ) -> Result<
+        BTreeMap<FragmentNodeId, ScanSourceContract>,
+        NativeFragmentDecodeError,
+    >,
     decode_exchange_contracts: impl FnOnce(
         &plan::DistributedNode,
         FieldPath,
