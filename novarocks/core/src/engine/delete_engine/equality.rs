@@ -42,6 +42,7 @@ use crate::engine::write_transaction::{
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
+use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
@@ -53,6 +54,7 @@ pub(crate) fn execute_add_equality_delete_statement(
     stmt: &AddEqualityDeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let target =
@@ -116,6 +118,7 @@ pub(crate) fn execute_add_equality_delete_statement(
         current_snapshot_id,
         &delete_columns,
         values_query,
+        execution,
         connector_context,
     )?;
     Ok(StatementResult::Ok)
@@ -127,6 +130,7 @@ struct DistributedEqualityDeleteWriteExecutor {
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
+    execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
@@ -143,7 +147,7 @@ impl IcebergWriteTransactionExecutor for DistributedEqualityDeleteWriteExecutor 
             self.sink_spec.clone(),
             None,
             None,
-            None,
+            Some(&self.execution),
             &self.connector_context,
         )?;
         if result.write_abort.is_none()
@@ -183,6 +187,7 @@ fn run_equality_delete_distributed_transaction(
     current_snapshot_id: Option<i64>,
     delete_columns: &[EqualityDeleteColumn],
     values_query: sqlparser::ast::Query,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let resolved = {
@@ -276,6 +281,7 @@ fn run_equality_delete_distributed_transaction(
         delete_query: values_query,
         sink_spec,
         commit_executor,
+        execution: execution.clone(),
         connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);

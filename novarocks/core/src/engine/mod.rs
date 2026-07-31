@@ -52,6 +52,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
+pub mod delete_engine;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
@@ -858,6 +859,10 @@ impl StandaloneNovaRocks {
     }
 
     pub fn insert_engine(&self) -> Arc<dyn insert_engine::InsertEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
+    pub fn delete_engine(&self) -> Arc<dyn delete_engine::DeleteEngine> {
         Arc::new(Arc::clone(&self.inner))
     }
 
@@ -1788,16 +1793,8 @@ impl StandaloneSession {
             sqlast::Statement::Insert(_) => {
                 Err("INSERT must be routed by frontend DML service".to_string())
             }
-            sqlast::Statement::Delete(ref delete) => {
-                let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
-                crate::engine::delete_flow::execute_delete_statement(
-                    &self.inner,
-                    &stmt,
-                    current_catalog,
-                    current_database,
-                    request_context.execution(),
-                    &connector_context,
-                )
+            sqlast::Statement::Delete(_) => {
+                Err("DELETE must be routed by frontend DML service".to_string())
             }
             ref update_stmt @ sqlast::Statement::Update(_) => {
                 if let Some(result) = self::information_schema::try_update_be_configs(update_stmt)?
@@ -2263,14 +2260,8 @@ impl StandaloneSession {
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        let stmt = crate::engine::statement::parse_add_equality_delete_sql(sql)?;
-        crate::engine::equality_delete_flow::execute_add_equality_delete_statement(
-            &self.inner,
-            &stmt,
-            current_catalog,
-            current_database,
-            connector_context,
-        )
+        let _ = (sql, current_catalog, current_database, connector_context);
+        Err("ADD EQUALITY DELETE must be routed by frontend DML service".to_string())
     }
 
     /// Handle CREATE CATALOG result.
@@ -2754,9 +2745,7 @@ fn build_iceberg_create_table_ddl(
 // Custom statement dispatch
 // ---------------------------------------------------------------------------
 
-pub(crate) mod delete_flow;
 pub(crate) mod delete_predicate_translate;
-pub(crate) mod equality_delete_flow;
 pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 

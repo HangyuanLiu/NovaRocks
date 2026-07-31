@@ -160,6 +160,7 @@ where
                 services,
                 move |engine| {
                     let insert_engine = engine.insert_engine();
+                    let delete_engine = engine.delete_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
@@ -168,6 +169,7 @@ where
                         topology,
                         dml,
                         insert_engine,
+                        delete_engine,
                     )))
                 },
                 shutdown,
@@ -217,6 +219,7 @@ where
                 services,
                 move |engine| {
                     let insert_engine = engine.insert_engine();
+                    let delete_engine = engine.delete_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
@@ -225,6 +228,7 @@ where
                         topology,
                         dml,
                         insert_engine,
+                        delete_engine,
                     )))
                 },
                 shutdown,

@@ -50,8 +50,7 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::delete_visibility::{
     ExistingDeleteVisibility, ExistingDeleteVisibilityByDataFile, ReferencedDataFilePartition,
-    ReferencedDataFilePartitions, data_file_row_is_visible,
-    insert_referenced_data_file_partition,
+    ReferencedDataFilePartitions, data_file_row_is_visible, insert_referenced_data_file_partition,
     load_existing_delete_visibility_by_data_file, load_existing_delete_visibility_by_data_file_at,
     load_existing_delete_visibility_from_descriptors, load_referenced_data_file_partitions,
     load_referenced_data_file_partitions_at,

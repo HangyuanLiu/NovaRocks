@@ -101,6 +101,7 @@ where
             services,
             move |engine| {
                 let insert_engine = engine.insert_engine();
+                let delete_engine = engine.delete_engine();
                 Ok(std::sync::Arc::new(
                     novarocks_frontend::FrontendQueryService::new(
                         engine,
@@ -110,6 +111,7 @@ where
                         topology,
                         dml,
                         insert_engine,
+                        delete_engine,
                     ),
                 ))
             },
