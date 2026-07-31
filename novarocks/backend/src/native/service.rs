@@ -33,10 +33,6 @@ use novarocks::query_execution::lifecycle::{
     decode_query_terminal_snapshot,
 };
 use novarocks::query_execution::report::NativeReportHandler;
-use novarocks::service::grpc_query_lifecycle_adapter::{
-    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
-};
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks::service::native_fragment_ingress::NativeFragmentIngress;
 use novarocks_protocol::{filter, novarocks as proto};
@@ -45,6 +41,10 @@ use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use super::lifecycle_adapter::{
+    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
+    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
+};
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;

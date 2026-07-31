@@ -23,27 +23,27 @@ use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::proto::novarocks;
-use crate::query_execution::lifecycle::contract::{
+use novarocks::query_execution::lifecycle::contract::{
     decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
     decode_query_init_request, decode_query_stage_request, decode_query_start_request,
     encode_abort_query_response, encode_query_control_event, encode_query_init_response,
     encode_query_stage_response, encode_query_start_response,
 };
-use crate::query_execution::lifecycle::{
+use novarocks::query_execution::lifecycle::{
     BackendQueryControl, QueryControlCommand, QueryControlEvent, QueryInitOutcome,
     QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminationReason,
 };
+use novarocks_protocol::novarocks as proto;
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
 
-pub(crate) type QueryControlResponseStream =
-    ReceiverStream<Result<novarocks::QueryControlResponse, tonic::Status>>;
+pub type QueryControlResponseStream =
+    ReceiverStream<Result<proto::QueryControlResponse, tonic::Status>>;
 
-pub(crate) fn handle_init_query(
+pub fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
-    request: novarocks::InitQueryRequest,
-) -> Result<novarocks::InitQueryResponse, tonic::Status> {
+    request: proto::InitQueryRequest,
+) -> Result<proto::InitQueryResponse, tonic::Status> {
     let request = decode_query_init_request(&request).map_err(status_from_lifecycle_error)?;
     let execution_id = request.manifest().execution_id();
     let ack = ingress.init_query(request);
@@ -83,10 +83,10 @@ pub(crate) fn handle_init_query(
     Ok(encode_query_init_response(&ack))
 }
 
-pub(crate) fn handle_abort_query(
+pub fn handle_abort_query(
     ingress: &dyn QueryLifecycleIngress,
-    request: novarocks::AbortQueryRequest,
-) -> Result<novarocks::AbortQueryResponse, tonic::Status> {
+    request: proto::AbortQueryRequest,
+) -> Result<proto::AbortQueryResponse, tonic::Status> {
     let request = decode_abort_query_request(&request).map_err(status_from_lifecycle_error)?;
     let response = ingress
         .abort_query(request)
@@ -96,16 +96,16 @@ pub(crate) fn handle_abort_query(
 }
 
 fn emit_query_lifecycle_abort_marker() {
-    if crate::common::config::debug_emit_cancel_marker() {
+    if novarocks::common::config::debug_emit_cancel_marker() {
         println!("NOVAROCKS_QUERY_LIFECYCLE_ABORT");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }
 
-pub(crate) fn handle_stage_fragments(
+pub fn handle_stage_fragments(
     ingress: &dyn QueryLifecycleIngress,
-    request: novarocks::StageFragmentsRequest,
-) -> Result<novarocks::StageFragmentsResponse, tonic::Status> {
+    request: proto::StageFragmentsRequest,
+) -> Result<proto::StageFragmentsResponse, tonic::Status> {
     let request = decode_query_stage_request(&request).map_err(status_from_lifecycle_error)?;
     let execution_id = request.execution_id();
     let response = ingress.stage_fragments(request);
@@ -136,10 +136,10 @@ pub(crate) fn handle_stage_fragments(
     Ok(encode_query_stage_response(&response))
 }
 
-pub(crate) fn handle_start_prepared_query(
+pub fn handle_start_prepared_query(
     ingress: &dyn QueryLifecycleIngress,
-    request: novarocks::StartPreparedQueryRequest,
-) -> Result<novarocks::StartPreparedQueryResponse, tonic::Status> {
+    request: proto::StartPreparedQueryRequest,
+) -> Result<proto::StartPreparedQueryResponse, tonic::Status> {
     let request = decode_query_start_request(&request).map_err(status_from_lifecycle_error)?;
     let execution_id = request.execution_id();
     let response = ingress.start_prepared_query(request);
@@ -178,9 +178,9 @@ pub(crate) fn handle_start_prepared_query(
     Ok(encode_query_start_response(&response))
 }
 
-pub(crate) async fn handle_query_control_stream(
+pub async fn handle_query_control_stream(
     ingress: Arc<dyn QueryLifecycleIngress>,
-    mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
+    mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<QueryControlResponseStream, tonic::Status> {
     let first = tokio::select! {
@@ -194,7 +194,7 @@ pub(crate) async fn handle_query_control_stream(
     .ok_or_else(|| tonic::Status::failed_precondition("first frame must be Attach"))?;
     if !matches!(
         first.command,
-        Some(novarocks::query_control_request::Command::Attach(_))
+        Some(proto::query_control_request::Command::Attach(_))
     ) {
         return Err(tonic::Status::failed_precondition(
             "first frame must be Attach",
@@ -203,10 +203,6 @@ pub(crate) async fn handle_query_control_stream(
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
     let execution_id = attach.execution_id();
     let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
-    let terminal_snapshot_stream_drop = claim_backend_fault(
-        QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
-        execution_id,
-    )?;
     let attachment = ingress
         .attach_control(attach)
         .map_err(status_from_lifecycle_error)?;
@@ -216,28 +212,22 @@ pub(crate) async fn handle_query_control_stream(
         inbound,
         lease,
         attachment.events,
-        attachment.observations,
         outbound_tx,
         shutdown,
         heartbeat_stop,
-        terminal_snapshot_stream_drop,
         execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
 }
 
 async fn run_attached_control_stream(
-    mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
+    mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut lease: CoordinatorLease,
     mut events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
-    mut observations: tokio::sync::watch::Receiver<
-        Option<crate::query_execution::lifecycle::FragmentLiveObservation>,
-    >,
-    outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
+    outbound: tokio::sync::mpsc::Sender<Result<proto::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
-    terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
-    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
         biased;
@@ -276,8 +266,35 @@ async fn run_attached_control_stream(
         return;
     }
 
+    let mut awaiting_graceful_termination = false;
     let mut heartbeat_stop_logged = false;
     loop {
+        if awaiting_graceful_termination {
+            let event = tokio::select! {
+                biased;
+                _ = wait_for_query_control_shutdown(&mut shutdown) => break,
+                event = events.recv() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
+            let termination_accepted =
+                matches!(event, QueryControlEvent::TerminationAccepted { .. });
+            if !send_control_response(
+                &outbound,
+                Ok(encode_query_control_event(&event)),
+                &mut shutdown,
+            )
+            .await
+            {
+                break;
+            }
+            if termination_accepted {
+                lease.mark_graceful();
+                break;
+            }
+            continue;
+        }
         tokio::select! {
             biased;
             _ = wait_for_query_control_shutdown(&mut shutdown) => {
@@ -301,7 +318,7 @@ async fn run_attached_control_stream(
                 };
                 if matches!(
                     request.command,
-                    Some(novarocks::query_control_request::Command::Attach(_))
+                    Some(proto::query_control_request::Command::Attach(_))
                 ) {
                     let _ = send_control_response(
                         &outbound,
@@ -351,19 +368,16 @@ async fn run_attached_control_stream(
                         }
                     }
                     QueryControlCommand::Abort { reason } => {
+                        awaiting_graceful_termination = true;
                         let result = lease.control().abort(reason);
                         if result.is_ok() {
                             emit_query_lifecycle_abort_marker();
                         }
                         result
                     }
-                    QueryControlCommand::Finalize => lease.control().finalize(),
-                    QueryControlCommand::TerminalAck { ack } => {
-                        let result = lease.control().terminal_ack(ack);
-                        if result.is_ok() {
-                            lease.mark_graceful();
-                        }
-                        result
+                    QueryControlCommand::Finalize => {
+                        awaiting_graceful_termination = true;
+                        lease.control().finalize()
                     }
                 };
                 if let Err(error) = result {
@@ -380,21 +394,8 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                if matches!(event, QueryControlEvent::TerminalSnapshot { .. })
-                    && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
-                {
-                    eprintln!(
-                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
-                        scope.execution_id.query_id().high(),
-                        scope.execution_id.query_id().low(),
-                        scope.execution_id.attempt_id().get(),
-                        scope.backend_index,
-                        scope.backend_id,
-                        scope.start_epoch,
-                        scope.token,
-                    );
-                    break;
-                }
+                let termination_accepted =
+                    matches!(event, QueryControlEvent::TerminationAccepted { .. });
                 if !send_control_response(
                     &outbound,
                     Ok(encode_query_control_event(&event)),
@@ -404,25 +405,8 @@ async fn run_attached_control_stream(
                 {
                     break;
                 }
-            }
-            changed = observations.changed() => {
-                if changed.is_err() {
-                    // The lifecycle entry owns the sender. Its removal cannot
-                    // invalidate correctness delivery already in flight.
-                    continue;
-                }
-                let Some(observation) = observations.borrow_and_update().clone() else {
-                    continue;
-                };
-                if !send_control_response(
-                    &outbound,
-                    Ok(encode_query_control_event(
-                        &QueryControlEvent::FragmentObservation { observation },
-                    )),
-                    &mut shutdown,
-                )
-                .await
-                {
+                if termination_accepted {
+                    lease.mark_graceful();
                     break;
                 }
             }
@@ -431,18 +415,21 @@ async fn run_attached_control_stream(
 }
 
 #[cfg(debug_assertions)]
-use crate::common::query_lifecycle_fault::claim_matching_fault;
+use novarocks::common::query_lifecycle_fault::claim_matching_fault;
 #[cfg(debug_assertions)]
-use crate::common::query_lifecycle_fault::observe_matching_fault;
-use crate::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
+use novarocks::common::query_lifecycle_fault::observe_matching_fault;
+use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
 
 #[cfg(debug_assertions)]
 fn staged_heartbeat_stops() -> &'static Mutex<
-    BTreeMap<crate::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
+    BTreeMap<novarocks::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
 > {
     static STOPS: OnceLock<
         Mutex<
-            BTreeMap<crate::query_execution::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
+            BTreeMap<
+                novarocks::query_execution::lifecycle::QueryExecutionId,
+                QueryLifecycleFaultScope,
+            >,
         >,
     > = OnceLock::new();
     STOPS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -461,7 +448,7 @@ fn register_staged_heartbeat_stop(_scope: QueryLifecycleFaultScope) {}
 
 #[cfg(debug_assertions)]
 fn staged_heartbeat_stop(
-    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Option<QueryLifecycleFaultScope> {
     staged_heartbeat_stops()
         .lock()
@@ -472,7 +459,7 @@ fn staged_heartbeat_stop(
 
 #[cfg(not(debug_assertions))]
 fn staged_heartbeat_stop(
-    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Option<QueryLifecycleFaultScope> {
     None
 }
@@ -480,9 +467,9 @@ fn staged_heartbeat_stop(
 #[cfg(debug_assertions)]
 fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
-    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = crate::common::config::sql_test_query_lifecycle_fault_dir() else {
+    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
@@ -493,7 +480,7 @@ fn claim_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = crate::runtime::backend_id::backend_id()
+    let backend_id = novarocks::runtime::backend_id::backend_id()
         .and_then(|id| u64::try_from(id).ok())
         .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
     claim_matching_fault(
@@ -502,7 +489,7 @@ fn claim_backend_fault(
         execution_id,
         backend_index,
         backend_id,
-        crate::runtime::start_epoch::start_epoch(),
+        novarocks::runtime::start_epoch::start_epoch(),
     )
     .map_err(tonic::Status::failed_precondition)
 }
@@ -510,9 +497,9 @@ fn claim_backend_fault(
 #[cfg(debug_assertions)]
 fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
-    execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = crate::common::config::sql_test_query_lifecycle_fault_dir() else {
+    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
         return Ok(None);
     };
     let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
@@ -523,7 +510,7 @@ fn observe_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = crate::runtime::backend_id::backend_id()
+    let backend_id = novarocks::runtime::backend_id::backend_id()
         .and_then(|id| u64::try_from(id).ok())
         .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
     observe_matching_fault(
@@ -532,7 +519,7 @@ fn observe_backend_fault(
         execution_id,
         backend_index,
         backend_id,
-        crate::runtime::start_epoch::start_epoch(),
+        novarocks::runtime::start_epoch::start_epoch(),
     )
     .map_err(tonic::Status::failed_precondition)
 }
@@ -540,7 +527,7 @@ fn observe_backend_fault(
 #[cfg(not(debug_assertions))]
 fn claim_backend_fault(
     _kind: QueryLifecycleFaultKind,
-    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }
@@ -548,14 +535,14 @@ fn claim_backend_fault(
 #[cfg(not(debug_assertions))]
 fn observe_backend_fault(
     _kind: QueryLifecycleFaultKind,
-    _execution_id: crate::query_execution::lifecycle::QueryExecutionId,
+    _execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }
 
 async fn send_control_response(
-    outbound: &tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
-    response: Result<novarocks::QueryControlResponse, tonic::Status>,
+    outbound: &tokio::sync::mpsc::Sender<Result<proto::QueryControlResponse, tonic::Status>>,
+    response: Result<proto::QueryControlResponse, tonic::Status>,
     shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
 ) -> bool {
     tokio::select! {
@@ -614,7 +601,7 @@ impl Drop for CoordinatorLease {
     }
 }
 
-pub(crate) fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
+pub fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
     let detail = error.detail().to_string();
     match error.code() {
         QueryLifecycleErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),

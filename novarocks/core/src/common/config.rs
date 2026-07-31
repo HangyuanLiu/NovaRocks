@@ -37,7 +37,7 @@ pub(crate) fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
         .and_then(|c| c.debug.fault_inject_fetch_not_ready_count())
 }
 
-pub(crate) fn debug_emit_cancel_marker() -> bool {
+pub fn debug_emit_cancel_marker() -> bool {
     novarocks_app_config()
         .ok()
         .map(|c| c.debug.emit_cancel_marker())
@@ -64,7 +64,7 @@ pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }
 
-pub(crate) fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
+pub fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
     novarocks_app_config()
         .ok()
         .and_then(|config| config.debug.query_lifecycle_fault_dir())
