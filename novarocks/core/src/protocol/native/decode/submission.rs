@@ -32,8 +32,8 @@ use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
-    NativeFragmentSubmissionValidator, NativeRuntimeFilterContractDecoder,
-    NativeScanSourceContractDecoder,
+    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder,
+    NativeRuntimeFilterContractDecoder, NativeScanSourceContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -116,6 +116,7 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         },
         |sink| decode_fragment_sink_assignment(sink, instance_params),
         None,
+        None,
         |root, path| decode_scan_source_contracts(root, path),
         |root, path| decode_exchange_contracts(root, path),
         |fragment| decode_runtime_filter_contract(fragment),
@@ -130,6 +131,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     submission_validator: &dyn NativeFragmentSubmissionValidator,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     expression_decoder: Arc<dyn NativeExpressionDecoder>,
+    output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
     runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
@@ -158,6 +160,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
                 .map_err(NativeFragmentDecodeError::from)
         },
         Some(expression_decoder),
+        Some(output_layout_decoder),
         |root, path| {
             scan_source_contract_decoder
                 .decode_scan_source_contracts(root, path)
@@ -188,6 +191,7 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
     require_sink: impl FnOnce(&plan::PlanFragment) -> Result<&plan::DataSink, NativeFragmentDecodeError>,
     decode_sink_assignment: F,
     expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
+    output_layout_decoder: Option<Arc<dyn NativeOutputLayoutDecoder>>,
     decode_scan_source_contracts: impl FnOnce(
         &plan::DistributedNode,
         FieldPath,
@@ -289,6 +293,9 @@ where
     .with_execution_resolver(execution_resolver);
     if let Some(expression_decoder) = expression_decoder {
         context = context.with_expression_decoder(expression_decoder);
+    }
+    if let Some(output_layout_decoder) = output_layout_decoder {
+        context = context.with_output_layout_decoder(output_layout_decoder);
     }
     let mut runtime_filter_ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,

@@ -24,7 +24,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
@@ -53,14 +53,9 @@ pub(super) fn lower_values_node(
     } else {
         path.clone().field("columns")
     };
-    let layout = NativeFragmentDecodeError::map_invalid(
-        columns_path.clone(),
-        layout_from_output_columns(columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        columns_path,
-        chunk_schema_from_output_columns(columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(columns, columns_path)?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     let chunk = materialize_values_chunk_with_context(
         &values.rows,
         columns,

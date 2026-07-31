@@ -20,7 +20,6 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::chunk_schema_from_output_columns;
 use super::common::{concat_layouts, proto_join_type};
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
@@ -72,6 +71,7 @@ pub(super) fn lower_hash_join_node(
         join_scope_chunk_schema.clone(),
         "HashJoinNode",
         physical_output_path,
+        ctx,
     )?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
@@ -166,14 +166,14 @@ pub(super) fn join_output_chunk_schema(
     fallback: ChunkSchemaRef,
     _node_kind: &str,
     path: FieldPath,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
     if physical.output_columns.is_empty() {
         return Ok(fallback);
     }
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        path,
-        chunk_schema_from_output_columns(&physical.output_columns),
-    )?;
+    let output_schema = ctx
+        .decode_output_layout(&physical.output_columns, path)?
+        .chunk_schema();
     if output_schema.slot_ids() == fallback.slot_ids() {
         return Ok(output_schema);
     }

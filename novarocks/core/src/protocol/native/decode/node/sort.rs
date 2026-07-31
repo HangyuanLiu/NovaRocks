@@ -17,7 +17,7 @@
 
 use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::Layout;
 use super::common::{
     build_slot_projection, parse_distributed_limit, parse_optional_nonnegative_i64,
 };
@@ -118,14 +118,9 @@ pub(super) fn lower_sort_node(
         return Ok(sorted);
     }
 
-    let layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path.clone())?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     if layout.order() == child.layout.order() {
         return Ok(DecodedNode {
             node: sorted.node,
@@ -141,6 +136,7 @@ pub(super) fn lower_sort_node(
         output_columns_path,
         node.node_id,
         arena,
+        ctx,
     )
 }
 

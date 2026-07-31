@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -66,14 +66,9 @@ pub(super) fn lower_window_node(
             "WindowNode output_columns missing",
         ));
     }
-    let final_layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let final_output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let final_layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let final_output_schema = output_layout.chunk_schema();
 
     let groups = group_window_exprs_by_spec(&window.window_exprs);
     if groups.is_empty() {

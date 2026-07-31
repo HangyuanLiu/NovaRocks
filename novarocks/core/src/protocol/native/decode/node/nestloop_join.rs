@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::{Layout, chunk_schema_from_output_columns};
+use super::super::layout::Layout;
 use super::common::concat_layouts;
 use super::hash_join;
 use super::{DecodedNode, NativePlanDecodeContext};
@@ -78,16 +78,15 @@ pub(super) fn lower_nest_loop_join_node(
             | NestedLoopJoinType::NullAwareLeftAnti
     );
     let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
-        NativeFragmentDecodeError::map_invalid(
-            physical_output_path.clone(),
-            chunk_schema_from_output_columns(&physical.output_columns),
-        )?
+        ctx.decode_output_layout(&physical.output_columns, physical_output_path.clone())?
+            .chunk_schema()
     } else {
         hash_join::join_output_chunk_schema(
             physical,
             join_scope_chunk_schema.clone(),
             "NestLoopJoinNode",
             physical_output_path,
+            ctx,
         )?
     };
     let join_conjunct = join

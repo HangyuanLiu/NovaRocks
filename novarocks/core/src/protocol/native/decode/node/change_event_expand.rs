@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
+use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
@@ -48,14 +48,9 @@ pub(super) fn lower_change_event_expand_node(
     } else {
         (&expand.output_columns, path.clone().field("output_columns"))
     };
-    let layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     let output_slot_ids = layout.order().to_vec();
     let output_set = output_slot_ids.iter().copied().collect::<HashSet<_>>();
     let change_op_slot_id = SlotId::new(expand.change_op_column_id);

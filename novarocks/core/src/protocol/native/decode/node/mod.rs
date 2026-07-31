@@ -64,7 +64,8 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
-    NativeExpressionDecoder, NativeExpressionInputLayout,
+    NativeExpressionDecoder, NativeExpressionInputLayout, NativeOutputLayout,
+    NativeOutputLayoutDecoder,
 };
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::fragment::instance::{
@@ -98,6 +99,7 @@ pub(crate) struct NativePlanDecodeContext {
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     execution_resolver: Option<Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>>,
     expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
+    output_layout_decoder: Option<Arc<dyn NativeOutputLayoutDecoder>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
 }
@@ -112,6 +114,7 @@ impl Default for NativePlanDecodeContext {
             connectors: None,
             execution_resolver: None,
             expression_decoder: None,
+            output_layout_decoder: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(crate::common::types::UniqueId {
                 hi: 0,
@@ -138,6 +141,7 @@ impl NativePlanDecodeContext {
             connectors: Some(connectors),
             execution_resolver: None,
             expression_decoder: None,
+            output_layout_decoder: None,
             query_id: Some(query_id),
             fragment_instance_id,
         }
@@ -157,6 +161,53 @@ impl NativePlanDecodeContext {
     ) -> Self {
         self.expression_decoder = Some(decoder);
         self
+    }
+
+    pub(crate) fn with_output_layout_decoder(
+        mut self,
+        decoder: Arc<dyn NativeOutputLayoutDecoder>,
+    ) -> Self {
+        self.output_layout_decoder = Some(decoder);
+        self
+    }
+
+    pub(crate) fn decode_output_layout(
+        &self,
+        columns: &[crate::proto::common::OutputColumn],
+        path: FieldPath,
+    ) -> Result<NativeOutputLayout, super::NativeFragmentDecodeError> {
+        let Some(decoder) = self.output_layout_decoder.as_ref() else {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                let layout = super::NativeFragmentDecodeError::map_invalid(
+                    path.clone(),
+                    super::layout::layout_from_output_columns(columns),
+                )?;
+                let chunk_schema = super::NativeFragmentDecodeError::map_invalid(
+                    path.clone(),
+                    super::layout::chunk_schema_from_output_columns(columns),
+                )?;
+                let slot_schemas = super::NativeFragmentDecodeError::map_invalid(
+                    path,
+                    super::layout::slot_schemas_from_output_columns(columns),
+                )?;
+                return Ok(NativeOutputLayout::new(
+                    layout.order().to_vec(),
+                    chunk_schema,
+                    slot_schemas,
+                ));
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                return Err(super::NativeFragmentDecodeError::unsupported(
+                    path,
+                    "native output layout decoder must be supplied by the backend runtime",
+                ));
+            }
+        };
+        decoder
+            .decode_output_layout(columns, path)
+            .map_err(super::NativeFragmentDecodeError::from)
     }
 
     pub(crate) fn decode_expression(
@@ -1729,6 +1780,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::AssertOneRow(assert) => assert::lower_assert_one_row_node(
             node,

@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::connector::ConnectorRegistry;
+use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
@@ -204,6 +205,52 @@ pub trait NativeExpressionDecoder: Send + Sync {
     ) -> Result<ExprId, ProtocolError>;
 }
 
+/// Backend-decoded physical output layout for a native plan node.
+///
+/// The core consumes this as execution metadata only. Wire type decoding and
+/// duplicate-slot validation remain owned by the backend role.
+#[derive(Clone, Debug)]
+pub struct NativeOutputLayout {
+    slot_ids: Vec<SlotId>,
+    chunk_schema: ChunkSchemaRef,
+    slot_schemas: Vec<ChunkSlotSchema>,
+}
+
+impl NativeOutputLayout {
+    pub fn new(
+        slot_ids: Vec<SlotId>,
+        chunk_schema: ChunkSchemaRef,
+        slot_schemas: Vec<ChunkSlotSchema>,
+    ) -> Self {
+        Self {
+            slot_ids,
+            chunk_schema,
+            slot_schemas,
+        }
+    }
+
+    pub fn slot_ids(&self) -> &[SlotId] {
+        &self.slot_ids
+    }
+
+    pub fn chunk_schema(&self) -> ChunkSchemaRef {
+        self.chunk_schema.clone()
+    }
+
+    pub fn slot_schemas(&self) -> &[ChunkSlotSchema] {
+        &self.slot_schemas
+    }
+}
+
+/// Backend-owned decoding of native `OutputColumn` wire metadata.
+pub trait NativeOutputLayoutDecoder: Send + Sync {
+    fn decode_output_layout(
+        &self,
+        columns: &[crate::proto::common::OutputColumn],
+        path: FieldPath,
+    ) -> Result<NativeOutputLayout, ProtocolError>;
+}
+
 /// Backend-owned runtime-filter contract decoder invoked after plan assembly
 /// has consumed the binding table.
 pub trait NativeRuntimeFilterContractDecoder: Send + Sync {
@@ -253,6 +300,7 @@ pub fn assemble_fragment_submission_for_backend(
     submission_validator: &dyn NativeFragmentSubmissionValidator,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     expression_decoder: Arc<dyn NativeExpressionDecoder>,
+    output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
     runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
@@ -267,6 +315,7 @@ pub fn assemble_fragment_submission_for_backend(
         submission_validator,
         sink_assignment_decoder,
         expression_decoder,
+        output_layout_decoder,
         scan_source_contract_decoder,
         exchange_contract_decoder,
         runtime_filter_contract_decoder,

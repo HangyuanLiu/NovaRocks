@@ -22,6 +22,9 @@ use std::sync::Arc;
 
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use novarocks::protocol::native_fragment_assembly_port::{
+    NativeOutputLayout, NativeOutputLayoutDecoder,
+};
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks_protocol::common;
 
@@ -31,6 +34,25 @@ pub(crate) fn chunk_schema_from_output_columns(
     columns: &[common::OutputColumn],
     path: FieldPath,
 ) -> Result<ChunkSchemaRef, ProtocolError> {
+    decode_output_layout(columns, path).map(|layout| layout.chunk_schema())
+}
+
+pub(crate) struct BackendNativeOutputLayoutDecoder;
+
+impl NativeOutputLayoutDecoder for BackendNativeOutputLayoutDecoder {
+    fn decode_output_layout(
+        &self,
+        columns: &[common::OutputColumn],
+        path: FieldPath,
+    ) -> Result<NativeOutputLayout, ProtocolError> {
+        decode_output_layout(columns, path)
+    }
+}
+
+fn decode_output_layout(
+    columns: &[common::OutputColumn],
+    path: FieldPath,
+) -> Result<NativeOutputLayout, ProtocolError> {
     let mut slots = Vec::with_capacity(columns.len());
     let mut seen = HashMap::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
@@ -71,11 +93,62 @@ pub(crate) fn chunk_schema_from_output_columns(
                 .map_err(|detail| error(path.clone(), ProtocolErrorKind::InvalidValue, detail))?,
         );
     }
-    ChunkSchema::try_new(slots)
+    let chunk_schema = ChunkSchema::try_new(slots.clone())
         .map(Arc::new)
-        .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))
+        .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))?;
+    Ok(NativeOutputLayout::new(
+        slots.iter().map(|slot| slot.slot_id()).collect(),
+        chunk_schema,
+        slots,
+    ))
 }
 
 fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolFamily::Native, path, kind, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendNativeOutputLayoutDecoder, NativeOutputLayoutDecoder};
+    use novarocks::common::ids::SlotId;
+    use novarocks::protocol::FieldPath;
+    use novarocks_protocol::common;
+
+    fn int_column(column_id: u32) -> common::OutputColumn {
+        common::OutputColumn {
+            column_id,
+            name: "id".to_string(),
+            nullable: true,
+            r#type: Some(common::TypeDesc {
+                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                    r#type: common::PrimitiveType::Int as i32,
+                    ..Default::default()
+                })),
+            }),
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn decodes_layout_slots_schema_and_slot_schemas_together() {
+        let layout = BackendNativeOutputLayoutDecoder
+            .decode_output_layout(&[int_column(3)], FieldPath::root("columns"))
+            .expect("layout decodes");
+
+        assert_eq!(layout.slot_ids(), &[SlotId::new(3)]);
+        assert_eq!(layout.chunk_schema().slots().len(), 1);
+        assert_eq!(layout.slot_schemas()[0].slot_id(), SlotId::new(3));
+    }
+
+    #[test]
+    fn preserves_duplicate_slot_error_path() {
+        let error = BackendNativeOutputLayoutDecoder
+            .decode_output_layout(&[int_column(3), int_column(3)], FieldPath::root("columns"))
+            .expect_err("duplicate slots must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "native protocol error at columns[1].column_id (inconsistent fields): duplicate OutputColumn.column_id 3 at index 1 (first seen at index 0)"
+        );
+    }
 }

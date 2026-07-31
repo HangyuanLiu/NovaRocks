@@ -16,11 +16,8 @@
 // under the License.
 
 use super::super::NativeFragmentDecodeError;
-use super::super::layout::{
-    chunk_schema_from_output_columns, layout_from_output_columns, slot_schemas_from_output_columns,
-};
-use super::common::slot_ids_from_columns;
-use super::{super::decode_type, DecodedNode};
+use super::super::layout::Layout;
+use super::{super::decode_type, DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -39,6 +36,7 @@ pub(super) fn lower_set_op_node(
     physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let kind = plan::PlanSetOpKind::try_from(set_op.kind).map_err(|_| {
         NativeFragmentDecodeError::invalid_enum(
@@ -51,14 +49,9 @@ pub(super) fn lower_set_op_node(
     } else {
         (&set_op.output_columns, path.clone().field("output_columns"))
     };
-    let layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path.clone())?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     let inputs = normalize_set_op_inputs(
         node.node_id,
         children,
@@ -68,6 +61,7 @@ pub(super) fn lower_set_op_node(
         output_schema.clone(),
         path.clone(),
         arena,
+        ctx,
     )?;
     match kind {
         plan::PlanSetOpKind::UnionAll => Ok(DecodedNode {
@@ -124,6 +118,7 @@ fn normalize_set_op_inputs(
     output_schema: ChunkSchemaRef,
     path: FieldPath,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<Vec<ExecNode>, NativeFragmentDecodeError> {
     if child_output_columns.is_empty() {
         return normalize_set_op_inputs_by_position(
@@ -134,6 +129,7 @@ fn normalize_set_op_inputs(
             output_schema,
             path,
             arena,
+            ctx,
         );
     }
     if child_output_columns.len() != children.len() {
@@ -146,11 +142,9 @@ fn normalize_set_op_inputs(
             ),
         ));
     }
-    let output_slots = slot_ids_from_columns(output_columns, output_columns_path.clone())?;
-    let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        slot_schemas_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path.clone())?;
+    let output_slots = output_layout.slot_ids().to_vec();
+    let output_slot_schemas = output_layout.slot_schemas().to_vec();
     children
         .into_iter()
         .zip(child_output_columns.iter())
@@ -160,7 +154,12 @@ fn normalize_set_op_inputs(
             if child_columns.columns.len() != output_columns.len() {
                 return Err(NativeFragmentDecodeError::inconsistent(child_path.clone(), format!("SetOpNode child {idx} output width mismatch: expected {}, got {}", output_columns.len(), child_columns.columns.len())));
             }
-            let expected_child_layout = NativeFragmentDecodeError::map_invalid(child_path.clone(), layout_from_output_columns(&child_columns.columns))?;
+            let expected_child_layout = Layout::for_slots(
+                ctx.decode_output_layout(&child_columns.columns, child_path.clone())?
+                    .slot_ids()
+                    .iter()
+                    .copied(),
+            );
             if expected_child_layout.order() != child.layout.order() {
                 return Err(NativeFragmentDecodeError::inconsistent(child_path.clone(), format!("SetOpNode child {idx} output columns do not match child layout: columns={:?} layout={:?}", expected_child_layout.order(), child.layout.order())));
             }
@@ -202,12 +201,11 @@ fn normalize_set_op_inputs_by_position(
     output_schema: ChunkSchemaRef,
     path: FieldPath,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<Vec<ExecNode>, NativeFragmentDecodeError> {
-    let output_slots = slot_ids_from_columns(output_columns, output_columns_path.clone())?;
-    let output_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        slot_schemas_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path.clone())?;
+    let output_slots = output_layout.slot_ids().to_vec();
+    let output_slot_schemas = output_layout.slot_schemas().to_vec();
     children
         .into_iter()
         .enumerate()

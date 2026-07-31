@@ -42,6 +42,7 @@ use super::exchange::BackendNativeExchangeContractDecoder;
 use super::expression::BackendNativeExpressionDecoder;
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
+use super::layout::BackendNativeOutputLayoutDecoder;
 use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
 use super::scan_contract::BackendNativeScanSourceContractDecoder;
 use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
@@ -127,6 +128,7 @@ impl NativeFragmentRequest {
             &BackendNativeFragmentSubmissionValidator,
             &BackendNativeFragmentSinkAssignmentDecoder,
             Arc::new(BackendNativeExpressionDecoder),
+            Arc::new(BackendNativeOutputLayoutDecoder),
             &BackendNativeScanSourceContractDecoder,
             &BackendNativeExchangeContractDecoder,
             &BackendNativeRuntimeFilterContractDecoder,

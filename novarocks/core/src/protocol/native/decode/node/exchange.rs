@@ -28,9 +28,7 @@ use crate::exec::node::sort::{SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
-use crate::protocol::native::decode::layout::{
-    chunk_schema_from_output_columns, layout_from_output_columns,
-};
+use crate::protocol::native::decode::layout::Layout;
 
 pub(super) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
@@ -67,14 +65,12 @@ pub(super) fn lower_exchange_receiver(
     // The instance-scoped ExchangeKey and sender count are materialized into the
     // per-node ExchangeBinding at execution time, not baked into the static node.
     NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
-    let layout = NativeFragmentDecodeError::map_invalid(
+    let output_layout = ctx.decode_output_layout(
+        &exchange.output_columns,
         path.clone().field("output_columns"),
-        layout_from_output_columns(&exchange.output_columns),
     )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("output_columns"),
-        chunk_schema_from_output_columns(&exchange.output_columns),
-    )?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     let mut lowered = DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
