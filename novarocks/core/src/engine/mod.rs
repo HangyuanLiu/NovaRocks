@@ -231,11 +231,25 @@ impl PreparedQueryCompletion {
                 ) {
                     lines.push(apply.to_string());
                 }
+                if let Some(apply) = crate::query_execution::profile::collect_native_scan_conjunct_apply_from_profile_trees(
+                    &fragment_profiles,
+                ) {
+                    lines.push(apply.to_string());
+                }
                 if let Some(counters) =
                     crate::query_execution::profile::format_counter_sums_from_profile_trees(
                         &fragment_profiles,
                         ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
                         "ProfileCounters",
+                    )
+                {
+                    lines.push(counters);
+                }
+                if let Some(counters) =
+                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
+                        &fragment_profiles,
+                        CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
+                        "ConnectorFileMetrics",
                     )
                 {
                     lines.push(counters);
@@ -3358,10 +3372,24 @@ fn explain_analyze_query(
     {
         lines.push(apply.to_string());
     }
+    if let Some(apply) =
+        crate::query_execution::profile::collect_native_scan_conjunct_apply_from_profile_trees(
+            &outcome.fragment_profiles,
+        )
+    {
+        lines.push(apply.to_string());
+    }
     if let Some(counters) = crate::query_execution::profile::format_counter_sums_from_profile_trees(
         &outcome.fragment_profiles,
         ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
         "ProfileCounters",
+    ) {
+        lines.push(counters);
+    }
+    if let Some(counters) = crate::query_execution::profile::format_counter_sums_from_profile_trees(
+        &outcome.fragment_profiles,
+        CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
+        "ConnectorFileMetrics",
     ) {
         lines.push(counters);
     }
@@ -3388,6 +3416,9 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Unsupported",
     "IcebergRuntimeFilePruning/Unavailable",
 ];
+
+const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] =
+    &["ConnectorFileRowGroupsRead", "ConnectorFileRowGroupsPruned"];
 
 fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,
