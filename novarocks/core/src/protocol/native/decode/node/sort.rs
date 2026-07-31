@@ -16,6 +16,7 @@
 // under the License.
 
 use super::super::NativeFragmentDecodeError;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::super::expr::decode_expr_at;
 use super::super::layout::Layout;
 use super::common::{
@@ -140,6 +141,7 @@ pub(super) fn lower_sort_node(
     )
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(super) fn lower_sort_items(
     node_kind: &str,
     items: &[expr::SortItem],
@@ -184,7 +186,19 @@ fn lower_sort_items_with_decoder(
                 Some(ctx) => {
                     ctx.decode_expression(expr, item_path.field("expr"), arena, input_layout)
                 }
-                None => decode_expr_at(expr, item_path.field("expr"), arena, input_layout),
+                None => {
+                    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+                    {
+                        decode_expr_at(expr, item_path.field("expr"), arena, input_layout)
+                    }
+                    #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+                    {
+                        Err(NativeFragmentDecodeError::unsupported(
+                            item_path.field("expr"),
+                            "native expression decoder must be supplied by the backend runtime",
+                        ))
+                    }
+                }
             }?;
             Ok(SortExpression {
                 expr,

@@ -23,6 +23,7 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::super::NativeFragmentDecodeError;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::super::expr::decode_expr_at;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
@@ -149,7 +150,19 @@ fn materialize_values_chunk_with_context(
                 .index(col_idx);
             let expr_id = match ctx {
                 Some(ctx) => ctx.decode_expression(expr, expr_path.clone(), arena, &input_layout),
-                None => decode_expr_at(expr, expr_path.clone(), arena, &input_layout),
+                None => {
+                    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+                    {
+                        decode_expr_at(expr, expr_path.clone(), arena, &input_layout)
+                    }
+                    #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+                    {
+                        Err(NativeFragmentDecodeError::unsupported(
+                            expr_path.clone(),
+                            "native expression decoder must be supplied by the backend runtime",
+                        ))
+                    }
+                }
             }?;
             let array = arena
                 .eval(expr_id, &one_row)

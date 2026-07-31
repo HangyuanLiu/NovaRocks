@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use super::decode_type;
 use super::error::NativeFragmentLeafDecodeError;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::expr::decode_expr;
 use super::node::NativePlanDecodeContext;
 use crate::common::ids::SlotId;
@@ -876,7 +877,19 @@ fn decode_expr_with_context(
             arena,
             layout,
         ),
-        None => decode_expr(expression, arena, layout),
+        None => {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                decode_expr(expression, arena, layout)
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                Err(super::NativeFragmentDecodeError::unsupported(
+                    FieldPath::root("plan_fragment").field("sink"),
+                    "native expression decoder must be supplied by the backend runtime",
+                ))
+            }
+        }
     }
 }
 
