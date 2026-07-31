@@ -41,10 +41,9 @@ pub(in crate::protocol::native) use runtime_filter::{
     decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
     decode_runtime_filter_logical_domain_and_reduction,
 };
-pub(crate) use sink::{
-    decode_fragment_sink_assignment, decode_fragment_sink_program,
-    decode_fragment_sink_program_with_context,
-};
+pub(crate) use sink::decode_fragment_sink_program_with_context;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
 pub(crate) use submission::assemble_fragment_submission_with_connectors_and_execution_resolver;
 #[cfg(test)]
 #[allow(unused_imports)]

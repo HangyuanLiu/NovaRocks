@@ -43,9 +43,12 @@ use crate::exec::fragment::sink::{
     IcebergChangeStreamRouterProgram, IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::DataStreamPartitionType;
-use crate::proto::{common, expr, novarocks, plan};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use crate::proto::novarocks;
+use crate::proto::{common, expr, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::runtime::fragment::instance::FragmentSinkAssignment;
 
 use self::equality_delete::{
@@ -62,6 +65,7 @@ use self::partition::{
 };
 use self::position_delete::bind_position_delete_descriptor_from_native;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_sink_program(
     fragment: &plan::PlanFragment,
     layout: &super::layout::Layout,
@@ -173,6 +177,7 @@ pub(crate) fn decode_fragment_sink_program_with_context(
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
     instance: &novarocks::InstanceParams,

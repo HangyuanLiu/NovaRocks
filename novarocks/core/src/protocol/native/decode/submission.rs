@@ -44,11 +44,13 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use super::decode_fragment_sink_assignment;
 use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
 use super::{
     NativeFragmentDecodeError, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
-    decode_fragment_sink_assignment, decode_fragment_sink_program_with_context,
-    decode_node_with_runtime_filters, decode_query_options,
+    decode_fragment_sink_program_with_context, decode_node_with_runtime_filters,
+    decode_query_options,
 };
 
 #[derive(Debug)]
