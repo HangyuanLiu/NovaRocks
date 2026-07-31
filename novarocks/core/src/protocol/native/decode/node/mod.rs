@@ -167,7 +167,17 @@ impl NativePlanDecodeContext {
         layout: &Layout,
     ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
         let Some(decoder) = self.expression_decoder.as_ref() else {
-            return super::expr::decode_expr_at(expression, path, arena, layout);
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                return super::expr::decode_expr_at(expression, path, arena, layout);
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                return Err(super::NativeFragmentDecodeError::unsupported(
+                    path,
+                    "native expression decoder must be supplied by the backend runtime",
+                ));
+            }
         };
         let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
         decoder
