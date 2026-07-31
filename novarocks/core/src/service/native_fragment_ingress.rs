@@ -16,35 +16,48 @@
 // under the License.
 
 use std::fmt;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::sync::Arc;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::time::Duration;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::proto;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::protocol::native::decode::{
     decode_fragment_submission_with_connectors_and_execution_resolver, decode_query_execution_id,
 };
 use crate::query_execution::lifecycle::QueryExecutionId;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use crate::runtime::endpoint::RuntimeEndpoint;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::runtime::query_options::QueryOptions;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
     submission: FragmentSubmission,
     backend_num: i32,
+    report_endpoint: Option<RuntimeEndpoint>,
 }
 
 /// Decode the query identity before choosing the query-scoped BE execution
 /// resolver. This is transport validation only; it does not resolve or install
 /// any Connector binding.
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn decode_native_query_execution_id(
     execution_id: &proto::novarocks::QueryExecutionId,
 ) -> Result<QueryExecutionId, NativeFragmentIngressError> {
     decode_query_execution_id(execution_id).map_err(NativeFragmentIngressError::new)
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl NativeFragmentRequest {
     pub fn try_decode_wire(
         execution_id: proto::novarocks::QueryExecutionId,
@@ -128,6 +141,7 @@ impl NativeFragmentRequest {
             execution_id,
             submission,
             backend_num: metadata.backend_num(),
+            report_endpoint: metadata.report_endpoint().cloned(),
         })
     }
 
@@ -145,6 +159,10 @@ impl NativeFragmentRequest {
 
     pub const fn backend_num(&self) -> i32 {
         self.backend_num
+    }
+
+    pub fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
+        self.report_endpoint.as_ref()
     }
 
     pub fn enable_profile(&self) -> bool {
@@ -186,8 +204,10 @@ impl NativeFragmentRequest {
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 struct MissingExecutionResolver;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionResolver {
     fn resolve(
         &self,
