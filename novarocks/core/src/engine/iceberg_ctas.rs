@@ -40,10 +40,10 @@
 //! table.
 //!
 //! Phase-1 trade-off: the SELECT is executed twice — once here for schema
-//! inference (Step A) and once inside `execute_iceberg_insert_or_overwrite`
-//! for the actual data write (Steps C+D). This duplication avoids wiring
-//! chunk re-use through the insert path; a future optimisation can buffer
-//! the chunks from Step A and replay them without re-running the query.
+//! inference (Step A) and once inside CTAS-owned `execute_ctas_write` for the
+//! actual data write (Steps C+D). This duplication avoids wiring chunk re-use
+//! through the write path; a future optimisation can buffer the chunks from
+//! Step A and replay them without re-running the query.
 
 use std::sync::Arc;
 
@@ -54,8 +54,7 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::QueryResultColumn;
 use crate::sql::parser::ast::{
-    CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, InsertSource, OverwriteMode,
-    TableColumnDef,
+    CreateTableKind, CreateTableStmt, IcebergPartitionFieldExpr, TableColumnDef,
 };
 use novarocks_catalog::schema::SqlType;
 
@@ -461,13 +460,13 @@ fn execute_ctas_write(
     query: &sqlparser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    crate::engine::iceberg_writer::prepare_iceberg_insert_or_overwrite(
+    crate::engine::iceberg_writer::prepare_iceberg_write(
         state,
         target,
         resolved,
         &[],
-        &InsertSource::FromQuery(Box::new(query.clone())),
-        OverwriteMode::None,
+        &crate::engine::iceberg_writer::IcebergWriteInput::Query(Box::new(query.clone())),
+        crate::engine::iceberg_writer::IcebergWriteMode::Append,
         "main",
         None,
         connector_context,

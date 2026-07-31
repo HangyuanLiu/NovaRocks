@@ -59,7 +59,6 @@ pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
-pub(crate) mod insert;
 pub mod insert_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
@@ -78,15 +77,12 @@ pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
 
-#[cfg(test)]
-pub(crate) use self::insert::build_local_insert_batch;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
     execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_add_legacy_range_partition, looks_like_alter_iceberg_properties,
-    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
-    looks_like_show_create_table, parse_add_legacy_range_partition_sql,
+    looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
+    looks_like_alter_partition_column, looks_like_show_create_table,
     parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql, parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
@@ -1320,10 +1316,6 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let mut normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
-        if looks_like_add_legacy_range_partition(&normalized) {
-            let stmt = parse_add_legacy_range_partition_sql(&normalized)?;
-            return self.handle_add_legacy_range_partition(stmt, current_catalog, current_database);
-        }
         normalized =
             rewrite_legacy_partition_references(&self.inner, &normalized, current_database)?;
         normalized = rewrite_named_partition_insert_overwrite(&normalized)?;
@@ -1856,47 +1848,6 @@ impl StandaloneSession {
         current_database: &str,
     ) -> Result<StatementResult, String> {
         crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
-    }
-
-    fn handle_add_legacy_range_partition(
-        &self,
-        stmt: crate::engine::statement::AlterLegacyRangePartitionStmt,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        let target = crate::engine::backend_resolver::resolve_existing_table_target(
-            &self.inner,
-            &stmt.table,
-            current_catalog,
-            current_database,
-        )?;
-        if target.backend_name == "iceberg" {
-            return Err(
-                "ALTER TABLE ADD PARTITION only supports standalone StarRocks tables".into(),
-            );
-        }
-        let mut catalog = self
-            .inner
-            .catalog_service
-            .local()
-            .write()
-            .expect("standalone catalog write lock");
-        let table_def = catalog.get(&target.namespace, &target.table)?;
-        let mut partition = stmt.partition;
-        if partition.column.is_empty() {
-            partition.column = table_def
-                .columns
-                .first()
-                .map(|column| column.name.clone())
-                .ok_or_else(|| {
-                    format!(
-                        "cannot infer range partition column for empty table schema {}.{}",
-                        target.namespace, target.table
-                    )
-                })?;
-        }
-        catalog.add_legacy_range_partition(&target.namespace, &target.table, partition)?;
-        Ok(StatementResult::Ok)
     }
 
     fn handle_show_create_table(
@@ -5494,7 +5445,7 @@ mod tests {
         ($session:expr, $target:expr; $([$($value:expr),* $(,)?]),+ $(,)?) => {
             insert_iceberg_fixture_rows(
                 $session,
-                $target,
+                &$target,
                 &[
                     $(vec![$($value.into_test_literal()),*]),+
                 ],
@@ -7114,337 +7065,12 @@ mysql_port = 47892
     }
 
     #[test]
-    fn build_local_insert_batch_supports_array_columns() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let columns = vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "score_items".to_string(),
-                data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            },
-            ColumnDef {
-                name: "tags".to_string(),
-                data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                nullable: true,
-                write_default: None,
-                logical_type: None,
-            },
-        ];
-        let rows = vec![
-            vec![
-                Literal::Int(1),
-                Literal::Array(vec![Literal::Int(90), Literal::Null, Literal::Int(80)]),
-                Literal::Array(vec![
-                    Literal::String("a".to_string()),
-                    Literal::Null,
-                    Literal::String("c".to_string()),
-                ]),
-            ],
-            vec![Literal::Int(2), Literal::Null, Literal::Array(vec![])],
-        ];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let scores = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("score_items list array");
-        let tags = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("tags list array");
-
-        assert_eq!(scores.len(), 2);
-        assert_eq!(scores.value(0).len(), 3);
-        assert!(scores.is_null(1));
-
-        assert_eq!(tags.len(), 2);
-        assert_eq!(tags.value(0).len(), 3);
-        assert_eq!(tags.value(1).len(), 0);
-    }
-
-    #[test]
     fn sql_type_to_arrow_type_maps_largeint_to_fixed_size_binary() {
         assert_eq!(
             super::sql_type_to_arrow_type(&novarocks_catalog::schema::SqlType::LargeInt)
                 .expect("map largeint type"),
             DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
         );
-    }
-
-    #[test]
-    fn build_local_insert_batch_supports_largeint_columns() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-        use novarocks_types::largeint;
-
-        let columns = vec![ColumnDef {
-            name: "v".to_string(),
-            data_type: DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![
-            vec![Literal::String(
-                "-170141183460469231731687303715884105728".to_string(),
-            )],
-            vec![Literal::String("0".to_string())],
-            vec![Literal::Null],
-            vec![Literal::String(
-                "170141183460469231731687303715884105727".to_string(),
-            )],
-        ];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .expect("largeint array");
-
-        assert_eq!(
-            largeint::value_at(values, 0).expect("decode min"),
-            i128::MIN
-        );
-        assert_eq!(largeint::value_at(values, 1).expect("decode zero"), 0);
-        assert!(values.is_null(2));
-        assert_eq!(
-            largeint::value_at(values, 3).expect("decode max"),
-            i128::MAX
-        );
-    }
-
-    #[test]
-    fn build_local_insert_batch_accepts_integral_float_literals_for_bigint_arrays() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let columns = vec![ColumnDef {
-            name: "nums".to_string(),
-            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Array(vec![
-            Literal::Float(1.0),
-            Literal::Float(2.0),
-        ])]];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let nums = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .expect("nums list array");
-        let values_ref = nums.value(0);
-        let values = values_ref
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 values");
-
-        assert_eq!(values.value(0), 1);
-        assert_eq!(values.value(1), 2);
-    }
-
-    #[test]
-    fn build_local_insert_batch_drops_null_map_keys() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        // Arrow's Map layout requires `entries.key` to be non-nullable; map
-        // literals with NULL keys must drop those kv-pairs so that the output
-        // array matches the catalog schema.
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![
-            (Literal::Null, Literal::String("dropped".to_string())),
-            (Literal::Int(7), Literal::String("kept".to_string())),
-        ])]];
-
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let map = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::MapArray>()
-            .expect("map array");
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.value_length(0), 1);
-        let entries = map.entries();
-        let keys = entries
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("key array");
-        assert_eq!(keys.null_count(), 0);
-        assert_eq!(keys.value(0), 7);
-
-        let schema = batch.schema();
-        let DataType::Map(entries_field, _) = schema.field(0).data_type() else {
-            panic!("expected map field");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected struct entries");
-        };
-        assert!(!entry_fields[0].is_nullable());
-    }
-
-    #[test]
-    fn cast_batch_to_schema_relaxes_map_key_nullability() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        let source_entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let source_columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(source_entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![(
-            Literal::Int(1),
-            Literal::String("v".to_string()),
-        )])]];
-        let source_batch =
-            super::build_local_insert_batch(&source_columns, &rows).expect("build source batch");
-
-        let target_entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, true)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let target_schema = Arc::new(Schema::new(vec![Field::new(
-            "m",
-            DataType::Map(target_entries_field, false),
-            true,
-        )]));
-
-        let casted =
-            crate::formats::parquet::local_io::cast_batch_to_schema(&source_batch, &target_schema)
-                .expect("cast batch");
-        let casted_schema = casted.schema();
-        let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
-            panic!("expected MAP column");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected MAP entries to be STRUCT");
-        };
-
-        assert!(
-            entry_fields[0].is_nullable(),
-            "expected casted map key field to become nullable"
-        );
-    }
-
-    #[test]
-    fn local_parquet_round_trip_drops_null_map_keys() {
-        use crate::sql::parser::ast::Literal;
-        use novarocks_catalog::schema::ColumnDef;
-
-        // Arrow's Map layout requires non-null keys; when a literal carries a
-        // NULL key, the insert path drops the kv-pair and the resulting
-        // parquet round trip must preserve that (no null keys).
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("key", DataType::Int32, false)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ]
-                .into(),
-            ),
-            false,
-        ));
-        let columns = vec![ColumnDef {
-            name: "m".to_string(),
-            data_type: DataType::Map(entries_field, false),
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }];
-        let rows = vec![vec![Literal::Map(vec![
-            (Literal::Null, Literal::String("dropped".to_string())),
-            (Literal::Int(5), Literal::String("kept".to_string())),
-        ])]];
-        let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("map_round_trip.parquet");
-
-        crate::formats::parquet::local_io::write_parquet_to_path(&path, &batch)
-            .expect("write local parquet");
-        let round_tripped =
-            crate::formats::parquet::local_io::read_local_parquet_data(&path, &batch.schema())
-                .expect("read local parquet");
-        let map = round_tripped
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::MapArray>()
-            .expect("map array");
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.value_length(0), 1);
-        let entries = map.entries();
-        let keys = entries
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("key array");
-        assert_eq!(keys.null_count(), 0);
-        assert_eq!(keys.value(0), 5);
-
-        let round_schema = round_tripped.schema();
-        let DataType::Map(entries_field, _) = round_schema.field(0).data_type() else {
-            panic!("expected map field");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected struct entries");
-        };
-        assert!(!entry_fields[0].is_nullable());
     }
 
     #[test]
@@ -7475,7 +7101,11 @@ mysql_port = 47892
     fn explain_analyze_runs_distributed_plan_and_renders_actuals() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(4,400)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, 30)),
+            kv_rows!((1, 100), (2, 200), (4, 400)),
+        );
 
         let result = session
             .execute_in_context(
@@ -7568,13 +7198,7 @@ mysql_port = 47892
         assert_eq!(empty_result.columns[0].name, "id");
         assert_eq!(empty_result.columns[1].name, "name");
 
-        let insert = session
-            .execute_in_database(
-                "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
-                "default",
-            )
-            .expect("insert iceberg rows");
-        assert!(matches!(insert, StatementResult::Ok));
+        insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
 
         let result = session
             .query("select name from ice.db1.tbl where id = 2")
@@ -7614,13 +7238,7 @@ mysql_port = 47892
             .expect("create iceberg table");
         assert!(matches!(create_table, StatementResult::Ok));
 
-        let insert = session
-            .execute_in_database(
-                "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
-                "default",
-            )
-            .expect("insert iceberg rows");
-        assert!(matches!(insert, StatementResult::Ok));
+        insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
 
         let result = session
             .query("select name, id from ice.db1.tbl where id = 2")
@@ -7647,9 +7265,7 @@ mysql_port = 47892
     fn iceberg_refresh_load_failure_does_not_use_stale_external_metadata() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("insert iceberg row");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
         session
             .query("select id from ice.db1.t")
             .expect("query iceberg table");
@@ -7682,9 +7298,7 @@ mysql_port = 47892
     fn drop_iceberg_table_invalidates_external_metadata_without_local_registration() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("insert iceberg row");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
         session
             .query("select id from ice.db1.t")
             .expect("query iceberg table");
@@ -7738,13 +7352,7 @@ mysql_port = 47892
             .expect("create iceberg table");
         assert!(matches!(create_table, StatementResult::Ok));
 
-        let insert = session
-            .execute_in_database(
-                "insert into ice.db1.nums values (1, 101), (2, 102)",
-                "default",
-            )
-            .expect("insert iceberg rows");
-        assert!(matches!(insert, StatementResult::Ok));
+        insert_rows!(&session, ["ice", "db1", "nums"]; [1, 101], [2, 102]);
 
         let result = session
             .execute_in_context(
@@ -7817,13 +7425,7 @@ mysql_port = 47892
                 .expect("create iceberg table");
             assert!(matches!(create_table, StatementResult::Ok));
 
-            let insert = session
-                .execute_in_database(
-                    "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
-                    "default",
-                )
-                .expect("insert iceberg rows");
-            assert!(matches!(insert, StatementResult::Ok));
+            insert_rows!(&session, ["ice", "db1", "tbl"]; [1, "a"], [2, "b"]);
         }
 
         let restored = StandaloneNovaRocks::open(
@@ -8067,10 +7669,8 @@ mysql_port = 47892
         .expect_err("refresh should fail without MV runtime prerequisites");
         assert!(
             err.contains("requires current Iceberg catalog context")
-                || err.contains("StarRocks table config is missing")
                 || err.contains("sqlite metadata store")
-                || err.contains("materialized view")
-                || err.contains("StarRocks table"),
+                || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
     }
@@ -8332,30 +7932,6 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn mysql_request_cancellation_reaches_insert_metadata_lookup() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        let cancellation = Arc::new(AtomicBool::new(true));
-        let connector_context =
-            crate::connector::connector_request_context(None, cancellation).expect("context");
-
-        let error = session
-            .execute_in_context_with_connector_context(
-                "insert into ice.db1.t values (1, 'cancelled')",
-                None,
-                "default",
-                None,
-                connector_context,
-            )
-            .expect_err("cancelled MySQL request must abort INSERT metadata lookup");
-
-        assert!(
-            error.contains("cancel"),
-            "unexpected cancellation error: {error}"
-        );
-    }
-
-    #[test]
     fn iceberg_catalog_lifecycle_registers_and_retires_its_control_binding() {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
@@ -8509,9 +8085,7 @@ path = "meta/operations.sqlite"
     fn time_travel_select_with_current_iceberg_catalog_resolves_synthetic_local_table() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
 
         let result = session
             .execute_in_context(
@@ -8532,9 +8106,7 @@ path = "meta/operations.sqlite"
     fn time_travel_explain_with_current_iceberg_catalog_resolves_synthetic_local_table() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
 
         let result = session
             .execute_in_context(
@@ -8546,139 +8118,6 @@ path = "meta/operations.sqlite"
             .expect("time-travel explain");
 
         assert!(matches!(result, StatementResult::Query(_)));
-    }
-
-    #[test]
-    fn iceberg_insert_select_drives_a_new_snapshot() {
-        // INSERT INTO ... SELECT writes data files + a new snapshot. The
-        // standalone iceberg backend's local-FS path historically only
-        // registered the *first* data file for local-FS tables (see
-        // `connector/iceberg/catalog/backend.rs`'s data-files branch), so
-        // a SELECT-side verification would only see the seed file even
-        // though the new snapshot includes both. This is a separate
-        // NovaRocks-side gap tracked outside Phase 1; here we verify the
-        // iceberg layer's snapshot chain advanced as expected via the
-        // registry.
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("seed");
-        let snap_before = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
-                "default",
-            )
-            .expect("insert select");
-        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
-        assert_ne!(
-            snap_before, snap_after,
-            "INSERT INTO ... SELECT must advance the iceberg snapshot id"
-        );
-        assert_iceberg_operation_finalized(
-            &engine,
-            2,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
-            snap_after,
-        );
-    }
-
-    #[test]
-    fn iceberg_branch_writes_record_branch_head_base_snapshot() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'main-1')", "default")
-            .expect("seed main");
-        let branch_base =
-            current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("seed snapshot");
-        session
-            .execute_in_database("alter table ice.db1.t create branch dev", "default")
-            .expect("create branch");
-        session
-            .execute_in_database("insert into ice.db1.t values (2, 'main-2')", "default")
-            .expect("advance main after branch creation");
-        let main_after_branch = current_iceberg_snapshot_id(&engine, "ice", "db1", "t")
-            .expect("main advanced snapshot");
-        assert_ne!(
-            branch_base, main_after_branch,
-            "main must advance after the branch was created"
-        );
-
-        session
-            .execute_in_database(
-                "insert into ice.db1.t.branch_dev values (3, 'dev-3')",
-                "default",
-            )
-            .expect("branch insert");
-        let dev_after = iceberg_ref_snapshot_id(&engine, "ice", "db1", "t", "dev")
-            .expect("dev branch snapshot");
-        assert_ne!(
-            branch_base, dev_after,
-            "branch insert must advance the branch head"
-        );
-
-        let operation = load_iceberg_operation(&engine, 3);
-        assert_eq!(
-            operation.operation_kind,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend
-        );
-        assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
-        assert_eq!(
-            operation.base_snapshot_id,
-            Some(branch_base),
-            "branch write operation must record the branch head before commit, not main"
-        );
-        assert_eq!(
-            operation
-                .commit_outcome
-                .as_ref()
-                .map(|outcome| outcome.snapshot_id),
-            Some(dev_after)
-        );
-        assert_eq!(
-            current_iceberg_snapshot_id(&engine, "ice", "db1", "t"),
-            Some(main_after_branch),
-            "branch insert must not advance main"
-        );
-
-        session
-            .execute_in_database(
-                "insert overwrite ice.db1.t.branch_dev values (4, 'dev-4')",
-                "default",
-            )
-            .expect("branch overwrite");
-        let dev_after_overwrite = iceberg_ref_snapshot_id(&engine, "ice", "db1", "t", "dev")
-            .expect("dev branch snapshot after overwrite");
-        assert_ne!(
-            dev_after, dev_after_overwrite,
-            "branch overwrite must advance the branch head"
-        );
-
-        let operation = load_iceberg_operation(&engine, 4);
-        assert_eq!(
-            operation.operation_kind,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertOverwrite
-        );
-        assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
-        assert_eq!(
-            operation.base_snapshot_id,
-            Some(dev_after),
-            "branch overwrite operation must record the branch head before commit, not main"
-        );
-        assert_eq!(
-            operation
-                .commit_outcome
-                .as_ref()
-                .map(|outcome| outcome.snapshot_id),
-            Some(dev_after_overwrite)
-        );
-        assert_eq!(
-            current_iceberg_snapshot_id(&engine, "ice", "db1", "t"),
-            Some(main_after_branch),
-            "branch overwrite must not advance main"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -8701,9 +8140,7 @@ path = "meta/operations.sqlite"
             "3",
             Arc::clone(&statistics) as Arc<dyn StatisticsService>,
         );
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
 
         // Sanity: the table is NOT in the in-memory catalog yet (never SELECTed).
         assert!(
@@ -8732,9 +8169,7 @@ path = "meta/operations.sqlite"
             "3",
             Arc::clone(&statistics) as Arc<dyn StatisticsService>,
         );
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
 
         assert!(!engine.has_local_table("db1", "t"));
 
@@ -8796,12 +8231,7 @@ path = "meta/operations.sqlite"
                     "default",
                 )
                 .expect("create table");
-            session
-                .execute_in_database(
-                    &format!("insert into ice.db1.{name} values (1), (2), (3)"),
-                    "default",
-                )
-                .expect("seed table");
+            insert_rows!(&session, ["ice", "db1", name]; [1], [2], [3]);
         }
 
         // `t2` is referenced ONLY inside the ON-clause IN-subquery. Sanity:
@@ -9100,42 +8530,11 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_insert_overwrite_replaces_all_rows() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c')",
-                "default",
-            )
-            .expect("seed");
-        // INSERT OVERWRITE replaces every row in the table with the SELECT
-        // output (Task 13 OverwriteCommit path).
-        session
-            .execute_in_database(
-                "insert overwrite ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
-                "default",
-            )
-            .expect("overwrite select");
-        let mut rows = collect_id_v(&session, "select id, v from ice.db1.t");
-        rows.sort_by_key(|(id, _)| *id);
-        assert_eq!(
-            rows,
-            vec![(1, "A".to_string()), (2, "B".to_string())],
-            "overwrite must replace ALL rows, not append"
-        );
-    }
-
-    #[test]
     fn iceberg_delete_where_removes_matching_rows() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
-                "default",
-            )
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"];
+            [1, "a"], [2, "b"], [3, "c"], [4, "d"]);
         let snap_before = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         session
             .execute_in_database("delete from ice.db1.t where id = 2", "default")
@@ -9147,7 +8546,7 @@ path = "meta/operations.sqlite"
         );
         assert_iceberg_operation_finalized(
             &engine,
-            2,
+            1,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
@@ -9166,9 +8565,7 @@ path = "meta/operations.sqlite"
     fn iceberg_legacy_delete_still_uses_position_delete_path() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
         session
             .execute_in_database("delete from ice.db1.t where id = 1", "default")
             .expect("legacy delete");
@@ -9181,46 +8578,13 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_row_lineage_insert_select_advances_next_row_id() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("seed");
-        let (before_next_row_id, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
-                "default",
-            )
-            .expect("row-lineage insert select");
-        let (after_next_row_id, row_range) =
-            current_iceberg_row_lineage(&engine, "ice", "db1", "t");
-        assert_eq!(
-            after_next_row_id,
-            before_next_row_id + 2,
-            "row-lineage INSERT SELECT must advance next-row-id by written rows"
-        );
-        assert_eq!(
-            row_range,
-            Some((before_next_row_id, 2)),
-            "row-lineage INSERT SELECT snapshot must record its row range"
-        );
-    }
-
-    #[test]
     fn iceberg_row_lineage_optimize_does_not_advance_next_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
 
         // Seed 3 INSERTs so OPTIMIZE has multiple input data files to coalesce.
         for i in 1..=3 {
-            session
-                .execute_in_database(
-                    &format!("insert into ice.db1.t values ({i}, '{i}')"),
-                    "default",
-                )
-                .expect("seed");
+            insert_rows!(&session, ["ice", "db1", "t"]; [i, i.to_string()]);
         }
         let (next_row_id_before, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
 
@@ -9289,24 +8653,9 @@ path = "meta/operations.sqlite"
     fn iceberg_row_lineage_optimize_preserves_row_identity() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, '10'), (2, '20')",
-                "default",
-            )
-            .expect("seed first files");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (3, '30'), (4, '40')",
-                "default",
-            )
-            .expect("seed second files");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (5, '50'), (6, '60')",
-                "default",
-            )
-            .expect("seed third files");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "10"], [2, "20"]);
+        insert_rows!(&session, ["ice", "db1", "t"]; [3, "30"], [4, "40"]);
+        insert_rows!(&session, ["ice", "db1", "t"]; [5, "50"], [6, "60"]);
         session
             .execute_in_database("update ice.db1.t set v = '99' where id = 2", "default")
             .expect("update before optimize");
@@ -9350,43 +8699,10 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_row_lineage_overwrite_writes_row_range() {
-        let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c')",
-                "default",
-            )
-            .expect("seed");
-        let (before_next_row_id, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
-        session
-            .execute_in_database(
-                "insert overwrite ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
-                "default",
-            )
-            .expect("row-lineage overwrite");
-        let (after_next_row_id, row_range) =
-            current_iceberg_row_lineage(&engine, "ice", "db1", "t");
-        assert_eq!(
-            after_next_row_id,
-            before_next_row_id + 2,
-            "row-lineage OVERWRITE must advance next-row-id by added rows"
-        );
-        assert_eq!(
-            row_range,
-            Some((before_next_row_id, 2)),
-            "row-lineage OVERWRITE snapshot must record its row range"
-        );
-    }
-
-    #[test]
     fn iceberg_delete_no_match_is_a_noop() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
         // No row matches → must succeed without committing a delete snapshot.
         session
             .execute_in_database("delete from ice.db1.t where id = 999", "default")
@@ -9399,9 +8715,7 @@ path = "meta/operations.sqlite"
     fn iceberg_delete_without_where_is_rejected() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
         let err = session
             .execute_in_database("delete from ice.db1.t", "default")
             .expect_err("delete without WHERE must be rejected");
@@ -9415,9 +8729,7 @@ path = "meta/operations.sqlite"
     fn iceberg_delete_unsupported_predicate_is_rejected() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
         // LIKE is not in the Phase 1 predicate translator's supported set.
         let err = session
             .execute_in_database("delete from ice.db1.t where v like 'a%'", "default")
@@ -9432,12 +8744,8 @@ path = "meta/operations.sqlite"
     fn iceberg_row_lineage_delete_writes_puffin_dv_and_merges_second_delete() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
-                "default",
-            )
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"];
+            [1, "a"], [2, "b"], [3, "c"], [4, "d"]);
         session
             .execute_in_database("delete from ice.db1.t where id = 2", "default")
             .expect("first row-lineage delete");
@@ -9517,7 +8825,7 @@ path = "meta/operations.sqlite"
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            3,
+            2,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
@@ -9527,12 +8835,8 @@ path = "meta/operations.sqlite"
     fn iceberg_add_equality_delete_drives_operation_lifecycle() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'b')",
-                "default",
-            )
-            .expect("seed");
+        insert_rows!(&session, ["ice", "db1", "t"];
+            [1, "a"], [2, "b"], [3, "b"]);
         session
             .execute_in_database(
                 "alter table ice.db1.t add equality delete (v) values ('b')",
@@ -9542,7 +8846,7 @@ path = "meta/operations.sqlite"
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            2,
+            1,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
@@ -9612,9 +8916,7 @@ path = "meta/operations.sqlite"
     fn iceberg_v3_cow_update_preserves_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
         let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("insert");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
         let previous_snapshot_id =
             current_iceberg_snapshot_id(&engine, "ice", "db1", "t").expect("previous snapshot");
         let before = collect_id_rowid_seq(
@@ -9630,7 +8932,7 @@ path = "meta/operations.sqlite"
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            2,
+            1,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
@@ -9686,9 +8988,7 @@ path = "meta/operations.sqlite"
             &warehouse,
             &[("novarocks.update.mode", "merge-on-read")],
         );
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("insert");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
         let before = collect_id_rowid_seq(
             &session,
             "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
@@ -9702,7 +9002,7 @@ path = "meta/operations.sqlite"
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            2,
+            1,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
@@ -9735,7 +9035,7 @@ path = "meta/operations.sqlite"
     #[test]
     fn iceberg_v3_update_from_source_table() {
         // Use a second iceberg table (in the same catalog/namespace) as the
-        // source so the test does not depend on StarRocks table configuration.
+        // source so both sides exercise the same external-table contract.
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
         session
@@ -9744,12 +9044,8 @@ path = "meta/operations.sqlite"
                 "default",
             )
             .expect("create source iceberg table");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("insert target");
-        session
-            .execute_in_database("insert into ice.db1.src values (2, 'bb')", "default")
-            .expect("insert source");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
+        insert_rows!(&session, ["ice", "db1", "src"]; [2, "bb"]);
         session
             .execute_in_database(
                 "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
@@ -9770,15 +9066,8 @@ path = "meta/operations.sqlite"
                 "default",
             )
             .expect("create source iceberg table");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
-            .expect("insert target");
-        session
-            .execute_in_database(
-                "insert into ice.db1.src values (2, 'bb'), (3, 'c')",
-                "default",
-            )
-            .expect("insert source");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"], [2, "b"]);
+        insert_rows!(&session, ["ice", "db1", "src"]; [2, "bb"], [3, "c"]);
         session
             .execute_in_database(
                 "merge into ice.db1.t as t using ice.db1.src as s on t.id = s.id \
@@ -9803,20 +9092,18 @@ path = "meta/operations.sqlite"
         // produced two operations — a separate InsertAppend (not-matched
         // INSERT FastAppend) plus a RowDelta (matched UPDATE).
         //
-        // Here the two preceding inserts take operation ids #1 and #2
-        // (InsertAppend each), so the folded MERGE occupies the single
-        // operation id #3 — the slot the not-matched INSERT branch used to
-        // take — and no operation #4 exists.
+        // Typed fixture writes bypass the legacy operation repository, so the
+        // folded MERGE owns operation #1 and no second operation exists.
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            3,
+            1,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
         // Prove the fold: the MERGE committed exactly one operation, so the
-        // pre-fold second operation (#4) must not exist.
-        assert_iceberg_operation_absent(&engine, 4);
+        // pre-fold second operation (#2) must not exist.
+        assert_iceberg_operation_absent(&engine, 2);
     }
 
     #[test]
@@ -9832,15 +9119,8 @@ path = "meta/operations.sqlite"
                 "default",
             )
             .expect("create source iceberg table");
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("insert target");
-        session
-            .execute_in_database(
-                "insert into ice.db1.src values (1, 'x'), (1, 'y')",
-                "default",
-            )
-            .expect("insert source");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
+        insert_rows!(&session, ["ice", "db1", "src"]; [1, "x"], [1, "y"]);
         let err = session
             .execute_in_database(
                 "update ice.db1.t as t set v = s.new_v from ice.db1.src as s where t.id = s.id",
@@ -9861,12 +9141,8 @@ path = "meta/operations.sqlite"
     fn iceberg_v3_cow_update_multiple_files_preserves_row_id() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
-        session
-            .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
-            .expect("insert first file");
-        session
-            .execute_in_database("insert into ice.db1.t values (2, 'b')", "default")
-            .expect("insert second file");
+        insert_rows!(&session, ["ice", "db1", "t"]; [1, "a"]);
+        insert_rows!(&session, ["ice", "db1", "t"]; [2, "b"]);
         let before = collect_id_rowid_seq(
             &session,
             "select id, _row_id, _last_updated_sequence_number from ice.db1.t order by id",
@@ -9957,12 +9233,8 @@ path = "meta/operations.sqlite"
         let (engine, session) = open_v3_row_lineage_session_bigint(&warehouse);
 
         // Snapshot S1: 3 rows.
-        session
-            .execute_in_database(
-                "insert into ice.ns.t values (1, 'A'), (2, 'B'), (3, 'C')",
-                "default",
-            )
-            .expect("seed S1");
+        insert_rows!(&session, ["ice", "ns", "t"];
+            [1_i64, "A"], [2_i64, "B"], [3_i64, "C"]);
         let (s1_first_row_id, s1_seq) = current_snapshot_lineage_info(&engine, "ice", "ns", "t");
 
         let pre_rows = collect_id_rowid_seq(
@@ -9987,9 +9259,7 @@ path = "meta/operations.sqlite"
         );
 
         // Snapshot S2: 2 more rows.
-        session
-            .execute_in_database("insert into ice.ns.t values (4, 'D'), (5, 'E')", "default")
-            .expect("seed S2");
+        insert_rows!(&session, ["ice", "ns", "t"]; [4_i64, "D"], [5_i64, "E"]);
         let (s2_first_row_id, s2_seq) = current_snapshot_lineage_info(&engine, "ice", "ns", "t");
 
         // S2 must be a later sequence number than S1.
@@ -10112,8 +9382,8 @@ path = "meta/operations.sqlite"
     #[test]
     fn select_last_updated_sequence_number_fails_on_non_row_lineage_iceberg_table() {
         // Tests that _last_updated_sequence_number fails on a regular V3 iceberg
-        // table without write.row-lineage=true (same fail-fast path as non-iceberg
-        // tables, verified without needing StarRocks table config).
+        // table without write.row-lineage=true (same fail-fast path as unsupported
+        // source tables).
         let warehouse = TempDir::new().expect("warehouse tempdir");
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default(), test_open_services())
             .expect("open standalone engine");
@@ -10545,29 +9815,34 @@ path = "meta/operations.sqlite"
         );
     }
 
-    fn create_kv_tables(session: &StandaloneSession, t1_values: &str, t2_values: &str) {
+    fn create_kv_tables(
+        session: &StandaloneSession,
+        t1_rows: &[(Option<i64>, Option<i64>)],
+        t2_rows: &[(Option<i64>, Option<i64>)],
+    ) {
         session
             .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
             .expect("create t1");
         session
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
-        if !t1_values.trim().is_empty() {
-            session
-                .execute_in_database(
-                    &format!("insert into ice.db1.t1 values {t1_values}"),
-                    "default",
-                )
-                .expect("insert t1");
+        insert_kv_fixture_rows(session, "t1", t1_rows);
+        insert_kv_fixture_rows(session, "t2", t2_rows);
+    }
+
+    fn insert_kv_fixture_rows(
+        session: &StandaloneSession,
+        table: &str,
+        rows: &[(Option<i64>, Option<i64>)],
+    ) {
+        if rows.is_empty() {
+            return;
         }
-        if !t2_values.trim().is_empty() {
-            session
-                .execute_in_database(
-                    &format!("insert into ice.db1.t2 values {t2_values}"),
-                    "default",
-                )
-                .expect("insert t2");
-        }
+        let rows = rows
+            .iter()
+            .map(|(key, value)| vec![(*key).into_test_literal(), (*value).into_test_literal()])
+            .collect::<Vec<_>>();
+        insert_iceberg_fixture_rows(session, &["ice", "db1", table], &rows);
     }
 
     fn assert_subquery_result_i64(
@@ -10596,18 +9871,9 @@ path = "meta/operations.sqlite"
             .expect("create t2");
         // t1: (1,10),(2,20),(3,30)
         // t2: (1,10),(1,5),(2,20),(2,15)  -> min for k=1 is 5, k=2 is 15, k=3 has no match
-        session
-            .execute_in_database(
-                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
-                "default",
-            )
-            .expect("insert t1");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t2 values (1,10),(1,5),(2,20),(2,15)",
-                "default",
-            )
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 10_i64], [2_i64, 20_i64], [3_i64, 30_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"];
+            [1_i64, 10_i64], [1_i64, 5_i64], [2_i64, 20_i64], [2_i64, 15_i64]);
 
         // The subquery: SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
         // k=1: min(t2.v) for k=1 = 5; t1.v=10 != 5 -> not selected
@@ -10618,9 +9884,7 @@ path = "meta/operations.sqlite"
         // Alternatively use a query where some rows DO match:
         // WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
         // Let's insert a t1 row where v=5 (k=1) so it matches min(t2.v)=5.
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,5)", "default")
-            .expect("insert matching t1 row");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 5_i64]);
 
         let sql = "SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) ORDER BY 1";
 
@@ -10642,18 +9906,9 @@ path = "meta/operations.sqlite"
         session
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
-                "default",
-            )
-            .expect("insert t1");
-        session
-            .execute_in_database(
-                "insert into ice.db1.t2 values (1,100),(2,200),(3,300)",
-                "default",
-            )
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 10_i64], [2_i64, 20_i64], [3_i64, 30_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"];
+            [1_i64, 100_i64], [2_i64, 200_i64], [3_i64, 300_i64]);
 
         // Uncorrelated scalar: v > (SELECT min(v) FROM t2). min(t2.v)=100 and all
         // t1.v are < 100, so the result is empty.
@@ -10682,12 +9937,8 @@ path = "meta/operations.sqlite"
             .expect("create t2");
         // t1: k=1, k=2, k=3. t2 has only k=1 and k=2.
         // k=3 has no match → scalar is NULL.
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
-            .expect("insert t1");
-        session
-            .execute_in_database("insert into ice.db1.t2 values (1,10),(2,20)", "default")
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [2_i64, 20_i64]);
 
         // Project the scalar result (may be NULL) for each t1 row.
         let sql = "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
@@ -10713,12 +9964,8 @@ path = "meta/operations.sqlite"
         session
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
-            .expect("insert t1");
-        session
-            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,20)", "default")
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [1_i64, 20_i64]);
 
         // count(*) for k=1 → 2, k=2 → 0, k=3 → 0 (not NULL)
         let sql = "SELECT (SELECT count(*) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
@@ -10746,12 +9993,9 @@ path = "meta/operations.sqlite"
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
         // t1 has a NULL k; the correlated scalar must also be NULL.
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0),(NULL,0)", "default")
-            .expect("insert t1");
-        session
-            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,5)", "default")
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"];
+            [Some(1_i64), 0_i64], [None::<i64>, 0_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 10_i64], [1_i64, 5_i64]);
 
         let sql =
             "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k NULLS LAST";
@@ -10778,12 +10022,8 @@ path = "meta/operations.sqlite"
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
         // t2.k is effectively unique: each k appears exactly once.
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
-            .expect("insert t1");
-        session
-            .execute_in_database("insert into ice.db1.t2 values (1,100),(2,200)", "default")
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 100_i64], [2_i64, 200_i64]);
 
         // Correlated non-aggregate: (SELECT t2.v FROM t2 WHERE t2.k = t1.k)
         // k=1 → 100, k=2 → 200, k=3 → NULL (no match)
@@ -10815,12 +10055,8 @@ path = "meta/operations.sqlite"
             .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
             .expect("create t2");
         // t2 has TWO rows with k=1, so the correlated scalar for t1.k=1 returns >1 row.
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0)", "default")
-            .expect("insert t1");
-        session
-            .execute_in_database("insert into ice.db1.t2 values (1,100),(1,200)", "default")
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t1"]; [1_i64, 0_i64]);
+        insert_rows!(&session, ["ice", "db1", "t2"]; [1_i64, 100_i64], [1_i64, 200_i64]);
 
         let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1";
         expect_subquery_error(&session, sql, "correlate scalar subquery result must 1 row");
@@ -10865,20 +10101,13 @@ path = "meta/operations.sqlite"
             .expect("create t3");
 
         // t1: three outer rows with distinct keys
-        session
-            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
-            .expect("insert t1");
+        insert_rows!(&session, ["ice", "db1", "t1"];
+            [1_i64, 0_i64], [2_i64, 0_i64], [3_i64, 0_i64]);
         // t2: k=1 has two rows (min=5), k=2 has one row (min=20), k=3 absent
-        session
-            .execute_in_database(
-                "insert into ice.db1.t2 values (1,5),(1,10),(2,20)",
-                "default",
-            )
-            .expect("insert t2");
+        insert_rows!(&session, ["ice", "db1", "t2"];
+            [1_i64, 5_i64], [1_i64, 10_i64], [2_i64, 20_i64]);
         // t3: k=1 has one row (max=90), k=2 absent, k=3 has one row (max=30)
-        session
-            .execute_in_database("insert into ice.db1.t3 values (1,90),(3,30)", "default")
-            .expect("insert t3");
+        insert_rows!(&session, ["ice", "db1", "t3"]; [1_i64, 90_i64], [3_i64, 30_i64]);
 
         let sql = "SELECT t1.k, \
                    (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k), \
@@ -10912,8 +10141,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(NULL,40)",
-            "(1,100),(1,101),(3,300),(NULL,999)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (NULL, 40)),
+            kv_rows!((1, 100), (1, 101), (3, 300), (NULL, 999)),
         );
 
         assert_subquery_result_i64(
@@ -10929,8 +10158,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(NULL,40)",
-            "(1,100),(3,300),(NULL,999)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (NULL, 40)),
+            kv_rows!((1, 100), (3, 300), (NULL, 999)),
         );
 
         assert_subquery_result_i64(
@@ -10944,7 +10173,11 @@ path = "meta/operations.sqlite"
     fn exists_uncorrelated_returns_expected_rows() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,101),(2,200)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, 30)),
+            kv_rows!((1, 101), (2, 200)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -10964,8 +10197,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(4,NULL)",
-            "(1,10),(1,11),(2,99),(3,30),(4,NULL)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (4, NULL)),
+            kv_rows!((1, 10), (1, 11), (2, 99), (3, 30), (4, NULL)),
         );
 
         assert_subquery_result_i64(
@@ -10981,8 +10214,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(4,NULL)",
-            "(9,10),(9,30),(9,NULL)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (4, NULL)),
+            kv_rows!((9, 10), (9, 30), (9, NULL)),
         );
 
         assert_subquery_result_i64(
@@ -10996,7 +10229,11 @@ path = "meta/operations.sqlite"
     fn in_inside_or_with_build_null_preserves_unknown() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,NULL)", "(9,10),(9,NULL)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, NULL)),
+            kv_rows!((9, 10), (9, NULL)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -11011,7 +10248,11 @@ path = "meta/operations.sqlite"
     fn in_projection_with_build_null_preserves_unknown() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,NULL)", "(9,10),(9,NULL)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, NULL)),
+            kv_rows!((9, 10), (9, NULL)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -11029,7 +10270,11 @@ path = "meta/operations.sqlite"
     fn not_in_uncorrelated_no_null() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(9,20),(9,40)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, 30)),
+            kv_rows!((9, 20), (9, 40)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -11042,7 +10287,11 @@ path = "meta/operations.sqlite"
     fn not_in_uncorrelated_build_null() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(9,20),(9,NULL)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, 20), (3, 30)),
+            kv_rows!((9, 20), (9, NULL)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -11055,7 +10304,7 @@ path = "meta/operations.sqlite"
     fn not_in_inside_or_with_build_null_is_unknown() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20)", "(9,NULL)");
+        create_kv_tables(&session, kv_rows!((1, 10), (2, 20)), kv_rows!((9, NULL)));
 
         assert_subquery_result_i64(
             &session,
@@ -11070,7 +10319,7 @@ path = "meta/operations.sqlite"
     fn not_in_inside_or_with_probe_null_and_empty_build_is_true() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,NULL),(2,20)", "");
+        create_kv_tables(&session, kv_rows!((1, NULL), (2, 20)), &[]);
 
         assert_subquery_result_i64(
             &session,
@@ -11085,13 +10334,11 @@ path = "meta/operations.sqlite"
     fn not_in_join_on_with_build_null_is_unknown() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,20)", "(9,NULL)");
+        create_kv_tables(&session, kv_rows!((1, 10), (2, 20)), kv_rows!((9, NULL)));
         session
             .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
             .expect("create t3");
-        session
-            .execute_in_database("insert into ice.db1.t3 values (100,0)", "default")
-            .expect("insert t3");
+        insert_rows!(&session, ["ice", "db1", "t3"]; [100_i64, 0_i64]);
 
         assert_subquery_result_i64(
             &session,
@@ -11106,13 +10353,11 @@ path = "meta/operations.sqlite"
     fn not_in_join_on_with_probe_null_is_unknown() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,NULL),(2,20)", "(9,10)");
+        create_kv_tables(&session, kv_rows!((1, NULL), (2, 20)), kv_rows!((9, 10)));
         session
             .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
             .expect("create t3");
-        session
-            .execute_in_database("insert into ice.db1.t3 values (100,0)", "default")
-            .expect("insert t3");
+        insert_rows!(&session, ["ice", "db1", "t3"]; [100_i64, 0_i64]);
 
         assert_subquery_result_i64(
             &session,
@@ -11127,7 +10372,11 @@ path = "meta/operations.sqlite"
     fn not_in_uncorrelated_probe_null() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
-        create_kv_tables(&session, "(1,10),(2,NULL),(3,30)", "(9,20),(9,40)");
+        create_kv_tables(
+            &session,
+            kv_rows!((1, 10), (2, NULL), (3, 30)),
+            kv_rows!((9, 20), (9, 40)),
+        );
 
         assert_subquery_result_i64(
             &session,
@@ -11142,8 +10391,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(4,40)",
-            "(1,20),(1,30),(2,20),(2,NULL),(3,NULL),(3,40)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (4, 40)),
+            kv_rows!((1, 20), (1, 30), (2, 20), (2, NULL), (3, NULL), (3, 40)),
         );
 
         assert_subquery_result_i64(
@@ -11159,8 +10408,8 @@ path = "meta/operations.sqlite"
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(
             &session,
-            "(1,10),(2,20),(3,30),(4,40)",
-            "(1,10),(1,150),(2,20),(2,99),(3,300),(4,400)",
+            kv_rows!((1, 10), (2, 20), (3, 30), (4, 40)),
+            kv_rows!((1, 10), (1, 150), (2, 20), (2, 99), (3, 300), (4, 400)),
         );
 
         assert_subquery_result_i64(
