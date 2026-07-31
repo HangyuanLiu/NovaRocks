@@ -29,6 +29,7 @@ pub(crate) mod instance;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod report;
 pub(crate) mod service;
+pub(crate) mod sink_assignment;
 
 pub(crate) mod transport {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

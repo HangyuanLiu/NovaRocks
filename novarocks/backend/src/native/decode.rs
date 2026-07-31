@@ -19,8 +19,8 @@
 //!
 //! This value owns the production request surface and decodes the instance
 //! execution values before invoking the narrow core assembly seam for the
-//! shared plan program. Sink-assignment DTO decoding remains with the sink
-//! assembly slice until that companion migration is complete.
+//! shared plan program. It also supplies the backend-owned sink-assignment
+//! decoder at the established core assembly validation point.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +39,7 @@ use novarocks_spi::connector::ConnectorExecutionResolver;
 
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
+use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
 
 pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
@@ -116,6 +117,7 @@ impl NativeFragmentRequest {
             &fragment,
             instance,
             &instance_params,
+            &BackendNativeFragmentSinkAssignmentDecoder,
             connectors,
             execution_resolver,
         )

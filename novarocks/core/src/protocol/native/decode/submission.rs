@@ -29,7 +29,9 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
-use crate::protocol::native_fragment_assembly_port::NativeFragmentInstanceInput;
+use crate::protocol::native_fragment_assembly_port::{
+    NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
+};
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use crate::runtime::fragment::instance::{
@@ -85,12 +87,12 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let instance_parts = decode_instance_parts(instance_params)?;
-    assemble_fragment_submission_with_connectors_and_execution_resolver(
+    assemble_fragment_submission_with_sink_assignment(
         fragment,
         instance_parts,
-        instance_params,
         connectors,
         execution_resolver,
+        |sink| decode_fragment_sink_assignment(sink, instance_params),
     )
 }
 
@@ -98,9 +100,38 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     fragment: &plan::PlanFragment,
     instance_parts: NativeFragmentInstanceInput,
     instance_params: &novarocks::InstanceParams,
+    sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    assemble_fragment_submission_with_sink_assignment(
+        fragment,
+        instance_parts,
+        connectors,
+        execution_resolver,
+        |sink| {
+            sink_assignment_decoder
+                .decode_sink_assignment(sink, instance_params)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+    )
+}
+
+fn assemble_fragment_submission_with_sink_assignment<F>(
+    fragment: &plan::PlanFragment,
+    instance_parts: NativeFragmentInstanceInput,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    decode_sink_assignment: F,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError>
+where
+    F: FnOnce(
+        &plan::DataSink,
+    ) -> Result<
+        crate::runtime::fragment::instance::FragmentSinkAssignment,
+        NativeFragmentDecodeError,
+    >,
+{
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = fragment.root.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(root_path.clone(), "native PlanFragment requires root")
@@ -136,7 +167,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
         &instance_parts.raw_scan_ranges,
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
     )?;
-    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)?;
+    let sink_assignment = decode_sink_assignment(sink)?;
 
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(instance_parts.query_options.allow_throw_exception);

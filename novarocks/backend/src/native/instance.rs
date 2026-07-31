@@ -371,10 +371,7 @@ fn unique_id_from_native(src: &common::UniqueId) -> UniqueId {
 }
 
 fn query_id_from_native(src: &common::UniqueId) -> QueryId {
-    QueryId {
-        hi: src.hi,
-        lo: src.lo,
-    }
+    QueryId::new(src.hi, src.lo)
 }
 
 #[cfg(test)]
@@ -410,14 +407,14 @@ mod tests {
         let mut params = valid_params();
         params.per_node_scan_ranges.insert(
             4,
-            novarocks::ScanRanges {
+            novarocks::ScanRangeList {
                 ranges: vec![novarocks::ScanRangeParams::default()],
             },
         );
         let error = decode_instance_params(&params).expect_err("range is required");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.per_node_scan_ranges[4].ranges[0].range (missing field): native ScanRangeParams requires range"
+            "native protocol error at instance_params.per_node_scan_ranges[\"4\"].ranges[0].range (missing field): native ScanRangeParams requires range"
         );
     }
 }

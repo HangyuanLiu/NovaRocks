@@ -17,11 +17,11 @@
 
 //! Execution-domain assembly seam for a backend-decoded native fragment.
 //!
-//! The `InstanceParams` execution values are decoded by the backend role.
-//! This module builds the shared execution submission without exposing decode
-//! contexts, registries, or runtime state. The sink-assignment DTO is retained
-//! temporarily to preserve its established validation ordering while the sink
-//! decoder moves as its own slice.
+//! The `InstanceParams` execution values and sink assignment are decoded by the
+//! backend role. This module builds the shared execution submission without
+//! exposing decode contexts, registries, or runtime state. It invokes the
+//! backend sink decoder at the former core validation point, preserving error
+//! ordering relative to root, runtime-filter, and scan-contract checks.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -31,9 +31,10 @@ use crate::connector::ConnectorRegistry;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::proto::novarocks;
 use crate::proto::plan;
+use crate::protocol::ProtocolError;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::instance::{
-    BackendNum, ExchangeInputAssignments, FragmentInstanceId,
+    BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
@@ -41,7 +42,8 @@ use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
 
 /// Backend-decoded `InstanceParams` execution values required to assemble a
-/// fragment. Sink assignment is intentionally excluded.
+/// fragment. Sink assignment is carried separately to keep its validation at
+/// the established assembly point.
 #[derive(Debug)]
 pub struct NativeFragmentInstanceInput {
     pub(crate) query_id: QueryId,
@@ -82,6 +84,15 @@ impl NativeFragmentInstanceInput {
     }
 }
 
+/// Backend-owned sink-assignment decoder invoked during core assembly.
+pub trait NativeFragmentSinkAssignmentDecoder: Send + Sync {
+    fn decode_sink_assignment(
+        &self,
+        sink: &plan::DataSink,
+        instance: &novarocks::InstanceParams,
+    ) -> Result<FragmentSinkAssignment, ProtocolError>;
+}
+
 pub struct AssembledNativeFragmentSubmission {
     submission: FragmentSubmission,
     backend_num: i32,
@@ -98,6 +109,7 @@ pub fn assemble_fragment_submission_for_backend(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
     sink_assignment_params: &novarocks::InstanceParams,
+    sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     connectors: Arc<ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<AssembledNativeFragmentSubmission, String> {
@@ -105,6 +117,7 @@ pub fn assemble_fragment_submission_for_backend(
         fragment,
         instance,
         sink_assignment_params,
+        sink_assignment_decoder,
         connectors,
         execution_resolver,
     )
