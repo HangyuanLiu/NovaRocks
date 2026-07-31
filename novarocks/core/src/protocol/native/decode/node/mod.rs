@@ -476,6 +476,7 @@ fn decode_node_inner(
             &mut children,
             arena,
             path.clone().field("runtime_filter_binding_ids"),
+            ctx,
         )?;
     }
 
@@ -505,7 +506,14 @@ fn decode_node_inner(
         ),
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
+        attach_leaf_consumers(
+            node,
+            &consumer_bindings,
+            &mut lowered,
+            arena,
+            path.clone(),
+            ctx,
+        )?;
     }
     let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
@@ -616,6 +624,7 @@ fn attach_direct_input_consumers(
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
     path: FieldPath,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
     for binding in bindings {
@@ -651,7 +660,7 @@ fn attach_direct_input_consumers(
             )
         })?;
         let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena, ctx)?;
         grouped
             .entry(index)
             .or_default()
@@ -680,6 +689,7 @@ fn attach_leaf_consumers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
@@ -704,8 +714,13 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id =
-                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
+            let expr_id = lower_binding_expression(
+                binding,
+                &lowered.layout,
+                &lowered.output_schema,
+                arena,
+                ctx,
+            )?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 super::NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -1278,6 +1293,7 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
@@ -1287,7 +1303,7 @@ fn lower_binding_expression(
         schema,
         expression_path.clone(),
     )?;
-    super::expr::decode_expr_at(&binding.expression, expression_path, arena, layout)
+    ctx.decode_expression(&binding.expression, expression_path, arena, layout)
 }
 
 fn validate_column_refs_exact(
@@ -1795,6 +1811,7 @@ fn lower_physical_node(
                 physical_output_path.clone(),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::CteAnchor(_) => Err(super::NativeFragmentDecodeError::unsupported(

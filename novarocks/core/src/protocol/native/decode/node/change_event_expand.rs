@@ -20,9 +20,8 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::change_event_expand::{
@@ -41,6 +40,7 @@ pub(super) fn lower_change_event_expand_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let (output_columns, output_columns_path) = if expand.output_columns.is_empty() {
@@ -150,7 +150,7 @@ pub(super) fn lower_change_event_expand_node(
             .predicate
             .as_ref()
             .map(|expr| {
-                decode_expr_at(
+                ctx.decode_expression(
                     expr,
                     event_path.clone().field("predicate"),
                     arena,
@@ -173,7 +173,7 @@ pub(super) fn lower_change_event_expand_node(
                 let expr = assignment
                     .expr
                     .as_ref()
-                    .map(|expr| decode_expr_at(expr, event_path.clone().field("assignments").index(assign_idx).field("expr"), arena, &child.layout))
+                    .map(|expr| ctx.decode_expression(expr, event_path.clone().field("assignments").index(assign_idx).field("expr"), arena, &child.layout))
                     .transpose()?;
                 Ok(ChangeEventRuntimeOutputExpr {
                     output_slot_id: slot_id,
