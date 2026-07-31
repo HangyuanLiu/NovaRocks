@@ -42,7 +42,7 @@ impl WriteExecutor for FakeExecutor {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<()>, String> {
-        Ok(CoordinatedWriteReport::Committable(()))
+        Ok(CoordinatedWriteReport::CommitRequired(()))
     }
 
     fn commit(
@@ -70,7 +70,7 @@ impl WriteExecutor for KnownCommittedCommitErrorExecutor {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<()>, String> {
-        Ok(CoordinatedWriteReport::Committable(()))
+        Ok(CoordinatedWriteReport::CommitRequired(()))
     }
 
     fn commit(

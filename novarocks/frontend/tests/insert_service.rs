@@ -257,8 +257,8 @@ impl InsertEngine for FakeInsertEngine {
     ) -> Result<IcebergWriteReport, String> {
         self.calls.lock().unwrap().push(Call::Run);
         Ok(match *self.write_behavior.lock().unwrap() {
-            WriteBehavior::NoOp => IcebergWriteReport::NoOp(Arc::new(FakeCommit)),
-            WriteBehavior::Committable => IcebergWriteReport::Committable(Arc::new(FakeCommit)),
+            WriteBehavior::NoOp => IcebergWriteReport::NoOp,
+            WriteBehavior::Committable => IcebergWriteReport::CommitRequired(Arc::new(FakeCommit)),
             WriteBehavior::Aborted => IcebergWriteReport::Aborted {
                 reason: "writer aborted".to_string(),
                 has_staged_files: true,

@@ -226,8 +226,8 @@ pub enum IcebergWriteReport {
         reason: String,
         has_staged_files: bool,
     },
-    NoOp(Arc<dyn IcebergInsertCommit>),
-    Committable(Arc<dyn IcebergInsertCommit>),
+    NoOp,
+    CommitRequired(Arc<dyn IcebergInsertCommit>),
 }
 
 /// Transitional one-to-one core domain port used by frontend DML.
@@ -509,6 +509,7 @@ impl InsertEngine for Arc<StandaloneState> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
             prepared.prepared.run_coordinated_write()?,
+            prepared.prepared.commit_op_kind(),
         ))
     }
 
@@ -579,6 +580,7 @@ fn downcast_prepared(
 
 fn iceberg_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
+    commit_op_kind: CommitOpKind,
 ) -> IcebergWriteReport {
     if let Some(abort) = result.write_abort {
         let has_staged_files = abort
@@ -591,18 +593,16 @@ fn iceberg_write_report_from_result(
             has_staged_files,
         };
     }
-    let has_files = result
-        .write_commit
-        .as_ref()
-        .is_some_and(crate::engine::write_transaction::write_commit_has_files);
-    let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit {
-        input: result.write_commit,
-    });
-    if has_files {
-        IcebergWriteReport::Committable(commit)
-    } else {
-        IcebergWriteReport::NoOp(commit)
+    let Some(input) = result.write_commit else {
+        return IcebergWriteReport::NoOp;
+    };
+    let has_files = crate::engine::write_transaction::write_commit_has_files(&input);
+    if !has_files && matches!(commit_op_kind, CommitOpKind::FastAppend) {
+        return IcebergWriteReport::NoOp;
     }
+    let commit: Arc<dyn IcebergInsertCommit> =
+        Arc::new(CoreIcebergInsertCommit { input: Some(input) });
+    IcebergWriteReport::CommitRequired(commit)
 }
 
 fn target_backend(target: &ResolvedInsertTarget, backend_name: &'static str) -> TargetBackend {
@@ -838,25 +838,61 @@ mod tests {
     }
 
     #[test]
-    fn query_execution_result_maps_empty_commit_to_opaque_noop_handle() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(WriteCommitInput {
-                write_id: UniqueId { hi: 1, lo: 2 },
-                writers: Vec::new(),
-            }),
-            write_abort: None,
-            fragment_profiles: Vec::new(),
-        });
+    fn query_execution_result_maps_fileless_overwrite_to_commit_required_handle() {
+        let report = iceberg_write_report_from_result(
+            QueryExecutionResult {
+                query_result: QueryResult::empty(),
+                write_commit: Some(WriteCommitInput {
+                    write_id: UniqueId { hi: 1, lo: 2 },
+                    writers: Vec::new(),
+                }),
+                write_abort: None,
+                fragment_profiles: Vec::new(),
+            },
+            CommitOpKind::Overwrite,
+        );
 
-        let IcebergWriteReport::NoOp(handle) = report else {
-            panic!("fileless writer output must be a no-op report");
+        let IcebergWriteReport::CommitRequired(handle) = report else {
+            panic!("fileless overwrite output must require a commit");
         };
         let handle = handle
             .as_any()
             .downcast_ref::<CoreIcebergInsertCommit>()
             .expect("core commit handle");
         assert!(handle.input.is_some());
+    }
+
+    #[test]
+    fn query_execution_result_maps_absent_commit_to_noop() {
+        let report = iceberg_write_report_from_result(
+            QueryExecutionResult {
+                query_result: QueryResult::empty(),
+                write_commit: None,
+                write_abort: None,
+                fragment_profiles: Vec::new(),
+            },
+            CommitOpKind::Overwrite,
+        );
+
+        assert!(matches!(report, IcebergWriteReport::NoOp));
+    }
+
+    #[test]
+    fn query_execution_result_maps_fileless_fast_append_to_noop() {
+        let report = iceberg_write_report_from_result(
+            QueryExecutionResult {
+                query_result: QueryResult::empty(),
+                write_commit: Some(WriteCommitInput {
+                    write_id: UniqueId { hi: 1, lo: 2 },
+                    writers: Vec::new(),
+                }),
+                write_abort: None,
+                fragment_profiles: Vec::new(),
+            },
+            CommitOpKind::FastAppend,
+        );
+
+        assert!(matches!(report, IcebergWriteReport::NoOp));
     }
 
     #[test]
@@ -869,7 +905,7 @@ mod tests {
                 ),
             ),
             fragment_profiles: Vec::new(),
-        });
+        }, CommitOpKind::FastAppend);
 
         let IcebergWriteReport::Aborted {
             reason,
@@ -888,12 +924,15 @@ mod tests {
             crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
         abort.completed_writer_outputs[0].iceberg_commits =
             vec![crate::proto::novarocks::IcebergCommitInfo::default()];
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(abort),
-            fragment_profiles: Vec::new(),
-        });
+        let report = iceberg_write_report_from_result(
+            QueryExecutionResult {
+                query_result: QueryResult::empty(),
+                write_commit: None,
+                write_abort: Some(abort),
+                fragment_profiles: Vec::new(),
+            },
+            CommitOpKind::FastAppend,
+        );
 
         let IcebergWriteReport::Aborted {
             has_staged_files, ..

@@ -14442,7 +14442,7 @@ fn build_imv_change_stream_branches(
                     let planned_snapshot_id = if target_ref == "main" {
                         table.metadata().current_snapshot().map(|s| s.snapshot_id())
                     } else {
-                        crate::engine::delete_flow::resolve_branch_head_snapshot_id(
+                        crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                             table.metadata(),
                             target_ref,
                         )?

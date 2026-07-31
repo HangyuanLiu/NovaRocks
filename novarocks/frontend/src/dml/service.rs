@@ -84,7 +84,7 @@ impl DmlService {
     pub(crate) fn require_journal(&self) -> Result<&dyn OperationJournal, DmlError> {
         self.journal.as_deref().ok_or_else(|| {
             DmlError::journal_unavailable(
-                "state store is required for Iceberg INSERT; configure [state_store]",
+                "state store is required for Iceberg DML; configure [state_store]",
             )
         })
     }
@@ -134,7 +134,7 @@ mod tests {
             &self,
             _spec: &WriteTransactionSpec,
         ) -> Result<CoordinatedWriteReport<()>, String> {
-            Ok(CoordinatedWriteReport::Committable(()))
+            Ok(CoordinatedWriteReport::CommitRequired(()))
         }
 
         fn commit(
