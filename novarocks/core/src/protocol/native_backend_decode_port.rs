@@ -25,10 +25,7 @@ use std::sync::Arc;
 
 use crate::connector::ConnectorRegistry;
 use crate::proto::{novarocks, plan};
-use crate::protocol::native::decode::{
-    decode_fragment_submission_with_connectors_and_execution_resolver, decode_query_execution_id,
-};
-use crate::query_execution::lifecycle::QueryExecutionId;
+use crate::protocol::native::decode::decode_fragment_submission_with_connectors_and_execution_resolver;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::submission::FragmentSubmission;
 
@@ -42,12 +39,6 @@ impl DecodedNativeFragmentSubmission {
     pub fn into_parts(self) -> (FragmentSubmission, i32, Option<RuntimeEndpoint>) {
         (self.submission, self.backend_num, self.report_endpoint)
     }
-}
-
-pub fn decode_query_execution_id_for_backend(
-    execution_id: &novarocks::QueryExecutionId,
-) -> Result<QueryExecutionId, String> {
-    decode_query_execution_id(execution_id).map_err(|error| error.to_string())
 }
 
 pub fn decode_fragment_submission_for_backend(

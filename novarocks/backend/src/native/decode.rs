@@ -27,7 +27,9 @@ use std::time::Duration;
 use novarocks::cache::CacheOptions;
 use novarocks::common::types::UniqueId;
 use novarocks::connector::ConnectorRegistry;
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
+use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::fragment::submission::FragmentSubmission;
 use novarocks::runtime::query_context::QueryId;
@@ -46,10 +48,42 @@ pub(crate) struct NativeFragmentRequest {
 pub(crate) fn decode_native_query_execution_id(
     execution_id: &proto::QueryExecutionId,
 ) -> Result<QueryExecutionId, NativeFragmentIngressError> {
-    novarocks::protocol::native_backend_decode_port::decode_query_execution_id_for_backend(
-        execution_id,
+    let root = FieldPath::root("execution_id");
+    let query_id = execution_id.query_id.as_ref().ok_or_else(|| {
+        NativeFragmentIngressError::new(
+            ProtocolError::new(
+                ProtocolFamily::Native,
+                root.clone().field("query_id"),
+                ProtocolErrorKind::MissingField,
+                "native fragment execution_id requires query_id",
+            )
+            .to_string(),
+        )
+    })?;
+    let attempt_id = AttemptId::new(execution_id.attempt_id).map_err(|error| {
+        NativeFragmentIngressError::new(
+            ProtocolError::new(
+                ProtocolFamily::Native,
+                root.clone().field("attempt_id"),
+                ProtocolErrorKind::InvalidValue,
+                error.to_string(),
+            )
+            .to_string(),
+        )
+    })?;
+    QueryExecutionId::new(ExecutionQueryId::new(query_id.hi, query_id.lo), attempt_id).map_err(
+        |error| {
+            NativeFragmentIngressError::new(
+                ProtocolError::new(
+                    ProtocolFamily::Native,
+                    root,
+                    ProtocolErrorKind::InvalidValue,
+                    error.to_string(),
+                )
+                .to_string(),
+            )
+        },
     )
-    .map_err(NativeFragmentIngressError::new)
 }
 
 impl NativeFragmentRequest {
@@ -155,5 +189,31 @@ impl ConnectorExecutionResolver for MissingExecutionResolver {
             novarocks_spi::connector::ConnectorErrorKind::Unavailable,
             "native ConnectorReadSource execution resolver is not configured",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_native_query_execution_id;
+    use novarocks_protocol::{common, novarocks};
+
+    #[test]
+    fn execution_identity_decode_preserves_native_error_contract() {
+        let missing = decode_native_query_execution_id(&novarocks::QueryExecutionId::default())
+            .expect_err("query id is required");
+        assert_eq!(
+            missing.to_string(),
+            "native protocol error at execution_id.query_id (missing field): native fragment execution_id requires query_id"
+        );
+
+        let zero_attempt = decode_native_query_execution_id(&novarocks::QueryExecutionId {
+            query_id: Some(common::UniqueId { hi: 7, lo: 8 }),
+            attempt_id: 0,
+        })
+        .expect_err("attempt id is required");
+        assert_eq!(
+            zero_attempt.to_string(),
+            "native protocol error at execution_id.attempt_id (invalid value): InvalidManifest: attempt id must be nonzero"
+        );
     }
 }

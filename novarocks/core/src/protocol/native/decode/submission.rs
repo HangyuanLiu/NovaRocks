@@ -212,6 +212,7 @@ impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionRe
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_query_execution_id(
     execution_id: &novarocks::QueryExecutionId,
 ) -> Result<QueryExecutionId, NativeFragmentDecodeError> {

@@ -45,9 +45,11 @@ pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_prog
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use submission::decode_fragment_submission;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+pub(crate) use submission::decode_query_execution_id;
 pub(crate) use submission::{
     decode_fragment_submission_with_connectors,
-    decode_fragment_submission_with_connectors_and_execution_resolver, decode_query_execution_id,
+    decode_fragment_submission_with_connectors_and_execution_resolver,
 };
 
 #[cfg(test)]
