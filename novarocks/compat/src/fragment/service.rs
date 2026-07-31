@@ -1235,19 +1235,22 @@ fn register_fragment_reports(
         }
         match worker.report_destination.as_ref() {
             Some(StarRocksReportDestination::NovaRocks(endpoint)) => {
-                service.report_service.register_native(
-                    FragmentReportRegistration::new(
-                        worker.finst_id,
-                        query_id,
-                        worker.backend_num,
-                        worker.enable_profile,
-                        worker.profiler.clone(),
-                        Some(Arc::clone(&worker.fragment_mem_tracker)),
-                        Some(Arc::clone(&worker.query_mem_tracker)),
-                        worker.report_interval_ns,
-                    ),
-                    endpoint.clone(),
-                );
+                service
+                    .report_service
+                    .register_native(
+                        FragmentReportRegistration::new(
+                            worker.finst_id,
+                            query_id,
+                            worker.backend_num,
+                            worker.enable_profile,
+                            worker.profiler.clone(),
+                            Some(Arc::clone(&worker.fragment_mem_tracker)),
+                            Some(Arc::clone(&worker.query_mem_tracker)),
+                            worker.report_interval_ns,
+                        ),
+                        endpoint.clone(),
+                    )
+                    .map_err(|error| (error, registered.clone()))?;
                 registered.push(worker.finst_id);
                 record_report_registration(query_id, worker.finst_id);
             }

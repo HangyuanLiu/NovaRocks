@@ -27,6 +27,7 @@ pub(crate) struct CompatReportService {
     periodic_stop: Arc<AtomicBool>,
     periodic_worker: Mutex<Option<JoinHandle<()>>>,
     tracking: Arc<LoadTrackingStore>,
+    native: novarocks::query_execution::native_fragment_report::NativeFragmentReportManager,
 }
 
 #[derive(Clone)]
@@ -58,11 +59,15 @@ impl CompatReportService {
             periodic_stop: Arc::new(AtomicBool::new(false)),
             periodic_worker: Mutex::new(None),
             tracking,
+            native:
+                novarocks::query_execution::native_fragment_report::NativeFragmentReportManager::new(
+                ),
         }
     }
 
     pub(crate) fn start(&self) -> Result<(), String> {
         self.reporter.start()?;
+        self.native.start()?;
         let mut worker = self
             .periodic_worker
             .lock()
@@ -98,6 +103,7 @@ impl CompatReportService {
             let _ = worker.join();
         }
         self.reporter.stop();
+        self.native.shutdown();
     }
 
     pub(crate) fn register(
@@ -158,16 +164,16 @@ impl CompatReportService {
         &self,
         registration: FragmentReportRegistration,
         endpoint: novarocks::runtime::endpoint::RuntimeEndpoint,
-    ) {
-        novarocks::query_execution::native_fragment_report::register(registration, endpoint);
+    ) -> Result<(), String> {
+        self.native.register(registration, endpoint)
     }
 
     pub(crate) fn unregister_native(&self, finst_id: UniqueId) {
-        novarocks::query_execution::native_fragment_report::unregister(finst_id);
+        self.native.unregister(finst_id);
     }
 
     pub(crate) fn report_native_progress(&self, finst_id: UniqueId) {
-        novarocks::query_execution::native_fragment_report::report_progress(finst_id);
+        self.native.report_progress(finst_id);
     }
 
     pub(crate) fn report_native_terminal(
@@ -175,7 +181,7 @@ impl CompatReportService {
         finst_id: UniqueId,
         terminal: FragmentTerminalReport,
     ) {
-        novarocks::query_execution::native_fragment_report::report_terminal(finst_id, terminal);
+        self.native.report_terminal(finst_id, terminal);
     }
 
     pub(crate) fn report_terminal(&self, finst_id: UniqueId, terminal: FragmentTerminalReport) {
