@@ -3269,9 +3269,11 @@ dependencies = [
  "novarocks-protocol",
  "novarocks-spi",
  "prost 0.13.5",
+ "protoc-bin-vendored",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-build",
 ]
 
 [[package]]

@@ -26,6 +26,7 @@ pub(crate) mod grpc_runtime_filter_sender;
 pub mod grpc_server;
 pub mod internal_rpc;
 pub(crate) mod metrics_http;
+pub mod native_data_plane;
 pub use metrics_http::{
     MetricsHttpServer, publish_backend_query_execution_resource,
     publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,

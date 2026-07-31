@@ -15,19 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod codec;
-pub(crate) mod decode;
-pub(crate) mod encode;
-pub(crate) mod runtime_filter_contract_codec;
-mod runtime_filter_install;
-pub(crate) mod type_encode;
-pub(crate) mod type_mapping;
+//! Backend-owned native gRPC transport declarations.
+//!
+//! This module intentionally contains no service implementation yet. It owns
+//! the generated server stub while `novarocks-protocol` remains the sole owner
+//! of all native protobuf DTO definitions.
 
-// Narrow Task 4/5 surface: handlers and client adapters need only these DTOs
-// and boundary entry points, not the codec implementation module.
-#[allow(unused_imports)]
-pub(crate) use runtime_filter_install::{
-    DecodedRuntimeFilterParticipantInstall, RuntimeFilterDeploymentAbort,
-    RuntimeFilterQueryLifecycleOptions, decode_abort_runtime_filter_deployment,
-    decode_participant_install, encode_abort_runtime_filter_deployment, encode_participant_install,
-};
+pub(crate) mod codec;
+pub(crate) mod report;
+pub(crate) mod service;
+
+pub(crate) mod transport {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_native_server_stub_references_protocol_dtos() {
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
+        assert!(generated.contains("::novarocks_protocol::novarocks::HeartbeatRequest"));
+        assert!(generated.contains("::novarocks_protocol::filter::LookupRequest"));
+    }
+}

@@ -12,19 +12,41 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
-use novarocks::service::{MetricsHttpServer, grpc_server};
+use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
+use novarocks::service::MetricsHttpServer;
 
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
-    native_result_writer,
+    native_fragment_event_sink, native_result_writer,
 };
+use crate::native::report::NativeReportManager;
+use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BACKEND_REPORT_ROLE_REJECTION: &str =
+    "native backend role does not own coordinator report ingress";
+
+struct BackendNativeReportHandler;
+
+impl NativeReportHandler for BackendNativeReportHandler {
+    fn handle_native_report(
+        &self,
+        _report: novarocks_protocol::novarocks::ExecStatusReport,
+    ) -> Result<(), NativeReportHandlerError> {
+        Err(NativeReportHandlerError::role_rejected(
+            BACKEND_REPORT_ROLE_REJECTION,
+        ))
+    }
+}
+
+pub fn backend_native_report_handler() -> Arc<dyn NativeReportHandler> {
+    Arc::new(BackendNativeReportHandler)
+}
 
 pub struct BackendServerConfig {
     pub config: NovaRocksConfig,
@@ -75,10 +97,12 @@ impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
     ready_marker: String,
+    grpc_server: NativeGrpcServerHandle,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
+    report_manager: Arc<NativeReportManager>,
     metrics_http_server: MetricsHttpServer,
 }
 
@@ -96,6 +120,7 @@ struct BackendApplicationServices {
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+    report_manager: Arc<NativeReportManager>,
 }
 
 /// Backend composition root for the QLC-3 Stage/Start transaction.  The
@@ -219,6 +244,7 @@ fn compose_backend_application_services(
         QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
     );
     let connector_registry = Arc::new(ConnectorRegistry::new());
+    let report_manager = Arc::new(NativeReportManager::new());
     let default_object_store = config.connector.object_store_config().map_err(|error| {
         BackendApplicationError::new(
             BackendApplicationErrorKind::Configuration,
@@ -247,10 +273,12 @@ fn compose_backend_application_services(
         grpc_exchange_transmitter(),
         grpc_fragment_lookup_client(),
         native_result_writer(),
-        Arc::clone(&controls),
+        native_fragment_event_sink(Arc::clone(&report_manager)),
+        controls,
         Arc::clone(&query_lifecycle_registry),
         connector_registry,
         Arc::clone(&execution_host),
+        Arc::clone(&report_manager),
     ));
     controls.publish_resource_snapshot();
     execution_host.publish_resource_snapshot();
@@ -266,6 +294,7 @@ fn compose_backend_application_services(
         query_lifecycle_registry,
         execution_host,
         query_lifecycle_ingress,
+        report_manager,
     })
 }
 
@@ -274,16 +303,31 @@ impl BackendApplicationHost {
         Self::open_with_readiness_timeout(config, READINESS_TIMEOUT)
     }
 
+    /// Starts a native backend whose report ingress is owned by the supplied
+    /// coordinator. This is used only by the all-in-one composition root.
+    pub fn open_with_native_report_handler(
+        config: BackendServerConfig,
+        native_report_handler: Arc<dyn NativeReportHandler>,
+    ) -> Result<Self, BackendApplicationError> {
+        Self::open_with_native_report_handler_and_terminal_ingress(
+            config,
+            native_report_handler,
+            None,
+        )
+    }
+
     /// The combined all-in-one process still delivers terminal facts through
     /// the generated gRPC service.  The FE-owned ingress is supplied only at
     /// this composition root; a standalone BE must not accept terminal reports.
-    pub fn open_with_terminal_ingress(
+    pub fn open_with_native_report_handler_and_terminal_ingress(
         config: BackendServerConfig,
+        native_report_handler: Arc<dyn NativeReportHandler>,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Result<Self, BackendApplicationError> {
-        Self::open_with_readiness_timeout_and_terminal_ingress(
+        Self::open_with_readiness_timeout_and_report_handler(
             config,
             READINESS_TIMEOUT,
+            native_report_handler,
             terminal_ingress,
         )
     }
@@ -295,7 +339,8 @@ impl BackendApplicationHost {
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
-        grpc_server::poll_grpc_server_failure()
+        self.grpc_server
+            .poll_failure()
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Supervision, error)
             })
@@ -307,15 +352,15 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        let listener_shutdown = self.grpc_server.stop();
+        let sweep_result = self.query_lifecycle_sweep.stop();
         let execution_shutdown = self
             .execution_host
             .shutdown()
             .map_err(|error| error.to_string());
-        let resource_result = stop_backend_resources();
-        let sweep_result = self.query_lifecycle_sweep.stop();
-        let metrics_result = self.metrics_http_server.stop();
-        combine_shutdown_results(sweep_result, resource_result)
-            .and_then(|()| metrics_result)
+        self.report_manager.shutdown();
+        combine_shutdown_results(listener_shutdown, sweep_result)
+            .and_then(|()| self.metrics_http_server.stop())
             .and_then(|()| execution_shutdown)
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
@@ -326,12 +371,18 @@ impl BackendApplicationHost {
         config: BackendServerConfig,
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
-        Self::open_with_readiness_timeout_and_terminal_ingress(config, readiness_timeout, None)
+        Self::open_with_readiness_timeout_and_report_handler(
+            config,
+            readiness_timeout,
+            backend_native_report_handler(),
+            None,
+        )
     }
 
-    fn open_with_readiness_timeout_and_terminal_ingress(
+    fn open_with_readiness_timeout_and_report_handler(
         config: BackendServerConfig,
         readiness_timeout: Duration,
+        native_report_handler: Arc<dyn NativeReportHandler>,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Result<Self, BackendApplicationError> {
         let config = config.config;
@@ -364,28 +415,37 @@ impl BackendApplicationHost {
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
-        if let Err(error) = grpc_server::start_grpc_exchange_server_with_terminal_ingress(
+        let mut grpc_server = NativeGrpcServerHandle::start(
             &bind_host,
             grpc_port,
-            native_fragment_service.clone(),
-            services.query_lifecycle_ingress.clone(),
-            terminal_ingress,
-        ) {
+            NativeBackendGrpcService::new(
+                native_fragment_service.clone(),
+                services.query_lifecycle_ingress.clone(),
+                native_report_handler,
+                terminal_ingress,
+            ),
+        )
+        .map_err(|error| {
             let _ = query_lifecycle_sweep.stop();
             let _ = metrics_http_server.stop();
-            return Err(BackendApplicationError::new(
+            BackendApplicationError::new(
                 BackendApplicationErrorKind::Start,
                 format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
-            ));
-        }
+            )
+        })?;
 
         if let Err(error) = wait_for_tcp_ready(readiness_addr, readiness_timeout) {
+            let listener_result = grpc_server.stop();
             let _ = query_lifecycle_sweep.stop();
             let _ = metrics_http_server.stop();
-            return Err(cleanup_after_primary_error(BackendApplicationError::new(
+            let primary = BackendApplicationError::new(
                 BackendApplicationErrorKind::Readiness,
                 format!("advertised endpoint readiness failed: {error}"),
-            )));
+            );
+            return Err(match listener_result {
+                Ok(()) => primary,
+                Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
+            });
         }
 
         Ok(Self {
@@ -394,10 +454,12 @@ impl BackendApplicationHost {
                 advertise_endpoint.host,
                 std::process::id()
             ),
+            grpc_server,
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
             execution_host: services.execution_host,
             query_lifecycle_sweep,
+            report_manager: services.report_manager,
             metrics_http_server,
         })
     }
@@ -488,23 +550,11 @@ fn combine_primary_and_shutdown(
     }
 }
 
-fn cleanup_after_primary_error(primary: BackendApplicationError) -> BackendApplicationError {
-    match stop_backend_resources() {
-        Ok(()) => primary,
-        Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
-    }
-}
-
-fn stop_backend_resources() -> Result<(), String> {
-    let grpc_result = grpc_server::stop_grpc_server();
-    grpc_result
-}
-
 fn combine_shutdown_results(
+    listener: Result<(), String>,
     sweep: Result<(), String>,
-    resources: Result<(), String>,
 ) -> Result<(), String> {
-    match (sweep, resources) {
+    match (listener, sweep) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(sweep), Err(resources)) => Err(format!("{sweep}; {resources}")),
@@ -570,10 +620,10 @@ mod tests {
     };
     use novarocks::runtime::query_options::QueryOptions;
     use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
-    use novarocks_protocol::common::UniqueId;
+    use novarocks_protocol::common::{Status, UniqueId};
     use novarocks_protocol::novarocks::{
-        AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
-        InitQueryRequest as ProtoInitQueryRequest,
+        AbortQueryRequest as ProtoAbortQueryRequest, ExecStatusReport, HeartbeatRequest,
+        InitQueryRequest as ProtoInitQueryRequest, ReportExecStatusRequest,
     };
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -663,6 +713,40 @@ mod tests {
         assert_eq!(error.kind(), BackendApplicationErrorKind::Readiness);
         TcpListener::bind(("127.0.0.1", grpc_port))
             .expect("readiness cleanup must release the started listener");
+    }
+
+    #[test]
+    fn native_backend_rejects_coordinator_reports_with_role_error() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let host = BackendApplicationHost::open(backend_config(grpc_port, grpc_port))
+            .expect("native backend host starts");
+        let client = NovaRocksGrpcRemoteClient::new(
+            format!("127.0.0.1:{grpc_port}")
+                .parse()
+                .expect("backend address"),
+        )
+        .expect("gRPC client");
+
+        let response = client
+            .blocking_report_exec_status(ReportExecStatusRequest {
+                report: Some(ExecStatusReport {
+                    query_id: Some(UniqueId { hi: 41, lo: 73 }),
+                    fragment_instance_id: Some(UniqueId { hi: 41, lo: 74 }),
+                    status: Some(Status::default()),
+                    done: true,
+                    ..Default::default()
+                }),
+            })
+            .expect("role rejection is returned as a business response");
+
+        assert_eq!(response.status_code, 1);
+        assert_eq!(response.error_code, "NativeReportRoleRejected");
+        assert_eq!(
+            response.message,
+            "native backend role does not own coordinator report ingress"
+        );
+        host.shutdown().expect("native backend shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

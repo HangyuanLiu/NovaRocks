@@ -29,7 +29,8 @@ use novarocks::novarocks_logging::error;
 use novarocks::novarocks_logging::warn;
 use novarocks::query_execution::lifecycle::StageFragment;
 use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportHandle,
+    FragmentReportRegistration, FragmentResultWriter, FragmentTerminalReport,
 };
 use novarocks::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
@@ -51,6 +52,7 @@ use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
+use crate::native::report::NativeReportManager;
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +102,7 @@ pub struct NativeFragmentService {
     result_writer: Arc<dyn FragmentResultWriter>,
     connector_registry: Arc<ConnectorRegistry>,
     execution_host: Arc<ConnectorExecutionHost>,
+    report_manager: Arc<NativeReportManager>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -126,6 +129,7 @@ impl NativeFragmentService {
         lifecycle: Arc<QueryLifecycleRegistry>,
         connector_registry: Arc<ConnectorRegistry>,
     ) -> Self {
+        let report_manager = Arc::new(NativeReportManager::new());
         Self::new_with_controls(
             exchange_transmitter,
             lookup_client,
@@ -134,6 +138,7 @@ impl NativeFragmentService {
             lifecycle,
             connector_registry,
             Arc::new(ConnectorExecutionHost::new()),
+            report_manager,
         )
     }
 
@@ -145,6 +150,7 @@ impl NativeFragmentService {
         lifecycle: Arc<QueryLifecycleRegistry>,
         connector_registry: Arc<ConnectorRegistry>,
         execution_host: Arc<ConnectorExecutionHost>,
+        report_manager: Arc<NativeReportManager>,
     ) -> Self {
         Self {
             controls,
@@ -155,6 +161,7 @@ impl NativeFragmentService {
             result_writer,
             connector_registry,
             execution_host,
+            report_manager,
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -171,6 +178,7 @@ impl NativeFragmentService {
     ) -> Self {
         let controls = Arc::new(FragmentControlRegistry::default());
         let lifecycle = test_lifecycle_registry(Arc::clone(&controls));
+        let report_manager = Arc::new(NativeReportManager::new());
         let mut service = Self::new_with_controls(
             crate::fragment::grpc_exchange_transmitter(),
             crate::fragment::grpc_fragment_lookup_client(),
@@ -179,6 +187,7 @@ impl NativeFragmentService {
             lifecycle,
             Arc::new(ConnectorRegistry::new()),
             Arc::new(ConnectorExecutionHost::new()),
+            report_manager,
         );
         service.lifecycle_observer = Some(Arc::new(observer));
         service
@@ -256,6 +265,7 @@ impl NativeFragmentService {
         request: NativeFragmentRequest,
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
+        let query_id = request.query_id();
         let execution_id = request.execution_id();
         let fragment_instance_id = request.fragment_instance_id();
         let lifecycle_permit = self
@@ -263,7 +273,12 @@ impl NativeFragmentService {
             .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
         let backend_num = request.backend_num();
+        let report_endpoint = request.report_endpoint().cloned();
         let enable_profile = request.enable_profile();
+        let report_interval_ns = profile_report_interval_ns(
+            enable_profile,
+            request.runtime_profile_report_interval_seconds(),
+        );
         let (delivery_expire, query_expire) = request.query_expire_durations();
         let cache_options = request.cache_options()?;
         let profiler =
@@ -318,6 +333,7 @@ impl NativeFragmentService {
         let token = reservation.publish(control_handle);
         let queries = self.queries.clone();
         let lifecycle = Arc::clone(&self.lifecycle);
+        let report_manager = Arc::clone(&self.report_manager);
         let observer = self.lifecycle_observer.clone();
         std::thread::Builder::new()
             .name(format!(
@@ -335,6 +351,18 @@ impl NativeFragmentService {
                 // while this worker is dormant. Only the Start gate winner may
                 // make it live.
                 registration.into_running();
+                let report_handle = register_native_report(
+                    report_manager.as_ref(),
+                    report_endpoint,
+                    fragment_instance_id,
+                    query_id,
+                    backend_num,
+                    enable_profile,
+                    profiler,
+                    fragment_mem_tracker,
+                    query_mem_tracker,
+                    report_interval_ns,
+                );
                 let staged_failure = claim_configured_fragment_failure_trigger(
                     failure_injection_eligible,
                 );
@@ -370,6 +398,7 @@ impl NativeFragmentService {
                     lifecycle,
                     execution_id,
                     backend_num,
+                    report_handle,
                 );
             })
             .map_err(|error| {
@@ -401,7 +430,12 @@ impl NativeFragmentService {
             after_lifecycle_admission();
         }
         let backend_num = request.backend_num();
+        let report_endpoint = request.report_endpoint().cloned();
         let enable_profile = request.enable_profile();
+        let report_interval_ns = profile_report_interval_ns(
+            enable_profile,
+            request.runtime_profile_report_interval_seconds(),
+        );
         let (delivery_expire, query_expire) = request.query_expire_durations();
         let cache_options = request.cache_options()?;
         let profiler =
@@ -459,7 +493,10 @@ impl NativeFragmentService {
         let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
         let queries = self.queries.clone();
         let lifecycle = Arc::clone(&self.lifecycle);
+        let report_manager = Arc::clone(&self.report_manager);
         let observer = self.lifecycle_observer.clone();
+        let report_handle = Arc::new(Mutex::new(None::<Arc<dyn FragmentReportHandle>>));
+        let report_handle_for_worker = Arc::clone(&report_handle);
         #[cfg(test)]
         if self.fail_worker_spawn_on_submission.is_some_and(|target| {
             self.submission_count.fetch_add(1, Ordering::SeqCst) + 1 == target
@@ -477,6 +514,16 @@ impl NativeFragmentService {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
                     error!(target: "novarocks::exec", finst_id = %fragment_instance_id, %error, "native fragment start signal was dropped");
+                    if let Some(report_handle) = report_handle_for_worker
+                        .lock()
+                        .expect("native report handle lock")
+                        .clone()
+                    {
+                        report_handle.report_terminal(FragmentTerminalReport::new(
+                            Some(error),
+                            false,
+                        ));
+                    }
                     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
                     queries.finish_fragment(execution_id);
                     token.complete();
@@ -515,6 +562,10 @@ impl NativeFragmentService {
                         }
                     }
                 }
+                let report_handle = report_handle_for_worker
+                    .lock()
+                    .expect("native report handle lock")
+                    .clone();
                 consume_terminal_fact(
                     running,
                     token,
@@ -522,14 +573,27 @@ impl NativeFragmentService {
                     lifecycle,
                     execution_id,
                     backend_num,
+                    report_handle,
                 );
             })
             .map_err(|error| {
                 NativeFragmentIngressError::new(format!(
                     "spawn native fragment adapter worker failed: {error}"
                 ))
-            })?;
+        })?;
         registration.into_running();
+        *report_handle.lock().expect("native report handle lock") = register_native_report(
+            report_manager.as_ref(),
+            report_endpoint,
+            fragment_instance_id,
+            query_id,
+            backend_num,
+            enable_profile,
+            profiler,
+            fragment_mem_tracker,
+            query_mem_tracker,
+            report_interval_ns,
+        );
 
         self.observe(NativeFragmentLifecycleEvent::Registered);
         lifecycle_permit
@@ -654,15 +718,30 @@ fn consume_terminal_fact(
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
     backend_num: i32,
+    report_handle: Option<Arc<dyn FragmentReportHandle>>,
 ) {
     let fact = running.join();
     let fragment_instance_id = fact.fragment_instance_id();
-    if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
-        error!(target: "novarocks::exec", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
-    }
+    let report_error = match fact.outcome() {
+        FragmentOutcome::Succeeded => {
+            if let Some(profile) = fact.profile() {
+                info!(target: "novarocks::profile", finst_id = %fragment_instance_id, profile = ?profile, "native_fragment_profile");
+            }
+            None
+        }
+        FragmentOutcome::Failed(execution_error) => {
+            let report_error = execution_error.to_string();
+            error!(target: "novarocks::exec", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
+            Some(report_error)
+        }
+        FragmentOutcome::Cancelled { reason } => Some(reason.detail().to_string()),
+    };
     let sink = novarocks::runtime::sink_commit::report_snapshot(fragment_instance_id);
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
+    if let Some(report_handle) = report_handle {
+        report_handle.report_terminal(FragmentTerminalReport::new(report_error, false));
+    }
     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
     queries.finish_fragment(execution_id);
     // Publish the terminal report before this fact can fail-close the local
@@ -671,12 +750,76 @@ fn consume_terminal_fact(
     token.complete();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn register_native_report(
+    report_manager: &NativeReportManager,
+    report_endpoint: Option<novarocks::runtime::endpoint::RuntimeEndpoint>,
+    fragment_instance_id: novarocks::UniqueId,
+    query_id: novarocks::runtime::query_context::QueryId,
+    backend_num: i32,
+    enable_profile: bool,
+    profiler: Option<Profiler>,
+    fragment_mem_tracker: Arc<novarocks::runtime::mem_tracker::MemTracker>,
+    query_mem_tracker: Arc<novarocks::runtime::mem_tracker::MemTracker>,
+    report_interval_ns: Option<i64>,
+) -> Option<Arc<dyn FragmentReportHandle>> {
+    let Some(report_endpoint) = report_endpoint else {
+        warn!(
+            target: "novarocks::report",
+            finst_id = %fragment_instance_id,
+            "missing native report_endpoint for reportExecStatus"
+        );
+        return None;
+    };
+    match report_manager.register(
+        FragmentReportRegistration::new(
+            fragment_instance_id,
+            query_id,
+            backend_num,
+            enable_profile,
+            profiler,
+            Some(fragment_mem_tracker),
+            Some(query_mem_tracker),
+            report_interval_ns,
+        ),
+        report_endpoint,
+    ) {
+        Ok(handle) => Some(Arc::new(handle)),
+        Err(error) => {
+            warn!(
+                target: "novarocks::report",
+                finst_id = %fragment_instance_id,
+                error = %error,
+                "failed to register native reportExecStatus"
+            );
+            None
+        }
+    }
+}
+
 fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
     let profiler = Profiler::new(format!(
         "execute_fragment_native (plan_node_id={root_plan_node_id})"
     ));
     profiler.set_metadata(i64::from(root_plan_node_id));
     profiler
+}
+
+fn profile_report_interval_ns(
+    enable_profile: bool,
+    query_interval_seconds: Option<i64>,
+) -> Option<i64> {
+    if !enable_profile {
+        return None;
+    }
+    query_interval_seconds
+        .filter(|value| *value > 0)
+        .and_then(|value| value.checked_mul(1_000_000_000))
+        .or_else(|| {
+            app_config::config()
+                .ok()
+                .map(|config| config.runtime.profile_report_interval.max(1) * 1_000_000_000)
+        })
 }
 
 #[cfg(test)]

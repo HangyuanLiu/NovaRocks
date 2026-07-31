@@ -40,6 +40,12 @@ pub struct RuntimeProfile {
 
 pub type Profiler = RuntimeProfile;
 
+/// Encodes the execution-domain profile into the native report DTO without
+/// exposing profile internals to a role-specific transport crate.
+pub fn encode_native_runtime_profile(profiler: &Profiler) -> novarocks::RuntimeProfileTree {
+    profiler.to_proto()
+}
+
 /// Merges driver-level pipeline profiles into the fragment-level profile shape
 /// consumed by report transports. This is execution-domain logic; protocol
 /// adapters are responsible only for serializing the resulting profile.
