@@ -22,6 +22,7 @@
 //! of all native protobuf DTO definitions.
 
 pub(crate) mod codec;
+pub(crate) mod connector_binding;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod report;
 pub(crate) mod service;

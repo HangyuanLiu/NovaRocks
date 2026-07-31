@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod cluster_heartbeat;
-pub mod connector_binding;
+pub(crate) mod connector_binding;
 pub mod fragment_control;
 pub mod grpc_client;
 pub(crate) mod grpc_fragment_dispatcher;

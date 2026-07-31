@@ -246,9 +246,9 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
             let (execution_id, declaration) =
-                novarocks::service::connector_binding::decode_ensure_request(request.into_inner())
+                super::connector_binding::decode_ensure_request(request.into_inner())
                     .map_err(|error| error.to_string())?;
-            let context = novarocks::service::connector_binding::install_request_context()
+            let context = super::connector_binding::install_request_context()
                 .map_err(|error| error.to_string())?;
             ingress
                 .ensure_connector_execution_binding(execution_id, declaration, context)
@@ -278,9 +278,8 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
     {
         let ingress = Arc::clone(&self.native_fragment_ingress);
         let result = tokio::task::spawn_blocking(move || {
-            let key =
-                novarocks::service::connector_binding::decode_retire_request(request.into_inner())
-                    .map_err(|error| error.to_string())?;
+            let key = super::connector_binding::decode_retire_request(request.into_inner())
+                .map_err(|error| error.to_string())?;
             ingress
                 .retire_connector_execution_binding(key)
                 .map_err(|error| error.to_string())

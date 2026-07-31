@@ -26,15 +26,15 @@ use novarocks_spi::connector::{
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-use crate::proto::novarocks::{
+use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks::service::native_fragment_ingress::decode_native_query_execution_id;
+use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
-use crate::protocol::native::decode::decode_query_execution_id;
-use crate::query_execution::lifecycle::QueryExecutionId;
 
 const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) fn decode_ensure_request(
+pub fn decode_ensure_request(
     request: EnsureConnectorExecutionBindingRequest,
 ) -> Result<(QueryExecutionId, ConnectorExecutionDeclaration), ConnectorError> {
     let execution_id = request.execution_id.as_ref().ok_or_else(|| {
@@ -43,7 +43,7 @@ pub(crate) fn decode_ensure_request(
             "connector execution binding request is missing execution_id",
         )
     })?;
-    let execution_id = decode_query_execution_id(execution_id).map_err(|error| {
+    let execution_id = decode_native_query_execution_id(execution_id).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
     let provider_id = ConnectorProviderId::parse(&request.provider_id)?;
@@ -60,7 +60,7 @@ pub(crate) fn decode_ensure_request(
     Ok((execution_id, declaration))
 }
 
-pub(crate) fn decode_retire_request(
+pub fn decode_retire_request(
     request: RetireConnectorExecutionBindingRequest,
 ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
     Ok(ConnectorExecutionBindingKey {
@@ -69,7 +69,7 @@ pub(crate) fn decode_retire_request(
     })
 }
 
-pub(crate) fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
+pub fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
     ConnectorRequestContext::try_new(
         Instant::now() + CONNECTOR_BINDING_CONTEXT_TIMEOUT,
         Arc::new(NotCancelled),
@@ -103,8 +103,8 @@ mod tests {
     #[test]
     fn ensure_request_rejects_invalid_incarnation_length() {
         let error = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
-            execution_id: Some(crate::proto::novarocks::QueryExecutionId {
-                query_id: Some(crate::proto::common::UniqueId { hi: 7, lo: 9 }),
+            execution_id: Some(novarocks::proto::novarocks::QueryExecutionId {
+                query_id: Some(novarocks::proto::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
             provider_id: "iceberg".to_string(),
