@@ -20,10 +20,13 @@
 pub(crate) mod equality;
 pub(crate) mod standard;
 
+use std::any::Any;
 use std::sync::Arc;
 
-use crate::engine::{StandaloneState, StatementResult};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
+use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.
@@ -60,7 +63,7 @@ pub fn parse_equality_delete_statement(sql: &str) -> Result<Option<()>, String> 
 
 /// One admitted frontend DELETE request. The raw SQL stays inside the narrow
 /// reverse port so the frontend never handles core-private DELETE AST payloads.
-pub struct ExecuteDeleteRequest<'a> {
+pub struct PrepareDeleteRequest<'a> {
     pub sql: &'a str,
     pub current_catalog: Option<String>,
     pub current_database: String,
@@ -69,14 +72,57 @@ pub struct ExecuteDeleteRequest<'a> {
     pub kind: DeleteStatementKind,
 }
 
+pub trait DeletePrepared: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub trait DeleteCommit: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeleteOperation {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub target_ref: String,
+    pub attempt_id: String,
+    pub commit_op_kind: CommitOpKind,
+    pub base_snapshot_id: Option<i64>,
+}
+
+pub struct PreparedDelete {
+    pub operation: DeleteOperation,
+    pub handle: Arc<dyn DeletePrepared>,
+}
+
+pub enum DeleteWriteReport {
+    Aborted { reason: String, has_staged_files: bool },
+    NoOp,
+    CommitRequired(Arc<dyn DeleteCommit>),
+}
+
+pub(crate) trait PreparedDeleteExecution: Send + Sync {
+    fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
+    fn commit(&self, input: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError>;
+    fn finalize(&self) -> Result<(), String>;
+}
+
 /// One-to-one core capability used only by the frontend DML application owner.
 // Design: ADR-0020 (docs/adr/ADR-0020-frontend-delete-application-owner.md)
 pub trait DeleteEngine: Send + Sync {
-    fn execute_delete(&self, request: ExecuteDeleteRequest<'_>) -> Result<(), String>;
+    fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String>;
+    fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
+    fn commit_delete(
+        &self,
+        prepared: &dyn DeletePrepared,
+        commit: &dyn DeleteCommit,
+    ) -> Result<CommitOutcome, CommitServiceError>;
+    fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String>;
 }
 
 impl DeleteEngine for Arc<StandaloneState> {
-    fn execute_delete(&self, request: ExecuteDeleteRequest<'_>) -> Result<(), String> {
+    fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
@@ -88,37 +134,103 @@ impl DeleteEngine for Arc<StandaloneState> {
                 })?;
                 let statement =
                     crate::engine::statement::convert_sqlparser_delete_to_custom(&delete)?;
-                match standard::execute_delete_statement(
+                standard::prepare_delete_statement(
                     self,
                     &statement,
                     request.current_catalog.as_deref(),
                     &request.current_database,
                     &request.execution,
                     &connector_context,
-                )? {
-                    StatementResult::Ok => Ok(()),
-                    StatementResult::Query(_) => {
-                        Err("DELETE unexpectedly produced query rows".to_string())
-                    }
-                }
+                )
             }
             DeleteStatementKind::Equality => {
                 let statement =
                     crate::engine::statement::parse_add_equality_delete_sql(request.sql)?;
-                match equality::execute_add_equality_delete_statement(
+                equality::prepare_equality_delete_statement(
                     self,
                     &statement,
                     request.current_catalog.as_deref(),
                     &request.current_database,
                     &request.execution,
                     &connector_context,
-                )? {
-                    StatementResult::Ok => Ok(()),
-                    StatementResult::Query(_) => {
-                        Err("equality DELETE unexpectedly produced query rows".to_string())
-                    }
-                }
+                )
             }
         }
     }
+
+    fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+        let prepared = downcast_prepared(prepared)?;
+        let result = prepared.execution.run()?;
+        if let Some(abort) = result.write_abort {
+            let has_staged_files = abort
+                .completed_writer_outputs
+                .iter()
+                .flat_map(|writer| &writer.iceberg_commits)
+                .next()
+                .is_some();
+            return Ok(DeleteWriteReport::Aborted {
+                reason: abort.reason,
+                has_staged_files,
+            });
+        }
+        let Some(input) = result.write_commit else {
+            return Ok(DeleteWriteReport::NoOp);
+        };
+        if matches!(prepared.operation.commit_op_kind, CommitOpKind::FastAppend)
+            && !crate::engine::write_transaction::write_commit_has_files(&input)
+        {
+            return Ok(DeleteWriteReport::NoOp);
+        }
+        Ok(DeleteWriteReport::CommitRequired(Arc::new(CoreDeleteCommit { input })))
+    }
+
+    fn commit_delete(
+        &self,
+        prepared: &dyn DeletePrepared,
+        commit: &dyn DeleteCommit,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let prepared = downcast_prepared(prepared).map_err(|message| {
+            CommitServiceError::known_uncommitted(
+                message,
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        let commit = commit.as_any().downcast_ref::<CoreDeleteCommit>().ok_or_else(|| {
+            CommitServiceError::known_uncommitted(
+                "foreign DELETE commit handle".to_string(),
+                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
+            )
+        })?;
+        prepared.execution.commit(&commit.input)
+    }
+
+    fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
+        downcast_prepared(prepared)?.execution.finalize()
+    }
+}
+
+struct CorePreparedDelete {
+    operation: DeleteOperation,
+    execution: Arc<dyn PreparedDeleteExecution>,
+}
+
+impl DeletePrepared for CorePreparedDelete {
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+struct CoreDeleteCommit { input: WriteCommitInput }
+
+impl DeleteCommit for CoreDeleteCommit {
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+pub(crate) fn prepared_delete(
+    operation: DeleteOperation,
+    execution: Arc<dyn PreparedDeleteExecution>,
+) -> PreparedDelete {
+    PreparedDelete { operation: operation.clone(), handle: Arc::new(CorePreparedDelete { operation, execution }) }
+}
+
+fn downcast_prepared(prepared: &dyn DeletePrepared) -> Result<&CorePreparedDelete, String> {
+    prepared.as_any().downcast_ref::<CorePreparedDelete>().ok_or_else(|| "foreign DELETE prepared handle".to_string())
 }

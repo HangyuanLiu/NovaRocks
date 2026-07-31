@@ -1024,7 +1024,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::engine::delete_engine::{DeleteEngine, ExecuteDeleteRequest};
+    use novarocks::engine::delete_engine::{
+        DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
+        PrepareDeleteRequest, PreparedDelete,
+    };
     use novarocks::engine::insert_engine::{
         AppendBatchRequest, AppendRowsRequest, IcebergInsertCommit, IcebergPreparedInsert,
         IcebergWriteReport, InsertQueryRequest, PrepareIcebergInsert, PreparedIcebergInsert,
@@ -1052,13 +1055,43 @@ mod tests {
         executions: Mutex<Vec<QueryExecutionContext>>,
     }
 
+    struct TestDeletePrepared;
+
+    impl DeletePrepared for TestDeletePrepared {
+        fn as_any(&self) -> &dyn std::any::Any { self }
+    }
+
     impl DeleteEngine for RecordingDeleteEngine {
-        fn execute_delete(&self, request: ExecuteDeleteRequest<'_>) -> Result<(), String> {
+        fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
             self.executions
                 .lock()
                 .expect("delete executions")
                 .push(request.execution);
-            Ok(())
+            Ok(PreparedDelete {
+                operation: DeleteOperation {
+                    catalog: "ice".to_string(), namespace: "db".to_string(), table: "t".to_string(),
+                    target_ref: "main".to_string(), attempt_id: "test-delete".to_string(),
+                    commit_op_kind: novarocks::connector::iceberg::commit::CommitOpKind::RowDelta,
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(TestDeletePrepared),
+            })
+        }
+
+        fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+            Ok(DeleteWriteReport::NoOp)
+        }
+
+        fn commit_delete(
+            &self,
+            _prepared: &dyn DeletePrepared,
+            _commit: &dyn DeleteCommit,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            unreachable!("no-op DELETE must not commit")
+        }
+
+        fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
+            unreachable!("no-op DELETE must not finalize")
         }
     }
 

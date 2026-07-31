@@ -17,15 +17,55 @@
 
 //! Frontend-owned DELETE statement recognition and application routing.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use novarocks::engine::delete_engine::{
-    DeleteEngine, DeleteStatementKind, ExecuteDeleteRequest, parse_delete_statement,
+    DeleteCommit, DeleteEngine, DeleteStatementKind, DeleteWriteReport, PrepareDeleteRequest,
+    PreparedDelete, parse_delete_statement,
     parse_equality_delete_statement,
 };
 use novarocks::query_execution::request_context::RequestContext;
 use novarocks::runtime::query_options::QueryOptions;
 
 use crate::dml::error::DmlError;
+use crate::dml::model::{CommitOpKind, CommitOutcome, CommitServiceError, OperationKind, OperationTarget, WriteTransactionSpec};
+use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 use crate::dml::service::DmlService;
+
+struct DeleteWriteExecutor<'a> { engine: &'a dyn DeleteEngine, prepared: &'a PreparedDelete }
+
+impl WriteExecutor for DeleteWriteExecutor<'_> {
+    type CommitHandle = Arc<dyn DeleteCommit>;
+
+    fn run_coordinated_write(&self, _spec: &WriteTransactionSpec) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String> {
+        Ok(match self.engine.run_delete(self.prepared.handle.as_ref())? {
+            DeleteWriteReport::Aborted { reason, has_staged_files } => CoordinatedWriteReport::Aborted { reason, has_staged: has_staged_files },
+            DeleteWriteReport::NoOp => CoordinatedWriteReport::NoOp,
+            DeleteWriteReport::CommitRequired(handle) => CoordinatedWriteReport::CommitRequired(handle),
+        })
+    }
+
+    fn commit(&self, _spec: &WriteTransactionSpec, handle: &Self::CommitHandle) -> Result<CommitOutcome, CommitServiceError> {
+        self.engine.commit_delete(self.prepared.handle.as_ref(), handle.as_ref())
+    }
+
+    fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
+        self.engine.finalize_delete(self.prepared.handle.as_ref())
+    }
+}
+
+fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
+    let operation = &prepared.operation;
+    WriteTransactionSpec {
+        target: OperationTarget { catalog: operation.catalog.clone(), namespace: operation.namespace.clone(), table: operation.table.clone(), ref_name: (operation.target_ref != "main").then(|| operation.target_ref.clone()) },
+        operation_kind: OperationKind::RowDelta,
+        commit_op_kind: operation.commit_op_kind,
+        attempt_id: operation.attempt_id.clone(),
+        base_snapshot_id: operation.base_snapshot_id,
+        base_snapshot_map: BTreeMap::new(),
+    }
+}
 
 impl DmlService {
     pub fn try_execute_delete(
@@ -51,8 +91,8 @@ impl DmlService {
 
         self.require_journal()?;
         let session = context.session();
-        engine
-            .execute_delete(ExecuteDeleteRequest {
+        let prepared = engine
+            .prepare_delete(PrepareDeleteRequest {
                 sql,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
                 current_database: session.current_database().to_string(),
@@ -61,6 +101,8 @@ impl DmlService {
                 kind,
             })
             .map_err(DmlError::executor)?;
+        let executor = DeleteWriteExecutor { engine, prepared: &prepared };
+        self.run_write(write_transaction_spec(&prepared), &executor)?;
         Ok(Some(()))
     }
 }
