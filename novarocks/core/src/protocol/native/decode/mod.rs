@@ -48,6 +48,7 @@ pub(crate) use submission::decode_fragment_submission;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) use submission::decode_query_execution_id;
 pub(crate) use submission::{
+    assemble_fragment_submission_with_connectors_and_execution_resolver,
     decode_fragment_submission_with_connectors,
     decode_fragment_submission_with_connectors_and_execution_resolver,
 };

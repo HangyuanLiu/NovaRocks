@@ -1,0 +1,118 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Execution-domain assembly seam for a backend-decoded native fragment.
+//!
+//! The `InstanceParams` execution values are decoded by the backend role.
+//! This module builds the shared execution submission without exposing decode
+//! contexts, registries, or runtime state. The sink-assignment DTO is retained
+//! temporarily to preserve its established validation ordering while the sink
+//! decoder moves as its own slice.
+
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use crate::connector::ConnectorRegistry;
+use crate::exec::fragment::program::FragmentNodeId;
+use crate::proto::novarocks;
+use crate::proto::plan;
+use crate::runtime::endpoint::RuntimeEndpoint;
+use crate::runtime::fragment::instance::{
+    BackendNum, ExchangeInputAssignments, FragmentInstanceId,
+};
+use crate::runtime::fragment::submission::FragmentSubmission;
+use crate::runtime::query_context::QueryId;
+use crate::runtime::query_options::QueryOptions;
+use crate::runtime::scan_range::ScanRangeParams;
+
+/// Backend-decoded `InstanceParams` execution values required to assemble a
+/// fragment. Sink assignment is intentionally excluded.
+#[derive(Debug)]
+pub struct NativeFragmentInstanceInput {
+    pub(crate) query_id: QueryId,
+    pub(crate) fragment_instance_id: FragmentInstanceId,
+    pub(crate) backend_num: BackendNum,
+    pub(crate) query_options: QueryOptions,
+    pub(crate) pipeline_dop: NonZeroUsize,
+    pub(crate) raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    pub(crate) exchange_inputs: ExchangeInputAssignments,
+    pub(crate) report_endpoint: Option<RuntimeEndpoint>,
+    pub(crate) typed_result_sink: bool,
+}
+
+impl NativeFragmentInstanceInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        query_id: QueryId,
+        fragment_instance_id: FragmentInstanceId,
+        backend_num: BackendNum,
+        query_options: QueryOptions,
+        pipeline_dop: NonZeroUsize,
+        raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+        exchange_inputs: ExchangeInputAssignments,
+        report_endpoint: Option<RuntimeEndpoint>,
+        typed_result_sink: bool,
+    ) -> Self {
+        Self {
+            query_id,
+            fragment_instance_id,
+            backend_num,
+            query_options,
+            pipeline_dop,
+            raw_scan_ranges,
+            exchange_inputs,
+            report_endpoint,
+            typed_result_sink,
+        }
+    }
+}
+
+pub struct AssembledNativeFragmentSubmission {
+    submission: FragmentSubmission,
+    backend_num: i32,
+    report_endpoint: Option<RuntimeEndpoint>,
+}
+
+impl AssembledNativeFragmentSubmission {
+    pub fn into_parts(self) -> (FragmentSubmission, i32, Option<RuntimeEndpoint>) {
+        (self.submission, self.backend_num, self.report_endpoint)
+    }
+}
+
+pub fn assemble_fragment_submission_for_backend(
+    fragment: &plan::PlanFragment,
+    instance: NativeFragmentInstanceInput,
+    sink_assignment_params: &novarocks::InstanceParams,
+    connectors: Arc<ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+) -> Result<AssembledNativeFragmentSubmission, String> {
+    let decoded = crate::protocol::native::decode::assemble_fragment_submission_with_connectors_and_execution_resolver(
+        fragment,
+        instance,
+        sink_assignment_params,
+        connectors,
+        execution_resolver,
+    )
+    .map_err(|error| error.to_string())?;
+    let (submission, metadata) = decoded.into_parts();
+    Ok(AssembledNativeFragmentSubmission {
+        submission,
+        backend_num: metadata.backend_num(),
+        report_endpoint: metadata.report_endpoint().cloned(),
+    })
+}

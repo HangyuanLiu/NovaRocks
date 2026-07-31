@@ -29,6 +29,7 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
+use crate::protocol::native_fragment_assembly_port::NativeFragmentInstanceInput;
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use crate::runtime::fragment::instance::{
@@ -64,17 +65,6 @@ impl DecodedNativeFragment {
     }
 }
 
-struct DecodedNativeInstanceParts {
-    query_id: QueryId,
-    fragment_instance_id: FragmentInstanceId,
-    backend_num: BackendNum,
-    query_options: crate::runtime::query_options::QueryOptions,
-    pipeline_dop: NonZeroUsize,
-    raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
-    exchange_inputs: ExchangeInputAssignments,
-    typed_result_sink: bool,
-}
-
 pub(crate) fn decode_fragment_submission_with_connectors(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
@@ -95,6 +85,22 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let instance_parts = decode_instance_parts(instance_params)?;
+    assemble_fragment_submission_with_connectors_and_execution_resolver(
+        fragment,
+        instance_parts,
+        instance_params,
+        connectors,
+        execution_resolver,
+    )
+}
+
+pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolver(
+    fragment: &plan::PlanFragment,
+    instance_parts: NativeFragmentInstanceInput,
+    instance_params: &novarocks::InstanceParams,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = fragment.root.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(root_path.clone(), "native PlanFragment requires root")
@@ -173,6 +179,7 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     );
     let metadata = NativeSubmissionMetadata::new(
         instance_parts.backend_num.get(),
+        instance_parts.report_endpoint.clone(),
         instance_parts.typed_result_sink,
     );
     let instance = FragmentInstanceSpec::new_native(
@@ -314,7 +321,7 @@ fn validate_runtime_filter_binding_expressions(
 
 fn decode_instance_parts(
     src: &novarocks::InstanceParams,
-) -> Result<DecodedNativeInstanceParts, NativeFragmentDecodeError> {
+) -> Result<NativeFragmentInstanceInput, NativeFragmentDecodeError> {
     let path = FieldPath::root("instance_params");
     let query_id = src.query_id.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -395,16 +402,23 @@ fn decode_instance_parts(
             ExchangeInputAssignment::new(count),
         );
     }
-    Ok(DecodedNativeInstanceParts {
-        query_id: query_id_from_native(query_id),
-        fragment_instance_id: FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
+    let report_endpoint = src
+        .report_endpoint
+        .as_deref()
+        .map(super::decode_endpoint)
+        .transpose()?;
+
+    Ok(NativeFragmentInstanceInput::new(
+        query_id_from_native(query_id),
+        FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
         backend_num,
         query_options,
         pipeline_dop,
         raw_scan_ranges,
-        exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-        typed_result_sink: src.typed_result_sink,
-    })
+        ExchangeInputAssignments::new(exchange_inputs),
+        report_endpoint,
+        src.typed_result_sink,
+    ))
 }
 
 /// Cross-check that every FE-provided per-node scan-range entry maps to a

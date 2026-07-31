@@ -17,9 +17,10 @@
 
 //! Backend fragment-decode boundary.
 //!
-//! This value owns the production request surface.  Its current bridge keeps
-//! the mature core decoder reachable while expression/node/scan/sink decoder
-//! modules are migrated without changing validation order or error text.
+//! This value owns the production request surface and decodes the instance
+//! execution values before invoking the narrow core assembly seam for the
+//! shared plan program. Sink-assignment DTO decoding remains with the sink
+//! assembly slice until that companion migration is complete.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,7 @@ use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 
 use super::ingress::NativeFragmentIngressError;
+use super::instance::decode_instance_params;
 
 pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
@@ -109,9 +111,15 @@ impl NativeFragmentRequest {
         connectors: Arc<ConnectorRegistry>,
         execution_resolver: Arc<dyn ConnectorExecutionResolver>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let decoded = novarocks::protocol::native_backend_decode_port::decode_fragment_submission_for_backend(
-            &fragment, &instance_params, connectors, execution_resolver,
-        ).map_err(NativeFragmentIngressError::new)?;
+        let instance = decode_instance_params(&instance_params)?;
+        let decoded = novarocks::protocol::native_fragment_assembly_port::assemble_fragment_submission_for_backend(
+            &fragment,
+            instance,
+            &instance_params,
+            connectors,
+            execution_resolver,
+        )
+        .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num, report_endpoint) = decoded.into_parts();
         if execution_id.query_id().high() != submission.instance().query_id().hi()
             || execution_id.query_id().low() != submission.instance().query_id().lo()

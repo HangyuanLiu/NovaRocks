@@ -17,6 +17,17 @@
 
 pub mod common;
 pub(crate) mod native;
-pub mod native_backend_decode_port;
+pub mod native_fragment_assembly_port;
 
 pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+
+/// Decode the lifecycle-owned query-options DTO into execution options.
+///
+/// This is deliberately separate from native fragment assembly: backend roles
+/// validate their `InstanceParams` before passing the resulting execution value
+/// to the core assembly kernel.
+pub fn decode_native_query_options(
+    src: &crate::proto::novarocks::QueryOptions,
+) -> Result<crate::runtime::query_options::QueryOptions, ProtocolError> {
+    native::query_options_contract::decode_query_options(src)
+}
