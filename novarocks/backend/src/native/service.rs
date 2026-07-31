@@ -34,13 +34,13 @@ use novarocks::query_execution::lifecycle::{
 };
 use novarocks::query_execution::report::NativeReportHandler;
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
-use novarocks::service::native_fragment_ingress::NativeFragmentIngress;
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use super::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use super::lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
@@ -218,20 +218,18 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
             }));
         }
         self.native_fragment_ingress
-            .cancel(
-                novarocks::service::native_fragment_ingress::NativeFragmentCancelRequest::new(
-                    novarocks::runtime::query_context::QueryId::new(query_id.hi, query_id.lo),
-                    request
-                        .finst_ids
-                        .iter()
-                        .map(|id| novarocks::UniqueId {
-                            hi: id.hi,
-                            lo: id.lo,
-                        })
-                        .collect(),
-                    request.reason,
-                ),
-            )
+            .cancel(NativeFragmentCancelRequest::new(
+                novarocks::runtime::query_context::QueryId::new(query_id.hi, query_id.lo),
+                request
+                    .finst_ids
+                    .iter()
+                    .map(|id| novarocks::UniqueId {
+                        hi: id.hi,
+                        lo: id.lo,
+                    })
+                    .collect(),
+                request.reason,
+            ))
             .map_err(|error| tonic::Status::internal(error.to_string()))?;
         Ok(tonic::Response::new(proto::CancelFragmentResponse {
             status_code: CANCEL_FRAGMENT_OK,

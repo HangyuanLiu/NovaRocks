@@ -23,6 +23,7 @@
 
 pub(crate) mod codec;
 pub(crate) mod connector_binding;
+pub(crate) mod ingress;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod report;
 pub(crate) mod service;
