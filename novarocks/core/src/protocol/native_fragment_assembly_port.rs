@@ -29,9 +29,11 @@ use std::sync::Arc;
 
 use crate::common::ids::SlotId;
 use crate::connector::ConnectorRegistry;
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
 };
+use crate::proto::expr;
 use crate::proto::novarocks;
 use crate::proto::plan;
 use crate::protocol::ProtocolError;
@@ -166,6 +168,21 @@ pub trait NativeFragmentEnvelopeDecoder: Send + Sync {
         &self,
         fragment: &'a plan::PlanFragment,
     ) -> Result<&'a plan::DataSink, ProtocolError>;
+}
+
+/// Backend-owned expression decoder capability used by native plan lowering.
+///
+/// The shared core supplies only the expression arena and immutable input-slot
+/// layout. Query lifecycle, connector, and runtime-registry state remain out
+/// of this contract.
+pub trait NativeExpressionDecoder: Send + Sync {
+    fn decode_expression(
+        &self,
+        expression: &expr::Expr,
+        path: FieldPath,
+        arena: &mut ExprArena,
+        input: &NativeExpressionInputLayout,
+    ) -> Result<ExprId, ProtocolError>;
 }
 
 /// Backend-owned runtime-filter contract decoder invoked after plan assembly
