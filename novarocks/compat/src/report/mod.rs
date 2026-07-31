@@ -137,6 +137,7 @@ impl CompatReportService {
             .get(&finst_id)
             .cloned();
         let Some(instance) = instance else {
+            self.report_native_progress(finst_id);
             return;
         };
         enqueue_progress(&self.reporter, &self.tracking, finst_id, instance);
@@ -151,6 +152,30 @@ impl CompatReportService {
             .lock()
             .expect("compat report registry lock")
             .remove(&finst_id);
+    }
+
+    pub(crate) fn register_native(
+        &self,
+        registration: FragmentReportRegistration,
+        endpoint: novarocks::runtime::endpoint::RuntimeEndpoint,
+    ) {
+        novarocks::query_execution::native_fragment_report::register(registration, endpoint);
+    }
+
+    pub(crate) fn unregister_native(&self, finst_id: UniqueId) {
+        novarocks::query_execution::native_fragment_report::unregister(finst_id);
+    }
+
+    pub(crate) fn report_native_progress(&self, finst_id: UniqueId) {
+        novarocks::query_execution::native_fragment_report::report_progress(finst_id);
+    }
+
+    pub(crate) fn report_native_terminal(
+        &self,
+        finst_id: UniqueId,
+        terminal: FragmentTerminalReport,
+    ) {
+        novarocks::query_execution::native_fragment_report::report_terminal(finst_id, terminal);
     }
 
     pub(crate) fn report_terminal(&self, finst_id: UniqueId, terminal: FragmentTerminalReport) {
