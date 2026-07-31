@@ -30,7 +30,7 @@
 //!    which commits the generated position-delete files and drives
 //!    finalization lifecycle.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -43,19 +43,29 @@ use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
 };
-use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
-use crate::engine::write_transaction::{
-    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
-    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, write_commit_has_files,
+#[cfg(test)]
+use crate::connector::iceberg::delete_visibility::{
+    ExistingDeleteVisibility, ReferencedDataFilePartition, ReferencedDataFilePartitions,
+    insert_referenced_data_file_partition, load_existing_delete_visibility_by_data_file,
+    load_existing_delete_visibility_by_data_file_at,
+    load_existing_delete_visibility_from_descriptors, load_referenced_data_file_partitions,
+    load_referenced_data_file_partitions_at,
 };
-use crate::engine::{StandaloneState, StatementResult};
-use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
+use crate::connector::iceberg::delete_visibility::{
+    ExistingDeleteVisibilityByDataFile, data_file_row_is_visible,
+};
+use crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
+use crate::engine::StandaloneState;
+use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
+use crate::engine::delete_engine::{
+    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
+};
+use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::write::WriteCommitInput;
@@ -64,14 +74,14 @@ use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use novarocks_catalog::schema::ColumnDef;
 
-pub(crate) fn execute_delete_statement(
+pub(crate) fn prepare_delete_statement(
     state: &Arc<StandaloneState>,
     stmt: &DeleteStmt,
     current_catalog: Option<&str>,
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<PreparedDelete, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
@@ -152,7 +162,7 @@ pub(crate) fn execute_delete_statement(
     };
 
     if matches!(delete_strategy, IcebergSqlDeleteStrategy::DeletionVectors) {
-        run_delete_dv_write_transaction(
+        return prepare_delete_dv_write(
             state,
             &target,
             catalog,
@@ -163,8 +173,7 @@ pub(crate) fn execute_delete_statement(
             &stmt.where_clause,
             execution.clone(),
             connector_context,
-        )?;
-        return Ok(StatementResult::Ok);
+        );
     }
 
     let resolved = {
@@ -206,7 +215,7 @@ pub(crate) fn execute_delete_statement(
         )
         .with_table_metadata(metadata.clone()),
     );
-    run_delete_write_transaction(
+    prepare_delete_write(
         state,
         &target,
         catalog,
@@ -219,9 +228,7 @@ pub(crate) fn execute_delete_statement(
         sink_spec,
         execution.clone(),
         connector_context,
-    )?;
-
-    Ok(StatementResult::Ok)
+    )
 }
 
 struct DistributedDeleteWriteExecutor {
@@ -234,11 +241,8 @@ struct DistributedDeleteWriteExecutor {
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
-impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<QueryExecutionResult, String> {
+impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
+    fn run(&self) -> Result<QueryExecutionResult, String> {
         let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
@@ -260,15 +264,11 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
         Ok(result)
     }
 
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    fn commit(&self, write_commit: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError> {
         self.commit_executor.commit_write_input(write_commit)
     }
 
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+    fn finalize(&self) -> Result<(), String> {
         self.commit_executor.finalize()
     }
 }
@@ -283,11 +283,8 @@ struct DistributedDvDeleteWriteExecutor {
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
-impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<QueryExecutionResult, String> {
+impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
+    fn run(&self) -> Result<QueryExecutionResult, String> {
         let mut result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
@@ -309,21 +306,17 @@ impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
         Ok(result)
     }
 
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
+    fn commit(&self, write_commit: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError> {
         self.commit_executor.commit_write_input(write_commit)
     }
 
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+    fn finalize(&self) -> Result<(), String> {
         self.commit_executor.finalize()
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_delete_dv_write_transaction(
+fn prepare_delete_dv_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn iceberg::Catalog>,
@@ -334,7 +327,7 @@ fn run_delete_dv_write_transaction(
     where_clause: &sqlast::Expr,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<PreparedDelete, String> {
     let resolved = {
         crate::connector::metadata_load_table(
             state.connector_control.as_ref(),
@@ -395,33 +388,13 @@ fn run_delete_dv_write_transaction(
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
     };
-    let spec = IcebergWriteTransactionSpec {
-        target: IcebergOperationTarget {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
-        },
-        operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:delete-dv:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
-        commit: IcebergWriteCommitPolicy {
-            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
-            base_snapshot_id,
-            base_snapshot_map: BTreeMap::new(),
-            target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        },
-        validation: IcebergWriteValidationPolicy {
-            require_v3_for_branch: target_ref != "main",
-        },
-        source: IcebergWriteSource::CoordinatedPlan,
-    };
+    let attempt_id = format!(
+        "{}.{}.{}:delete-dv:{}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        uuid::Uuid::new_v4()
+    );
     let executor = DistributedDvDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -431,13 +404,22 @@ fn run_delete_dv_write_transaction(
         execution,
         connector_context: connector_context.clone(),
     };
-    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
-    let _outcome = runner.run(spec)?;
-    Ok(())
+    Ok(prepared_delete(
+        DeleteOperation {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            target_ref: target_ref.to_string(),
+            attempt_id,
+            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
+            base_snapshot_id,
+        },
+        Arc::new(executor),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_delete_write_transaction(
+fn prepare_delete_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn iceberg::Catalog>,
@@ -450,7 +432,7 @@ fn run_delete_write_transaction(
     sink_spec: IcebergWriteSinkSpec,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
+) -> Result<PreparedDelete, String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = IcebergWriteCommitExecutor {
@@ -465,33 +447,13 @@ fn run_delete_write_transaction(
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
     };
-    let spec = IcebergWriteTransactionSpec {
-        target: IcebergOperationTarget {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
-        },
-        operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:delete:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
-        commit: IcebergWriteCommitPolicy {
-            commit_op_kind: CommitOpKind::RowDelta,
-            base_snapshot_id,
-            base_snapshot_map: BTreeMap::new(),
-            target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
-        },
-        validation: IcebergWriteValidationPolicy {
-            require_v3_for_branch: target_ref != "main",
-        },
-        source: IcebergWriteSource::CoordinatedPlan,
-    };
+    let attempt_id = format!(
+        "{}.{}.{}:delete:{}",
+        target.catalog,
+        target.namespace,
+        target.table,
+        uuid::Uuid::new_v4()
+    );
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -501,9 +463,18 @@ fn run_delete_write_transaction(
         execution,
         connector_context: connector_context.clone(),
     };
-    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
-    let _outcome = runner.run(spec)?;
-    Ok(())
+    Ok(prepared_delete(
+        DeleteOperation {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            target_ref: target_ref.to_string(),
+            attempt_id,
+            commit_op_kind: CommitOpKind::RowDelta,
+            base_snapshot_id,
+        },
+        Arc::new(executor),
+    ))
 }
 
 fn build_delete_position_sink_query(
@@ -955,383 +926,6 @@ fn literal_to_datum(
             "phase 1 DELETE WHERE primitive type {other:?} not yet supported (column `{column_name}`)"
         )),
     }
-}
-
-pub(crate) struct ReferencedDataFilePartition {
-    pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: iceberg::spec::Struct,
-}
-
-pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
-
-/// Resolve the snapshot id at the head of a named Iceberg branch.
-///
-/// Returns `None` when the branch exists but has never had a snapshot committed
-/// to it (unborn branch). Returns an error when the ref does not exist in the
-/// table metadata.
-pub(crate) fn resolve_branch_head_snapshot_id(
-    metadata: &iceberg::spec::TableMetadata,
-    branch_name: &str,
-) -> Result<Option<i64>, String> {
-    match metadata.refs().get(branch_name) {
-        Some(snap_ref) => Ok(Some(snap_ref.snapshot_id)),
-        None => {
-            if branch_name == "main" && metadata.current_snapshot().is_none() {
-                // Unborn main branch — no snapshot yet; caller should treat as empty.
-                Ok(None)
-            } else {
-                Err(format!(
-                    "iceberg ref: branch '{branch_name}' not found in table metadata"
-                ))
-            }
-        }
-    }
-}
-
-/// Snapshot-aware version of [`load_referenced_data_file_partitions`].
-///
-/// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
-pub(crate) fn load_referenced_data_file_partitions_at(
-    table: &iceberg::table::Table,
-    snapshot_id: Option<i64>,
-) -> Result<ReferencedDataFilePartitions, String> {
-    let data_files = match snapshot_id {
-        Some(id) => registry::extract_data_files_with_stats_at(table, id)?,
-        None => registry::extract_data_files_with_stats(table)?,
-    };
-    let mut out = HashMap::with_capacity(data_files.len());
-    for data_file in data_files {
-        let partition_spec_id = data_file.partition_spec_id.ok_or_else(|| {
-            format!(
-                "iceberg data file `{}` missing partition spec id",
-                data_file.path
-            )
-        })?;
-        let partition_values = data_file.partition_values.ok_or_else(|| {
-            format!(
-                "iceberg data file `{}` missing partition values",
-                data_file.path
-            )
-        })?;
-        let partition = ReferencedDataFilePartition {
-            partition_spec_id,
-            partition_values,
-        };
-        insert_referenced_data_file_partition(&mut out, data_file.path, partition)?;
-    }
-    Ok(out)
-}
-
-pub(crate) fn load_referenced_data_file_partitions(
-    table: &iceberg::table::Table,
-) -> Result<ReferencedDataFilePartitions, String> {
-    load_referenced_data_file_partitions_at(table, None)
-}
-
-fn insert_referenced_data_file_partition(
-    partitions: &mut ReferencedDataFilePartitions,
-    path: String,
-    partition: ReferencedDataFilePartition,
-) -> Result<(), String> {
-    match partitions.entry(path) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(partition);
-        }
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let existing = entry.get();
-            if existing.partition_spec_id == partition.partition_spec_id
-                && existing.partition_values == partition.partition_values
-            {
-                return Ok(());
-            }
-            return Err(format!(
-                "iceberg data file `{}` has conflicting partition metadata: old partition spec id {}, new partition spec id {}",
-                entry.key(),
-                existing.partition_spec_id,
-                partition.partition_spec_id
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ExistingDeleteVisibility {
-    pub(crate) deleted_positions: roaring::RoaringTreemap,
-    pub(crate) equality_deletes: Vec<crate::connector::iceberg::equality_delete::EqualityDeleteSet>,
-}
-
-pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDeleteVisibility>;
-
-/// Snapshot-aware version of [`load_existing_delete_visibility_by_data_file`].
-///
-/// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
-pub(crate) fn load_existing_delete_visibility_by_data_file_at(
-    table: &iceberg::table::Table,
-    snapshot_id: Option<i64>,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
-) -> Result<ExistingDeleteVisibilityByDataFile, String> {
-    let data_files = match snapshot_id {
-        Some(id) => crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
-            table, id,
-        )?,
-        None => crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(table)?,
-    };
-    load_delete_visibility_from_data_files(data_files, object_store_config)
-}
-
-pub(crate) fn load_existing_delete_visibility_by_data_file(
-    table: &iceberg::table::Table,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
-) -> Result<ExistingDeleteVisibilityByDataFile, String> {
-    load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)
-}
-
-pub(crate) fn load_existing_delete_visibility_from_descriptors(
-    data_files: &[crate::connector::iceberg::changes::DeleteVisibilityDataFileDescriptor],
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
-) -> Result<ExistingDeleteVisibilityByDataFile, String> {
-    let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
-
-    for data_file in data_files {
-        if data_file.delete_files.is_empty() {
-            continue;
-        }
-
-        let data_file_len = u64::try_from(data_file.size)
-            .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
-        let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
-        loader_ranges.push(crate::connector::file_execution::FileScanRange {
-            path: data_file.path.clone(),
-            file_len: data_file_len,
-            offset: 0,
-            length: data_file_len,
-            scan_range_id: -1,
-            external_datacache: None,
-        });
-        for delete_file in &data_file.delete_files {
-            let delete_len_i64 = delete_file.length.unwrap_or(0);
-            let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
-                format!("iceberg delete file size is negative: {}", delete_file.path)
-            })?;
-            loader_ranges.push(crate::connector::file_execution::FileScanRange {
-                path: delete_file.path.clone(),
-                file_len: delete_len,
-                offset: 0,
-                length: delete_len,
-                scan_range_id: -1,
-                external_datacache: None,
-            });
-        }
-
-        let ctx = crate::connector::file_execution::FileScanContext::build(
-            loader_ranges,
-            None,
-            object_store_config,
-        )?;
-        let normalized_delete_specs = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(data_file.delete_files.iter())
-            .map(|(resolved, original)| {
-                let file_format = match original.file_format {
-                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
-                        crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet
-                    }
-                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
-                        crate::connector::iceberg::delete_file::IcebergFileFormat::Puffin
-                    }
-                };
-                let file_content = match original.file_content {
-                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Position => {
-                        crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes
-                    }
-                    crate::connector::iceberg::changes::DeleteVisibilityDeleteFileContent::Equality => {
-                        crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes
-                    }
-                };
-                Ok(
-                    crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
-                        path: resolved.path.clone(),
-                        file_format,
-                        file_content,
-                        length: original
-                            .length
-                            .map(u64::try_from)
-                            .transpose()
-                            .map_err(|_| {
-                                format!("iceberg delete file size is negative: {}", original.path)
-                            })?,
-                        content_offset: original.content_offset,
-                        content_size_in_bytes: original.content_size_in_bytes,
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
-            &normalized_delete_specs,
-            &data_file.path,
-            &ctx.access,
-        )?;
-        let equality_deletes =
-            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
-                &normalized_delete_specs,
-                &ctx.access,
-            )?;
-        if deleted_positions.is_empty() && equality_deletes.is_empty() {
-            continue;
-        }
-        let visibility = ExistingDeleteVisibility {
-            deleted_positions,
-            equality_deletes,
-        };
-        if let Some(resolved_data_file) = ctx.ranges.first()
-            && resolved_data_file.path != data_file.path
-        {
-            out.insert(resolved_data_file.path.clone(), visibility.clone());
-        }
-        out.insert(data_file.path.clone(), visibility);
-    }
-
-    Ok(out)
-}
-
-fn load_delete_visibility_from_data_files(
-    data_files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
-) -> Result<ExistingDeleteVisibilityByDataFile, String> {
-    let mut out: ExistingDeleteVisibilityByDataFile = HashMap::new();
-
-    for data_file in data_files {
-        if data_file.delete_files.is_empty() {
-            continue;
-        }
-
-        let data_file_len = u64::try_from(data_file.size)
-            .map_err(|_| format!("iceberg data file size is negative: {}", data_file.path))?;
-        let mut loader_ranges = Vec::with_capacity(1 + data_file.delete_files.len());
-        loader_ranges.push(crate::connector::file_execution::FileScanRange {
-            path: data_file.path.clone(),
-            file_len: data_file_len,
-            offset: 0,
-            length: data_file_len,
-            scan_range_id: -1,
-            external_datacache: None,
-        });
-        for delete_file in &data_file.delete_files {
-            let delete_len_i64 = delete_file.length.unwrap_or(0);
-            let delete_len = u64::try_from(delete_len_i64).map_err(|_| {
-                format!("iceberg delete file size is negative: {}", delete_file.path)
-            })?;
-            loader_ranges.push(crate::connector::file_execution::FileScanRange {
-                path: delete_file.path.clone(),
-                file_len: delete_len,
-                offset: 0,
-                length: delete_len,
-                scan_range_id: -1,
-                external_datacache: None,
-            });
-        }
-
-        let ctx = crate::connector::file_execution::FileScanContext::build(
-            loader_ranges,
-            None,
-            object_store_config,
-        )?;
-        let normalized_delete_specs = ctx
-            .ranges
-            .iter()
-            .skip(1)
-            .zip(data_file.delete_files.iter())
-            .map(|(resolved, original)| {
-                let file_format = match original.file_format {
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
-                        crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet
-                    }
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
-                        crate::connector::iceberg::delete_file::IcebergFileFormat::Puffin
-                    }
-                };
-                let file_content = match original.file_content {
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
-                        crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes
-                    }
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
-                        crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes
-                    }
-                };
-                Ok(
-                    crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
-                        path: resolved.path.clone(),
-                        file_format,
-                        file_content,
-                        length: original
-                            .length
-                            .map(u64::try_from)
-                            .transpose()
-                            .map_err(|_| {
-                                format!("iceberg delete file size is negative: {}", original.path)
-                            })?,
-                        content_offset: original.content_offset,
-                        content_size_in_bytes: original.content_size_in_bytes,
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let deleted_positions = crate::connector::iceberg::position_delete::load_position_deletes(
-            &normalized_delete_specs,
-            &data_file.path,
-            &ctx.access,
-        )?;
-        let equality_deletes =
-            crate::connector::iceberg::equality_delete::load_equality_delete_sets(
-                &normalized_delete_specs,
-                &ctx.access,
-            )?;
-        if deleted_positions.is_empty() && equality_deletes.is_empty() {
-            continue;
-        }
-        let visibility = ExistingDeleteVisibility {
-            deleted_positions,
-            equality_deletes,
-        };
-        if let Some(resolved_data_file) = ctx.ranges.first()
-            && resolved_data_file.path != data_file.path
-        {
-            out.insert(resolved_data_file.path.clone(), visibility.clone());
-        }
-        out.insert(data_file.path, visibility);
-    }
-
-    Ok(out)
-}
-
-pub(crate) fn data_file_row_is_visible(
-    batch: &RecordBatch,
-    row: usize,
-    file_path: &str,
-    row_position: i64,
-    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
-) -> Result<bool, String> {
-    let visibility = existing_deletes_by_file.get(file_path);
-    if visibility
-        .map(|state| state.deleted_positions.contains(row_position as u64))
-        .unwrap_or(false)
-    {
-        return Ok(false);
-    }
-    let equality_deletes = visibility
-        .map(|state| state.equality_deletes.as_slice())
-        .unwrap_or(&[]);
-    if crate::connector::iceberg::equality_delete::equality_delete_row_is_deleted(
-        batch,
-        row,
-        equality_deletes,
-    )? {
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 fn collect_position_deletes_from_batch(

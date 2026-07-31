@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
+use novarocks::engine::delete_engine::DeleteEngine;
 use novarocks::engine::insert_engine::InsertEngine;
 use novarocks::engine::{
     PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
@@ -74,6 +75,7 @@ impl CoreCommandRoute for StandaloneCommandExecutor {
 fn execute_frontend_command(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
+    delete_engine: &dyn DeleteEngine,
     command: &dyn CoreCommandRoute,
     sql: &str,
     context: &RequestContext,
@@ -81,7 +83,12 @@ fn execute_frontend_command(
 ) -> Result<StatementResult, String> {
     match dml.try_execute_insert(insert_engine, sql, context, Some(&query_options)) {
         Ok(Some(())) => Ok(StatementResult::Ok),
-        Ok(None) => command.execute(sql, context, query_options),
+        Ok(None) => match dml.try_execute_delete(delete_engine, sql, context, Some(&query_options))
+        {
+            Ok(Some(())) => Ok(StatementResult::Ok),
+            Ok(None) => command.execute(sql, context, query_options),
+            Err(error) => Err(error.to_string()),
+        },
         Err(error) => Err(error.to_string()),
     }
 }
@@ -96,6 +103,7 @@ pub struct FrontendQueryService {
     topology: BackendTopologyService,
     dml: Arc<DmlService>,
     insert_engine: Arc<dyn InsertEngine>,
+    delete_engine: Arc<dyn DeleteEngine>,
 }
 
 impl FrontendQueryService {
@@ -107,6 +115,7 @@ impl FrontendQueryService {
         topology: BackendTopologyService,
         dml: Arc<DmlService>,
         insert_engine: Arc<dyn InsertEngine>,
+        delete_engine: Arc<dyn DeleteEngine>,
     ) -> Self {
         Self {
             engine,
@@ -116,6 +125,7 @@ impl FrontendQueryService {
             topology,
             dml,
             insert_engine,
+            delete_engine,
         }
     }
 }
@@ -440,6 +450,7 @@ impl FrontendQuerySession {
         let query_execution = self.service.query_execution.clone();
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
+        let delete_engine = Arc::clone(&self.service.delete_engine);
         let mut query_options = state.execution_settings.query_options();
         query_options.apply_sql_hints(&sql);
         let is_query = is_query_statement(&sql);
@@ -452,6 +463,7 @@ impl FrontendQuerySession {
                 execute_frontend_command(
                     dml.as_ref(),
                     insert_engine.as_ref(),
+                    delete_engine.as_ref(),
                     &command_executor,
                     &sql,
                     &context,
@@ -1012,6 +1024,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use novarocks::engine::delete_engine::{
+        DeleteCommit, DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport,
+        PrepareDeleteRequest, PreparedDelete,
+    };
     use novarocks::engine::insert_engine::{
         AppendBatchRequest, AppendRowsRequest, IcebergInsertCommit, IcebergPreparedInsert,
         IcebergWriteReport, InsertQueryRequest, PrepareIcebergInsert, PreparedIcebergInsert,
@@ -1032,6 +1048,59 @@ mod tests {
     struct RecordingCoreCommand {
         calls: AtomicUsize,
         contexts: Mutex<Vec<QueryExecutionContext>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingDeleteEngine {
+        executions: Mutex<Vec<QueryExecutionContext>>,
+    }
+
+    struct TestDeletePrepared;
+
+    impl DeletePrepared for TestDeletePrepared {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl DeleteEngine for RecordingDeleteEngine {
+        fn prepare_delete(
+            &self,
+            request: PrepareDeleteRequest<'_>,
+        ) -> Result<PreparedDelete, String> {
+            self.executions
+                .lock()
+                .expect("delete executions")
+                .push(request.execution);
+            Ok(PreparedDelete {
+                operation: DeleteOperation {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "t".to_string(),
+                    target_ref: "main".to_string(),
+                    attempt_id: "test-delete".to_string(),
+                    commit_op_kind: novarocks::connector::iceberg::commit::CommitOpKind::RowDelta,
+                    base_snapshot_id: None,
+                },
+                handle: Arc::new(TestDeletePrepared),
+            })
+        }
+
+        fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
+            Ok(DeleteWriteReport::NoOp)
+        }
+
+        fn commit_delete(
+            &self,
+            _prepared: &dyn DeletePrepared,
+            _commit: &dyn DeleteCommit,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            unreachable!("no-op DELETE must not commit")
+        }
+
+        fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
+            unreachable!("no-op DELETE must not finalize")
+        }
     }
 
     impl CoreCommandRoute for RecordingCoreCommand {
@@ -1176,6 +1245,7 @@ mod tests {
     #[test]
     fn frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
@@ -1185,6 +1255,7 @@ mod tests {
         let result = execute_frontend_command(
             &dml,
             &engine,
+            &delete_engine,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1201,6 +1272,7 @@ mod tests {
     #[test]
     fn frontend_router_passes_one_request_context_to_dml() {
         let engine = RecordingInsertEngine::default();
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
@@ -1210,6 +1282,7 @@ mod tests {
         execute_frontend_command(
             &dml,
             &engine,
+            &delete_engine,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1231,8 +1304,39 @@ mod tests {
     }
 
     #[test]
+    fn frontend_router_handles_delete_before_core_command() {
+        let engine = RecordingInsertEngine::default();
+        let delete_engine = RecordingDeleteEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::new(Arc::new(
+            crate::dml::journal::testing::InMemoryOperationJournal::default(),
+        ));
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let context = router_test_context(88, deadline, &cancellation);
+
+        execute_frontend_command(
+            &dml,
+            &engine,
+            &delete_engine,
+            &command,
+            "DELETE FROM t WHERE a = 1",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("frontend DELETE route");
+
+        let executions = delete_engine.executions.lock().unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].topology().revision(), 88);
+        assert_eq!(executions[0].deadline(), Some(deadline));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn non_insert_still_reaches_core_command_executor() {
         let engine = RecordingInsertEngine::default();
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
@@ -1242,6 +1346,7 @@ mod tests {
         execute_frontend_command(
             &dml,
             &engine,
+            &delete_engine,
             &command,
             "CREATE DATABASE db2",
             &context,

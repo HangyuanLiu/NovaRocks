@@ -58,9 +58,9 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
                     reason,
                     has_staged: has_staged_files,
                 },
-                IcebergWriteReport::NoOp(handle) => CoordinatedWriteReport::NoOp(handle),
-                IcebergWriteReport::Committable(handle) => {
-                    CoordinatedWriteReport::Committable(handle)
+                IcebergWriteReport::NoOp => CoordinatedWriteReport::NoOp,
+                IcebergWriteReport::CommitRequired(handle) => {
+                    CoordinatedWriteReport::CommitRequired(handle)
                 }
             },
         )

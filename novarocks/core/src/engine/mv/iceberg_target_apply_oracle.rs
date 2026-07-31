@@ -47,8 +47,8 @@ pub(crate) fn load_target_apply_locator_inputs(
     target_table: &iceberg::table::Table,
 ) -> Result<
     (
-        crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-        crate::engine::delete_flow::ReferencedDataFilePartitions,
+        crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+        crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     ),
     String,
 > {
@@ -57,7 +57,7 @@ pub(crate) fn load_target_apply_locator_inputs(
         .current_snapshot()
         .map(|s| s.snapshot_id());
     let existing_deletes_by_file =
-        crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
+        crate::connector::iceberg::delete_visibility::load_existing_delete_visibility_by_data_file_at(
             target_table,
             snapshot_id,
             target_entry.object_store_config(),
@@ -72,7 +72,7 @@ pub(crate) fn load_target_apply_locator_inputs(
         );
     }
     let referenced_data_file_partitions =
-        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+        crate::connector::iceberg::delete_visibility::load_referenced_data_file_partitions_at(
             target_table,
             snapshot_id,
         )?;
@@ -83,8 +83,8 @@ pub(crate) fn load_target_apply_locator_inputs(
 pub(crate) async fn locate_target_rows_by_apply_key(
     target_table: &iceberg::table::Table,
     base_row_ids: &[i64],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_apply_key_with_matches(
@@ -102,8 +102,8 @@ pub(crate) async fn locate_target_rows_by_apply_key(
 pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     base_row_ids: &[i64],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
@@ -122,8 +122,8 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[String],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_string_apply_key_with_matches(
@@ -143,8 +143,8 @@ pub(crate) async fn locate_target_rows_by_string_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[String],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
@@ -176,8 +176,8 @@ pub(crate) struct BranchStringApplyKey {
 pub(crate) async fn locate_target_rows_by_branch_apply_key(
     target_table: &iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_branch_apply_key_with_matches(
@@ -195,8 +195,8 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
 pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
@@ -215,8 +215,8 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[BranchStringApplyKey],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     Ok(locate_target_rows_by_branch_string_apply_key_with_matches(
@@ -236,8 +236,8 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[BranchStringApplyKey],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     locate_target_rows_by_apply_key_impl(
@@ -386,7 +386,7 @@ fn process_apply_key_locator_batch(
     request_is_i64: bool,
     requested: &std::collections::HashSet<ApplyKeyValue>,
     matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<(), String> {
     use arrow::array::{Array, Int64Array, StringArray};
 
@@ -426,7 +426,7 @@ fn process_apply_key_locator_batch(
             }
             let file = files.value(row);
             let pos = positions.value(row);
-            if !crate::engine::delete_flow::data_file_row_is_visible(
+            if !crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
                 batch,
                 row,
                 file,
@@ -457,7 +457,7 @@ fn process_apply_key_locator_batch(
             }
             let file = files.value(row);
             let pos = positions.value(row);
-            if !crate::engine::delete_flow::data_file_row_is_visible(
+            if !crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
                 batch,
                 row,
                 file,
@@ -483,7 +483,7 @@ fn process_branch_i64_apply_key_locator_batch(
     batch: &arrow::record_batch::RecordBatch,
     requested: &std::collections::HashSet<ApplyKeyValue>,
     matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<(), String> {
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 
@@ -538,7 +538,7 @@ fn process_branch_i64_apply_key_locator_batch(
         }
         let file = files.value(row);
         let pos = positions.value(row);
-        if !crate::engine::delete_flow::data_file_row_is_visible(
+        if !crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
             batch,
             row,
             file,
@@ -567,7 +567,7 @@ fn process_branch_utf8_apply_key_locator_batch(
     apply_key_column: &str,
     requested: &std::collections::HashSet<ApplyKeyValue>,
     matches: &mut std::collections::HashMap<ApplyKeyValue, (String, i64)>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<(), String> {
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 
@@ -620,7 +620,7 @@ fn process_branch_utf8_apply_key_locator_batch(
         }
         let file = files.value(row);
         let pos = positions.value(row);
-        if !crate::engine::delete_flow::data_file_row_is_visible(
+        if !crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
             batch,
             row,
             file,
@@ -646,7 +646,7 @@ fn process_branch_utf8_apply_key_locator_batch(
 #[cfg(test)]
 fn build_position_delete_groups_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     Ok(build_target_apply_locator_result_from_apply_key_matches(
         matches,
@@ -658,7 +658,7 @@ fn build_position_delete_groups_from_apply_key_matches(
 #[cfg(test)]
 fn build_target_apply_locator_result_from_apply_key_matches(
     matches: std::collections::HashMap<ApplyKeyValue, (String, i64)>,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
 ) -> Result<TargetApplyLocatorResult, String> {
     let mut by_file = std::collections::BTreeMap::<String, Vec<i64>>::new();
     for (_key, (file, pos)) in matches {
@@ -703,7 +703,7 @@ pub(crate) fn resolve_target_positions_via_framework(
     target_table_name: &str,
     apply_key_column: &str,
     requested_keys: ApplyKeyRequest<'_>,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     if requested_keys.is_empty() {
@@ -1328,8 +1328,8 @@ async fn locate_target_rows_by_apply_key_impl(
     target_table: &iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: ApplyKeyRequest<'_>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     use futures::StreamExt;
@@ -1493,8 +1493,8 @@ async fn locate_target_rows_by_apply_key_impl(
 pub(crate) async fn locate_target_rows_by_apply_key_string(
     target_table: &iceberg::table::Table,
     join_row_keys: &[String],
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
+    referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::commit::PositionDeleteGroup>, String> {
     locate_target_rows_by_string_apply_key(
@@ -2026,12 +2026,13 @@ mod tests {
         .expect("branch string locator batch")
     }
 
-    fn referenced_partitions() -> crate::engine::delete_flow::ReferencedDataFilePartitions {
+    fn referenced_partitions()
+    -> crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions {
         let mut partitions = std::collections::HashMap::new();
         for file in ["file-a.parquet", "file-b.parquet"] {
             partitions.insert(
                 file.to_string(),
-                crate::engine::delete_flow::ReferencedDataFilePartition {
+                crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
                     partition_values: Struct::empty(),
                 },
@@ -2649,13 +2650,13 @@ mod tests {
 
     fn referenced_partitions_for_table(
         table: &iceberg::table::Table,
-    ) -> crate::engine::delete_flow::ReferencedDataFilePartitions {
+    ) -> crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions {
         let snapshot_id = table
             .metadata()
             .current_snapshot()
             .expect("target snapshot")
             .snapshot_id();
-        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+        crate::connector::iceberg::delete_visibility::load_referenced_data_file_partitions_at(
             table,
             Some(snapshot_id),
         )
@@ -2911,12 +2912,12 @@ mod tests {
 
         let requested = vec!["key-a".to_string(), "key-b".to_string()];
         let empty_deletes = std::collections::HashMap::new();
-        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+        let mut referenced: crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions =
             std::collections::HashMap::new();
         for path in &fixture.file_paths {
             referenced.insert(
                 path.clone(),
-                crate::engine::delete_flow::ReferencedDataFilePartition {
+                crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
                     partition_values: iceberg::spec::Struct::empty(),
                 },
@@ -3312,12 +3313,12 @@ mod tests {
         }
 
         let requested = vec!["key-a".to_string()];
-        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+        let mut referenced: crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions =
             std::collections::HashMap::new();
         for path in &fixture.file_paths {
             referenced.insert(
                 path.clone(),
-                crate::engine::delete_flow::ReferencedDataFilePartition {
+                crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
                     partition_values: iceberg::spec::Struct::empty(),
                 },
@@ -3462,12 +3463,12 @@ mod tests {
         // Populate referenced_data_file_partitions for both files so the locator
         // can build PositionDeleteGroups after finding the match.  The table was
         // just created so its only partition spec has id=0.
-        let mut referenced: crate::engine::delete_flow::ReferencedDataFilePartitions =
+        let mut referenced: crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions =
             std::collections::HashMap::new();
         for path in file_paths {
             referenced.insert(
                 path.clone(),
-                crate::engine::delete_flow::ReferencedDataFilePartition {
+                crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
                     partition_values: iceberg::spec::Struct::empty(),
                 },

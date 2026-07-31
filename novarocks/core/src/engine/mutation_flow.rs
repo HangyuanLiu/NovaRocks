@@ -280,7 +280,10 @@ pub(crate) fn build_mor_deletion_vector_sink_spec(
     let planned_snapshot_id = if target_ref == "main" {
         table.metadata().current_snapshot().map(|s| s.snapshot_id())
     } else {
-        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+        crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            table.metadata(),
+            target_ref,
+        )?
     };
     let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         target, resolved, table, entry,
@@ -1018,7 +1021,10 @@ fn execute_mor_update(
 ) -> Result<StatementResult, String> {
     // For branch DML, read partition metadata at the branch head snapshot.
     let read_snapshot_id: Option<i64> = if target_ref != "main" {
-        crate::engine::delete_flow::resolve_branch_head_snapshot_id(table.metadata(), target_ref)?
+        crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            table.metadata(),
+            target_ref,
+        )?
     } else {
         table.metadata().current_snapshot().map(|s| s.snapshot_id())
     };
@@ -1448,7 +1454,9 @@ fn execute_cow_update(
     let metadata = table.metadata();
     // For branch DML, commit against the branch head snapshot.
     let base_snapshot_id: Option<i64> = if target_ref != "main" {
-        crate::engine::delete_flow::resolve_branch_head_snapshot_id(metadata, target_ref)?
+        crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            metadata, target_ref,
+        )?
     } else {
         metadata.current_snapshot().map(|s| s.snapshot_id())
     };

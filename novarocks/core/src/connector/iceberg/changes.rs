@@ -1135,7 +1135,7 @@ pub(crate) fn scan_one_deleted_data_file(
     base_table: &iceberg::table::Table,
     deleted_file: &DeletedDataFileRef,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
-    previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    previous_delete_visibility: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
     let expected_bucket = expected_object_store_bucket_for_table(base_table)?;
@@ -1153,7 +1153,7 @@ pub(crate) fn scan_one_deleted_data_file_with_factory(
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
-    previous_delete_visibility: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    previous_delete_visibility: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
         std::slice::from_ref(deleted_file),
@@ -1667,7 +1667,7 @@ fn scan_deleted_data_file_rows_with_visibility_and_v3_lineage(
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
-    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if deleted_data_files.is_empty() {
         return Ok(Vec::new());
@@ -1724,7 +1724,7 @@ fn read_full_data_file_with_v3_lineage_and_visibility(
     data_sequence_number: i64,
     factory: &novarocks_fs::FsAccessHandle,
     existing_deletes_by_file: Option<
-        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+        &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     >,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     use arrow::array::BooleanArray;
@@ -1748,7 +1748,7 @@ fn read_full_data_file_with_v3_lineage_and_visibility(
                     let row_position = i64::try_from(position).map_err(|_| {
                         format!("row position {position} is too large for deleted file {path}")
                     })?;
-                    crate::engine::delete_flow::data_file_row_is_visible(
+                    crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
                         &batch,
                         row,
                         logical_path,
@@ -1810,7 +1810,7 @@ fn scan_deleted_data_file_rows_with_factory_and_visibility<N>(
     factory: &novarocks_fs::FsAccessHandle,
     normalize_path: N,
     existing_deletes_by_file: Option<
-        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+        &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     >,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, ChangeError>
 where
@@ -1877,7 +1877,7 @@ fn read_full_data_file_with_base_row_id_and_visibility(
     first_row_id: i64,
     factory: &novarocks_fs::FsAccessHandle,
     existing_deletes_by_file: Option<
-        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+        &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     >,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     use arrow::array::BooleanArray;
@@ -1901,7 +1901,7 @@ fn read_full_data_file_with_base_row_id_and_visibility(
                     let row_position = i64::try_from(position).map_err(|_| {
                         format!("row position {position} is too large for deleted file {path}")
                     })?;
-                    crate::engine::delete_flow::data_file_row_is_visible(
+                    crate::connector::iceberg::delete_visibility::data_file_row_is_visible(
                         &batch,
                         row,
                         logical_path,

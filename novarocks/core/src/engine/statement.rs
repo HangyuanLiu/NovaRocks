@@ -716,6 +716,39 @@ pub(crate) fn execute_create_table_statement(
                     ));
                 }
             }
+            // This validation must precede the connector mutation dispatcher:
+            // its reconciliation path may inspect a not-yet-created table,
+            // whereas an invalid partition source is a deterministic statement
+            // error independent of catalog state.
+            for partition_field in &partition_fields {
+                let source_column = match partition_field {
+                    crate::sql::parser::ast::IcebergPartitionFieldExpr::Identity { column }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Year { column }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Month { column }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Day { column }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Hour { column }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Bucket {
+                        column, ..
+                    }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Truncate {
+                        column, ..
+                    }
+                    | crate::sql::parser::ast::IcebergPartitionFieldExpr::Void { column } => column,
+                };
+                if let Some(column) = columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(source_column))
+                    && matches!(
+                        column.data_type,
+                        novarocks_catalog::schema::SqlType::Variant
+                    )
+                {
+                    return Err(format!(
+                        "iceberg table column `{}` is variant; variant columns cannot appear in the partition spec. Use a non-variant source column for partition transforms.",
+                        column.name
+                    ));
+                }
+            }
 
             let target = crate::engine::backend_resolver::resolve_table_target(
                 state,

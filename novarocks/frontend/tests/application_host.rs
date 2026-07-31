@@ -229,7 +229,7 @@ async fn absent_state_store_builds_dml_service_with_disabled_journal() {
     assert!(
         error
             .to_string()
-            .contains("state store is required for Iceberg INSERT"),
+            .contains("state store is required for Iceberg DML"),
         "{error}"
     );
     host.shutdown().await.expect("shutdown");

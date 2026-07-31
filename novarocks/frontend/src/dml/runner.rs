@@ -18,8 +18,8 @@
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-    OperationFact, OperationState, WriteTransactionOutcome, WriteTransactionSpec,
+    CleanupAttempt, CommitOutcome, CommitServiceError, CreatePreparingRequest, OperationFact,
+    OperationState, WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::now_unix_millis;
 use crate::dml::reconcile;
@@ -31,11 +31,11 @@ use crate::dml::reconcile;
 pub enum CoordinatedWriteReport<H> {
     /// Writer aborted before commit; `has_staged` drives cleanup next-action.
     Aborted { reason: String, has_staged: bool },
-    /// Fileless writer output. Fast append may short-circuit; other commit
-    /// operations still pass the handle to `commit`.
-    NoOp(H),
-    /// Committable output; the handle is passed back to `commit`.
-    Committable(H),
+    /// The writer has no externally visible commit to perform.
+    NoOp,
+    /// The writer produced a commit input. The handle is passed to `commit`,
+    /// even when that input has no data files (for example, an overwrite).
+    CommitRequired(H),
 }
 
 /// Side-effecting dependencies of a write transaction. DML-1 ships only a fake;
@@ -147,9 +147,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     "iceberg write operation {operation_id} aborted before commit: {reason}"
                 )));
             }
-            CoordinatedWriteReport::NoOp(_)
-                if matches!(spec.commit_op_kind, CommitOpKind::FastAppend) =>
-            {
+            CoordinatedWriteReport::NoOp => {
                 self.journal
                     .transition(operation_id, OperationState::Aborting)?;
                 self.journal
@@ -159,8 +157,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                     committed_snapshot_id: None,
                 });
             }
-            CoordinatedWriteReport::NoOp(handle) => handle,
-            CoordinatedWriteReport::Committable(handle) => handle,
+            CoordinatedWriteReport::CommitRequired(handle) => handle,
         };
 
         self.journal
@@ -329,7 +326,7 @@ mod tests {
     impl Default for FakeExecutor {
         fn default() -> Self {
             Self {
-                write: Ok(CoordinatedWriteReport::Committable(())),
+                write: Ok(CoordinatedWriteReport::CommitRequired(())),
                 commit: Ok(CommitOutcome {
                     new_snapshot_id: 42,
                     written_manifest_paths: vec![],
@@ -472,7 +469,7 @@ mod tests {
     fn empty_fast_append_aborts_as_noop() {
         let journal = InMemoryOperationJournal::default();
         let executor = FakeExecutor {
-            write: Ok(CoordinatedWriteReport::NoOp(())),
+            write: Ok(CoordinatedWriteReport::NoOp),
             ..FakeExecutor::default()
         };
         let admit = AlwaysAdmit;
@@ -487,7 +484,7 @@ mod tests {
     fn fileless_overwrite_still_commits() {
         let journal = InMemoryOperationJournal::default();
         let executor = FakeExecutor {
-            write: Ok(CoordinatedWriteReport::NoOp(())),
+            write: Ok(CoordinatedWriteReport::CommitRequired(())),
             ..FakeExecutor::default()
         };
         let admit = AlwaysAdmit;
