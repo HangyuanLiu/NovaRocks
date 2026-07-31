@@ -1520,6 +1520,112 @@ operator_buffer_chunks = 1
 }
 
 #[test]
+fn cross_process_three_be_connector_catalog_mutation_is_visible_to_non_empty_reads() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let metadata_dir =
+        tempfile::tempdir_in(runtime_dir()).expect("create catalog mutation metadata directory");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_connector_reader_marker = true
+"#,
+        &metadata_config,
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create catalog mutation warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG mutation_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create catalog mutation Iceberg catalog");
+    conn.query_drop("CREATE DATABASE mutation_catalog.mutation_db")
+        .expect("create catalog mutation namespace");
+    conn.query_drop("CREATE DATABASE IF NOT EXISTS mutation_catalog.mutation_db")
+        .expect("namespace IF NOT EXISTS must be a provider NoOp");
+    conn.query_drop(
+        "CREATE TABLE mutation_catalog.mutation_db.data (id BIGINT, value STRING) \
+         TBLPROPERTIES ('format-version' = '3')",
+    )
+    .expect("create catalog mutation table");
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS mutation_catalog.mutation_db.data (id BIGINT, value STRING)",
+    )
+    .expect("table IF NOT EXISTS must be a provider NoOp");
+    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+        conn.query_drop(format!(
+            "INSERT INTO mutation_catalog.mutation_db.data \
+             SELECT generate_series, CAST(generate_series AS STRING) \
+             FROM TABLE(generate_series({range}))"
+        ))
+        .expect("write an independent Iceberg data file");
+    }
+    conn.query_drop("ALTER TABLE mutation_catalog.mutation_db.data ADD COLUMN category STRING DEFAULT 'catalog-mutation'")
+        .expect("apply schema mutation");
+    conn.query_drop(
+        "ALTER TABLE mutation_catalog.mutation_db.data ADD PARTITION COLUMN bucket(id, 16)",
+    )
+    .expect("apply partition-spec mutation");
+    conn.query_drop(
+        "ALTER TABLE mutation_catalog.mutation_db.data SET TBLPROPERTIES ('spi-4b' = 'enabled')",
+    )
+    .expect("apply properties mutation");
+    conn.query_drop("ALTER TABLE mutation_catalog.mutation_db.data CREATE BRANCH verify")
+        .expect("create Iceberg branch through mutation SPI");
+    conn.query_drop("ALTER TABLE mutation_catalog.mutation_db.data DROP BRANCH verify")
+        .expect("drop Iceberg branch through mutation SPI");
+
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+    let rows: Vec<Row> = conn
+        .query(
+            "SELECT count(*), min(id), max(id), min(category) \
+             FROM mutation_catalog.mutation_db.data",
+        )
+        .expect("read post-mutation Iceberg table through the distributed connector");
+    assert_eq!(rows.len(), 1, "aggregate must return one row");
+    let row = &rows[0];
+    assert_eq!(row.get::<Option<i64>, usize>(0).flatten(), Some(300_000));
+    assert_eq!(row.get::<Option<i64>, usize>(1).flatten(), Some(1));
+    assert_eq!(row.get::<Option<i64>, usize>(2).flatten(), Some(300_000));
+    assert_eq!(
+        row.get::<Option<String>, usize>(3).flatten().as_deref(),
+        Some("catalog-mutation")
+    );
+    let reader_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
+        Duration::from_secs(10),
+    );
+    for lines in &reader_output {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("NOVAROCKS_CONNECTOR_READ_SOURCE")),
+            "each BE must receive a real opaque Iceberg read source: {lines:?}"
+        );
+    }
+
+    conn.query_drop("DROP TABLE IF EXISTS mutation_catalog.mutation_db.data")
+        .expect("drop table through mutation SPI");
+    conn.query_drop("DROP DATABASE IF EXISTS mutation_catalog.mutation_db")
+        .expect("drop namespace through mutation SPI");
+}
+
+#[test]
 fn cross_process_three_be_connector_read_applies_deletion_vectors() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
