@@ -43,6 +43,174 @@ pub(crate) fn decode_field_type(
     })
 }
 
+/// Test-only native type encoder used to construct backend decoder fixtures.
+///
+/// Production type encoding remains frontend-owned; keeping this helper behind
+/// `cfg(test)` prevents the backend wire ingress from acquiring an encoder
+/// capability merely for fixture construction.
+#[cfg(test)]
+pub(crate) fn encode_type(desc: &DataType) -> Result<common::TypeDesc, String> {
+    encode_type_inner(desc, None)
+}
+
+#[cfg(test)]
+fn encode_type_inner(
+    data_type: &DataType,
+    field: Option<&Field>,
+) -> Result<common::TypeDesc, String> {
+    use common::type_desc::Kind;
+    use novarocks_types::logical::logical_type_of_field;
+
+    if let Some(logical_type) = field.and_then(logical_type_of_field) {
+        return Ok(scalar_desc(
+            logical_primitive(logical_type),
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let kind = match data_type {
+        DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
+            Kind::List(Box::new(common::ListType {
+                element: Some(Box::new(encode_type_inner(
+                    item.data_type(),
+                    Some(item.as_ref()),
+                )?)),
+            }))
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "MAP logical entries field must be Struct, got {:?}",
+                    entries.data_type()
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "MAP logical entries field must have exactly 2 children, got {}",
+                    fields.len()
+                ));
+            }
+            Kind::Map(Box::new(common::MapType {
+                key: Some(Box::new(encode_type_inner(
+                    fields[0].data_type(),
+                    Some(fields[0].as_ref()),
+                )?)),
+                value: Some(Box::new(encode_type_inner(
+                    fields[1].data_type(),
+                    Some(fields[1].as_ref()),
+                )?)),
+            }))
+        }
+        DataType::Struct(fields) => Kind::Strct(common::StructType {
+            fields: fields
+                .iter()
+                .map(|field| {
+                    Ok(common::StructField {
+                        name: field.name().to_string(),
+                        r#type: Some(encode_type_inner(field.data_type(), Some(field.as_ref()))?),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        }),
+        _ => return encode_scalar_type(data_type),
+    };
+    Ok(common::TypeDesc { kind: Some(kind) })
+}
+
+#[cfg(test)]
+fn encode_scalar_type(data_type: &DataType) -> Result<common::TypeDesc, String> {
+    use common::PrimitiveType;
+
+    let (primitive, precision, scale, time_unit) = match data_type {
+        DataType::Null => (PrimitiveType::NullType, None, None, None),
+        DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
+        DataType::Int8 => (PrimitiveType::Tinyint, None, None, None),
+        DataType::Int16 => (PrimitiveType::Smallint, None, None, None),
+        DataType::Int32 => (PrimitiveType::Int, None, None, None),
+        DataType::Int64 => (PrimitiveType::Bigint, None, None, None),
+        DataType::Float32 => (PrimitiveType::Float, None, None, None),
+        DataType::Float64 => (PrimitiveType::Double, None, None, None),
+        DataType::Decimal128(precision, scale) => {
+            validate_decimal(*precision, *scale, 38, "Decimal128")?;
+            (
+                PrimitiveType::Decimal128,
+                Some(i32::from(*precision)),
+                Some(i32::from(*scale)),
+                None,
+            )
+        }
+        DataType::Decimal256(precision, scale) => {
+            validate_decimal(*precision, *scale, 76, "Decimal256")?;
+            (
+                PrimitiveType::Decimal256,
+                Some(i32::from(*precision)),
+                Some(i32::from(*scale)),
+                None,
+            )
+        }
+        DataType::Date32 => (PrimitiveType::Date, None, None, None),
+        DataType::Timestamp(unit, _) => {
+            let time_unit = match unit {
+                TimeUnit::Microsecond => None,
+                TimeUnit::Nanosecond => Some(TIME_UNIT_NANOS),
+                other => {
+                    return Err(format!(
+                        "unsupported timestamp unit {other:?}; only Microsecond/Nanosecond supported"
+                    ));
+                }
+            };
+            (PrimitiveType::Datetime, None, None, time_unit)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None),
+        DataType::Time64(unit) => {
+            return Err(format!(
+                "unsupported Time64 unit {unit:?}; only Microsecond supported"
+            ));
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => (PrimitiveType::Varchar, None, None, None),
+        DataType::Binary => (PrimitiveType::Varbinary, None, None, None),
+        DataType::LargeBinary => (PrimitiveType::Variant, None, None, None),
+        DataType::FixedSizeBinary(16) => (PrimitiveType::Largeint, None, None, None),
+        other => {
+            return Err(format!(
+                "Arrow-to-native TypeDesc conversion does not support data type {other:?}"
+            ));
+        }
+    };
+    Ok(scalar_desc(primitive, precision, scale, time_unit))
+}
+
+#[cfg(test)]
+fn scalar_desc(
+    primitive: common::PrimitiveType,
+    precision: Option<i32>,
+    scale: Option<i32>,
+    time_unit: Option<i32>,
+) -> common::TypeDesc {
+    common::TypeDesc {
+        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+            r#type: primitive as i32,
+            len: None,
+            precision,
+            scale,
+            time_unit,
+        })),
+    }
+}
+
+#[cfg(test)]
+fn logical_primitive(logical_type: LogicalType) -> common::PrimitiveType {
+    match logical_type {
+        LogicalType::Json => common::PrimitiveType::Json,
+        LogicalType::Hll => common::PrimitiveType::Hll,
+        LogicalType::Bitmap => common::PrimitiveType::Bitmap,
+        LogicalType::Object => common::PrimitiveType::Object,
+        LogicalType::Percentile => common::PrimitiveType::Percentile,
+    }
+}
+
 fn decode_type_inner(desc: &common::TypeDesc) -> Result<DataType, String> {
     use common::type_desc::Kind;
 

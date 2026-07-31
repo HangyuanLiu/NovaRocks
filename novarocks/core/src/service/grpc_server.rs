@@ -40,7 +40,8 @@ use crate::novarocks_logging::{error, info};
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::lifecycle::{
-    QueryTerminalIngress, QueryTerminalReportOutcome, decode_query_terminal_snapshot,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportOutcome,
+    decode_query_terminal_snapshot,
 };
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(all(test, feature = "compat"))]
@@ -49,7 +50,7 @@ use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::service::grpc_query_lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
+    handle_stage_fragments, handle_start_prepared_query,
 };
 use crate::service::metrics_http;
 use crate::service::native_data_plane::NativeDataPlaneKernel;
@@ -64,6 +65,20 @@ pub use crate::proto;
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CANCEL_FRAGMENT_OK: i32 = 0;
 const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
+
+fn status_from_terminal_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
+    let detail = error.detail().to_string();
+    match error.code() {
+        QueryLifecycleErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),
+        QueryLifecycleErrorCode::Conflict => tonic::Status::already_exists(detail),
+        QueryLifecycleErrorCode::StaleBackend | QueryLifecycleErrorCode::Terminated => {
+            tonic::Status::failed_precondition(detail)
+        }
+        QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
+        QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
+        QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
+    }
+}
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -252,6 +267,7 @@ impl GrpcService {
             query_lifecycle_ingress: None,
             query_control_shutdown: None,
             report_handler,
+            terminal_ingress: None,
             data_plane: NativeDataPlaneKernel::query_scoped(),
         }
     }
@@ -265,6 +281,7 @@ impl GrpcService {
             query_lifecycle_ingress: None,
             query_control_shutdown: None,
             report_handler,
+            terminal_ingress: None,
             data_plane: NativeDataPlaneKernel::query_scoped(),
         }
     }
@@ -1000,7 +1017,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             if let Some(ingress) = self.query_lifecycle_ingress.as_ref() {
                 ingress
                     .bind_backend_identity(u64::from(req.assigned_be_id))
-                    .map_err(status_from_lifecycle_error)?;
+                    .map_err(status_from_terminal_lifecycle_error)?;
                 crate::runtime::backend_id::set_backend_id(i64::from(req.assigned_be_id));
             }
             let num_cores = std::thread::available_parallelism()
@@ -1156,14 +1173,14 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         let snapshot = request.into_inner().snapshot.ok_or_else(|| {
             tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
         })?;
-        let snapshot =
-            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let snapshot = decode_query_terminal_snapshot(&snapshot)
+            .map_err(status_from_terminal_lifecycle_error)?;
         let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
-            .map_err(status_from_lifecycle_error)?;
+            .map_err(status_from_terminal_lifecycle_error)?;
         let outcome = match ack.outcome() {
             QueryTerminalReportOutcome::Accepted => {
                 proto::novarocks::ReportQueryTerminalOutcome::Accepted
@@ -1583,6 +1600,7 @@ pub fn start_grpc_exchange_server(
 /// Starts a native fragment endpoint with an optional FE-owned terminal
 /// fallback ingress.  Backend-only and compat composition deliberately pass
 /// `None`, so their endpoint rejects `ReportQueryTerminal`.
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn start_grpc_exchange_server_with_terminal_ingress(
     host: &str,
     port: u16,

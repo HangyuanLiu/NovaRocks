@@ -118,6 +118,7 @@ mod tests {
                     ..Default::default()
                 })),
             }),
+            is_internal: false,
         }
     }
 
@@ -132,8 +133,11 @@ mod tests {
         let schema = contracts
             .get(&novarocks::exec::fragment::program::FragmentNodeId::new(7))
             .expect("exchange contract for node");
-        assert_eq!(schema.schema().slots().len(), 1);
-        assert_eq!(schema.schema().slots()[0].slot_id().get(), 3);
+        assert_eq!(schema.expected_schema().slots().len(), 1);
+        assert_eq!(
+            schema.expected_schema().slots()[0].slot_id(),
+            novarocks::common::ids::SlotId::new(3)
+        );
     }
 
     #[test]
@@ -145,6 +149,7 @@ mod tests {
                 name: "id".to_string(),
                 nullable: true,
                 r#type: None,
+                is_internal: false,
             }],
         );
 
