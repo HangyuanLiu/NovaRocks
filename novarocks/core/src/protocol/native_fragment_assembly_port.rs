@@ -95,6 +95,20 @@ pub trait NativeFragmentSinkAssignmentDecoder: Send + Sync {
     ) -> Result<FragmentSinkAssignment, ProtocolError>;
 }
 
+/// Backend-owned envelope decoder invoked at the original fragment root and
+/// sink presence-validation points.
+pub trait NativeFragmentEnvelopeDecoder: Send + Sync {
+    fn require_root<'a>(
+        &self,
+        fragment: &'a plan::PlanFragment,
+    ) -> Result<&'a plan::DistributedNode, ProtocolError>;
+
+    fn require_sink<'a>(
+        &self,
+        fragment: &'a plan::PlanFragment,
+    ) -> Result<&'a plan::DataSink, ProtocolError>;
+}
+
 /// Backend-owned runtime-filter contract decoder invoked after plan assembly
 /// has consumed the binding table.
 pub trait NativeRuntimeFilterContractDecoder: Send + Sync {
@@ -140,6 +154,7 @@ pub fn assemble_fragment_submission_for_backend(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
     sink_assignment_params: &novarocks::InstanceParams,
+    envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
@@ -151,6 +166,7 @@ pub fn assemble_fragment_submission_for_backend(
         fragment,
         instance,
         sink_assignment_params,
+        envelope_decoder,
         sink_assignment_decoder,
         scan_source_contract_decoder,
         exchange_contract_decoder,

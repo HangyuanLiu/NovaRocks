@@ -30,7 +30,7 @@ use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
-    NativeExchangeContractDecoder, NativeFragmentInstanceInput,
+    NativeExchangeContractDecoder, NativeFragmentEnvelopeDecoder, NativeFragmentInstanceInput,
     NativeFragmentSinkAssignmentDecoder, NativeRuntimeFilterContractDecoder,
     NativeScanSourceContractDecoder,
 };
@@ -94,6 +94,22 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         instance_parts,
         connectors,
         execution_resolver,
+        |fragment| {
+            fragment.root.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    FieldPath::root("plan_fragment").field("root"),
+                    "native PlanFragment requires root",
+                )
+            })
+        },
+        |fragment| {
+            fragment.sink.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    FieldPath::root("plan_fragment").field("sink"),
+                    "native PlanFragment requires sink",
+                )
+            })
+        },
         |sink| decode_fragment_sink_assignment(sink, instance_params),
         |root, path| decode_scan_source_contracts(root, path),
         |root, path| decode_exchange_contracts(root, path),
@@ -105,6 +121,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     fragment: &plan::PlanFragment,
     instance_parts: NativeFragmentInstanceInput,
     instance_params: &novarocks::InstanceParams,
+    envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
@@ -117,6 +134,16 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
         instance_parts,
         connectors,
         execution_resolver,
+        |fragment| {
+            envelope_decoder
+                .require_root(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        |fragment| {
+            envelope_decoder
+                .require_sink(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
         |sink| {
             sink_assignment_decoder
                 .decode_sink_assignment(sink, instance_params)
@@ -145,6 +172,10 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
     instance_parts: NativeFragmentInstanceInput,
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    require_root: impl FnOnce(
+        &plan::PlanFragment,
+    ) -> Result<&plan::DistributedNode, NativeFragmentDecodeError>,
+    require_sink: impl FnOnce(&plan::PlanFragment) -> Result<&plan::DataSink, NativeFragmentDecodeError>,
     decode_sink_assignment: F,
     decode_scan_source_contracts: impl FnOnce(
         &plan::DistributedNode,
@@ -176,14 +207,10 @@ where
     >,
 {
     let root_path = FieldPath::root("plan_fragment").field("root");
-    let root = fragment.root.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(root_path.clone(), "native PlanFragment requires root")
-    })?;
+    let root = require_root(fragment)?;
     validate_node_required_fields(root, root_path.clone())?;
     let sink_path = FieldPath::root("plan_fragment").field("sink");
-    let sink = fragment.sink.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(sink_path.clone(), "native PlanFragment requires sink")
-    })?;
+    let sink = require_sink(fragment)?;
     if sink.kind.is_none() {
         return Err(NativeFragmentDecodeError::missing(
             sink_path.clone().field("kind"),

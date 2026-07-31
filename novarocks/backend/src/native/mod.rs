@@ -24,6 +24,7 @@
 pub(crate) mod codec;
 pub(crate) mod connector_binding;
 pub(crate) mod decode;
+pub(crate) mod envelope;
 pub(crate) mod exchange;
 pub(crate) mod ingress;
 pub(crate) mod instance;
