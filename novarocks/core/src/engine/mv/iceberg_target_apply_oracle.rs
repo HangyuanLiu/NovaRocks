@@ -1009,6 +1009,7 @@ fn build_locator_visible_target_table_def(
         None => Vec::new(),
     };
     let files = filter_locator_data_files_by_partition(target_table, files, partition_filter)?;
+    register_framework_locator_control_fixture(state, target_catalog_name, &files)?;
     let loaded =
         framework_locator_loaded_table(target_table, entry.object_store_config().cloned())?;
     let table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
@@ -1020,6 +1021,27 @@ fn build_locator_visible_target_table_def(
         files,
     )?;
     expose_physical_apply_key_for_locator_registration(table_def, target_table, apply_key_column)
+}
+
+#[cfg(test)]
+fn register_framework_locator_control_fixture(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    catalog: &str,
+    files: &[crate::connector::iceberg::catalog::registry::DataFileWithStats],
+) -> Result<(), String> {
+    let planned_files = files
+        .iter()
+        .cloned()
+        .map(
+            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+        )
+        .collect();
+    crate::connector::iceberg::provider::register_planned_table_files_control_fixture(
+        state.connector_control.as_ref(),
+        catalog,
+        std::collections::HashMap::from([("*".to_string(), planned_files)]),
+    )
+    .map_err(|error| format!("register framework locator connector control fixture: {error}"))
 }
 
 #[cfg(test)]
@@ -2704,6 +2726,8 @@ mod tests {
             )
             .expect("extract target data files");
         assert_eq!(data_files.len(), 2, "expected one data file per partition");
+        register_framework_locator_control_fixture(&state, "ice", &data_files)
+            .expect("register framework locator connector control fixture");
 
         let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
             "ice",

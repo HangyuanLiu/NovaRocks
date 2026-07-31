@@ -20787,8 +20787,6 @@ mod tests {
     #[test]
     fn cancelled_refresh_plan_does_not_run_recovery_mutations() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
-        crate::engine::register_iceberg_control_binding(&env.state, "ice")
-            .expect("register Iceberg connector instance");
         create_base_table(&env.state, "ice", "sales", "orders");
         create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
         let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
@@ -26096,6 +26094,8 @@ mod tests {
                 .create_catalog("ice", &catalog_props)
                 .expect("create iceberg catalog");
         }
+        crate::engine::register_iceberg_control_binding(&state, "ice")
+            .expect("register iceberg connector control");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -26163,6 +26163,8 @@ mod tests {
                 .create_catalog("ice", &catalog_props)
                 .expect("create iceberg catalog");
         }
+        crate::engine::register_iceberg_control_binding(&state, "ice")
+            .expect("register iceberg connector control");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let staging_branch = "__nova_cleanup_failure";

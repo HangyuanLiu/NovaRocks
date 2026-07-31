@@ -168,17 +168,15 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
             )
             .expect("create iceberg catalog");
     }
-    {
-        let connectors = state.connectors.read().expect("connector registry");
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                catalog,
-                Arc::new(crate::connector::FixtureControlResolver::new(
-                    connectors.clone(),
-                )),
-            ));
-    }
+    crate::engine::register_iceberg_control_binding(&state, catalog)
+        .expect("register iceberg connector control");
+    state
+        .catalog_service
+        .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+            catalog,
+            Arc::clone(&state.connector_control)
+                as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+        ));
     MaintenanceTestEnv {
         state,
         maintenance_service,
