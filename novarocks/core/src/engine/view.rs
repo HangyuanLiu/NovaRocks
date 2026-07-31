@@ -29,11 +29,18 @@ use crate::engine::StandaloneState;
 use crate::runtime::query_result::QueryResult;
 /// Shared StarRocks SQL parser contract for view DDL, storage, and rewrite.
 pub use crate::sql::parser::dialect::StarRocksDialect as ViewSqlDialect;
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRequestContext,
+    ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity, CreateOrReplacePolicy,
+    DropPolicy,
+};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
     pub current_catalog: Option<&'a str>,
     pub current_database: &'a str,
+    /// Query-owned context used by connector reads and external view mutations.
+    pub connector_context: Option<&'a ConnectorRequestContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +70,7 @@ pub struct CreateExternalViewRequest {
     pub sql: String,
     pub comment: Option<String>,
     pub or_replace: bool,
+    pub if_not_exists: bool,
     pub properties: Vec<(String, String)>,
 }
 
@@ -97,10 +105,27 @@ pub trait ViewService: Send + Sync {
 pub trait ViewEngine: Send + Sync {
     fn validate_iceberg_catalog(&self, catalog: &str) -> Result<(), String>;
     fn is_rest_iceberg_catalog(&self, catalog: &str) -> bool;
-    fn table_exists(&self, target: &ViewTarget) -> Result<bool, String>;
-    fn view_exists(&self, target: &ViewTarget) -> Result<bool, String>;
-    fn create_external_view(&self, request: CreateExternalViewRequest) -> Result<(), String>;
-    fn drop_external_view(&self, target: &ViewTarget) -> Result<(), String>;
+    fn table_exists(
+        &self,
+        target: &ViewTarget,
+        context: &ConnectorRequestContext,
+    ) -> Result<bool, String>;
+    fn view_exists(
+        &self,
+        target: &ViewTarget,
+        context: &ConnectorRequestContext,
+    ) -> Result<bool, String>;
+    fn create_external_view(
+        &self,
+        request: CreateExternalViewRequest,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String>;
+    fn drop_external_view(
+        &self,
+        target: &ViewTarget,
+        context: &ConnectorRequestContext,
+        policy: DropPolicy,
+    ) -> Result<(), String>;
     fn load_external_view(
         &self,
         target: &ViewTarget,
@@ -111,6 +136,7 @@ pub trait ViewEngine: Send + Sync {
         catalog: &str,
         database: &str,
         query: &sqlparser::ast::Query,
+        context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String>;
 }
 
@@ -168,20 +194,25 @@ impl ViewEngine for StandaloneState {
             .is_ok_and(|entry| entry.rest_uri.is_some())
     }
 
-    fn table_exists(&self, target: &ViewTarget) -> Result<bool, String> {
+    fn table_exists(
+        &self,
+        target: &ViewTarget,
+        context: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
         crate::connector::metadata_table_exists(
             self.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            context.clone(),
             &target.catalog,
             &target.database,
             &target.view,
         )
     }
 
-    fn view_exists(&self, target: &ViewTarget) -> Result<bool, String> {
+    fn view_exists(
+        &self,
+        target: &ViewTarget,
+        _context: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
         let registry = self
             .iceberg_catalogs
             .read()
@@ -193,42 +224,82 @@ impl ViewEngine for StandaloneState {
         )
     }
 
-    fn create_external_view(&self, request: CreateExternalViewRequest) -> Result<(), String> {
+    fn create_external_view(
+        &self,
+        request: CreateExternalViewRequest,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
         let columns = request
             .columns
             .into_iter()
             .map(|column| {
-                Ok(crate::sql::parser::ast::TableColumnDef {
+                let column = crate::sql::parser::ast::TableColumnDef {
                     name: column.name,
                     data_type: crate::sql::parser::dialect::convert_sql_type(column.data_type)?,
                     nullable: column.nullable,
                     aggregation: None,
                     default: None,
-                })
+                };
+                crate::engine::statement::connector_column(&column)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        self.connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .create_view(crate::connector::backend::CreateViewRequest {
-                catalog: request.target.catalog,
-                namespace: request.target.database,
-                view: request.target.view,
+        let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.connector_control.as_ref(),
+            &instance_id,
+            ConnectorCatalogMutationOperation::CreateView {
+                view: ConnectorViewIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(request.target.database),
+                    view: Arc::from(request.target.view),
+                },
                 columns,
-                view_sql: request.sql,
-                comment: request.comment,
-                or_replace: request.or_replace,
-                properties: request.properties,
-            })
+                definition: ConnectorViewDefinition {
+                    dialect: ConnectorViewDialect::StarRocks,
+                    sql: Arc::from(request.sql),
+                },
+                comment: request.comment.map(Arc::from),
+                properties: request
+                    .properties
+                    .into_iter()
+                    .map(|(key, value)| (Arc::from(key), Arc::from(value)))
+                    .collect(),
+                policy: if request.or_replace {
+                    CreateOrReplacePolicy::ReplaceIfExists
+                } else if request.if_not_exists {
+                    CreateOrReplacePolicy::NoOpIfExists
+                } else {
+                    CreateOrReplacePolicy::FailIfExists
+                },
+            },
+            context.clone(),
+        )
+        .map(|_| ())
     }
 
-    fn drop_external_view(&self, target: &ViewTarget) -> Result<(), String> {
-        self.connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend("iceberg")?
-            .drop_view(&target.catalog, &target.database, &target.view)
+    fn drop_external_view(
+        &self,
+        target: &ViewTarget,
+        context: &ConnectorRequestContext,
+        policy: DropPolicy,
+    ) -> Result<(), String> {
+        let instance_id =
+            ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.connector_control.as_ref(),
+            &instance_id,
+            ConnectorCatalogMutationOperation::DropView {
+                view: ConnectorViewIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.database.as_str()),
+                    view: Arc::from(target.view.as_str()),
+                },
+                policy,
+            },
+            context.clone(),
+        )
+        .map(|_| ())
     }
 
     fn load_external_view(
@@ -271,6 +342,7 @@ impl ViewEngine for StandaloneState {
         catalog: &str,
         database: &str,
         query: &sqlparser::ast::Query,
+        context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         let catalog_service_snapshot = crate::sql::catalog::StandaloneCatalogService::new(
             Arc::new(RwLock::new(self.catalog_service.local_snapshot())),
@@ -285,10 +357,7 @@ impl ViewEngine for StandaloneState {
             Some(catalog),
             &catalog_service_snapshot,
             self.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            context.clone(),
             crate::sql::catalog::TableLookupMode::SchemaOnly,
         );
         let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, database)
@@ -395,19 +464,36 @@ mod tests {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn table_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+        fn table_exists(
+            &self,
+            _target: &ViewTarget,
+            _context: &ConnectorRequestContext,
+        ) -> Result<bool, String> {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn view_exists(&self, _target: &ViewTarget) -> Result<bool, String> {
+        fn view_exists(
+            &self,
+            _target: &ViewTarget,
+            _context: &ConnectorRequestContext,
+        ) -> Result<bool, String> {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn create_external_view(&self, _request: CreateExternalViewRequest) -> Result<(), String> {
+        fn create_external_view(
+            &self,
+            _request: CreateExternalViewRequest,
+            _context: &ConnectorRequestContext,
+        ) -> Result<(), String> {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn drop_external_view(&self, _target: &ViewTarget) -> Result<(), String> {
+        fn drop_external_view(
+            &self,
+            _target: &ViewTarget,
+            _context: &ConnectorRequestContext,
+            _policy: DropPolicy,
+        ) -> Result<(), String> {
             unreachable!("empty view service must not access the engine")
         }
 
@@ -431,6 +517,7 @@ mod tests {
             _catalog: &str,
             _database: &str,
             _query: &sqlast::Query,
+            _context: &ConnectorRequestContext,
         ) -> Result<Vec<ViewColumnDefinition>, String> {
             unreachable!("empty view service must not access the engine")
         }
@@ -451,6 +538,7 @@ mod tests {
         let ctx = ViewRequestContext {
             current_catalog: None,
             current_database: "db",
+            connector_context: None,
         };
         assert!(
             service

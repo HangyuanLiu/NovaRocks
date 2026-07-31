@@ -387,16 +387,45 @@ impl MvEngine for StandaloneMvEngine {
         _operation_id: uuid::Uuid,
     ) -> Result<CreatedMvTarget, MvEngineError> {
         let prepared = self.preparation(plan)?;
-        crate::connector::iceberg::catalog::registry::create_table(
-            &prepared.entry,
-            &prepared.target.namespace,
-            &prepared.target.table,
-            &prepared.columns,
-            None,
-            &prepared.partition_fields,
-            &prepared.target_properties,
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
+                .map_err(|error| engine_target_error(error.to_string()))?;
+        let created = crate::connector::mutation::execute_catalog_mutation(
+            self.state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(prepared.target.namespace.as_str()),
+                    table: Arc::from(prepared.target.table.as_str()),
+                },
+                columns: prepared
+                    .columns
+                    .iter()
+                    .map(crate::engine::statement::connector_column)
+                    .collect::<Result<_, _>>()
+                    .map_err(engine_target_error)?,
+                key: None,
+                partitioning: prepared
+                    .partition_fields
+                    .iter()
+                    .map(crate::engine::statement::connector_partition_transform)
+                    .collect(),
+                properties: prepared
+                    .target_properties
+                    .iter()
+                    .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                    .collect(),
+                policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
+            },
+            self.connector_context.clone(),
         )
         .map_err(engine_target_error)?;
+        if created.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
+            return Err(engine_target_error(
+                "materialized view target create unexpectedly returned NoOp".to_string(),
+            ));
+        }
         prepared
             .entry
             .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
@@ -503,10 +532,23 @@ impl MvEngine for StandaloneMvEngine {
 
     fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
         let prepared = self.preparation_for_target(&target.target)?;
-        crate::connector::iceberg::catalog::registry::drop_table(
-            &prepared.entry,
-            &prepared.target.namespace,
-            &prepared.target.table,
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
+                .map_err(|error| engine_target_error(error.to_string()))?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(prepared.target.namespace.as_str()),
+                    table: Arc::from(prepared.target.table.as_str()),
+                },
+                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                data_disposition:
+                    novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+            },
+            self.connector_context.clone(),
         )
         .map_err(engine_target_error)?;
         self.preparations
@@ -3263,7 +3305,25 @@ pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Resu
         .list_unfinished_branch_staged_iceberg_refreshes()
         .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
     for refresh in unfinished {
-        recover_one_iceberg_mv_refresh(state, refresh)?;
+        recover_one_iceberg_mv_refresh(state, refresh, None)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_iceberg_mv_refreshes_with_connector_context(
+    state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    crate::connector::validate_request_context(connector_context)?;
+    if !state.mv_repository.availability().is_available() {
+        return Ok(());
+    }
+    let unfinished = state
+        .mv_repository
+        .list_unfinished_branch_staged_iceberg_refreshes()
+        .map_err(|e| format!("load unfinished iceberg MV refreshes failed: {e}"))?;
+    for refresh in unfinished {
+        recover_one_iceberg_mv_refresh(state, refresh, Some(connector_context))?;
     }
     Ok(())
 }
@@ -3271,6 +3331,7 @@ pub(crate) fn recover_iceberg_mv_refreshes(state: &Arc<StandaloneState>) -> Resu
 fn recover_one_iceberg_mv_refresh(
     state: &Arc<StandaloneState>,
     refresh: StoredMvRefresh,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     let target =
         IcebergMvTarget {
@@ -3286,7 +3347,15 @@ fn recover_one_iceberg_mv_refresh(
                 .ok_or_else(|| format!("mv refresh {} missing target table", refresh.refresh_id))?,
         };
     let (entry, catalog, loaded) = load_iceberg_mv_target(state, &target)?;
-    reconcile_iceberg_mv_refresh(state, refresh, &target, &entry, &catalog, &loaded.table)
+    reconcile_iceberg_mv_refresh(
+        state,
+        refresh,
+        &target,
+        &entry,
+        &catalog,
+        &loaded.table,
+        connector_context,
+    )
 }
 
 pub(crate) fn resolve_refresh_target(
@@ -3443,7 +3512,7 @@ pub(crate) fn repartition_iceberg_mv_with_connector_context(
         );
     };
     let _refresh_guard = acquire_mv_refresh_lock()?;
-    recover_iceberg_mv_refreshes(state)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let mv_definition = load_iceberg_mv_definition_by_target(state, &target)?;
@@ -5652,7 +5721,8 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
 
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
-    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
+        .map_err(RefreshError::pre_commit)?;
     let mv_definition =
         load_iceberg_mv_definition_by_target(state, &iceberg_target).map_err(RefreshError::user)?;
     let (_, _, target_loaded) =
@@ -7116,7 +7186,8 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
     let _refresh_guard = acquire_mv_refresh_lock().map_err(RefreshError::pre_commit)?;
     // Recovery may complete or roll back historical attempts before validating
     // this plan. The no-write guarantee below applies to the current attempt.
-    recover_iceberg_mv_refreshes(state).map_err(RefreshError::pre_commit)?;
+    recover_iceberg_mv_refreshes_with_connector_context(state, connector_context)
+        .map_err(RefreshError::pre_commit)?;
 
     let payload_target = resolve_refresh_target(
         plan.current_catalog.as_deref(),
@@ -8078,6 +8149,7 @@ fn reconcile_iceberg_mv_refresh(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     _catalog: &Arc<dyn iceberg::Catalog>,
     table: &iceberg::table::Table,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     if matches!(
         refresh.state,
@@ -8110,6 +8182,7 @@ fn reconcile_iceberg_mv_refresh(
                         entry,
                         staging_branch,
                         staging_snapshot_id,
+                        connector_context,
                     )
                 }
                 Ok(StagingDisposition::Diverged) => rollback_iceberg_mv_staging_branch(
@@ -8120,6 +8193,7 @@ fn reconcile_iceberg_mv_refresh(
                     table,
                     staging_branch,
                     staging_snapshot_id,
+                    connector_context,
                 ),
                 // The classifier's only `Err` is the sole-writer violation:
                 // `main` is on the staged snapshot id but its refresh marker
@@ -8149,6 +8223,7 @@ fn converge_published_iceberg_mv_staging_branch(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     staging_branch: &str,
     staging_snapshot_id: i64,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     // The publish landing is a lake fact (the classifier proved the staged
     // snapshot is on `main`'s lineage). The ledger row is only a derived cache
@@ -8160,7 +8235,17 @@ fn converge_published_iceberg_mv_staging_branch(
     if refresh.state == MvRefreshState::StagingCommitted {
         record_iceberg_mv_publish_commit(state, refresh.refresh_id, staging_snapshot_id)?;
     }
-    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    if let Some(connector_context) = connector_context {
+        drop_iceberg_mv_staging_branch_with_connector_context(
+            state,
+            target,
+            entry,
+            staging_branch,
+            connector_context,
+        )?;
+    } else {
+        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    }
     finalize_recovered_iceberg_mv_refresh(state, refresh)
 }
 
@@ -8181,6 +8266,7 @@ fn rollback_iceberg_mv_staging_branch(
     table: &iceberg::table::Table,
     staging_branch: &str,
     staging_snapshot_id: i64,
+    connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<(), String> {
     // The staged snapshot's parent is the pre-repartition `main` snapshot; its
     // data manifests witness the old default partition spec id.
@@ -8196,7 +8282,17 @@ fn rollback_iceberg_mv_staging_branch(
         table,
         reference_snapshot_id,
     )?;
-    drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    if let Some(connector_context) = connector_context {
+        drop_iceberg_mv_staging_branch_with_connector_context(
+            state,
+            target,
+            entry,
+            staging_branch,
+            connector_context,
+        )?;
+    } else {
+        drop_iceberg_mv_staging_branch(state, target, entry, staging_branch)?;
+    }
     mark_iceberg_mv_refresh_aborted(state, refresh.refresh_id)
 }
 
@@ -9205,6 +9301,36 @@ fn drop_iceberg_mv_staging_branch(
     .map(|_| ())?;
     register_iceberg_mv_target_in_catalog(state, target)?;
     Ok(())
+}
+
+fn drop_iceberg_mv_staging_branch_with_connector_context(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    staging_branch: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterRef {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            action: novarocks_spi::connector::ConnectorRefAction::Drop {
+                kind: novarocks_spi::connector::ConnectorRefKind::Branch,
+                name: Arc::from(staging_branch),
+                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+            },
+        },
+        connector_context.clone(),
+    )?;
+    target_entry.invalidate_table_cache(&target.namespace, &target.table);
+    register_iceberg_mv_target_in_catalog(state, target)
 }
 
 fn prepare_first_refresh_chunks_or_abort<F>(
@@ -14785,29 +14911,51 @@ pub(crate) async fn write_chunks_as_iceberg_data_files(
     write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
 
+#[cfg(test)]
 pub(crate) fn drop_iceberg_mv(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
+    drop_iceberg_mv_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        stmt,
+        &crate::connector::test_request_context(),
+    )
+}
+
+pub(crate) fn drop_iceberg_mv_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &DropMaterializedViewStmt,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    crate::connector::validate_request_context(connector_context)?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
     let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
     if !preflight_iceberg_mv_drop(state, &target, stmt.if_exists)? {
         return Ok(StatementResult::Ok);
     }
 
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&target.catalog)?
-    };
-    crate::connector::iceberg::catalog::registry::drop_table(
-        &entry,
-        &target.namespace,
-        &target.table,
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::mutation::execute_catalog_mutation(
+        state.connector_control.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+            table: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: Arc::from(target.namespace.as_str()),
+                table: Arc::from(target.table.as_str()),
+            },
+            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+            data_disposition: novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+        },
+        connector_context.clone(),
     )?;
     drop_iceberg_mv_metadata(state, &target)?;
     crate::engine::query_prep::drop_local_table_registration_if_exists(
@@ -17774,17 +17922,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        {
-            let connectors = state.connectors.read().expect("connector registry");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    catalog,
-                    Arc::new(crate::connector::FixtureControlResolver::new(
-                        connectors.clone(),
-                    )),
-                ));
-        }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
+        crate::engine::register_iceberg_control_binding(&state, catalog)
+            .expect("register Iceberg connector control binding");
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                catalog,
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+            ));
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -17839,6 +17986,28 @@ mod tests {
         stmt
     }
 
+    fn create_test_iceberg_namespace(state: &Arc<StandaloneState>, catalog: &str, namespace: &str) {
+        let entry = state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get(catalog)
+            .expect("catalog");
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, namespace)
+            .expect("create test namespace");
+    }
+
+    fn initialize_iceberg_mv_test_namespaces(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        current_db: &str,
+    ) {
+        create_test_iceberg_namespace(state, catalog, current_db);
+        if !current_db.eq_ignore_ascii_case("sales") {
+            create_test_iceberg_namespace(state, catalog, "sales");
+        }
+    }
+
     fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
         let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
             .expect("install all-in-one loopback backend");
@@ -17871,17 +18040,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        {
-            let connectors = state.connectors.read().expect("connector registry");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    catalog,
-                    Arc::new(crate::connector::FixtureControlResolver::new(
-                        connectors.clone(),
-                    )),
-                ));
-        }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
+        crate::engine::register_iceberg_control_binding(&state, catalog)
+            .expect("register Iceberg connector control binding");
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                catalog,
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+            ));
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -17921,17 +18089,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        {
-            let connectors = state.connectors.read().expect("connector registry");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    catalog,
-                    Arc::new(crate::connector::FixtureControlResolver::new(
-                        connectors.clone(),
-                    )),
-                ));
-        }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
+        crate::engine::register_iceberg_control_binding(&state, catalog)
+            .expect("register Iceberg connector control binding");
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                catalog,
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+            ));
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -17976,17 +18143,16 @@ mod tests {
                 )
                 .expect("create iceberg catalog");
         }
-        {
-            let connectors = state.connectors.read().expect("connector registry");
-            state
-                .catalog_service
-                .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                    catalog,
-                    Arc::new(crate::connector::FixtureControlResolver::new(
-                        connectors.clone(),
-                    )),
-                ));
-        }
+        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
+        crate::engine::register_iceberg_control_binding(&state, catalog)
+            .expect("register Iceberg connector control binding");
+        state
+            .catalog_service
+            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+                catalog,
+                Arc::clone(&state.connector_control)
+                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
+            ));
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -19193,7 +19359,7 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_catalog_backend_reads_mv_table_directly_without_alias() {
+    fn iceberg_mv_reader_loads_target_table_without_alias() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
@@ -25543,7 +25709,11 @@ mod tests {
             )
         };
 
-        recover_iceberg_mv_refreshes(&env.state).expect("recover");
+        recover_iceberg_mv_refreshes_with_connector_context(
+            &env.state,
+            &crate::connector::test_request_context(),
+        )
+        .expect("recover");
 
         let provider = env.state.metadata_provider.as_ref().expect("provider");
         let read = provider.begin_read().expect("read");

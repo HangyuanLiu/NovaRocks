@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CatalogBackend` / `TableSink` implementations for Iceberg, wrapping the
-//! free functions in `registry.rs`.
+//! Iceberg table-sink implementation and table-definition helpers.
 
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 
-use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, TableSink,
-};
+use crate::connector::backend::{ResolvedTable, TableSink};
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
@@ -35,102 +32,12 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
 use super::registry::{
-    IcebergCatalogEntry, IcebergCatalogRegistry, create_namespace as reg_create_namespace,
-    create_table as reg_create_table, drop_namespace as reg_drop_namespace,
-    drop_table as reg_drop_table, insert_rows as reg_insert_rows, list_tables as reg_list_tables,
+    IcebergCatalogEntry, IcebergCatalogRegistry, insert_rows as reg_insert_rows,
     load_table as reg_load_table,
 };
-use super::views;
 
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
 pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
-
-pub(crate) struct IcebergCatalogBackend {
-    registry: Arc<RwLock<IcebergCatalogRegistry>>,
-}
-
-impl IcebergCatalogBackend {
-    pub(crate) fn new(registry: Arc<RwLock<IcebergCatalogRegistry>>) -> Self {
-        Self { registry }
-    }
-
-    fn entry(&self, catalog: &str) -> Result<IcebergCatalogEntry, String> {
-        let guard = self.registry.read().expect("iceberg catalog read lock");
-        guard.get(catalog)
-    }
-}
-
-impl CatalogBackend for IcebergCatalogBackend {
-    fn name(&self) -> &'static str {
-        "iceberg"
-    }
-
-    fn create_namespace(&self, catalog: &str, namespace: &str) -> Result<(), String> {
-        reg_create_namespace(&self.entry(catalog)?, namespace)
-    }
-
-    fn drop_namespace(&self, catalog: &str, namespace: &str, force: bool) -> Result<(), String> {
-        let entry = self.entry(catalog)?;
-        if force {
-            for table in reg_list_tables(&entry, namespace)? {
-                reg_drop_table(&entry, namespace, &table)?;
-            }
-        }
-        reg_drop_namespace(&entry, namespace)
-    }
-
-    fn create_table(&self, req: CreateTableRequest) -> Result<(), String> {
-        let entry = self.entry(&req.catalog)?;
-        reg_create_table(
-            &entry,
-            &req.namespace,
-            &req.table,
-            &req.columns,
-            req.key_desc.as_ref(),
-            &req.partition_fields,
-            &req.properties,
-        )
-    }
-
-    fn alter_iceberg_partition_spec(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
-    ) -> Result<(), String> {
-        let entry = self.entry(catalog)?;
-        super::registry::alter_partition_spec(&entry, namespace, table, stmt)
-    }
-
-    fn drop_table(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        _if_exists: bool,
-    ) -> Result<(), String> {
-        reg_drop_table(&self.entry(catalog)?, namespace, table)
-    }
-
-    fn create_view(&self, req: CreateViewRequest) -> Result<(), String> {
-        let entry = self.entry(&req.catalog)?;
-        views::create_view(
-            &entry,
-            &req.namespace,
-            &req.view,
-            &req.columns,
-            &req.view_sql,
-            req.comment.as_deref(),
-            req.or_replace,
-            &req.properties,
-        )
-    }
-
-    fn drop_view(&self, catalog: &str, namespace: &str, view: &str) -> Result<(), String> {
-        views::drop_view(&self.entry(catalog)?, namespace, view)
-    }
-}
 
 pub(crate) fn iceberg_table_stats_provider(
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
@@ -1018,28 +925,29 @@ mod tests {
                 )
                 .expect("create catalog");
         }
-        let backend = IcebergCatalogBackend::new(Arc::clone(&registry));
-        backend
-            .create_namespace("ice", "db")
+        let entry = registry
+            .read()
+            .expect("registry")
+            .get("ice")
+            .expect("entry");
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "db")
             .expect("create namespace");
-        backend
-            .create_table(CreateTableRequest {
-                catalog: "ice".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                columns: vec![TableColumnDef {
-                    name: "id".to_string(),
-                    data_type: SqlType::BigInt,
-                    nullable: false,
-                    aggregation: None,
-                    default: None,
-                }],
-                key_desc: None,
-                bucket_count: None,
-                partition_fields: vec![],
-                properties: vec![],
-            })
-            .expect("create table");
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            "db",
+            "t",
+            &[TableColumnDef {
+                name: "id".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[],
+        )
+        .expect("create table");
 
         let entry = registry
             .read()
@@ -1160,31 +1068,32 @@ mod tests {
                 )
                 .expect("create catalog");
         }
-        let backend = IcebergCatalogBackend::new(registry.clone());
-        backend
-            .create_namespace("ice", "db")
+        let entry = registry
+            .read()
+            .expect("registry")
+            .get("ice")
+            .expect("entry");
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, "db")
             .expect("create namespace");
-        backend
-            .create_table(CreateTableRequest {
-                catalog: "ice".to_string(),
-                namespace: "db".to_string(),
-                table: "t".to_string(),
-                columns: vec![TableColumnDef {
-                    name: "id".to_string(),
-                    data_type: SqlType::BigInt,
-                    nullable: false,
-                    aggregation: None,
-                    default: None,
-                }],
-                key_desc: None,
-                bucket_count: None,
-                partition_fields: vec![],
-                properties: vec![
-                    ("format-version".to_string(), "3".to_string()),
-                    ("write.row-lineage".to_string(), "true".to_string()),
-                ],
-            })
-            .expect("create v3 row-lineage table");
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            "db",
+            "t",
+            &[TableColumnDef {
+                name: "id".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            None,
+            &[],
+            &[
+                ("format-version".to_string(), "3".to_string()),
+                ("write.row-lineage".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("create v3 row-lineage table");
 
         let entry = registry
             .read()

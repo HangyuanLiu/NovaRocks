@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorCancellation,
-    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorNamespaceIdentity, ConnectorOpenReaderRequest,
-    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationRequest, ConnectorColumnDefinition,
+    ConnectorDataType, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionInstaller, ConnectorInstanceId, ConnectorListTablesRequest,
+    ConnectorNamespaceIdentity, ConnectorOpenReaderRequest, ConnectorReadSelector,
+    ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution, CreatePolicy, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -133,6 +136,73 @@ fn iceberg_distribution_installs_a_metadata_free_read_only_instance() {
         execution.provider_id(),
         &declaration.descriptor().provider_id
     );
+}
+
+#[test]
+fn iceberg_control_mutation_honors_create_policy_without_implicit_namespace_creation() {
+    let (registry, _warehouse) = registry_with_table();
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let control = IcebergControlProvider::new_control(instance_id.clone(), registry)
+        .expect("Iceberg control binding");
+    let mutation = control.mutation().expect("mutation capability");
+    let target = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: control.incarnation(),
+    };
+    let namespace = ConnectorNamespaceIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from("db"),
+    };
+
+    let no_op = mutation
+        .execute(ConnectorCatalogMutationRequest {
+            operation_id: Default::default(),
+            target: target.clone(),
+            operation: ConnectorCatalogMutationOperation::CreateNamespace {
+                namespace,
+                policy: CreatePolicy::NoOpIfExists,
+            },
+            context: context(),
+        })
+        .expect("mutation contract");
+    assert!(matches!(
+        no_op,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            finalization: ExternalMutationFinalization::Complete,
+            ..
+        }
+    ));
+
+    let created = mutation
+        .execute(ConnectorCatalogMutationRequest {
+            operation_id: Default::default(),
+            target,
+            operation: ConnectorCatalogMutationOperation::CreateTable {
+                table: ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from("missing"),
+                    table: Arc::from("must_not_create_namespace"),
+                },
+                columns: vec![ConnectorColumnDefinition {
+                    name: Arc::from("id"),
+                    data_type: ConnectorDataType::Int,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key: None,
+                partitioning: Vec::new(),
+                properties: Vec::new(),
+                policy: CreatePolicy::FailIfExists,
+            },
+            context: context(),
+        })
+        .expect("mutation contract");
+    assert!(matches!(
+        created,
+        ExternalMutationOutcome::KnownUncommitted { .. }
+    ));
 }
 
 #[test]

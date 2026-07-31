@@ -23,6 +23,7 @@ mod execution;
 mod handle;
 mod identity;
 mod metadata;
+mod mutation;
 mod read;
 
 pub mod conformance;
@@ -50,6 +51,19 @@ pub use metadata::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
     ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
+};
+pub use mutation::{
+    ConnectorCatalogMutation, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
+    ConnectorCatalogMutationReceipt, ConnectorCatalogMutationReconcileRequest,
+    ConnectorCatalogMutationRequest, ConnectorCatalogMutationResolver, ConnectorColumnAggregation,
+    ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition, ConnectorDataType,
+    ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorPartitionTransform,
+    ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind, ConnectorSchemaChange,
+    ConnectorStructField, ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewDefinition,
+    ConnectorViewDialect, ConnectorViewIdentity, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,

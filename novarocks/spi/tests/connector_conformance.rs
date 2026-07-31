@@ -207,6 +207,7 @@ fn control_binding_rejects_metadata_owned_by_another_instance() {
                 descriptor,
                 incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
             }),
+            None,
         )
         .err()
         .expect("a host must not attach foreign metadata")

@@ -2240,8 +2240,8 @@ use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, Tr
 use iceberg::{TableRequirement, TableUpdate};
 
 use crate::connector::iceberg::catalog::registry::{
-    TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key, logical_type_property_key,
-    logical_type_property_value,
+    IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
+    logical_type_property_key, logical_type_property_value,
 };
 use crate::connector::iceberg::commit::retry::commit_with_retry;
 use crate::connector::iceberg::variant_write::{
@@ -3775,7 +3775,7 @@ pub(crate) fn alter_table_schema(
         );
     }
 
-    protect_schema_change(state, &target, &stmt.change)?;
+    validate_schema_change_application_guard(state, &target, &stmt.change)?;
 
     let entry = {
         let registry = state
@@ -3867,7 +3867,86 @@ pub(crate) fn alter_table_schema(
     Ok(())
 }
 
-fn protect_schema_change(
+/// Provider-owned schema mutation for one already-resolved Iceberg table.
+/// Application-level MV/dependency guards run before this entry point; the
+/// provider retains catalog metadata validation, equality-delete protection,
+/// default-version checks, OCC retry, and cache invalidation.
+pub(crate) fn alter_table_schema_on_entry(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+    change: &IcebergSchemaChange,
+) -> Result<(), String> {
+    reject_reserved_change(change)?;
+    entry.invalidate_table_cache(namespace, table);
+    let loaded = crate::connector::iceberg::catalog::registry::load_table(entry, namespace, table)?;
+    let metadata = loaded.table.metadata();
+    build_updated_schema(metadata.current_schema(), metadata.last_column_id(), change)?;
+    build_property_updates(metadata.properties(), change)?;
+    if let IcebergSchemaChange::DropColumn { path } = change {
+        let equality_delete_columns =
+            crate::connector::iceberg::catalog::registry::current_equality_delete_column_names(
+                &loaded.table,
+            )?;
+        reject_drop_dependencies(&path.dotted(), &equality_delete_columns, &[])?;
+    }
+    if let IcebergSchemaChange::AddColumn {
+        default: Some(literal),
+        data_type,
+        ..
+    } = change
+    {
+        let column_default =
+            crate::sql::literal::default_literal_to_column_default(literal, data_type)?;
+        crate::connector::iceberg::default_value::require_v3_for_column_default(
+            metadata.format_version(),
+            column_default.as_ref(),
+        )?;
+    }
+
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = namespace.to_string();
+    let table_for_retry = table.to_string();
+    let change_for_retry = change.clone();
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry = entry_for_retry.clone();
+                let namespace = namespace_for_retry.clone();
+                let table = table_for_retry.clone();
+                let change = change_for_retry.clone();
+                async move {
+                    entry.invalidate_table_cache(&namespace, &table);
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
+                            .map_err(|error| {
+                                iceberg::Error::new(iceberg::ErrorKind::Unexpected, error)
+                            })?;
+                    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry, &namespace, &table,
+                    )
+                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::Unexpected, error))?;
+                    let tx = Transaction::new(&loaded.table);
+                    let tx = SchemaUpdateTxnAction { change }
+                        .apply(tx)
+                        .map_err(|error| {
+                            iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                        })?;
+                    tx.commit(catalog.as_ref()).await.map(|_| ())
+                }
+            })
+            .await
+        })
+        .map_err(|error| format!("alter iceberg schema runtime failed: {error}"))?;
+    entry.invalidate_table_cache(namespace, table);
+    commit_result
+}
+
+/// Enforce frontend-owned guards before a schema mutation reaches the provider.
+///
+/// This deliberately retains MV/dependency policy in the application layer;
+/// the provider owns the external catalog commit and its metadata validation.
+pub(crate) fn validate_schema_change_application_guard(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     change: &IcebergSchemaChange,
@@ -4048,6 +4127,106 @@ fn validate_variant_shredding_property_set(
     Ok(())
 }
 
+/// Provider-owned table property mutation. The caller must already have
+/// selected the catalog instance and normalized the SPI property DTO.
+pub(crate) fn alter_table_properties_on_entry(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+    op: &PropertiesOp,
+) -> Result<(), String> {
+    let denied = collect_property_denylist_hits(op);
+    if !denied.is_empty() {
+        let mut messages = denied
+            .into_iter()
+            .map(|(key, reason)| format!("`{key}`: {reason}"))
+            .collect::<Vec<_>>();
+        messages.sort();
+        return Err(format!(
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): {}",
+            messages.join("; ")
+        ));
+    }
+
+    entry.invalidate_table_cache(namespace, table);
+    let entry_for_retry = entry.clone();
+    let namespace_for_retry = namespace.to_string();
+    let table_for_retry = table.to_string();
+    let op_for_retry = op.clone();
+    let commit_result =
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            commit_with_retry(|_attempt| {
+                let entry_inner = entry_for_retry.clone();
+                let namespace_inner = namespace_for_retry.clone();
+                let table_inner = table_for_retry.clone();
+                let op_inner = op_for_retry.clone();
+                async move {
+                    entry_inner.invalidate_table_cache(&namespace_inner, &table_inner);
+                    let catalog =
+                        crate::connector::iceberg::catalog::registry::build_iceberg_catalog(
+                            &entry_inner,
+                        )
+                        .map_err(|error| {
+                            iceberg::Error::new(
+                                iceberg::ErrorKind::Unexpected,
+                                format!("build catalog for retry: {error}"),
+                            )
+                        })?;
+                    let loaded = crate::connector::iceberg::catalog::registry::load_table(
+                        &entry_inner,
+                        &namespace_inner,
+                        &table_inner,
+                    )
+                    .map_err(|error| {
+                        iceberg::Error::new(
+                            iceberg::ErrorKind::Unexpected,
+                            format!("reload table for retry: {error}"),
+                        )
+                    })?;
+                    let existing = loaded.table.metadata().properties().clone();
+                    validate_variant_shredding_property_set(
+                        &op_inner,
+                        loaded.table.metadata().current_schema(),
+                    )
+                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error))?;
+                    validate_unset_keys_present(&op_inner, &existing).map_err(|error| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error)
+                    })?;
+                    if let PropertiesOp::Unset {
+                        if_exists: true, ..
+                    } = &op_inner
+                    {
+                        if compute_remove_keys(&op_inner, &existing).is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    let tx = Transaction::new(&loaded.table);
+                    let mut action = tx.update_table_properties();
+                    match &op_inner {
+                        PropertiesOp::Set { entries } => {
+                            for (key, value) in entries {
+                                action = action.set(key.clone(), value.clone());
+                            }
+                        }
+                        PropertiesOp::Unset { .. } => {
+                            for key in compute_remove_keys(&op_inner, &existing) {
+                                action = action.remove(key);
+                            }
+                        }
+                    }
+                    let tx = action.apply(tx).map_err(|error| {
+                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                    })?;
+                    tx.commit(catalog.as_ref()).await.map(|_| ())
+                }
+            })
+            .await
+        })
+        .map_err(|error| format!("alter table properties runtime failed: {error}"))?;
+    entry.invalidate_table_cache(namespace, table);
+    commit_result
+}
+
 /// Execute SET TBLPROPERTIES or UNSET TBLPROPERTIES on an Iceberg table.
 ///
 /// Mirrors `alter_table_schema`: resolves the catalog entry, invalidates the
@@ -4058,6 +4237,7 @@ pub(crate) fn alter_table_properties(
     stmt: &AlterIcebergPropertiesStmt,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     // 1. Resolve target — same helper as alter_table_schema.
     let target =
@@ -4070,10 +4250,7 @@ pub(crate) fn alter_table_properties(
     let target_table = {
         crate::connector::metadata_load_table(
             state.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,

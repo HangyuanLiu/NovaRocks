@@ -20,6 +20,7 @@ use novarocks::engine::view::{
     ViewTarget,
 };
 use novarocks_catalog::identifier::normalize_identifier;
+use novarocks_spi::connector::DropPolicy;
 use sqlparser::ast::{CreateView, ObjectName, ObjectNamePart};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -84,21 +85,16 @@ pub(super) fn create_external_view(
     engine: &dyn ViewEngine,
     target: ViewTarget,
     statement: CreateView,
+    context: ViewRequestContext<'_>,
 ) -> Result<ViewStatementResult, String> {
     if statement.materialized {
         return Err(
             "CREATE MATERIALIZED VIEW must go through the materialized-view DDL path".to_string(),
         );
     }
-    if engine.table_exists(&target)? {
-        return Err(format!(
-            "a table named {}.{}.{} already exists",
-            target.catalog, target.database, target.view
-        ));
-    }
-    if statement.if_not_exists && engine.view_exists(&target)? {
-        return Ok(ViewStatementResult::Ok);
-    }
+    let connector_context = context
+        .connector_context
+        .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let view_sql = statement.query.to_string();
     let mut analyzed_query = statement.query.as_ref().clone();
@@ -108,10 +104,15 @@ pub(super) fn create_external_view(
         ViewRequestContext {
             current_catalog: Some(&target.catalog),
             current_database: &target.database,
+            connector_context: Some(connector_context),
         },
     )?;
-    let mut columns =
-        engine.analyze_external_view(&target.catalog, &target.database, &analyzed_query)?;
+    let mut columns = engine.analyze_external_view(
+        &target.catalog,
+        &target.database,
+        &analyzed_query,
+        connector_context,
+    )?;
     if columns.is_empty() {
         return Err("CREATE VIEW: SELECT produced no output columns".to_string());
     }
@@ -127,14 +128,18 @@ pub(super) fn create_external_view(
             column.name = alias.name.value.clone();
         }
     }
-    engine.create_external_view(CreateExternalViewRequest {
-        target,
-        columns,
-        sql: view_sql,
-        comment: statement.comment,
-        or_replace: statement.or_replace,
-        properties: Vec::new(),
-    })?;
+    engine.create_external_view(
+        CreateExternalViewRequest {
+            target,
+            columns,
+            sql: view_sql,
+            comment: statement.comment,
+            or_replace: statement.or_replace,
+            if_not_exists: statement.if_not_exists,
+            properties: Vec::new(),
+        },
+        connector_context,
+    )?;
     Ok(ViewStatementResult::Ok)
 }
 
@@ -142,23 +147,20 @@ pub(super) fn drop_external_view(
     engine: &dyn ViewEngine,
     target: &ViewTarget,
     if_exists: bool,
+    context: ViewRequestContext<'_>,
 ) -> Result<(), String> {
-    match engine.drop_external_view(target) {
-        Ok(()) => Ok(()),
-        Err(error) if error.contains("unknown view") => {
-            if if_exists {
-                return Ok(());
-            }
-            if engine.table_exists(target)? {
-                return Err(format!(
-                    "{}.{}.{} is a table, use DROP TABLE",
-                    target.catalog, target.database, target.view
-                ));
-            }
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
+    let connector_context = context
+        .connector_context
+        .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
+    engine.drop_external_view(
+        target,
+        connector_context,
+        if if_exists {
+            DropPolicy::NoOpIfMissing
+        } else {
+            DropPolicy::FailIfMissing
+        },
+    )
 }
 
 pub(super) fn show_create_view(

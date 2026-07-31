@@ -80,6 +80,7 @@ code-anchors:
 - ADR-0014 — 共享文件访问与 Parquet/ORC 物理解码为何属于无 Connector identity 的独立基础（active）
 - ADR-0015 — table-format Connector 为何拥有 read correctness，native fragment 只绑定已安装真实 instance（active）
 - ADR-0016 — Connector 为何共享逻辑 identity、但不共享 FE control 与 BE execution runtime（active）
+- ADR-0017 — Connector catalog mutation 为何使用 FE-only lease 与三态 external outcome（active）
 
 ### distributed-query-lifecycle
 

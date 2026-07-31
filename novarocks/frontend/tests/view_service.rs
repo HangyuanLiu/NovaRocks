@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
@@ -27,7 +27,10 @@ use novarocks::engine::view::{
     ViewRequestContext, ViewService, ViewSqlDialect, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::FrontendViewService;
-use novarocks_spi::state_store::{FeDeploymentView, StateStore};
+use novarocks_spi::{
+    connector::{ConnectorCancellation, ConnectorRequestContext},
+    state_store::{FeDeploymentView, StateStore},
+};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
@@ -83,20 +86,38 @@ impl ViewEngine for FakeViewEngine {
         self.rest_catalogs.lock().unwrap().contains(catalog)
     }
 
-    fn table_exists(&self, target: &ViewTarget) -> Result<bool, String> {
+    fn table_exists(
+        &self,
+        target: &ViewTarget,
+        _context: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
         if self.table_probe_failures.lock().unwrap().contains(target) {
             return Err("table probe failed".to_string());
         }
         Ok(self.tables.lock().unwrap().contains(target))
     }
 
-    fn view_exists(&self, target: &ViewTarget) -> Result<bool, String> {
+    fn view_exists(
+        &self,
+        target: &ViewTarget,
+        _context: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
         Ok(self.views.lock().unwrap().contains_key(target))
     }
 
-    fn create_external_view(&self, request: CreateExternalViewRequest) -> Result<(), String> {
+    fn create_external_view(
+        &self,
+        request: CreateExternalViewRequest,
+        _context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        if self.tables.lock().unwrap().contains(&request.target) {
+            return Err(format!(
+                "a table named {}.{}.{} already exists",
+                request.target.catalog, request.target.database, request.target.view
+            ));
+        }
         let mut views = self.views.lock().unwrap();
-        if views.contains_key(&request.target) && !request.or_replace {
+        if views.contains_key(&request.target) && !request.or_replace && !request.if_not_exists {
             return Err(format!(
                 "view already exists: {}.{}.{}",
                 request.target.catalog, request.target.database, request.target.view
@@ -122,8 +143,15 @@ impl ViewEngine for FakeViewEngine {
         Ok(())
     }
 
-    fn drop_external_view(&self, target: &ViewTarget) -> Result<(), String> {
+    fn drop_external_view(
+        &self,
+        target: &ViewTarget,
+        _context: &ConnectorRequestContext,
+        policy: novarocks_spi::connector::DropPolicy,
+    ) -> Result<(), String> {
         if self.views.lock().unwrap().remove(target).is_some() {
+            Ok(())
+        } else if policy == novarocks_spi::connector::DropPolicy::NoOpIfMissing {
             Ok(())
         } else {
             Err(format!(
@@ -156,6 +184,7 @@ impl ViewEngine for FakeViewEngine {
         _catalog: &str,
         _database: &str,
         query: &Query,
+        _context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
         self.analyzed_queries
             .lock()
@@ -175,10 +204,32 @@ impl ViewEngine for FakeViewEngine {
     }
 }
 
+struct NeverCancelled;
+
+impl ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn connector_context() -> &'static ConnectorRequestContext {
+    static CONTEXT: OnceLock<ConnectorRequestContext> = OnceLock::new();
+    CONTEXT.get_or_init(|| {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(300),
+            Arc::new(NeverCancelled),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+    })
+}
+
 fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContext<'a> {
     ViewRequestContext {
         current_catalog: catalog,
         current_database: database,
+        connector_context: Some(connector_context()),
     }
 }
 
@@ -424,7 +475,7 @@ async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
         .unwrap();
     assert_eq!(
         engine.analyzed_queries.lock().unwrap().len(),
-        analyzed_before
+        analyzed_before + 1
     );
 }
 

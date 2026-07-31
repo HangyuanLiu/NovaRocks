@@ -19,9 +19,9 @@
 #[cfg(test)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{Arc, RwLock, Weak};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
@@ -317,7 +317,7 @@ impl Default for StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
-            connector_control: Arc::new(TestConnectorControlRegistry),
+            connector_control: Arc::new(TestConnectorControlRegistry::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
@@ -351,21 +351,74 @@ impl Default for StandaloneState {
 }
 
 #[cfg(test)]
-struct TestConnectorControlRegistry;
+#[derive(Default)]
+struct TestConnectorControlRegistry {
+    bindings: Mutex<
+        std::collections::HashMap<
+            novarocks_spi::connector::ConnectorInstanceId,
+            Arc<novarocks_spi::connector::ConnectorControlBinding>,
+        >,
+    >,
+}
 
 #[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControlRegistry {
     fn acquire_current(
         &self,
-        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
         novarocks_spi::connector::ConnectorControlPlanningLease,
         novarocks_spi::connector::ConnectorError,
     > {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            "test connector control registry has no active binding",
-        ))
+        let binding = self
+            .bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    "test connector control registry has no active binding",
+                )
+            })?;
+        Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
+    }
+}
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnectorControlRegistry {
+    fn acquire_current_mutation(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    "test connector control registry has no active mutation binding",
+                )
+            })?;
+        let mutation = binding.mutation().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no mutation capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            binding.descriptor().clone(),
+            binding.incarnation(),
+            mutation,
+            || {},
+        )
     }
 }
 
@@ -373,15 +426,23 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
 impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
     fn register(
         &self,
-        _binding: novarocks_spi::connector::ConnectorControlBinding,
+        binding: novarocks_spi::connector::ConnectorControlBinding,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .insert(binding.descriptor().instance_id.clone(), Arc::new(binding));
         Ok(())
     }
 
     fn retire_current(
         &self,
-        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        self.bindings
+            .lock()
+            .expect("test connector control registry lock")
+            .remove(instance_id);
         Ok(())
     }
 }
@@ -988,6 +1049,7 @@ impl StandaloneSession {
                     crate::engine::view::ViewRequestContext {
                         current_catalog,
                         current_database,
+                        connector_context: Some(&connector_context),
                     },
                 )?;
                 self::virtual_table::rewrite_query(&self.inner, &mut prepared)?;
@@ -1216,6 +1278,7 @@ impl StandaloneSession {
             crate::engine::view::ViewRequestContext {
                 current_catalog,
                 current_database,
+                connector_context: Some(&connector_context),
             },
         )? {
             return Ok(match result {
@@ -1411,6 +1474,7 @@ impl StandaloneSession {
                 &normalized,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
 
@@ -1420,13 +1484,19 @@ impl StandaloneSession {
                 &normalized,
                 current_catalog,
                 current_database,
+                &connector_context,
             );
         }
 
         // ALTER TABLE ... ADD/DROP PARTITION COLUMN ...
         if looks_like_alter_partition_column(&normalized) {
             let stmt = parse_alter_partition_column_sql(&normalized)?;
-            return self.handle_alter_partition_spec(stmt, current_catalog, current_database);
+            return self.handle_alter_partition_spec(
+                stmt,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // SHOW CREATE TABLE ...
@@ -1581,6 +1651,7 @@ impl StandaloneSession {
                     crate::engine::view::ViewRequestContext {
                         current_catalog,
                         current_database,
+                        connector_context: Some(&connector_context),
                     },
                 )?;
                 // Materialize information_schema virtual tables (e.g. `schemata`)
@@ -1859,6 +1930,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = parse_alter_iceberg_properties_sql(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -1874,12 +1946,47 @@ impl StandaloneSession {
                 crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
             )?;
         }
-        crate::connector::iceberg::catalog::alter_table_properties(
-            &self.inner,
-            &stmt,
-            current_catalog,
-            current_database,
+        if target.backend_name != "iceberg" {
+            return Err(
+                "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
+            );
+        }
+        let changes = match stmt.op {
+            crate::engine::statement::PropertiesOp::Set { entries } => entries
+                .into_iter()
+                .map(
+                    |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
+                        key: Arc::from(key),
+                        value: Arc::from(value),
+                    },
+                )
+                .collect(),
+            crate::engine::statement::PropertiesOp::Unset { keys, if_exists } => keys
+                .into_iter()
+                .map(
+                    |key| novarocks_spi::connector::ConnectorPropertyChange::Unset {
+                        key: Arc::from(key),
+                        if_exists,
+                    },
+                )
+                .collect(),
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.inner.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                changes,
+            },
+            connector_context.clone(),
         )?;
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
     }
 
@@ -1888,6 +1995,7 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let stmt = crate::engine::statement::parse_alter_iceberg_schema_sql(sql)?;
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
@@ -1904,12 +2012,90 @@ impl StandaloneSession {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
         )?;
-        crate::connector::iceberg::catalog::alter_table_schema(
+        crate::connector::iceberg::catalog::schema_update::validate_schema_change_application_guard(
             &self.inner,
-            &stmt,
-            current_catalog,
-            current_database,
+            &target,
+            &stmt.change,
         )?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        let change = match stmt.change {
+            crate::engine::statement::IcebergSchemaChange::AddColumn {
+                parent,
+                name,
+                data_type,
+                default,
+                position,
+            } => {
+                let column = crate::sql::parser::ast::TableColumnDef {
+                    name,
+                    data_type,
+                    nullable: true,
+                    aggregation: None,
+                    default,
+                };
+                novarocks_spi::connector::ConnectorSchemaChange::AddColumn {
+                    parent: novarocks_spi::connector::ConnectorColumnPath {
+                        segments: parent
+                            .segments()
+                            .iter()
+                            .map(|segment| Arc::from(segment.as_str()))
+                            .collect(),
+                    },
+                    column: crate::engine::statement::connector_column(&column)?,
+                    position: connector_schema_position(position),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::DropColumn { path } => {
+                novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
+                    path: connector_schema_path(path),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::RenameColumn { path, new_name } => {
+                novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
+                    path: connector_schema_path(path),
+                    to: Arc::from(new_name),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::ModifyColumn { path, new_type } => {
+                novarocks_spi::connector::ConnectorSchemaChange::ModifyColumn {
+                    path: connector_schema_path(path),
+                    data_type: crate::engine::statement::connector_data_type(&new_type)?,
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::SetNullable { path, nullable } => {
+                novarocks_spi::connector::ConnectorSchemaChange::SetColumnNullability {
+                    path: connector_schema_path(path),
+                    nullable,
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::Reorder { path, position } => {
+                novarocks_spi::connector::ConnectorSchemaChange::ReorderColumn {
+                    path: connector_schema_path(path),
+                    position: connector_schema_position(position),
+                }
+            }
+            crate::engine::statement::IcebergSchemaChange::UpdateComment { path, comment } => {
+                novarocks_spi::connector::ConnectorSchemaChange::SetColumnComment {
+                    path: connector_schema_path(path),
+                    comment: Arc::from(comment),
+                }
+            }
+        };
+        crate::connector::mutation::execute_catalog_mutation(
+            self.inner.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                changes: vec![change],
+            },
+            connector_context.clone(),
+        )?;
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
     }
 
@@ -1937,6 +2123,7 @@ impl StandaloneSession {
         stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
         let table_name = match &stmt {
             crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
@@ -1965,17 +2152,39 @@ impl StandaloneSession {
             &target,
             crate::engine::mv::iceberg_guard::IcebergMvUserMutation::AlterTable,
         )?;
-        let backend = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read")
-            .catalog_backend(target.backend_name)?;
-        backend.alter_iceberg_partition_spec(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            stmt,
+        let adding = matches!(
+            &stmt,
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn { .. }
+        );
+        let transform = match &stmt {
+            crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::AddPartitionColumn {
+                field,
+                ..
+            }
+            | crate::sql::parser::ast::AlterIcebergPartitionSpecStmt::DropPartitionColumn {
+                field,
+                ..
+            } => connector_partition_transform(&field),
+        };
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::mutation::execute_catalog_mutation(
+            self.inner.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                table: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from(target.namespace.as_str()),
+                    table: Arc::from(target.table.as_str()),
+                },
+                add: if adding {
+                    vec![transform.clone()]
+                } else {
+                    Vec::new()
+                },
+                drop: if adding { Vec::new() } else { vec![transform] },
+            },
+            connector_context.clone(),
         )?;
         crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.inner, &target)?;
         Ok(StatementResult::Ok)
@@ -2166,6 +2375,7 @@ impl StandaloneSession {
                     current_database,
                     stmt.if_exists,
                     stmt.force,
+                    connector_context,
                 )?;
                 match stmt.name.parts.as_slice() {
                     [table] => self
@@ -2229,6 +2439,82 @@ impl StandaloneSession {
             execution,
             connector_context,
         )
+    }
+}
+
+fn connector_schema_path(
+    path: crate::engine::statement::ColumnPath,
+) -> novarocks_spi::connector::ConnectorColumnPath {
+    novarocks_spi::connector::ConnectorColumnPath {
+        segments: path
+            .segments()
+            .iter()
+            .map(|segment| Arc::from(segment.as_str()))
+            .collect(),
+    }
+}
+
+fn connector_schema_position(
+    position: crate::engine::statement::AddPosition,
+) -> novarocks_spi::connector::ConnectorColumnPosition {
+    match position {
+        crate::engine::statement::AddPosition::Default => {
+            novarocks_spi::connector::ConnectorColumnPosition::Default
+        }
+        crate::engine::statement::AddPosition::First => {
+            novarocks_spi::connector::ConnectorColumnPosition::First
+        }
+        crate::engine::statement::AddPosition::After(column) => {
+            novarocks_spi::connector::ConnectorColumnPosition::After {
+                column: Arc::from(column),
+            }
+        }
+        crate::engine::statement::AddPosition::Before(column) => {
+            novarocks_spi::connector::ConnectorColumnPosition::Before {
+                column: Arc::from(column),
+            }
+        }
+    }
+}
+
+fn connector_partition_transform(
+    field: &crate::sql::parser::ast::IcebergPartitionFieldExpr,
+) -> novarocks_spi::connector::ConnectorPartitionTransform {
+    use crate::sql::parser::ast::IcebergPartitionFieldExpr;
+    use novarocks_spi::connector::ConnectorPartitionTransform;
+
+    match field {
+        IcebergPartitionFieldExpr::Identity { column } => ConnectorPartitionTransform::Identity {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Year { column } => ConnectorPartitionTransform::Year {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Month { column } => ConnectorPartitionTransform::Month {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Day { column } => ConnectorPartitionTransform::Day {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Hour { column } => ConnectorPartitionTransform::Hour {
+            column: Arc::from(column.as_str()),
+        },
+        IcebergPartitionFieldExpr::Bucket {
+            column,
+            num_buckets,
+        } => ConnectorPartitionTransform::Bucket {
+            column: Arc::from(column.as_str()),
+            num_buckets: *num_buckets,
+        },
+        IcebergPartitionFieldExpr::Truncate { column, width } => {
+            ConnectorPartitionTransform::Truncate {
+                column: Arc::from(column.as_str()),
+                width: *width,
+            }
+        }
+        IcebergPartitionFieldExpr::Void { column } => ConnectorPartitionTransform::Void {
+            column: Arc::from(column.as_str()),
+        },
     }
 }
 
@@ -2505,9 +2791,13 @@ pub(crate) fn dispatch_statement(
                 Err(error) => Err(error.to_string()),
             }
         }
-        Statement::DropMaterializedView(stmt) => {
-            crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
-        }
+        Statement::DropMaterializedView(stmt) => crate::engine::mv_flow::drop_mv(
+            state,
+            current_catalog,
+            current_database,
+            &stmt,
+            connector_context,
+        ),
         Statement::AlterMaterializedView(stmt) => {
             crate::engine::mv_flow::alter_mv_with_connector_context(
                 state,
@@ -2881,6 +3171,7 @@ fn prepare_explain_query(
         crate::engine::view::ViewRequestContext {
             current_catalog,
             current_database,
+            connector_context: Some(connector_context),
         },
     )?;
 
@@ -5409,7 +5700,7 @@ mod tests {
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
             Arc::new(super::TestNativeReportHandler),
             crate::query_execution::control::QueryControlService::for_test(),
-            Arc::new(super::TestConnectorControlRegistry),
+            Arc::new(super::TestConnectorControlRegistry::default()),
             0,
         )
     }

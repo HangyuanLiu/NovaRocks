@@ -64,11 +64,12 @@ impl MvBackend for IcebergMvBackend {
 
     fn drop_mv(&self, req: DropMvRequest) -> Result<(), String> {
         let state = self.state()?;
-        crate::engine::mv::iceberg_refresh::drop_iceberg_mv(
+        crate::engine::mv::iceberg_refresh::drop_iceberg_mv_with_connector_context(
             &state,
             req.current_catalog.as_deref(),
             &req.current_database,
             &req.stmt,
+            &req.connector_context,
         )
         .map(|_| ())
     }

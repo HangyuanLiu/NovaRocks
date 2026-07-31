@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 PACKAGE_NAME = "novarocks-spi"
-REQUIRED_NORMAL_DEPENDENCIES = ("async-trait", "bytes", "sha2", "uuid")
+REQUIRED_NORMAL_DEPENDENCIES = ("arrow", "async-trait", "bytes", "sha2", "uuid")
 OPTIONAL_NORMAL_DEPENDENCIES = ("tokio",)
 CONFORMANCE_FEATURE = "state-store-conformance"
 

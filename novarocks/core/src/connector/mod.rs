@@ -17,13 +17,14 @@
 pub(crate) mod backend;
 pub mod file_execution;
 pub mod iceberg;
+pub(crate) mod mutation;
 pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;
 pub mod starrocks;
 pub(crate) mod stats;
 
-pub(crate) use backend::{CatalogBackend, MvBackend, TableSink};
+pub(crate) use backend::{MvBackend, TableSink};
 #[cfg(test)]
 pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
 pub(crate) use iceberg::catalog::{
@@ -232,8 +233,6 @@ pub use crate::formats::parquet::ParquetScanConfig;
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 
 #[cfg(test)]
-mod backend_test;
-#[cfg(test)]
 mod iceberg_provider_test;
 #[cfg(test)]
 mod runtime_test;
@@ -258,7 +257,7 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
+    starrocks_table_state: Option<std::sync::Weak<crate::engine::StandaloneState>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
     #[cfg(test)]
@@ -272,7 +271,7 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            catalog_backends: HashMap::new(),
+            starrocks_table_state: None,
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
             #[cfg(test)]
@@ -319,15 +318,22 @@ impl ConnectorRegistry {
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
     }
 
-    pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {
-        self.catalog_backends.insert(backend.name(), backend);
+    #[cfg(feature = "compat")]
+    pub(crate) fn bind_starrocks_table_state(
+        &mut self,
+        state: &Arc<crate::engine::StandaloneState>,
+    ) {
+        self.starrocks_table_state = Some(Arc::downgrade(state));
     }
 
-    pub(crate) fn catalog_backend(&self, name: &str) -> Result<Arc<dyn CatalogBackend>, String> {
-        self.catalog_backends
-            .get(name)
-            .cloned()
-            .ok_or_else(|| format!("unknown catalog backend: {name}"))
+    #[cfg(feature = "compat")]
+    pub(crate) fn starrocks_table_state(
+        &self,
+    ) -> Result<Arc<crate::engine::StandaloneState>, String> {
+        self.starrocks_table_state
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| "standalone StarRocks table state is unavailable".to_string())
     }
 
     pub(crate) fn register_table_sink(&mut self, sink: Arc<dyn TableSink>) {
@@ -428,9 +434,8 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             .connectors
             .write()
             .expect("standalone connector registry write lock");
-        connectors.register_catalog_backend(Arc::new(
-            iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(&iceberg_catalogs)),
-        ));
+        #[cfg(feature = "compat")]
+        connectors.bind_starrocks_table_state(state);
         connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
             Arc::clone(&iceberg_catalogs),
         )));
@@ -448,14 +453,11 @@ impl Default for ConnectorRegistry {
 
 impl std::fmt::Debug for ConnectorRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut catalog_backends: Vec<_> = self.catalog_backends.keys().copied().collect();
-        catalog_backends.sort();
         let mut table_sinks: Vec<_> = self.table_sinks.keys().copied().collect();
         table_sinks.sort();
         let mut mv_backends: Vec<_> = self.mv_backends.keys().copied().collect();
         mv_backends.sort();
         f.debug_struct("ConnectorRegistry")
-            .field("catalog_backends", &catalog_backends)
             .field("table_sinks", &table_sinks)
             .field("mv_backends", &mv_backends)
             .finish()
