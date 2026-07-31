@@ -19,7 +19,6 @@ use std::collections::HashSet;
 
 use crate::common::ids::SlotId;
 use crate::connector::iceberg::sink_plan::{IcebergSinkFactoryInput, IcebergSinkPlan};
-#[cfg(feature = "compat")]
 use crate::connector::starrocks::sink::plan::StarRocksTableSinkProgram;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
@@ -33,7 +32,6 @@ pub enum FragmentSinkProgram {
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
-    #[cfg(feature = "compat")]
     StarRocksTable(StarRocksTableSinkProgram),
     IcebergTable(IcebergTableSinkProgram),
     IcebergChangeStreamRouter(IcebergChangeStreamRouterProgram),
@@ -46,7 +44,6 @@ impl FragmentSinkProgram {
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
-            #[cfg(feature = "compat")]
             Self::StarRocksTable(program) => program
                 .validate()
                 .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Sink, error)),

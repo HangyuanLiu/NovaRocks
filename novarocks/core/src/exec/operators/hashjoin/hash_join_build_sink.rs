@@ -44,7 +44,6 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinType};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-#[cfg(feature = "compat")]
 use crate::exec::runtime_filter::{
     MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
     RUNTIME_FILTER_JOIN_MODE_BROADCAST, RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter,
@@ -57,7 +56,6 @@ use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_state::RuntimeState;
-#[cfg(feature = "compat")]
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.

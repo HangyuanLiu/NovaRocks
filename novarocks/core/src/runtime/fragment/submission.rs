@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "compat")]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-#[cfg(feature = "compat")]
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef};
 use crate::exec::fragment::error::{
@@ -75,7 +73,6 @@ impl FragmentSubmission {
         &self.instance
     }
 
-    #[cfg(feature = "compat")]
     pub fn incremental_scan_contracts(&self) -> HashMap<i32, Option<SlotId>> {
         let mut contracts = HashMap::new();
         collect_incremental_scan_contracts(&self.program.plan().root, &mut contracts);
@@ -108,7 +105,6 @@ impl FragmentSubmission {
     }
 }
 
-#[cfg(feature = "compat")]
 fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32, Option<SlotId>>) {
     match &node.kind {
         ExecNodeKind::Scan(scan) => {
@@ -213,7 +209,6 @@ impl ProgramInventory {
                 }
                 Ok(())
             }
-            #[cfg(feature = "compat")]
             ExecNodeKind::Fetch(node) => self.visit(&node.input),
             ExecNodeKind::LookUp(_) => Ok(()),
             ExecNodeKind::Aggregate(node) => self.visit(&node.input),

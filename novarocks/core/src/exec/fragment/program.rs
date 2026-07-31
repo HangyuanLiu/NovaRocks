@@ -85,9 +85,7 @@ impl FragmentProgramOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanAssignmentKind {
     File,
-    #[cfg(feature = "compat")]
     BrokerFile,
-    #[cfg(feature = "compat")]
     SchemaSelection,
     StarRocksTablet,
 }
@@ -214,7 +212,6 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
-            #[cfg(feature = "compat")]
             FragmentSinkProgram::StarRocksTable(_) => (
                 FragmentSinkKind::StarRocksTable,
                 Required(FragmentSinkAssignmentKind::StarRocksTable),
@@ -357,7 +354,6 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::Limit(node) => node.node_id,
         ExecNodeKind::ExchangeSource(node) => node.node_id,
         ExecNodeKind::Scan(node) => node.node_id().unwrap_or(-1),
-        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(node) => node.node_id,
         ExecNodeKind::LookUp(node) => node.node_id,
         ExecNodeKind::Aggregate(node) => node.node_id,

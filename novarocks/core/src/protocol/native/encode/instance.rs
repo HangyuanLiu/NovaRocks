@@ -95,11 +95,9 @@ fn encode_scan_range(src: &scan_range::ScanRange) -> Result<novarocks::ScanRange
                 file,
             )?)),
         }),
-        #[cfg(feature = "compat")]
         scan_range::ScanRange::BrokerFile(_) => {
             Err("native protocol cannot encode a StarRocks broker-file scan range".to_string())
         }
-        #[cfg(feature = "compat")]
         scan_range::ScanRange::SchemaSelection(_) => {
             Err("native protocol cannot encode a StarRocks schema-scan selection".to_string())
         }

@@ -30,7 +30,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::i256;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
-use prost::Message;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -43,7 +42,8 @@ use crate::connector::starrocks::lake::delete_payload_codec::{
     decode_delete_keys_payload, encode_delete_keys_payload,
 };
 use crate::connector::starrocks::lake::storage_domain::{
-    StorageRowset, StorageSchemaKey, StorageTransactionLog, StorageWriteOperation,
+    StorageCombinedTransactionLog, StorageRowset, StorageSchemaKey, StorageTabletMetadata,
+    StorageTransactionLog, StorageWriteOperation,
 };
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
@@ -52,41 +52,28 @@ use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_i
 use crate::exec::chunk::Chunk;
 use crate::formats::starrocks::metadata::{
     StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
-    load_bundle_segment_footers, load_tablet_snapshot, tablet_operator_relative_path,
+    load_bundle_segment_footers, load_tablet_snapshot_with_metadata_provider,
+    tablet_operator_relative_path,
 };
 use crate::formats::starrocks::plan::{
     StarRocksOutputColumnHint, StarRocksPhysicalColumnBinding,
     build_native_read_plan_with_output_hints,
 };
 use crate::formats::starrocks::reader::build_native_record_batch;
-use crate::formats::starrocks::writer::bundle_meta::{
-    load_latest_tablet_metadata, next_rowset_id, write_bundle_meta_file,
-    write_bundle_meta_file_with_provider,
-};
+use crate::formats::starrocks::writer::bundle_meta::load_latest_tablet_metadata_with_provider;
 use crate::formats::starrocks::writer::io::{read_bytes, read_bytes_if_exists, write_bytes};
 use crate::formats::starrocks::writer::layout::{
     DATA_DIR, build_data_file_name, join_tablet_path, txn_log_file_path,
     txn_log_file_path_with_load_id,
 };
 use crate::formats::starrocks::writer::{
-    StarRocksWriteFormat, build_single_segment_facts, build_single_segment_metadata,
-    build_starrocks_native_segment_bytes, build_txn_data_file_name,
-    read_bundle_parquet_snapshot_if_any, sort_batch_for_native_write, write_parquet_file,
+    StarRocksWriteFormat, build_single_segment_facts, build_starrocks_native_segment_bytes,
+    build_txn_data_file_name, read_bundle_parquet_snapshot_if_any, sort_batch_for_native_write,
+    write_parquet_file,
 };
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::{
-    CombinedTxnLogPb, PUniqueId, RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TxnLogPb,
-    txn_log_pb,
-};
 use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
-
-fn encode_unique_id(value: UniqueId) -> PUniqueId {
-    PUniqueId {
-        hi: value.hi,
-        lo: value.lo,
-    }
-}
 
 pub(crate) fn append_lake_txn_log_with_chunk_rowset(
     ctx: &TabletWriteContext,
@@ -147,6 +134,10 @@ fn append_lake_txn_log_with_rowset_impl(
         return Err("cannot append empty record batch into lake txn log".to_string());
     }
 
+    let storage_metadata = ctx.storage_metadata_provider.as_deref().ok_or_else(|| {
+        "StarRocks lake transaction writes require a storage metadata provider".to_string()
+    })?;
+
     // A full-schema upsert has no partial-update state to materialize and no
     // delete-key control column to interpret.  Let the compat-owned codec
     // carry the transaction log at the file boundary in that common path.
@@ -167,7 +158,7 @@ fn append_lake_txn_log_with_rowset_impl(
     }
 
     register_tablet_runtime(ctx)?;
-    let schema_key = build_table_schema_key(ctx)?;
+    let schema_key = build_storage_table_schema_key(ctx)?;
 
     let legacy_log_path = txn_log_file_path(&ctx.tablet_root_path, ctx.tablet_id, txn_id)?;
     let primary_log_path = if let Some(load_id) = load_id {
@@ -176,26 +167,27 @@ fn append_lake_txn_log_with_rowset_impl(
         legacy_log_path.clone()
     };
     with_txn_log_append_lock(ctx.tablet_id, txn_id, || {
-        let mut txn_log = match read_txn_log_if_exists(&primary_log_path)? {
+        let mut txn_log = match read_storage_txn_log_if_exists(storage_metadata, &primary_log_path)?
+        {
             Some(existing) => existing,
-            None => TxnLogPb {
+            None => StorageTransactionLog {
                 tablet_id: Some(ctx.tablet_id),
                 txn_id: Some(txn_id),
-                op_write: Some(txn_log_pb::OpWrite {
+                write: Some(StorageWriteOperation {
                     rowset: None,
                     txn_meta: None,
                     dels: Vec::new(),
                     rewrite_segments: Vec::new(),
                     del_encryption_metas: Vec::new(),
                     ssts: Vec::new(),
-                    schema_key: Some(schema_key),
+                    schema_key: Some(schema_key.clone()),
                 }),
-                op_compaction: None,
-                op_schema_change: None,
-                op_alter_metadata: None,
-                op_replication: None,
+                compaction: None,
+                schema_change: None,
+                alter_metadata: None,
+                replication: None,
                 partition_id: Some(partition_id),
-                load_id: load_id.copied().map(encode_unique_id),
+                load_id: load_id.map(|id| (id.hi, id.lo)),
             },
         };
         let write_routing = resolve_lake_batch_write_routing_with_slots(
@@ -206,7 +198,7 @@ fn append_lake_txn_log_with_rowset_impl(
         )?;
         let (mut incoming_rowset, incoming_dels) = match write_routing {
             LakeBatchWriteRouting::Empty => (
-                RowsetMetadataPb {
+                StorageRowset {
                     id: None,
                     overlapped: Some(false),
                     segments: Vec::new(),
@@ -245,7 +237,7 @@ fn append_lake_txn_log_with_rowset_impl(
                 let del_payload = encode_delete_keys_file_payload(&key_batch, &ctx.tablet_schema)?;
                 write_bytes(&del_file_path, del_payload)?;
                 (
-                    RowsetMetadataPb {
+                    StorageRowset {
                         id: None,
                         overlapped: Some(false),
                         segments: Vec::new(),
@@ -348,9 +340,9 @@ fn append_lake_txn_log_with_rowset_impl(
                 "OLAP_TABLE_SINK append_lake_txn_log incoming rowset"
             );
         }
-        normalize_rowset_shared_segments(&mut incoming_rowset);
-        ensure_rowset_segment_meta_consistency(&incoming_rowset)?;
-        upsert_write_rowset_in_txn_log(
+        normalize_storage_rowset_shared_segments(&mut incoming_rowset);
+        ensure_storage_rowset_segment_meta_consistency(&incoming_rowset)?;
+        upsert_storage_write_rowset_in_txn_log(
             &mut txn_log,
             ctx.tablet_id,
             txn_id,
@@ -361,7 +353,7 @@ fn append_lake_txn_log_with_rowset_impl(
             &schema_key,
         )?;
         if ctx.partial_update.merge_condition.is_some()
-            && let Some(op_write) = txn_log.op_write.as_ref()
+            && let Some(op_write) = txn_log.write.as_ref()
             && let Some(rowset) = op_write.rowset.as_ref()
         {
             info!(
@@ -377,34 +369,35 @@ fn append_lake_txn_log_with_rowset_impl(
                 "OLAP_TABLE_SINK append_lake_txn_log merged rowset in primary log"
             );
         }
-        write_txn_log_file_for_context(ctx, &primary_log_path, &txn_log)?;
+        write_storage_txn_log(storage_metadata, &primary_log_path, &txn_log)?;
 
         // Keep writing a legacy plain txn log for compatibility with FE requests
         // that do not carry load_ids.
         if load_id.is_some() && legacy_log_path != primary_log_path {
-            let mut legacy_log = match read_txn_log_if_exists(&legacy_log_path)? {
-                Some(existing) => existing,
-                None => TxnLogPb {
-                    tablet_id: Some(ctx.tablet_id),
-                    txn_id: Some(txn_id),
-                    op_write: Some(txn_log_pb::OpWrite {
-                        rowset: None,
-                        txn_meta: None,
-                        dels: Vec::new(),
-                        rewrite_segments: Vec::new(),
-                        del_encryption_metas: Vec::new(),
-                        ssts: Vec::new(),
-                        schema_key: Some(schema_key),
-                    }),
-                    op_compaction: None,
-                    op_schema_change: None,
-                    op_alter_metadata: None,
-                    op_replication: None,
-                    partition_id: Some(partition_id),
-                    load_id: None,
-                },
-            };
-            upsert_write_rowset_in_txn_log(
+            let mut legacy_log =
+                match read_storage_txn_log_if_exists(storage_metadata, &legacy_log_path)? {
+                    Some(existing) => existing,
+                    None => StorageTransactionLog {
+                        tablet_id: Some(ctx.tablet_id),
+                        txn_id: Some(txn_id),
+                        write: Some(StorageWriteOperation {
+                            rowset: None,
+                            txn_meta: None,
+                            dels: Vec::new(),
+                            rewrite_segments: Vec::new(),
+                            del_encryption_metas: Vec::new(),
+                            ssts: Vec::new(),
+                            schema_key: Some(schema_key.clone()),
+                        }),
+                        compaction: None,
+                        schema_change: None,
+                        alter_metadata: None,
+                        replication: None,
+                        partition_id: Some(partition_id),
+                        load_id: None,
+                    },
+                };
+            upsert_storage_write_rowset_in_txn_log(
                 &mut legacy_log,
                 ctx.tablet_id,
                 txn_id,
@@ -415,7 +408,7 @@ fn append_lake_txn_log_with_rowset_impl(
                 &schema_key,
             )?;
             if ctx.partial_update.merge_condition.is_some()
-                && let Some(op_write) = legacy_log.op_write.as_ref()
+                && let Some(op_write) = legacy_log.write.as_ref()
                 && let Some(rowset) = op_write.rowset.as_ref()
             {
                 info!(
@@ -431,7 +424,7 @@ fn append_lake_txn_log_with_rowset_impl(
                     "OLAP_TABLE_SINK append_lake_txn_log merged rowset in legacy log"
                 );
             }
-            write_txn_log_file_for_context(ctx, &legacy_log_path, &legacy_log)?;
+            write_storage_txn_log(storage_metadata, &legacy_log_path, &legacy_log)?;
         }
 
         let backend_id = crate::runtime::backend_id::backend_id().unwrap_or(-1);
@@ -440,7 +433,7 @@ fn append_lake_txn_log_with_rowset_impl(
         let mut output_bytes = 0_i64;
         let mut output_segments = 0_i32;
         let mut num_delfile = 0_i64;
-        if let Some(op_write) = txn_log.op_write.as_ref() {
+        if let Some(op_write) = txn_log.write.as_ref() {
             if let Some(rowset) = op_write.rowset.as_ref() {
                 rowset_id = rowset.id.map(|value| value.to_string()).unwrap_or_default();
                 output_rows = rowset.num_rows.unwrap_or(0).max(0);
@@ -481,25 +474,6 @@ fn append_lake_txn_log_with_rowset_impl(
         });
         Ok(())
     })
-}
-
-fn build_txn_upsert_data_file_name(
-    ctx: &TabletWriteContext,
-    txn_id: i64,
-    driver_id: i32,
-    file_seq: u64,
-    write_format: StarRocksWriteFormat,
-    load_id: Option<&UniqueId>,
-) -> Result<String, String> {
-    let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
-    build_txn_data_file_name(
-        ctx.tablet_id,
-        txn_id,
-        driver_id,
-        file_seq,
-        write_format,
-        load_id,
-    )
 }
 
 fn can_append_full_upsert_through_storage_provider(
@@ -551,7 +525,7 @@ fn append_full_upsert_through_storage_provider(
     begin_time_ms: i64,
 ) -> Result<(), String> {
     let provider = ctx.storage_metadata_provider.as_deref().ok_or_else(|| {
-        "missing compat storage metadata provider for domain txn write".to_string()
+        "StarRocks lake transaction writes require a storage metadata provider".to_string()
     })?;
     register_tablet_runtime(ctx)?;
     let schema_key = build_storage_table_schema_key(ctx)?;
@@ -606,8 +580,6 @@ fn append_full_upsert_through_storage_provider(
         )?;
         write_storage_txn_log(provider, &primary_log_path, &txn_log)?;
 
-        // Keep writing the plain txn log too because older FE requests do not
-        // include the load id when they retrieve transaction state.
         if load_id.is_some() && legacy_log_path != primary_log_path {
             let mut legacy_log = read_storage_txn_log_if_exists(provider, &legacy_log_path)?
                 .unwrap_or_else(|| StorageTransactionLog {
@@ -643,6 +615,25 @@ fn append_full_upsert_through_storage_provider(
         );
         Ok(())
     })
+}
+
+fn build_txn_upsert_data_file_name(
+    ctx: &TabletWriteContext,
+    txn_id: i64,
+    driver_id: i32,
+    file_seq: u64,
+    write_format: StarRocksWriteFormat,
+    load_id: Option<&UniqueId>,
+) -> Result<String, String> {
+    let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
+    build_txn_data_file_name(
+        ctx.tablet_id,
+        txn_id,
+        driver_id,
+        file_seq,
+        write_format,
+        load_id,
+    )
 }
 
 fn read_storage_txn_log_if_exists(
@@ -738,9 +729,9 @@ fn record_storage_write_load_facts(
     });
 }
 
-fn txn_log_contains_data_segment(txn_log: &TxnLogPb, data_file_name: &str) -> bool {
+fn txn_log_contains_data_segment(txn_log: &StorageTransactionLog, data_file_name: &str) -> bool {
     txn_log
-        .op_write
+        .write
         .as_ref()
         .and_then(|op_write| op_write.rowset.as_ref())
         .is_some_and(|rowset| {
@@ -751,9 +742,9 @@ fn txn_log_contains_data_segment(txn_log: &TxnLogPb, data_file_name: &str) -> bo
         })
 }
 
-fn txn_log_contains_del_file(txn_log: &TxnLogPb, del_file_name: &str) -> bool {
+fn txn_log_contains_del_file(txn_log: &StorageTransactionLog, del_file_name: &str) -> bool {
     txn_log
-        .op_write
+        .write
         .as_ref()
         .is_some_and(|op_write| op_write.dels.iter().any(|del| del == del_file_name))
 }
@@ -778,13 +769,13 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
         return Err(format!("invalid txn_id for lake write: {}", txn_id));
     }
 
-    if ctx.storage_metadata_provider.is_some() {
-        return append_empty_rowset_through_storage_provider(ctx, txn_id, partition_id, load_id);
-    }
+    let storage_metadata = ctx.storage_metadata_provider.as_deref().ok_or_else(|| {
+        "StarRocks lake transaction writes require a storage metadata provider".to_string()
+    })?;
 
     register_tablet_runtime(ctx)?;
-    let schema_key = build_table_schema_key(ctx)?;
-    let mut incoming_rowset = RowsetMetadataPb {
+    let schema_key = build_storage_table_schema_key(ctx)?;
+    let mut incoming_rowset = StorageRowset {
         id: None,
         overlapped: Some(false),
         segments: Vec::new(),
@@ -803,8 +794,8 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
         record_predicate: None,
         segment_metas: Vec::new(),
     };
-    normalize_rowset_shared_segments(&mut incoming_rowset);
-    ensure_rowset_segment_meta_consistency(&incoming_rowset)?;
+    normalize_storage_rowset_shared_segments(&mut incoming_rowset);
+    ensure_storage_rowset_segment_meta_consistency(&incoming_rowset)?;
 
     let legacy_log_path = txn_log_file_path(&ctx.tablet_root_path, ctx.tablet_id, txn_id)?;
     let primary_log_path = if let Some(load_id) = load_id {
@@ -813,118 +804,29 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
         legacy_log_path.clone()
     };
     with_txn_log_append_lock(ctx.tablet_id, txn_id, || {
-        let mut txn_log = match read_txn_log_if_exists(&primary_log_path)? {
+        let mut txn_log = match read_storage_txn_log_if_exists(storage_metadata, &primary_log_path)?
+        {
             Some(existing) => existing,
-            None => TxnLogPb {
+            None => StorageTransactionLog {
                 tablet_id: Some(ctx.tablet_id),
                 txn_id: Some(txn_id),
-                op_write: Some(txn_log_pb::OpWrite {
+                write: Some(StorageWriteOperation {
                     rowset: None,
                     txn_meta: None,
                     dels: Vec::new(),
                     rewrite_segments: Vec::new(),
                     del_encryption_metas: Vec::new(),
                     ssts: Vec::new(),
-                    schema_key: Some(schema_key),
-                }),
-                op_compaction: None,
-                op_schema_change: None,
-                op_alter_metadata: None,
-                op_replication: None,
-                partition_id: Some(partition_id),
-                load_id: load_id.copied().map(encode_unique_id),
-            },
-        };
-        upsert_write_rowset_in_txn_log(
-            &mut txn_log,
-            ctx.tablet_id,
-            txn_id,
-            partition_id,
-            &incoming_rowset,
-            &[],
-            load_id,
-            &schema_key,
-        )?;
-        write_txn_log_file_for_context(ctx, &primary_log_path, &txn_log)?;
-
-        // Keep writing a legacy plain txn log for compatibility with FE requests
-        // that do not carry load_ids.
-        if load_id.is_some() && legacy_log_path != primary_log_path {
-            let mut legacy_log = match read_txn_log_if_exists(&legacy_log_path)? {
-                Some(existing) => existing,
-                None => TxnLogPb {
-                    tablet_id: Some(ctx.tablet_id),
-                    txn_id: Some(txn_id),
-                    op_write: Some(txn_log_pb::OpWrite {
-                        rowset: None,
-                        txn_meta: None,
-                        dels: Vec::new(),
-                        rewrite_segments: Vec::new(),
-                        del_encryption_metas: Vec::new(),
-                        ssts: Vec::new(),
-                        schema_key: Some(schema_key),
-                    }),
-                    op_compaction: None,
-                    op_schema_change: None,
-                    op_alter_metadata: None,
-                    op_replication: None,
-                    partition_id: Some(partition_id),
-                    load_id: None,
-                },
-            };
-            upsert_write_rowset_in_txn_log(
-                &mut legacy_log,
-                ctx.tablet_id,
-                txn_id,
-                partition_id,
-                &incoming_rowset,
-                &[],
-                None,
-                &schema_key,
-            )?;
-            write_txn_log_file_for_context(ctx, &legacy_log_path, &legacy_log)?;
-        }
-        Ok(())
-    })
-}
-
-fn append_empty_rowset_through_storage_provider(
-    ctx: &TabletWriteContext,
-    txn_id: i64,
-    partition_id: i64,
-    load_id: Option<&UniqueId>,
-) -> Result<(), String> {
-    let provider = ctx.storage_metadata_provider.as_deref().ok_or_else(|| {
-        "missing compat storage metadata provider for empty txn write".to_string()
-    })?;
-    register_tablet_runtime(ctx)?;
-    let schema_key = build_storage_table_schema_key(ctx)?;
-    let incoming_rowset = StorageRowset {
-        overlapped: Some(false),
-        num_rows: Some(0),
-        data_size: Some(0),
-        num_dels: Some(0),
-        ..StorageRowset::default()
-    };
-    let legacy_log_path = txn_log_file_path(&ctx.tablet_root_path, ctx.tablet_id, txn_id)?;
-    let primary_log_path = if let Some(load_id) = load_id {
-        txn_log_file_path_with_load_id(&ctx.tablet_root_path, ctx.tablet_id, txn_id, load_id)?
-    } else {
-        legacy_log_path.clone()
-    };
-    with_txn_log_append_lock(ctx.tablet_id, txn_id, || {
-        let mut txn_log = read_storage_txn_log_if_exists(provider, &primary_log_path)?
-            .unwrap_or_else(|| StorageTransactionLog {
-                tablet_id: Some(ctx.tablet_id),
-                txn_id: Some(txn_id),
-                write: Some(StorageWriteOperation {
                     schema_key: Some(schema_key.clone()),
-                    ..StorageWriteOperation::default()
                 }),
+                compaction: None,
+                schema_change: None,
+                alter_metadata: None,
+                replication: None,
                 partition_id: Some(partition_id),
                 load_id: load_id.map(|id| (id.hi, id.lo)),
-                ..StorageTransactionLog::default()
-            });
+            },
+        };
         upsert_storage_write_rowset_in_txn_log(
             &mut txn_log,
             ctx.tablet_id,
@@ -935,20 +837,34 @@ fn append_empty_rowset_through_storage_provider(
             load_id,
             &schema_key,
         )?;
-        write_storage_txn_log(provider, &primary_log_path, &txn_log)?;
+        write_storage_txn_log(storage_metadata, &primary_log_path, &txn_log)?;
 
+        // Keep writing a legacy plain txn log for compatibility with FE requests
+        // that do not carry load_ids.
         if load_id.is_some() && legacy_log_path != primary_log_path {
-            let mut legacy_log = read_storage_txn_log_if_exists(provider, &legacy_log_path)?
-                .unwrap_or_else(|| StorageTransactionLog {
-                    tablet_id: Some(ctx.tablet_id),
-                    txn_id: Some(txn_id),
-                    write: Some(StorageWriteOperation {
-                        schema_key: Some(schema_key.clone()),
-                        ..StorageWriteOperation::default()
-                    }),
-                    partition_id: Some(partition_id),
-                    ..StorageTransactionLog::default()
-                });
+            let mut legacy_log =
+                match read_storage_txn_log_if_exists(storage_metadata, &legacy_log_path)? {
+                    Some(existing) => existing,
+                    None => StorageTransactionLog {
+                        tablet_id: Some(ctx.tablet_id),
+                        txn_id: Some(txn_id),
+                        write: Some(StorageWriteOperation {
+                            rowset: None,
+                            txn_meta: None,
+                            dels: Vec::new(),
+                            rewrite_segments: Vec::new(),
+                            del_encryption_metas: Vec::new(),
+                            ssts: Vec::new(),
+                            schema_key: Some(schema_key.clone()),
+                        }),
+                        compaction: None,
+                        schema_change: None,
+                        alter_metadata: None,
+                        replication: None,
+                        partition_id: Some(partition_id),
+                        load_id: None,
+                    },
+                };
             upsert_storage_write_rowset_in_txn_log(
                 &mut legacy_log,
                 ctx.tablet_id,
@@ -959,7 +875,7 @@ fn append_empty_rowset_through_storage_provider(
                 None,
                 &schema_key,
             )?;
-            write_storage_txn_log(provider, &legacy_log_path, &legacy_log)?;
+            write_storage_txn_log(storage_metadata, &legacy_log_path, &legacy_log)?;
         }
         Ok(())
     })
@@ -1039,7 +955,7 @@ fn resolve_lake_batch_write_routing_with_slots(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
     batch_slot_ids: Option<&[Option<SlotId>]>,
-    existing_txn_log: Option<&TxnLogPb>,
+    existing_txn_log: Option<&StorageTransactionLog>,
 ) -> Result<LakeBatchWriteRouting, String> {
     let is_primary_keys_table = is_primary_keys_table_for_write(&ctx.tablet_schema)?;
     let parsed_op = parse_op_batch(batch)?;
@@ -1345,7 +1261,7 @@ fn resolve_upsert_batch_for_mode(
     data_batch: RecordBatch,
     data_batch_slot_ids: Option<&[Option<SlotId>]>,
     mode: ResolvedPartialWriteMode,
-    existing_txn_log: Option<&TxnLogPb>,
+    existing_txn_log: Option<&StorageTransactionLog>,
     full_schema_col_count: usize,
 ) -> Result<LakeBatchWriteRouting, String> {
     let data_batch =
@@ -2272,7 +2188,7 @@ fn build_partial_update_base_rows(
     output_schema: &SchemaRef,
     key_schema_indexes: &[usize],
     key_output_schema: &SchemaRef,
-    existing_txn_log: Option<&TxnLogPb>,
+    existing_txn_log: Option<&StorageTransactionLog>,
 ) -> Result<VisibleRowMap, String> {
     let mut rows = HashMap::new();
     let published_batch = load_published_visible_batch(ctx, output_schema)?;
@@ -2345,7 +2261,15 @@ fn load_published_visible_batch(
     ctx: &TabletWriteContext,
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch, String> {
-    let (latest_version, _) = load_latest_tablet_metadata(&ctx.tablet_root_path, ctx.tablet_id)?;
+    let storage_metadata_provider = ctx.storage_metadata_provider.as_deref().ok_or_else(|| {
+        "storage metadata capability is unavailable because no compat provider is installed"
+            .to_string()
+    })?;
+    let (latest_version, _) = load_latest_tablet_metadata_with_provider(
+        &ctx.tablet_root_path,
+        ctx.tablet_id,
+        storage_metadata_provider,
+    )?;
     if latest_version <= 0 {
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
@@ -2353,11 +2277,12 @@ fn load_published_visible_batch(
         &ctx.tablet_root_path,
         ctx.s3_config.as_ref(),
     )?;
-    let snapshot = match load_tablet_snapshot(
+    let snapshot = match load_tablet_snapshot_with_metadata_provider(
         ctx.tablet_id,
         latest_version,
         &ctx.tablet_root_path,
         object_store_profile.as_ref(),
+        storage_metadata_provider,
     ) {
         Ok(snapshot) => snapshot,
         Err(err) if is_missing_tablet_metadata_error(&err) => {
@@ -2396,13 +2321,13 @@ fn load_published_visible_batch(
 
 fn apply_existing_txn_log_overlay(
     ctx: &TabletWriteContext,
-    txn_log: &TxnLogPb,
+    txn_log: &StorageTransactionLog,
     rows: &mut VisibleRowMap,
     output_schema: &SchemaRef,
     key_schema_indexes: &[usize],
     key_output_schema: &SchemaRef,
 ) -> Result<(), String> {
-    let Some(op_write) = txn_log.op_write.as_ref() else {
+    let Some(op_write) = txn_log.write.as_ref() else {
         return Ok(());
     };
     if let Some(rowset) = op_write.rowset.as_ref()
@@ -2429,7 +2354,7 @@ fn apply_existing_txn_log_overlay(
 
 pub(crate) fn load_rowset_batch_for_partial_update(
     ctx: &TabletWriteContext,
-    rowset: &RowsetMetadataPb,
+    rowset: &StorageRowset,
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch, String> {
     if rowset.segments.is_empty() || rowset.num_rows.unwrap_or(0) <= 0 {
@@ -2441,7 +2366,7 @@ pub(crate) fn load_rowset_batch_for_partial_update(
 
 pub(crate) fn load_rowset_batch_for_partial_update_with_delete_predicates(
     ctx: &TabletWriteContext,
-    rowset: &RowsetMetadataPb,
+    rowset: &StorageRowset,
     rowset_visibility_version: i64,
     delete_predicates: &[StarRocksDeletePredicateRaw],
     output_schema: &SchemaRef,
@@ -2495,7 +2420,7 @@ fn load_rowset_batch_from_partial_update_snapshot(
 
 fn build_rowset_snapshot_for_partial_update(
     ctx: &TabletWriteContext,
-    rowset: &RowsetMetadataPb,
+    rowset: &StorageRowset,
     rowset_visibility_version: i64,
     delete_predicates: &[StarRocksDeletePredicateRaw],
 ) -> Result<StarRocksTabletSnapshot, String> {
@@ -2554,7 +2479,7 @@ fn build_rowset_snapshot_for_partial_update(
     })
 }
 
-fn synthetic_rowset_snapshot_version(rowset: &RowsetMetadataPb) -> i64 {
+fn synthetic_rowset_snapshot_version(rowset: &StorageRowset) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     rowset.id.hash(&mut hasher);
     rowset.version.hash(&mut hasher);
@@ -2603,7 +2528,7 @@ fn materialize_partial_upsert_batch(
     data_batch: &RecordBatch,
     data_batch_slot_ids: Option<&[Option<SlotId>]>,
     mode: ResolvedPartialWriteMode,
-    existing_txn_log: Option<&TxnLogPb>,
+    existing_txn_log: Option<&StorageTransactionLog>,
 ) -> Result<RecordBatch, String> {
     let output_schema = build_tablet_output_schema(&ctx.tablet_schema)?;
     let schema_to_batch =
@@ -3681,12 +3606,12 @@ pub(crate) fn build_rowset_for_upsert_batch(
     file_seq: u64,
     write_format: StarRocksWriteFormat,
     load_id: Option<&UniqueId>,
-) -> Result<RowsetMetadataPb, String> {
+) -> Result<StorageRowset, String> {
     let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
     let sorted_batch = sort_batch_for_native_write(batch, &ctx.tablet_schema)?;
     let write_batch = filter_decimal_cast_overflow_rows(&sorted_batch, &ctx.tablet_schema)?;
     if write_batch.num_rows() == 0 {
-        return Ok(RowsetMetadataPb {
+        return Ok(StorageRowset {
             id: None,
             overlapped: Some(false),
             segments: Vec::new(),
@@ -3722,7 +3647,7 @@ pub(crate) fn build_rowset_for_upsert_batch(
     let row_count = write_batch.num_rows() as i64;
     let (data_file_size, bundle_file_offsets, segment_metas) = match write_format {
         StarRocksWriteFormat::Native => {
-            let segment_meta = build_single_segment_metadata(&write_batch, &ctx.tablet_schema)?;
+            let segment_meta = build_single_segment_facts(&write_batch, &ctx.tablet_schema)?;
             let segment_bytes =
                 build_starrocks_native_segment_bytes(&write_batch, &ctx.tablet_schema)?;
             let segment_size = segment_bytes.len() as u64;
@@ -3734,7 +3659,7 @@ pub(crate) fn build_rowset_for_upsert_batch(
             (parquet_size, Vec::new(), Vec::new())
         }
     };
-    Ok(RowsetMetadataPb {
+    Ok(StorageRowset {
         id: None,
         overlapped: Some(false),
         segments: vec![data_file_name],
@@ -3756,7 +3681,7 @@ pub(crate) fn build_rowset_for_upsert_batch(
 }
 
 /// Builds the execution-owned facts for a lake upsert rowset.  Unlike the
-/// legacy helper above this does not construct `RowsetMetadataPb`; compat
+/// legacy helper above this does not construct `StorageRowset`; compat
 /// serializes these facts only after the transaction state machine is done.
 pub(crate) fn build_rowset_facts_for_upsert_batch(
     ctx: &TabletWriteContext,
@@ -4052,110 +3977,6 @@ fn encode_delete_keys_file_payload(
     crate::connector::starrocks::lake::delete_payload_codec::encode_delete_keys_payload(batch)
 }
 
-fn upsert_write_rowset_in_txn_log(
-    txn_log: &mut TxnLogPb,
-    tablet_id: i64,
-    txn_id: i64,
-    partition_id: i64,
-    incoming_rowset: &RowsetMetadataPb,
-    incoming_dels: &[String],
-    expected_load_id: Option<&UniqueId>,
-    expected_schema_key: &TableSchemaKeyPb,
-) -> Result<(), String> {
-    if txn_log.tablet_id != Some(tablet_id) {
-        return Err(format!(
-            "txn log tablet_id mismatch: expected={} actual={:?}",
-            tablet_id, txn_log.tablet_id
-        ));
-    }
-    if txn_log.txn_id != Some(txn_id) {
-        return Err(format!(
-            "txn log txn_id mismatch: expected={} actual={:?}",
-            txn_id, txn_log.txn_id
-        ));
-    }
-    if txn_log.op_compaction.is_some()
-        || txn_log.op_schema_change.is_some()
-        || txn_log.op_alter_metadata.is_some()
-        || txn_log.op_replication.is_some()
-    {
-        return Err(format!(
-            "unsupported mixed txn log operation for tablet={} txn={}",
-            tablet_id, txn_id
-        ));
-    }
-    if let Some(load_id) = expected_load_id {
-        if let Some(existing_load_id) = txn_log.load_id.as_ref()
-            && (existing_load_id.hi != load_id.hi || existing_load_id.lo != load_id.lo)
-        {
-            return Err(format!(
-                "txn log load_id mismatch for tablet={} txn={}: expected=({}, {}) actual=({}, {})",
-                tablet_id, txn_id, load_id.hi, load_id.lo, existing_load_id.hi, existing_load_id.lo
-            ));
-        }
-        txn_log.load_id = Some(encode_unique_id(*load_id));
-    }
-
-    let op_write = txn_log.op_write.get_or_insert_with(|| txn_log_pb::OpWrite {
-        rowset: None,
-        txn_meta: None,
-        dels: Vec::new(),
-        rewrite_segments: Vec::new(),
-        del_encryption_metas: Vec::new(),
-        ssts: Vec::new(),
-        schema_key: Some(*expected_schema_key),
-    });
-    if let Some(existing_schema_key) = op_write.schema_key.as_ref() {
-        ensure_table_schema_key_equals(existing_schema_key, expected_schema_key)?;
-    } else {
-        op_write.schema_key = Some(*expected_schema_key);
-    }
-    match op_write.rowset.as_mut() {
-        Some(existing_rowset) => merge_rowset_metadata(existing_rowset, incoming_rowset)?,
-        None => {
-            op_write.rowset = Some(incoming_rowset.clone());
-        }
-    }
-    if op_write.del_encryption_metas.is_empty() {
-        op_write.del_encryption_metas = vec![Vec::new(); op_write.dels.len()];
-    } else if op_write.del_encryption_metas.len() != op_write.dels.len() {
-        return Err(format!(
-            "txn log op_write dels/encryption metas length mismatch for tablet={} txn={}: dels={} del_encryption_metas={}",
-            tablet_id,
-            txn_id,
-            op_write.dels.len(),
-            op_write.del_encryption_metas.len()
-        ));
-    }
-    for del_name in incoming_dels {
-        if op_write.dels.iter().any(|existing| existing == del_name) {
-            continue;
-        }
-        op_write.dels.push(del_name.clone());
-        op_write.del_encryption_metas.push(Vec::new());
-    }
-    if partition_id > 0 {
-        txn_log.partition_id = Some(partition_id);
-    }
-    Ok(())
-}
-
-fn build_table_schema_key(ctx: &TabletWriteContext) -> Result<TableSchemaKeyPb, String> {
-    if ctx.db_id <= 0 {
-        return Err(format!("invalid db_id for lake write: {}", ctx.db_id));
-    }
-    let schema_id = ctx
-        .tablet_schema
-        .id
-        .filter(|v| *v > 0)
-        .ok_or_else(|| "tablet schema id is missing".to_string())?;
-    Ok(TableSchemaKeyPb {
-        db_id: Some(ctx.db_id),
-        table_id: Some(ctx.table_id),
-        schema_id: Some(schema_id),
-    })
-}
-
 fn build_storage_table_schema_key(ctx: &TabletWriteContext) -> Result<StorageSchemaKey, String> {
     if ctx.db_id <= 0 {
         return Err(format!("invalid db_id for lake write: {}", ctx.db_id));
@@ -4349,311 +4170,30 @@ fn upsert_storage_write_rowset_in_txn_log(
     Ok(())
 }
 
-fn ensure_table_schema_key_equals(
-    actual: &TableSchemaKeyPb,
-    expected: &TableSchemaKeyPb,
-) -> Result<(), String> {
-    if actual.db_id != expected.db_id
-        || actual.table_id != expected.table_id
-        || actual.schema_id != expected.schema_id
-    {
-        return Err(format!(
-            "txn log schema_key mismatch: expected=(db_id={:?}, table_id={:?}, schema_id={:?}) actual=(db_id={:?}, table_id={:?}, schema_id={:?})",
-            expected.db_id,
-            expected.table_id,
-            expected.schema_id,
-            actual.db_id,
-            actual.table_id,
-            actual.schema_id
-        ));
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub(crate) fn append_bundle_meta_with_rowset(
-    ctx: &TabletWriteContext,
-    batch: &RecordBatch,
-    txn_id: i64,
-    driver_id: i32,
-    file_seq: u64,
-    write_format: StarRocksWriteFormat,
-) -> Result<i64, String> {
-    if ctx.table_id <= 0 {
-        return Err(format!("invalid table_id for lake write: {}", ctx.table_id));
-    }
-    if ctx.tablet_id <= 0 {
-        return Err(format!(
-            "invalid tablet_id for lake write: {}",
-            ctx.tablet_id
-        ));
-    }
-    if batch.num_rows() == 0 {
-        return Err("cannot append empty record batch into lake tablet".to_string());
-    }
-
-    // TODO: serialize multi-writer updates for the same tablet root.
-    // Current simplified implementation assumes low-contention INSERT VALUES workload.
-    let (prev_version, prev_meta) =
-        load_latest_tablet_metadata(&ctx.tablet_root_path, ctx.tablet_id)?;
-    let new_version = prev_version.saturating_add(1);
-
-    let write_format = resolve_batch_write_format(write_format, &ctx.tablet_schema)?;
-    let data_file_name = build_data_file_name(
-        ctx.tablet_id,
-        new_version,
-        txn_id,
-        driver_id,
-        file_seq,
-        write_format,
-    )?;
-    let data_file_path = join_tablet_path(
-        &ctx.tablet_root_path,
-        &format!("{DATA_DIR}/{data_file_name}"),
-    )?;
-    let (row_batch, data_file_size, bundle_file_offsets, segment_metas) = match write_format {
-        StarRocksWriteFormat::Native => {
-            let sorted_batch = sort_batch_for_native_write(batch, &ctx.tablet_schema)?;
-            let segment_meta = build_single_segment_metadata(&sorted_batch, &ctx.tablet_schema)?;
-            let segment_bytes =
-                build_starrocks_native_segment_bytes(&sorted_batch, &ctx.tablet_schema)?;
-            let segment_size = segment_bytes.len() as u64;
-            write_bytes(&data_file_path, segment_bytes)?;
-            (sorted_batch, segment_size, Vec::new(), vec![segment_meta])
-        }
-        StarRocksWriteFormat::Parquet => {
-            let aligned_batch = sort_batch_for_native_write(batch, &ctx.tablet_schema)?;
-            let parquet_size = write_parquet_file(&data_file_path, &aligned_batch)?;
-            (aligned_batch, parquet_size, Vec::new(), Vec::new())
-        }
-    };
-
-    let mut rowsets = prev_meta.rowsets;
-    let new_rowset_id = next_rowset_id(&rowsets);
-    let mut new_rowset = RowsetMetadataPb {
-        id: Some(new_rowset_id),
-        overlapped: Some(false),
-        segments: vec![data_file_name],
-        num_rows: Some(row_batch.num_rows() as i64),
-        data_size: Some(data_file_size as i64),
-        delete_predicate: None,
-        num_dels: Some(0),
-        segment_size: vec![data_file_size],
-        max_compact_input_rowset_id: None,
-        version: Some(new_version),
-        del_files: Vec::new(),
-        segment_encryption_metas: Vec::new(),
-        next_compaction_offset: None,
-        bundle_file_offsets,
-        shared_segments: Vec::new(),
-        record_predicate: None,
-        segment_metas,
-    };
-    normalize_rowset_shared_segments(&mut new_rowset);
-    ensure_rowset_segment_meta_consistency(&new_rowset)?;
-    rowsets.push(new_rowset);
-
-    let schema_id = ctx
-        .tablet_schema
-        .id
-        .filter(|v| *v > 0)
-        .ok_or_else(|| "tablet schema id is missing".to_string())?;
-    let rowset_to_schema = rowsets
-        .iter()
-        .filter_map(|r| r.id.map(|id| (id, schema_id)))
-        .collect::<HashMap<_, _>>();
-
-    let tablet_meta = TabletMetadataPb {
-        id: Some(ctx.tablet_id),
-        version: Some(new_version),
-        schema: None,
-        rowsets,
-        next_rowset_id: Some(new_rowset_id.saturating_add(1)),
-        cumulative_point: Some(0),
-        delvec_meta: None,
-        compaction_inputs: Vec::new(),
-        prev_garbage_version: None,
-        orphan_files: Vec::new(),
-        enable_persistent_index: None,
-        persistent_index_type: None,
-        commit_time: None,
-        source_schema: None,
-        sstable_meta: None,
-        dcg_meta: None,
-        historical_schemas: HashMap::new(),
-        rowset_to_schema,
-        gtid: Some(0),
-        compaction_strategy: None,
-        flat_json_config: None,
-    };
-
-    if let Some(provider) = ctx.storage_metadata_provider.as_deref() {
-        let domain_metadata = provider
-            .decode_tablet_metadata(&tablet_meta.encode_to_vec())
-            .map_err(|error| {
-                format!("decode schema-change tablet metadata through compat codec failed: {error}")
-            })?;
-        write_bundle_meta_file_with_provider(
-            &ctx.tablet_root_path,
-            ctx.tablet_id,
-            new_version,
-            &ctx.tablet_schema,
-            &domain_metadata,
-            provider,
-        )?;
-    } else {
-        write_bundle_meta_file(
-            &ctx.tablet_root_path,
-            ctx.tablet_id,
-            new_version,
-            &ctx.tablet_schema,
-            &tablet_meta,
-        )?;
-    }
-    Ok(new_version)
-}
-pub(crate) fn normalize_rowset_shared_segments(rowset: &mut RowsetMetadataPb) {
-    let seg_len = rowset.segments.len();
-    if rowset.shared_segments.len() < seg_len {
-        rowset.shared_segments.resize(seg_len, false);
-    } else if rowset.shared_segments.len() > seg_len {
-        rowset.shared_segments.truncate(seg_len);
-    }
-}
-
-pub(crate) fn ensure_rowset_segment_meta_consistency(
-    rowset: &RowsetMetadataPb,
-) -> Result<(), String> {
-    if rowset.segment_metas.is_empty() {
-        return Ok(());
-    }
-    if rowset.segment_metas.len() != rowset.segments.len() {
-        return Err(format!(
-            "rowset segment_metas/segments length mismatch: segment_metas={} segments={}",
-            rowset.segment_metas.len(),
-            rowset.segments.len()
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn merge_rowset_metadata(
-    target: &mut RowsetMetadataPb,
-    incoming: &RowsetMetadataPb,
-) -> Result<(), String> {
-    ensure_rowset_segment_meta_consistency(target)?;
-    ensure_rowset_segment_meta_consistency(incoming)?;
-    normalize_rowset_shared_segments(target);
-    let mut merged_incoming = incoming.clone();
-    normalize_rowset_shared_segments(&mut merged_incoming);
-
-    let existing_segments = target
-        .segments
-        .iter()
-        .map(|seg| seg.as_str())
-        .collect::<HashSet<_>>();
-    let duplicate_count = merged_incoming
-        .segments
-        .iter()
-        .filter(|seg| existing_segments.contains(seg.as_str()))
-        .count();
-    if duplicate_count > 0 {
-        if duplicate_count == merged_incoming.segments.len() {
-            return Ok(());
-        }
-        return Err(format!(
-            "detected partial duplicate segments while merging txn rowset: duplicate_count={} incoming_segments={} existing_segments={}",
-            duplicate_count,
-            merged_incoming.segments.len(),
-            target.segments.len()
-        ));
-    }
-
-    target.segments.extend(merged_incoming.segments);
-    target.segment_size.extend(merged_incoming.segment_size);
-    target
-        .segment_encryption_metas
-        .extend(merged_incoming.segment_encryption_metas);
-    target
-        .bundle_file_offsets
-        .extend(merged_incoming.bundle_file_offsets);
-    target.segment_metas.extend(merged_incoming.segment_metas);
-    target
-        .shared_segments
-        .extend(merged_incoming.shared_segments);
-    normalize_rowset_shared_segments(target);
-    ensure_rowset_segment_meta_consistency(target)?;
-
-    target.num_rows = Some(
-        target
-            .num_rows
-            .unwrap_or(0)
-            .saturating_add(incoming.num_rows.unwrap_or(0)),
-    );
-    target.data_size = Some(
-        target
-            .data_size
-            .unwrap_or(0)
-            .saturating_add(incoming.data_size.unwrap_or(0)),
-    );
-    target.num_dels = Some(
-        target
-            .num_dels
-            .unwrap_or(0)
-            .saturating_add(incoming.num_dels.unwrap_or(0)),
-    );
-    target.overlapped = Some(
-        target.overlapped.unwrap_or(false)
-            || incoming.overlapped.unwrap_or(false)
-            || target.segments.len() > 1,
-    );
-    Ok(())
-}
-
-pub(crate) fn write_txn_log_file(path: &str, txn_log: &TxnLogPb) -> Result<(), String> {
-    write_bytes(path, txn_log.encode_to_vec())
-}
-
-/// Writes a transaction log through the compat-owned storage codec when the
-/// fragment composition supplied one. The mutation model is still being
-/// domainized, so this bridge first validates the assembled facts through the
-/// codec and lets the codec produce the persisted bytes. Native/standalone
-/// callers have no compat provider and retain their existing local path.
-fn write_txn_log_file_for_context(
-    ctx: &TabletWriteContext,
+pub(crate) fn write_txn_log_file(
+    provider: &dyn crate::connector::starrocks::ports::StorageMetadataProvider,
     path: &str,
-    txn_log: &TxnLogPb,
+    txn_log: &StorageTransactionLog,
 ) -> Result<(), String> {
-    let bytes = if let Some(provider) = ctx.storage_metadata_provider.as_deref() {
-        let assembled = txn_log.encode_to_vec();
-        let domain = provider.decode_transaction_log(&assembled)?;
-        provider.encode_transaction_log(&domain)?
-    } else {
-        txn_log.encode_to_vec()
-    };
-    write_bytes(path, bytes)
+    write_storage_txn_log(provider, path, txn_log)
 }
 
-pub(crate) fn read_txn_log_if_exists(path: &str) -> Result<Option<TxnLogPb>, String> {
-    let maybe_bytes = read_bytes_if_exists(path)?;
-    let Some(bytes) = maybe_bytes else {
-        return Ok(None);
-    };
-    let txn_log =
-        TxnLogPb::decode(bytes.as_slice()).map_err(|e| format!("decode txn log failed: {}", e))?;
-    Ok(Some(txn_log))
+pub(crate) fn read_txn_log_if_exists(
+    provider: &dyn crate::connector::starrocks::ports::StorageMetadataProvider,
+    path: &str,
+) -> Result<Option<StorageTransactionLog>, String> {
+    read_storage_txn_log_if_exists(provider, path)
 }
 
 pub(crate) fn read_combined_txn_log_if_exists(
+    provider: &dyn crate::connector::starrocks::ports::StorageMetadataProvider,
     path: &str,
-) -> Result<Option<CombinedTxnLogPb>, String> {
+) -> Result<Option<StorageCombinedTransactionLog>, String> {
     let maybe_bytes = read_bytes_if_exists(path)?;
     let Some(bytes) = maybe_bytes else {
         return Ok(None);
     };
-    let logs = CombinedTxnLogPb::decode(bytes.as_slice())
-        .map_err(|e| format!("decode combined txn log failed: {}", e))?;
-    Ok(Some(logs))
+    provider.decode_combined_transaction_log(&bytes).map(Some)
 }
 
 fn unix_millis_now() -> i64 {

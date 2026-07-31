@@ -16,8 +16,6 @@
 // under the License.
 pub mod cluster_heartbeat;
 pub(crate) mod connector_binding;
-#[cfg(feature = "compat")]
-pub mod engine_ffi;
 pub mod fragment_control;
 pub mod grpc_client;
 pub(crate) mod grpc_fragment_dispatcher;
@@ -26,8 +24,7 @@ pub mod grpc_query_lifecycle_client;
 pub(crate) mod grpc_runtime_filter_adapter;
 pub(crate) mod grpc_runtime_filter_sender;
 pub mod grpc_server;
-pub(crate) mod internal_rpc;
-pub(crate) mod internal_rpc_transport;
+pub mod internal_rpc;
 pub(crate) mod metrics_http;
 pub use metrics_http::{
     publish_backend_query_lifecycle_metrics, publish_frontend_query_lifecycle_metrics,

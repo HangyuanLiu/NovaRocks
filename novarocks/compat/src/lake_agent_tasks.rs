@@ -19,9 +19,6 @@
 
 use std::sync::Arc;
 
-use novarocks::connector::starrocks::lake::schema_adapter::{
-    build_create_tablet_schema, build_tablet_schema_from_thrift,
-};
 use novarocks::connector::starrocks::lake::schema_change::{
     CompiledRollupExpression, LakeAlterTabletMode, LakeAlterTabletTask, LakeTabletMetadataUpdate,
     LakeUpdateTabletMetaTask, RollupExpressionProgram, RollupInputSlot,
@@ -32,14 +29,17 @@ use novarocks::connector::starrocks::lake::storage_domain::{
 };
 use novarocks::exec::expr::ExprArena;
 use novarocks::runtime::starlet_shard_registry::StarletShardInfo;
-use novarocks::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, PersistentIndexTypePb,
-};
 use novarocks::thrift::agent_service::{
     TAlterJobType, TAlterTabletReqV2, TCompactionStrategy, TCreateTabletReq, TPersistentIndexType,
     TTabletType, TUpdateTabletMetaInfoReq,
 };
 use novarocks::thrift::exprs::TExpr;
+
+use crate::schema_wire::{
+    COMPACTION_STRATEGY_DEFAULT, COMPACTION_STRATEGY_REAL_TIME, PERSISTENT_INDEX_CLOUD_NATIVE,
+    PERSISTENT_INDEX_LOCAL, build_create_tablet_schema, build_tablet_schema_from_thrift,
+    map_create_tablet_compaction_strategy, map_create_tablet_persistent_index_type,
+};
 
 pub(crate) struct CompatLakeAgentTaskAdapter {
     storage_metadata_provider:
@@ -98,7 +98,7 @@ fn adapt_create_tablet_task(
                 .compaction_strategy
                 .map(map_create_tablet_compaction_strategy)
                 .transpose()?
-                .or(Some(CompactionStrategyPb::Default as i32)),
+                .or(Some(COMPACTION_STRATEGY_DEFAULT)),
             flat_json_config: request
                 .flat_json_config
                 .as_ref()
@@ -113,34 +113,6 @@ fn adapt_create_tablet_task(
                 .unwrap_or(false),
         },
     )
-}
-
-fn map_create_tablet_persistent_index_type(
-    persistent_index_type: TPersistentIndexType,
-) -> Result<i32, String> {
-    if persistent_index_type == TPersistentIndexType::LOCAL {
-        return Ok(PersistentIndexTypePb::Local as i32);
-    }
-    if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
-        return Ok(PersistentIndexTypePb::CloudNative as i32);
-    }
-    Err(format!(
-        "unsupported create_tablet persistent_index_type={persistent_index_type:?}"
-    ))
-}
-
-fn map_create_tablet_compaction_strategy(
-    compaction_strategy: TCompactionStrategy,
-) -> Result<i32, String> {
-    if compaction_strategy == TCompactionStrategy::DEFAULT {
-        return Ok(CompactionStrategyPb::Default as i32);
-    }
-    if compaction_strategy == TCompactionStrategy::REAL_TIME {
-        return Ok(CompactionStrategyPb::RealTime as i32);
-    }
-    Err(format!(
-        "unsupported create_tablet compaction_strategy={compaction_strategy:?}"
-    ))
 }
 
 fn adapt_update_tablet_meta_task(
@@ -206,10 +178,10 @@ fn map_update_tablet_meta_persistent_index_type(
     persistent_index_type: TPersistentIndexType,
 ) -> Result<i32, String> {
     if persistent_index_type == TPersistentIndexType::LOCAL {
-        return Ok(PersistentIndexTypePb::Local as i32);
+        return Ok(PERSISTENT_INDEX_LOCAL);
     }
     if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
-        return Ok(PersistentIndexTypePb::CloudNative as i32);
+        return Ok(PERSISTENT_INDEX_CLOUD_NATIVE);
     }
     Err(format!(
         "update_tablet_meta_info unsupported persistent_index_type={persistent_index_type:?}"
@@ -220,10 +192,10 @@ fn map_update_tablet_meta_compaction_strategy(
     compaction_strategy: TCompactionStrategy,
 ) -> Result<i32, String> {
     if compaction_strategy == TCompactionStrategy::DEFAULT {
-        return Ok(CompactionStrategyPb::Default as i32);
+        return Ok(COMPACTION_STRATEGY_DEFAULT);
     }
     if compaction_strategy == TCompactionStrategy::REAL_TIME {
-        return Ok(CompactionStrategyPb::RealTime as i32);
+        return Ok(COMPACTION_STRATEGY_REAL_TIME);
     }
     Err(format!(
         "update_tablet_meta_info unsupported compaction_strategy={compaction_strategy:?}"

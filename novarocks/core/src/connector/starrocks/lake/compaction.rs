@@ -16,7 +16,6 @@
 // under the License.
 
 use arrow::record_batch::RecordBatch;
-use prost::Message;
 use std::sync::Arc;
 
 use crate::connector::starrocks::lake::context::{TabletWriteContext, with_txn_log_append_lock};
@@ -24,26 +23,28 @@ use crate::connector::starrocks::lake::service_domain::{
     AbortCompactionCommand, CompactTabletsCommand, CompactTabletsResult, CompactionStat,
     LakeOkResult,
 };
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageCompactionOperation, StorageRowset, StorageTransactionLog,
+};
 use crate::connector::starrocks::lake::transactions::resolve_tablet_location;
 use crate::connector::starrocks::lake::txn_log::{
-    build_metadata_object_store_profile_for_partial, build_rowset_for_upsert_batch,
-    build_tablet_output_schema, write_txn_log_file,
+    build_metadata_object_store_profile_for_partial, build_rowset_facts_for_upsert_batch,
+    build_tablet_output_schema,
 };
-use crate::connector::starrocks::ports::LakeStorageDependencies;
+use crate::connector::starrocks::ports::{LakeStorageDependencies, StorageMetadataProvider};
 use crate::connector::starrocks::schema::StarRocksKeysType;
-use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
+use crate::formats::starrocks::metadata::{
+    StarRocksTabletSnapshot, load_bundle_segment_footers,
+    load_tablet_snapshot_with_metadata_provider,
+};
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::formats::starrocks::writer::bundle_meta::load_tablet_metadata_at_version;
+use crate::formats::starrocks::writer::bundle_meta::load_tablet_metadata_at_version_with_provider;
+use crate::formats::starrocks::writer::io::write_transaction_log_with_provider;
+use crate::formats::starrocks::writer::layout::txn_log_file_path;
 use crate::formats::starrocks::writer::parquet::read_bundle_parquet_snapshot_if_any;
 use crate::novarocks_logging::warn;
-use crate::service::grpc_client::proto::starrocks::{
-    AbortCompactionRequest, AbortCompactionResponse, CompactRequest, CompactResponse, CompactStat,
-    StatusPb, TabletParallelConfig, TxnLogPb, txn_log_pb,
-};
-
-const STATUS_CODE_OK: i32 = 0;
 
 pub fn execute_compact(
     dependencies: &LakeStorageDependencies,
@@ -54,77 +55,42 @@ pub fn execute_compact(
         "compact",
         &command.tablet_ids,
     );
-    let response = compact_inner(
-        &compact_request_from_command(command),
-        dependencies.storage_metadata.clone(),
-    )?;
-    let txn_logs = if response.txn_logs.is_empty() {
-        Vec::new()
-    } else {
-        let provider = dependencies.storage_metadata()?;
-        response
-            .txn_logs
-            .iter()
-            .map(|log| provider.decode_transaction_log(&log.encode_to_vec()))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    Ok(CompactTabletsResult {
-        failed_tablets: response.failed_tablets,
-        compact_stats: response
-            .compact_stats
-            .into_iter()
-            .filter_map(|stat| {
-                stat.tablet_id.map(|tablet_id| CompactionStat {
-                    tablet_id,
-                    total_compact_input_file_size: stat.total_compact_input_file_size.unwrap_or(0),
-                    read_segment_count: stat.read_segment_count.unwrap_or(0),
-                    write_segment_count: stat.write_segment_count.unwrap_or(0),
-                    write_segment_bytes: stat.write_segment_bytes.unwrap_or(0),
-                })
-            })
-            .collect(),
-        success_compaction_input_file_size: response
-            .success_compaction_input_file_size
-            .unwrap_or(0),
-        txn_logs,
-    })
+    compact_inner(command, dependencies.storage_metadata()?)
 }
 
 fn compact_inner(
-    request: &CompactRequest,
-    storage_metadata_provider: Option<
-        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
-    >,
-) -> Result<CompactResponse, String> {
-    let txn_id = request
+    command: &CompactTabletsCommand,
+    storage_metadata: &Arc<dyn StorageMetadataProvider>,
+) -> Result<CompactTabletsResult, String> {
+    let txn_id = command
         .txn_id
         .ok_or_else(|| "compact missing txn_id".to_string())?;
     if txn_id <= 0 {
         return Err(format!("compact has non-positive txn_id={txn_id}"));
     }
-    let version = request
+    let version = command
         .version
         .ok_or_else(|| "compact missing version".to_string())?;
     if version <= 0 {
         return Err(format!("compact has non-positive version={version}"));
     }
-    if request.tablet_ids.is_empty() {
+    if command.tablet_ids.is_empty() {
         return Err("compact missing tablet_ids".to_string());
     }
 
-    let skip_write_txnlog = request.skip_write_txnlog.unwrap_or(false);
+    let skip_write_txnlog = command.skip_write_txnlog.unwrap_or(false);
     let mut failed_tablets = Vec::new();
     let mut compact_stats = Vec::new();
     let mut txn_logs = Vec::new();
     let mut success_compaction_input_file_size = 0_i64;
 
-    for tablet_id in &request.tablet_ids {
+    for tablet_id in &command.tablet_ids {
         match compact_one_tablet(
             *tablet_id,
             txn_id,
             version,
             skip_write_txnlog,
-            storage_metadata_provider.clone(),
+            Arc::clone(storage_metadata),
         ) {
             Ok(result) => {
                 success_compaction_input_file_size = success_compaction_input_file_size
@@ -144,16 +110,11 @@ fn compact_inner(
         }
     }
 
-    Ok(CompactResponse {
+    Ok(CompactTabletsResult {
         failed_tablets,
-        status: Some(StatusPb {
-            status_code: STATUS_CODE_OK,
-            error_msgs: Vec::new(),
-        }),
         compact_stats,
-        success_compaction_input_file_size: Some(success_compaction_input_file_size),
+        success_compaction_input_file_size,
         txn_logs,
-        subtask_statuses: Vec::new(),
     })
 }
 
@@ -161,50 +122,18 @@ pub fn execute_abort_compaction(
     _dependencies: &LakeStorageDependencies,
     command: &AbortCompactionCommand,
 ) -> Result<LakeOkResult, String> {
-    abort_compaction_inner(&AbortCompactionRequest {
-        txn_id: command.txn_id,
-    })?;
-    Ok(LakeOkResult)
-}
-
-fn compact_request_from_command(command: &CompactTabletsCommand) -> CompactRequest {
-    CompactRequest {
-        tablet_ids: command.tablet_ids.clone(),
-        txn_id: command.txn_id,
-        version: command.version,
-        timeout_ms: command.timeout_ms,
-        allow_partial_success: command.allow_partial_success,
-        encryption_meta: command.encryption_meta.clone(),
-        force_base_compaction: command.force_base_compaction,
-        skip_write_txnlog: command.skip_write_txnlog,
-        parallel_config: command.parallel_config.map(|config| TabletParallelConfig {
-            enable_parallel: config.enable_parallel,
-            max_parallel_per_tablet: config.max_parallel_per_tablet,
-            max_bytes_per_subtask: config.max_bytes_per_subtask,
-        }),
-    }
-}
-
-fn abort_compaction_inner(
-    request: &AbortCompactionRequest,
-) -> Result<AbortCompactionResponse, String> {
-    let txn_id = request
+    let txn_id = command
         .txn_id
         .ok_or_else(|| "abort_compaction missing txn_id".to_string())?;
     if txn_id <= 0 {
         return Err(format!("abort_compaction has non-positive txn_id={txn_id}"));
     }
-    Ok(AbortCompactionResponse {
-        status: Some(StatusPb {
-            status_code: STATUS_CODE_OK,
-            error_msgs: Vec::new(),
-        }),
-    })
+    Ok(LakeOkResult)
 }
 
 struct CompactOneTabletOutput {
-    txn_log: TxnLogPb,
-    stat: CompactStat,
+    txn_log: StorageTransactionLog,
+    stat: CompactionStat,
     success_compaction_input_file_size: i64,
 }
 
@@ -213,29 +142,33 @@ fn compact_one_tablet(
     txn_id: i64,
     version: i64,
     skip_write_txnlog: bool,
-    storage_metadata_provider: Option<
-        Arc<dyn crate::connector::starrocks::ports::StorageMetadataProvider>,
-    >,
+    storage_metadata: Arc<dyn StorageMetadataProvider>,
 ) -> Result<CompactOneTabletOutput, String> {
     if tablet_id <= 0 {
         return Err(format!("compact has non-positive tablet_id={tablet_id}"));
     }
 
     let (tablet_root_path, s3_config) = resolve_tablet_location("compact", tablet_id)?;
-    let metadata = load_tablet_metadata_at_version(&tablet_root_path, tablet_id, version)?
-        .ok_or_else(|| {
-            format!(
-                "compact metadata not found for tablet_id={} version={}",
-                tablet_id, version
-            )
-        })?;
+    let metadata = load_tablet_metadata_at_version_with_provider(
+        &tablet_root_path,
+        tablet_id,
+        version,
+        storage_metadata.as_ref(),
+    )?
+    .ok_or_else(|| {
+        format!(
+            "compact metadata not found for tablet_id={} version={}",
+            tablet_id, version
+        )
+    })?;
     let object_store_profile =
         build_metadata_object_store_profile_for_partial(&tablet_root_path, s3_config.as_ref())?;
-    let snapshot = load_tablet_snapshot(
+    let snapshot = load_tablet_snapshot_with_metadata_provider(
         tablet_id,
         version,
         &tablet_root_path,
         object_store_profile.as_ref(),
+        storage_metadata.as_ref(),
     )?;
     let tablet_schema = snapshot.tablet_schema.clone();
     if tablet_schema.keys_type == Some(StarRocksKeysType::Primary) {
@@ -289,10 +222,10 @@ fn compact_one_tablet(
                 tablet_root_path: tablet_root_path.clone(),
                 tablet_schema: tablet_schema.clone(),
                 s3_config,
-                storage_metadata_provider,
+                storage_metadata_provider: Some(Arc::clone(&storage_metadata)),
                 partial_update: Default::default(),
             };
-            let new_rowset = build_rowset_for_upsert_batch(
+            let new_rowset = build_rowset_facts_for_upsert_batch(
                 &ctx,
                 &batch,
                 txn_id,
@@ -310,36 +243,27 @@ fn compact_one_tablet(
     let txn_log =
         build_compaction_txn_log(tablet_id, txn_id, version, &input_rowsets, output_rowset);
     if !skip_write_txnlog {
-        let path = crate::formats::starrocks::writer::layout::txn_log_file_path(
-            &tablet_root_path,
-            tablet_id,
-            txn_id,
-        )?;
-        with_txn_log_append_lock(tablet_id, txn_id, || write_txn_log_file(&path, &txn_log))?;
+        let path = txn_log_file_path(&tablet_root_path, tablet_id, txn_id)?;
+        with_txn_log_append_lock(tablet_id, txn_id, || {
+            write_transaction_log_with_provider(&path, &txn_log, storage_metadata.as_ref())
+        })?;
     }
 
     Ok(CompactOneTabletOutput {
         txn_log,
-        stat: CompactStat {
-            tablet_id: Some(tablet_id),
-            read_time_remote: Some(0),
-            read_bytes_remote: Some(0),
-            read_time_local: Some(0),
-            read_bytes_local: Some(0),
-            total_compact_input_file_size: Some(success_compaction_input_file_size),
-            read_segment_count: Some(read_segment_count),
-            write_segment_count: Some(write_segment_count),
-            write_segment_bytes: Some(write_segment_bytes),
-            write_time_remote: Some(0),
-            sub_task_count: Some(1),
-            in_queue_time_sec: Some(0),
+        stat: CompactionStat {
+            tablet_id,
+            total_compact_input_file_size: success_compaction_input_file_size,
+            read_segment_count,
+            write_segment_count,
+            write_segment_bytes,
         },
         success_compaction_input_file_size,
     })
 }
 
 fn load_compaction_visible_batch(
-    snapshot: &crate::formats::starrocks::metadata::StarRocksTabletSnapshot,
+    snapshot: &StarRocksTabletSnapshot,
     tablet_root_path: &str,
     object_store_profile: Option<&crate::connector::starrocks::ObjectStoreProfile>,
     output_schema: &arrow::datatypes::SchemaRef,
@@ -368,30 +292,23 @@ fn build_compaction_txn_log(
     txn_id: i64,
     version: i64,
     input_rowsets: &[u32],
-    output_rowset: Option<crate::service::grpc_client::proto::starrocks::RowsetMetadataPb>,
-) -> TxnLogPb {
+    output_rowset: Option<StorageRowset>,
+) -> StorageTransactionLog {
     let new_segment_count = output_rowset
         .as_ref()
         .map(|rowset| i32::try_from(rowset.segments.len()).unwrap_or(i32::MAX))
         .unwrap_or(0);
-    TxnLogPb {
+    StorageTransactionLog {
         tablet_id: Some(tablet_id),
         txn_id: Some(txn_id),
-        op_write: None,
-        op_compaction: Some(txn_log_pb::OpCompaction {
+        compaction: Some(StorageCompactionOperation {
             input_rowsets: input_rowsets.to_vec(),
             output_rowset,
-            input_sstables: Vec::new(),
-            output_sstable: None,
             compact_version: Some(version),
             new_segment_offset: Some(0),
             new_segment_count: Some(new_segment_count),
-            ssts: Vec::new(),
+            ..StorageCompactionOperation::default()
         }),
-        op_schema_change: None,
-        op_alter_metadata: None,
-        op_replication: None,
-        partition_id: None,
-        load_id: None,
+        ..StorageTransactionLog::default()
     }
 }

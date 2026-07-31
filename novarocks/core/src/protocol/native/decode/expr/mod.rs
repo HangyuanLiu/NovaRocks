@@ -34,13 +34,11 @@ mod collection;
 mod function_call;
 mod lambda;
 mod literal;
-#[cfg(feature = "compat")]
 mod min_max;
 mod nested;
 mod predicate;
 mod unary;
 
-#[cfg(feature = "compat")]
 pub(crate) use min_max::extract_min_max_predicates;
 
 #[allow(dead_code)]

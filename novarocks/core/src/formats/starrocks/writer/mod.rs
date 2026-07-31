@@ -53,6 +53,4 @@ pub use parquet::{
     read_bundle_parquet_snapshot_with_output_hints_if_any, write_parquet_file,
 };
 pub use segment_data::build_starrocks_native_segment_bytes;
-pub use segment_meta::{
-    build_single_segment_facts, build_single_segment_metadata, sort_batch_for_native_write,
-};
+pub use segment_meta::{build_single_segment_facts, sort_batch_for_native_write};

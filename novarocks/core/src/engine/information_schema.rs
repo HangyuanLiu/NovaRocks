@@ -156,12 +156,6 @@ fn materialized_view_rows(
         .mv_repository
         .list_definitions()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
-    let snapshot = state
-        .starrocks_table
-        .read()
-        .expect("standalone StarRocks table read lock")
-        .snapshot
-        .clone();
     let mut rows = Vec::new();
     for mv in &definitions {
         if mv.storage_engine.eq_ignore_ascii_case("iceberg") {
@@ -178,39 +172,8 @@ fn materialized_view_rows(
             });
             continue;
         }
-        let Some(table) = snapshot.tables.iter().find(|table| {
-            table.table_id == mv.mv_id && is_starrocks_materialized_view(&table.kind)
-        }) else {
-            continue;
-        };
-        let Some(database) = snapshot
-            .databases
-            .iter()
-            .find(|database| database.db_id == table.db_id)
-        else {
-            continue;
-        };
-        let is_active = is_starrocks_table_active(&table.state);
-        rows.push(MaterializedViewInfoRow {
-            table_schema: database.name.clone(),
-            table_name: table.name.clone(),
-            is_active,
-            inactive_reason: if is_active {
-                None
-            } else {
-                Some(format!("{:?}", table.state))
-            },
-        });
     }
     Ok(rows)
-}
-
-fn is_starrocks_materialized_view(kind: &impl std::fmt::Debug) -> bool {
-    format!("{kind:?}") == "MaterializedView"
-}
-
-fn is_starrocks_table_active(state: &impl std::fmt::Debug) -> bool {
-    format!("{state:?}") == "Active"
 }
 
 fn is_information_schema_be_configs(factor: &sqlast::TableFactor) -> bool {

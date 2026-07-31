@@ -44,9 +44,6 @@ use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksScalarType, StarRocksTabletSchema, StarRocksTypeDesc,
     StarRocksTypeNode,
 };
-use crate::service::grpc_client::proto::starrocks::{
-    PScalarType, PTypeDesc, PTypeNode, SegmentMetadataPb, TuplePb, VariantPb, VariantTypePb,
-};
 use novarocks_types::largeint;
 
 const TYPE_NODE_SCALAR: i32 = 0;
@@ -169,29 +166,6 @@ pub fn sort_batch_for_native_write(
     }
     RecordBatch::try_new(aligned_batch.schema(), sorted_columns)
         .map_err(|e| format!("build sorted record batch failed: {e}"))
-}
-
-pub fn build_single_segment_metadata(
-    sorted_batch: &RecordBatch,
-    tablet_schema: &StarRocksTabletSchema,
-) -> Result<SegmentMetadataPb, String> {
-    let sorted_batch = align_batch_columns_to_schema(sorted_batch, tablet_schema)?;
-    if sorted_batch.num_rows() == 0 {
-        return Err("cannot build segment metadata from empty batch".to_string());
-    }
-    let sort_key_indexes = resolve_sort_key_indexes(tablet_schema, sorted_batch.num_columns())?;
-    let sort_key_min = build_sort_key_tuple(&sorted_batch, tablet_schema, &sort_key_indexes, 0)?;
-    let sort_key_max = build_sort_key_tuple(
-        &sorted_batch,
-        tablet_schema,
-        &sort_key_indexes,
-        sorted_batch.num_rows() - 1,
-    )?;
-    Ok(SegmentMetadataPb {
-        sort_key_min: Some(sort_key_min),
-        sort_key_max: Some(sort_key_max),
-        num_rows: Some(sorted_batch.num_rows() as i64),
-    })
 }
 
 /// Produces protocol-neutral segment facts for lake transaction state.  The
@@ -359,29 +333,6 @@ fn resolve_sort_key_indexes(
     Ok(indexes)
 }
 
-fn build_sort_key_tuple(
-    batch: &RecordBatch,
-    tablet_schema: &StarRocksTabletSchema,
-    sort_key_indexes: &[usize],
-    row_idx: usize,
-) -> Result<TuplePb, String> {
-    let mut values = Vec::with_capacity(sort_key_indexes.len());
-    for col_idx in sort_key_indexes {
-        let schema_col = tablet_schema.column.get(*col_idx).ok_or_else(|| {
-            format!(
-                "sort key column index out of range in tablet schema: idx={} columns={}",
-                col_idx,
-                tablet_schema.column.len()
-            )
-        })?;
-        let array = batch.column(*col_idx);
-        let value_type = parse_sort_key_value_type(schema_col)?;
-        let variant = build_variant_for_value(array, schema_col, value_type, *col_idx, row_idx)?;
-        values.push(variant);
-    }
-    Ok(TuplePb { values })
-}
-
 fn build_sort_key_tuple_facts(
     batch: &RecordBatch,
     tablet_schema: &StarRocksTabletSchema,
@@ -407,117 +358,6 @@ fn build_sort_key_tuple_facts(
         )?);
     }
     Ok(StorageTuple { values })
-}
-
-fn build_variant_for_value(
-    array: &ArrayRef,
-    schema_col: &StarRocksColumnSchema,
-    value_type: SortKeyValueType,
-    col_idx: usize,
-    row_idx: usize,
-) -> Result<VariantPb, String> {
-    let type_desc = build_scalar_type_desc(schema_col, value_type)?;
-    if array.is_null(row_idx) {
-        return Ok(VariantPb {
-            r#type: Some(type_desc),
-            value: None,
-            variant_type: Some(VariantTypePb::NullValue as i32),
-        });
-    }
-    let value = match value_type {
-        SortKeyValueType::TinyInt
-        | SortKeyValueType::SmallInt
-        | SortKeyValueType::Int
-        | SortKeyValueType::BigInt
-        | SortKeyValueType::LargeInt => {
-            extract_integral_sort_key_value(array, row_idx, col_idx)?.to_string()
-        }
-        SortKeyValueType::Boolean => {
-            let typed = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    format!(
-                        "sort-key type mismatch: expected Boolean array at column {}",
-                        col_idx
-                    )
-                })?;
-            if typed.value(row_idx) {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            }
-        }
-        SortKeyValueType::Float => {
-            let typed = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    format!(
-                        "sort-key type mismatch: expected Float32 array at column {}",
-                        col_idx
-                    )
-                })?;
-            typed.value(row_idx).to_string()
-        }
-        SortKeyValueType::Double => {
-            let typed = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    format!(
-                        "sort-key type mismatch: expected Float64 array at column {}",
-                        col_idx
-                    )
-                })?;
-            typed.value(row_idx).to_string()
-        }
-        SortKeyValueType::Varchar => extract_varchar_sort_key_value(array, row_idx, col_idx)?,
-        SortKeyValueType::Date => {
-            let typed = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| {
-                    format!(
-                        "sort-key type mismatch: expected Date32 array at column {}",
-                        col_idx
-                    )
-                })?;
-            format_date32_sort_key_value(typed.value(row_idx))?
-        }
-        SortKeyValueType::Datetime => extract_datetime_sort_key_value(array, row_idx, col_idx)?,
-        SortKeyValueType::Decimal { wire_type, scale } => {
-            if wire_type == StarRocksSegmentWireType::Decimal256 {
-                let typed = array
-                    .as_any()
-                    .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| {
-                        format!(
-                            "sort-key type mismatch: expected Decimal256 array at column {}",
-                            col_idx
-                        )
-                    })?;
-                format_decimal256_sort_key_value(typed.value(row_idx), scale)
-            } else {
-                let typed = array
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| {
-                        format!(
-                            "sort-key type mismatch: expected Decimal128 array at column {}",
-                            col_idx
-                        )
-                    })?;
-                format_decimal_sort_key_value(typed.value(row_idx), scale)
-            }
-        }
-    };
-
-    Ok(VariantPb {
-        r#type: Some(type_desc),
-        value: Some(value),
-        variant_type: Some(VariantTypePb::NormalValue as i32),
-    })
 }
 
 fn build_variant_facts_for_value(
@@ -643,29 +483,6 @@ fn parse_sort_key_value_type(col: &StarRocksColumnSchema) -> Result<SortKeyValue
             other
         )),
     }
-}
-
-fn build_scalar_type_desc(
-    col: &StarRocksColumnSchema,
-    value_type: SortKeyValueType,
-) -> Result<PTypeDesc, String> {
-    let facts = build_scalar_type_desc_facts(col, value_type)?;
-    Ok(PTypeDesc {
-        types: facts
-            .types
-            .into_iter()
-            .map(|node| PTypeNode {
-                r#type: node.r#type,
-                scalar_type: node.scalar_type.map(|scalar| PScalarType {
-                    r#type: scalar.r#type,
-                    len: scalar.len,
-                    precision: scalar.precision,
-                    scale: scalar.scale,
-                }),
-                struct_fields: Vec::new(),
-            })
-            .collect(),
-    })
 }
 
 fn build_scalar_type_desc_facts(

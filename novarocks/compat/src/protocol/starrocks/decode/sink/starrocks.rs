@@ -32,11 +32,10 @@ use crate::protocol::starrocks::decode::{
     FragmentExprArenaOwner, StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
 };
 use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
+use crate::schema_wire::build_sink_tablet_schema;
 use novarocks::common::ids::SlotId;
 use novarocks::common::types::UniqueId;
-use novarocks::connector::starrocks::lake::{
-    build_sink_tablet_schema, context::PartialUpdateWriteMode,
-};
+use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
 use novarocks::connector::starrocks::schema::StarRocksKeysType;
 use novarocks::connector::starrocks::sink::partition_key::{PartitionExprPlan, PartitionKeyValue};
 use novarocks::connector::starrocks::sink::plan::{

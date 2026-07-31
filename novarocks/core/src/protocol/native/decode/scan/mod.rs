@@ -18,9 +18,7 @@
 mod common;
 mod generic;
 mod iceberg_metadata;
-#[cfg(feature = "compat")]
 mod native_starrocks;
-#[cfg(feature = "compat")]
 mod starrocks;
 mod variant_path;
 
@@ -102,20 +100,9 @@ pub(crate) fn lower_scan_node(
         plan::scan_source::Kind::StarrocksTable(source) => {
             reject_variant_columns_for_source(scan, "StarRocksTable")
                 .map_err(|error| error.into_native(path.clone()))?;
-            #[cfg(feature = "compat")]
-            {
-                starrocks::validate_starrocks_output_columns(&output_columns, source)?;
-                starrocks::lower_starrocks_scan(node, scan, source, &output_columns, ctx, arena)
-                    .map_err(|error| error.into_native(source_path.field("starrocks_table")))
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                let _ = (node, scan, source, ctx, arena);
-                Err(NativeFragmentDecodeError::unsupported(
-                    source_path.field("starrocks_table"),
-                    "StarRocks native scan requires feature compat",
-                ))
-            }
+            starrocks::validate_starrocks_output_columns(&output_columns, source)?;
+            starrocks::lower_starrocks_scan(node, scan, source, &output_columns, ctx, arena)
+                .map_err(|error| error.into_native(source_path.field("starrocks_table")))
         }
         plan::scan_source::Kind::ConnectorRead(source) => {
             let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
@@ -905,20 +892,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "compat"))]
-    #[test]
-    fn rejects_starrocks_native_scan_without_compat_feature() {
-        let node = scan_node(starrocks_source());
-        let ctx = NativePlanDecodeContext::default()
-            .with_scan_ranges(10, vec![starrocks_range(300, 100, 7)]);
-        let mut arena = ExprArena::default();
-
-        let err = decode_node(&node, &mut arena, &ctx)
-            .expect_err("StarRocks native scan requires compat connector support");
-        assert_eq!(err, "StarRocks native scan requires feature compat");
-    }
-
-    #[cfg(feature = "compat")]
     #[test]
     fn native_starrocks_scan_decode_defers_tablet_resolution_without_registry_mutation() {
         let _guard = crate::connector::starrocks::lake::context::lock_runtime_test_state();

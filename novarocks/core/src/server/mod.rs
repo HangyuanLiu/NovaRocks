@@ -199,10 +199,6 @@ where
     .await
 }
 
-pub fn configure_standalone_internal_rpc_transport() {
-    crate::service::internal_rpc_transport::use_grpc_internal_rpc_transport();
-}
-
 async fn run_with_resolved_options_until_shutdown_with_session_factory<F, B>(
     resolved: ResolvedStandaloneServerOptions,
     mut services: StandaloneOpenServices,
@@ -213,7 +209,6 @@ where
     F: Future<Output = ()> + Send,
     B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
-    configure_standalone_internal_rpc_transport();
     let native_report_handler = Arc::clone(&services.native_report_handler);
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,

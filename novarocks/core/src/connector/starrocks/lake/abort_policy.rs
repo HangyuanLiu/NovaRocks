@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::service::grpc_client::proto::starrocks::TxnInfoPb;
+use crate::connector::starrocks::lake::service_domain::LakeTransactionInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbortTxnLogSource {
@@ -27,8 +27,8 @@ pub(crate) fn should_skip_abort_cleanup(skip_cleanup: Option<bool>) -> bool {
     skip_cleanup.unwrap_or(false)
 }
 
-pub(crate) fn decide_abort_txn_log_source(txn_info: &TxnInfoPb) -> AbortTxnLogSource {
-    if txn_info.combined_txn_log.unwrap_or(false) {
+pub(crate) fn decide_abort_txn_log_source(txn_info: &LakeTransactionInfo) -> AbortTxnLogSource {
+    if txn_info.combined_txn_log {
         AbortTxnLogSource::Combined
     } else {
         AbortTxnLogSource::PerTablet

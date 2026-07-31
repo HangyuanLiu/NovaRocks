@@ -16,8 +16,6 @@
 // under the License.
 use std::collections::HashMap;
 
-#[cfg(feature = "compat")]
-use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
 use crate::proto;
 use crate::runtime::exchange;
@@ -25,40 +23,6 @@ use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
 use crate::runtime::query_context::QueryId;
-#[cfg(feature = "compat")]
-use crate::runtime::query_context::query_context_manager;
-
-#[cfg(feature = "compat")]
-type CompatTransmitChunkRequest = proto::starrocks::PTransmitChunkParams; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatTransmitChunkResponse = proto::starrocks::PTransmitChunkResult; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatLookupRequest = proto::starrocks::PLookUpRequest; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatLookupResponse = proto::starrocks::PLookUpResponse; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatLookupCloseRequest = proto::starrocks::PLookUpCloseRequest; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatLookupCloseResponse = proto::starrocks::PLookUpCloseResponse; // cfg(feature = "compat")
-#[cfg(feature = "compat")]
-type CompatColumn = proto::starrocks::PColumn; // cfg(feature = "compat")
-
-#[cfg(feature = "compat")]
-fn ok_status() -> proto::starrocks::StatusPb {
-    proto::starrocks::StatusPb {
-        status_code: 0,
-        error_msgs: Vec::new(),
-    }
-}
-
-#[cfg(feature = "compat")]
-fn error_status(message: impl Into<String>) -> proto::starrocks::StatusPb {
-    proto::starrocks::StatusPb {
-        status_code: 1,
-        error_msgs: vec![message.into()],
-    }
-}
-
 fn ok_common_status() -> proto::common::Status {
     proto::common::Status {
         code: 0,
@@ -73,71 +37,7 @@ fn error_common_status(message: impl Into<String>) -> proto::common::Status {
     }
 }
 
-#[cfg(feature = "compat")]
-fn common_status_to_compat(status: proto::common::Status) -> proto::starrocks::StatusPb {
-    proto::starrocks::StatusPb {
-        status_code: status.code,
-        error_msgs: if status.message.is_empty() {
-            Vec::new()
-        } else {
-            vec![status.message]
-        },
-    }
-}
-
-// Used by engine_ffi.rs when feature = "compat" is enabled.
-#[cfg(feature = "compat")]
-#[allow(dead_code)]
-pub(crate) fn handle_update_fail_point_status(
-    request: proto::starrocks::PUpdateFailPointStatusRequest,
-) -> proto::starrocks::PUpdateFailPointStatusResponse {
-    let mut response = proto::starrocks::PUpdateFailPointStatusResponse {
-        status: Some(ok_status()),
-    };
-
-    let Some(name) = request.fail_point_name.as_deref() else {
-        response.status = Some(error_status("missing fail_point_name"));
-        return response;
-    };
-    let Some(trigger_mode) = request.trigger_mode.as_ref() else {
-        response.status = Some(error_status("missing trigger_mode"));
-        return response;
-    };
-    let Some(mode) = trigger_mode.mode else {
-        response.status = Some(error_status("missing trigger_mode.mode"));
-        return response;
-    };
-
-    let mode = match proto::starrocks::FailPointTriggerModeType::try_from(mode) {
-        Ok(proto::starrocks::FailPointTriggerModeType::Enable) => FailPointMode::Enable,
-        Ok(proto::starrocks::FailPointTriggerModeType::Disable) => FailPointMode::Disable,
-        Ok(proto::starrocks::FailPointTriggerModeType::ProbabilityEnable) => {
-            let Some(probability) = trigger_mode.probability else {
-                response.status = Some(error_status("missing trigger_mode.probability"));
-                return response;
-            };
-            FailPointMode::Probability(probability)
-        }
-        Ok(proto::starrocks::FailPointTriggerModeType::EnableNTimes) => {
-            let Some(n_times) = trigger_mode.n_times else {
-                response.status = Some(error_status("missing trigger_mode.n_times"));
-                return response;
-            };
-            FailPointMode::EnableNTimes(n_times)
-        }
-        Err(_) => {
-            response.status = Some(error_status(format!("invalid trigger_mode.mode={mode}")));
-            return response;
-        }
-    };
-
-    if let Err(err) = failpoint::update(name, mode) {
-        response.status = Some(error_status(err));
-    }
-    response
-}
-
-pub(crate) fn handle_transmit_chunk(
+pub fn handle_transmit_chunk(
     params: proto::novarocks::ExchangeRequest,
 ) -> proto::novarocks::ExchangeResponse {
     let mut response = proto::novarocks::ExchangeResponse {
@@ -179,61 +79,7 @@ pub(crate) fn handle_transmit_chunk(
     response
 }
 
-#[cfg(feature = "compat")]
-pub(crate) fn handle_transmit_chunk_compat(
-    params: CompatTransmitChunkRequest,
-) -> CompatTransmitChunkResponse {
-    let mut response = CompatTransmitChunkResponse {
-        status: Some(ok_status()),
-        receive_timestamp: None,
-        receiver_post_process_time: None,
-    };
-
-    let Some(finst_id) = params.finst_id.as_ref() else {
-        response.status = Some(error_status("missing finst_id for transmit_chunk"));
-        return response;
-    };
-    let Some(node_id) = params.node_id else {
-        response.status = Some(error_status("missing node_id for transmit_chunk"));
-        return response;
-    };
-    let Some(sender_id) = params.sender_id else {
-        response.status = Some(error_status("missing sender_id for transmit_chunk"));
-        return response;
-    };
-    let Some(be_number) = params.be_number else {
-        response.status = Some(error_status("missing be_number for transmit_chunk"));
-        return response;
-    };
-    let Some(eos) = params.eos else {
-        response.status = Some(error_status("missing eos for transmit_chunk"));
-        return response;
-    };
-    let Some(sequence) = params.sequence else {
-        response.status = Some(error_status("missing sequence for transmit_chunk"));
-        return response;
-    };
-    let Some(payload) = params.chunks.first().and_then(|chunk| chunk.data.as_ref()) else {
-        response.status = Some(error_status("missing chunks[0].data for transmit_chunk"));
-        return response;
-    };
-
-    let native = proto::novarocks::ExchangeRequest {
-        finst_id_hi: finst_id.hi,
-        finst_id_lo: finst_id.lo,
-        node_id,
-        sender_id,
-        be_number,
-        eos,
-        sequence,
-        payload: payload.clone(),
-    };
-    let native_response = handle_transmit_chunk(native);
-    response.status = native_response.status.map(common_status_to_compat);
-    response
-}
-
-pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
+pub fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
     let mut response = proto::filter::LookupResponse {
         status: Some(ok_common_status()),
         columns: Vec::new(),
@@ -300,101 +146,9 @@ pub(crate) fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter:
     response
 }
 
-#[cfg(feature = "compat")]
-pub(crate) fn handle_lookup_compat(req: CompatLookupRequest) -> CompatLookupResponse {
-    let mut request_columns = Vec::with_capacity(req.request_columns.len());
-    let Some(tuple_id) = req.request_tuple_id else {
-        return CompatLookupResponse {
-            status: Some(error_status("missing request_tuple_id for lookup")),
-            columns: Vec::new(),
-        };
-    };
-
-    for col in req.request_columns {
-        let Some(slot_id) = col.slot_id else {
-            return CompatLookupResponse {
-                status: Some(error_status("lookup request column missing slot_id")),
-                columns: Vec::new(),
-            };
-        };
-        let data = col.data.unwrap_or_default();
-        if data.is_empty() {
-            return CompatLookupResponse {
-                status: Some(error_status(format!(
-                    "lookup request column {} missing data",
-                    slot_id
-                ))),
-                columns: Vec::new(),
-            };
-        }
-        let data_size = col.data_size.unwrap_or(data.len() as i64);
-        request_columns.push(proto::filter::Column {
-            slot_id,
-            data_size,
-            data,
-        });
-    }
-
-    let native = proto::filter::LookupRequest {
-        query_id: req
-            .query_id
-            .as_ref()
-            .map(|query_id| proto::common::UniqueId {
-                hi: query_id.hi,
-                lo: query_id.lo,
-            }),
-        lookup_node_id: req.lookup_node_id.unwrap_or_default(),
-        request_tuple_id: tuple_id,
-        request_columns,
-    };
-    let response = handle_lookup(native);
-    let status = response.status.map(|status| proto::starrocks::StatusPb {
-        status_code: status.code,
-        error_msgs: if status.message.is_empty() {
-            Vec::new()
-        } else {
-            vec![status.message]
-        },
-    });
-    CompatLookupResponse {
-        status,
-        columns: response
-            .columns
-            .into_iter()
-            .map(|col| CompatColumn {
-                slot_id: Some(col.slot_id),
-                data_size: Some(col.data_size),
-                data: Some(col.data),
-            })
-            .collect(),
-    }
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn handle_lookup_close_compat(
-    req: CompatLookupCloseRequest,
-) -> CompatLookupCloseResponse {
-    let Some(query_id) = req.query_id else {
-        return CompatLookupCloseResponse {
-            status: Some(error_status("missing query_id for lookup_close")),
-        };
-    };
-    let Some(lookup_node_id) = req.lookup_node_id else {
-        return CompatLookupCloseResponse {
-            status: Some(error_status("missing lookup_node_id for lookup_close")),
-        };
-    };
-    let query_id = QueryId {
-        hi: query_id.hi,
-        lo: query_id.lo,
-    };
-    let status = match query_context_manager().complete_lookup_fetcher(query_id, lookup_node_id) {
-        Ok(()) => ok_status(),
-        Err(err) => error_status(err),
-    };
-    CompatLookupCloseResponse {
-        status: Some(status),
-    }
+pub fn handle_lookup_close(query_id: QueryId, lookup_node_id: i32) -> Result<(), String> {
+    crate::runtime::query_context::query_context_manager()
+        .complete_lookup_fetcher(query_id, lookup_node_id)
 }
 
 #[cfg(test)]

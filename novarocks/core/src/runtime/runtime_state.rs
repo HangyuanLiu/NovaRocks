@@ -265,7 +265,6 @@ impl RuntimeState {
         sink.append(query_id, logs);
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_info(&self, info: sink_commit::TabletCommitInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -284,7 +283,6 @@ impl RuntimeState {
         sink_commit::add_tablet_commit_info(finst_id, info);
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_commit_infos(
         &self,
         infos: impl IntoIterator<Item = sink_commit::TabletCommitInfo>,
@@ -294,7 +292,6 @@ impl RuntimeState {
         }
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_info(&self, info: sink_commit::TabletFailInfo) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
@@ -313,7 +310,6 @@ impl RuntimeState {
         sink_commit::add_tablet_fail_info(finst_id, info);
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn add_tablet_fail_infos(
         &self,
         infos: impl IntoIterator<Item = sink_commit::TabletFailInfo>,

@@ -35,7 +35,6 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 
-#[cfg(not(feature = "compat"))]
 use crate::common::config::http_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
@@ -1229,7 +1228,6 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
         .route("/metrics", get(metrics_http::handle_metrics))
 }
 
-#[cfg(not(feature = "compat"))]
 pub fn start_grpc_server_with_native_fragment_ingress(
     host: &str,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
@@ -1245,7 +1243,6 @@ pub fn start_grpc_server_with_native_fragment_ingress(
     )
 }
 
-#[cfg(not(feature = "compat"))]
 fn start_grpc_http_server(
     host: &str,
     grpc_http_port: u16,

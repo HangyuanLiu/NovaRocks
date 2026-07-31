@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use crate::connector::starrocks::INTERNAL_CATALOG_NAME;
 use crate::connector::starrocks::fe_v2_meta::{LakeScanTabletRef, LakeTableIdentity};
 use crate::connector::starrocks::scan::{
     DeferredLakeScanResolution, LakeScanSchemaMeta, StarRocksScanRange, StarRocksSchemaColumnHint,
@@ -24,7 +25,6 @@ use crate::connector::starrocks::scan::{
 use crate::connector::starrocks::schema::{
     StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
 };
-use crate::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;

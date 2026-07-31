@@ -26,7 +26,7 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{
-    StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
+    StarRocksTabletSnapshot, load_bundle_segment_footers,
     load_tablet_snapshot_with_metadata_provider,
 };
 use crate::formats::starrocks::plan::{
@@ -394,20 +394,19 @@ impl StarRocksNativeReader {
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
         let output_schema = output_chunk_schema.arrow_schema_ref();
-        let snapshot_result = lake_schema_meta
+        let storage_metadata_provider = lake_schema_meta
             .and_then(|meta| meta.storage_metadata_provider.as_deref())
-            .map_or_else(
-                || load_tablet_snapshot(tablet_id, version, storage_path, object_store_profile),
-                |provider| {
-                    load_tablet_snapshot_with_metadata_provider(
-                        tablet_id,
-                        version,
-                        storage_path,
-                        object_store_profile,
-                        provider,
-                    )
-                },
-            );
+            .ok_or_else(|| {
+                "storage metadata capability is unavailable because no compat provider is installed"
+                    .to_string()
+            })?;
+        let snapshot_result = load_tablet_snapshot_with_metadata_provider(
+            tablet_id,
+            version,
+            storage_path,
+            object_store_profile,
+            storage_metadata_provider,
+        );
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,
             Err(err)

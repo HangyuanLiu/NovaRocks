@@ -20,7 +20,6 @@ pub mod iceberg;
 pub mod runtime;
 pub(crate) mod scan_model;
 pub mod schema;
-#[cfg(feature = "compat")]
 pub mod starrocks;
 pub(crate) mod stats;
 
@@ -32,17 +31,6 @@ pub(crate) use iceberg::catalog::{
 };
 #[cfg(test)]
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
-#[cfg(feature = "compat")]
-pub(crate) use starrocks::table::{
-    StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
-    runtime_registered,
-};
-#[cfg(not(feature = "compat"))]
-pub(crate) use starrocks_table_stub::{
-    StarRocksTableCatalog, StarRocksTableConfig, register_starrocks_tables_in_catalog,
-    runtime_registered,
-};
-
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -241,7 +229,6 @@ pub use crate::connector::file_execution::FileScanRange;
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
-#[cfg(feature = "compat")]
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 
 #[cfg(test)]
@@ -250,138 +237,6 @@ mod backend_test;
 mod iceberg_provider_test;
 #[cfg(test)]
 mod runtime_test;
-
-#[cfg(not(feature = "compat"))]
-mod starrocks_table_stub {
-    use crate::common::app_config::StandaloneStarRocksTableConfig as AppStarRocksTableConfig;
-    use crate::meta::repository::starrocks_table::{
-        StarRocksTableSnapshot, StoredStarRocksPartition, StoredStarRocksTable,
-        StoredStarRocksTablet,
-    };
-    use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::sql::catalog::local::PlannerMemoryCatalog;
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct StarRocksTableConfig {
-        pub(crate) warehouse_uri: String,
-        pub(crate) s3: S3StoreConfig,
-        pub(crate) mv_default_storage_engine: String,
-    }
-
-    impl StarRocksTableConfig {
-        pub(crate) fn from_app_config(config: AppStarRocksTableConfig) -> Result<Self, String> {
-            let warehouse_uri = config
-                .warehouse_uri
-                .trim()
-                .trim_end_matches('/')
-                .to_string();
-            if warehouse_uri.is_empty() {
-                return Err("standalone StarRocks table warehouse_uri is empty".to_string());
-            }
-            let (bucket, _) = novarocks_fs::parse_object_store_path_parse_only(&warehouse_uri)
-                .map_err(|error| error.to_string())?;
-            let mv_default_storage_engine = config
-                .mv_default_storage_engine
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("iceberg")
-                .to_string();
-            if mv_default_storage_engine != "iceberg" {
-                return Err(format!(
-                    "invalid mv_default_storage_engine `{mv_default_storage_engine}`; allowed: iceberg"
-                ));
-            }
-            Ok(Self {
-                warehouse_uri,
-                s3: S3StoreConfig {
-                    endpoint: config.endpoint.trim().to_string(),
-                    bucket,
-                    access_key_id: config.access_key_id.trim().to_string(),
-                    access_key_secret: config.access_key_secret.trim().to_string(),
-                    region: config.region.as_ref().map(|value| value.trim().to_string()),
-                    enable_path_style_access: config.enable_path_style_access,
-                },
-                mv_default_storage_engine,
-            })
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub(crate) struct StarRocksTableRuntime {
-        pub(crate) database_name: String,
-        pub(crate) table: StoredStarRocksTable,
-        pub(crate) partitions: Vec<StoredStarRocksPartition>,
-        pub(crate) tablets: Vec<StoredStarRocksTablet>,
-    }
-
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct StarRocksTableCatalog {
-        pub(crate) config: Option<StarRocksTableConfig>,
-        pub(crate) snapshot: StarRocksTableSnapshot,
-        runtimes: Vec<StarRocksTableRuntime>,
-    }
-
-    impl StarRocksTableCatalog {
-        pub(crate) fn empty(config: Option<StarRocksTableConfig>) -> Self {
-            Self {
-                config,
-                snapshot: StarRocksTableSnapshot::default(),
-                runtimes: Vec::new(),
-            }
-        }
-
-        pub(crate) fn rebuild_from_repository(
-            config: Option<StarRocksTableConfig>,
-            snapshot: StarRocksTableSnapshot,
-        ) -> Result<Self, String> {
-            Ok(Self {
-                config,
-                snapshot,
-                runtimes: Vec::new(),
-            })
-        }
-
-        pub(crate) fn table(
-            &self,
-            database_name: &str,
-            table_name: &str,
-        ) -> Result<&StarRocksTableRuntime, String> {
-            let _ = (database_name, table_name);
-            Err("standalone StarRocks tables require the compat feature".to_string())
-        }
-
-        pub(crate) fn runtime_by_table_id(&self, table_id: i64) -> Option<&StarRocksTableRuntime> {
-            let _ = table_id;
-            None
-        }
-
-        pub(crate) fn list_tables_in_database(
-            &self,
-            database_name: &str,
-        ) -> Result<Vec<String>, String> {
-            Ok(self
-                .runtimes
-                .iter()
-                .filter(|runtime| runtime.database_name == database_name)
-                .map(|runtime| runtime.table.name.clone())
-                .collect())
-        }
-    }
-
-    pub(crate) fn runtime_registered(tablet_id: i64) -> bool {
-        let _ = tablet_id;
-        false
-    }
-
-    pub(crate) fn register_starrocks_tables_in_catalog(
-        catalog: &mut PlannerMemoryCatalog,
-        starrocks: &StarRocksTableCatalog,
-    ) -> Result<(), String> {
-        let _ = (catalog, starrocks);
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -403,7 +258,6 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    starrocks_table_state: Option<std::sync::Weak<crate::engine::StandaloneState>>,
     catalog_backends: HashMap<&'static str, Arc<dyn CatalogBackend>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
@@ -418,7 +272,6 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            starrocks_table_state: None,
             catalog_backends: HashMap::new(),
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
@@ -464,24 +317,6 @@ impl ConnectorRegistry {
                 )
             })?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn bind_starrocks_table_state(
-        &mut self,
-        state: &Arc<crate::engine::StandaloneState>,
-    ) {
-        self.starrocks_table_state = Some(Arc::downgrade(state));
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn starrocks_table_state(
-        &self,
-    ) -> Result<Arc<crate::engine::StandaloneState>, String> {
-        self.starrocks_table_state
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| "standalone StarRocks table state is unavailable".to_string())
     }
 
     pub(crate) fn register_catalog_backend(&mut self, backend: Arc<dyn CatalogBackend>) {
@@ -593,8 +428,6 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             .connectors
             .write()
             .expect("standalone connector registry write lock");
-        #[cfg(feature = "compat")]
-        connectors.bind_starrocks_table_state(state);
         connectors.register_catalog_backend(Arc::new(
             iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(&iceberg_catalogs)),
         ));

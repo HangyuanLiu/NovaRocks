@@ -18,6 +18,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageCombinedTransactionLog, StorageTransactionLog,
+};
+use crate::connector::starrocks::ports::StorageMetadataProvider;
 use crate::formats::starrocks::fs_access::resolve_format_path;
 use novarocks_fs::FsScheme;
 use opendal::ErrorKind;
@@ -93,6 +97,64 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
             path
         )),
     }
+}
+
+/// Writes a transaction log through the explicitly installed storage wire
+/// provider. The lake kernel only passes protocol-neutral facts here; compat
+/// owns protobuf encoding at the file boundary.
+pub fn write_transaction_log_with_provider(
+    path: &str,
+    log: &StorageTransactionLog,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    let bytes = provider
+        .encode_transaction_log(log)
+        .map_err(|error| format!("encode StarRocks transaction log failed: {error}"))?;
+    write_bytes(path, bytes)
+}
+
+/// Reads a transaction log through the explicitly installed storage wire
+/// provider. A missing file remains distinguishable from an invalid payload.
+pub fn read_transaction_log_if_exists_with_provider(
+    path: &str,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<Option<StorageTransactionLog>, String> {
+    let Some(bytes) = read_bytes_if_exists(path)? else {
+        return Ok(None);
+    };
+    provider
+        .decode_transaction_log(&bytes)
+        .map(Some)
+        .map_err(|error| format!("decode StarRocks transaction log failed: {error}"))
+}
+
+/// Writes a combined transaction log through the explicitly installed storage
+/// wire provider.
+pub fn write_combined_transaction_log_with_provider(
+    path: &str,
+    log: &StorageCombinedTransactionLog,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<(), String> {
+    let bytes = provider
+        .encode_combined_transaction_log(log)
+        .map_err(|error| format!("encode StarRocks combined transaction log failed: {error}"))?;
+    write_bytes(path, bytes)
+}
+
+/// Reads a combined transaction log through the explicitly installed storage
+/// wire provider. A missing file remains distinguishable from an invalid
+/// payload.
+pub fn read_combined_transaction_log_if_exists_with_provider(
+    path: &str,
+    provider: &dyn StorageMetadataProvider,
+) -> Result<Option<StorageCombinedTransactionLog>, String> {
+    let Some(bytes) = read_bytes_if_exists(path)? else {
+        return Ok(None);
+    };
+    provider
+        .decode_combined_transaction_log(&bytes)
+        .map(Some)
+        .map_err(|error| format!("decode StarRocks combined transaction log failed: {error}"))
 }
 
 pub fn delete_path_if_exists(path: &str) -> Result<(), String> {

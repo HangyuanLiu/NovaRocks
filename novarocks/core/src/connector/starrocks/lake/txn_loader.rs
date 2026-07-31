@@ -17,42 +17,45 @@
 
 use std::collections::HashSet;
 
-use crate::connector::starrocks::lake::txn_log::{
-    read_combined_txn_log_if_exists, read_txn_log_if_exists,
+use crate::connector::starrocks::lake::service_domain::LakeTransactionInfo;
+use crate::connector::starrocks::lake::storage_domain::StorageTransactionLog;
+use crate::connector::starrocks::ports::StorageMetadataProvider;
+use crate::formats::starrocks::writer::io::{
+    read_combined_transaction_log_if_exists_with_provider,
+    read_transaction_log_if_exists_with_provider,
 };
 use crate::formats::starrocks::writer::layout::{
     combined_txn_log_file_path, txn_log_file_path, txn_log_file_path_with_load_id,
     txn_vlog_file_path,
 };
-use crate::service::grpc_client::proto::starrocks::{TxnInfoPb, TxnLogPb};
 
 #[derive(Clone)]
 pub(crate) struct LoadedTxnLog {
-    pub(crate) log: TxnLogPb,
+    pub(crate) log: StorageTransactionLog,
 }
 
+/// Loads persisted transaction facts only through the explicit storage codec.
+/// The combined-log fallback is intentionally retained: some FE plans declare
+/// a combined log while the sink has written per-tablet logs.
 pub(crate) fn load_txn_logs_for_publish(
     tablet_root_path: &str,
     tablet_id: i64,
-    txn_info: &TxnInfoPb,
+    txn_info: &LakeTransactionInfo,
+    storage_metadata: &dyn StorageMetadataProvider,
 ) -> Result<Vec<LoadedTxnLog>, String> {
-    let txn_id = txn_info
-        .txn_id
-        .ok_or_else(|| "publish_version txn_info missing txn_id".to_string())?;
+    let txn_id = txn_info.txn_id;
     if !txn_info.load_ids.is_empty() {
         let mut logs = Vec::with_capacity(txn_info.load_ids.len());
         let mut seen_paths = HashSet::with_capacity(txn_info.load_ids.len());
         for load_id in &txn_info.load_ids {
-            let load_id = crate::common::types::UniqueId {
-                hi: load_id.hi,
-                lo: load_id.lo,
-            };
             let path =
-                txn_log_file_path_with_load_id(tablet_root_path, tablet_id, txn_id, &load_id)?;
+                txn_log_file_path_with_load_id(tablet_root_path, tablet_id, txn_id, load_id)?;
             if !seen_paths.insert(path.clone()) {
                 continue;
             }
-            if let Some(txn_log) = read_txn_log_if_exists(&path)? {
+            if let Some(txn_log) =
+                read_transaction_log_if_exists_with_provider(&path, storage_metadata)?
+            {
                 logs.push(LoadedTxnLog { log: txn_log });
             }
         }
@@ -60,46 +63,52 @@ pub(crate) fn load_txn_logs_for_publish(
             return Ok(logs);
         }
         let fallback_path = txn_log_file_path(tablet_root_path, tablet_id, txn_id)?;
-        if let Some(txn_log) = read_txn_log_if_exists(&fallback_path)? {
+        if let Some(txn_log) =
+            read_transaction_log_if_exists_with_provider(&fallback_path, storage_metadata)?
+        {
             return Ok(vec![LoadedTxnLog { log: txn_log }]);
         }
         return Ok(Vec::new());
     }
 
-    if txn_info.combined_txn_log.unwrap_or(false) {
+    if txn_info.combined_txn_log {
         let combined_path = combined_txn_log_file_path(tablet_root_path, txn_id)?;
-        if let Some(combined_log) = read_combined_txn_log_if_exists(&combined_path)? {
-            let mut logs = Vec::new();
-            for log in combined_log.txn_logs {
-                if log.tablet_id == Some(tablet_id) {
-                    logs.push(LoadedTxnLog { log });
-                }
-            }
+        if let Some(combined_log) =
+            read_combined_transaction_log_if_exists_with_provider(&combined_path, storage_metadata)?
+        {
+            let logs = combined_log
+                .transaction_logs
+                .into_iter()
+                .filter(|log| log.tablet_id == Some(tablet_id))
+                .map(|log| LoadedTxnLog { log })
+                .collect::<Vec<_>>();
             if !logs.is_empty() {
                 return Ok(logs);
             }
         }
 
-        // FE may mark combined_txn_log=true while writer persists per-tablet txn logs.
-        // Fallback keeps publish path compatible with simplified sink writer.
         let tablet_path = txn_log_file_path(tablet_root_path, tablet_id, txn_id)?;
-        if let Some(txn_log) = read_txn_log_if_exists(&tablet_path)? {
+        if let Some(txn_log) =
+            read_transaction_log_if_exists_with_provider(&tablet_path, storage_metadata)?
+        {
             return Ok(vec![LoadedTxnLog { log: txn_log }]);
         }
         return Ok(Vec::new());
     }
 
     let path = txn_log_file_path(tablet_root_path, tablet_id, txn_id)?;
-    if let Some(txn_log) = read_txn_log_if_exists(&path)? {
-        return Ok(vec![LoadedTxnLog { log: txn_log }]);
-    }
-    Ok(Vec::new())
+    Ok(
+        read_transaction_log_if_exists_with_provider(&path, storage_metadata)?
+            .map(|log| vec![LoadedTxnLog { log }])
+            .unwrap_or_default(),
+    )
 }
 
 pub(crate) fn load_txn_vlog_for_publish(
     tablet_root_path: &str,
     tablet_id: i64,
     version: i64,
+    storage_metadata: &dyn StorageMetadataProvider,
 ) -> Result<Option<LoadedTxnLog>, String> {
     if version <= 0 {
         return Err(format!(
@@ -107,6 +116,8 @@ pub(crate) fn load_txn_vlog_for_publish(
         ));
     }
     let path = txn_vlog_file_path(tablet_root_path, tablet_id, version)?;
-    let maybe_log = read_txn_log_if_exists(&path)?;
-    Ok(maybe_log.map(|log| LoadedTxnLog { log }))
+    Ok(
+        read_transaction_log_if_exists_with_provider(&path, storage_metadata)?
+            .map(|log| LoadedTxnLog { log }),
+    )
 }

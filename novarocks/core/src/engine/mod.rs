@@ -16,8 +16,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "compat")]
-use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -42,15 +40,9 @@ use crate::runtime::query_result::{
 };
 
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
-use crate::connector::{
-    IcebergCatalogRegistry, StarRocksTableCatalog, StarRocksTableConfig, iceberg_namespace_exists,
-};
-#[cfg(feature = "compat")]
-use crate::connector::{register_starrocks_tables_in_catalog, runtime_registered};
+use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
-use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
-use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
 use crate::mv::repository::{MvRepository, UnavailableMvRepository};
 use crate::sql::catalog::local::PlannerMemoryCatalog;
@@ -107,187 +99,6 @@ pub struct StandaloneOptions {
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
-#[cfg(feature = "compat")]
-pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
-    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, String>, String> {
-    recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids)
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
-    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, String>, String> {
-    if tablet_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let cfg = match novarocks_config::config() {
-        Ok(cfg) => cfg,
-        Err(_) => return Ok(HashMap::new()),
-    };
-    let Some(metadata) = cfg.metadata.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let Some(standalone) = cfg.standalone_server.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let Some(app_cfg) = standalone.starrocks_table_config()? else {
-        return Ok(HashMap::new());
-    };
-    let starrocks_table_config = StarRocksTableConfig::from_app_config(app_cfg)?;
-    let provider = open_metadata_provider(&ResolvedMetadataBackend {
-        provider: metadata.provider,
-        path: metadata.path.clone(),
-    })?;
-    let read = provider.begin_read().map_err(|e| {
-        format!("open StarRocks table metadata recovery read transaction failed: {e}")
-    })?;
-    let snapshot = StarRocksTableMetaRepository
-        .load_snapshot(read.as_ref())
-        .map_err(|e| {
-            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
-        })?;
-    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
-        Some(starrocks_table_config.clone()),
-        snapshot,
-    )?;
-    let paths = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
-    register_starrocks_shard_infos(&starrocks_table_config.s3, &paths);
-    Ok(paths)
-}
-
-#[cfg(feature = "compat")]
-pub(crate) fn recover_starrocks_tablet_paths_from_state(
-    state: &Arc<StandaloneState>,
-    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, String>, String> {
-    if tablet_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut paths = {
-        let catalog = state
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock");
-        select_starrocks_tablet_paths_from_catalog(&catalog, table, tablet_ids)?
-    };
-    if starrocks_tablet_paths_cover(tablet_ids, &paths) {
-        register_starrocks_shard_infos_from_paths(state, &paths);
-        return Ok(paths);
-    }
-
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        register_starrocks_shard_infos_from_paths(state, &paths);
-        return Ok(paths);
-    };
-
-    let read = provider.begin_read().map_err(|e| {
-        format!("open StarRocks table metadata recovery read transaction failed: {e}")
-    })?;
-    let snapshot = state
-        .starrocks_table_repo
-        .load_snapshot(read.as_ref())
-        .map_err(|e| {
-            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
-        })?;
-    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
-        state.starrocks_table_config.clone(),
-        snapshot.clone(),
-    )?;
-    let recovered = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
-    if !recovered.is_empty() {
-        register_starrocks_shard_infos_from_paths(state, &recovered);
-        paths.extend(recovered);
-    }
-
-    {
-        let mut catalog = state
-            .catalog_service
-            .local()
-            .write()
-            .expect("standalone catalog write lock");
-        for database in &snapshot.databases {
-            catalog.create_database(&database.name)?;
-        }
-        register_starrocks_tables_in_catalog(&mut catalog, &rebuilt)?;
-    }
-    let mut guard = state
-        .starrocks_table
-        .write()
-        .expect("standalone StarRocks table write lock");
-    *guard = rebuilt;
-
-    Ok(paths)
-}
-
-#[cfg(feature = "compat")]
-fn select_starrocks_tablet_paths_from_catalog(
-    catalog: &StarRocksTableCatalog,
-    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
-    tablet_ids: &[i64],
-) -> Result<HashMap<i64, String>, String> {
-    let requested = tablet_ids.iter().copied().collect::<HashSet<_>>();
-    let Some(runtime) = catalog
-        .runtime_by_table_id(table.table_id)
-        .or_else(|| catalog.table(&table.db_name, &table.table_name).ok())
-    else {
-        return Ok(HashMap::new());
-    };
-    let mut paths = HashMap::with_capacity(requested.len());
-    for tablet in &runtime.tablets {
-        if requested.contains(&tablet.tablet_id) {
-            paths.insert(tablet.tablet_id, tablet.tablet_root_path.clone());
-        }
-    }
-    Ok(paths)
-}
-
-#[cfg(feature = "compat")]
-fn starrocks_tablet_paths_cover(tablet_ids: &[i64], paths: &HashMap<i64, String>) -> bool {
-    tablet_ids.iter().all(|tablet_id| {
-        paths
-            .get(tablet_id)
-            .is_some_and(|path| !path.trim().is_empty())
-    })
-}
-
-#[cfg(feature = "compat")]
-fn register_starrocks_shard_infos_from_paths(
-    state: &StandaloneState,
-    paths: &HashMap<i64, String>,
-) -> usize {
-    let Some(config) = state.starrocks_table_config.as_ref() else {
-        return 0;
-    };
-    register_starrocks_shard_infos(&config.s3, paths)
-}
-
-#[cfg(feature = "compat")]
-fn register_starrocks_shard_infos(
-    s3: &crate::runtime::starlet_shard_registry::S3StoreConfig,
-    paths: &HashMap<i64, String>,
-) -> usize {
-    if paths.is_empty() {
-        return 0;
-    }
-    crate::runtime::starlet_shard_registry::upsert_many_infos(paths.iter().map(
-        |(tablet_id, full_path)| {
-            (
-                *tablet_id,
-                crate::runtime::starlet_shard_registry::StarletShardInfo {
-                    full_path: full_path.clone(),
-                    s3: Some(s3.clone()),
-                },
-            )
-        },
-    ))
-}
-
 pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> StandaloneCatalogService {
     StandaloneCatalogService::new(
         Arc::new(RwLock::new(state.catalog_service.local_snapshot())),
@@ -309,27 +120,6 @@ pub(crate) fn build_catalog_service_provider<'a>(
         connector_context,
         lookup_mode,
     )
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneStarRocksTabletInfo {
-    pub tablet_id: i64,
-    pub bucket_seq: i64,
-    pub tablet_root_path: String,
-    pub runtime_registered: bool,
-    pub snapshot_version: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandaloneStarRocksTableInfo {
-    pub database_name: String,
-    pub table_name: String,
-    pub table_id: i64,
-    pub current_schema_id: i64,
-    pub keys_type: String,
-    pub bucket_num: i64,
-    pub visible_version: i64,
-    pub tablets: Vec<StandaloneStarRocksTabletInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -471,17 +261,13 @@ pub(crate) struct StandaloneState {
     pub(crate) execution_role: crate::common::app_config::ClusterRole,
     pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
-    pub(crate) starrocks_table: RwLock<StarRocksTableCatalog>,
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
-    pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
-    pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
-    pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     /// Provider-neutral MV metadata boundary. Production wiring is installed by
     /// the frontend host; the core default deliberately rejects MV operations.
     pub(crate) mv_repository: Arc<dyn MvRepository>,
@@ -530,15 +316,11 @@ impl Default for StandaloneState {
             execution_role: crate::common::app_config::ClusterRole::AllInOne,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
-            starrocks_table: RwLock::new(StarRocksTableCatalog::default()),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
             connector_control: Arc::new(TestConnectorControlRegistry),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
-            starrocks_table_config: None,
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
-            starrocks_table_repo: StarRocksTableMetaRepository,
-            starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository: Arc::new(UnavailableMvRepository),
             mv_application_service: Arc::new(UnavailableMvApplicationService),
             catalog_attachment_repo: CatalogAttachmentRepository,
@@ -868,20 +650,11 @@ impl StandaloneNovaRocks {
         services: StandaloneOpenServices,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        let cfg =
-            crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
             .map(open_metadata_provider)
             .transpose()?;
-        let starrocks_table_config = match cfg.standalone_server.as_ref() {
-            Some(standalone) => standalone
-                .starrocks_table_config()?
-                .map(StarRocksTableConfig::from_app_config)
-                .transpose()?,
-            None => None,
-        };
         let mv_refresh_pruning_limits = resolve_mv_refresh_pruning_limits()?;
         let StandaloneOpenServices {
             execution_role,
@@ -903,14 +676,8 @@ impl StandaloneNovaRocks {
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             execution_role,
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
-            starrocks_table: RwLock::new(StarRocksTableCatalog::empty(
-                starrocks_table_config.clone(),
-            )),
-            starrocks_table_config,
             mv_refresh_pruning_limits,
             metadata_provider: metadata_provider.clone(),
-            starrocks_table_repo: StarRocksTableMetaRepository,
-            starrocks_txn_repo: StarRocksTxnRepository,
             mv_repository,
             mv_application_service,
             catalog_attachment_repo: CatalogAttachmentRepository,
@@ -973,66 +740,6 @@ impl StandaloneNovaRocks {
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> Arc<StandaloneState> {
         Arc::clone(&self.inner)
-    }
-
-    #[cfg(feature = "compat")]
-    pub fn starrocks_table_info(
-        &self,
-        database_name: &str,
-        table_name: &str,
-    ) -> Result<StandaloneStarRocksTableInfo, String> {
-        let starrocks = self
-            .inner
-            .starrocks_table
-            .read()
-            .expect("standalone StarRocks table read lock");
-        let runtime = starrocks.table(database_name, table_name)?;
-        let visible_version = runtime
-            .partitions
-            .iter()
-            .map(|partition| partition.visible_version)
-            .max()
-            .unwrap_or(1);
-        let object_store_profile = starrocks
-            .config
-            .as_ref()
-            .map(|config| {
-                crate::connector::starrocks::ObjectStoreProfile::from_s3_store_config(&config.s3)
-            })
-            .transpose()?;
-        let tablets = runtime
-            .tablets
-            .iter()
-            .map(|tablet| {
-                let snapshot_version = object_store_profile.as_ref().and_then(|profile| {
-                    crate::formats::starrocks::metadata::load_tablet_snapshot(
-                        tablet.tablet_id,
-                        visible_version,
-                        &tablet.tablet_root_path,
-                        Some(profile),
-                    )
-                    .ok()
-                    .map(|snapshot| snapshot.version)
-                });
-                StandaloneStarRocksTabletInfo {
-                    tablet_id: tablet.tablet_id,
-                    bucket_seq: tablet.bucket_seq,
-                    tablet_root_path: tablet.tablet_root_path.clone(),
-                    runtime_registered: runtime_registered(tablet.tablet_id),
-                    snapshot_version,
-                }
-            })
-            .collect();
-        Ok(StandaloneStarRocksTableInfo {
-            database_name: runtime.database_name.clone(),
-            table_name: runtime.table.name.clone(),
-            table_id: runtime.table.table_id,
-            current_schema_id: runtime.table.current_schema_id,
-            keys_type: runtime.table.keys_type.clone(),
-            bucket_num: runtime.table.bucket_num,
-            visible_version,
-            tablets,
-        })
     }
 
     pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
@@ -5275,17 +4982,6 @@ mod tests {
         StandaloneSession, StandaloneState, StatementResult, dispatch_statement,
         register_connector_backends,
     };
-    #[cfg(feature = "compat")]
-    use super::{
-        recover_starrocks_tablet_paths_from_installed_config,
-        recover_starrocks_tablet_paths_from_state,
-    };
-    #[cfg(feature = "compat")]
-    use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
-    #[cfg(feature = "compat")]
-    use crate::connector::starrocks::lake::context::lock_runtime_test_state;
-    #[cfg(feature = "compat")]
-    use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::engine::statistics::{
         CatalogColumnStatistics, CatalogTableStatistics, StatisticsEngine,
         StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
@@ -6129,25 +5825,8 @@ path = "{metadata_path}"
         );
     }
 
-    #[cfg(not(feature = "compat"))]
     fn lock_runtime_test_state() -> super::TestSerializationGuard {
         super::acquire_standalone_test_guard()
-    }
-
-    #[cfg(feature = "compat")]
-    fn test_starrocks_table_config() -> StarRocksTableConfig {
-        StarRocksTableConfig {
-            warehouse_uri: "s3://test/warehouse".to_string(),
-            s3: crate::runtime::starlet_shard_registry::S3StoreConfig {
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                bucket: "test".to_string(),
-                access_key_id: "ak".to_string(),
-                access_key_secret: "sk".to_string(),
-                region: None,
-                enable_path_style_access: Some(true),
-            },
-            mv_default_storage_engine: "starrocks".to_string(),
-        }
     }
 
     #[test]
@@ -7663,23 +7342,6 @@ mysql_port = 47892
                 "err={drop_column_err}"
             );
 
-            let provider = engine
-                .inner
-                .metadata_provider
-                .as_ref()
-                .expect("metadata provider");
-            let read = provider.begin_read().expect("open read txn");
-            let starrocks_table_snapshot = engine
-                .inner
-                .starrocks_table_repo
-                .load_snapshot(read.as_ref())
-                .expect("load StarRocks snapshot");
-            assert!(
-                !starrocks_table_snapshot
-                    .tables
-                    .iter()
-                    .any(|table| table.name == "mv_orders")
-            );
             assert!(
                 engine
                     .inner

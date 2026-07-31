@@ -68,9 +68,7 @@ struct SinkCommitStore {
 #[derive(Default)]
 struct SinkCommitEntry {
     iceberg_commits: Vec<IcebergCommitInfo>,
-    #[cfg(feature = "compat")]
     tablet_commit_infos: Vec<TabletCommitInfo>,
-    #[cfg(feature = "compat")]
     tablet_fail_infos: Vec<TabletFailInfo>,
     /// Per-file Theta sketch sets produced by the Iceberg sink for Puffin
     /// NDV statistics. These are not Cloneable (the `ThetaSketchHandle`
@@ -163,7 +161,6 @@ pub(crate) fn take_sketch_sets(finst_id: UniqueId) -> Vec<FileSketchSet> {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
@@ -174,7 +171,6 @@ pub(crate) fn add_tablet_commit_info(finst_id: UniqueId, info: TabletCommitInfo)
     }
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TabletCommitInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
@@ -184,7 +180,6 @@ pub(crate) fn list_tablet_commit_infos(finst_id: UniqueId) -> Vec<TabletCommitIn
         .unwrap_or_default()
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
@@ -195,7 +190,6 @@ pub(crate) fn add_tablet_fail_info(finst_id: UniqueId, info: TabletFailInfo) {
     }
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TabletFailInfo> {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
@@ -245,14 +239,8 @@ pub fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
     };
     SinkCommitReportSnapshot {
         iceberg_commits: entry.iceberg_commits.clone(),
-        #[cfg(feature = "compat")]
         tablet_commit_infos: entry.tablet_commit_infos.clone(),
-        #[cfg(not(feature = "compat"))]
-        tablet_commit_infos: Vec::new(),
-        #[cfg(feature = "compat")]
         tablet_fail_infos: entry.tablet_fail_infos.clone(),
-        #[cfg(not(feature = "compat"))]
-        tablet_fail_infos: Vec::new(),
         load_stats: SinkLoadStats {
             loaded_rows: entry.loaded_rows,
             loaded_bytes: entry.loaded_bytes,

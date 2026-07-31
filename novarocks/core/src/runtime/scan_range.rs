@@ -35,7 +35,6 @@ impl ScanRangeParams {
         }
     }
 
-    #[cfg(feature = "compat")]
     pub fn broker_file(file: BrokerFileScanRange) -> Self {
         Self {
             range: ScanRange::BrokerFile(file),
@@ -45,7 +44,6 @@ impl ScanRangeParams {
         }
     }
 
-    #[cfg(feature = "compat")]
     pub fn schema_selection(selected: bool) -> Self {
         Self {
             range: ScanRange::SchemaSelection(SchemaScanSelection { selected }),
@@ -55,7 +53,6 @@ impl ScanRangeParams {
         }
     }
 
-    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     pub fn starrocks_tablet(
         tablet_id: i64,
         partition_id: i64,
@@ -74,21 +71,16 @@ impl ScanRangeParams {
 #[derive(Clone, Debug)]
 pub enum ScanRange {
     File(FileScanRange),
-    #[cfg(feature = "compat")]
     BrokerFile(BrokerFileScanRange),
-    #[cfg(feature = "compat")]
     SchemaSelection(SchemaScanSelection),
-    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     StarRocksTablet(StarRocksTabletScanRange),
 }
 
-#[cfg(feature = "compat")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchemaScanSelection {
     pub selected: bool,
 }
 
-#[cfg(feature = "compat")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrokerFileFormat {
     Csv,
@@ -97,7 +89,6 @@ pub enum BrokerFileFormat {
     Orc,
 }
 
-#[cfg(feature = "compat")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerFileScanRange {
     pub path: String,
@@ -117,7 +108,6 @@ pub struct StarRocksTabletScanRange {
 }
 
 impl StarRocksTabletScanRange {
-    #[cfg_attr(not(feature = "compat"), allow(dead_code))]
     pub fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
         for (field, value) in [
             ("tablet_id", tablet_id),

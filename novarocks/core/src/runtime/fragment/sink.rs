@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "compat")]
 use crate::connector::starrocks::sink::plan::{
     FrontendAddress, StarRocksSinkDescriptor, StarRocksSinkFactoryInput, StarRocksTableSinkProgram,
 };
@@ -24,7 +23,6 @@ use crate::exec::fragment::sink::{
     DataStreamSinkBranchProgram, FragmentSinkProgram, IcebergChangeStreamRouterProgram,
     MultiCastDataStreamSinkProgram,
 };
-#[cfg(feature = "compat")]
 use crate::exec::operators::OlapTableSinkFactory;
 use crate::exec::operators::{
     DataStreamSinkFactory, DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
@@ -141,7 +139,6 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
                 .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>)
                 .map_err(materialization_error)
         }
-        #[cfg(feature = "compat")]
         (
             FragmentSinkProgram::StarRocksTable(table),
             FragmentSinkAssignment::StarRocksTable(assignment),
@@ -165,7 +162,6 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     }
 }
 
-#[cfg(feature = "compat")]
 fn materialize_starrocks_table(
     program: &StarRocksTableSinkProgram,
     assignment: &crate::runtime::fragment::instance::StarRocksTableSinkAssignment,
@@ -176,7 +172,6 @@ fn materialize_starrocks_table(
         .map_err(materialization_error)
 }
 
-#[cfg(feature = "compat")]
 fn starrocks_factory_input(
     program: &StarRocksTableSinkProgram,
     assignment: &crate::runtime::fragment::instance::StarRocksTableSinkAssignment,
@@ -374,7 +369,6 @@ fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
         FragmentSinkProgram::DataStream(_) => "data_stream",
         FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
         FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
-        #[cfg(feature = "compat")]
         FragmentSinkProgram::StarRocksTable(_) => "starrocks_table",
         FragmentSinkProgram::IcebergTable(_) => "iceberg_table",
         FragmentSinkProgram::IcebergChangeStreamRouter(_) => "iceberg_change_stream_router",

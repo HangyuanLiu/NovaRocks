@@ -32,7 +32,6 @@ mod assert_num_rows_processor;
 mod change_event_expand_processor;
 mod data_stream_sink;
 mod exchange_source;
-#[cfg(feature = "compat")]
 mod fetch_processor;
 mod filter_processor;
 pub(crate) mod hashjoin;
@@ -59,7 +58,6 @@ mod values_source;
 
 // Re-export all public types to maintain compatibility
 pub use crate::connector::iceberg::IcebergTableSinkFactory;
-#[cfg(feature = "compat")]
 pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
 pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
@@ -75,7 +73,6 @@ pub(crate) use data_stream_sink::DataStreamSinkFactory;
 pub(crate) use data_stream_sink::take_eos_be_number_for_test;
 pub use data_stream_sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 pub use exchange_source::ExchangeSourceFactory;
-#[cfg(feature = "compat")]
 pub use fetch_processor::FetchProcessorFactory;
 pub(crate) use filter_processor::FilterEncodingPolicy;
 pub use filter_processor::FilterProcessorFactory;

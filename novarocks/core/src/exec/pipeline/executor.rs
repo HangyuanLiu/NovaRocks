@@ -250,7 +250,6 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     )
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn execute_compat_plan_with_pipeline(
     plan: ExecPlan,
     debug: bool,
@@ -284,7 +283,6 @@ pub(crate) fn execute_compat_plan_with_pipeline(
     )
 }
 
-#[cfg(feature = "compat")]
 pub(crate) fn execute_compat_plan_with_pipeline_with_root_sink_dop(
     plan: ExecPlan,
     debug: bool,

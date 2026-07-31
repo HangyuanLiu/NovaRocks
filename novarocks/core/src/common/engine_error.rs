@@ -211,19 +211,6 @@ impl EngineError {
         }
     }
 
-    #[cfg(feature = "compat")]
-    pub fn to_tstatus_code(&self) -> crate::thrift::status_code::TStatusCode {
-        match self.code {
-            EngineErrorCode::UnsupportedDistributedDmlShape => {
-                crate::thrift::status_code::TStatusCode::NOT_IMPLEMENTED_ERROR
-            }
-            EngineErrorCode::ProtocolDecodeError => {
-                crate::thrift::status_code::TStatusCode::INVALID_ARGUMENT
-            }
-            _ => crate::thrift::status_code::TStatusCode::INTERNAL_ERROR,
-        }
-    }
-
     pub fn to_mysql_error_kind(&self) -> opensrv_mysql::ErrorKind {
         match self.code {
             EngineErrorCode::UnsupportedDistributedDmlShape => {
@@ -283,11 +270,6 @@ mod tests {
         let err = EngineError::write_coordinator_gone(UniqueId { hi: 11, lo: 22 });
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
         assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
-        #[cfg(feature = "compat")]
-        assert_eq!(
-            err.to_tstatus_code(),
-            crate::thrift::status_code::TStatusCode::INTERNAL_ERROR
-        );
         assert!(err.to_user_message().contains("11/22"));
     }
 

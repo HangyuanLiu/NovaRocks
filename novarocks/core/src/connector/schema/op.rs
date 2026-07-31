@@ -68,7 +68,6 @@ impl SchemaScanOp {
 
     fn collect_rows(&self) -> Result<Vec<SchemaRow>, String> {
         let mut rows = match &self.table {
-            #[cfg(feature = "compat")]
             SchemaTable::Loads => self
                 .schema_load_provider
                 .as_ref()
@@ -76,7 +75,6 @@ impl SchemaScanOp {
                     "StarRocks schema-load capability is unavailable for this fragment".to_string()
                 })?
                 .fetch_load_rows(&self.context, self.fe_addr.as_ref())?,
-            #[cfg(feature = "compat")]
             SchemaTable::LoadTrackingLogs => self
                 .schema_load_provider
                 .as_ref()
@@ -84,7 +82,6 @@ impl SchemaScanOp {
                     "StarRocks schema-load capability is unavailable for this fragment".to_string()
                 })?
                 .fetch_tracking_load_log_rows(&self.context, self.fe_addr.as_ref())?,
-            #[cfg(feature = "compat")]
             SchemaTable::AnalyzeStatus
             | SchemaTable::CharacterSets
             | SchemaTable::Collations
@@ -334,8 +331,6 @@ impl SchemaScanOp {
             SchemaTable::Be(BeSchemaTable::Threads) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Bvars) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Unsupported(_)) => Vec::new(),
-            #[cfg(not(feature = "compat"))]
-            table => return Err(fe_only_schema_table_error(table)),
         };
 
         if let Some(limit) = self.context.limit_as_usize()
@@ -345,14 +340,6 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
-}
-
-#[cfg(not(feature = "compat"))]
-fn fe_only_schema_table_error(table: &SchemaTable) -> String {
-    format!(
-        "schema table {} requires StarRocks FE compatibility mode",
-        table.table_name()
-    )
 }
 
 fn build_be_config_rows() -> Result<Vec<SchemaRow>, String> {
@@ -757,7 +744,6 @@ mod tests {
             port: None,
             thread_id: None,
             user_ip: None,
-            #[cfg(feature = "compat")]
             current_user_ident: None,
             catalog_name: None,
             table_id: None,
@@ -774,7 +760,6 @@ mod tests {
             log_level: None,
             log_pattern: None,
             log_limit: None,
-            #[cfg(feature = "compat")]
             frontends: Vec::new(),
         }
     }

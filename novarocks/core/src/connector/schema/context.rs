@@ -14,13 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(feature = "compat")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaUserRoles {
     pub role_id_list: Option<Vec<i64>>,
 }
 
-#[cfg(feature = "compat")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaUserIdentity {
     pub username: Option<String>,
@@ -30,7 +28,6 @@ pub struct SchemaUserIdentity {
     pub current_role_ids: Option<SchemaUserRoles>,
 }
 
-#[cfg(feature = "compat")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaFrontend {
     pub id: Option<String>,
@@ -50,7 +47,6 @@ pub struct SchemaScanContext {
     pub port: Option<i32>,
     pub thread_id: Option<i64>,
     pub user_ip: Option<String>,
-    #[cfg(feature = "compat")]
     pub current_user_ident: Option<SchemaUserIdentity>,
     pub catalog_name: Option<String>,
     pub table_id: Option<i64>,
@@ -67,7 +63,6 @@ pub struct SchemaScanContext {
     pub log_level: Option<String>,
     pub log_pattern: Option<String>,
     pub log_limit: Option<i64>,
-    #[cfg(feature = "compat")]
     pub frontends: Vec<SchemaFrontend>,
 }
 

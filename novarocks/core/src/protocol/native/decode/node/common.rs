@@ -58,7 +58,6 @@ pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
         ExecNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
         ExecNodeKind::AssertNumRows(_) => "AssertNumRows",
         ExecNodeKind::Analytic(_) => "Analytic",
-        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(_) => "Fetch",
         ExecNodeKind::LookUp(_) => "LookUp",
     }

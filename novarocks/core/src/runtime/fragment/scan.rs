@@ -74,7 +74,6 @@ fn visit(
         ExecNodeKind::ChangeEventExpand(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::UnionAll(node) => visit_inputs(&node.inputs, instance, bindings),
         ExecNodeKind::Limit(node) => visit(&node.input, instance, bindings),
-        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Aggregate(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Join(node) => {
