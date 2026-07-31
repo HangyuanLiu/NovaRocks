@@ -31,7 +31,6 @@ use novarocks::connector::ConnectorRegistry;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
 use novarocks::query_execution::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::fragment::submission::FragmentSubmission;
 use novarocks::runtime::query_context::QueryId;
 use novarocks_protocol::{novarocks as proto, plan};
@@ -52,7 +51,6 @@ pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
     submission: FragmentSubmission,
     backend_num: i32,
-    report_endpoint: Option<RuntimeEndpoint>,
 }
 
 pub(crate) fn decode_native_query_execution_id(
@@ -136,7 +134,7 @@ impl NativeFragmentRequest {
             execution_resolver,
         )
         .map_err(NativeFragmentIngressError::new)?;
-        let (submission, backend_num, report_endpoint) = decoded.into_parts();
+        let (submission, backend_num) = decoded.into_parts();
         if execution_id.query_id().high() != submission.instance().query_id().hi()
             || execution_id.query_id().low() != submission.instance().query_id().lo()
         {
@@ -148,7 +146,6 @@ impl NativeFragmentRequest {
             execution_id,
             submission,
             backend_num,
-            report_endpoint,
         })
     }
 
@@ -163,9 +160,6 @@ impl NativeFragmentRequest {
     }
     pub(crate) const fn backend_num(&self) -> i32 {
         self.backend_num
-    }
-    pub(crate) fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
-        self.report_endpoint.as_ref()
     }
     pub(crate) fn enable_profile(&self) -> bool {
         self.query_options().enable_profile()

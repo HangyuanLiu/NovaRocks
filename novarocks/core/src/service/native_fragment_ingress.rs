@@ -32,8 +32,6 @@ use crate::protocol::native::decode::{
 };
 use crate::query_execution::lifecycle::QueryExecutionId;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
-use crate::runtime::endpoint::RuntimeEndpoint;
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
@@ -44,7 +42,6 @@ pub struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
     submission: FragmentSubmission,
     backend_num: i32,
-    report_endpoint: Option<RuntimeEndpoint>,
 }
 
 /// Decode the query identity before choosing the query-scoped BE execution
@@ -141,7 +138,6 @@ impl NativeFragmentRequest {
             execution_id,
             submission,
             backend_num: metadata.backend_num(),
-            report_endpoint: metadata.report_endpoint().cloned(),
         })
     }
 
@@ -159,10 +155,6 @@ impl NativeFragmentRequest {
 
     pub const fn backend_num(&self) -> i32 {
         self.backend_num
-    }
-
-    pub fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
-        self.report_endpoint.as_ref()
     }
 
     pub fn enable_profile(&self) -> bool {

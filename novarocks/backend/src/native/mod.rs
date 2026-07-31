@@ -31,7 +31,6 @@ pub(crate) mod ingress;
 pub(crate) mod instance;
 pub(crate) mod layout;
 pub(crate) mod lifecycle_adapter;
-pub(crate) mod report;
 pub(crate) mod runtime_filter;
 pub(crate) mod scan_contract;
 pub(crate) mod service;

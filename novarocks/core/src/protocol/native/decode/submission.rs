@@ -330,7 +330,6 @@ where
     );
     let metadata = NativeSubmissionMetadata::new(
         instance_parts.backend_num.get(),
-        instance_parts.report_endpoint.clone(),
         instance_parts.typed_result_sink,
     );
     let instance = FragmentInstanceSpec::new_native(
@@ -556,12 +555,6 @@ fn decode_instance_parts(
             ExchangeInputAssignment::new(count),
         );
     }
-    let report_endpoint = src
-        .report_endpoint
-        .as_deref()
-        .map(super::decode_endpoint)
-        .transpose()?;
-
     Ok(NativeFragmentInstanceInput::new(
         query_id_from_native(query_id),
         FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
@@ -570,7 +563,6 @@ fn decode_instance_parts(
         pipeline_dop,
         raw_scan_ranges,
         ExchangeInputAssignments::new(exchange_inputs),
-        report_endpoint,
         src.typed_result_sink,
     ))
 }

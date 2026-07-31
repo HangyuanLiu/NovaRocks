@@ -25,7 +25,6 @@ use novarocks::common::types::UniqueId;
 use novarocks::exec::fragment::program::FragmentNodeId;
 use novarocks::protocol::native_fragment_assembly_port::NativeFragmentInstanceInput;
 use novarocks::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
-use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
@@ -124,15 +123,6 @@ pub(crate) fn decode_instance_params(
             ExchangeInputAssignment::new(count),
         );
     }
-    let report_endpoint = src
-        .report_endpoint
-        .as_deref()
-        .map(|endpoint| {
-            RuntimeEndpoint::parse(endpoint)
-                .map_err(|detail| invalid_value(path.clone().field("report_endpoint"), detail))
-        })
-        .transpose()?;
-
     Ok(NativeFragmentInstanceInput::new(
         query_id_from_native(query_id),
         FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
@@ -141,7 +131,6 @@ pub(crate) fn decode_instance_params(
         pipeline_dop,
         raw_scan_ranges,
         ExchangeInputAssignments::new(exchange_inputs),
-        report_endpoint,
         src.typed_result_sink,
     ))
 }

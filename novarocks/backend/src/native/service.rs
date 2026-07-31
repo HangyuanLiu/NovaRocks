@@ -23,16 +23,14 @@
 //! point; no process-global listener state is used here.
 
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use novarocks::common::engine_error::EngineError;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
     decode_query_terminal_snapshot,
 };
-use novarocks::query_execution::report::NativeReportHandler;
 use novarocks::service::native_data_plane::NativeDataPlaneKernel;
 use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -40,7 +38,7 @@ use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::wrappers::TcpListenerStream;
 
-use super::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
+use super::ingress::NativeFragmentIngress;
 use super::lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
@@ -48,19 +46,6 @@ use super::lifecycle_adapter::{
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const CANCEL_FRAGMENT_OK: i32 = 0;
-const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
-static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-fn cancel_finst_marker(
-    query_id: novarocks::common::types::UniqueId,
-    finst_id: novarocks::common::types::UniqueId,
-) -> String {
-    format!(
-        "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
-        query_id.hi, query_id.lo, finst_id.hi, finst_id.lo
-    )
-}
 
 /// Backend-owned production Tonic service.  Core contributes only the narrow
 /// data-plane kernel and protocol-neutral lifecycle/report ports.
@@ -69,7 +54,6 @@ pub(crate) struct NativeBackendGrpcService {
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
-    report_handler: Arc<dyn NativeReportHandler>,
     terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     data_plane: NativeDataPlaneKernel,
 }
@@ -78,14 +62,12 @@ impl NativeBackendGrpcService {
     pub(crate) fn new(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
-        report_handler: Arc<dyn NativeReportHandler>,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Self {
         Self {
             native_fragment_ingress,
             query_lifecycle_ingress,
             query_control_shutdown: None,
-            report_handler,
             terminal_ingress,
             data_plane: NativeDataPlaneKernel::query_scoped(),
         }
@@ -211,65 +193,6 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
                     tonic::Status::internal(format!("fetch_result handler panicked: {error}"))
                 })?;
         Ok(tonic::Response::new(response))
-    }
-
-    async fn cancel_fragment(
-        &self,
-        request: tonic::Request<proto::CancelFragmentRequest>,
-    ) -> Result<tonic::Response<proto::CancelFragmentResponse>, tonic::Status> {
-        let request = request.into_inner();
-        let query_id = request.query_id.as_ref().ok_or_else(|| {
-            tonic::Status::invalid_argument("CancelFragmentRequest requires query_id")
-        })?;
-        if request.start_epoch != 0
-            && request.start_epoch != novarocks::runtime::start_epoch::start_epoch()
-        {
-            return Ok(tonic::Response::new(proto::CancelFragmentResponse {
-                status_code: CANCEL_FRAGMENT_IGNORED_STALE_EPOCH,
-            }));
-        }
-        self.native_fragment_ingress
-            .cancel(NativeFragmentCancelRequest::new(
-                novarocks::runtime::query_context::QueryId::new(query_id.hi, query_id.lo),
-                request
-                    .finst_ids
-                    .iter()
-                    .map(|id| novarocks::UniqueId {
-                        hi: id.hi,
-                        lo: id.lo,
-                    })
-                    .collect(),
-                request.reason.clone(),
-            ))
-            .map_err(|error| tonic::Status::internal(error.to_string()))?;
-        if novarocks::common::config::debug_emit_cancel_marker() {
-            let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-            println!(
-                "NOVAROCKS_CANCEL count={} finsts={} reason={}",
-                count,
-                request.finst_ids.len(),
-                request.reason
-            );
-            for finst_id in &request.finst_ids {
-                println!(
-                    "{}",
-                    cancel_finst_marker(
-                        novarocks::common::types::UniqueId {
-                            hi: query_id.hi,
-                            lo: query_id.lo,
-                        },
-                        novarocks::common::types::UniqueId {
-                            hi: finst_id.hi,
-                            lo: finst_id.lo,
-                        }
-                    )
-                );
-            }
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        Ok(tonic::Response::new(proto::CancelFragmentResponse {
-            status_code: CANCEL_FRAGMENT_OK,
-        }))
     }
 
     async fn ensure_connector_execution_binding(
@@ -465,78 +388,6 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
             outcome: outcome as i32,
             detail: ack.detail().to_string(),
         }))
-    }
-
-    async fn report_exec_status(
-        &self,
-        request: tonic::Request<proto::ReportExecStatusRequest>,
-    ) -> Result<tonic::Response<proto::ReportExecStatusResponse>, tonic::Status> {
-        let report_handler = Arc::clone(&self.report_handler);
-        let result = tokio::task::spawn_blocking(move || {
-            let report = request.into_inner().report.ok_or_else(|| {
-                novarocks::query_execution::report::NativeReportHandlerError::from(
-                    EngineError::protocol_decode("ReportExecStatusRequest missing report"),
-                )
-            })?;
-            report_handler.handle_native_report(report)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("report_exec_status handler panicked: {error}"))
-        })?;
-        match result {
-            Ok(()) => Ok(tonic::Response::new(proto::ReportExecStatusResponse {
-                status_code: novarocks::common::engine_error::REPORT_EXEC_STATUS_OK,
-                message: String::new(),
-                error_code: String::new(),
-            })),
-            Err(error) => Ok(tonic::Response::new(proto::ReportExecStatusResponse {
-                status_code: error.status_code(),
-                message: error.message().to_string(),
-                error_code: error.error_code().to_string(),
-            })),
-        }
-    }
-
-    async fn batch_report_exec_status(
-        &self,
-        request: tonic::Request<proto::BatchReportExecStatusRequest>,
-    ) -> Result<tonic::Response<proto::BatchReportExecStatusResponse>, tonic::Status> {
-        let report_handler = Arc::clone(&self.report_handler);
-        let result = tokio::task::spawn_blocking(move || {
-            let reports = request.into_inner().reports;
-            if reports.is_empty() {
-                return Err(
-                    novarocks::query_execution::report::NativeReportHandlerError::from(
-                        EngineError::protocol_decode(
-                            "BatchReportExecStatusRequest contains empty reports batch",
-                        ),
-                    ),
-                );
-            }
-            for report in reports {
-                report_handler.handle_native_report(report)?;
-            }
-            Ok::<(), novarocks::query_execution::report::NativeReportHandlerError>(())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "batch_report_exec_status handler panicked: {error}"
-            ))
-        })?;
-        match result {
-            Ok(()) => Ok(tonic::Response::new(proto::BatchReportExecStatusResponse {
-                status_code: novarocks::common::engine_error::REPORT_EXEC_STATUS_OK,
-                message: String::new(),
-                error_code: String::new(),
-            })),
-            Err(error) => Ok(tonic::Response::new(proto::BatchReportExecStatusResponse {
-                status_code: error.status_code(),
-                message: error.message().to_string(),
-                error_code: error.error_code().to_string(),
-            })),
-        }
     }
 }
 

@@ -39,7 +39,6 @@ use crate::proto::novarocks;
 use crate::proto::plan;
 use crate::protocol::ProtocolError;
 use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
-use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
 };
@@ -117,7 +116,6 @@ pub struct NativeFragmentInstanceInput {
     pub(crate) pipeline_dop: NonZeroUsize,
     pub(crate) raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     pub(crate) exchange_inputs: ExchangeInputAssignments,
-    pub(crate) report_endpoint: Option<RuntimeEndpoint>,
     pub(crate) typed_result_sink: bool,
 }
 
@@ -131,7 +129,6 @@ impl NativeFragmentInstanceInput {
         pipeline_dop: NonZeroUsize,
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         exchange_inputs: ExchangeInputAssignments,
-        report_endpoint: Option<RuntimeEndpoint>,
         typed_result_sink: bool,
     ) -> Self {
         Self {
@@ -142,7 +139,6 @@ impl NativeFragmentInstanceInput {
             pipeline_dop,
             raw_scan_ranges,
             exchange_inputs,
-            report_endpoint,
             typed_result_sink,
         }
     }
@@ -283,12 +279,11 @@ pub trait NativeScanSourceContractDecoder: Send + Sync {
 pub struct AssembledNativeFragmentSubmission {
     submission: FragmentSubmission,
     backend_num: i32,
-    report_endpoint: Option<RuntimeEndpoint>,
 }
 
 impl AssembledNativeFragmentSubmission {
-    pub fn into_parts(self) -> (FragmentSubmission, i32, Option<RuntimeEndpoint>) {
-        (self.submission, self.backend_num, self.report_endpoint)
+    pub fn into_parts(self) -> (FragmentSubmission, i32) {
+        (self.submission, self.backend_num)
     }
 }
 
@@ -327,6 +322,5 @@ pub fn assemble_fragment_submission_for_backend(
     Ok(AssembledNativeFragmentSubmission {
         submission,
         backend_num: metadata.backend_num(),
-        report_endpoint: metadata.report_endpoint().cloned(),
     })
 }
