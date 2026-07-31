@@ -25,6 +25,7 @@
 use futures::TryStreamExt;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::connector::schema;
@@ -33,7 +34,8 @@ use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_storage_txn_log_to_metadata;
 use crate::connector::starrocks::lake::context::{
-    get_tablet_runtime, remove_tablet_runtime, with_txn_log_append_lock,
+    TabletRuntimeEntry, cache_tablet_runtime, get_tablet_runtime, remove_tablet_runtime,
+    with_txn_log_append_lock,
 };
 use crate::connector::starrocks::lake::service_domain::{
     AbortTransactionCommand, DeleteDataCommand, DeleteTabletsCommand, DropLakeTableCommand,
@@ -111,7 +113,7 @@ pub fn execute_publish_version(
             base_version,
             new_version,
             &transactions,
-            provider.as_ref(),
+            provider.clone(),
         ) {
             Ok(row_count) => {
                 tablet_row_nums.insert(*tablet_id, row_count);
@@ -185,14 +187,14 @@ fn publish_one_tablet(
     base_version: i64,
     new_version: i64,
     transactions: &[LakeTransactionInfo],
-    provider: &dyn StorageMetadataProvider,
+    provider: Arc<dyn StorageMetadataProvider>,
 ) -> Result<i64, String> {
     if tablet_id <= 0 {
         return Err(format!(
             "publish_version has non-positive tablet_id={tablet_id}"
         ));
     }
-    let runtime = get_tablet_runtime(tablet_id)?;
+    let runtime = get_runtime_for_publish(tablet_id, base_version, provider.clone())?;
     let mut metadata = if base_version == 0 {
         StorageTabletMetadata {
             id: Some(tablet_id),
@@ -205,7 +207,7 @@ fn publish_one_tablet(
             &runtime.root_path,
             tablet_id,
             base_version,
-            provider,
+            provider.as_ref(),
         )?
         .ok_or_else(|| {
             format!(
@@ -225,7 +227,12 @@ fn publish_one_tablet(
         if transaction.txn_id == EMPTY_TXNLOG_TXN_ID {
             continue;
         }
-        let logs = load_txn_logs_for_publish(&runtime.root_path, tablet_id, transaction, provider)?;
+        let logs = load_txn_logs_for_publish(
+            &runtime.root_path,
+            tablet_id,
+            transaction,
+            provider.as_ref(),
+        )?;
         if logs.is_empty() {
             if transaction.force_publish {
                 continue;
@@ -262,7 +269,7 @@ fn publish_one_tablet(
         new_version,
         &runtime.schema,
         &metadata,
-        provider,
+        provider.as_ref(),
     )?;
     if transactions.len() == 1 && !transactions[0].combined_txn_log {
         let path = txn_log_file_path(&runtime.root_path, tablet_id, transactions[0].txn_id)?;
@@ -278,6 +285,46 @@ fn publish_one_tablet(
         new_version,
     );
     Ok(tablet_row_count(&metadata))
+}
+
+fn get_runtime_for_publish(
+    tablet_id: i64,
+    base_version: i64,
+    provider: Arc<dyn StorageMetadataProvider>,
+) -> Result<TabletRuntimeEntry, String> {
+    if let Ok(runtime) = get_tablet_runtime(tablet_id) {
+        return Ok(runtime);
+    }
+
+    let (root_path, s3_config) = resolve_tablet_location("publish_version", tablet_id)?;
+    let recovery_version = if base_version > 0 { base_version } else { 1 };
+    let metadata = load_tablet_metadata_at_version_with_provider(
+        &root_path,
+        tablet_id,
+        recovery_version,
+        provider.as_ref(),
+    )?
+    .ok_or_else(|| {
+        format!(
+            "publish_version could not recover tablet runtime from metadata: tablet_id={} base_version={}",
+            tablet_id, base_version
+        )
+    })?;
+    let schema = metadata.schema.ok_or_else(|| {
+        format!(
+            "publish_version recovered metadata without schema: tablet_id={} base_version={}",
+            tablet_id, base_version
+        )
+    })?;
+    cache_tablet_runtime(
+        tablet_id,
+        TabletRuntimeEntry {
+            root_path,
+            schema,
+            s3_config,
+            storage_metadata_provider: Some(provider),
+        },
+    )
 }
 
 pub fn execute_publish_log_version(
