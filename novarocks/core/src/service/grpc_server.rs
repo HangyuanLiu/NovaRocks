@@ -215,6 +215,7 @@ impl NativeReportHandler for AcceptingTestNativeReportHandler {
 }
 
 impl GrpcService {
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     pub fn with_fragment_execution(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
@@ -1407,6 +1408,7 @@ fn bind_tcp_listener(host: &str, port: u16, role: &str) -> Result<TcpListener, S
 
 #[derive(Clone)]
 enum StandaloneGrpcMode {
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     FullExecution(
         Arc<dyn NativeFragmentIngress>,
         Arc<dyn QueryLifecycleIngress>,
@@ -1417,6 +1419,7 @@ enum StandaloneGrpcMode {
 impl std::fmt::Debug for StandaloneGrpcMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             Self::FullExecution(_, _) => formatter.write_str("FullExecution"),
             Self::ReportOnly => formatter.write_str("ReportOnly"),
         }
@@ -1426,6 +1429,7 @@ impl std::fmt::Debug for StandaloneGrpcMode {
 impl StandaloneGrpcMode {
     fn service(self, report_handler: Arc<dyn NativeReportHandler>) -> GrpcService {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             StandaloneGrpcMode::FullExecution(ingress, query_lifecycle_ingress) => {
                 GrpcService::with_fragment_execution(
                     ingress,
@@ -1439,6 +1443,7 @@ impl StandaloneGrpcMode {
 
     fn label(&self) -> &'static str {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             StandaloneGrpcMode::FullExecution(_, _) => "standalone grpc report/exchange",
             StandaloneGrpcMode::ReportOnly => "standalone grpc report-only",
         }
@@ -1449,6 +1454,7 @@ impl StandaloneGrpcMode {
 ///
 /// This does not require global config to be initialised: the caller supplies
 /// the bind address, native fragment ingress, and report handler directly.
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn start_grpc_exchange_server(
     host: &str,
     port: u16,
