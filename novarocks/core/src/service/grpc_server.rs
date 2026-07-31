@@ -177,7 +177,7 @@ fn pause_standalone_grpc_startup_after_reservation() {
 
 #[derive(Clone)]
 pub struct GrpcService {
-    allow_local_execution: bool,
+    endpoint_role: GrpcEndpointRole,
     native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
     query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
@@ -186,10 +186,17 @@ pub struct GrpcService {
     data_plane: NativeDataPlaneKernel,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum GrpcEndpointRole {
+    FullExecution,
+    CompatNeutral,
+    ReportOnly,
+}
+
 impl std::fmt::Debug for GrpcService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrpcService")
-            .field("allow_local_execution", &self.allow_local_execution)
+            .field("endpoint_role", &self.endpoint_role)
             .finish_non_exhaustive()
     }
 }
@@ -214,7 +221,7 @@ impl GrpcService {
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
         Self::with_handlers(
-            true,
+            GrpcEndpointRole::FullExecution,
             Some(native_fragment_ingress),
             Some(query_lifecycle_ingress),
             report_handler,
@@ -229,7 +236,7 @@ impl GrpcService {
         report_handler: Arc<dyn NativeReportHandler>,
     ) -> Self {
         Self::with_handlers(
-            true,
+            GrpcEndpointRole::CompatNeutral,
             None,
             None,
             report_handler,
@@ -239,7 +246,7 @@ impl GrpcService {
 
     pub fn report_ingress_only(report_handler: Arc<dyn NativeReportHandler>) -> Self {
         Self::with_handlers(
-            false,
+            GrpcEndpointRole::ReportOnly,
             None,
             None,
             report_handler,
@@ -248,14 +255,14 @@ impl GrpcService {
     }
 
     fn with_handlers(
-        allow_local_execution: bool,
+        endpoint_role: GrpcEndpointRole,
         native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
         query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
         report_handler: Arc<dyn NativeReportHandler>,
         data_plane: NativeDataPlaneKernel,
     ) -> Self {
         Self {
-            allow_local_execution,
+            endpoint_role,
             native_fragment_ingress,
             query_lifecycle_ingress,
             query_control_shutdown: None,
@@ -271,7 +278,7 @@ impl GrpcService {
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
         Self::with_handlers(
-            true,
+            GrpcEndpointRole::FullExecution,
             Some(Arc::new(RejectingTestNativeFragmentIngress)),
             None,
             report_handler,
@@ -287,7 +294,7 @@ impl GrpcService {
         runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
     ) -> Self {
         Self::with_handlers(
-            false,
+            GrpcEndpointRole::ReportOnly,
             None,
             None,
             report_handler,
@@ -303,7 +310,7 @@ impl GrpcService {
         manager: Arc<crate::runtime::query_context::QueryContextManager>,
     ) -> Self {
         let mut service = Self::with_handlers(
-            true,
+            GrpcEndpointRole::FullExecution,
             Some(Arc::new(RejectingTestNativeFragmentIngress)),
             None,
             report_handler,
@@ -314,13 +321,24 @@ impl GrpcService {
         service
     }
 
-    fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
-        if self.allow_local_execution {
-            Ok(())
-        } else {
-            Err(tonic::Status::failed_precondition(format!(
+    fn require_data_plane(&self, rpc_name: &str) -> Result<(), tonic::Status> {
+        match self.endpoint_role {
+            GrpcEndpointRole::FullExecution | GrpcEndpointRole::CompatNeutral => Ok(()),
+            GrpcEndpointRole::ReportOnly => Err(tonic::Status::failed_precondition(format!(
                 "report-only NovaRocksGrpc endpoint rejects local execution RPC: {rpc_name}"
-            )))
+            ))),
+        }
+    }
+
+    fn require_backend_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
+        match self.endpoint_role {
+            GrpcEndpointRole::FullExecution => Ok(()),
+            GrpcEndpointRole::CompatNeutral => Err(tonic::Status::failed_precondition(format!(
+                "compat-neutral NovaRocksGrpc endpoint rejects backend-owned RPC: {rpc_name}"
+            ))),
+            GrpcEndpointRole::ReportOnly => Err(tonic::Status::failed_precondition(format!(
+                "report-only NovaRocksGrpc endpoint rejects local execution RPC: {rpc_name}"
+            ))),
         }
     }
 
@@ -328,7 +346,7 @@ impl GrpcService {
         &self,
         rpc_name: &str,
     ) -> Result<Arc<dyn QueryLifecycleIngress>, tonic::Status> {
-        self.require_local_execution(rpc_name)?;
+        self.require_backend_execution(rpc_name)?;
         self.query_lifecycle_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("query lifecycle ingress is not configured")
         })
@@ -637,7 +655,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         use crate::novarocks_logging::debug;
 
-        self.require_local_execution("Exchange")?;
+        self.require_data_plane("Exchange")?;
         let mut inbound = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<
             Result<proto::novarocks::ExchangeResponse, tonic::Status>,
@@ -717,7 +735,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::ExchangeRequest>,
     ) -> Result<tonic::Response<proto::novarocks::ExchangeResponse>, tonic::Status> {
-        self.require_local_execution("ExchangeUnary")?;
+        self.require_data_plane("ExchangeUnary")?;
         let req = request.into_inner();
         let kernel = self.data_plane.clone();
         let result = tokio::task::spawn_blocking(move || kernel.exchange(req))
@@ -732,7 +750,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::filter::RuntimeFilterEnvelope>,
     ) -> Result<tonic::Response<proto::filter::RuntimeFilterEnvelopeResponse>, tonic::Status> {
-        self.require_local_execution("TransmitRuntimeFilterEnvelope")?;
+        self.require_data_plane("TransmitRuntimeFilterEnvelope")?;
         let kernel = self.data_plane.clone();
         let request = request.into_inner();
         let response =
@@ -750,7 +768,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::filter::LookupRequest>,
     ) -> Result<tonic::Response<proto::filter::LookupResponse>, tonic::Status> {
-        self.require_local_execution("Lookup")?;
+        self.require_data_plane("Lookup")?;
         Ok(tonic::Response::new(
             self.data_plane.lookup(request.into_inner()),
         ))
@@ -760,7 +778,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::FetchResultRequest>,
     ) -> Result<tonic::Response<proto::novarocks::FetchResultResponse>, tonic::Status> {
-        self.require_local_execution("FetchResult")?;
+        self.require_data_plane("FetchResult")?;
         let req = request.into_inner();
         let kernel = self.data_plane.clone();
         let response = tokio::task::spawn_blocking(move || kernel.fetch_result(req))
@@ -775,7 +793,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::CancelFragmentRequest>,
     ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
-        self.require_local_execution("CancelFragment")?;
+        self.require_backend_execution("CancelFragment")?;
         let req = request.into_inner();
         let query_id = req
             .query_id
@@ -846,7 +864,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         tonic::Response<proto::novarocks::EnsureConnectorExecutionBindingResponse>,
         tonic::Status,
     > {
-        self.require_local_execution("EnsureConnectorExecutionBinding")?;
+        self.require_backend_execution("EnsureConnectorExecutionBinding")?;
         let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("connector binding ingress is not configured")
         })?;
@@ -886,7 +904,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         tonic::Response<proto::novarocks::RetireConnectorExecutionBindingResponse>,
         tonic::Status,
     > {
-        self.require_local_execution("RetireConnectorExecutionBinding")?;
+        self.require_backend_execution("RetireConnectorExecutionBinding")?;
         let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
             tonic::Status::failed_precondition("connector binding ingress is not configured")
         })?;
@@ -920,6 +938,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::HeartbeatRequest>,
     ) -> Result<tonic::Response<proto::novarocks::HeartbeatResponse>, tonic::Status> {
+        self.require_backend_execution("Heartbeat")?;
         let req = request.into_inner();
         if let Some(ingress) = self.query_lifecycle_ingress.as_ref() {
             ingress
@@ -2249,6 +2268,22 @@ mod pr3_tests {
             .expect_err("report-only endpoint must reject InitQuery");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn compat_neutral_endpoint_rejects_backend_heartbeat() {
+        let error = GrpcService::internal_execution_without_native_fragment_ingress(Arc::new(
+            AcceptingTestNativeReportHandler,
+        ))
+        .heartbeat(Request::new(HeartbeatRequest::default()))
+        .await
+        .expect_err("compat-neutral endpoint must not accept backend heartbeat");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "compat-neutral NovaRocksGrpc endpoint rejects backend-owned RPC: Heartbeat"
+        );
     }
 
     fn query_lifecycle_init_fixture(start_epoch: u64, query_low: i64) -> QueryInitRequest {
