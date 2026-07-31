@@ -20,17 +20,13 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_empty_array, new_null_array};
-use arrow::compute::{cast, filter_record_batch, take};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use prost::Message;
-
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
     update_tablet_runtime_schema, with_txn_log_append_lock,
 };
-use crate::connector::starrocks::lake::schema_adapter::build_tablet_schema_from_thrift;
+use crate::connector::starrocks::lake::storage_domain::{
+    StorageRowset, StorageSchemaChangeOperation, StorageTabletMetadata, StorageTransactionLog,
+};
 use crate::connector::starrocks::lake::txn_log::{
     build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
@@ -42,10 +38,11 @@ use crate::connector::starrocks::schema::{
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::formats::starrocks::metadata::{
-    collect_delete_predicates, lake_rowset_visibility_version,
+    StarRocksBinaryPredicateRaw, StarRocksDeletePredicateRaw, StarRocksInPredicateRaw,
+    StarRocksIsNullPredicateRaw,
 };
 use crate::formats::starrocks::writer::bundle_meta::{
-    empty_tablet_metadata, load_tablet_metadata_at_version, write_initial_meta_file_with_provider,
+    load_tablet_metadata_at_version_with_provider, write_initial_meta_file_with_provider,
     write_standalone_meta_file_with_provider,
 };
 use crate::formats::starrocks::writer::io::{read_bytes_if_exists, write_bytes};
@@ -54,18 +51,14 @@ use crate::formats::starrocks::writer::layout::{
     txn_log_file_path,
 };
 use crate::formats::starrocks::writer::{
-    StarRocksWriteFormat, build_single_segment_metadata, build_starrocks_native_segment_bytes,
+    StarRocksWriteFormat, build_single_segment_facts, build_starrocks_native_segment_bytes,
     build_txn_data_file_name, sort_batch_for_native_write,
 };
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
-use crate::service::grpc_client::proto::starrocks::{
-    CompactionStrategyPb, PersistentIndexTypePb, RowsetMetadataPb, TabletMetadataPb, TxnLogPb,
-    txn_log_pb,
-};
-use crate::thrift::agent_service::{
-    TCompactionStrategy, TPersistentIndexType, TTabletMetaInfo, TTabletType,
-    TUpdateTabletMetaInfoReq,
-};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_empty_array, new_null_array};
+use arrow::compute::{cast, filter_record_batch, take};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LakeAlterTabletMode {
@@ -232,6 +225,7 @@ pub fn execute_lake_alter_tablet_task(
         base_tablet_id,
         alter_version,
         true,
+        storage_metadata_provider.as_ref(),
     )?;
     let new_metadata = load_tablet_metadata_for_alter_with_retry(
         "alter_new_tablet",
@@ -239,6 +233,7 @@ pub fn execute_lake_alter_tablet_task(
         new_tablet_id,
         1,
         true,
+        storage_metadata_provider.as_ref(),
     )?;
 
     let base_read_schema = if let Some(read_schema) = task.base_tablet_read_schema.as_ref() {
@@ -318,19 +313,11 @@ pub fn execute_lake_alter_tablet_task(
             .as_deref()
             .expect("compat schema-change context installs storage metadata provider"),
     ) {
-        let patched_meta = new_metadata.clone();
         let provider = new_ctx
             .storage_metadata_provider
             .as_deref()
             .expect("compat schema-change context installs storage metadata provider");
-        let mut domain_metadata = provider
-            .decode_tablet_metadata(&patched_meta.encode_to_vec())
-            .map_err(|error| {
-                format!(
-                    "decode schema-change initial metadata through compat codec failed: tablet_id={} error={error}",
-                    new_tablet_id
-                )
-            })?;
+        let mut domain_metadata = new_metadata.clone();
         domain_metadata.schema = Some(new_schema.clone());
         if let Some(schema_id) = new_schema.id.filter(|id| *id > 0) {
             domain_metadata
@@ -368,7 +355,7 @@ pub fn execute_lake_alter_tablet_task(
     }
 
     let source_output_schema = build_tablet_output_schema(&base_read_schema)?;
-    let base_delete_predicates = collect_delete_predicates(&base_metadata)?;
+    let base_delete_predicates = collect_delete_predicates_from_storage_metadata(&base_metadata)?;
     let mut rewritten_rowsets = Vec::with_capacity(base_metadata.rowsets.len());
     for (rowset_idx, source_rowset) in base_metadata.rowsets.iter().enumerate() {
         let rowset_visibility_version = lake_rowset_visibility_version(source_rowset, rowset_idx)?;
@@ -398,48 +385,10 @@ pub fn execute_lake_alter_tablet_task(
         txn_id,
         alter_version,
         rewritten_rowsets,
-    )
-}
-
-/// Executes a lake metadata update through the storage codec selected by the
-/// composition root. Compat always supplies a codec rather than discovering
-/// one from global runtime state.
-pub(crate) fn execute_update_tablet_meta_info_task_with_storage_metadata_provider(
-    request: &TUpdateTabletMetaInfoReq,
-    storage_metadata_provider: Arc<dyn StorageMetadataProvider>,
-) -> Result<(), String> {
-    let tablet_type = request.tablet_type.unwrap_or(TTabletType::TABLET_TYPE_DISK);
-    if tablet_type != TTabletType::TABLET_TYPE_LAKE {
-        return Err(format!(
-            "update_tablet_meta_info unsupported tablet_type={tablet_type:?} (only TABLET_TYPE_LAKE is supported)"
-        ));
-    }
-    let txn_id = request
-        .txn_id
-        .ok_or_else(|| "update_tablet_meta_info missing txn_id".to_string())?;
-    if txn_id <= 0 {
-        return Err(format!(
-            "update_tablet_meta_info has invalid txn_id={txn_id}"
-        ));
-    }
-    let tablet_meta_infos = request
-        .tablet_meta_infos
-        .as_ref()
-        .ok_or_else(|| "update_tablet_meta_info missing tablet_meta_infos".to_string())?;
-    let updates = tablet_meta_infos
-        .iter()
-        .map(|tablet_meta_info| {
-            Ok(LakeTabletMetadataUpdate {
-                tablet_id: tablet_meta_info.tablet_id.ok_or_else(|| {
-                    "update_tablet_meta_info tablet_meta_info missing tablet_id".to_string()
-                })?,
-                metadata_update: build_storage_metadata_update(tablet_meta_info)?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    execute_lake_update_tablet_meta_task(
-        LakeUpdateTabletMetaTask { txn_id, updates },
-        storage_metadata_provider,
+        new_ctx
+            .storage_metadata_provider
+            .as_deref()
+            .expect("compat schema-change context installs storage metadata provider"),
     )
 }
 
@@ -467,9 +416,15 @@ fn load_tablet_metadata_for_alter_with_retry(
     tablet_id: i64,
     version: i64,
     allow_missing_page_as_empty: bool,
-) -> Result<TabletMetadataPb, String> {
+    storage_metadata_provider: &dyn StorageMetadataProvider,
+) -> Result<StorageTabletMetadata, String> {
     for attempt in 1..=ALTER_METADATA_LOAD_MAX_ATTEMPTS {
-        match load_tablet_metadata_at_version(tablet_root_path, tablet_id, version) {
+        match load_tablet_metadata_at_version_with_provider(
+            tablet_root_path,
+            tablet_id,
+            version,
+            storage_metadata_provider,
+        ) {
             Ok(Some(metadata)) => return Ok(metadata),
             Ok(None) => {
                 if attempt == ALTER_METADATA_LOAD_MAX_ATTEMPTS {
@@ -498,9 +453,11 @@ fn load_tablet_metadata_for_alter_with_retry(
                             error = %err,
                             "alter task fallback to empty metadata after missing tablet page retries"
                         );
-                        let mut metadata = empty_tablet_metadata(tablet_id);
-                        metadata.version = Some(version);
-                        return Ok(metadata);
+                        return Ok(StorageTabletMetadata {
+                            id: Some(tablet_id),
+                            version: Some(version),
+                            ..StorageTabletMetadata::default()
+                        });
                     }
                     return Err(format!(
                         "{op} metadata load failed after retries: tablet_id={} version={} attempts={} last_error={}",
@@ -551,66 +508,6 @@ fn execute_single_tablet_meta_update(
         update_tablet_runtime_schema(tablet_id, schema)?;
     }
     Ok(())
-}
-
-fn build_storage_metadata_update(
-    tablet_meta_info: &TTabletMetaInfo,
-) -> Result<crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate, String> {
-    Ok(
-        crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate {
-            enable_persistent_index: tablet_meta_info.enable_persistent_index,
-            persistent_index_type: tablet_meta_info
-                .persistent_index_type
-                .map(map_update_tablet_meta_persistent_index_type)
-                .transpose()?,
-            bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
-            compaction_strategy: tablet_meta_info
-                .compaction_strategy
-                .map(map_update_tablet_meta_compaction_strategy)
-                .transpose()?,
-            flat_json_config: tablet_meta_info.flat_json_config.as_ref().map(|cfg| {
-                crate::connector::starrocks::lake::storage_domain::StorageFlatJsonConfig {
-                    enabled: cfg.flat_json_enable,
-                    null_factor: cfg.flat_json_null_factor.map(|value| value.0),
-                    sparsity_factor: cfg.flat_json_sparsity_factor.map(|value| value.0),
-                    max_column_max: cfg.flat_json_column_max,
-                }
-            }),
-            tablet_schema: tablet_meta_info
-                .tablet_schema
-                .as_ref()
-                .map(build_tablet_schema_from_thrift)
-                .transpose()?,
-        },
-    )
-}
-
-fn map_update_tablet_meta_persistent_index_type(
-    persistent_index_type: TPersistentIndexType,
-) -> Result<i32, String> {
-    if persistent_index_type == TPersistentIndexType::LOCAL {
-        return Ok(PersistentIndexTypePb::Local as i32);
-    }
-    if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
-        return Ok(PersistentIndexTypePb::CloudNative as i32);
-    }
-    Err(format!(
-        "update_tablet_meta_info unsupported persistent_index_type={persistent_index_type:?}"
-    ))
-}
-
-fn map_update_tablet_meta_compaction_strategy(
-    compaction_strategy: TCompactionStrategy,
-) -> Result<i32, String> {
-    if compaction_strategy == TCompactionStrategy::DEFAULT {
-        return Ok(CompactionStrategyPb::Default as i32);
-    }
-    if compaction_strategy == TCompactionStrategy::REAL_TIME {
-        return Ok(CompactionStrategyPb::RealTime as i32);
-    }
-    Err(format!(
-        "update_tablet_meta_info unsupported compaction_strategy={compaction_strategy:?}"
-    ))
 }
 
 fn write_update_tablet_meta_txn_log_with_provider(
@@ -678,7 +575,125 @@ fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
         || error.contains("bundle metadata does not contain tablet page:")
 }
 
-fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, version: i64) -> bool {
+fn lake_rowset_visibility_version(
+    rowset: &StorageRowset,
+    rowset_index: usize,
+) -> Result<i64, String> {
+    let rowset_version = i64::try_from(rowset_index).map_err(|_| {
+        format!(
+            "rowset index overflow while deriving delete visibility version: rowset_id={:?}, rowset_index={}",
+            rowset.id, rowset_index
+        )
+    })?;
+    if rowset_version < 0 {
+        return Err(format!(
+            "invalid rowset version in tablet metadata: rowset_id={:?}, version={}",
+            rowset.id, rowset_version
+        ));
+    }
+    Ok(rowset_version)
+}
+
+fn collect_delete_predicates_from_storage_metadata(
+    metadata: &StorageTabletMetadata,
+) -> Result<Vec<StarRocksDeletePredicateRaw>, String> {
+    let mut delete_predicates = Vec::new();
+    for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
+        let version = lake_rowset_visibility_version(rowset, rowset_index)?;
+        let Some(predicate) = rowset.delete_predicate.as_ref() else {
+            continue;
+        };
+        delete_predicates.push(StarRocksDeletePredicateRaw {
+            version,
+            sub_predicates: Vec::new(),
+            in_predicates: predicate
+                .in_predicates
+                .iter()
+                .map(|item| {
+                    Ok(StarRocksInPredicateRaw {
+                        column_name: required_delete_predicate_field(
+                            item.column_name.as_deref(),
+                            "delete in predicate column_name",
+                            rowset.id,
+                            version,
+                        )?,
+                        is_not_in: item.is_not_in.unwrap_or(false),
+                        values: item.values.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            binary_predicates: predicate
+                .binary_predicates
+                .iter()
+                .map(|item| {
+                    let column_name = required_delete_predicate_field(
+                        item.column_name.as_deref(),
+                        "delete binary predicate column_name",
+                        rowset.id,
+                        version,
+                    )?;
+                    let op = required_delete_predicate_field(
+                        item.op.as_deref(), "delete binary predicate op", rowset.id, version,
+                    )
+                    .map_err(|_| {
+                        format!(
+                            "delete binary predicate op is missing: rowset_id={:?}, version={}, column_name={}",
+                            rowset.id, version, column_name
+                        )
+                    })?;
+                    let value = required_delete_predicate_field(
+                        item.value.as_deref(), "delete binary predicate value", rowset.id, version,
+                    )
+                    .map_err(|_| {
+                        format!(
+                            "delete binary predicate value is missing: rowset_id={:?}, version={}, column_name={}, op={}",
+                            rowset.id, version, column_name, op
+                        )
+                    })?;
+                    Ok(StarRocksBinaryPredicateRaw {
+                        column_name,
+                        op,
+                        value,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            is_null_predicates: predicate
+                .is_null_predicates
+                .iter()
+                .map(|item| {
+                    Ok(StarRocksIsNullPredicateRaw {
+                        column_name: required_delete_predicate_field(
+                            item.column_name.as_deref(),
+                            "delete is-null predicate column_name",
+                            rowset.id,
+                            version,
+                        )?,
+                        is_not_null: item.is_not_null.unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+    Ok(delete_predicates)
+}
+
+fn required_delete_predicate_field(
+    value: Option<&str>,
+    field: &str,
+    rowset_id: Option<u32>,
+    version: i64,
+) -> Result<String, String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{field} is missing: rowset_id={rowset_id:?}, version={version}"))
+}
+
+fn is_expected_initial_metadata_without_schema(
+    metadata: &StorageTabletMetadata,
+    version: i64,
+) -> bool {
     version == 1
         && metadata.schema.is_none()
         && metadata.rowsets.is_empty()
@@ -686,32 +701,23 @@ fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, vers
 }
 
 fn should_patch_initial_metadata_schema(
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     target_schema: &StarRocksTabletSchema,
     storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> bool {
-    storage_metadata_provider
-        .decode_tablet_metadata(&metadata.encode_to_vec())
-        .map(|metadata| metadata.schema.as_ref() != Some(target_schema))
-        .unwrap_or(true)
+    let _ = storage_metadata_provider;
+    metadata.schema.as_ref() != Some(target_schema)
 }
 
 fn resolve_tablet_schema_from_metadata_or_runtime(
     op: &str,
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     tablet_id: i64,
     version: i64,
-    storage_metadata_provider: &dyn StorageMetadataProvider,
+    _storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<StarRocksTabletSchema, String> {
     if metadata.schema.is_some() {
-        let domain_metadata = storage_metadata_provider
-            .decode_tablet_metadata(&metadata.encode_to_vec())
-            .map_err(|error| {
-                format!(
-                    "{op} decode tablet schema through compat codec failed: tablet_id={tablet_id} version={version} error={error}"
-                )
-            })?;
-        return domain_metadata.schema.ok_or_else(|| {
+        return metadata.schema.clone().ok_or_else(|| {
             format!(
                 "{op} compat-decoded tablet metadata missing schema: tablet_id={tablet_id} version={version}"
             )
@@ -794,7 +800,7 @@ fn resolve_tablet_location(
 
 fn ensure_schema_change_base_supported(
     schema: &StarRocksTabletSchema,
-    metadata: &TabletMetadataPb,
+    metadata: &StorageTabletMetadata,
     context: &str,
 ) -> Result<(), String> {
     let keys_type = schema
@@ -1592,37 +1598,28 @@ fn repeat_singleton_array(
 
 fn write_rewritten_rowset(
     new_ctx: &TabletWriteContext,
-    source_rowset: &RowsetMetadataPb,
+    source_rowset: &StorageRowset,
     transformed_batch: &RecordBatch,
     txn_id: i64,
     rowset_idx: usize,
-) -> Result<RowsetMetadataPb, String> {
+) -> Result<StorageRowset, String> {
     if transformed_batch.num_rows() == 0 {
-        return Ok(RowsetMetadataPb {
-            id: None,
+        return Ok(StorageRowset {
             overlapped: source_rowset.overlapped.or(Some(false)),
-            segments: Vec::new(),
             num_rows: Some(0),
             data_size: Some(0),
             // Rewritten rowsets materialize post-delete visible rows, so they must not
             // carry over source delete predicates or delete counters again.
-            delete_predicate: None,
             num_dels: Some(0),
-            segment_size: Vec::new(),
             max_compact_input_rowset_id: source_rowset.max_compact_input_rowset_id,
-            version: None,
-            del_files: Vec::new(),
-            segment_encryption_metas: Vec::new(),
             next_compaction_offset: source_rowset.next_compaction_offset,
-            bundle_file_offsets: Vec::new(),
-            shared_segments: Vec::new(),
             record_predicate: source_rowset.record_predicate.clone(),
-            segment_metas: Vec::new(),
+            ..StorageRowset::default()
         });
     }
 
     let sorted_batch = sort_batch_for_native_write(transformed_batch, &new_ctx.tablet_schema)?;
-    let segment_meta = build_single_segment_metadata(&sorted_batch, &new_ctx.tablet_schema)?;
+    let segment_meta = build_single_segment_facts(&sorted_batch, &new_ctx.tablet_schema)?;
     let segment_bytes =
         build_starrocks_native_segment_bytes(&sorted_batch, &new_ctx.tablet_schema)?;
     let segment_size = segment_bytes.len() as u64;
@@ -1646,25 +1643,20 @@ fn write_rewritten_rowset(
     )?;
     write_bytes(&data_file_path, segment_bytes)?;
 
-    Ok(RowsetMetadataPb {
-        id: None,
+    Ok(StorageRowset {
         overlapped: source_rowset.overlapped.or(Some(false)),
         segments: vec![data_file_name],
         num_rows: Some(sorted_batch.num_rows() as i64),
         data_size: Some(segment_size as i64),
         // Delete predicates are applied while reading source rowsets for rewrite.
-        delete_predicate: None,
         num_dels: Some(0),
         segment_size: vec![segment_size],
         max_compact_input_rowset_id: source_rowset.max_compact_input_rowset_id,
-        version: None,
-        del_files: Vec::new(),
-        segment_encryption_metas: Vec::new(),
         next_compaction_offset: source_rowset.next_compaction_offset,
-        bundle_file_offsets: Vec::new(),
         shared_segments: vec![false],
         record_predicate: source_rowset.record_predicate.clone(),
         segment_metas: vec![segment_meta],
+        ..StorageRowset::default()
     })
 }
 
@@ -1673,22 +1665,17 @@ fn write_schema_change_txn_log(
     new_tablet_id: i64,
     txn_id: i64,
     alter_version: i64,
-    rewritten_rowsets: Vec<RowsetMetadataPb>,
+    rewritten_rowsets: Vec<StorageRowset>,
+    storage_metadata_provider: &dyn StorageMetadataProvider,
 ) -> Result<(), String> {
     let txn_log_path = txn_log_file_path(tablet_root_path, new_tablet_id, txn_id)?;
     with_txn_log_append_lock(new_tablet_id, txn_id, || {
-        let mut txn_log = match read_txn_log_if_exists(&txn_log_path)? {
+        let mut txn_log = match read_txn_log_if_exists(storage_metadata_provider, &txn_log_path)? {
             Some(existing) => existing,
-            None => TxnLogPb {
+            None => StorageTransactionLog {
                 tablet_id: Some(new_tablet_id),
                 txn_id: Some(txn_id),
-                op_write: None,
-                op_compaction: None,
-                op_schema_change: None,
-                op_alter_metadata: None,
-                op_replication: None,
-                partition_id: None,
-                load_id: None,
+                ..StorageTransactionLog::default()
             },
         };
         if txn_log.tablet_id != Some(new_tablet_id) {
@@ -1703,23 +1690,23 @@ fn write_schema_change_txn_log(
                 txn_id, txn_log.txn_id
             ));
         }
-        if txn_log.op_write.is_some()
-            || txn_log.op_compaction.is_some()
-            || txn_log.op_alter_metadata.is_some()
-            || txn_log.op_replication.is_some()
+        if txn_log.write.is_some()
+            || txn_log.compaction.is_some()
+            || txn_log.alter_metadata.is_some()
+            || txn_log.replication.is_some()
         {
             return Err(format!(
                 "alter task does not support mixed txn log operation: tablet_id={} txn_id={}",
                 new_tablet_id, txn_id
             ));
         }
-        txn_log.op_schema_change = Some(txn_log_pb::OpSchemaChange {
+        txn_log.schema_change = Some(StorageSchemaChangeOperation {
             rowsets: rewritten_rowsets,
             linked_segment: Some(false),
             alter_version: Some(alter_version),
             delvec_meta: None,
         });
-        write_txn_log_file(&txn_log_path, &txn_log)
+        write_txn_log_file(storage_metadata_provider, &txn_log_path, &txn_log)
     })
 }
 
@@ -1755,26 +1742,18 @@ mod tests {
 
     #[test]
     fn metadata_update_domain_facts_preserve_optional_task_values() {
-        let request = TTabletMetaInfo {
+        let update = crate::connector::starrocks::lake::storage_domain::StorageMetadataUpdate {
             enable_persistent_index: Some(true),
-            persistent_index_type: Some(TPersistentIndexType::CLOUD_NATIVE),
+            persistent_index_type: Some(1),
             bundle_tablet_metadata: Some(true),
-            compaction_strategy: Some(TCompactionStrategy::REAL_TIME),
-            ..TTabletMetaInfo::default()
+            compaction_strategy: Some(1),
+            ..Default::default()
         };
 
-        let update = build_storage_metadata_update(&request).expect("domain update facts");
-
         assert_eq!(update.enable_persistent_index, Some(true));
-        assert_eq!(
-            update.persistent_index_type,
-            Some(PersistentIndexTypePb::CloudNative as i32)
-        );
+        assert_eq!(update.persistent_index_type, Some(1));
         assert_eq!(update.bundle_tablet_metadata, Some(true));
-        assert_eq!(
-            update.compaction_strategy,
-            Some(CompactionStrategyPb::RealTime as i32)
-        );
+        assert_eq!(update.compaction_strategy, Some(1));
         assert!(update.tablet_schema.is_none());
     }
 }

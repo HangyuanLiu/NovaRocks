@@ -652,7 +652,6 @@ mod tests {
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             &host,
         );
-        novarocks::server::configure_standalone_internal_rpc_transport();
         novarocks::service::grpc_server::start_grpc_exchange_server(
             &config.server.host,
             config.server.grpc_port,

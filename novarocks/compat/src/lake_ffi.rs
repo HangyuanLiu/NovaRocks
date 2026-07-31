@@ -20,14 +20,13 @@
 //! These symbols intentionally keep their historic names.  The C++ BRPC
 //! bridge passes an opaque, host-owned service context as their first
 //! parameter; it remains responsible for freeing both returned buffers using
-//! the existing core buffer free function.
+//! the compat-owned buffer free function.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 
 use novarocks::novarocks_logging::error;
-use novarocks::service::engine_ffi::NovaRocksRustBuf;
 use novarocks::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
     DeleteTabletRequest, DropTableRequest, PublishLogVersionBatchRequest, PublishLogVersionRequest,
@@ -35,6 +34,7 @@ use novarocks::service::grpc_client::proto::starrocks::{
 };
 use prost::Message;
 
+use crate::ffi_support::NovaRocksRustBuf;
 use crate::lake_storage::{CompatLakeStorageService, LakeWireResult, decode_lake_request};
 
 fn reset_output(buffer: *mut NovaRocksRustBuf) {
@@ -202,9 +202,7 @@ lake_ffi_export!(novarocks_rs_lake_vacuum, "vacuum", VacuumRequest, vacuum);
 mod tests {
     use std::ffi::c_void;
 
-    use novarocks::service::engine_ffi::NovaRocksRustBuf;
-
-    use super::novarocks_rs_lake_publish_version;
+    use super::{NovaRocksRustBuf, novarocks_rs_lake_publish_version};
 
     fn take_buffer(buffer: NovaRocksRustBuf) -> Vec<u8> {
         if buffer.ptr.is_null() {

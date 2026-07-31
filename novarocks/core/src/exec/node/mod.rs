@@ -19,7 +19,6 @@ pub mod analytic;
 pub mod assert;
 pub mod change_event_expand;
 pub mod exchange_source;
-#[cfg(feature = "compat")]
 pub mod fetch;
 pub mod filter;
 pub mod join;
@@ -43,7 +42,6 @@ use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
 use crate::exec::node::change_event_expand::ChangeEventExpandNode;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
-#[cfg(feature = "compat")]
 use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::JoinNode;
@@ -74,7 +72,6 @@ pub enum ExecNodeKind {
     Limit(LimitNode),
     ExchangeSource(ExchangeSourceNode),
     Scan(ScanNode),
-    #[cfg(feature = "compat")]
     Fetch(FetchNode),
     LookUp(LookUpNode),
     Aggregate(AggregateNode),

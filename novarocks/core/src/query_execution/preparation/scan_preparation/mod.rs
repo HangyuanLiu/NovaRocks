@@ -130,18 +130,7 @@ fn prepare_scan_node(
             );
         }
         ScanSource::StarRocks { .. } => {
-            #[cfg(feature = "compat")]
-            {
-                let planned =
-                    crate::connector::starrocks::table::scan_adapter::plan_native_starrocks_scan_with_compat(
-                    node_id, scan, connectors, context.clone(),
-                )?;
-                return store_planned_starrocks_scan(fragment_id, node_id, planned, bindings);
-            }
-            #[cfg(not(feature = "compat"))]
-            {
-                return Err("StarRocks native scan planning requires feature compat".to_string());
-            }
+            return Err("native StarRocks catalog scan planning is unavailable".to_string());
         }
         source if scan_source_requires_resolver(source) => {
             let source_context = scan_source_context(source);

@@ -44,11 +44,9 @@ pub trait SchemaLoadProvider: Send + Sync {
     ) -> Result<Vec<SchemaRow>, String>;
 }
 pub use context::SchemaScanContext;
-#[cfg(feature = "compat")]
 pub use context::{SchemaFrontend, SchemaUserIdentity, SchemaUserRoles};
 // Re-exported for the StarRocks (compat) schema-scan decoder; in non-compat
 // builds these are reached directly via the `op` module (e.g. from tests).
-#[cfg(feature = "compat")]
 pub use op::SchemaScanSource;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

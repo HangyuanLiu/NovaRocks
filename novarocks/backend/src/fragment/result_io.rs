@@ -65,13 +65,17 @@ impl FragmentResultSession for NativeFragmentResultSession {
                     error,
                 )
             })?;
-            return self.handle.write_typed(payload).map_err(|error| {
-                FragmentIoError::new(
-                    FragmentIoOperation::ResultWrite,
-                    FragmentIoErrorKind::Internal,
-                    error,
-                )
-            });
+            return self
+                .handle
+                .write_typed(payload)
+                .map(|_| ())
+                .map_err(|error| {
+                    FragmentIoError::new(
+                        FragmentIoOperation::ResultWrite,
+                        FragmentIoErrorKind::Internal,
+                        error,
+                    )
+                });
         }
 
         let batch = build_result_batch(&chunk, self.spec.projections(), self.spec.presentation())
@@ -88,6 +92,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
                 eos: false,
                 result_batch: batch,
             })
+            .map(|_| ())
             .map_err(|error| {
                 FragmentIoError::new(
                     FragmentIoOperation::ResultWrite,
@@ -98,7 +103,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
     }
 
     fn finish(&self) -> Result<(), FragmentIoError> {
-        self.handle.finish().map_err(|error| {
+        self.handle.finish().map(|_| ()).map_err(|error| {
             FragmentIoError::new(
                 FragmentIoOperation::ResultFinish,
                 FragmentIoErrorKind::Internal,

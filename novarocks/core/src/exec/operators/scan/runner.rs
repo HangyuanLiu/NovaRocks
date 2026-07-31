@@ -378,33 +378,25 @@ impl ScanAsyncRunner {
         &self,
         morsel: &ScanMorsel,
     ) -> Result<Option<LakeRowPositionState>, String> {
-        #[cfg(not(feature = "compat"))]
-        {
-            let _ = morsel;
+        let Some(spec) = self.scan.lake_row_position() else {
             return Ok(None);
-        }
-        #[cfg(feature = "compat")]
-        {
-            let Some(spec) = self.scan.lake_row_position() else {
-                return Ok(None);
-            };
-            let (tablet_id, index) = match morsel {
-                ScanMorsel::StarRocksRange { tablet_id, index } => (*tablet_id, *index),
-                ScanMorsel::ConnectorSplit { index, .. } => {
-                    let Some(tablet_id) = self.op.storage_tablet_id(morsel)? else {
-                        return Ok(None);
-                    };
-                    (tablet_id, *index)
-                }
-                _ => return Ok(None),
-            };
-            Ok(Some(LakeRowPositionState {
-                spec: spec.clone(),
-                tablet_id,
-                range_idx: i32::try_from(index).unwrap_or(i32::MAX),
-                next_row_offset: 0,
-            }))
-        }
+        };
+        let (tablet_id, index) = match morsel {
+            ScanMorsel::StarRocksRange { tablet_id, index } => (*tablet_id, *index),
+            ScanMorsel::ConnectorSplit { index, .. } => {
+                let Some(tablet_id) = self.op.storage_tablet_id(morsel)? else {
+                    return Ok(None);
+                };
+                (tablet_id, *index)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(LakeRowPositionState {
+            spec: spec.clone(),
+            tablet_id,
+            range_idx: i32::try_from(index).unwrap_or(i32::MAX),
+            next_row_offset: 0,
+        }))
     }
 
     fn append_row_position_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {

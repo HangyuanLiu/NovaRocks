@@ -793,30 +793,10 @@ fn refresh_execution_target_for_definition(
         }
     }
 
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "StarRocks MV refresh scheduler requires metadata provider".to_string())?;
-    let txn = provider
-        .begin_read()
-        .map_err(|e| format!("open StarRocks MV scheduler read transaction failed: {e}"))?;
-    let table = state
-        .starrocks_table_repo
-        .load_table(txn.as_ref(), definition.mv_id)
-        .map_err(|e| format!("load StarRocks MV table failed: {e}"))?
-        .ok_or_else(|| format!("StarRocks MV table {} not found", definition.mv_id))?;
-    let database = state
-        .starrocks_table_repo
-        .load_database(txn.as_ref(), table.db_id)
-        .map_err(|e| format!("load StarRocks MV database failed: {e}"))?
-        .ok_or_else(|| format!("StarRocks database {} not found", table.db_id))?;
-    Ok(RefreshExecutionTarget {
-        current_catalog: None,
-        current_database: database.name,
-        name: ObjectName {
-            parts: vec![table.name],
-        },
-    })
+    Err(format!(
+        "standalone StarRocks materialized view definition {} is unavailable",
+        definition.mv_id
+    ))
 }
 
 pub(crate) struct RefreshCoordinatorHandle {

@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::connector::starrocks::schema::{
+use novarocks::connector::starrocks::schema::{
     LakeScanColumnHint, LakeScanTableSchema, StarRocksColumnSchema, StarRocksKeysType,
     StarRocksTabletSchema,
 };
@@ -35,13 +35,13 @@ const COMPRESSION_GZIP: i32 = 8;
 const COMPRESSION_DEFLATE: i32 = 9;
 const COMPRESSION_BZIP2: i32 = 10;
 const COMPRESSION_BROTLI: i32 = 12;
-const PERSISTENT_INDEX_LOCAL: i32 = 0;
-const PERSISTENT_INDEX_CLOUD_NATIVE: i32 = 1;
-const COMPACTION_STRATEGY_DEFAULT: i32 = 0;
-const COMPACTION_STRATEGY_REAL_TIME: i32 = 1;
+pub(crate) const PERSISTENT_INDEX_LOCAL: i32 = 0;
+pub(crate) const PERSISTENT_INDEX_CLOUD_NATIVE: i32 = 1;
+pub(crate) const COMPACTION_STRATEGY_DEFAULT: i32 = 0;
+pub(crate) const COMPACTION_STRATEGY_REAL_TIME: i32 = 1;
 
 pub fn build_sink_tablet_schema(
-    schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
+    schema: &novarocks::thrift::descriptors::TOlapTableSchemaParam,
     schema_id: i64,
     keys_type: StarRocksKeysType,
 ) -> Result<StarRocksTabletSchema, String> {
@@ -201,7 +201,7 @@ pub fn build_sink_tablet_schema(
 }
 
 pub fn build_create_tablet_schema(
-    request: &crate::thrift::agent_service::TCreateTabletReq,
+    request: &novarocks::thrift::agent_service::TCreateTabletReq,
 ) -> Result<StarRocksTabletSchema, String> {
     let schema = &request.tablet_schema;
     if schema.columns.is_empty() {
@@ -341,7 +341,7 @@ pub fn build_create_tablet_schema(
     let compression = request
         .compression_type
         .or(schema.compression_type)
-        .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
+        .unwrap_or(novarocks::thrift::types::TCompressionType::LZ4_FRAME);
     let compression_type = map_create_tablet_compression_type(compression)?;
     let compression_level = request
         .compression_level
@@ -368,7 +368,7 @@ pub fn build_create_tablet_schema(
 }
 
 pub fn build_tablet_schema_from_thrift(
-    schema: &crate::thrift::agent_service::TTabletSchema,
+    schema: &novarocks::thrift::agent_service::TTabletSchema,
 ) -> Result<StarRocksTabletSchema, String> {
     if schema.columns.is_empty() {
         return Err("schema_change base_tablet_read_schema.columns is empty".to_string());
@@ -503,7 +503,7 @@ pub fn build_tablet_schema_from_thrift(
         .max(fallback_next_unique_id as i32) as u32;
     let compression = schema
         .compression_type
-        .unwrap_or(crate::thrift::types::TCompressionType::LZ4_FRAME);
+        .unwrap_or(novarocks::thrift::types::TCompressionType::LZ4_FRAME);
     let compression_type = map_create_tablet_compression_type(compression)?;
     let compression_level = schema.compression_level.or(Some(-1));
 
@@ -527,7 +527,7 @@ pub fn build_tablet_schema_from_thrift(
 }
 
 pub fn build_lake_scan_table_schema_from_thrift(
-    schema: &crate::thrift::agent_service::TTabletSchema,
+    schema: &novarocks::thrift::agent_service::TTabletSchema,
 ) -> Result<LakeScanTableSchema, String> {
     let tablet_schema = build_tablet_schema_from_thrift(schema)?;
     let mut column_hints = HashMap::new();
@@ -566,7 +566,7 @@ pub fn build_lake_scan_table_schema_from_thrift(
 }
 
 fn resolve_create_tablet_column_pb(
-    column: &crate::thrift::descriptors::TColumn,
+    column: &novarocks::thrift::descriptors::TColumn,
     column_idx: usize,
 ) -> Result<StarRocksColumnSchema, String> {
     if let Some(type_desc) = column.type_desc.as_ref() {
@@ -582,7 +582,7 @@ fn resolve_create_tablet_column_pb(
 }
 
 fn build_create_tablet_column_pb_from_column_type(
-    column_type: &crate::thrift::types::TColumnType,
+    column_type: &novarocks::thrift::types::TColumnType,
     column_idx: usize,
 ) -> Result<StarRocksColumnSchema, String> {
     let sr_type = map_primitive_to_starrocks_type(column_type.type_).ok_or_else(|| {
@@ -617,7 +617,7 @@ fn build_create_tablet_column_pb_from_column_type(
 }
 
 fn build_create_tablet_column_pb_from_type_desc(
-    type_desc: &crate::thrift::types::TTypeDesc,
+    type_desc: &novarocks::thrift::types::TTypeDesc,
     column_idx: usize,
 ) -> Result<StarRocksColumnSchema, String> {
     let nodes = type_desc.types.as_ref().ok_or_else(|| {
@@ -647,7 +647,7 @@ fn build_create_tablet_column_pb_from_type_desc(
 }
 
 fn type_desc_to_column_pb(
-    nodes: &[crate::thrift::types::TTypeNode],
+    nodes: &[novarocks::thrift::types::TTypeNode],
     cursor: &mut usize,
     column_idx: usize,
     path: &str,
@@ -664,7 +664,7 @@ fn type_desc_to_column_pb(
     })?;
     *cursor += 1;
 
-    if node.type_ == crate::thrift::types::TTypeNodeType::SCALAR {
+    if node.type_ == novarocks::thrift::types::TTypeNodeType::SCALAR {
         let scalar = node.scalar_type.as_ref().ok_or_else(|| {
             format!(
                 "create_tablet column {} scalar node missing scalar_type at path={}",
@@ -687,7 +687,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::thrift::types::TTypeNodeType::ARRAY {
+    if node.type_ == novarocks::thrift::types::TTypeNodeType::ARRAY {
         column_pb.r#type = "ARRAY".to_string();
         let mut element = init_create_tablet_sub_field_pb();
         type_desc_to_column_pb(
@@ -702,7 +702,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::thrift::types::TTypeNodeType::MAP {
+    if node.type_ == novarocks::thrift::types::TTypeNodeType::MAP {
         column_pb.r#type = "MAP".to_string();
         let mut key = init_create_tablet_sub_field_pb();
         type_desc_to_column_pb(nodes, cursor, column_idx, &format!("{path}.key"), &mut key)?;
@@ -722,7 +722,7 @@ fn type_desc_to_column_pb(
         return Ok(());
     }
 
-    if node.type_ == crate::thrift::types::TTypeNodeType::STRUCT {
+    if node.type_ == novarocks::thrift::types::TTypeNodeType::STRUCT {
         column_pb.r#type = "STRUCT".to_string();
         let struct_fields = node.struct_fields.as_ref().ok_or_else(|| {
             format!(
@@ -792,11 +792,11 @@ fn init_create_tablet_sub_field_pb() -> StarRocksColumnSchema {
 }
 
 fn resolve_decimal_type_attrs(
-    primitive: crate::thrift::types::TPrimitiveType,
+    primitive: novarocks::thrift::types::TPrimitiveType,
     precision: Option<i32>,
     scale: Option<i32>,
 ) -> (Option<i32>, Option<i32>) {
-    if primitive == crate::thrift::types::TPrimitiveType::DECIMALV2 {
+    if primitive == novarocks::thrift::types::TPrimitiveType::DECIMALV2 {
         return (
             Some(i32::from(LEGACY_DECIMALV2_PRECISION)),
             Some(i32::from(LEGACY_DECIMALV2_SCALE)),
@@ -824,18 +824,18 @@ fn normalize_column_pb_type_attrs(column: &mut StarRocksColumnSchema) {
 }
 
 fn map_create_tablet_keys_type(
-    keys_type: crate::thrift::types::TKeysType,
+    keys_type: novarocks::thrift::types::TKeysType,
 ) -> Result<StarRocksKeysType, String> {
-    if keys_type == crate::thrift::types::TKeysType::DUP_KEYS {
+    if keys_type == novarocks::thrift::types::TKeysType::DUP_KEYS {
         return Ok(StarRocksKeysType::Duplicate);
     }
-    if keys_type == crate::thrift::types::TKeysType::UNIQUE_KEYS {
+    if keys_type == novarocks::thrift::types::TKeysType::UNIQUE_KEYS {
         return Ok(StarRocksKeysType::Unique);
     }
-    if keys_type == crate::thrift::types::TKeysType::AGG_KEYS {
+    if keys_type == novarocks::thrift::types::TKeysType::AGG_KEYS {
         return Ok(StarRocksKeysType::Aggregate);
     }
-    if keys_type == crate::thrift::types::TKeysType::PRIMARY_KEYS {
+    if keys_type == novarocks::thrift::types::TKeysType::PRIMARY_KEYS {
         return Ok(StarRocksKeysType::Primary);
     }
     Err(format!(
@@ -845,38 +845,38 @@ fn map_create_tablet_keys_type(
 }
 
 fn map_create_tablet_compression_type(
-    compression_type: crate::thrift::types::TCompressionType,
+    compression_type: novarocks::thrift::types::TCompressionType,
 ) -> Result<i32, String> {
-    if compression_type == crate::thrift::types::TCompressionType::DEFAULT_COMPRESSION {
+    if compression_type == novarocks::thrift::types::TCompressionType::DEFAULT_COMPRESSION {
         return Ok(COMPRESSION_DEFAULT);
     }
-    if compression_type == crate::thrift::types::TCompressionType::NO_COMPRESSION {
+    if compression_type == novarocks::thrift::types::TCompressionType::NO_COMPRESSION {
         return Ok(COMPRESSION_NONE);
     }
-    if compression_type == crate::thrift::types::TCompressionType::SNAPPY {
+    if compression_type == novarocks::thrift::types::TCompressionType::SNAPPY {
         return Ok(COMPRESSION_SNAPPY);
     }
-    if compression_type == crate::thrift::types::TCompressionType::LZ4
-        || compression_type == crate::thrift::types::TCompressionType::LZ4_FRAME
+    if compression_type == novarocks::thrift::types::TCompressionType::LZ4
+        || compression_type == novarocks::thrift::types::TCompressionType::LZ4_FRAME
     {
         return Ok(COMPRESSION_LZ4_FRAME);
     }
-    if compression_type == crate::thrift::types::TCompressionType::ZLIB {
+    if compression_type == novarocks::thrift::types::TCompressionType::ZLIB {
         return Ok(COMPRESSION_ZLIB);
     }
-    if compression_type == crate::thrift::types::TCompressionType::ZSTD {
+    if compression_type == novarocks::thrift::types::TCompressionType::ZSTD {
         return Ok(COMPRESSION_ZSTD);
     }
-    if compression_type == crate::thrift::types::TCompressionType::GZIP {
+    if compression_type == novarocks::thrift::types::TCompressionType::GZIP {
         return Ok(COMPRESSION_GZIP);
     }
-    if compression_type == crate::thrift::types::TCompressionType::DEFLATE {
+    if compression_type == novarocks::thrift::types::TCompressionType::DEFLATE {
         return Ok(COMPRESSION_DEFLATE);
     }
-    if compression_type == crate::thrift::types::TCompressionType::BZIP2 {
+    if compression_type == novarocks::thrift::types::TCompressionType::BZIP2 {
         return Ok(COMPRESSION_BZIP2);
     }
-    if compression_type == crate::thrift::types::TCompressionType::BROTLI {
+    if compression_type == novarocks::thrift::types::TCompressionType::BROTLI {
         return Ok(COMPRESSION_BROTLI);
     }
     Err(format!(
@@ -886,12 +886,13 @@ fn map_create_tablet_compression_type(
 }
 
 pub(crate) fn map_create_tablet_persistent_index_type(
-    persistent_index_type: crate::thrift::agent_service::TPersistentIndexType,
+    persistent_index_type: novarocks::thrift::agent_service::TPersistentIndexType,
 ) -> Result<i32, String> {
-    if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::LOCAL {
+    if persistent_index_type == novarocks::thrift::agent_service::TPersistentIndexType::LOCAL {
         return Ok(PERSISTENT_INDEX_LOCAL);
     }
-    if persistent_index_type == crate::thrift::agent_service::TPersistentIndexType::CLOUD_NATIVE {
+    if persistent_index_type == novarocks::thrift::agent_service::TPersistentIndexType::CLOUD_NATIVE
+    {
         return Ok(PERSISTENT_INDEX_CLOUD_NATIVE);
     }
     Err(format!(
@@ -903,12 +904,12 @@ pub(crate) fn map_create_tablet_persistent_index_type(
 pub(crate) const DEFAULT_COMPACTION_STRATEGY: i32 = COMPACTION_STRATEGY_DEFAULT;
 
 pub(crate) fn map_create_tablet_compaction_strategy(
-    compaction_strategy: crate::thrift::agent_service::TCompactionStrategy,
+    compaction_strategy: novarocks::thrift::agent_service::TCompactionStrategy,
 ) -> Result<i32, String> {
-    if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::DEFAULT {
+    if compaction_strategy == novarocks::thrift::agent_service::TCompactionStrategy::DEFAULT {
         return Ok(COMPACTION_STRATEGY_DEFAULT);
     }
-    if compaction_strategy == crate::thrift::agent_service::TCompactionStrategy::REAL_TIME {
+    if compaction_strategy == novarocks::thrift::agent_service::TCompactionStrategy::REAL_TIME {
         return Ok(COMPACTION_STRATEGY_REAL_TIME);
     }
     Err(format!(
@@ -918,8 +919,8 @@ pub(crate) fn map_create_tablet_compaction_strategy(
 }
 
 fn build_slot_descs_by_name(
-    schema: &crate::thrift::descriptors::TOlapTableSchemaParam,
-) -> Result<HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>, String> {
+    schema: &novarocks::thrift::descriptors::TOlapTableSchemaParam,
+) -> Result<HashMap<String, &novarocks::thrift::descriptors::TSlotDescriptor>, String> {
     let mut map = HashMap::new();
     for (idx, slot) in schema.slot_descs.iter().enumerate() {
         let name = slot
@@ -940,10 +941,10 @@ fn build_slot_descs_by_name(
 }
 
 fn resolve_sink_unique_id(
-    column: &crate::thrift::descriptors::TColumn,
+    column: &novarocks::thrift::descriptors::TColumn,
     column_name: &str,
     column_idx: usize,
-    slot_descs_by_name: &HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>,
+    slot_descs_by_name: &HashMap<String, &novarocks::thrift::descriptors::TSlotDescriptor>,
 ) -> i32 {
     column
         .col_unique_id
@@ -958,11 +959,11 @@ fn resolve_sink_unique_id(
 }
 
 fn resolve_sink_column_pb(
-    column: &crate::thrift::descriptors::TColumn,
+    column: &novarocks::thrift::descriptors::TColumn,
     column_name: &str,
     column_idx: usize,
     schema_id: i64,
-    slot_descs_by_name: &HashMap<String, &crate::thrift::descriptors::TSlotDescriptor>,
+    slot_descs_by_name: &HashMap<String, &novarocks::thrift::descriptors::TSlotDescriptor>,
 ) -> Result<StarRocksColumnSchema, String> {
     if let Some(column_type) = column.column_type.as_ref() {
         return build_create_tablet_column_pb_from_column_type(column_type, column_idx).map_err(
@@ -1009,7 +1010,7 @@ fn resolve_sink_column_pb(
 }
 
 fn map_aggregation_type_to_schema_string(
-    aggregation_type: Option<crate::thrift::types::TAggregationType>,
+    aggregation_type: Option<novarocks::thrift::types::TAggregationType>,
     is_key: bool,
     keys_type: StarRocksKeysType,
     column_idx: usize,
@@ -1027,16 +1028,16 @@ fn map_aggregation_type_to_schema_string(
         )
     })?;
     let name = match agg {
-        crate::thrift::types::TAggregationType::SUM => "SUM",
-        crate::thrift::types::TAggregationType::MAX => "MAX",
-        crate::thrift::types::TAggregationType::MIN => "MIN",
-        crate::thrift::types::TAggregationType::REPLACE => "REPLACE",
-        crate::thrift::types::TAggregationType::HLL_UNION => "HLL_UNION",
-        crate::thrift::types::TAggregationType::NONE => "NONE",
-        crate::thrift::types::TAggregationType::BITMAP_UNION => "BITMAP_UNION",
-        crate::thrift::types::TAggregationType::REPLACE_IF_NOT_NULL => "REPLACE_IF_NOT_NULL",
-        crate::thrift::types::TAggregationType::PERCENTILE_UNION => "PERCENTILE_UNION",
-        crate::thrift::types::TAggregationType::AGG_STATE_UNION => "AGG_STATE_UNION",
+        novarocks::thrift::types::TAggregationType::SUM => "SUM",
+        novarocks::thrift::types::TAggregationType::MAX => "MAX",
+        novarocks::thrift::types::TAggregationType::MIN => "MIN",
+        novarocks::thrift::types::TAggregationType::REPLACE => "REPLACE",
+        novarocks::thrift::types::TAggregationType::HLL_UNION => "HLL_UNION",
+        novarocks::thrift::types::TAggregationType::NONE => "NONE",
+        novarocks::thrift::types::TAggregationType::BITMAP_UNION => "BITMAP_UNION",
+        novarocks::thrift::types::TAggregationType::REPLACE_IF_NOT_NULL => "REPLACE_IF_NOT_NULL",
+        novarocks::thrift::types::TAggregationType::PERCENTILE_UNION => "PERCENTILE_UNION",
+        novarocks::thrift::types::TAggregationType::AGG_STATE_UNION => "AGG_STATE_UNION",
         other => {
             return Err(format!(
                 "unsupported aggregation_type for value column in schema.indexes column index {}: {:?}",
@@ -1048,59 +1049,59 @@ fn map_aggregation_type_to_schema_string(
 }
 
 fn map_primitive_to_starrocks_type(
-    primitive: crate::thrift::types::TPrimitiveType,
+    primitive: novarocks::thrift::types::TPrimitiveType,
 ) -> Option<&'static str> {
     let t = primitive;
-    Some(if t == crate::thrift::types::TPrimitiveType::BOOLEAN {
+    Some(if t == novarocks::thrift::types::TPrimitiveType::BOOLEAN {
         "BOOLEAN"
-    } else if t == crate::thrift::types::TPrimitiveType::TINYINT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::TINYINT {
         "TINYINT"
-    } else if t == crate::thrift::types::TPrimitiveType::SMALLINT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::SMALLINT {
         "SMALLINT"
-    } else if t == crate::thrift::types::TPrimitiveType::INT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::INT {
         "INT"
-    } else if t == crate::thrift::types::TPrimitiveType::BIGINT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::BIGINT {
         "BIGINT"
-    } else if t == crate::thrift::types::TPrimitiveType::LARGEINT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::LARGEINT {
         "LARGEINT"
-    } else if t == crate::thrift::types::TPrimitiveType::FLOAT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::FLOAT {
         "FLOAT"
-    } else if t == crate::thrift::types::TPrimitiveType::DOUBLE {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DOUBLE {
         "DOUBLE"
-    } else if t == crate::thrift::types::TPrimitiveType::DATE {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DATE {
         "DATE"
-    } else if t == crate::thrift::types::TPrimitiveType::DATETIME
-        || t == crate::thrift::types::TPrimitiveType::TIME
+    } else if t == novarocks::thrift::types::TPrimitiveType::DATETIME
+        || t == novarocks::thrift::types::TPrimitiveType::TIME
     {
         "DATETIME"
-    } else if t == crate::thrift::types::TPrimitiveType::CHAR {
+    } else if t == novarocks::thrift::types::TPrimitiveType::CHAR {
         "CHAR"
-    } else if t == crate::thrift::types::TPrimitiveType::VARCHAR {
+    } else if t == novarocks::thrift::types::TPrimitiveType::VARCHAR {
         "VARCHAR"
-    } else if t == crate::thrift::types::TPrimitiveType::HLL {
+    } else if t == novarocks::thrift::types::TPrimitiveType::HLL {
         "HLL"
-    } else if t == crate::thrift::types::TPrimitiveType::OBJECT {
+    } else if t == novarocks::thrift::types::TPrimitiveType::OBJECT {
         "OBJECT"
-    } else if t == crate::thrift::types::TPrimitiveType::PERCENTILE {
+    } else if t == novarocks::thrift::types::TPrimitiveType::PERCENTILE {
         "PERCENTILE"
-    } else if t == crate::thrift::types::TPrimitiveType::BINARY {
+    } else if t == novarocks::thrift::types::TPrimitiveType::BINARY {
         "BINARY"
-    } else if t == crate::thrift::types::TPrimitiveType::VARBINARY {
+    } else if t == novarocks::thrift::types::TPrimitiveType::VARBINARY {
         "VARBINARY"
-    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL
-        || t == crate::thrift::types::TPrimitiveType::DECIMALV2
+    } else if t == novarocks::thrift::types::TPrimitiveType::DECIMAL
+        || t == novarocks::thrift::types::TPrimitiveType::DECIMALV2
     {
         // Native writer path is DecimalV3-based; map legacy decimal primitives to Decimal128.
         "DECIMAL128"
-    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL32 {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DECIMAL32 {
         "DECIMAL32"
-    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL64 {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DECIMAL64 {
         "DECIMAL64"
-    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL128 {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DECIMAL128 {
         "DECIMAL128"
-    } else if t == crate::thrift::types::TPrimitiveType::DECIMAL256 {
+    } else if t == novarocks::thrift::types::TPrimitiveType::DECIMAL256 {
         "DECIMAL256"
-    } else if t == crate::thrift::types::TPrimitiveType::JSON {
+    } else if t == novarocks::thrift::types::TPrimitiveType::JSON {
         "JSON"
     } else {
         return None;
@@ -1113,7 +1114,7 @@ fn map_primitive_to_starrocks_type(
 ///
 /// Returns None if the expression cannot be evaluated as a constant literal
 /// (e.g., unsupported node type, malformed expression).
-fn convert_define_expr_to_json(expr: &crate::thrift::exprs::TExpr) -> Option<String> {
+fn convert_define_expr_to_json(expr: &novarocks::thrift::exprs::TExpr) -> Option<String> {
     if expr.nodes.is_empty() {
         return None;
     }
@@ -1128,7 +1129,9 @@ fn convert_define_expr_to_json(expr: &crate::thrift::exprs::TExpr) -> Option<Str
 }
 
 /// Extract struct field names from a TTypeDesc, if it describes a STRUCT type.
-fn extract_struct_field_names(type_desc: &crate::thrift::types::TTypeDesc) -> Option<Vec<String>> {
+fn extract_struct_field_names(
+    type_desc: &novarocks::thrift::types::TTypeDesc,
+) -> Option<Vec<String>> {
     let nodes = type_desc.types.as_ref()?;
     for type_node in nodes {
         if let Some(fields) = &type_node.struct_fields {
@@ -1148,7 +1151,7 @@ fn extract_struct_field_names(type_desc: &crate::thrift::types::TTypeDesc) -> Op
 /// `struct_fields_hint`: when Some, the caller knows the expected struct field names
 /// (used for positional `row(v1, v2, ...)` calls where field names aren't in the expr).
 fn eval_texpr_node(
-    nodes: &[crate::thrift::exprs::TExprNode],
+    nodes: &[novarocks::thrift::exprs::TExprNode],
     idx: &mut usize,
     struct_fields_hint: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
@@ -1164,7 +1167,7 @@ fn eval_texpr_node(
     let num_children = node.num_children as usize;
     let nt = node.node_type;
 
-    use crate::thrift::exprs::TExprNodeType;
+    use novarocks::thrift::exprs::TExprNodeType;
     if nt == TExprNodeType::INT_LITERAL {
         let v = node
             .int_literal
@@ -1337,7 +1340,7 @@ fn eval_texpr_node(
 #[cfg(test)]
 mod lake_scan_tests {
     use super::*;
-    use crate::thrift::{agent_service, descriptors, types};
+    use novarocks::thrift::{agent_service, descriptors, types};
 
     #[test]
     fn storage_domain_enum_values_preserve_starrocks_wire_numbers() {

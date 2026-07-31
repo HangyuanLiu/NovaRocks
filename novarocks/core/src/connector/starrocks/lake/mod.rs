@@ -27,18 +27,15 @@ pub(crate) mod applier;
 #[allow(dead_code)]
 pub(crate) mod compaction;
 pub mod context;
-pub(crate) mod create_tablet;
 pub(crate) mod delete_payload_codec;
 #[allow(dead_code)]
 pub(crate) mod pk_applier;
 #[allow(dead_code)]
 pub(crate) mod replay_policy;
 pub(crate) mod schema;
-pub mod schema_adapter;
 pub mod schema_change;
 pub mod service_domain;
 pub mod storage_domain;
-pub(crate) mod storage_schema_wire;
 #[allow(dead_code)]
 pub(crate) mod transactions;
 #[allow(dead_code)]
@@ -47,9 +44,7 @@ pub(crate) mod txn_log;
 
 pub use compaction::{execute_abort_compaction, execute_compact};
 pub(crate) use context::TabletWriteContext;
-pub(crate) use create_tablet::create_lake_tablet_from_req;
 pub use schema::{LakeCreateTabletTask, execute_lake_create_tablet_task};
-pub use schema_adapter::build_sink_tablet_schema;
 pub use schema_change::{
     LakeTabletMetadataUpdate, LakeUpdateTabletMetaTask, execute_lake_update_tablet_meta_task,
 };

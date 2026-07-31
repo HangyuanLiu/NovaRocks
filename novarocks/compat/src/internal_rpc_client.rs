@@ -20,8 +20,9 @@ use std::ffi::CString;
 use novarocks::common::types::UniqueId;
 use novarocks::proto;
 use novarocks::runtime::query_context::QueryId;
-use novarocks::service::engine_ffi::NovaRocksRustBuf;
 use prost::Message;
+
+use crate::ffi_support::NovaRocksRustBuf;
 
 unsafe extern "C" {
     fn novarocks_compat_transmit_chunk(

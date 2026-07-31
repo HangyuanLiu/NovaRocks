@@ -29,8 +29,6 @@ pub mod delta;
 pub(crate) mod delta_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
-#[cfg(feature = "compat")]
-pub(crate) mod file_pruning_wire;
 pub(crate) mod file_reader;
 pub(crate) mod fs_io;
 pub mod metadata;

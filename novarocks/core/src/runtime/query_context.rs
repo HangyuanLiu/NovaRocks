@@ -26,13 +26,9 @@ use crate::cache::CacheOptions;
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::node::scan::ConnectorRowPositionLookup;
-#[cfg(feature = "compat")]
 use crate::exec::node::scan::IncrementalScanRange;
-#[cfg(feature = "compat")]
 use crate::exec::node::scan::LakeGlmScanInfo;
-#[cfg(feature = "compat")]
 use crate::exec::node::scan::ScanOp;
-#[cfg(feature = "compat")]
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
@@ -210,11 +206,9 @@ pub(crate) struct QueryContext {
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
-    #[cfg(feature = "compat")]
     pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
-    #[cfg(feature = "compat")]
     starrocks_preparing_admissions: usize,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
@@ -410,11 +404,9 @@ impl QueryContext {
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
             connector_glm_contexts: HashMap::new(),
-            #[cfg(feature = "compat")]
             lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
-            #[cfg(feature = "compat")]
             starrocks_preparing_admissions: 0,
             cleanup_leases: Vec::new(),
         }
@@ -651,12 +643,10 @@ impl QueryContext {
         ))
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn register_lake_glm(&mut self, row_source_slot: SlotId, info: LakeGlmScanInfo) {
         self.lake_glm_contexts.insert(row_source_slot, info);
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn lake_glm_info(&self, row_source_slot: SlotId) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_contexts.get(&row_source_slot)
     }
@@ -714,14 +704,12 @@ impl Drop for QueryContext {
     }
 }
 
-#[cfg(feature = "compat")]
 struct IncrementalScanNodeHandle {
     op: Arc<dyn ScanOp>,
     dispatch: Arc<ScanDispatchState>,
     update_mu: Mutex<()>,
 }
 
-#[cfg(feature = "compat")]
 impl IncrementalScanNodeHandle {
     fn new(op: Arc<dyn ScanOp>, dispatch: Arc<ScanDispatchState>) -> Self {
         Self {
@@ -761,11 +749,8 @@ struct QueryContextManagerInner {
     after_runtime_filter_service_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     abort_wait_observer: Option<Arc<dyn Fn() + Send + Sync>>,
-    #[cfg(feature = "compat")]
     incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
-    #[cfg(feature = "compat")]
     pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
-    #[cfg(feature = "compat")]
     incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
@@ -888,7 +873,6 @@ pub(crate) struct FinstCancelResult {
     pub(crate) finsts: Vec<UniqueId>,
 }
 
-#[cfg(feature = "compat")]
 pub(crate) struct StarRocksQueryHandoff {
     pub(crate) execution: QueryExecutionKey,
     pub(crate) delivery_expire: Duration,
@@ -1900,7 +1884,6 @@ impl QueryContextManager {
         }
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn get_or_register_compat(
         &self,
         query_id: QueryId,
@@ -1919,7 +1902,6 @@ impl QueryContextManager {
         )
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn ensure_compat_context(
         &self,
         query_id: QueryId,
@@ -1938,7 +1920,6 @@ impl QueryContextManager {
         )
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn prepare_starrocks_admission(
         &self,
         query_id: QueryId,
@@ -1961,7 +1942,6 @@ impl QueryContextManager {
         Ok(context.mem_tracker())
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn release_starrocks_admission(&self, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         let location = if guard.active.contains_key(&query_id) {
@@ -2160,7 +2140,6 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn commit_starrocks_handoff<F>(
         &self,
         handoff: StarRocksQueryHandoff,
@@ -2528,7 +2507,6 @@ impl QueryContextManager {
             .and_then(|ctx| ctx.row_pos_desc(tuple_id))
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn register_lake_glm(
         &self,
         query_id: QueryId,
@@ -2541,7 +2519,6 @@ impl QueryContextManager {
         })
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn lake_glm_info(
         &self,
         query_id: QueryId,
@@ -2552,8 +2529,7 @@ impl QueryContextManager {
             .active
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.lake_glm_info(row_source_slot))
-            .cloned()
+            .and_then(|ctx| ctx.lake_glm_info(row_source_slot).map(Clone::clone))
     }
 
     /// Returns the query tracker for lifecycle verification and neutral runtime observers.
@@ -2575,7 +2551,6 @@ impl QueryContextManager {
             .and_then(|ctx| ctx.desc_snapshot.clone())
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn register_incremental_scan_node(
         &self,
         finst_id: UniqueId,
@@ -2611,7 +2586,6 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn append_incremental_scan_ranges(
         &self,
         finst_id: UniqueId,
@@ -2648,7 +2622,6 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn incremental_change_op_slot(
         &self,
         finst_id: UniqueId,
@@ -2755,7 +2728,6 @@ impl QueryContextManager {
             .map(|execution| execution.query_id())
     }
 
-    #[cfg(all(test, feature = "compat"))]
     pub(crate) fn query_execution_by_finst(&self, finst_id: UniqueId) -> Option<QueryExecutionKey> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.get(&finst_id).copied()
@@ -2764,11 +2736,8 @@ impl QueryContextManager {
     pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.pending_incremental_scan_ranges.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.incremental_change_op_slots.remove(&finst_id);
     }
 
@@ -2834,11 +2803,8 @@ impl QueryContextManager {
             return;
         }
         guard.finst_to_query.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.incremental_scan_nodes.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.pending_incremental_scan_ranges.remove(&finst_id);
-        #[cfg(feature = "compat")]
         guard.incremental_change_op_slots.remove(&finst_id);
     }
 
@@ -2847,7 +2813,6 @@ impl QueryContextManager {
     /// The handoff publishes every fragment route and the query context atomically.
     /// Its adapter-side rollback therefore removes the same complete route set and
     /// drops the context, including descriptor cleanup leases, as one operation.
-    #[cfg(feature = "compat")]
     pub(crate) fn rollback_starrocks_handoff(
         &self,
         execution: QueryExecutionKey,

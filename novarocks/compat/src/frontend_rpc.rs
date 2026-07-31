@@ -29,7 +29,6 @@ use thrift::transport::{
 };
 
 use novarocks::common::config;
-use novarocks::connector::starrocks::lake::schema_adapter::build_lake_scan_table_schema_from_thrift;
 use novarocks::connector::starrocks::ports::{
     ConnectorWireError, ConnectorWireErrorKind, TableSchemaProvider, TableSchemaRequest,
     TableSchemaRequestSource,
@@ -40,6 +39,7 @@ use novarocks::thrift::types;
 use novarocks::thrift::{descriptors, frontend_service, status, status_code};
 
 use crate::control::FrontendControlState;
+use crate::schema_wire::build_lake_scan_table_schema_from_thrift;
 
 type FrontendRpcClientInner = FrontendServiceSyncClient<
     TBinaryInputProtocol<TBufferedReadTransport<TReadHalf<TTcpChannel>>>,

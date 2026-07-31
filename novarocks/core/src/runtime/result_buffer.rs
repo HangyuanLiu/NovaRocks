@@ -36,6 +36,18 @@ enum ResultBufferWriteState {
     Aborted,
 }
 
+/// Observable result-buffer state changes for an adapter-owned publication boundary.
+///
+/// Core always wakes its in-process waiters after a mutation. Protocol adapters decide whether a
+/// particular state transition needs an external notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultPublication {
+    DataReady,
+    TerminalReady,
+    Removed,
+    NoChange,
+}
+
 /// Fragment-scoped ownership of a single Result Buffer sender registration.
 ///
 /// The handle intentionally owns terminal publication: callers cannot finish through one path
@@ -70,16 +82,15 @@ impl ResultBufferWriteHandle {
         })
     }
 
-    pub fn write_legacy(&self, result: FetchResult) -> Result<(), String> {
+    pub fn write_legacy(&self, result: FetchResult) -> Result<ResultPublication, String> {
         self.require_open()?;
         if self.mode != ResultBufferMode::Legacy {
             return Err("typed result buffer cannot accept legacy result batches".to_string());
         }
-        insert(self.fragment_instance_id, result);
-        Ok(())
+        Ok(insert(self.fragment_instance_id, result))
     }
 
-    pub fn write_typed(&self, payload: Vec<u8>) -> Result<(), String> {
+    pub fn write_typed(&self, payload: Vec<u8>) -> Result<ResultPublication, String> {
         self.require_open()?;
         if self.mode != ResultBufferMode::Typed {
             return Err("legacy result buffer cannot accept typed payloads".to_string());
@@ -87,27 +98,27 @@ impl ResultBufferWriteHandle {
         insert_typed(self.fragment_instance_id, payload)
     }
 
-    pub fn finish(&self) -> Result<(), String> {
+    pub fn finish(&self) -> Result<ResultPublication, String> {
         let mut state = self.state.lock().expect("result buffer write handle lock");
         match *state {
             ResultBufferWriteState::Open => {
-                close_ok(self.fragment_instance_id);
+                let publication = close_ok(self.fragment_instance_id);
                 *state = ResultBufferWriteState::Finished;
-                Ok(())
+                Ok(publication)
             }
-            ResultBufferWriteState::Finished => Ok(()),
+            ResultBufferWriteState::Finished => Ok(ResultPublication::NoChange),
             ResultBufferWriteState::Aborted => {
                 Err("result buffer session was aborted before finish".to_string())
             }
         }
     }
 
-    pub fn abort(&self, reason: ResultAbort) {
+    pub fn abort(&self, reason: ResultAbort) -> ResultPublication {
         let mut state = self.state.lock().expect("result buffer write handle lock");
         if *state != ResultBufferWriteState::Open {
-            return;
+            return ResultPublication::NoChange;
         }
-        match reason {
+        let publication = match reason {
             ResultAbort::PrepareRollback | ResultAbort::NeverStarted => {
                 discard(self.fragment_instance_id)
             }
@@ -115,8 +126,9 @@ impl ResultBufferWriteHandle {
             ResultAbort::Cancelled(reason) => {
                 cancel_with_message(self.fragment_instance_id, reason)
             }
-        }
+        };
         *state = ResultBufferWriteState::Aborted;
+        publication
     }
 
     fn require_open(&self) -> Result<(), String> {
@@ -332,48 +344,46 @@ fn ctx() -> &'static ResultCtx {
     })
 }
 
-#[cfg(all(feature = "compat", not(test)))]
-unsafe extern "C" {
-    fn novarocks_compat_notify_fetch_ready(finst_id_hi: i64, finst_id_lo: i64);
-}
-
-fn notify_fetch_ready(finst_id: UniqueId) {
-    // Notify any in-process waiters (e.g. wait_fetch).
+fn notify_waiters() {
     ctx().cvar.notify_all();
-
-    #[cfg(all(feature = "compat", not(test)))]
-    unsafe {
-        novarocks_compat_notify_fetch_ready(finst_id.hi, finst_id.lo);
-    }
-
-    #[cfg(not(all(feature = "compat", not(test))))]
-    let _ = finst_id;
 }
 
-pub(crate) fn insert(finst_id: UniqueId, result: FetchResult) {
+pub(crate) fn insert(finst_id: UniqueId, result: FetchResult) -> ResultPublication {
     let c = ctx();
+    let mut publication = ResultPublication::NoChange;
     {
         let mut guard = c.mu.lock().expect("ctx lock");
         let block = guard
             .entry(finst_id)
             .or_insert_with(BufferControlBlock::new);
+        if block.closed_ok || block.status_error.is_some() || block.cancelled {
+            return ResultPublication::NoChange;
+        }
         if block.set_mode(ResultBufferMode::Legacy).is_ok() {
             let tracked = TrackedFetchResult::new(result, block.mem_tracker.as_ref());
             block.queue.push_back(tracked);
+            publication = ResultPublication::DataReady;
         } else {
             block.fail_mode_mismatch(ResultBufferMode::Legacy);
         }
     }
-    notify_fetch_ready(finst_id);
+    notify_waiters();
+    publication
 }
 
-pub(crate) fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<(), String> {
+pub(crate) fn insert_typed(
+    finst_id: UniqueId,
+    payload: Vec<u8>,
+) -> Result<ResultPublication, String> {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
         let block = guard
             .entry(finst_id)
             .or_insert_with(BufferControlBlock::new);
+        if block.closed_ok || block.status_error.is_some() || block.cancelled {
+            return Ok(ResultPublication::NoChange);
+        }
         block.set_mode(ResultBufferMode::Typed)?;
         let result = TypedFetchResult {
             packet_seq: 0,
@@ -383,55 +393,68 @@ pub(crate) fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<(), S
         let tracked = TrackedTypedFetchResult::new(result, block.mem_tracker.as_ref());
         block.typed_queue.push_back(tracked);
     }
-    notify_fetch_ready(finst_id);
-    Ok(())
+    notify_waiters();
+    Ok(ResultPublication::DataReady)
 }
 
-pub(crate) fn close_ok(finst_id: UniqueId) {
+pub(crate) fn close_ok(finst_id: UniqueId) -> ResultPublication {
     let c = ctx();
+    let mut publication = ResultPublication::NoChange;
     {
         let mut guard = c.mu.lock().expect("ctx lock");
         let block = guard
             .entry(finst_id)
             .or_insert_with(BufferControlBlock::new);
-        block.closed_ok = true;
-    }
-    notify_fetch_ready(finst_id);
-}
-
-pub(crate) fn close_error(finst_id: UniqueId, message: String) {
-    let c = ctx();
-    {
-        let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard
-            .entry(finst_id)
-            .or_insert_with(BufferControlBlock::new);
-        block.status_error = Some(message);
-        block.queue.clear();
-        block.typed_queue.clear();
-    }
-    notify_fetch_ready(finst_id);
-}
-
-pub(crate) fn cancel(finst_id: UniqueId) {
-    cancel_with_message(finst_id, "Cancelled".to_string());
-}
-
-fn cancel_with_message(finst_id: UniqueId, message: String) {
-    let c = ctx();
-    {
-        let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard
-            .entry(finst_id)
-            .or_insert_with(BufferControlBlock::new);
-        block.cancelled = true;
-        if block.cancel_message.is_none() {
-            block.cancel_message = Some(message);
+        if !block.closed_ok && block.status_error.is_none() && !block.cancelled {
+            block.closed_ok = true;
+            publication = ResultPublication::TerminalReady;
         }
-        block.queue.clear();
-        block.typed_queue.clear();
     }
-    notify_fetch_ready(finst_id);
+    notify_waiters();
+    publication
+}
+
+pub(crate) fn close_error(finst_id: UniqueId, message: String) -> ResultPublication {
+    let c = ctx();
+    let mut publication = ResultPublication::NoChange;
+    {
+        let mut guard = c.mu.lock().expect("ctx lock");
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
+        if !block.closed_ok && block.status_error.is_none() && !block.cancelled {
+            block.status_error = Some(message);
+            block.queue.clear();
+            block.typed_queue.clear();
+            publication = ResultPublication::TerminalReady;
+        }
+    }
+    notify_waiters();
+    publication
+}
+
+pub(crate) fn cancel(finst_id: UniqueId) -> ResultPublication {
+    cancel_with_message(finst_id, "Cancelled".to_string())
+}
+
+fn cancel_with_message(finst_id: UniqueId, message: String) -> ResultPublication {
+    let c = ctx();
+    let mut publication = ResultPublication::NoChange;
+    {
+        let mut guard = c.mu.lock().expect("ctx lock");
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
+        if !block.closed_ok && block.status_error.is_none() && !block.cancelled {
+            block.cancelled = true;
+            block.cancel_message = Some(message);
+            block.queue.clear();
+            block.typed_queue.clear();
+            publication = ResultPublication::TerminalReady;
+        }
+    }
+    notify_waiters();
+    publication
 }
 
 pub(crate) fn create_sender(finst_id: UniqueId) {
@@ -474,10 +497,11 @@ fn try_create_sender_with_mode(finst_id: UniqueId, mode: ResultBufferMode) -> Re
     Ok(())
 }
 
-pub(crate) fn discard(finst_id: UniqueId) {
+pub(crate) fn discard(finst_id: UniqueId) -> ResultPublication {
     let c = ctx();
     c.mu.lock().expect("ctx lock").remove(&finst_id);
     c.cvar.notify_all();
+    ResultPublication::Removed
 }
 
 pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
@@ -728,7 +752,7 @@ fn fallback_fetch_wait_timeout() -> Duration {
     Duration::from_secs(300)
 }
 
-pub(crate) fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
+pub fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
     use crate::runtime::query_context::query_context_manager;
 
     query_context_manager()
@@ -736,7 +760,7 @@ pub(crate) fn fetch_wait_timeout(finst_id: UniqueId) -> Duration {
         .unwrap_or_else(fallback_fetch_wait_timeout)
 }
 
-pub(crate) fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
+pub fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
     let millis = fetch_wait_timeout(finst_id).as_millis();
     i64::try_from(millis).unwrap_or(i64::MAX).max(1)
 }
@@ -794,8 +818,14 @@ mod tests {
         let finst_id = UniqueId { hi: 9903, lo: 9904 };
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
-        handle.abort(ResultAbort::Cancelled("Cancelled".to_string()));
-        handle.abort(ResultAbort::Failed("late failure".to_string()));
+        assert_eq!(
+            handle.abort(ResultAbort::Cancelled("Cancelled".to_string())),
+            ResultPublication::TerminalReady
+        );
+        assert_eq!(
+            handle.abort(ResultAbort::Failed("late failure".to_string())),
+            ResultPublication::NoChange
+        );
         assert!(
             handle
                 .write_legacy(FetchResult {
@@ -812,13 +842,49 @@ mod tests {
     }
 
     #[test]
+    fn publication_outcomes_distinguish_data_terminal_and_removed_state() {
+        let finst_id = UniqueId { hi: 9909, lo: 9910 };
+        let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
+
+        assert_eq!(
+            handle
+                .write_legacy(FetchResult {
+                    packet_seq: 0,
+                    eos: false,
+                    result_batch: ResultBatch::empty(),
+                })
+                .expect("write result"),
+            ResultPublication::DataReady
+        );
+        assert_eq!(
+            handle.finish().expect("finish result"),
+            ResultPublication::TerminalReady
+        );
+        assert_eq!(
+            handle.finish().expect("repeat finish"),
+            ResultPublication::NoChange
+        );
+
+        let rolled_back = UniqueId { hi: 9911, lo: 9912 };
+        let handle = ResultBufferWriteHandle::open(rolled_back, false, None).expect("open result");
+        assert_eq!(
+            handle.abort(ResultAbort::PrepareRollback),
+            ResultPublication::Removed
+        );
+        assert!(!is_registered(rolled_back));
+    }
+
+    #[test]
     fn fragment_result_session_failure_preserves_execution_error() {
         let finst_id = UniqueId { hi: 9907, lo: 9908 };
         let handle = ResultBufferWriteHandle::open(finst_id, false, None).expect("open result");
 
-        handle.abort(ResultAbort::Failed(
-            "assert_num_rows failed: actual=2 row(s), expected = 1 row(s)".to_string(),
-        ));
+        assert_eq!(
+            handle.abort(ResultAbort::Failed(
+                "assert_num_rows failed: actual=2 row(s), expected = 1 row(s)".to_string(),
+            )),
+            ResultPublication::TerminalReady
+        );
 
         let TryFetchResult::Error(error) = try_fetch(finst_id) else {
             panic!("expected failed result");
@@ -840,8 +906,14 @@ mod tests {
                 result_batch: ResultBatch::new(vec![b"done".to_vec()], false, 0, None),
             })
             .expect("write result");
-        handle.finish().expect("finish result");
-        handle.abort(ResultAbort::Cancelled("Cancelled".to_string()));
+        assert_eq!(
+            handle.finish().expect("finish result"),
+            ResultPublication::TerminalReady
+        );
+        assert_eq!(
+            handle.abort(ResultAbort::Cancelled("Cancelled".to_string())),
+            ResultPublication::NoChange
+        );
 
         let TryFetchResult::Ready(result) = try_fetch(finst_id) else {
             panic!("late abort must not discard a finished result");
@@ -853,7 +925,7 @@ mod tests {
     fn cancel_is_observable() {
         let finst_id = UniqueId { hi: 42, lo: 7 };
         create_sender(finst_id);
-        cancel(finst_id);
+        assert_eq!(cancel(finst_id), ResultPublication::TerminalReady);
 
         let TryFetchResult::Error(err) = try_fetch(finst_id) else {
             panic!("expected cancel error");
@@ -865,7 +937,10 @@ mod tests {
     fn close_error_is_observable() {
         let finst_id = UniqueId { hi: 1, lo: 2 };
         create_sender(finst_id);
-        close_error(finst_id, "boom".to_string());
+        assert_eq!(
+            close_error(finst_id, "boom".to_string()),
+            ResultPublication::TerminalReady
+        );
 
         let TryFetchResult::Error(err) = try_fetch(finst_id) else {
             panic!("expected close_error");

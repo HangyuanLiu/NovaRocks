@@ -256,7 +256,6 @@ mod tests {
             port: None,
             thread_id: None,
             user_ip: None,
-            #[cfg(feature = "compat")]
             current_user_ident: None,
             catalog_name: None,
             table_id: None,
@@ -273,7 +272,6 @@ mod tests {
             log_level: None,
             log_pattern: None,
             log_limit: None,
-            #[cfg(feature = "compat")]
             frontends: Vec::new(),
         }
     }

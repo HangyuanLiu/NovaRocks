@@ -1497,18 +1497,23 @@ mod tests {
         )
         .expect("write provider-backed bundle");
 
-        let path = novarocks::formats::starrocks::writer::layout::bundle_meta_file_path(&root, 3)
-            .expect("bundle meta path");
-        let bytes = std::fs::read(&path).expect("read provider-backed bundle");
-        let bundle = provider
-            .decode_bundle_file(&bytes)
-            .expect("decode provider-backed bundle");
+        let bundle =
+            novarocks::formats::starrocks::writer::bundle_meta::load_bundle_file_with_provider(
+                &root,
+                3,
+                provider.as_ref(),
+            )
+            .expect("load provider-backed bundle")
+            .expect("provider-backed bundle exists");
         assert_eq!(bundle.tablet_to_schema.get(&11), Some(&7));
         assert_eq!(bundle.schemas.get(&7), Some(&schema));
         assert_eq!(
-            provider
-                .decode_tablet_metadata(bundle.tablet_metadata_pages.get(&11).expect("tablet page"))
-                .expect("decode tablet page"),
+            novarocks::formats::starrocks::writer::bundle_meta::decode_bundle_tablet_metadata_with_provider(
+                &bundle,
+                11,
+                provider.as_ref(),
+            )
+            .expect("decode tablet page"),
             metadata
         );
         std::fs::remove_dir_all(&root).expect("remove temporary bundle directory");
@@ -1669,5 +1674,77 @@ mod tests {
             decode_transaction_log(&bytes).expect("decode transaction log"),
             log
         );
+    }
+
+    #[test]
+    fn provider_backed_transaction_log_files_preserve_domain_facts() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-compat-storage-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        let root = root.to_string_lossy().into_owned();
+        let provider = storage_metadata_provider();
+        let log = StorageTransactionLog {
+            tablet_id: Some(7),
+            txn_id: Some(11),
+            write: Some(StorageWriteOperation {
+                rowset: Some(StorageRowset {
+                    id: Some(13),
+                    segments: vec!["segment-13.dat".to_string()],
+                    num_rows: Some(17),
+                    ..StorageRowset::default()
+                }),
+                ..StorageWriteOperation::default()
+            }),
+            ..StorageTransactionLog::default()
+        };
+        let combined = StorageCombinedTransactionLog {
+            transaction_logs: vec![log.clone()],
+        };
+        let log_path = format!("{root}/log/txn.log");
+        let combined_path = format!("{root}/log/combined.log");
+
+        novarocks::formats::starrocks::writer::io::write_transaction_log_with_provider(
+            &log_path,
+            &log,
+            provider.as_ref(),
+        )
+        .expect("write provider-backed transaction log");
+        novarocks::formats::starrocks::writer::io::write_combined_transaction_log_with_provider(
+            &combined_path,
+            &combined,
+            provider.as_ref(),
+        )
+        .expect("write provider-backed combined transaction log");
+
+        assert_eq!(
+            novarocks::formats::starrocks::writer::io::read_transaction_log_if_exists_with_provider(
+                &log_path,
+                provider.as_ref(),
+            )
+            .expect("read provider-backed transaction log"),
+            Some(log)
+        );
+        assert_eq!(
+            novarocks::formats::starrocks::writer::io::read_combined_transaction_log_if_exists_with_provider(
+                &combined_path,
+                provider.as_ref(),
+            )
+            .expect("read provider-backed combined transaction log"),
+            Some(combined)
+        );
+        assert_eq!(
+            novarocks::formats::starrocks::writer::io::read_transaction_log_if_exists_with_provider(
+                &format!("{root}/log/missing.log"),
+                provider.as_ref(),
+            )
+            .expect("read missing transaction log"),
+            None
+        );
+        std::fs::remove_dir_all(&root).expect("remove temporary log directory");
     }
 }

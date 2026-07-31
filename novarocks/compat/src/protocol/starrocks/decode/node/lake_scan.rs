@@ -25,12 +25,12 @@ use crate::protocol::starrocks::decode::layout::{
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
 use novarocks::common::ids::SlotId;
+use novarocks::connector::starrocks::INTERNAL_CATALOG_NAME;
 use novarocks::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
     lake_scan_execution_properties,
 };
 use novarocks::connector::starrocks::plan_compat_starrocks_read_source;
-use novarocks::connector::starrocks::table::INTERNAL_CATALOG_NAME;
 use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::fragment::program::ScanAssignmentKind;
 use novarocks::exec::node::project::ProjectNode;

@@ -69,7 +69,6 @@ use crate::runtime_filter::service::{
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::operators::AssertNumRowsProcessorFactory;
-#[cfg(feature = "compat")]
 use crate::exec::operators::FetchProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
@@ -553,7 +552,6 @@ fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::C
         ExecNodeKind::NativeRuntimeFilterConsumer(consumer) => {
             output_chunk_schema_for_node(&consumer.input)
         }
-        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
         ExecNodeKind::LookUp(lookup) => Some(Arc::clone(&lookup.output_chunk_schema)),
         ExecNodeKind::Aggregate(aggregate) => Some(Arc::clone(&aggregate.output_chunk_schema)),
@@ -2071,7 +2069,6 @@ fn build_pipeline_for_node(
                 stream: StreamDesc::any(ctx.pipeline_dop),
             })
         }
-        #[cfg(feature = "compat")]
         ExecNodeKind::Fetch(fetch) => {
             let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;
             child_build

@@ -9,7 +9,20 @@ use novarocks::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
     FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteSpec,
 };
-use novarocks::runtime::result_buffer::ResultBufferWriteHandle;
+use novarocks::runtime::result_buffer::{ResultBufferWriteHandle, ResultPublication};
+
+use crate::ffi_support;
+
+fn notify_fetch_ready(spec: &ResultWriteSpec, publication: ResultPublication) {
+    if !matches!(
+        publication,
+        ResultPublication::DataReady | ResultPublication::TerminalReady
+    ) {
+        return;
+    }
+
+    ffi_support::notify_fetch_ready(spec.fragment_instance_id());
+}
 
 pub(crate) fn compat_result_writer() -> Arc<dyn FragmentResultWriter> {
     Arc::new(CompatFragmentResultWriter)
@@ -60,13 +73,15 @@ impl FragmentResultSession for CompatFragmentResultSession {
                     error,
                 )
             })?;
-            return self.handle.write_typed(payload).map_err(|error| {
+            let publication = self.handle.write_typed(payload).map_err(|error| {
                 FragmentIoError::new(
                     FragmentIoOperation::ResultWrite,
                     FragmentIoErrorKind::Internal,
                     error,
                 )
-            });
+            })?;
+            notify_fetch_ready(&self.spec, publication);
+            return Ok(());
         }
         let batch = match self.spec.presentation() {
             ResultPresentation::Statistic => {
@@ -92,7 +107,8 @@ impl FragmentResultSession for CompatFragmentResultSession {
                 error,
             )
         })?;
-        self.handle
+        let publication = self
+            .handle
             .write_legacy(FetchResult {
                 packet_seq: 0,
                 eos: false,
@@ -104,20 +120,24 @@ impl FragmentResultSession for CompatFragmentResultSession {
                     FragmentIoErrorKind::Internal,
                     error,
                 )
-            })
+            })?;
+        notify_fetch_ready(&self.spec, publication);
+        Ok(())
     }
 
     fn finish(&self) -> Result<(), FragmentIoError> {
-        self.handle.finish().map_err(|error| {
+        let publication = self.handle.finish().map_err(|error| {
             FragmentIoError::new(
                 FragmentIoOperation::ResultFinish,
                 FragmentIoErrorKind::Internal,
                 error,
             )
-        })
+        })?;
+        notify_fetch_ready(&self.spec, publication);
+        Ok(())
     }
 
     fn abort(&self, reason: ResultAbort) {
-        self.handle.abort(reason);
+        notify_fetch_ready(&self.spec, self.handle.abort(reason));
     }
 }

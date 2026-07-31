@@ -43,10 +43,8 @@ pub use novarocks_version as version;
 pub use common::app_config as novarocks_config;
 pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
-#[cfg(feature = "compat")]
 pub use connector::starrocks as novarocks_connector_starrocks;
 
 pub use common::types::{FetchResult, UniqueId};
 pub use service::grpc_server::start_grpc_exchange_server;
-#[cfg(not(feature = "compat"))]
 pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;

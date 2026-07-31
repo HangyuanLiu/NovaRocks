@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "compat")]
-use crate::connector::starrocks::table::model::StarRocksTableKind;
 use crate::engine::StandaloneState;
 use crate::mv::analysis::ResolvedTableRef;
 use crate::mv::dependency::graph::{
@@ -123,32 +121,9 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
                 });
             }
             ResolvedTableRef::StarRocks { database, table } => {
-                #[cfg(not(feature = "compat"))]
-                {
-                    return Err(format!(
-                        "StarRocks table MV dependency `{database}.{table}` requires the compat feature"
-                    ));
-                }
-                #[cfg(feature = "compat")]
-                {
-                    let starrocks = state
-                        .starrocks_table
-                        .read()
-                        .expect("standalone StarRocks table read lock");
-                    let runtime = starrocks.table(database, table).map_err(|err| {
-                        format!(
-                            "resolve StarRocks table MV dependency {database}.{table} failed: {err}"
-                        )
-                    })?;
-                    if runtime.table.kind != StarRocksTableKind::MaterializedView {
-                        return Err(format!(
-                            "materialized view base tables must be Iceberg tables or materialized views; found StarRocks table `{database}.{table}`"
-                        ));
-                    }
-                    return Err(format!(
-                        "StarRocks table MV-on-MV dependency `{database}.{table}` is recognized but cannot be used as an incremental Iceberg base in this release"
-                    ));
-                }
+                return Err(format!(
+                    "standalone StarRocks table MV dependency `{database}.{table}` is unavailable"
+                ));
             }
         }
     }
@@ -286,33 +261,10 @@ fn stored_definition_dependency_ref_from_state(
     if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
         return stored_definition_dependency_ref(definition, None);
     }
-    let starrocks = state
-        .starrocks_table
-        .read()
-        .expect("standalone StarRocks table read lock");
-    let table = starrocks
-        .snapshot
-        .tables
-        .iter()
-        .find(|table| table.table_id == definition.mv_id)
-        .ok_or_else(|| {
-            format!(
-                "StarRocks table MV definition {} is missing runtime table metadata",
-                definition.mv_id
-            )
-        })?;
-    let database = starrocks
-        .snapshot
-        .databases
-        .iter()
-        .find(|database| database.db_id == table.db_id)
-        .ok_or_else(|| {
-            format!(
-                "StarRocks table MV definition {} is missing runtime database metadata",
-                definition.mv_id
-            )
-        })?;
-    stored_definition_dependency_ref(definition, Some((&database.name, &table.name)))
+    Err(format!(
+        "standalone StarRocks materialized view definition {} is unavailable",
+        definition.mv_id
+    ))
 }
 
 #[cfg(test)]
