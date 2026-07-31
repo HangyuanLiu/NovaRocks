@@ -70,6 +70,7 @@ impl DecodedNativeFragment {
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_submission_with_connectors(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
@@ -83,6 +84,7 @@ pub(crate) fn decode_fragment_submission_with_connectors(
     )
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
@@ -342,8 +344,10 @@ where
     Ok(DecodedNativeFragment::new(submission, metadata))
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 struct MissingExecutionResolver;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionResolver {
     fn resolve(
         &self,
@@ -459,6 +463,7 @@ fn validate_runtime_filter_binding_expressions(
     Ok(())
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_instance_parts(
     src: &novarocks::InstanceParams,
 ) -> Result<NativeFragmentInstanceInput, NativeFragmentDecodeError> {
@@ -585,6 +590,7 @@ fn validate_raw_scan_range_nodes(
     Ok(())
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_scan_source_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
@@ -597,6 +603,7 @@ fn decode_scan_source_contracts(
     })
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_exchange_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
@@ -644,6 +651,7 @@ fn decode_exchange_contracts(
     Ok(contracts)
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
 ) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {
