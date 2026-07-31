@@ -17,5 +17,6 @@
 
 pub mod common;
 pub(crate) mod native;
+pub mod native_backend_decode_port;
 
 pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
