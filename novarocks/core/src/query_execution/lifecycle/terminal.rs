@@ -22,7 +22,6 @@
 
 use std::collections::BTreeSet;
 
-use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
@@ -280,7 +279,7 @@ impl QueryTerminalSnapshot {
             match &fragment.profile {
                 Some(profile) => {
                     put_u8(&mut bytes, 1);
-                    put_bytes(&mut bytes, &profile.to_proto().encode_to_vec());
+                    put_profile(&mut bytes, profile);
                 }
                 None => put_u8(&mut bytes, 0),
             }
@@ -416,6 +415,37 @@ fn put_sink(bytes: &mut Vec<u8>, sink: &SinkCommitReportSnapshot) {
     put_i64(bytes, sink.load_stats.loaded_rows);
     put_i64(bytes, sink.load_stats.loaded_bytes);
     put_i64(bytes, sink.load_stats.filtered_rows);
+}
+
+/// Profile wire messages contain map fields, so their ordinary prost encoding
+/// is not a deterministic digest input. Encode the typed tree directly:
+/// repeated counters and children keep semantic order while BTreeMap-backed
+/// info strings use key order.
+fn put_profile(bytes: &mut Vec<u8>, profile: &RuntimeProfileTree) {
+    put_profile_node(bytes, &profile.root);
+}
+
+fn put_profile_node(bytes: &mut Vec<u8>, node: &crate::runtime::profile::ProfileNode) {
+    put_string(bytes, &node.name);
+    put_i32(bytes, node.node_id);
+    put_u64(bytes, node.counters.len() as u64);
+    for counter in &node.counters {
+        put_string(bytes, &counter.name);
+        put_string(bytes, &counter.parent_name);
+        put_i32(bytes, counter.unit.to_proto() as i32);
+        put_i64(bytes, counter.value);
+        put_optional_i64(bytes, counter.min_value);
+        put_optional_i64(bytes, counter.max_value);
+    }
+    put_u64(bytes, node.info_strings.len() as u64);
+    for (key, value) in &node.info_strings {
+        put_string(bytes, key);
+        put_string(bytes, value);
+    }
+    put_u64(bytes, node.children.len() as u64);
+    for child in &node.children {
+        put_profile_node(bytes, child);
+    }
 }
 
 /// Iceberg commit facts contain protobuf map fields. Prost represents those as
@@ -597,6 +627,9 @@ mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::{AttemptId, QueryControlEndpoint};
+    use crate::runtime::profile::{
+        CounterStrategy, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
+    };
 
     fn snapshot(fragment_ids: &[i64]) -> QueryTerminalSnapshot {
         let execution =
@@ -670,5 +703,76 @@ mod tests {
     fn terminal_record_enforces_encoded_limit() {
         let snapshot = snapshot(&[1]);
         assert!(ImmutableQueryTerminalRecord::new(snapshot, 1).is_err());
+    }
+
+    #[test]
+    fn query_lifecycle_terminal_snapshot_profile_digest_is_canonical() {
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+        let backend = ParticipantBackendIdentity::new(
+            1,
+            QueryControlEndpoint::new("127.0.0.1", 9030).unwrap(),
+            1,
+        )
+        .unwrap();
+        let profile = RuntimeProfileTree {
+            root: ProfileNode {
+                name: "fragment".to_string(),
+                node_id: 7,
+                counters: vec![ProfileCounter {
+                    name: "Rows".to_string(),
+                    parent_name: String::new(),
+                    unit: ProfileUnit::Unit,
+                    strategy: CounterStrategy::new(
+                        crate::runtime::profile::CounterAggregateType::Sum,
+                    ),
+                    value: 11,
+                    min_value: Some(3),
+                    max_value: Some(8),
+                }],
+                info_strings: [
+                    ("alpha".to_string(), "first".to_string()),
+                    ("omega".to_string(), "last".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                children: vec![ProfileNode {
+                    name: "child".to_string(),
+                    node_id: 8,
+                    counters: Vec::new(),
+                    info_strings: Default::default(),
+                    children: Vec::new(),
+                }],
+            },
+        };
+        let fact = FragmentTerminalSnapshot::new(
+            UniqueId { hi: 0, lo: 1 },
+            0,
+            FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            Some(profile),
+        )
+        .unwrap();
+        let snapshot = QueryTerminalSnapshot::new(
+            execution,
+            backend,
+            ParticipantManifestDigest::new([7; 32]),
+            vec![fact],
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.digest().as_bytes(),
+            &[
+                65, 88, 68, 23, 208, 128, 182, 219, 96, 206, 131, 141, 227, 131, 105, 7, 103, 11,
+                157, 196, 130, 194, 85, 51, 110, 231, 175, 136, 116, 234, 47, 242,
+            ]
+        );
+        snapshot.validate().expect("profile digest stays canonical");
+        let wire = super::super::encode_query_terminal_snapshot(&snapshot);
+        let decoded =
+            super::super::decode_query_terminal_snapshot(&wire).expect("profile wire round trip");
+        assert_eq!(decoded.digest(), snapshot.digest());
+        assert_eq!(decoded, snapshot);
     }
 }
