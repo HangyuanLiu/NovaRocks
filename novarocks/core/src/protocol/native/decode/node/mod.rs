@@ -1746,6 +1746,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Window(window) => window::lower_window_node(
             node,
@@ -1775,6 +1776,7 @@ fn lower_physical_node(
                 path.clone().field("table_function"),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::Decode(_) => Err(super::NativeFragmentDecodeError::unsupported(

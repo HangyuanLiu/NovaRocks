@@ -21,9 +21,8 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, slot_schemas_from_output_columns};
-use super::DecodedNode;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -39,6 +38,7 @@ pub(super) fn lower_table_function_node(
     path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     validate_table_function_signature(table_function, path.clone())?;
@@ -74,7 +74,7 @@ pub(super) fn lower_table_function_node(
         .enumerate()
         .zip(param_slot_schemas.iter())
     {
-        let expr = decode_expr_at(
+        let expr = ctx.decode_expression(
             arg,
             path.clone().field("args").index(idx),
             arena,
