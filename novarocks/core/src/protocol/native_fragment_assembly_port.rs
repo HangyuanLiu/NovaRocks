@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::common::ids::SlotId;
 use crate::connector::ConnectorRegistry;
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
@@ -34,6 +35,7 @@ use crate::exec::fragment::program::{
 use crate::proto::novarocks;
 use crate::proto::plan;
 use crate::protocol::ProtocolError;
+use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::fragment::instance::{
     BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentSinkAssignment,
@@ -42,6 +44,63 @@ use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
+
+/// Immutable input-slot value supplied to backend expression decoders.
+///
+/// It deliberately contains no connector, runtime, or arena state. The
+/// backend may only resolve a wire column id to an already-established slot.
+#[derive(Clone, Debug, Default)]
+pub struct NativeExpressionInputLayout {
+    slots: Vec<SlotId>,
+}
+
+impl NativeExpressionInputLayout {
+    pub fn from_slot_ids(slots: impl IntoIterator<Item = SlotId>) -> Self {
+        let mut layout = Self::default();
+        for slot in slots {
+            if !layout.slots.contains(&slot) {
+                layout.slots.push(slot);
+            }
+        }
+        layout
+    }
+
+    pub fn resolve_column_id(
+        &self,
+        column_id: u32,
+        path: FieldPath,
+    ) -> Result<SlotId, ProtocolError> {
+        let slot = SlotId::new(column_id);
+        if self.slots.contains(&slot) {
+            Ok(slot)
+        } else {
+            Err(ProtocolError::new(
+                ProtocolFamily::Native,
+                path.field("column_id"),
+                ProtocolErrorKind::InvalidValue,
+                format!("ColumnRef column_id={column_id} not found in input layout"),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod expression_layout_tests {
+    use super::NativeExpressionInputLayout;
+    use crate::common::ids::SlotId;
+    use crate::protocol::FieldPath;
+
+    #[test]
+    fn preserves_unknown_column_error_contract() {
+        let error = NativeExpressionInputLayout::from_slot_ids([SlotId::new(7)])
+            .resolve_column_id(9, FieldPath::root("expr").field("column_ref"))
+            .expect_err("unknown slot must fail");
+        assert_eq!(
+            error.to_string(),
+            "native protocol error at expr.column_ref.column_id (invalid value): ColumnRef column_id=9 not found in input layout"
+        );
+    }
+}
 
 /// Backend-decoded `InstanceParams` execution values required to assemble a
 /// fragment. Sink assignment is carried separately to keep its validation at
