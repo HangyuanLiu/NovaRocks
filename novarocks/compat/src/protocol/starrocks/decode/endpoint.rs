@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::protocol::starrocks::compat::endpoint::destination_address_with_field;
+use crate::thrift::data_sinks::TPlanFragmentDestination;
+use crate::thrift::types::TNetworkAddress;
 use novarocks::common::types::UniqueId;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::thrift::data_sinks::TPlanFragmentDestination;
-use novarocks::thrift::types::TNetworkAddress;
 
 use super::StarRocksFragmentDecodeError;
 

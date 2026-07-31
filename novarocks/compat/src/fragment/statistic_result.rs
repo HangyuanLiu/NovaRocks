@@ -1,6 +1,6 @@
 use crate::protocol::starrocks::thrift_codec::thrift_compact_serialize;
+use crate::thrift::data;
 use base64::Engine;
-use novarocks::thrift::data;
 use thrift::OrderedFloat;
 
 const STATISTIC_DATA_VERSION_V1: i32 = 1;

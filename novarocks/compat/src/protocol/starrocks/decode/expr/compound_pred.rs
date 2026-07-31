@@ -17,8 +17,8 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 
-use novarocks::thrift::exprs;
-use novarocks::thrift::opcodes;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
 
 /// Lower COMPOUND_PRED expression to logical ExprNode.
 pub(crate) fn lower_compound_pred(

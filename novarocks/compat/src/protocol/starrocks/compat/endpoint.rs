@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::thrift::data_sinks::TPlanFragmentDestination;
-use novarocks::thrift::types::TNetworkAddress;
+use crate::thrift::data_sinks::TPlanFragmentDestination;
+use crate::thrift::types::TNetworkAddress;
 
 /// Selects the destination endpoint across the current and historical wire shapes.
 ///

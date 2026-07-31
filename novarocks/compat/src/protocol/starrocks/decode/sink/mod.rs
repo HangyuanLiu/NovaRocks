@@ -17,11 +17,10 @@
 
 pub(crate) mod fragment;
 pub(crate) mod iceberg;
-#[cfg(feature = "compat")]
 pub(crate) mod starrocks;
 
+use crate::thrift::partitions;
 use novarocks::exec::operators::DataStreamPartitionType;
-use novarocks::thrift::partitions;
 
 pub(crate) fn decode_data_stream_partition_type(
     partition_type: partitions::TPartitionType,

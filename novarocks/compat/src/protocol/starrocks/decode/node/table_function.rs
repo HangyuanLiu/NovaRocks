@@ -21,10 +21,10 @@ use arrow::datatypes::DataType;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::{descriptors, plan_nodes};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::{descriptors, plan_nodes};
 use novarocks_types::largeint;
 
 pub(crate) fn lower_table_function_node(

@@ -23,8 +23,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::thrift::{master_service, types};
 use novarocks::novarocks_logging::{debug, warn};
-use novarocks::thrift::{master_service, types};
 
 use crate::control::FrontendControlState;
 

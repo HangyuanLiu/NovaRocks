@@ -23,6 +23,7 @@ use crate::protocol::starrocks::decode::{
     FragmentExprArenaOwner, StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
     decode_fragment_destination,
 };
+use crate::thrift::{data_sinks, descriptors, planner};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::FragmentSinkSpec;
@@ -40,7 +41,6 @@ use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::FragmentDestination;
 use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
 use novarocks::runtime::fragment::io::{ResultPresentation, ResultProjection};
-use novarocks::thrift::{data_sinks, descriptors, planner};
 use novarocks_types::PrimitiveType;
 
 fn runtime_destination_from_thrift(
@@ -692,20 +692,19 @@ pub(crate) fn decode_fragment_sink(
             Ok(decoded)
         }
         data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
-            #[cfg(feature = "compat")]
-            {
-                let olap_sink_path = sink_path.clone().field("olap_table_sink");
-                let olap_sink = sink.olap_table_sink.as_ref().ok_or_else(|| {
-                    StarRocksFragmentDecodeError::missing(
-                        olap_sink_path.clone(),
-                        "OLAP_TABLE_SINK missing olap_table_sink payload",
-                    )
-                })?;
-                let draft_plan = ExecPlan {
-                    arena: arena.clone(),
-                    root: lowered.node.clone(),
-                };
-                let (program, assignment) = crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_table_sink(
+            let olap_sink_path = sink_path.clone().field("olap_table_sink");
+            let olap_sink = sink.olap_table_sink.as_ref().ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    olap_sink_path.clone(),
+                    "OLAP_TABLE_SINK missing olap_table_sink payload",
+                )
+            })?;
+            let draft_plan = ExecPlan {
+                arena: arena.clone(),
+                root: lowered.node.clone(),
+            };
+            let (program, assignment) =
+                crate::protocol::starrocks::decode::sink::starrocks::lower_starrocks_table_sink(
                     olap_sink,
                     fragment.output_exprs.as_deref(),
                     Some(&draft_plan),
@@ -717,17 +716,11 @@ pub(crate) fn decode_fragment_sink(
                     fragment_path.clone().field("output_exprs"),
                 )
                 .map_err(|error| error.into_fragment(olap_sink_path.clone()))?;
-                decoded_compat_sink(
-                    FragmentSinkProgram::StarRocksTable(program),
-                    FragmentSinkAssignment::StarRocksTable(assignment),
-                    sink_path,
-                )
-            }
-            #[cfg(not(feature = "compat"))]
-            Err(StarRocksFragmentDecodeError::unsupported(
+            decoded_compat_sink(
+                FragmentSinkProgram::StarRocksTable(program),
+                FragmentSinkAssignment::StarRocksTable(assignment),
                 sink_path,
-                "OLAP_TABLE_SINK requires the compat feature",
-            ))
+            )
         }
         other => Err(StarRocksFragmentDecodeError::unsupported(
             sink_path.field("type"),
@@ -803,7 +796,7 @@ fn result_sink_config_from_thrift(
 }
 
 fn result_projection_from_thrift_expr(
-    expr: &novarocks::thrift::exprs::TExpr,
+    expr: &crate::thrift::exprs::TExpr,
     expr_path: FieldPath,
 ) -> Result<ResultProjection, StarRocksFragmentDecodeError> {
     let root_path = expr_path.field("nodes").index(0);
@@ -813,7 +806,7 @@ fn result_projection_from_thrift_expr(
             "RESULT_SINK output expression is empty",
         )
     })?;
-    if root.node_type != novarocks::thrift::exprs::TExprNodeType::SLOT_REF {
+    if root.node_type != crate::thrift::exprs::TExprNodeType::SLOT_REF {
         return Err(StarRocksFragmentDecodeError::invalid_enum(
             root_path.clone().field("node_type"),
             format!(
@@ -843,7 +836,7 @@ fn result_projection_from_thrift_expr(
 }
 
 fn result_projections_from_thrift_exprs(
-    output_exprs: Option<&Vec<novarocks::thrift::exprs::TExpr>>,
+    output_exprs: Option<&Vec<crate::thrift::exprs::TExpr>>,
     output_exprs_path: FieldPath,
 ) -> Result<Option<Vec<ResultProjection>>, StarRocksFragmentDecodeError> {
     let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {

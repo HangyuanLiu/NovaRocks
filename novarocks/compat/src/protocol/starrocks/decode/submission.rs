@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::thrift::{descriptors, internal_service, planner, types};
 use novarocks::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::{
@@ -41,7 +42,6 @@ use novarocks::runtime::fragment::io::{
 };
 use novarocks::runtime::fragment::submission::FragmentSubmission;
 use novarocks::runtime::query_context::LookupFetcherLifecycle;
-use novarocks::thrift::{descriptors, internal_service, planner, types};
 
 use super::dependency::{
     FragmentExprArenaOwner, QueryProfilePatch, StarRocksExternalDependency,
@@ -96,7 +96,6 @@ pub(crate) struct StarRocksFragmentDraft {
     parts: DecodedDraftParts,
     external_dependencies: Vec<StarRocksExternalDependency>,
     query_profile_patches: Vec<QueryProfilePatch>,
-    #[cfg(feature = "compat")]
     lake_meta_values_patches: Vec<super::node::LakeMetaValuesPatch>,
 }
 
@@ -263,13 +262,11 @@ pub(crate) fn prepare_fragment_submission(
     let parts = decode_draft_parts(&input, instance, &dependencies)?;
     let external_dependencies = dependencies.external_dependencies();
     let query_profile_patches = dependencies.query_profile_patches();
-    #[cfg(feature = "compat")]
     let lake_meta_values_patches = dependencies.lake_meta_values_patches();
     Ok(StarRocksFragmentDraft {
         parts,
         external_dependencies,
         query_profile_patches,
-        #[cfg(feature = "compat")]
         lake_meta_values_patches,
     })
 }
@@ -297,7 +294,6 @@ pub(crate) fn finish_fragment_submission(
                 )
             })?;
     }
-    #[cfg(feature = "compat")]
     for patch in &draft.lake_meta_values_patches {
         let Some(StarRocksResolvedDependencyValue::LakeMetaStorage(facts)) =
             resolved.get(patch.dependency_id())
@@ -364,7 +360,6 @@ fn query_profile_arena_mut(
                 program,
             ),
         ) => program.partition_arena_mut(),
-        #[cfg(feature = "compat")]
         (
             FragmentExprArenaOwner::StarRocksOutputProjection,
             novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
@@ -374,7 +369,6 @@ fn query_profile_arena_mut(
             })?;
             Arc::make_mut(&mut projection.arena)
         }
-        #[cfg(feature = "compat")]
         (
             FragmentExprArenaOwner::StarRocksPartition,
             novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
@@ -389,7 +383,6 @@ fn query_profile_arena_mut(
                 })?;
             &mut Arc::make_mut(partition).arena
         }
-        #[cfg(feature = "compat")]
         (
             FragmentExprArenaOwner::StarRocksIndexPredicate { index },
             novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
@@ -428,7 +421,6 @@ fn query_profile_patch_target_error(
     )
 }
 
-#[cfg(feature = "compat")]
 fn replace_values_chunk(
     node: &mut ExecNode,
     target_node_id: i32,
@@ -748,7 +740,7 @@ fn decode_lookup_fetcher_lifecycles(
     for node in plan
         .nodes
         .iter()
-        .filter(|node| node.node_type == novarocks::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE)
+        .filter(|node| node.node_type == crate::thrift::plan_nodes::TPlanNodeType::LOOKUP_NODE)
     {
         let lifecycle = match input
             .params
@@ -785,7 +777,7 @@ fn decode_lookup_close_targets(
     };
     let mut targets = std::collections::HashSet::new();
     for (node_index, node) in plan.nodes.iter().enumerate() {
-        if node.node_type != novarocks::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
+        if node.node_type != crate::thrift::plan_nodes::TPlanNodeType::FETCH_NODE {
             continue;
         }
         let Some(fetch) = node.fetch_node.as_ref() else {
@@ -1080,6 +1072,8 @@ fn split_resolved_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
+    use crate::thrift::{data_sinks, partitions, plan_nodes};
     use novarocks::common::types::UniqueId;
     use novarocks::exec::expr::{ExprNode, LiteralValue};
     use novarocks::exec::fragment::program::{FragmentSinkKind, FragmentSinkSpec};
@@ -1092,19 +1086,13 @@ mod tests {
     use novarocks::runtime::runtime_filter_observability::{
         QueryKey, RuntimeFilterLifecycleRegistry,
     };
-    use novarocks::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
-    use novarocks::thrift::{data_sinks, partitions, plan_nodes};
     use std::sync::LazyLock;
 
-    #[cfg(feature = "compat")]
     use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
-    #[cfg(feature = "compat")]
     use novarocks::connector::starrocks::schema::{
         StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
     };
-    #[cfg(feature = "compat")]
     use novarocks::connector::starrocks::sink::partition_key::PartitionExprPlan;
-    #[cfg(feature = "compat")]
     use novarocks::connector::starrocks::sink::plan::{
         SinkIndexDescriptor, SinkLocationDescriptor, SinkNodesDescriptor, SinkOutputProjectionPlan,
         SinkPartitionDescriptor, SinkPredicatePlan, SinkSchemaDescriptor,
@@ -1340,7 +1328,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "compat")]
     fn starrocks_program_with_owned_arenas() -> (FragmentProgram, [novarocks::exec::expr::ExprId; 3])
     {
         let mut output_arena = ExprArena::default();
@@ -1656,7 +1643,6 @@ mod tests {
         assert_resolved_profile(&submission.program().plan().arena, filter.predicate);
     }
 
-    #[cfg(feature = "compat")]
     #[test]
     fn starrocks_query_profile_owner_routing_targets_exact_retained_arena() {
         let (mut program, [output_id, partition_id, index_id]) =
@@ -1897,7 +1883,7 @@ mod tests {
             length: Some(64),
             partition_id: None,
             file_length: Some(64),
-            file_format: Some(novarocks::thrift::descriptors::THdfsFileFormat::PARQUET),
+            file_format: Some(crate::thrift::descriptors::THdfsFileFormat::PARQUET),
             text_file_desc: None,
             full_path: Some("s3://bucket/data.parquet".to_string()),
             hudi_logs: None,

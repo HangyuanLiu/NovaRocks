@@ -5,13 +5,13 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
+use crate::thrift::{master_service, types};
 use axum::Router;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::connector::starrocks::ports::LakeStorageDependencies;
 use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::fragment::io::SyncFragmentExecutor;
-use novarocks::thrift::{master_service, types};
 
 use crate::backend_service::{self, BackendServiceHandle};
 use crate::brpc;

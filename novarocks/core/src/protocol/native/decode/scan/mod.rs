@@ -160,8 +160,6 @@ mod tests {
     };
     use super::super::runtime_filter::NativeRuntimeFilterDecodeLedger;
     use crate::common::ids::SlotId;
-    #[cfg(feature = "compat")]
-    use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::delta::DeltaSourceRole;

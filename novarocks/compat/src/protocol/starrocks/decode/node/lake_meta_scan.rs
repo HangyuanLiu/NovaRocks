@@ -33,6 +33,7 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::{DraftDependencyValue, StarRocksExternalDependencyDraft};
+use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::connector::starrocks::lake_meta::{
     LakeMetaColumnKind, LakeMetaColumnRequest, LakeMetaStorageFacts, LakeMetaStorageRequest,
     LakeMetaTabletRequest,
@@ -41,7 +42,6 @@ use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::runtime::query_context::QueryId;
-use novarocks::thrift::{descriptors, plan_nodes, types};
 use novarocks_types::largeint;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

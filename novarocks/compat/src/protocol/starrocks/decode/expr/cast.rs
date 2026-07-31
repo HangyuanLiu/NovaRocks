@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::thrift::types;
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks::thrift::types;
 
 /// Lower CAST_EXPR expression to ExprNode::Cast.
 pub(crate) fn lower_cast(

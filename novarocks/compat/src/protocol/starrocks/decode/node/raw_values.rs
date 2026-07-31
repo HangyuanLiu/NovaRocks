@@ -28,7 +28,7 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
 use crate::protocol::starrocks::decode::node::Lowered;
 
-use novarocks::thrift::plan_nodes;
+use crate::thrift::plan_nodes;
 
 /// Lower a RAW_VALUES_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_raw_values_node(

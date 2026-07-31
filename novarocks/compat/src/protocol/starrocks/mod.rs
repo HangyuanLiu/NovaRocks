@@ -24,14 +24,14 @@ pub(crate) mod type_mapping;
 mod tests {
     use std::collections::BTreeMap;
 
-    use novarocks::exec::spill::SpillMode;
-    use novarocks::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
-    use novarocks::thrift::data_sinks::TPlanFragmentDestination;
-    use novarocks::thrift::internal_service::{
+    use crate::thrift::data_sinks::TPlanFragmentDestination;
+    use crate::thrift::internal_service::{
         TPlanFragmentExecParams, TQueryOptions, TScanRangeParams, TSpillMode, TSpillOptions,
     };
-    use novarocks::thrift::plan_nodes::TScanRange;
-    use novarocks::thrift::types::{TNetworkAddress, TUniqueId};
+    use crate::thrift::plan_nodes::TScanRange;
+    use crate::thrift::types::{TNetworkAddress, TUniqueId};
+    use novarocks::exec::spill::SpillMode;
+    use novarocks::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
 
     use super::compat::request::backfill_per_node_scan_ranges;
     use super::compat::sink::select_partition_boundary_key;
@@ -66,9 +66,9 @@ mod tests {
             None::<bool>,
             None::<i32>,
             None::<bool>,
-            None::<Vec<novarocks::thrift::internal_service::TExecDebugOption>>,
+            None::<Vec<crate::thrift::internal_service::TExecDebugOption>>,
             None::<BTreeMap<i32, i32>>,
-            None::<BTreeMap<i32, novarocks::thrift::descriptors::TNodesInfo>>,
+            None::<BTreeMap<i32, crate::thrift::descriptors::TNodesInfo>>,
         )
     }
 

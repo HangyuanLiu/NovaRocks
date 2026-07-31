@@ -20,6 +20,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, new_empty_a
 use arrow::compute::concat;
 use arrow::datatypes::{DataType, Field, Schema};
 
+use crate::thrift::descriptors;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::exec::expr::{ExprArena, cast_array_to_target};
@@ -27,7 +28,6 @@ use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::union_all::UnionAllNode;
 use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::descriptors;
 
 use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
@@ -35,8 +35,8 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::{plan_nodes, types};
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{plan_nodes, types};
 
 /// Lower a UNION_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_union_node(

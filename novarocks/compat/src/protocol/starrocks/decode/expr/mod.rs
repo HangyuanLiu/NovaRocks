@@ -51,8 +51,8 @@ use crate::protocol::starrocks::decode::layout::Layout;
 use crate::protocol::starrocks::decode::type_lowering::{
     arrow_type_from_desc, arrow_type_from_primitive, primitive_type_from_desc,
 };
-use novarocks::thrift::exprs;
-use novarocks::thrift::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 // Import node handlers
 use arithmetic::lower_arithmetic;

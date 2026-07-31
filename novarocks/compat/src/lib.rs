@@ -1,3 +1,6 @@
+include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
+
 mod application;
 mod backend_service;
 mod brpc;

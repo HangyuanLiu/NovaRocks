@@ -27,7 +27,7 @@ pub(crate) struct StarRocksStorageColumnDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[cfg_attr(not(feature = "compat"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) enum StarRocksKeysTypeDescriptor {
     Duplicate,
     Unique,

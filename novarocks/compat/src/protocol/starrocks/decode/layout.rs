@@ -20,13 +20,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::protocol::starrocks::decode::schema::chunk_slot_schema_from_type_desc;
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::planner;
+use crate::thrift::types;
+use crate::thrift::{data_sinks, partitions};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks::thrift::descriptors;
-use novarocks::thrift::exprs;
-use novarocks::thrift::planner;
-use novarocks::thrift::types;
-use novarocks::thrift::{data_sinks, partitions};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {

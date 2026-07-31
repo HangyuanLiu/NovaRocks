@@ -27,17 +27,17 @@ use serde_json::{Map, Value, json};
 
 use crate::frontend_rpc;
 use crate::protocol::starrocks::thrift_codec::thrift_binary_serialize;
-use novarocks::runtime::fragment::io::SyncFragmentExecutor;
-use novarocks::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
-use novarocks::runtime::{backend_id, sink_commit};
-use novarocks::thrift::frontend_service::{
+use crate::thrift::frontend_service::{
     TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest, TLoadTxnCommitResult,
     TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest, TStreamLoadPutResult,
 };
-use novarocks::thrift::plan_nodes::TFileFormatType;
-use novarocks::thrift::status::TStatus;
-use novarocks::thrift::status_code::TStatusCode;
-use novarocks::thrift::types::{self, TPartialUpdateMode, TUniqueId};
+use crate::thrift::plan_nodes::TFileFormatType;
+use crate::thrift::status::TStatus;
+use crate::thrift::status_code::TStatusCode;
+use crate::thrift::types::{self, TPartialUpdateMode, TUniqueId};
+use novarocks::runtime::fragment::io::SyncFragmentExecutor;
+use novarocks::runtime::sink_commit::{TabletCommitInfo, TabletFailInfo};
+use novarocks::runtime::{backend_id, sink_commit};
 
 use super::registry::CompatLoadRegistry;
 
@@ -724,12 +724,12 @@ fn commit_txn(
 ) -> Result<TLoadTxnCommitResult, ApiError> {
     let txn_commit_attachment =
         stats.map(
-            |stats| novarocks::thrift::frontend_service::TTxnCommitAttachment {
+            |stats| crate::thrift::frontend_service::TTxnCommitAttachment {
                 load_type: types::TLoadType::MANUAL_LOAD,
                 rl_task_txn_commit_attachment: None,
                 ml_txn_commit_attachment: None,
                 manual_load_txn_commit_attachment: Some(
-                    novarocks::thrift::frontend_service::TManualLoadTxnCommitAttachment::new(
+                    crate::thrift::frontend_service::TManualLoadTxnCommitAttachment::new(
                         Some(stats.number_loaded_rows),
                         Some(stats.number_filtered_rows),
                         Option::<String>::None,
@@ -785,7 +785,7 @@ fn rollback_txn(
         txn_id,
         Some(reason.to_string()),
         Option::<i64>::None,
-        Option::<novarocks::thrift::frontend_service::TTxnCommitAttachment>::None,
+        Option::<crate::thrift::frontend_service::TTxnCommitAttachment>::None,
         Some(tablet_fail_infos_to_thrift(fail_infos)),
         Some(tablet_commit_infos_to_thrift(commit_infos)),
     );

@@ -17,7 +17,7 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower CASE_EXPR expression to ExprNode::Case.
 pub(crate) fn lower_case(

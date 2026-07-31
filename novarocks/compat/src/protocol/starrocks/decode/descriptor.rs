@@ -19,12 +19,12 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Field;
 
+use crate::thrift::{descriptors, types};
 use novarocks::common::ids::SlotId;
 use novarocks::runtime::descriptor_snapshot::{
     DescriptorIcebergSchema, DescriptorIcebergSchemaField, DescriptorLogicalType, DescriptorSlot,
     DescriptorSnapshot, DescriptorTable, DescriptorTableKind, LookupNodeInfo, LookupNodesInfo,
 };
-use novarocks::thrift::{descriptors, types};
 
 pub(crate) fn decode_lookup_nodes_info(
     nodes_info: &descriptors::TNodesInfo,

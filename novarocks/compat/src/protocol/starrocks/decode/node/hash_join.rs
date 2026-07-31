@@ -34,7 +34,7 @@ use crate::protocol::starrocks::decode::node::Lowered;
 use novarocks::protocol::FieldPath;
 use novarocks_types::wider_type;
 
-use novarocks::thrift::{descriptors, plan_nodes};
+use crate::thrift::{descriptors, plan_nodes};
 
 fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<DataType>, String> {
     if left == right {
@@ -136,8 +136,8 @@ pub(crate) fn lower_hash_join_node(
             .field("eq_join_conjuncts")
             .index(cond_index);
         let null_safe = match cond.opcode {
-            Some(op) if op == novarocks::thrift::opcodes::TExprOpcode::EQ_FOR_NULL => true,
-            Some(op) if op == novarocks::thrift::opcodes::TExprOpcode::EQ => false,
+            Some(op) if op == crate::thrift::opcodes::TExprOpcode::EQ_FOR_NULL => true,
+            Some(op) if op == crate::thrift::opcodes::TExprOpcode::EQ => false,
             None => false,
             Some(other) => {
                 return Err(StarRocksFragmentDecodeError::unsupported(

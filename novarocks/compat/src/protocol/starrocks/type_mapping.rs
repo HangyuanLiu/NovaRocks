@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use novarocks::thrift::types;
+use crate::thrift::types;
 use novarocks_types::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
 

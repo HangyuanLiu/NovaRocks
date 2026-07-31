@@ -19,7 +19,7 @@ use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 
 use crate::protocol::starrocks::decode::layout::Layout;
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower SLOT_REF expression to ExprNode::SlotId.
 pub(crate) fn lower_slot_ref(

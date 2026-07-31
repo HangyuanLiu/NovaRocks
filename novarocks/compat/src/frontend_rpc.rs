@@ -28,15 +28,15 @@ use thrift::transport::{
     TTcpChannel, WriteHalf as TWriteHalf,
 };
 
+use crate::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
+use crate::thrift::types;
+use crate::thrift::{descriptors, frontend_service, status, status_code};
 use novarocks::common::config;
 use novarocks::connector::starrocks::ports::{
     ConnectorWireError, ConnectorWireErrorKind, TableSchemaProvider, TableSchemaRequest,
     TableSchemaRequestSource,
 };
 use novarocks::novarocks_logging::{debug, info, warn};
-use novarocks::thrift::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
-use novarocks::thrift::types;
-use novarocks::thrift::{descriptors, frontend_service, status, status_code};
 
 use crate::control::FrontendControlState;
 use crate::schema_wire::build_lake_scan_table_schema_from_thrift;
@@ -716,9 +716,8 @@ pub fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
 ) -> Result<String, String> {
-    let request = novarocks::thrift::frontend_service::TGetProfileRequest::new(Some(vec![
-        query_id.to_string(),
-    ]));
+    let request =
+        crate::thrift::frontend_service::TGetProfileRequest::new(Some(vec![query_id.to_string()]));
     let result = shared()
         .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?
         .call(FrontendRpcKind::SchemaQuery, coord, |client| {
@@ -728,7 +727,7 @@ pub fn fetch_query_profile(
         })
         .map_err(|error| format!("getQueryProfile RPC failed: {error}"))?;
     if let Some(status) = result.status
-        && status.status_code != novarocks::thrift::status_code::TStatusCode::OK
+        && status.status_code != crate::thrift::status_code::TStatusCode::OK
     {
         return Err(format!("FE returned error: {status:?}"));
     }
@@ -741,8 +740,8 @@ pub fn fetch_query_profile(
 /// Temporary compat transport seam for the stream-load ingress owner.
 /// RCI-5G moves the FE client pool out of core and removes these operations.
 pub fn load_txn_begin(
-    request: novarocks::thrift::frontend_service::TLoadTxnBeginRequest,
-) -> Result<novarocks::thrift::frontend_service::TLoadTxnBeginResult, LoadFrontendRpcError> {
+    request: crate::thrift::frontend_service::TLoadTxnBeginRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnBeginResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_begin(request.clone())
@@ -752,8 +751,8 @@ pub fn load_txn_begin(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn stream_load_put(
-    request: novarocks::thrift::frontend_service::TStreamLoadPutRequest,
-) -> Result<novarocks::thrift::frontend_service::TStreamLoadPutResult, LoadFrontendRpcError> {
+    request: crate::thrift::frontend_service::TStreamLoadPutRequest,
+) -> Result<crate::thrift::frontend_service::TStreamLoadPutResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .stream_load_put(request.clone())
@@ -763,8 +762,8 @@ pub fn stream_load_put(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_prepare(
-    request: novarocks::thrift::frontend_service::TLoadTxnCommitRequest,
-) -> Result<novarocks::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_prepare(request.clone())
@@ -774,8 +773,8 @@ pub fn load_txn_prepare(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_commit(
-    request: novarocks::thrift::frontend_service::TLoadTxnCommitRequest,
-) -> Result<novarocks::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
+    request: crate::thrift::frontend_service::TLoadTxnCommitRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnCommitResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_commit(request.clone())
@@ -785,8 +784,8 @@ pub fn load_txn_commit(
 
 /// Temporary compat transport seam for the stream-load ingress owner.
 pub fn load_txn_rollback(
-    request: novarocks::thrift::frontend_service::TLoadTxnRollbackRequest,
-) -> Result<novarocks::thrift::frontend_service::TLoadTxnRollbackResult, LoadFrontendRpcError> {
+    request: crate::thrift::frontend_service::TLoadTxnRollbackRequest,
+) -> Result<crate::thrift::frontend_service::TLoadTxnRollbackResult, LoadFrontendRpcError> {
     call_latest_control(|client| {
         client
             .load_txn_rollback(request.clone())
@@ -796,8 +795,8 @@ pub fn load_txn_rollback(
 
 pub fn batch_report_exec_status(
     coord: &types::TNetworkAddress,
-    params: novarocks::thrift::frontend_service::TBatchReportExecStatusParams,
-) -> Result<Option<Vec<novarocks::thrift::status::TStatus>>, String> {
+    params: crate::thrift::frontend_service::TBatchReportExecStatusParams,
+) -> Result<Option<Vec<crate::thrift::status::TStatus>>, String> {
     shared()
         .map_err(|error| error.to_string())?
         .call(FrontendRpcKind::ExecStatus, coord, |client| {
@@ -811,8 +810,8 @@ pub fn batch_report_exec_status(
 
 pub fn report_exec_status(
     coord: &types::TNetworkAddress,
-    params: novarocks::thrift::frontend_service::TReportExecStatusParams,
-) -> Result<Option<novarocks::thrift::status::TStatus>, String> {
+    params: crate::thrift::frontend_service::TReportExecStatusParams,
+) -> Result<Option<crate::thrift::status::TStatus>, String> {
     shared()
         .map_err(|error| error.to_string())?
         .call(FrontendRpcKind::ExecStatus, coord, |client| {
@@ -956,8 +955,8 @@ fn log_nofile_limit(limit: NoFileLimit) {
 /// result mapping while keeping the pooled transport private to this module.
 pub(crate) fn finish_task(
     coord: &types::TNetworkAddress,
-    request: novarocks::thrift::master_service::TFinishTaskRequest,
-) -> Result<novarocks::thrift::master_service::TMasterResult, String> {
+    request: crate::thrift::master_service::TFinishTaskRequest,
+) -> Result<crate::thrift::master_service::TMasterResult, String> {
     shared()
         .map_err(|error| error.to_string())?
         .call(FrontendRpcKind::Control, coord, |client| {
@@ -970,7 +969,7 @@ pub(crate) fn finish_task(
 
 pub(crate) fn report_disk(
     coord: &types::TNetworkAddress,
-    request: novarocks::thrift::master_service::TReportRequest,
+    request: crate::thrift::master_service::TReportRequest,
 ) -> Result<(), String> {
     let result = shared()
         .map_err(|error| error.to_string())?

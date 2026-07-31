@@ -3,22 +3,17 @@ name = "novarocks-compat"
 version = "0.1.0"
 edition = "2024"
 autotests = false
+build = "build.rs"
 
 [lib]
 doctest = false
 
-[features]
-default = ["compat"]
-compat = []
-
 [[bin]]
 name = "starrocks-compat-probe"
-path = "../../tests/starrocks-compat-probe/main.rs"
-test = false
-bench = false
+path = "src/bin/starrocks-compat-probe.rs"
 
 [dependencies]
-novarocks = { path = "../core", features = ["compat"] }
+novarocks = { path = "../core", features = [] }
 novarocks-fs = { path = "../fs" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
@@ -43,3 +38,9 @@ parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing = "0.1"
 threadpool = "1.8"
+
+[build-dependencies]
+cc = "1.2"
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+which = "6"

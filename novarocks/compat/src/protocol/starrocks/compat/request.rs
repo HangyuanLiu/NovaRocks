@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::thrift::internal_service::{TPlanFragmentExecParams, TScanRangeParams};
+use crate::thrift::internal_service::{TPlanFragmentExecParams, TScanRangeParams};
 
 /// Backfills the historical per-node scan-range view from the current per-driver view.
 ///

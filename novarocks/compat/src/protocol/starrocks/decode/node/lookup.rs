@@ -18,22 +18,22 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
+use crate::thrift::types;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::node::lookup::LookUpNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::exec::row_position::{RowPositionDescriptor, RowPositionType};
-use novarocks::thrift::descriptors;
-use novarocks::thrift::plan_nodes;
-use novarocks::thrift::types;
 
 fn row_position_type_from_thrift(
-    value: novarocks::thrift::descriptors::TRowPositionType,
+    value: crate::thrift::descriptors::TRowPositionType,
 ) -> Result<novarocks::exec::row_position::RowPositionType, String> {
     match value {
-        novarocks::thrift::descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION => {
+        crate::thrift::descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION => {
             Ok(RowPositionType::Iceberg)
         }
-        novarocks::thrift::descriptors::TRowPositionType::LAKE_ROW_POSITION => {
+        crate::thrift::descriptors::TRowPositionType::LAKE_ROW_POSITION => {
             Ok(RowPositionType::Lake)
         }
         other => Err(format!("unsupported row position type: {other:?}")),

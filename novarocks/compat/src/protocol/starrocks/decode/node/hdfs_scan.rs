@@ -26,6 +26,7 @@ use crate::protocol::starrocks::decode::descriptor::descriptor_snapshot_from_thr
 use crate::protocol::starrocks::decode::layout::{Layout, layout_from_slot_ids};
 use crate::protocol::starrocks::decode::node::decode::QueryGlobalDictMap;
 use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
+use crate::thrift::{descriptors, exprs, plan_nodes, types};
 use novarocks::cache::{CacheOptions, ExternalDataCacheRangeOptions};
 use novarocks::common::ids::SlotId;
 use novarocks::common::min_max_predicate::MinMaxPredicate;
@@ -57,7 +58,6 @@ use novarocks::runtime::descriptor_snapshot::{
 use novarocks::runtime::query_context::{QueryId, query_context_manager};
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
 use novarocks::runtime::scan_range::{FileFormat as RuntimeFileFormat, ScanRange};
-use novarocks::thrift::{descriptors, exprs, plan_nodes, types};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId, ConnectorOpenReaderRequest,
     ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,

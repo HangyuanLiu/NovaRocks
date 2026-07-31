@@ -26,12 +26,12 @@ use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::descriptors;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::query_options::QueryOptions;
-use novarocks::thrift::descriptors;
 
+use crate::thrift::{exprs, plan_nodes};
 use arrow::datatypes::{DataType, Field, Fields};
-use novarocks::thrift::{exprs, plan_nodes};
 
 /// Lower an AGGREGATION_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_aggregate_node(
@@ -176,7 +176,7 @@ pub(crate) fn lower_aggregate_node(
     })?;
 
     let streaming_preaggregation_mode = agg.streaming_preaggregation_mode.map(|mode| {
-        use novarocks::thrift::plan_nodes::TStreamingPreaggregationMode;
+        use crate::thrift::plan_nodes::TStreamingPreaggregationMode;
         match mode {
             TStreamingPreaggregationMode::AUTO => StreamingPreaggregationMode::Auto,
             TStreamingPreaggregationMode::FORCE_STREAMING => {
@@ -438,7 +438,7 @@ fn pack_struct_inputs(
     Ok(vec![struct_expr])
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -449,13 +449,13 @@ mod tests {
     use super::lower_aggregate_node;
     use crate::protocol::starrocks::decode::layout::Layout;
     use crate::protocol::starrocks::decode::node::Lowered;
+    use crate::thrift::{descriptors, plan_nodes};
     use novarocks::exec::chunk::{Chunk, ChunkSchema};
     use novarocks::exec::expr::ExprArena;
     use novarocks::exec::node::values::ValuesNode;
     use novarocks::exec::node::{ExecNode, ExecNodeKind};
     use novarocks::protocol::FieldPath;
     use novarocks::runtime::query_options::QueryOptions;
-    use novarocks::thrift::{descriptors, plan_nodes};
 
     fn empty_plan_node() -> plan_nodes::TPlanNode {
         plan_nodes::TPlanNode::new(

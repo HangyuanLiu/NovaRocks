@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
+use crate::proto::staros;
 use axum::Router;
 use axum::extract::Query;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use novarocks::proto::{novarocks as novarocks_proto, staros};
+use novarocks::proto::novarocks as novarocks_proto;
 use novarocks::query_execution::report::NativeReportHandler;
 use novarocks::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 use novarocks::service::grpc_server::GrpcService;

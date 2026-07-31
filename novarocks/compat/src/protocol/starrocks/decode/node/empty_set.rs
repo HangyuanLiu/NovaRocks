@@ -23,11 +23,11 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, schema_for_layout,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 use novarocks::exec::chunk::Chunk;
 use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::descriptors;
-use novarocks::thrift::plan_nodes;
 
 /// Lower an EMPTY_SET_NODE plan node to a zero-row `ValuesNode`.
 pub(crate) fn lower_empty_set_node(

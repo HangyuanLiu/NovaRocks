@@ -17,6 +17,17 @@
 
 //! StarRocks lake-storage protobuf codec.
 
+use crate::proto::starrocks::{
+    AggStateDescPb, BinaryPredicatePb, BundleTabletMetadataPb, ColumnPb, CombinedTxnLogPb,
+    DeletePredicatePb, DelfileWithRowsetId, DeltaColumnGroupColumnIdsPb,
+    DeltaColumnGroupMetadataPb, DeltaColumnGroupVerPb, DelvecMetadataPb, DelvecPagePb, FileMetaPb,
+    FlatJsonConfigPb, FooterPointerPb, InPredicatePb, IsNullPredicatePb, KeysType,
+    MetadataUpdateInfoPb, PScalarType, PStructField, PTypeDesc, PTypeNode, PUniqueId,
+    PagePointerPb, PersistentIndexSstableMetaPb, PersistentIndexSstablePb,
+    PersistentIndexSstablePredicatePb, RecordPredicatePb, RowsetMetadataPb, RowsetTxnMetaPb,
+    SegmentMetadataPb, TableSchemaKeyPb, TabletIndexPb, TabletMetadataPb, TabletSchemaPb, TuplePb,
+    TxnLogPb, VariantPb, VariantTypePb, record_predicate_pb, txn_log_pb,
+};
 use novarocks::connector::starrocks::lake::storage_domain::{
     StorageAlterMetadataOperation, StorageBinaryPredicate, StorageBundleFile,
     StorageBundleMetadata, StorageColumnHashCongruence, StorageCombinedTransactionLog,
@@ -34,17 +45,6 @@ use novarocks::connector::starrocks::schema::{
     StarRocksAggStateDesc, StarRocksColumnSchema, StarRocksKeysType, StarRocksScalarType,
     StarRocksStructField, StarRocksTabletIndex, StarRocksTabletSchema, StarRocksTypeDesc,
     StarRocksTypeNode,
-};
-use novarocks::service::grpc_client::proto::starrocks::{
-    AggStateDescPb, BinaryPredicatePb, BundleTabletMetadataPb, ColumnPb, CombinedTxnLogPb,
-    DeletePredicatePb, DelfileWithRowsetId, DeltaColumnGroupColumnIdsPb,
-    DeltaColumnGroupMetadataPb, DeltaColumnGroupVerPb, DelvecMetadataPb, DelvecPagePb, FileMetaPb,
-    FlatJsonConfigPb, FooterPointerPb, InPredicatePb, IsNullPredicatePb, KeysType,
-    MetadataUpdateInfoPb, PScalarType, PStructField, PTypeDesc, PTypeNode, PUniqueId,
-    PagePointerPb, PersistentIndexSstableMetaPb, PersistentIndexSstablePb,
-    PersistentIndexSstablePredicatePb, RecordPredicatePb, RowsetMetadataPb, RowsetTxnMetaPb,
-    SegmentMetadataPb, TableSchemaKeyPb, TabletIndexPb, TabletMetadataPb, TabletSchemaPb, TuplePb,
-    TxnLogPb, VariantPb, VariantTypePb, record_predicate_pb, txn_log_pb,
 };
 use prost::Message;
 use std::sync::Arc;

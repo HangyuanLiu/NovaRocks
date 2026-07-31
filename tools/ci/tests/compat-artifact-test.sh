@@ -27,7 +27,7 @@ cat >"$fake_builder" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected='cargo build --profile dev-opt -p novarocks-server -p novarocks --features compat --bin novarocks --bin starrocks-compat-probe'
+expected='cargo build --profile dev-opt -p novarocks-server -p novarocks-compat --features novarocks-server/compat --bin novarocks --bin starrocks-compat-probe'
 if [ "$*" != "$expected" ]; then
   echo "unexpected compat build command: $*" >&2
   exit 1

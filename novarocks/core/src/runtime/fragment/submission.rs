@@ -597,7 +597,6 @@ mod tests {
     };
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
-    #[cfg(feature = "compat")]
     use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::join::{
@@ -2029,7 +2028,6 @@ mod tests {
         FragmentSubmission::try_new(program, instance).expect("set op child scan");
     }
 
-    #[cfg(feature = "compat")]
     #[test]
     fn compat_fetch_wrapper_is_traversed() {
         let id = FragmentNodeId::new(10);

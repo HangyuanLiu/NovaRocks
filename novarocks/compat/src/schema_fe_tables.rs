@@ -21,8 +21,8 @@ use reqwest::blocking::Client;
 use serde_json::Value as JsonValue;
 use thrift::OrderedFloat;
 
-use novarocks::thrift::frontend_service;
-use novarocks::thrift::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 use crate::schema_frontend::{
     build_auth_info, effective_current_user_ident, ensure_ok_status, extract_db_name,

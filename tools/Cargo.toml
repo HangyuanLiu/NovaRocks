@@ -36,7 +36,7 @@ bytes = "1"
 futures = "0.3"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3"] }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
-novarocks = { path = "../novarocks/core", features = ["compat"] }
+novarocks = { path = "../novarocks/core" }
 novarocks-fs = { path = "../novarocks/fs" }
 prost = "0.13.5"
 

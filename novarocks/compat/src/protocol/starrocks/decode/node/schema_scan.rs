@@ -23,6 +23,8 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, schema_for_layout,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 use novarocks::connector::schema::{
     BeSchemaTable, SchemaFrontend, SchemaScanContext, SchemaScanSource, SchemaTable,
     SchemaUserIdentity, SchemaUserRoles,
@@ -34,8 +36,6 @@ use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::novarocks_logging::warn;
 use novarocks::runtime::scan_range::ScanRange;
-use novarocks::thrift::descriptors;
-use novarocks::thrift::plan_nodes;
 
 use super::ScanRangeCarrier;
 
@@ -277,7 +277,7 @@ fn schema_scan_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks::thrift::types;
+    use crate::thrift::types;
 
     #[test]
     fn schema_scan_wire_identity_and_frontends_decode_to_domain_context() {

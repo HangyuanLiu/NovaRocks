@@ -23,6 +23,7 @@ use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::{ExprArena, ExprId};
 use novarocks::exec::node::change_event_expand::{
@@ -31,7 +32,6 @@ use novarocks::exec::node::change_event_expand::{
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::FieldPath;
 use novarocks::sql::common::ChangeStreamBranchKind;
-use novarocks::thrift::{descriptors, plan_nodes, types};
 
 pub(crate) fn lower_change_event_expand_node(
     children: Vec<Lowered>,

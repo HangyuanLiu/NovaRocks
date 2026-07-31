@@ -27,9 +27,7 @@ mod file_scan;
 mod hash_join;
 pub(crate) mod hdfs_scan;
 mod iceberg_delta_scan;
-#[cfg(feature = "compat")]
 mod lake_meta_scan;
-#[cfg(feature = "compat")]
 mod lake_scan;
 mod lookup;
 mod nestloop_join;
@@ -40,7 +38,6 @@ mod schema_scan;
 mod select;
 mod set_op;
 mod sort;
-#[cfg(feature = "compat")]
 mod starrocks_scan;
 mod table_function;
 mod union;
@@ -60,8 +57,8 @@ use std::sync::Arc;
 use crate::protocol::starrocks::decode::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_with_common_slot_map_at;
 use crate::protocol::starrocks::decode::layout::{Layout, layout_for_row_tuples};
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{data, descriptors, exprs, plan_nodes, types};
 
 /// Transient scan-range access handed to compat scan decoders.
 ///
@@ -171,9 +168,7 @@ pub(crate) use file_scan::{
 pub(crate) use hash_join::lower_hash_join_node;
 pub(crate) use hdfs_scan::lower_hdfs_scan_node;
 pub(crate) use iceberg_delta_scan::lower_iceberg_delta_scan_node;
-#[cfg(feature = "compat")]
 pub(crate) use lake_meta_scan::{LakeMetaValuesPatch, lower_lake_meta_scan_node};
-#[cfg(feature = "compat")]
 pub(crate) use lake_scan::lower_lake_scan_node;
 pub(crate) use lookup::{lower_lookup_node, lower_row_pos_descs};
 pub(crate) use nestloop_join::lower_nestloop_join_node;
@@ -185,7 +180,6 @@ pub(crate) use schema_scan::supported_schema_scan_requires_ranges;
 pub(crate) use select::lower_select_node;
 pub(crate) use set_op::{lower_except_node, lower_intersect_node};
 pub(crate) use sort::lower_sort_node;
-#[cfg(feature = "compat")]
 pub(crate) use starrocks_scan::lower_starrocks_scan_node;
 pub(crate) use table_function::lower_table_function_node;
 pub(crate) use union::lower_union_node;
@@ -703,74 +697,47 @@ fn lower_node_with_children_typed(
                 )?
             }
             t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => {
-                #[cfg(feature = "compat")]
-                {
-                    lower_lake_scan_node(
-                        node,
-                        desc_tbl,
-                        tuple_slots,
-                        layout_hints,
-                        context.scan_ranges,
-                        context
-                            .lake_scan_program_facts
-                            .and_then(|facts| facts.get(&node.node_id)),
-                        context.query_id,
-                        &context.query_options,
-                        arena,
-                        query_global_dict_map,
-                        db_name,
-                        fe_addr,
-                    )?
-                }
-                #[cfg(not(feature = "compat"))]
-                {
-                    return Err("LAKE_SCAN_NODE requires the compat feature"
-                        .to_string()
-                        .into());
-                }
+                lower_lake_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    context.scan_ranges,
+                    context
+                        .lake_scan_program_facts
+                        .and_then(|facts| facts.get(&node.node_id)),
+                    context.query_id,
+                    &context.query_options,
+                    arena,
+                    query_global_dict_map,
+                    db_name,
+                    fe_addr,
+                )?
             }
             t if t == plan_nodes::TPlanNodeType::LAKE_META_SCAN_NODE => {
-                #[cfg(feature = "compat")]
-                {
-                    lower_lake_meta_scan_node(
-                        node,
-                        desc_tbl,
-                        tuple_slots,
-                        layout_hints,
-                        context
-                            .lake_meta_scan_range_facts
-                            .and_then(|facts| facts.get(&node.node_id))
-                            .map(Vec::as_slice),
-                        context.query_id,
-                        db_name,
-                        fe_addr,
-                    )?
-                }
-                #[cfg(not(feature = "compat"))]
-                {
-                    return Err("LAKE_META_SCAN_NODE requires the compat feature"
-                        .to_string()
-                        .into());
-                }
+                lower_lake_meta_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    context
+                        .lake_meta_scan_range_facts
+                        .and_then(|facts| facts.get(&node.node_id))
+                        .map(Vec::as_slice),
+                    context.query_id,
+                    db_name,
+                    fe_addr,
+                )?
             }
             t if t == plan_nodes::TPlanNodeType::OLAP_SCAN_NODE => {
-                #[cfg(feature = "compat")]
-                {
-                    lower_starrocks_scan_node(
-                        node,
-                        desc_tbl,
-                        tuple_slots,
-                        layout_hints,
-                        &context.query_options,
-                        query_global_dict_map,
-                    )?
-                }
-                #[cfg(not(feature = "compat"))]
-                {
-                    return Err("OLAP_SCAN_NODE requires the compat feature"
-                        .to_string()
-                        .into());
-                }
+                lower_starrocks_scan_node(
+                    node,
+                    desc_tbl,
+                    tuple_slots,
+                    layout_hints,
+                    &context.query_options,
+                    query_global_dict_map,
+                )?
             }
             t if t == plan_nodes::TPlanNodeType::AGGREGATION_NODE => {
                 if children.len() != 1 {

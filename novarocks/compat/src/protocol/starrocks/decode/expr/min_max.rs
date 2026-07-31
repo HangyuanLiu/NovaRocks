@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::protocol::starrocks::decode::layout::Layout;
+use crate::thrift::exprs;
 use novarocks::connector::MinMaxPredicate;
-use novarocks::thrift::exprs;
 
 /// Parse a min/max conjunct TExpr into MinMaxPredicates used for pruning.
 pub(crate) fn parse_min_max_conjuncts(

@@ -55,9 +55,6 @@ fn current_novarocks_rlib() -> &'static PathBuf {
             .arg("--message-format=json-render-diagnostics")
             .env("CARGO_TARGET_DIR", current_target_dir());
         let mut features = Vec::new();
-        if cfg!(feature = "compat") {
-            features.push("compat");
-        }
         if cfg!(feature = "foundationdb-provider") {
             features.push("foundationdb-provider");
         }

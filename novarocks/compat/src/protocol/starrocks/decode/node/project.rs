@@ -36,9 +36,9 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, layout_from_slot_ids, slot_display_name_from_desc,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
-use novarocks::thrift::descriptors;
-use novarocks::thrift::exprs;
-use novarocks::thrift::{plan_nodes, types};
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::{plan_nodes, types};
 
 fn project_slot_schema_from_desc(
     desc_tbl: &descriptors::TDescriptorTable,

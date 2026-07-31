@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::thrift::types::TUniqueId;
 use novarocks::common::types::UniqueId;
-use novarocks::thrift::types::TUniqueId;
 
 #[derive(Debug, Default)]
 pub(crate) struct CompatLoadRegistry {

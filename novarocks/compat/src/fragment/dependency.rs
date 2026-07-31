@@ -21,11 +21,11 @@ use std::sync::Arc;
 use crate::protocol::starrocks::decode::{
     StarRocksExternalDependency, StarRocksResolvedDependencies, StarRocksResolvedDependencyValue,
 };
+use crate::thrift::types::TNetworkAddress;
 use novarocks::connector::starrocks::{
     lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest},
     ports::{LakeMetaStorageResolver, StarletMetadataProvider, StorageMetadataProvider},
 };
-use novarocks::thrift::types::TNetworkAddress;
 
 use crate::fragment::admission::PrelaunchCancellationToken;
 
