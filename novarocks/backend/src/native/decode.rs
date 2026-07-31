@@ -39,6 +39,7 @@ use novarocks_spi::connector::ConnectorExecutionResolver;
 
 use super::envelope::BackendNativeFragmentEnvelopeDecoder;
 use super::exchange::BackendNativeExchangeContractDecoder;
+use super::expression::BackendNativeExpressionDecoder;
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
 use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
@@ -123,6 +124,7 @@ impl NativeFragmentRequest {
             &instance_params,
             &BackendNativeFragmentEnvelopeDecoder,
             &BackendNativeFragmentSinkAssignmentDecoder,
+            Arc::new(BackendNativeExpressionDecoder),
             &BackendNativeScanSourceContractDecoder,
             &BackendNativeExchangeContractDecoder,
             &BackendNativeRuntimeFilterContractDecoder,

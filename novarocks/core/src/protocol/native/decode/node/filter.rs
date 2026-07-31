@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::expr::decode_expr_at;
-use super::DecodedNode;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -29,6 +28,7 @@ pub(super) fn lower_filter_node(
     path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let predicate = filter.predicate.as_ref().ok_or_else(|| {
@@ -37,7 +37,8 @@ pub(super) fn lower_filter_node(
             "native FilterNode requires predicate",
         )
     })?;
-    let predicate = decode_expr_at(predicate, path.field("predicate"), arena, &child.layout)?;
+    let predicate =
+        ctx.decode_expression(predicate, path.field("predicate"), arena, &child.layout)?;
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Filter(FilterNode {

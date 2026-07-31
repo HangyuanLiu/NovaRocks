@@ -63,6 +63,9 @@ use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
+use crate::protocol::native_fragment_assembly_port::{
+    NativeExpressionDecoder, NativeExpressionInputLayout,
+};
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
@@ -94,6 +97,7 @@ pub(crate) struct NativePlanDecodeContext {
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     execution_resolver: Option<Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>>,
+    expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
 }
@@ -107,6 +111,7 @@ impl Default for NativePlanDecodeContext {
             query_options: None,
             connectors: None,
             execution_resolver: None,
+            expression_decoder: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(crate::common::types::UniqueId {
                 hi: 0,
@@ -132,6 +137,7 @@ impl NativePlanDecodeContext {
             query_options: Some(query_options),
             connectors: Some(connectors),
             execution_resolver: None,
+            expression_decoder: None,
             query_id: Some(query_id),
             fragment_instance_id,
         }
@@ -143,6 +149,30 @@ impl NativePlanDecodeContext {
     ) -> Self {
         self.execution_resolver = Some(resolver);
         self
+    }
+
+    pub(crate) fn with_expression_decoder(
+        mut self,
+        decoder: Arc<dyn NativeExpressionDecoder>,
+    ) -> Self {
+        self.expression_decoder = Some(decoder);
+        self
+    }
+
+    pub(crate) fn decode_expression(
+        &self,
+        expression: &crate::proto::expr::Expr,
+        path: FieldPath,
+        arena: &mut ExprArena,
+        layout: &Layout,
+    ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
+        let Some(decoder) = self.expression_decoder.as_ref() else {
+            return super::expr::decode_expr_at(expression, path, arena, layout);
+        };
+        let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
+        decoder
+            .decode_expression(expression, path, arena, &input)
+            .map_err(super::NativeFragmentDecodeError::from)
     }
 
     /// Record a scan node's enriched connector ranges (produced during node
@@ -1635,9 +1665,14 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Filter(filter) => {
-            filter::lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
-        }
+        plan::plan_node::Kind::Filter(filter) => filter::lower_filter_node(
+            node,
+            filter,
+            path.clone().field("filter"),
+            children,
+            arena,
+            ctx,
+        ),
         plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(
             node,
             limit,
