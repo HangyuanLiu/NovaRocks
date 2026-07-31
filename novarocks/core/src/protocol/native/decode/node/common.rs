@@ -21,7 +21,6 @@ use super::super::NativeFragmentDecodeError;
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::layout::Layout;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::join::JoinType;
 use crate::exec::node::project::ProjectNode;
