@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use novarocks::thrift::frontend_service::{self, TTrackingLoadInfo};
-use novarocks::thrift::types;
+use crate::thrift::frontend_service::{self, TTrackingLoadInfo};
+use crate::thrift::types;
 
 use crate::schema_frontend::with_frontend_client;
 use novarocks::connector::schema::SchemaScanContext;

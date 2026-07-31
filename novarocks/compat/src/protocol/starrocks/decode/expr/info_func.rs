@@ -17,7 +17,7 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower INFO_FUNC expression to ExprNode::Literal.
 pub(crate) fn lower_info_func(

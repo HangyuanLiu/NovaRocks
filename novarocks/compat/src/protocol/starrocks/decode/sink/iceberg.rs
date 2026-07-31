@@ -28,6 +28,7 @@ use crate::protocol::starrocks::decode::layout::Layout;
 use crate::protocol::starrocks::decode::{
     StarRocksExternalDependencyDraft, StarRocksFragmentDecodeError,
 };
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 use novarocks::connector::iceberg::commit::EqualityDeleteColumn;
 use novarocks::connector::iceberg::delete_file::IcebergFileFormat;
 use novarocks::connector::iceberg::position_delete_descriptor::{
@@ -51,7 +52,6 @@ use novarocks::fs::object_store_credentials::{
     ObjectStoreCredentials, ObjectStoreCredentialsSource,
 };
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{data_sinks, descriptors, exprs, types};
 
 type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
 

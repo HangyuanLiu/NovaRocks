@@ -391,13 +391,10 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
-    #[cfg(feature = "compat")]
     use crate::connector::starrocks::lake::context::PartialUpdateWriteMode;
-    #[cfg(feature = "compat")]
     use crate::connector::starrocks::schema::{
         StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
     };
-    #[cfg(feature = "compat")]
     use crate::connector::starrocks::sink::plan::{
         SinkIndexDescriptor, SinkLocationDescriptor, SinkNodesDescriptor, SinkPartitionDescriptor,
         SinkSchemaDescriptor, StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
@@ -416,10 +413,8 @@ mod tests {
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::operators::DataStreamPartitionType;
-    #[cfg(feature = "compat")]
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::fragment::error::{FragmentLaunchErrorKind, FragmentLaunchStage};
-    #[cfg(feature = "compat")]
     use crate::runtime::fragment::instance::StarRocksTableSinkAssignment;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
@@ -430,7 +425,6 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::sql::common::ChangeStreamBranchKind;
 
-    #[cfg(feature = "compat")]
     use super::starrocks_factory_input;
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
 
@@ -496,7 +490,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "compat")]
     fn starrocks_table_program() -> StarRocksTableSinkProgram {
         let tablet_schema = StarRocksTabletSchema::try_new(
             Some(10),
@@ -620,7 +613,6 @@ mod tests {
         assert_factory_and_operator_name(factory.as_ref(), "SPLIT_DATA_STREAM_SINK (id=99)");
     }
 
-    #[cfg(feature = "compat")]
     #[test]
     fn starrocks_materializer_assembles_dynamic_identity_only_at_runtime() {
         let program = starrocks_table_program();

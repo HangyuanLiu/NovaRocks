@@ -434,7 +434,7 @@ impl QueryContext {
             }
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     fn bind_starrocks_generation(
         &mut self,
         generation: StarRocksQueryGeneration,
@@ -2088,7 +2088,7 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     pub(crate) fn get_or_register_compat_generation(
         &self,
         execution: QueryExecutionKey,
@@ -2640,7 +2640,7 @@ impl QueryContextManager {
             })
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     fn pending_incremental_scan_ranges_for_test(
         &self,
         finst_id: UniqueId,
@@ -2674,7 +2674,7 @@ impl QueryContextManager {
         }
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     pub(crate) fn register_starrocks_finsts<I>(
         &self,
         finst_ids: I,
@@ -2700,7 +2700,7 @@ impl QueryContextManager {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     pub(crate) fn register_finsts_with_incremental_contracts<I>(
         &self,
         instances: I,
@@ -3162,7 +3162,7 @@ impl QueryContextManager {
         }
     }
 
-    #[cfg(all(test, feature = "compat"))]
+    #[cfg(test)]
     fn cancel_finst_with_binding_observer<F>(
         &self,
         finst_id: UniqueId,
@@ -3354,7 +3354,7 @@ mod fragment_cancellation_boundary_tests {
     }
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod generation_race_tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, mpsc};
@@ -3893,7 +3893,7 @@ mod runtime_filter_lifecycle_cleanup_tests {
     }
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod incremental_scan_domain_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;

@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(feature = "compat")]
-include!(concat!(env!("OUT_DIR"), "/thrift_root_mod.rs"));
 include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
 
 #[cfg(test)]

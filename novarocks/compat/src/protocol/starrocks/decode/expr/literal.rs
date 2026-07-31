@@ -21,7 +21,7 @@ use crate::protocol::starrocks::decode::expr::literals::{
     build_date_literal, build_decimal_literal, build_float_literal, build_int_literal,
     build_large_int_literal,
 };
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower literal expressions to ExprNode::Literal.
 pub(crate) fn lower_literal(

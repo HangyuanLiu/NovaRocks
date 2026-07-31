@@ -20,9 +20,9 @@ use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::protocol::starrocks::decode::type_lowering::{
     arrow_type_from_desc, arrow_type_from_primitive,
 };
-use novarocks::thrift::exprs;
-use novarocks::thrift::opcodes;
-use novarocks::thrift::types;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
+use crate::thrift::types;
 
 /// Lower BINARY_PRED expression to comparison ExprNode.
 pub(crate) fn lower_binary_pred(

@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
+use crate::thrift::{descriptors, internal_service, plan_nodes, types};
 use novarocks::cache::{ExternalDataCacheRangeOptions, datacache_block_cache_available};
 use novarocks::common::ids::SlotId;
 use novarocks::common::types::UniqueId;
@@ -34,7 +35,6 @@ use novarocks::runtime::scan_range::{
     BrokerFileFormat, BrokerFileScanRange, DatacacheOptions, DeletionVectorDescriptor, FileFormat,
     FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat, ScanRangeParams,
 };
-use novarocks::thrift::{descriptors, internal_service, plan_nodes, types};
 
 use super::{StarRocksFragmentDecodeError, decode_query_options, decode_runtime_endpoint};
 
@@ -905,7 +905,7 @@ fn decode_change_op_slots(
 
 pub(crate) fn decode_change_op_extended_column(
     node_id: i32,
-    extended_columns: &BTreeMap<i32, novarocks::thrift::exprs::TExpr>,
+    extended_columns: &BTreeMap<i32, crate::thrift::exprs::TExpr>,
     change_op_slot: Option<SlotId>,
 ) -> Result<Option<i8>, String> {
     let Some(slot) = change_op_slot else {
@@ -926,7 +926,7 @@ pub(crate) fn decode_change_op_extended_column(
         ));
     }
     let node = &expr.nodes[0];
-    if node.node_type != novarocks::thrift::exprs::TExprNodeType::INT_LITERAL {
+    if node.node_type != crate::thrift::exprs::TExprNodeType::INT_LITERAL {
         return Err(format!(
             "{} expects INT_LITERAL extended column, got {:?}",
             context(),
@@ -1036,8 +1036,8 @@ mod change_op_tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TIntLiteral};
     use novarocks::common::ids::SlotId;
-    use novarocks::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TIntLiteral};
 
     fn expr_node(node_type: TExprNodeType, children: i32, value: Option<i64>) -> TExprNode {
         TExprNode {

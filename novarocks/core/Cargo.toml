@@ -73,7 +73,6 @@ as-any = "0.3"
 opensrv-mysql = { version = "0.7", default-features = false }
 
 # starust core
-thrift = "0.17"
 threadpool = "1"
 serde_json = "1"
 bytes = "1"
@@ -118,10 +117,7 @@ mysql-state-store-provider = ["novarocks-state-store/mysql-state-store-provider"
 state-store-test-hooks = ["novarocks-state-store/state-store-test-hooks"]
 query-execution-contract-test-support = []
 ssb = []
-compat = []
 
 [build-dependencies]
-cc = "1.2"
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
-which = "6"

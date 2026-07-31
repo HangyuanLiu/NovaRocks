@@ -23,7 +23,7 @@
 
 use std::sync::Mutex;
 
-use novarocks::thrift::types;
+use crate::thrift::types;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiskReportReservation {
@@ -129,7 +129,7 @@ impl FrontendControlState {
 #[cfg(test)]
 mod tests {
     use super::FrontendControlState;
-    use novarocks::thrift::types::TNetworkAddress;
+    use crate::thrift::types::TNetworkAddress;
 
     fn address(hostname: &str, port: i32) -> TNetworkAddress {
         TNetworkAddress::new(hostname.to_string(), port)

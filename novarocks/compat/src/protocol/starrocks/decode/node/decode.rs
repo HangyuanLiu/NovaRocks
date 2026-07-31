@@ -32,6 +32,7 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::{data, descriptors, exprs, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{Chunk, ChunkSchema};
 use novarocks::exec::expr::{ExprArena, ExprNode};
@@ -39,7 +40,6 @@ use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::novarocks_logging::info;
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{data, descriptors, exprs, plan_nodes, types};
 
 pub(crate) type QueryGlobalDictMap = HashMap<types::TSlotId, Arc<HashMap<i32, Vec<u8>>>>;
 

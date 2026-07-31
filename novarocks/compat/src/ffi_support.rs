@@ -26,11 +26,15 @@
 use novarocks::common::failpoint::{self, FailPointMode};
 use novarocks::common::result_batch::ResultBatch;
 use novarocks::novarocks_logging::error;
-use novarocks::proto;
 use novarocks::runtime::query_context::QueryId;
 use novarocks::service::internal_rpc;
 use novarocks::{FetchResult, UniqueId};
 use prost::Message;
+
+mod proto {
+    pub(crate) use crate::proto::starrocks;
+    pub(crate) use ::novarocks::proto::*;
+}
 
 #[repr(C)]
 pub(crate) struct NovaRocksRustBuf {
@@ -52,8 +56,8 @@ fn unique_id(hi: i64, lo: i64) -> UniqueId {
 fn result_batch_to_thrift(
     batch: &ResultBatch,
     packet_seq: i64,
-) -> novarocks::thrift::data::TResultBatch {
-    novarocks::thrift::data::TResultBatch::new(
+) -> crate::thrift::data::TResultBatch {
+    crate::thrift::data::TResultBatch::new(
         batch.rows.clone(),
         batch.is_compressed,
         packet_seq,

@@ -26,12 +26,12 @@
 
 use std::ffi::c_void;
 
-use novarocks::novarocks_logging::error;
-use novarocks::service::grpc_client::proto::starrocks::{
+use crate::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
     DeleteTabletRequest, DropTableRequest, PublishLogVersionBatchRequest, PublishLogVersionRequest,
     PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
+use novarocks::novarocks_logging::error;
 use prost::Message;
 
 use crate::ffi_support::NovaRocksRustBuf;

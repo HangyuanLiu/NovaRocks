@@ -5,11 +5,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::frontend_rpc;
+use crate::thrift::{frontend_service, status, status_code, types};
 use novarocks::UniqueId;
 use novarocks::common::config;
 use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::query_context::QueryId;
-use novarocks::thrift::{frontend_service, status, status_code, types};
 
 const NORMAL_REPORT_QUEUE_LIMIT: usize = 1_000;
 
@@ -338,9 +338,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{ExecStateReportTask, StarRocksReporter, is_query_gone_status};
+    use crate::thrift::{status, status_code, types};
     use novarocks::UniqueId;
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::thrift::{status, status_code, types};
 
     use crate::report::status::{ExecStatusReportInput, build_report_params};
 

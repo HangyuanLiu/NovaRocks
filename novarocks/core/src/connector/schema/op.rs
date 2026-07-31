@@ -935,7 +935,6 @@ mod tests {
         super::be_tablet_write_log_store::clear_for_test();
     }
 
-    #[cfg(not(feature = "compat"))]
     #[test]
     fn schema_scan_op_rejects_fe_only_tables_without_compat() {
         let schema = Arc::new(Schema::new(vec![Field::new("LABEL", DataType::Utf8, true)]));

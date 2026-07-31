@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::thrift::descriptors;
 use novarocks::common::types::UniqueId;
 use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::query_context::{QueryCleanupLease, QueryId};
-use novarocks::thrift::descriptors;
 
 use crate::fragment::dependency::DependencyResolutionError;
 
@@ -426,8 +426,8 @@ mod tests {
     use novarocks::runtime::query_context::QueryId;
 
     use super::{DescriptorTransportCache, PrelaunchRegistry};
+    use crate::thrift::descriptors;
     use novarocks::common::types::UniqueId;
-    use novarocks::thrift::descriptors;
 
     fn descriptor(tuple_id: i32) -> descriptors::TDescriptorTable {
         descriptors::TDescriptorTable::new(

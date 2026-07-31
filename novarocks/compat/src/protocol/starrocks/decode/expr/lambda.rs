@@ -17,7 +17,7 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 pub(crate) fn lower_lambda_function(
     node: &exprs::TExprNode,

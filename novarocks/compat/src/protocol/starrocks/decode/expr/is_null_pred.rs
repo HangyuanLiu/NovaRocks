@@ -17,7 +17,7 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode};
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower IS_NULL_PRED expression to ExprNode::IsNull / ExprNode::IsNotNull.
 pub(crate) fn lower_is_null_pred(

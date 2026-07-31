@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::thrift::{data_cache, status as thrift_status, status_code, types};
 use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::{debug, warn};
 use novarocks::runtime::fragment::io::{FragmentReportRegistration, FragmentTerminalReport};
 use novarocks::runtime::sink_commit;
-use novarocks::thrift::{data_cache, status as thrift_status, status_code, types};
 
 use reporter::{ExecStateReportTask, StarRocksReporter};
 use status::{ExecStatusReportInput, build_report_params};
@@ -212,7 +212,7 @@ fn build_starrocks_report_params(
     tracking: &LoadTrackingStore,
     registration: &FragmentReportRegistration,
     terminal: Option<&FragmentTerminalReport>,
-) -> novarocks::thrift::frontend_service::TReportExecStatusParams {
+) -> crate::thrift::frontend_service::TReportExecStatusParams {
     let done = terminal.is_some();
     let error = terminal
         .and_then(FragmentTerminalReport::error)
@@ -263,7 +263,7 @@ fn build_tracking_url(
 }
 
 fn build_load_datacache_metrics(
-    profile: Option<&novarocks::thrift::runtime_profile::TRuntimeProfileTree>,
+    profile: Option<&crate::thrift::runtime_profile::TRuntimeProfileTree>,
 ) -> Option<data_cache::TLoadDataCacheMetrics> {
     let profile = profile?;
     let sum_counter = |name: &str| {

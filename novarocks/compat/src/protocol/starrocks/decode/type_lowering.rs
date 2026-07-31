@@ -17,15 +17,15 @@
 use crate::protocol::starrocks::type_mapping::{
     thrift_desc_to_arrow_field, thrift_desc_to_arrow_type, thrift_type_desc_from_primitive,
 };
+use crate::thrift::types;
 use arrow::datatypes::{DataType, Field};
 use novarocks::common::util::FieldRenderSchema;
-use novarocks::thrift::types;
 use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::primitive_to_arrow_type;
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
-    node: &novarocks::thrift::exprs::TExprNode,
+    node: &crate::thrift::exprs::TExprNode,
 ) -> Option<types::TPrimitiveType> {
     primitive_type_from_desc(&node.type_)
 }

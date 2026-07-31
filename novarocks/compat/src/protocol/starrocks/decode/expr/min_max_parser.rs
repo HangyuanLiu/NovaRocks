@@ -21,9 +21,9 @@ use tracing::debug;
 use crate::protocol::starrocks::type_mapping::{
     THRIFT_TIME_UNIT_NANOS, thrift_desc_to_arrow_type as arrow_type_from_desc,
 };
+use crate::thrift::exprs;
+use crate::thrift::types;
 use novarocks::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
-use novarocks::thrift::exprs;
-use novarocks::thrift::types;
 
 /// Parse thrift min/max conjuncts into native pruning predicates.
 pub(crate) fn parse_min_max_conjuncts_with_column_resolver<F>(
@@ -56,7 +56,7 @@ where
         .ok_or_else(|| format!("malformed TExpr: missing node at index {idx}"))?;
 
     if node.node_type == exprs::TExprNodeType::COMPOUND_PRED
-        && node.opcode == Some(novarocks::thrift::opcodes::TExprOpcode::COMPOUND_AND)
+        && node.opcode == Some(crate::thrift::opcodes::TExprOpcode::COMPOUND_AND)
     {
         let child_count = child_count(node)?;
         let mut next = idx + 1;
@@ -90,15 +90,15 @@ where
         return Ok(None);
     };
 
-    let predicate_type = if opcode == novarocks::thrift::opcodes::TExprOpcode::LE {
+    let predicate_type = if opcode == crate::thrift::opcodes::TExprOpcode::LE {
         "Le"
-    } else if opcode == novarocks::thrift::opcodes::TExprOpcode::GE {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::GE {
         "Ge"
-    } else if opcode == novarocks::thrift::opcodes::TExprOpcode::LT {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::LT {
         "Lt"
-    } else if opcode == novarocks::thrift::opcodes::TExprOpcode::GT {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::GT {
         "Gt"
-    } else if opcode == novarocks::thrift::opcodes::TExprOpcode::EQ {
+    } else if opcode == crate::thrift::opcodes::TExprOpcode::EQ {
         "Eq"
     } else {
         return Ok(None);

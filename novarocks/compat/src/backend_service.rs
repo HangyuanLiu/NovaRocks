@@ -37,12 +37,8 @@ use thrift::transport::{
     TReadTransportFactory, TTcpChannel, TWriteTransportFactory,
 };
 
-use novarocks::common::network;
-use novarocks::connector::starrocks::sink::clear_auto_increment_cache_for_table;
-use novarocks::novarocks_config::config as novarocks_app_config;
-use novarocks::runtime::starlet_shard_registry;
-use novarocks::thrift::master_service;
-use novarocks::thrift::{
+use crate::thrift::master_service;
+use crate::thrift::{
     agent_service,
     backend_service::{
         BackendServiceSyncHandler, BackendServiceSyncProcessor, TExportTaskRequest,
@@ -54,6 +50,10 @@ use novarocks::thrift::{
     status_code::TStatusCode,
     types,
 };
+use novarocks::common::network;
+use novarocks::connector::starrocks::sink::clear_auto_increment_cache_for_table;
+use novarocks::novarocks_config::config as novarocks_app_config;
+use novarocks::runtime::starlet_shard_registry;
 
 use crate::control::FrontendControlState;
 use crate::frontend_rpc;
@@ -380,7 +380,7 @@ impl BackendServiceSyncHandler for BackendHandler {
         _: internal_service::TFetchDataParams,
     ) -> thrift::Result<internal_service::TFetchDataResult> {
         Ok(internal_service::TFetchDataResult::new(
-            novarocks::thrift::data::TResultBatch::new(vec![], false, 0, None),
+            crate::thrift::data::TResultBatch::new(vec![], false, 0, None),
             true,
             0,
             Some(stub_status("fetch_data")),
@@ -773,7 +773,7 @@ impl Drop for BackendServiceHandle {
 #[cfg(test)]
 mod tests {
     use super::{BackendServiceHandle, BackendState, finish_task_report_times_for_error};
-    use novarocks::thrift::types::TTaskType;
+    use crate::thrift::types::TTaskType;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks::thrift::internal_service::{TQueryOptions, TSpillMode};
+use crate::thrift::internal_service::{TQueryOptions, TSpillMode};
 
 pub(crate) struct NormalizedQueryOptionAliases {
     pub(crate) exec_mem_limit: Option<i64>,

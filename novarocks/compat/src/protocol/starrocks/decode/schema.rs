@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::thrift::types;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkFieldSchema, ChunkSlotSchema};
-use novarocks::thrift::types;
 
 pub(crate) fn chunk_field_schema_from_type_desc(
     name: impl Into<String>,

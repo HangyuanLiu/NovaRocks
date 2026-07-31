@@ -34,6 +34,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 use novarocks::connector::iceberg::build_compat_delta_read_splits;
 use novarocks::connector::iceberg::delta::{
     BaseDataFileLineage, DeletedFileVisibility, DeltaDataColumn, DeltaScanDeleteSide,
@@ -46,8 +48,6 @@ use novarocks::exec::node::scan::BoundScanRanges;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::runtime::query_context::{QueryId, query_context_manager};
 use novarocks::runtime::query_options::{QueryOptions, query_expire_durations};
-use novarocks::thrift::descriptors;
-use novarocks::thrift::plan_nodes;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionBinding,
     ConnectorOpenReaderRequest, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,

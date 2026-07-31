@@ -24,8 +24,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use novarocks::runtime::backend_id as backend_id_store;
-use novarocks::thrift::{
+use crate::thrift::{
     heartbeat_service::{
         HeartbeatServiceSyncHandler, HeartbeatServiceSyncProcessor, TBackendInfo, THeartbeatResult,
         TMasterInfo,
@@ -33,6 +32,7 @@ use novarocks::thrift::{
     status::TStatus,
     status_code::TStatusCode,
 };
+use novarocks::runtime::backend_id as backend_id_store;
 use threadpool::ThreadPool;
 use thrift::protocol::{
     TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory, TInputProtocolFactory,
@@ -382,7 +382,7 @@ fn join_heartbeat_server_thread(handle: JoinHandle<()>) -> Result<(), String> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks::thrift::{master_service, types};
+    use crate::thrift::{master_service, types};
 
     use super::*;
     use crate::disk_report::DiskReportSender;

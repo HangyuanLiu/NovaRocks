@@ -19,7 +19,7 @@ use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function}
 use novarocks_types::largeint;
 
 use crate::protocol::starrocks::decode::{DraftDependencyValue, StarRocksExternalDependencyDraft};
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 fn is_numeric_like_type(data_type: &DataType) -> bool {
     matches!(

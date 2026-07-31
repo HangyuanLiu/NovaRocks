@@ -475,7 +475,7 @@ pub(crate) fn list_iceberg_writer_reports(
     iceberg_commit_infos_to_writer_reports(list_iceberg_commits(finst_id), metadata)
 }
 
-#[cfg(all(test, feature = "compat"))]
+#[cfg(test)]
 mod tests {
     use super::{
         TabletCommitInfo, TabletFailInfo, add_tablet_commit_info, add_tablet_fail_info,

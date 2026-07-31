@@ -16,10 +16,10 @@
 // under the License.
 use crate::protocol::starrocks::decode::layout::Layout;
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::plan_nodes;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::plan_nodes;
 
 pub(crate) fn lower_assert_num_rows_node(
     mut children: Vec<Lowered>,

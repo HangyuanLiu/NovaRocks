@@ -21,6 +21,15 @@
 //! protobuf.  The core storage kernel receives command/result facts from
 //! `lake::service_domain`; generated messages never cross that boundary.
 
+use crate::proto::starrocks::{
+    AbortCompactionRequest, AbortCompactionResponse, AbortTxnRequest, AbortTxnResponse,
+    CompactRequest, CompactResponse, CompactStat, DeleteDataRequest, DeleteDataResponse,
+    DeleteTabletRequest, DeleteTabletResponse, DropTableRequest, DropTableResponse,
+    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishLogVersionResponse,
+    PublishVersionRequest, PublishVersionResponse, ReshardingTabletInfoPb, StatusPb, TabletInfoPb,
+    TabletStatRequest, TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest,
+    VacuumResponse, tablet_stat_response,
+};
 use novarocks::common::types::UniqueId;
 use novarocks::connector::starrocks::lake::service_domain::{
     AbortCompactionCommand, AbortTransactionCommand, CompactParallelConfig, CompactTabletsCommand,
@@ -38,15 +47,6 @@ use novarocks::connector::starrocks::lake::{
     execute_vacuum,
 };
 use novarocks::connector::starrocks::ports::LakeStorageDependencies;
-use novarocks::service::grpc_client::proto::starrocks::{
-    AbortCompactionRequest, AbortCompactionResponse, AbortTxnRequest, AbortTxnResponse,
-    CompactRequest, CompactResponse, CompactStat, DeleteDataRequest, DeleteDataResponse,
-    DeleteTabletRequest, DeleteTabletResponse, DropTableRequest, DropTableResponse,
-    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishLogVersionResponse,
-    PublishVersionRequest, PublishVersionResponse, ReshardingTabletInfoPb, StatusPb, TabletInfoPb,
-    TabletStatRequest, TabletStatResponse, TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest,
-    VacuumResponse, tablet_stat_response,
-};
 use prost::Message;
 
 use crate::storage_wire::{decode_delete_predicate, decode_schema_key, encode_transaction_log};
@@ -493,14 +493,14 @@ where
 mod tests {
     use prost::Message;
 
+    use crate::proto::starrocks::{
+        PUniqueId, PublishVersionRequest, ReshardingTabletInfoPb, SplittingTabletInfoPb,
+        TabletParallelConfig, TxnInfoPb,
+    };
     use novarocks::connector::starrocks::lake::service_domain::{
         CompactTabletsResult, LakeTransactionType,
     };
     use novarocks::connector::starrocks::lake::storage_domain::StorageTransactionLog;
-    use novarocks::service::grpc_client::proto::starrocks::{
-        PUniqueId, PublishVersionRequest, ReshardingTabletInfoPb, SplittingTabletInfoPb,
-        TabletParallelConfig, TxnInfoPb,
-    };
 
     use super::{
         CompactRequest, LakeWireResult, compact_command, compact_response, decode_lake_request,

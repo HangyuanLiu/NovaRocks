@@ -19,6 +19,11 @@
 
 use std::sync::Arc;
 
+use crate::thrift::agent_service::{
+    TAlterJobType, TAlterTabletReqV2, TCompactionStrategy, TCreateTabletReq, TPersistentIndexType,
+    TTabletType, TUpdateTabletMetaInfoReq,
+};
+use crate::thrift::exprs::TExpr;
 use novarocks::connector::starrocks::lake::schema_change::{
     CompiledRollupExpression, LakeAlterTabletMode, LakeAlterTabletTask, LakeTabletMetadataUpdate,
     LakeUpdateTabletMetaTask, RollupExpressionProgram, RollupInputSlot,
@@ -29,11 +34,6 @@ use novarocks::connector::starrocks::lake::storage_domain::{
 };
 use novarocks::exec::expr::ExprArena;
 use novarocks::runtime::starlet_shard_registry::StarletShardInfo;
-use novarocks::thrift::agent_service::{
-    TAlterJobType, TAlterTabletReqV2, TCompactionStrategy, TCreateTabletReq, TPersistentIndexType,
-    TTabletType, TUpdateTabletMetaInfoReq,
-};
-use novarocks::thrift::exprs::TExpr;
 
 use crate::schema_wire::{
     COMPACTION_STRATEGY_DEFAULT, COMPACTION_STRATEGY_REAL_TIME, PERSISTENT_INDEX_CLOUD_NATIVE,

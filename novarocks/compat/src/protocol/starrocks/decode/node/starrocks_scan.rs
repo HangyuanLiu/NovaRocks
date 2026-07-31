@@ -18,9 +18,9 @@ use std::collections::HashMap;
 
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::node::decode::QueryGlobalDictMap;
+use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::novarocks_connectors::ConnectorRegistry;
 use novarocks::runtime::query_options::QueryOptions;
-use novarocks::thrift::{descriptors, plan_nodes, types};
 
 /// Lower an OLAP_SCAN_NODE StarRocks tablet scan node to a `Lowered` ExecNode.
 pub(crate) fn lower_starrocks_scan_node(

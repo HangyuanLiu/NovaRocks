@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
+use crate::thrift::{data_cache, frontend_service, runtime_profile, status, types};
 use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::debug;
 use novarocks::proto::novarocks as native_proto;
 use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::sink_commit;
-use novarocks::thrift::{data_cache, frontend_service, runtime_profile, status, types};
 
 pub(crate) struct ExecStatusReportInput {
     pub(crate) finst_id: UniqueId,
@@ -78,7 +78,7 @@ pub(crate) fn build_report_params(
         (loaded_bytes > 0).then_some(loaded_bytes),
         None::<i64>,
         None::<i64>,
-        None::<novarocks::thrift::internal_service::TLoadJobType>,
+        None::<crate::thrift::internal_service::TLoadJobType>,
         (!tablet_fail_infos.is_empty()).then_some(tablet_fail_infos),
         (filtered_rows > 0).then_some(filtered_rows),
         None::<i64>,

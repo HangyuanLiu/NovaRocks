@@ -56,7 +56,7 @@ pub(crate) use submission::{
 };
 
 pub(crate) fn decode_expression_for_layout(
-    expr: &novarocks::thrift::exprs::TExpr,
+    expr: &crate::thrift::exprs::TExpr,
     arena: &mut novarocks::exec::expr::ExprArena,
     layout: &layout::Layout,
 ) -> Result<novarocks::exec::expr::ExprId, String> {

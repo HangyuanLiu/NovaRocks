@@ -20,7 +20,7 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 
-use novarocks::thrift::{descriptors, plan_nodes};
+use crate::thrift::{descriptors, plan_nodes};
 
 /// Lower a CROSS_JOIN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_cross_join_node(

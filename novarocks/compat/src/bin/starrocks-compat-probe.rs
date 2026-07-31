@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use anyhow::{Context, Result, bail};
-use novarocks::proto::starrocks::{
+include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
+
+extern crate novarocks_compat as _;
+
+use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PLookUpRequest, PLookUpResponse,
     PTransmitChunkParams, PTransmitChunkResult, PUniqueId, StatusPb,
 };
+use anyhow::{Context, Result, bail};
 use prost::Message;
 use std::ffi::{CString, c_char};
 use std::io::{Read, Write};

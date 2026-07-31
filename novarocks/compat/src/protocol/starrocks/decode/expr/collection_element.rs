@@ -17,7 +17,7 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue, function::FunctionKind};
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Lower ARRAY_ELEMENT_EXPR to internal array `element_at` function.
 pub(crate) fn lower_array_element_expr(

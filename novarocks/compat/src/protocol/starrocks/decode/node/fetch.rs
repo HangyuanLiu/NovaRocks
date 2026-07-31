@@ -18,11 +18,11 @@ use crate::protocol::starrocks::decode::descriptor::decode_lookup_nodes_info;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::node::lookup::lower_row_pos_descs;
+use crate::thrift::descriptors;
+use crate::thrift::plan_nodes;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::node::fetch::FetchNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::descriptors;
-use novarocks::thrift::plan_nodes;
 use std::collections::HashSet;
 
 pub(crate) fn lower_fetch_node(

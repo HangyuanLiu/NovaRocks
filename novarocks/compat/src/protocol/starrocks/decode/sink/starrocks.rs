@@ -33,6 +33,7 @@ use crate::protocol::starrocks::decode::{
 };
 use crate::protocol::starrocks::type_mapping::thrift_desc_to_arrow_type;
 use crate::schema_wire::build_sink_tablet_schema;
+use crate::thrift::{data_sinks, descriptors, exprs, types};
 use novarocks::common::ids::SlotId;
 use novarocks::common::types::UniqueId;
 use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
@@ -48,7 +49,6 @@ use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::{ExecNodeKind, ExecPlan};
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::fragment::instance::StarRocksTableSinkAssignment;
-use novarocks::thrift::{data_sinks, descriptors, exprs, types};
 
 const LOAD_OP_COLUMN: &str = "__op";
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;
@@ -1564,13 +1564,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft;
+    use crate::thrift::{data_sinks, descriptors, types};
     use novarocks::connector::starrocks::schema::StarRocksKeysType;
     use novarocks::connector::starrocks::sink::plan::{
         StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
     };
     use novarocks::protocol::FieldPath;
     use novarocks::runtime::endpoint::RuntimeEndpoint;
-    use novarocks::thrift::{data_sinks, descriptors, types};
 
     use super::lower_starrocks_table_sink;
 
@@ -1661,7 +1661,7 @@ mod tests {
                 Vec::<String>::new(),
                 vec![partition],
                 Vec::<String>::new(),
-                Vec::<novarocks::thrift::exprs::TExpr>::new(),
+                Vec::<crate::thrift::exprs::TExpr>::new(),
                 false,
                 None,
             ),

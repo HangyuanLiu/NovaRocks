@@ -17,8 +17,8 @@
 use arrow::datatypes::DataType;
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, function::FunctionKind};
 
-use novarocks::thrift::exprs;
-use novarocks::thrift::opcodes;
+use crate::thrift::exprs;
+use crate::thrift::opcodes;
 
 /// Lower ARITHMETIC_EXPR expression to arithmetic ExprNode.
 pub(crate) fn lower_arithmetic(

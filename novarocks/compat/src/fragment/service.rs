@@ -32,6 +32,7 @@ use crate::protocol::starrocks::decode::{
     StarRocksSubmissionMetadata, decode_incremental_scan_ranges, decode_runtime_endpoint,
     finish_fragment_submission, prepare_fragment_submission, snapshot_decode_facts,
 };
+use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 use novarocks::cache::CacheOptions;
 use novarocks::common::types::UniqueId;
 use novarocks::protocol::FieldPath;
@@ -52,7 +53,6 @@ use novarocks::runtime::starrocks_fragment_query::{
     StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
     StarRocksFragmentQueryRuntime,
 };
-use novarocks::thrift::{data_sinks, descriptors, internal_service, planner, types};
 
 use crate::fragment::admission::{
     DescriptorPreparation, DescriptorTransportCache, PrelaunchCancellationToken, PrelaunchGuard,
@@ -2224,12 +2224,12 @@ mod tests {
     use crate::protocol::starrocks::thrift_codec::{
         thrift_binary_deserialize, thrift_binary_serialize,
     };
+    use crate::thrift::{
+        data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
+    };
     use novarocks::common::types::UniqueId;
     use novarocks::runtime::fragment::io::SyncFragmentExecutor;
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::thrift::{
-        data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
-    };
 
     use super::{
         AdapterFailurePlan, AdapterFailureStage, AdapterPausePlan, CompatFragmentService,

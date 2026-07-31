@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 
+use crate::thrift::frontend_service::{self, TFrontendServiceSyncClient};
+use crate::thrift::status_code;
+use crate::thrift::{exprs, types};
 use novarocks::common::config;
 use novarocks::connector::starrocks::ports::{
     AutoIncrementRange, AutomaticPartitionEntry, AutomaticPartitionIndex, AutomaticPartitionKey,
     AutomaticPartitionNode, AutomaticPartitionRequest, AutomaticPartitionResult,
     AutomaticPartitionTablet, SinkFrontendAddress, SinkFrontendProvider,
 };
-use novarocks::thrift::frontend_service::{self, TFrontendServiceSyncClient};
-use novarocks::thrift::status_code;
-use novarocks::thrift::{exprs, types};
 
 const CREATE_PARTITION_TRANSPORT_RETRIES: usize = 4;
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719_163;

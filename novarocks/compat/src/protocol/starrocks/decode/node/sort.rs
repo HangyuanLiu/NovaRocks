@@ -27,11 +27,11 @@ use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::descriptors;
 use novarocks::common::ids::SlotId;
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::descriptors;
 
-use novarocks::thrift::{exprs, plan_nodes, types};
+use crate::thrift::{exprs, plan_nodes, types};
 
 /// Lower a SORT_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_sort_node(

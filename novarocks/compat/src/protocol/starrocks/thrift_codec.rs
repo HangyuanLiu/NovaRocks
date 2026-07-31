@@ -92,18 +92,18 @@ mod tests {
 
     #[test]
     fn binary_and_compact_serialization_round_trip_generated_thrift_values() {
-        let value = novarocks::thrift::types::TUniqueId::new(17, 29);
+        let value = crate::thrift::types::TUniqueId::new(17, 29);
 
         let binary = thrift_binary_serialize(&value).expect("binary encode");
         assert_eq!(
-            thrift_binary_deserialize::<novarocks::thrift::types::TUniqueId>(&binary)
+            thrift_binary_deserialize::<crate::thrift::types::TUniqueId>(&binary)
                 .expect("binary decode"),
             value
         );
 
         let compact = thrift_compact_serialize(&value).expect("compact encode");
         assert_eq!(
-            thrift_compact_deserialize::<novarocks::thrift::types::TUniqueId>(&compact)
+            thrift_compact_deserialize::<crate::thrift::types::TUniqueId>(&compact)
                 .expect("compact decode"),
             value
         );

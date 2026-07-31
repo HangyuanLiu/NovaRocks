@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::protocol::starrocks::compat::options::normalize_query_option_aliases;
+use crate::thrift::internal_service::{TQueryOptions, TSpillMode};
 use novarocks::exec::spill::{SpillConfig, SpillMode};
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::query_options::{QueryCacheOptions, QueryOptions, QueryOptionsParts};
-use novarocks::thrift::internal_service::{TQueryOptions, TSpillMode};
 
 use super::StarRocksFragmentDecodeError;
 

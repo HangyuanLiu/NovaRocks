@@ -18,10 +18,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::protocol::starrocks::decode::layout::Layout;
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::{plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::node::repeat::RepeatNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::thrift::{plan_nodes, types};
 
 pub(crate) fn lower_repeat_node(
     child: Lowered,

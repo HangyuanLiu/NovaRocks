@@ -17,13 +17,13 @@
 use crate::protocol::starrocks::decode::type_lowering::{
     arrow_type_from_desc, primitive_type_from_node,
 };
+use crate::thrift::types;
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use novarocks::exec::expr::LiteralValue;
-use novarocks::thrift::types;
 
-use novarocks::thrift::exprs;
+use crate::thrift::exprs;
 
 /// Parse date literal string to days since epoch.
 pub(crate) fn parse_date_literal(value: &str) -> Result<i32, String> {

@@ -27,9 +27,9 @@ use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::lower_t_expr_at;
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::{descriptors, plan_nodes};
 use novarocks::common::config::exchange_wait_ms;
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{descriptors, plan_nodes};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
 ///

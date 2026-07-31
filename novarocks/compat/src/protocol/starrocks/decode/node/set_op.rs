@@ -20,15 +20,15 @@ use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, layout_from_slot_ids,
 };
 use crate::protocol::starrocks::decode::node::Lowered;
+use crate::thrift::descriptors;
+use crate::thrift::exprs;
+use crate::thrift::{plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::descriptors;
-use novarocks::thrift::exprs;
-use novarocks::thrift::{plan_nodes, types};
 
 pub(crate) fn lower_intersect_node(
     children: Vec<Lowered>,

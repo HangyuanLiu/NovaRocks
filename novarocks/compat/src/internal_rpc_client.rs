@@ -18,11 +18,15 @@
 use std::ffi::CString;
 
 use novarocks::common::types::UniqueId;
-use novarocks::proto;
 use novarocks::runtime::query_context::QueryId;
 use prost::Message;
 
 use crate::ffi_support::NovaRocksRustBuf;
+
+mod proto {
+    pub(crate) use crate::proto::starrocks;
+    pub(crate) use ::novarocks::proto::*;
+}
 
 unsafe extern "C" {
     fn novarocks_compat_transmit_chunk(
@@ -279,11 +283,11 @@ pub(crate) fn lookup_close(
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup_close_log_line, lookup_close_status_error, status_error};
-    use novarocks::proto;
+    use crate::proto::starrocks;
 
-    fn status(status_code: i32, error_msgs: &[&str]) -> proto::starrocks::StatusPb {
-        proto::starrocks::StatusPb {
+    use super::{lookup_close_log_line, lookup_close_status_error, status_error};
+    fn status(status_code: i32, error_msgs: &[&str]) -> starrocks::StatusPb {
+        starrocks::StatusPb {
             status_code,
             error_msgs: error_msgs
                 .iter()

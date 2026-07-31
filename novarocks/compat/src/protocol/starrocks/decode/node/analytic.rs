@@ -23,6 +23,7 @@ use crate::protocol::starrocks::decode::expr::{lower_expr_node_at, lower_t_expr_
 use crate::protocol::starrocks::decode::layout::{Layout, chunk_schema_for_layout};
 use crate::protocol::starrocks::decode::node::Lowered;
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::{exprs, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use novarocks::exec::node::analytic::{
@@ -31,14 +32,13 @@ use novarocks::exec::node::analytic::{
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::protocol::FieldPath;
-use novarocks::thrift::{exprs, plan_nodes, types};
 
 pub(crate) fn lower_analytic_node(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
     out_layout: &Layout,
-    desc_tbl: &novarocks::thrift::descriptors::TDescriptorTable,
+    desc_tbl: &crate::thrift::descriptors::TDescriptorTable,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft>,

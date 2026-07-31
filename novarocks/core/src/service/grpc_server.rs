@@ -14,9 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#[cfg(test)]
-#[cfg(feature = "compat")]
-use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -72,16 +69,6 @@ struct RejectingTestNativeFragmentIngress;
 
 #[cfg(test)]
 struct RejectingTestQueryLifecycleIngress;
-
-#[cfg(all(test, feature = "compat"))]
-struct RejectingTestSyncFragmentExecutor;
-
-#[cfg(all(test, feature = "compat"))]
-impl SyncFragmentExecutor for RejectingTestSyncFragmentExecutor {
-    fn execute_encoded(&self, _payload: &[u8]) -> Result<crate::common::types::UniqueId, String> {
-        Err("test StarRocks fragment sync ingress is not configured".to_string())
-    }
-}
 
 #[cfg(test)]
 pub(crate) fn rejecting_test_native_fragment_ingress() -> Arc<dyn NativeFragmentIngress> {

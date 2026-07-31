@@ -57,7 +57,7 @@ target_dir="$output_dir/target"
 build_command=(
   cargo build --profile "$profile"
   -p novarocks-server -p novarocks-compat
-  --features compat
+  --features novarocks-server/compat
   --bin novarocks --bin starrocks-compat-probe
 )
 

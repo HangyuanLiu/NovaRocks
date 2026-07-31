@@ -19,7 +19,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[cfg(feature = "compat")]
 use super::node::LakeMetaValuesPatch;
 use novarocks::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use novarocks::exec::expr::ExprId;
@@ -147,7 +146,6 @@ pub(crate) struct StarRocksExternalDependencyDraft {
     requirements: RefCell<BTreeMap<u64, StarRocksExternalDependency>>,
     query_profile_owner: RefCell<FragmentExprArenaOwner>,
     query_profile_patches: RefCell<Vec<QueryProfilePatch>>,
-    #[cfg(feature = "compat")]
     lake_meta_values_patches: RefCell<Vec<LakeMetaValuesPatch>>,
 }
 
@@ -168,7 +166,6 @@ impl StarRocksExternalDependencyDraft {
             requirements: RefCell::new(BTreeMap::new()),
             query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
             query_profile_patches: RefCell::new(Vec::new()),
-            #[cfg(feature = "compat")]
             lake_meta_values_patches: RefCell::new(Vec::new()),
         }
     }
@@ -196,7 +193,6 @@ impl StarRocksExternalDependencyDraft {
             requirements: RefCell::new(BTreeMap::new()),
             query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
             query_profile_patches: RefCell::new(Vec::new()),
-            #[cfg(feature = "compat")]
             lake_meta_values_patches: RefCell::new(Vec::new()),
         }
     }
@@ -218,7 +214,6 @@ impl StarRocksExternalDependencyDraft {
             requirements: RefCell::new(BTreeMap::new()),
             query_profile_owner: RefCell::new(FragmentExprArenaOwner::Plan),
             query_profile_patches: RefCell::new(Vec::new()),
-            #[cfg(feature = "compat")]
             lake_meta_values_patches: RefCell::new(Vec::new()),
         }
     }
@@ -374,7 +369,6 @@ impl StarRocksExternalDependencyDraft {
         })
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn lake_meta_storage_value(
         &self,
         request: &LakeMetaStorageRequest,
@@ -389,12 +383,10 @@ impl StarRocksExternalDependencyDraft {
         Ok(DraftDependencyValue::Pending(request.id()))
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn record_lake_meta_values_patch(&self, patch: LakeMetaValuesPatch) {
         self.lake_meta_values_patches.borrow_mut().push(patch);
     }
 
-    #[cfg(feature = "compat")]
     pub(crate) fn lake_meta_values_patches(&self) -> Vec<LakeMetaValuesPatch> {
         self.lake_meta_values_patches.borrow().clone()
     }

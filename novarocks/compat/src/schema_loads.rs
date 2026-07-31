@@ -16,8 +16,8 @@
 // under the License.
 use chrono::NaiveDateTime;
 
-use novarocks::thrift::frontend_service;
-use novarocks::thrift::types;
+use crate::thrift::frontend_service;
+use crate::thrift::types;
 
 use crate::schema_frontend::with_frontend_client;
 use novarocks::connector::schema::SchemaScanContext;

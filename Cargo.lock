@@ -3192,7 +3192,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
- "cc",
  "chrono",
  "chrono-tz",
  "crc32c",
@@ -3248,7 +3247,6 @@ dependencies = [
  "tdigest",
  "tempfile",
  "threadpool",
- "thrift",
  "tokio",
  "tokio-stream",
  "toml",
@@ -3260,7 +3258,6 @@ dependencies = [
  "typetag",
  "url",
  "uuid",
- "which",
 ]
 
 [[package]]
@@ -3294,6 +3291,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "cc",
  "chrono",
  "csv",
  "hex",
@@ -3305,6 +3303,7 @@ dependencies = [
  "novarocks-types",
  "parquet",
  "prost 0.13.5",
+ "protoc-bin-vendored",
  "rand 0.8.5",
  "reqwest",
  "serde_json",
@@ -3312,7 +3311,9 @@ dependencies = [
  "thrift",
  "tokio",
  "tonic",
+ "tonic-build",
  "tracing",
+ "which",
 ]
 
 [[package]]

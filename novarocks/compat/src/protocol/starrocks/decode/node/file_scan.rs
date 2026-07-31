@@ -31,6 +31,7 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::{Lowered, ScanRangeCarrier};
 use crate::protocol::starrocks::decode::type_lowering::arrow_type_from_desc;
+use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::connector::file_execution::FileScanRange;
 use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -42,7 +43,6 @@ use novarocks::exec::node::scan::{
 use novarocks::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::scan_range::{BrokerFileFormat, ScanRange};
-use novarocks::thrift::{descriptors, plan_nodes, types};
 
 #[derive(Clone, Debug)]
 struct CsvReadOptions {
@@ -77,7 +77,7 @@ pub(crate) struct BrokerFileProgramFacts {
 
 pub(crate) fn decode_broker_file_program_facts(
     nodes: &[plan_nodes::TPlanNode],
-    raw_ranges: &BTreeMap<i32, Vec<novarocks::thrift::internal_service::TScanRangeParams>>,
+    raw_ranges: &BTreeMap<i32, Vec<crate::thrift::internal_service::TScanRangeParams>>,
     arena: &mut ExprArena,
     _nodes_path: FieldPath,
     raw_ranges_path: FieldPath,
@@ -1056,11 +1056,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::FileLoadScanSource;
+    use crate::thrift::plan_nodes;
     use novarocks::connector::file_execution::FileScanRange;
     use novarocks::exec::chunk::ChunkSchema;
     use novarocks::exec::expr::ExprArena;
     use novarocks::exec::node::scan::{BoundScanRanges, ScanMorsel, ScanOp, ScanSource};
-    use novarocks::thrift::plan_nodes;
 
     fn source_for_test() -> FileLoadScanSource {
         FileLoadScanSource {

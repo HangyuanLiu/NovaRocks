@@ -24,6 +24,7 @@ use crate::protocol::starrocks::decode::layout::{
 };
 use crate::protocol::starrocks::decode::node::decode::build_scan_query_global_dicts;
 use crate::protocol::starrocks::decode::node::{Lowered, QueryGlobalDictMap, ScanRangeCarrier};
+use crate::thrift::{descriptors, plan_nodes, types};
 use novarocks::common::ids::SlotId;
 use novarocks::connector::starrocks::INTERNAL_CATALOG_NAME;
 use novarocks::connector::starrocks::fe_v2_meta::{
@@ -47,7 +48,6 @@ use novarocks::novarocks_logging::debug;
 use novarocks::runtime::query_context::QueryId;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRange;
-use novarocks::thrift::{descriptors, plan_nodes, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///

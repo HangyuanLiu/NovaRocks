@@ -20,8 +20,8 @@ use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::protocol::starrocks::decode::type_lowering::{
     arrow_type_from_desc, arrow_type_from_primitive,
 };
-use novarocks::thrift::exprs;
-use novarocks::thrift::types;
+use crate::thrift::exprs;
+use crate::thrift::types;
 
 fn is_temporal_type(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Date32 | DataType::Timestamp(_, _))

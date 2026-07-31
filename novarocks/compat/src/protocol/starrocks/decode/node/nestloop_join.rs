@@ -28,7 +28,7 @@ use crate::protocol::starrocks::decode::layout::{
 use crate::protocol::starrocks::decode::node::Lowered;
 use novarocks::protocol::FieldPath;
 
-use novarocks::thrift::{descriptors, plan_nodes, types};
+use crate::thrift::{descriptors, plan_nodes, types};
 
 /// Lower a NESTLOOP_JOIN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_nestloop_join_node(
