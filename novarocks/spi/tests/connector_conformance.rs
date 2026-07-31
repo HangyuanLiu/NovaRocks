@@ -24,9 +24,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::conformance::assert_batch_reader_contract;
 use novarocks_spi::connector::{
-    normalize_predicate_dispositions, validate_static_predicates, ConnectorBatchBudget,
-    ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
@@ -37,6 +36,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
     ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    normalize_predicate_dispositions, validate_static_predicates,
 };
 
 struct OwnerExecution {

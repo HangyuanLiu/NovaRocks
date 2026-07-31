@@ -69,6 +69,7 @@ fn scan_preparation_propagates_caller_cancellation() {
         &controls,
         &context,
         None,
+        super::super::ScanPreparationOptions::default(),
     ) {
         Ok(_) => panic!("caller cancellation must reach the connector provider"),
         Err(err) => err,
@@ -112,6 +113,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &controls,
         &context,
         None,
+        super::super::ScanPreparationOptions::default(),
         &mut seen_scan_node_ids,
         &mut bindings,
     )
@@ -123,6 +125,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &controls,
         &context,
         None,
+        super::super::ScanPreparationOptions::default(),
         &mut seen_scan_node_ids,
         &mut bindings,
     )

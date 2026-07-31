@@ -67,12 +67,12 @@ pub use mutation::{
     ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use predicate::{
-    normalize_predicate_dispositions, validate_static_predicates, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
-    ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType, ConnectorStaticPredicateId,
-    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
     MAX_CONNECTOR_STATIC_IN_LITERALS, MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES,
     MAX_CONNECTOR_STATIC_PREDICATES, MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES,
+    normalize_predicate_dispositions, validate_static_predicates,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,

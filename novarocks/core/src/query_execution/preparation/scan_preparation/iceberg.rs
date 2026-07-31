@@ -192,9 +192,11 @@ mod tests {
             },
         ];
 
-        assert_eq!(
-            residual_predicates(&predicates, &dispositions).unwrap(),
-            vec![predicate(true)]
-        );
+        let residual = residual_predicates(&predicates, &dispositions).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(matches!(
+            &residual[0].kind,
+            ExprKind::Literal(LiteralValue::Bool(true))
+        ));
     }
 }

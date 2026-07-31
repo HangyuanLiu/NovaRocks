@@ -168,7 +168,10 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
         "fixture provider does not claim predicate execution or file pruning"
     );
     assert_eq!(read.static_predicates.len(), 1);
-    assert_eq!(read.residual_predicates, vec![id_eq(12)]);
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![id_eq(12)])
+    );
     assert!(read.predicate_dispositions.iter().all(|disposition| {
         disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported
     }));
@@ -258,7 +261,10 @@ fn identity_partition_predicate_stays_on_opaque_connector_path() {
         .connector_read(0, 10)
         .expect("opaque connector read");
     assert_eq!(read.splits.len(), 2);
-    assert_eq!(read.residual_predicates, vec![id_eq(12)]);
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![id_eq(12)])
+    );
 }
 
 #[test]
@@ -315,6 +321,9 @@ fn unsupported_predicate_does_not_guess_pruning() {
         .connector_read(0, 10)
         .expect("opaque connector read");
     assert!(read.static_predicates.is_empty());
-    assert_eq!(read.residual_predicates, vec![unsupported_id_predicate()]);
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![unsupported_id_predicate()])
+    );
     assert_eq!(read.splits.len(), 2);
 }
