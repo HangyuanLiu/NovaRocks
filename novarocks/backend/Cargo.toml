@@ -12,6 +12,8 @@ novarocks = { path = "../core" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"
+arrow = "58.2.0"
+novarocks-types = { path = "../types" }
 prost = "0.13"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }

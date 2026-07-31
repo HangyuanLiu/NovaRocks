@@ -37,6 +37,7 @@ use novarocks::runtime::query_context::QueryId;
 use novarocks_protocol::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 
+use super::exchange::BackendNativeExchangeContractDecoder;
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
 use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
@@ -119,6 +120,7 @@ impl NativeFragmentRequest {
             instance,
             &instance_params,
             &BackendNativeFragmentSinkAssignmentDecoder,
+            &BackendNativeExchangeContractDecoder,
             &BackendNativeRuntimeFilterContractDecoder,
             connectors,
             execution_resolver,

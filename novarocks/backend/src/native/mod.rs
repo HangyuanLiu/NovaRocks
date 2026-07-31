@@ -24,13 +24,16 @@
 pub(crate) mod codec;
 pub(crate) mod connector_binding;
 pub(crate) mod decode;
+pub(crate) mod exchange;
 pub(crate) mod ingress;
 pub(crate) mod instance;
+pub(crate) mod layout;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod report;
 pub(crate) mod runtime_filter;
 pub(crate) mod service;
 pub(crate) mod sink_assignment;
+pub(crate) mod type_decode;
 
 pub(crate) mod transport {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

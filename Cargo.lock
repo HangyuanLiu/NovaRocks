@@ -3264,10 +3264,12 @@ dependencies = [
 name = "novarocks-backend"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "bytes",
  "novarocks",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-types",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "tokio",
