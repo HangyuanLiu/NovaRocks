@@ -223,10 +223,6 @@ impl ScheduleBoundDistributedQuery {
             NativeSubmissionContext {
                 query_id,
                 options: options.runtime_options().clone(),
-                report_endpoint: RuntimeEndpoint::from_socket_addr(
-                    "127.0.0.1:1".parse().expect("static test endpoint"),
-                ),
-                needs_fragment_status_report: true,
             },
         )?;
         Ok(InProcessTestArtifact {

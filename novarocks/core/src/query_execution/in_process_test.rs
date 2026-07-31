@@ -43,9 +43,9 @@ use crate::query_execution::contract::{
     DistributedQueryRequest, QueryId,
 };
 use crate::query_execution::fragment_transport::FetchedQueryBatch;
-use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
+use crate::query_execution::lifecycle::{AttemptId, FragmentTerminalSnapshot, QueryExecutionId};
 use crate::query_execution::outcome::FragmentProfileSet;
-use crate::query_execution::write::{NativeExecutionReport, WriteReportBuilder};
+use crate::query_execution::write::WriteTerminalBuilder;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
 use crate::runtime::fragment::prepare_fragment;
@@ -323,17 +323,16 @@ pub(crate) fn execute(
             .completion
             .profile(result, FragmentProfileSet::new(profiles)),
         DistributedQueryIntent::Write => {
-            let query_id = query_id.into_unique_id();
-            let mut builder = WriteReportBuilder::new(artifact.writer_registrations)?;
-            for (fragment_instance_id, backend_num) in writer_ids {
+            let mut builder = WriteTerminalBuilder::new(artifact.writer_registrations)?;
+            for fact in terminal_facts {
+                let fragment_instance_id = fact.fragment_instance_id();
+                let Some(&backend_num) = writer_ids.get(&fragment_instance_id) else {
+                    continue;
+                };
                 let snapshot = crate::runtime::sink_commit::report_snapshot(fragment_instance_id);
-                builder.apply(NativeExecutionReport::from_in_process_runtime(
-                    query_id,
-                    fragment_instance_id,
-                    backend_num,
-                    snapshot,
-                    None,
-                ))?;
+                let terminal = FragmentTerminalSnapshot::from_fact(fact, backend_num, snapshot)
+                    .map_err(|error| failed(error.to_string()))?;
+                builder.apply_terminal(&terminal)?;
                 crate::runtime::sink_commit::unregister(fragment_instance_id);
             }
             let report = builder.finish()?;
