@@ -211,11 +211,11 @@ impl QueryExecutionResourceSnapshot {
             }
             if self.fe_running
                 && !permits_terminal_retention
-                && (current.terminal_retained != before.terminal_retained
-                    || current.terminal_retained_bytes != before.terminal_retained_bytes)
+                && (current.terminal_retained > before.terminal_retained
+                    || current.terminal_retained_bytes > before.terminal_retained_bytes)
             {
                 deltas.push(format!(
-                    "BE[{}] terminal retention: before=({}, {}) current=({}, {})",
+                    "BE[{}] terminal retention grew above baseline: before=({}, {}) current=({}, {})",
                     current.index,
                     before.terminal_retained,
                     before.terminal_retained_bytes,
@@ -3876,5 +3876,35 @@ exec_node_output = true
 
         assert!(retained.convergence_failure(&baseline, true).is_none());
         assert!(retained.convergence_failure(&baseline, false).is_some());
+    }
+
+    #[test]
+    fn resource_convergence_allows_existing_terminal_retention_to_expire() {
+        let baseline = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
+                terminal_retained: 2.0,
+                terminal_retained_bytes: 512.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+        let expired = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
+                terminal_retained: 1.0,
+                terminal_retained_bytes: 256.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+
+        assert!(expired.convergence_failure(&baseline, false).is_none());
     }
 }
