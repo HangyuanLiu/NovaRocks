@@ -18,10 +18,10 @@
 use super::super::NativeFragmentDecodeError;
 use super::super::expr::decode_expr_at;
 use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
 use super::common::{
     build_slot_projection, parse_distributed_limit, parse_optional_nonnegative_i64,
 };
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -36,6 +36,7 @@ pub(super) fn lower_sort_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let (output_columns, output_columns_path) = if sort.output_columns.is_empty() {
@@ -43,12 +44,13 @@ pub(super) fn lower_sort_node(
     } else {
         (&sort.output_columns, path.clone().field("output_columns"))
     };
-    let order_by = lower_sort_items(
+    let order_by = lower_sort_items_with_context(
         "SortNode",
         &sort.items,
         path.clone().field("items"),
         arena,
         &child.layout,
+        ctx,
     )?;
     let limit = NativeFragmentDecodeError::map_invalid(
         path.clone().field("limit"),
@@ -68,7 +70,7 @@ pub(super) fn lower_sort_node(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            let expr = decode_expr_at(
+            let expr = ctx.decode_expression(
                 expr,
                 path.clone().field("analytic_partition_by").index(idx),
                 arena,
@@ -149,6 +151,28 @@ pub(super) fn lower_sort_items(
     arena: &mut ExprArena,
     input_layout: &Layout,
 ) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
+    lower_sort_items_with_decoder(node_kind, items, path, arena, input_layout, None)
+}
+
+pub(super) fn lower_sort_items_with_context(
+    node_kind: &str,
+    items: &[expr::SortItem],
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    ctx: &NativePlanDecodeContext,
+) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
+    lower_sort_items_with_decoder(node_kind, items, path, arena, input_layout, Some(ctx))
+}
+
+fn lower_sort_items_with_decoder(
+    node_kind: &str,
+    items: &[expr::SortItem],
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input_layout: &Layout,
+    ctx: Option<&NativePlanDecodeContext>,
+) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
     items
         .iter()
         .enumerate()
@@ -160,7 +184,12 @@ pub(super) fn lower_sort_items(
                     format!("{node_kind} sort item {idx} expr missing"),
                 )
             })?;
-            let expr = decode_expr_at(expr, item_path.field("expr"), arena, input_layout)?;
+            let expr = match ctx {
+                Some(ctx) => {
+                    ctx.decode_expression(expr, item_path.field("expr"), arena, input_layout)
+                }
+                None => decode_expr_at(expr, item_path.field("expr"), arena, input_layout),
+            }?;
             Ok(SortExpression {
                 expr,
                 asc: item.asc,

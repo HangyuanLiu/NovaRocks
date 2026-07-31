@@ -1657,6 +1657,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Project(project) => project::lower_project_node(
             node,
@@ -1689,6 +1690,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
             topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
@@ -1756,6 +1758,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Repeat(repeat) => {
             repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
