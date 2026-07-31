@@ -23,7 +23,7 @@
 //! point; no process-global listener state is used here.
 
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
@@ -50,6 +50,17 @@ use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServe
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CANCEL_FRAGMENT_OK: i32 = 0;
 const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
+static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn cancel_finst_marker(
+    query_id: novarocks::common::types::UniqueId,
+    finst_id: novarocks::common::types::UniqueId,
+) -> String {
+    format!(
+        "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
+        query_id.hi, query_id.lo, finst_id.hi, finst_id.lo
+    )
+}
 
 /// Backend-owned production Tonic service.  Core contributes only the narrow
 /// data-plane kernel and protocol-neutral lifecycle/report ports.
@@ -228,9 +239,34 @@ impl NovaRocksGrpc for NativeBackendGrpcService {
                         lo: id.lo,
                     })
                     .collect(),
-                request.reason,
+                request.reason.clone(),
             ))
             .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        if novarocks::common::config::debug_emit_cancel_marker() {
+            let count = CANCEL_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            println!(
+                "NOVAROCKS_CANCEL count={} finsts={} reason={}",
+                count,
+                request.finst_ids.len(),
+                request.reason
+            );
+            for finst_id in &request.finst_ids {
+                println!(
+                    "{}",
+                    cancel_finst_marker(
+                        novarocks::common::types::UniqueId {
+                            hi: query_id.hi,
+                            lo: query_id.lo,
+                        },
+                        novarocks::common::types::UniqueId {
+                            hi: finst_id.hi,
+                            lo: finst_id.lo,
+                        }
+                    )
+                );
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         Ok(tonic::Response::new(proto::CancelFragmentResponse {
             status_code: CANCEL_FRAGMENT_OK,
         }))
