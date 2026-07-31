@@ -79,7 +79,7 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
         let mut fragment_instance_ids = expected_instances.iter().copied().collect::<BTreeSet<_>>();
         fragment_instance_ids.extend(
             self.runtime
-                .cancel_query(execution_id.query_id(), detail.to_string()),
+                .cancel_execution(execution_id, detail.to_string()),
         );
         let fragment_instance_ids = fragment_instance_ids.into_iter().collect::<Vec<_>>();
         self.controls.cancel_many(&fragment_instance_ids, detail);

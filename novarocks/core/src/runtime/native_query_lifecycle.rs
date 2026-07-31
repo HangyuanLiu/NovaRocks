@@ -17,13 +17,14 @@
 
 //! Narrow query-lifecycle runtime facade owned by core.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::common::types::UniqueId;
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
 use crate::runtime::query_context::{
-    QueryContextManager, QueryId as RuntimeQueryId, query_context_manager,
+    QueryContextManager, QueryExecutionKey, QueryId as RuntimeQueryId, query_context_manager,
 };
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 
@@ -49,6 +50,14 @@ impl NativeQueryLifecycleRuntime {
                 "runtime filter contribution epoch does not match query attempt".to_string(),
             );
         }
+        self.manager
+            .ensure_native_context_execution(
+                runtime_execution_key(execution_id),
+                false,
+                contribution.lifecycle().delivery_expire,
+                contribution.lifecycle().query_expire,
+            )
+            .map_err(|error| format!("prepare attempt-scoped runtime filter context: {error}"))?;
         self.manager
             .install_runtime_filter_deployment(
                 runtime_query_id(execution_id.query_id()),
@@ -76,8 +85,25 @@ impl NativeQueryLifecycleRuntime {
         self.manager
             .cancel_query(runtime_query_id(query_id), reason)
     }
+
+    pub fn cancel_execution(
+        &self,
+        execution_id: QueryExecutionId,
+        reason: String,
+    ) -> Vec<UniqueId> {
+        self.manager
+            .cancel_query_execution(runtime_execution_key(execution_id), reason)
+    }
 }
 
 const fn runtime_query_id(query_id: QueryId) -> RuntimeQueryId {
     RuntimeQueryId::new(query_id.high(), query_id.low())
+}
+
+fn runtime_execution_key(execution_id: QueryExecutionId) -> QueryExecutionKey {
+    QueryExecutionKey::native_attempt(
+        runtime_query_id(execution_id.query_id()),
+        NonZeroU64::new(execution_id.attempt_id().get())
+            .expect("QueryExecutionId always has a nonzero attempt"),
+    )
 }

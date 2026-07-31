@@ -283,8 +283,8 @@ impl NativeFragmentService {
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
             .queries
-            .prepare_admission(
-                query_id,
+            .prepare_admission_execution(
+                execution_id,
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
@@ -318,8 +318,8 @@ impl NativeFragmentService {
             .map_err(NativeFragmentIngressError::new)?;
         let registration = self
             .queries
-            .register_fragment(
-                query_id,
+            .register_fragment_execution(
+                execution_id,
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
@@ -440,8 +440,8 @@ impl NativeFragmentService {
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
             .queries
-            .prepare_admission(
-                query_id,
+            .prepare_admission_execution(
+                execution_id,
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
@@ -476,8 +476,8 @@ impl NativeFragmentService {
             .map_err(NativeFragmentIngressError::new)?;
         let registration = self
             .queries
-            .register_fragment(
-                query_id,
+            .register_fragment_execution(
+                execution_id,
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
@@ -714,7 +714,6 @@ fn consume_terminal_fact(
     backend_num: i32,
 ) {
     let fact = running.join();
-    let query_id = fact.query_id();
     let fragment_instance_id = fact.fragment_instance_id();
     if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
         error!(target: "novarocks::exec", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
@@ -725,9 +724,8 @@ fn consume_terminal_fact(
     // periodic observation channel and must not own query completion.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
     native_fragment_report::unregister(fragment_instance_id);
-    let report_decision = queries.finish_fragment_for_report(query_id);
-    queries.unregister_fragment(fragment_instance_id);
-    queries.cleanup_after_fragment_report(query_id, report_decision);
+    queries.unregister_fragment_execution(execution_id, fragment_instance_id);
+    queries.finish_fragment(execution_id);
     // Publish the terminal report before this fact can fail-close the local
     // lifecycle. Otherwise a sibling cancelled by the first terminal fact may
     // win the report slot and hide the fragment that actually failed.
