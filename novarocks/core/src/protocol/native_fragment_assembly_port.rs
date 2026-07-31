@@ -170,6 +170,25 @@ pub trait NativeFragmentEnvelopeDecoder: Send + Sync {
     ) -> Result<&'a plan::DataSink, ProtocolError>;
 }
 
+/// Backend-owned structural validation for native fragment wire payloads.
+///
+/// This intentionally covers only recursive wire-shape checks that precede
+/// lowering. It receives no runtime state, connector registry, or execution
+/// objects, so the backend remains the DTO owner without widening the core
+/// execution seam.
+pub trait NativeFragmentSubmissionValidator: Send + Sync {
+    fn validate_root_node(
+        &self,
+        root: &plan::DistributedNode,
+        path: FieldPath,
+    ) -> Result<(), ProtocolError>;
+
+    fn validate_fragment_expressions(
+        &self,
+        fragment: &plan::PlanFragment,
+    ) -> Result<(), ProtocolError>;
+}
+
 /// Backend-owned expression decoder capability used by native plan lowering.
 ///
 /// The shared core supplies only the expression arena and immutable input-slot
@@ -231,6 +250,7 @@ pub fn assemble_fragment_submission_for_backend(
     instance: NativeFragmentInstanceInput,
     sink_assignment_params: &novarocks::InstanceParams,
     envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
+    submission_validator: &dyn NativeFragmentSubmissionValidator,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     expression_decoder: Arc<dyn NativeExpressionDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
@@ -244,6 +264,7 @@ pub fn assemble_fragment_submission_for_backend(
         instance,
         sink_assignment_params,
         envelope_decoder,
+        submission_validator,
         sink_assignment_decoder,
         expression_decoder,
         scan_source_contract_decoder,

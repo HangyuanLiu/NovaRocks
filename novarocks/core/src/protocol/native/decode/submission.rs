@@ -32,7 +32,8 @@ use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
-    NativeRuntimeFilterContractDecoder, NativeScanSourceContractDecoder,
+    NativeFragmentSubmissionValidator, NativeRuntimeFilterContractDecoder,
+    NativeScanSourceContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -102,6 +103,7 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
                 )
             })
         },
+        None,
         |fragment| {
             fragment.sink.as_ref().ok_or_else(|| {
                 NativeFragmentDecodeError::missing(
@@ -123,6 +125,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     instance_parts: NativeFragmentInstanceInput,
     instance_params: &novarocks::InstanceParams,
     envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
+    submission_validator: &dyn NativeFragmentSubmissionValidator,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
     expression_decoder: Arc<dyn NativeExpressionDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
@@ -141,6 +144,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
                 .require_root(fragment)
                 .map_err(NativeFragmentDecodeError::from)
         },
+        Some(submission_validator),
         |fragment| {
             envelope_decoder
                 .require_sink(fragment)
@@ -178,6 +182,7 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
     require_root: impl FnOnce(
         &plan::PlanFragment,
     ) -> Result<&plan::DistributedNode, NativeFragmentDecodeError>,
+    submission_validator: Option<&dyn NativeFragmentSubmissionValidator>,
     require_sink: impl FnOnce(&plan::PlanFragment) -> Result<&plan::DataSink, NativeFragmentDecodeError>,
     decode_sink_assignment: F,
     expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
@@ -212,7 +217,13 @@ where
 {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment)?;
-    validate_node_required_fields(root, root_path.clone())?;
+    if let Some(submission_validator) = submission_validator {
+        submission_validator
+            .validate_root_node(root, root_path.clone())
+            .map_err(NativeFragmentDecodeError::from)?;
+    } else {
+        validate_node_required_fields(root, root_path.clone())?;
+    }
     let sink_path = FieldPath::root("plan_fragment").field("sink");
     let sink = require_sink(fragment)?;
     if sink.kind.is_none() {
@@ -221,15 +232,21 @@ where
             "native DataSink requires kind",
         ));
     }
-    for (index, expression) in fragment.output_exprs.iter().enumerate() {
-        super::expr::validate_proto_expr_shape_at(
-            expression,
-            FieldPath::root("plan_fragment")
-                .field("output_exprs")
-                .index(index),
-        )?;
+    if let Some(submission_validator) = submission_validator {
+        submission_validator
+            .validate_fragment_expressions(fragment)
+            .map_err(NativeFragmentDecodeError::from)?;
+    } else {
+        for (index, expression) in fragment.output_exprs.iter().enumerate() {
+            super::expr::validate_proto_expr_shape_at(
+                expression,
+                FieldPath::root("plan_fragment")
+                    .field("output_exprs")
+                    .index(index),
+            )?;
+        }
+        validate_runtime_filter_binding_expressions(fragment)?;
     }
-    validate_runtime_filter_binding_expressions(fragment)?;
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())?;
     // Preserve the old cross-check: every FE-provided scan-range node must map

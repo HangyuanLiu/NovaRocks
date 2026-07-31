@@ -197,7 +197,7 @@ fn decode_expr_type_at(
         .map_err(|error| NativeExpressionDecodeError::invalid_value(path.field("type"), error))
 }
 
-pub(super) fn validate_proto_expr_shape_at(
+pub(crate) fn validate_proto_expr_shape_at(
     e: &expr::Expr,
     path: FieldPath,
 ) -> Result<(), NativeExpressionDecodeError> {

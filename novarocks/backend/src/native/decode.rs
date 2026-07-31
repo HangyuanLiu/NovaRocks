@@ -45,6 +45,7 @@ use super::instance::decode_instance_params;
 use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
 use super::scan_contract::BackendNativeScanSourceContractDecoder;
 use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
+use super::submission_validation::BackendNativeFragmentSubmissionValidator;
 
 pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
@@ -123,6 +124,7 @@ impl NativeFragmentRequest {
             instance,
             &instance_params,
             &BackendNativeFragmentEnvelopeDecoder,
+            &BackendNativeFragmentSubmissionValidator,
             &BackendNativeFragmentSinkAssignmentDecoder,
             Arc::new(BackendNativeExpressionDecoder),
             &BackendNativeScanSourceContractDecoder,
