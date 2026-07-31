@@ -187,6 +187,33 @@ impl InMemoryMvRepository {
         })
     }
 
+    fn expect_refresh_state(
+        refresh: &StoredMvRefresh,
+        expected: MvRefreshState,
+    ) -> Result<(), MvRepositoryError> {
+        if refresh.state == expected {
+            return Ok(());
+        }
+        Err(MvRepositoryError::new(
+            MvRepositoryErrorKind::Conflict,
+            format!(
+                "mv refresh {} is {}, expected {}",
+                refresh.refresh_id,
+                refresh.state.as_str(),
+                expected.as_str()
+            ),
+        ))
+    }
+
+    fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
+        refresh.published_snapshot_id.or_else(|| {
+            refresh
+                .external_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.target_snapshot_id)
+        })
+    }
+
     fn finish_locked(
         state: &mut State,
         request: MvRefreshFinalizeRequest,
@@ -489,6 +516,22 @@ impl MvRepository for InMemoryMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
         let refresh = Self::refresh_mut(&mut state, request.refresh_id)?;
+        if refresh.state == MvRefreshState::StagingCommitted {
+            if refresh.staging_snapshot_id == Some(request.staging_snapshot_id)
+                && refresh.rows == Some(request.rows)
+                && refresh.base_table_uuids == request.base_table_uuids
+            {
+                return Ok(());
+            }
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!(
+                    "mv refresh {} staging commit differs from recorded value",
+                    request.refresh_id
+                ),
+            ));
+        }
+        Self::expect_refresh_state(refresh, MvRefreshState::IntentCreated)?;
         refresh.state = MvRefreshState::StagingCommitted;
         refresh.staging_snapshot_id = Some(request.staging_snapshot_id);
         refresh.rows = Some(request.rows);
@@ -501,13 +544,39 @@ impl MvRepository for InMemoryMvRepository {
     ) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
         let refresh = Self::refresh_mut(&mut state, request.refresh_id)?;
+        if refresh.state == MvRefreshState::PublishCommitted {
+            if refresh.published_snapshot_id == Some(request.published_snapshot_id)
+                && Self::persisted_publish_target_snapshot(refresh)
+                    == Some(request.published_snapshot_id)
+            {
+                return Ok(());
+            }
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!(
+                    "mv refresh {} publish commit differs from recorded value",
+                    request.refresh_id
+                ),
+            ));
+        }
+        Self::expect_refresh_state(refresh, MvRefreshState::StagingCommitted)?;
         refresh.state = MvRefreshState::PublishCommitted;
         refresh.published_snapshot_id = Some(request.published_snapshot_id);
+        refresh.external_outcome = Some(RefreshExternalOutcome {
+            target_snapshot_id: Some(request.published_snapshot_id),
+            commit_id: format!("iceberg-snapshot-{}", request.published_snapshot_id),
+        });
         Ok(())
     }
     fn mark_refresh_commit_unknown(&self, refresh_id: i64) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
-        Self::refresh_mut(&mut state, refresh_id)?.state = MvRefreshState::CommitUnknown;
+        let refresh = Self::refresh_mut(&mut state, refresh_id)?;
+        if !matches!(
+            refresh.state,
+            MvRefreshState::Finalized | MvRefreshState::Aborted
+        ) {
+            refresh.state = MvRefreshState::CommitUnknown;
+        }
         Ok(())
     }
     fn record_external_commit_outcome(
@@ -516,7 +585,11 @@ impl MvRepository for InMemoryMvRepository {
         outcome: RefreshExternalOutcome,
     ) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
-        Self::refresh_mut(&mut state, refresh_id)?.external_outcome = Some(outcome);
+        let refresh = Self::refresh_mut(&mut state, refresh_id)?;
+        Self::expect_refresh_state(refresh, MvRefreshState::IntentCreated)?;
+        refresh.state = MvRefreshState::PublishCommitted;
+        refresh.published_snapshot_id = outcome.target_snapshot_id;
+        refresh.external_outcome = Some(outcome);
         Ok(())
     }
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {

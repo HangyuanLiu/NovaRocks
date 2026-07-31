@@ -20836,7 +20836,10 @@ mod tests {
         )
         .expect_err("publish main mismatch should fail before publishing");
         let err = err.into_message();
-        assert!(err.contains("main snapshot mismatch"), "{err}");
+        assert!(
+            err.contains("publication target branch does not match its expected snapshot"),
+            "{err}"
+        );
 
         let after =
             crate::connector::iceberg::catalog::load_table(&target_entry, "analytics", "mv_orders")
@@ -24072,7 +24075,7 @@ mod tests {
             operation.state,
             crate::meta::repository::iceberg_operation::IcebergOperationState::FinalizeFailedKnownCommitted
         );
-        assert!(operation.state.is_finished());
+        assert!(!operation.state.is_finished());
         let failure = operation.failure.expect("retryable finalize failure fact");
         assert_eq!(
             failure.kind,
@@ -26228,7 +26231,7 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_mv_drop_missing_staging_branch_errors() {
+    fn iceberg_mv_drop_missing_staging_branch_is_idempotent() {
         use crate::connector::iceberg::catalog::registry::{
             build_catalog_entry, build_iceberg_catalog,
         };
@@ -26287,18 +26290,14 @@ mod tests {
             namespace: "test_ns".to_string(),
             table: "t".to_string(),
         };
-        let err = drop_iceberg_mv_staging_branch(
+        drop_iceberg_mv_staging_branch(
             &state,
             &target,
             &entry,
             "__missing_staging_branch",
             &crate::connector::test_request_context(),
         )
-        .expect_err("missing staging branch must be an error");
-        assert!(
-            err.contains("branch '__missing_staging_branch' does not exist"),
-            "{err}"
-        );
+        .expect("missing staging branch already satisfies the cleanup target state");
     }
 
     #[test]
