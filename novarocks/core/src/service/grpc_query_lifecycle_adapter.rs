@@ -354,7 +354,13 @@ async fn run_attached_control_stream(
                         result
                     }
                     QueryControlCommand::Finalize => lease.control().finalize(),
-                    QueryControlCommand::TerminalAck { ack } => lease.control().terminal_ack(ack),
+                    QueryControlCommand::TerminalAck { ack } => {
+                        let result = lease.control().terminal_ack(ack);
+                        if result.is_ok() {
+                            lease.mark_graceful();
+                        }
+                        result
+                    }
                 };
                 if let Err(error) = result {
                     let _ = send_control_response(

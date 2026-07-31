@@ -1473,6 +1473,7 @@ impl QueryLifecycleRegistry {
                     let mut state = entry.state.lock().expect("query lifecycle entry lock");
                     state.terminal_record = None;
                 }
+                entry.terminal_delivery_completed.notify_all();
                 self.release_terminal_record(entry.manifest.execution_id());
                 self.increment_terminal_metric(|metrics| {
                     metrics.terminal_retention_expired =
@@ -2039,7 +2040,25 @@ impl QueryLifecycleRegistry {
         std::thread::Builder::new()
             .name("query-terminal-fallback".to_string())
             .spawn(move || {
-                std::thread::sleep(config.terminal_ack_timeout);
+                let retained = entry
+                    .terminal_delivery_completed
+                    .wait_timeout_while(
+                        entry.state.lock().expect("query lifecycle entry lock"),
+                        config.terminal_ack_timeout,
+                        |state| {
+                            state.terminal_record.as_ref().is_some_and(|record| {
+                                record.snapshot().digest() == snapshot.digest()
+                            })
+                        },
+                    )
+                    .expect("query lifecycle terminal fallback wait")
+                    .0
+                    .terminal_record
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot().digest() == snapshot.digest());
+                if !retained {
+                    return;
+                }
                 let mut backoff = config.terminal_fallback_initial_backoff;
                 for attempt in 0..config.terminal_fallback_max_attempts {
                     let Some(registry) = weak.upgrade() else {
@@ -2188,6 +2207,7 @@ impl QueryLifecycleRegistry {
         }
         state.terminal_record = None;
         drop(state);
+        entry.terminal_delivery_completed.notify_all();
         self.increment_terminal_metric(|metrics| {
             metrics.terminal_acknowledged = metrics.terminal_acknowledged.saturating_add(1);
         });

@@ -47,6 +47,10 @@ pub(crate) struct QueryLifecycleEntry {
     pub(crate) state: Mutex<QueryLifecycleEntryState>,
     pub(crate) init_completed: Condvar,
     pub(crate) stage_completed: Condvar,
+    /// Wakes the deferred fallback as soon as TerminalAck releases the
+    /// immutable record, so an acknowledged snapshot does not retain a
+    /// sleeping fallback worker for the full ACK timeout.
+    pub(crate) terminal_delivery_completed: Condvar,
 }
 
 pub(crate) struct QueryLifecycleEntryState {
@@ -120,6 +124,7 @@ impl QueryLifecycleEntry {
             }),
             init_completed: Condvar::new(),
             stage_completed: Condvar::new(),
+            terminal_delivery_completed: Condvar::new(),
         }
     }
 }

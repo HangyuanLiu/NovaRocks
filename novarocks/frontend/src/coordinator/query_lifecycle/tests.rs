@@ -84,6 +84,7 @@ struct RecordingSessionState {
     events: VecDeque<Result<QueryControlEvent, QueryLifecycleTransportError>>,
     send_errors: VecDeque<QueryLifecycleTransportError>,
     terminal_snapshot: Option<novarocks::query_execution::lifecycle::QueryTerminalSnapshot>,
+    emit_terminal_snapshot_on_finalize: bool,
 }
 
 impl RecordingSession {
@@ -106,6 +107,7 @@ impl RecordingSession {
         let state = RecordingSessionState {
             events: events.into_iter().collect(),
             terminal_snapshot: Some(terminal_snapshot),
+            emit_terminal_snapshot_on_finalize: true,
             ..RecordingSessionState::default()
         };
         Self {
@@ -130,6 +132,47 @@ impl RecordingSession {
             .send_errors
             .push_back(error);
     }
+
+    fn clear_commands(&self) {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .commands
+            .clear();
+    }
+
+    fn suppress_terminal_snapshot_on_finalize(&self) {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .emit_terminal_snapshot_on_finalize = false;
+    }
+
+    fn terminal_snapshot(&self) -> novarocks::query_execution::lifecycle::QueryTerminalSnapshot {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .terminal_snapshot
+            .clone()
+            .expect("recording terminal snapshot")
+    }
+
+    fn push_event(&self, event: QueryControlEvent) {
+        self.state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .events
+            .push_back(Ok(event));
+        self.state.1.notify_all();
+    }
+
+    fn state_ref_count(&self) -> usize {
+        Arc::strong_count(&self.state)
+    }
 }
 
 impl QueryControlSession for RecordingSession {
@@ -145,7 +188,8 @@ impl QueryControlSession for RecordingSession {
             QueryControlCommand::Heartbeat { .. } | QueryControlCommand::TerminalAck { .. } => None,
         };
         state.commands.push(command);
-        if matches!(terminal, Some(QueryTerminationReason::CoordinatorFinalize))
+        if state.emit_terminal_snapshot_on_finalize
+            && matches!(terminal, Some(QueryTerminationReason::CoordinatorFinalize))
             && let Some(snapshot) = state.terminal_snapshot.clone()
         {
             state
@@ -205,6 +249,19 @@ struct RecordingTransportState {
 
 impl RecordingTransport {
     fn ready(plan: &QueryInitPlan) -> (Self, BTreeMap<usize, RecordingSession>) {
+        Self::ready_with_drain(plan, true)
+    }
+
+    fn ready_without_local_drain(
+        plan: &QueryInitPlan,
+    ) -> (Self, BTreeMap<usize, RecordingSession>) {
+        Self::ready_with_drain(plan, false)
+    }
+
+    fn ready_with_drain(
+        plan: &QueryInitPlan,
+        include_local_drain: bool,
+    ) -> (Self, BTreeMap<usize, RecordingSession>) {
         let mut state = RecordingTransportState::default();
         let mut sessions = BTreeMap::new();
         for backend_idx in plan.backend_ids() {
@@ -226,13 +283,11 @@ impl RecordingTransport {
                 Vec::new(),
             )
             .expect("recording terminal snapshot");
-            let session = RecordingSession::with_terminal_snapshot(
-                [
-                    Ok(QueryControlEvent::ControlReady),
-                    Ok(QueryControlEvent::LocalDrained),
-                ],
-                snapshot,
-            );
+            let mut events = vec![Ok(QueryControlEvent::ControlReady)];
+            if include_local_drain {
+                events.push(Ok(QueryControlEvent::LocalDrained));
+            }
+            let session = RecordingSession::with_terminal_snapshot(events, snapshot);
             state.attach_results.insert(
                 backend_idx,
                 VecDeque::from([Ok(Arc::new(session.clone()) as Arc<dyn QueryControlSession>)]),
@@ -1157,6 +1212,60 @@ fn frontend_query_lifecycle_lease_finalize_sends_once() {
             1
         );
     }
+    wait_until(Duration::from_secs(1), || {
+        sessions
+            .values()
+            .all(|session| session.state_ref_count() == 1)
+    });
+}
+
+#[test]
+fn frontend_query_lifecycle_finalize_keeps_heartbeats_until_all_participants_drain() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready_without_local_drain(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let finalize_config = config()
+        .with_terminal_timeouts(Duration::from_secs(2), Duration::from_secs(2))
+        .expect("terminal timeouts");
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, finalize_config);
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+    for session in sessions.values() {
+        session.clear_commands();
+        session.suppress_terminal_snapshot_on_finalize();
+    }
+
+    let finalize = std::thread::spawn(move || lease.finalize());
+    wait_until(Duration::from_secs(1), || {
+        sessions.values().all(|session| {
+            session
+                .commands()
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Heartbeat { .. }))
+        })
+    });
+    for session in sessions.values() {
+        session.push_event(QueryControlEvent::LocalDrained);
+    }
+    wait_until(Duration::from_secs(1), || {
+        sessions.values().all(|session| {
+            session
+                .commands()
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Finalize))
+        })
+    });
+    for session in sessions.values() {
+        session.push_event(QueryControlEvent::TerminalSnapshot {
+            snapshot: session.terminal_snapshot(),
+        });
+    }
+    finalize
+        .join()
+        .expect("join finalize")
+        .expect("finalize once every snapshot arrives");
 }
 
 #[test]

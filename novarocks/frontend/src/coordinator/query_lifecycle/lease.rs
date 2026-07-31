@@ -705,6 +705,14 @@ impl AttemptControl {
         timeout: Duration,
     ) -> Result<(), String> {
         self.wait_terminal_event(timeout, |terminal| {
+            if self.terminal_delivery_started(terminal) {
+                // A Finalize command can turn a locally drained backend into
+                // TerminalRetained before its in-flight heartbeat is handled.
+                // Terminal delivery still needs the stream reader, but no
+                // longer needs liveness heartbeats once every participant has
+                // drained.
+                return Some(Ok(()));
+            }
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
@@ -752,6 +760,23 @@ impl AttemptControl {
         .ok_or_else(|| {
             "query lifecycle timed out waiting for all participants to drain".to_string()
         })?
+    }
+
+    fn terminal_delivery_started(&self, terminal: &TerminalState) -> bool {
+        self.state.load(Ordering::Acquire) == FINALIZING
+            && terminal.locally_drained.len()
+                == self
+                    .attempted
+                    .lock()
+                    .expect("attempted participant set")
+                    .len()
+    }
+
+    fn release_session(&self, backend_idx: usize) {
+        self.sessions
+            .lock()
+            .expect("active query control sessions")
+            .remove(&backend_idx);
     }
 
     fn wait_for_all_snapshots(&self, timeout: Duration) -> Result<QueryTerminalSet, String> {
@@ -848,7 +873,6 @@ impl AttemptControl {
                         }),
                 )
             })?;
-        self.stop_supervisor();
         if let Err(error) = self.wait_for_all_drained(self.config.terminal_drain_timeout()) {
             self.metrics.terminal_finalize_failure();
             return Err(failed(error));
@@ -1006,8 +1030,18 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
             // leaves the stream.
             continue;
         }
+        let terminal_snapshot = matches!(&event, QueryControlEvent::TerminalSnapshot { .. });
         if let Err(error) = control.handle_control_event(&session, event) {
             control.record_reader_failure(error);
+            return;
+        }
+        if terminal_snapshot {
+            // Store-before-ACK completed this participant's terminal handoff.
+            // Retained terminal ingress only needs the immutable participant
+            // identity and stored snapshot for unary fallback. Release the
+            // live session so successful queries do not retain HTTP/2 control
+            // streams for the full ingress TTL.
+            control.release_session(session.target.backend_idx());
             return;
         }
     }
@@ -1292,6 +1326,12 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
     let started = Instant::now();
     let mut sequence = 0u64;
     while control.wait_heartbeat_interval() {
+        {
+            let terminal = control.terminal.0.lock().expect("query terminal state");
+            if control.terminal_delivery_started(&terminal) {
+                return;
+            }
+        }
         sequence = match sequence.checked_add(1) {
             Some(sequence) => sequence,
             None => {
@@ -1308,6 +1348,10 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                 sequence,
                 sent_mono_ns: started.elapsed().as_nanos() as u64,
             }) {
+                let terminal = control.terminal.0.lock().expect("query terminal state");
+                if control.terminal_delivery_started(&terminal) {
+                    return;
+                }
                 control.supervisor_failed(
                     format!(
                         "query lifecycle control stream failed for backend {} digest {}: {error}",
@@ -1396,8 +1440,9 @@ impl FrontendQueryLifecycleLeaseGuard {
 
 impl QueryLifecycleLeaseGuard for FrontendQueryLifecycleLeaseGuard {
     fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
+        let result = self.control.finalize();
         self.stop_and_join();
-        self.control.finalize()
+        result
     }
 
     fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
