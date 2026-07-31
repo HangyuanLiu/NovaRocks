@@ -763,6 +763,24 @@ impl ManagedProcess {
         self.child.id()
     }
 
+    pub(crate) fn is_running(&self) -> Result<bool> {
+        self.ensure_output_io_ok("inspect process state")?;
+        #[cfg(unix)]
+        {
+            // A deliberate fault kill reaps the direct child immediately. For
+            // resource convergence, that exit is the required proof that this
+            // BE no longer owns heavy execution resources.
+            if self.stopped {
+                return Ok(false);
+            }
+            return Ok(self.leader_exit_status_observed()?.is_none());
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(!self.stopped)
+        }
+    }
+
     pub(crate) fn stdout_tail(&self) -> String {
         read_tail(&self.stdout_buffer, "<stdout lock poisoned>")
     }

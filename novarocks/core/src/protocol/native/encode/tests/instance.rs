@@ -112,10 +112,6 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         &placement,
         &query_options,
         5,
-        Some(
-            &crate::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 9030)
-                .expect("report endpoint"),
-        ),
         true,
     )
     .expect("encode instance params");
@@ -132,7 +128,6 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(encoded.backend_num, 5);
     assert_eq!(encoded.per_exch_num_senders.get(&42), Some(&2));
     assert_eq!(encoded.destinations[0].endpoint, "10.0.0.9:8060");
-    assert_eq!(encoded.report_endpoint.as_deref(), Some("127.0.0.1:9030"));
     assert!(encoded.typed_result_sink);
     let encoded_range = &encoded.per_node_scan_ranges[&11].ranges[0];
     assert_eq!(encoded_range.volume_id, Some(13));
@@ -208,7 +203,6 @@ fn instance_params_encoder_maps_starrocks_tablet_range() {
         &placement,
         &query_options,
         0,
-        None,
         false,
     )
     .expect("encode instance params");

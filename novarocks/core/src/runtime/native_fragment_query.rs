@@ -35,8 +35,7 @@ use crate::runtime::fragment::io::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
-    FragmentFinishReportDecision, QueryContextManager, QueryExecutionKey, QueryId,
-    query_context_manager,
+    QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
@@ -46,6 +45,25 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
+    pub fn publish_resource_snapshot(&self) {
+        let snapshot = self.manager.native_execution_resource_snapshot();
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_contexts_active",
+            snapshot.active_contexts,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_contexts_second_chance",
+            snapshot.second_chance_contexts,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_active_fragments",
+            snapshot.active_fragments,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_runtime_filter_services",
+            snapshot.runtime_filter_services,
+        );
+    }
     pub fn global() -> Self {
         Self {
             manager: query_context_manager(),
@@ -90,11 +108,13 @@ impl NativeFragmentQueryRuntime {
             fragment_instance_id.hi, fragment_instance_id.lo
         );
         let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
-        Ok(NativeFragmentAdmissionResources {
+        let resources = NativeFragmentAdmissionResources {
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
-        })
+        };
+        self.publish_resource_snapshot();
+        Ok(resources)
     }
 
     pub fn register_fragment_execution(
@@ -113,12 +133,14 @@ impl NativeFragmentQueryRuntime {
         )?;
         self.manager
             .register_native_finst_execution(fragment_instance_id, execution)?;
-        Ok(NativeFragmentRegistrationLease {
+        let lease = NativeFragmentRegistrationLease {
             runtime: self.clone(),
             execution,
             fragment_instance_id,
             active: true,
-        })
+        };
+        self.publish_resource_snapshot();
+        Ok(lease)
     }
 
     /// Legacy native admission retained for non-lifecycle test fixtures. The
@@ -186,19 +208,17 @@ impl NativeFragmentQueryRuntime {
         execution_id: QueryExecutionId,
         reason: String,
     ) -> Vec<UniqueId> {
-        self.manager
-            .cancel_query_execution(execution_key(execution_id), reason)
+        let cancelled = self
+            .manager
+            .cancel_query_execution(execution_key(execution_id), reason);
+        self.publish_resource_snapshot();
+        cancelled
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {
         self.manager
             .finish_fragment_execution(execution_key(execution_id));
-    }
-
-    pub fn finish_fragment_for_report(&self, query_id: QueryId) -> NativeFragmentReportDecision {
-        NativeFragmentReportDecision {
-            inner: self.manager.finish_fragment_for_report(query_id),
-        }
+        self.publish_resource_snapshot();
     }
 
     pub fn unregister_fragment(&self, fragment_instance_id: UniqueId) {
@@ -212,15 +232,7 @@ impl NativeFragmentQueryRuntime {
     ) {
         self.manager
             .unregister_finst_execution(fragment_instance_id, execution_key(execution_id));
-    }
-
-    pub fn cleanup_after_fragment_report(
-        &self,
-        query_id: QueryId,
-        decision: NativeFragmentReportDecision,
-    ) {
-        self.manager
-            .cleanup_after_fragment_report(query_id, decision.inner);
+        self.publish_resource_snapshot();
     }
 }
 
@@ -295,16 +307,6 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
-    }
-}
-
-pub struct NativeFragmentReportDecision {
-    inner: FragmentFinishReportDecision,
-}
-
-impl NativeFragmentReportDecision {
-    pub fn include_runtime_filter_profile(&self) -> bool {
-        self.inner.include_runtime_filter_profile
     }
 }
 

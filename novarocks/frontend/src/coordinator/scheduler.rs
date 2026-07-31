@@ -430,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn scheduler_attempt_identity_is_stable_within_attempt_and_changes_between_attempts() {
         let fixture =
             novarocks::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();

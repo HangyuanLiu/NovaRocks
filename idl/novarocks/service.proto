@@ -33,7 +33,7 @@ import "plan.proto";
 // traffic. Consumers: src/service/grpc_server.rs (server), src/service/
 // grpc_client.rs + src/service/grpc_fragment_dispatcher.rs (implementing the
 // src/coordinator/dispatch.rs port) + src/runtime/heartbeat_mgr.rs + src/service/
-// standalone_exec_state_reporter.rs (clients).
+// Query lifecycle clients own terminal delivery through QueryControlStream.
 service NovaRocksGrpc {
   // Streaming exchange shuffle: sender streams chunk payloads to a receiver
   // fragment instance. Producer: src/service/exchange_sender.rs. Consumer:
@@ -50,8 +50,6 @@ service NovaRocksGrpc {
 
   // Coordinator polls a fragment instance for result batches.
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
-  // Coordinator cancels one or more fragment instances.
-  rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
   // Coordinator establishes and owns one backend-local query attempt before
   // any native fragment is accepted.
   rpc InitQuery(InitQueryRequest) returns (InitQueryResponse);
@@ -79,14 +77,6 @@ service NovaRocksGrpc {
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
-  // BE -> coordinator exec-status report (distributed write). Producer:
-  // src/service/standalone_exec_state_reporter.rs. Control-plane owner:
-  // src/coordinator/report.rs. Transport consumer: src/service/grpc_server.rs.
-  rpc ReportExecStatus(ReportExecStatusRequest)
-      returns (ReportExecStatusResponse);
-  // Batched variant of ReportExecStatus.
-  rpc BatchReportExecStatus(BatchReportExecStatusRequest)
-      returns (BatchReportExecStatusResponse);
 }
 
 // Immutable identity for one physical execution attempt of a logical query.
@@ -409,7 +399,8 @@ message InstanceParams {
   reserved 7;
   reserved "runtime_filter_params";
   QueryOptions query_options = 8;
-  optional string report_endpoint = 9;                 // NovaRocks coordinator gRPC endpoint.
+  reserved 9;
+  reserved "report_endpoint";  // removed native report control-plane field; never reuse.
   bool typed_result_sink = 10;                         // novarocks_typed_result_sink
 }
 
@@ -574,18 +565,6 @@ message FetchResultResponse {
 }
 
 // Coordinator cancellation request for active fragment instances.
-message CancelFragmentRequest {
-  repeated novarocks.common.UniqueId finst_ids = 1;  // instances to cancel
-  string reason = 2;                                // cancellation reason for logging
-  uint64 start_epoch = 3;                           // guard: ignore if BE restarted past epoch
-  novarocks.common.UniqueId query_id = 4;           // coordinator query owning the instances
-}
-
-// Cancellation result returned after local cancellation handling.
-message CancelFragmentResponse {
-  int32 status_code = 1;  // 0 == cancellation accepted
-}
-
 // Control-plane-only declaration. `provider_id` selects a startup-composed
 // installer and never appears in a fragment carrier. `declaration_payload`
 // is provider-owned, bounded, opaque, and credential-free.
@@ -736,44 +715,4 @@ message IcebergCommitInfo {
   IcebergDataFile iceberg_data_file = 1;
   optional bool is_overwrite = 2;
   optional bool is_rewrite = 3;
-}
-
-// Native BE -> coordinator exec-status report. Control-plane owner:
-// src/coordinator/report.rs. Used only on the pure NovaRocksCoordinator gRPC
-// path; StarRocksFrontend compatibility keeps thrift.
-message ExecStatusReport {
-  novarocks.common.UniqueId query_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
-  int32 backend_num = 3;
-  novarocks.common.Status status = 4;
-  bool done = 5;
-  repeated IcebergCommitInfo iceberg_commits = 6;
-  int64 loaded_rows = 7;
-  int64 sink_load_bytes = 8;
-  int64 filtered_rows = 9;
-  RuntimeProfileTree profile = 10;  // absent unless ANALYZE/profile enabled
-}
-
-// BE -> coordinator exec-status report.
-message ReportExecStatusRequest {
-  ExecStatusReport report = 1;
-}
-
-// Result for one exec-status report accepted by the coordinator.
-message ReportExecStatusResponse {
-  int32 status_code = 1;  // 0 == report accepted
-  string message = 2;     // human-readable status or error detail
-  string error_code = 3;  // machine-readable error code when nonzero
-}
-
-// Batched exec-status reports from one BE to the coordinator.
-message BatchReportExecStatusRequest {
-  repeated ExecStatusReport reports = 1;
-}
-
-// Aggregate result for a batch of exec-status reports.
-message BatchReportExecStatusResponse {
-  int32 status_code = 1;  // 0 == batch accepted
-  string message = 2;     // human-readable status or error detail
-  string error_code = 3;  // machine-readable error code when nonzero
 }

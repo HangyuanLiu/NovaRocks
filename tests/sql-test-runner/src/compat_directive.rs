@@ -1270,8 +1270,8 @@ mod tests {
 
     #[test]
     fn exact_injected_query_cancellation_accepts_native_terminal_ack() {
-        let handle = FakeCompatHandle::new(vec!["", "", ""])
-            .with_fragment_failure_token("terminal-token");
+        let handle =
+            FakeCompatHandle::new(vec!["", "", ""]).with_fragment_failure_token("terminal-token");
         let step = step(QueryMeta {
             fail_fragment_after_start_be_index: Some(1),
             be_log_exact_fragment_cancellation: Some(3),

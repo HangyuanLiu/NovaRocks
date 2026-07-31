@@ -70,7 +70,6 @@ pub(crate) struct StarRocksDecodeInput<'a> {
     pub(crate) query_globals: Option<&'a internal_service::TQueryGlobals>,
     pub(crate) db_name: Option<&'a str>,
     pub(crate) coord: Option<&'a types::TNetworkAddress>,
-    pub(crate) novarocks_report_endpoint: Option<&'a RuntimeEndpoint>,
     pub(crate) backend_num: Option<i32>,
     pub(crate) pipeline_dop: i32,
     pub(crate) group_execution_scan_dop: Option<i32>,
@@ -137,7 +136,6 @@ pub(crate) struct StarRocksSubmissionMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StarRocksReportDestination {
-    NovaRocks(RuntimeEndpoint),
     Coordinator(RuntimeEndpoint),
 }
 
@@ -681,16 +679,10 @@ fn decode_draft_parts(
         })?;
     let lookup_fetcher_lifecycles = decode_lookup_fetcher_lifecycles(input)?;
     let lookup_close_targets = decode_lookup_close_targets(input)?;
-    let report_destination = input
-        .novarocks_report_endpoint
-        .cloned()
-        .map(StarRocksReportDestination::NovaRocks)
-        .or_else(|| {
-            instance
-                .report_endpoint
-                .clone()
-                .map(StarRocksReportDestination::Coordinator)
-        });
+    let report_destination = instance
+        .report_endpoint
+        .clone()
+        .map(StarRocksReportDestination::Coordinator);
     // Drain the enriched per-node `BoundScanRanges` captured during `lower_plan`
     // into the instance's scan assignments (`materialize_scan_bindings` binds
     // these). Uses `borrow_mut` (not `into_inner`) so `plan_context`'s borrow of
@@ -1470,7 +1462,6 @@ mod tests {
             query_globals: None,
             db_name: None,
             coord: None,
-            novarocks_report_endpoint: None,
             backend_num: Some(3),
             pipeline_dop: 1,
             group_execution_scan_dop: None,
@@ -1510,27 +1501,6 @@ mod tests {
             ExecNodeKind::Values(_)
         ));
         assert!(metadata.descriptor_snapshot().is_none());
-    }
-
-    #[test]
-    fn novarocks_report_endpoint_takes_precedence_over_coordinator() {
-        let fragment = values_noop_fragment();
-        let params = params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 33, lo: 34 });
-        let coordinator = types::TNetworkAddress::new("coordinator".to_string(), 9020);
-        let novarocks = RuntimeEndpoint::new("novarocks-report", 9030).expect("endpoint");
-        let mut input = decode_input(&fragment, &params);
-        input.coord = Some(&coordinator);
-        input.novarocks_report_endpoint = Some(&novarocks);
-
-        let draft = prepare_fragment_submission(input).expect("prepare values/noop fragment");
-        let decoded = finish_fragment_submission(draft, StarRocksResolvedDependencies::default())
-            .expect("finish values/noop fragment");
-        let (_, metadata) = decoded.into_parts();
-
-        assert_eq!(
-            metadata.report_destination(),
-            Some(&StarRocksReportDestination::NovaRocks(novarocks))
-        );
     }
 
     #[test]

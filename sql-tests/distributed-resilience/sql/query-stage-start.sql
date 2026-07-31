@@ -73,9 +73,13 @@ JOIN ${case_db}.stage_start right_side
 -- unknown across the idempotent retry. The frontend must Abort every
 -- participant instead of accepting a partial Start.
 -- @suppress_start_ack_be_index=2
+-- @drop_next_terminal_ack_be_index=1
 -- @query_control_fragment_backend_limit=2
 -- @expect_error=StartPreparedQuery retry failed after unknown outcome
 -- @be_log_contains=NOVAROCKS_START_ACK_SUPPRESSED
+-- @be_log_contains=NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_CONTROL_READY,3
+-- @be_log_contains=expected_fragments=0
 SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.stage_start left_side
 JOIN ${case_db}.stage_start right_side

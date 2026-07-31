@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
 use crate::query_execution::outcome::FragmentProfileSet;
-use crate::query_execution::write::NativeExecutionReport;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -33,29 +32,15 @@ const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 ///
 /// An execution can legitimately produce no fragment profile, so completion
 /// deliberately does not impose a non-empty production invariant.
-pub struct ProfileReportBuilder {
+pub struct ProfileTerminalBuilder {
     profiles: Vec<RuntimeProfileTree>,
 }
 
-impl ProfileReportBuilder {
+impl ProfileTerminalBuilder {
     pub fn new() -> Self {
         Self {
             profiles: Vec::new(),
         }
-    }
-
-    pub fn apply(&mut self, report: NativeExecutionReport) -> Result<(), DistributedQueryError> {
-        if let Some(message) = report.failure_message() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Failed,
-                message,
-            ));
-        }
-        let (_, profile) = report.into_parts();
-        if let Some(profile) = profile {
-            self.profiles.push(profile);
-        }
-        Ok(())
     }
 
     /// Profiles are a terminal contribution when profiling is enabled.  A
@@ -86,7 +71,7 @@ impl ProfileReportBuilder {
     }
 }
 
-impl Default for ProfileReportBuilder {
+impl Default for ProfileTerminalBuilder {
     fn default() -> Self {
         Self::new()
     }

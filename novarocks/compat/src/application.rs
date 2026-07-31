@@ -10,7 +10,6 @@ use axum::Router;
 use novarocks::common::app_config::{self, NovaRocksConfig};
 use novarocks::common::network;
 use novarocks::connector::starrocks::ports::LakeStorageDependencies;
-use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::fragment::io::SyncFragmentExecutor;
 
 use crate::backend_service::{self, BackendServiceHandle};
@@ -31,28 +30,8 @@ use crate::load::{
 use crate::report::{CompatReportService, new_report_service_with_tracking};
 
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const COMPAT_REPORT_ROLE_REJECTION: &str =
-    "compat backend role does not own native coordinator report ingress";
-
 #[cfg(test)]
 static APPLICATION_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-struct CompatNativeReportHandler;
-
-impl NativeReportHandler for CompatNativeReportHandler {
-    fn handle_native_report(
-        &self,
-        _report: novarocks::proto::novarocks::ExecStatusReport,
-    ) -> Result<(), NativeReportHandlerError> {
-        Err(NativeReportHandlerError::role_rejected(
-            COMPAT_REPORT_ROLE_REJECTION,
-        ))
-    }
-}
-
-fn compat_native_report_handler() -> Arc<dyn NativeReportHandler> {
-    Arc::new(CompatNativeReportHandler)
-}
 
 struct CompatDiskReportSender;
 
@@ -391,7 +370,6 @@ impl CompatApplicationHost {
                 starlet_port: server.starlet_port,
             },
             compat_routes,
-            compat_native_report_handler(),
             starlet_metadata_adapter,
         ) {
             return Err(host.start_failure(
@@ -566,7 +544,6 @@ trait CompatPorts: Send {
         &mut self,
         config: CompatListenerConfig,
         compat_routes: Router,
-        report_handler: Arc<dyn NativeReportHandler>,
         starlet_control: Arc<dyn listeners::StarletControl>,
     ) -> Result<(), String>;
     fn start_heartbeat(
@@ -604,13 +581,11 @@ impl CompatPorts for LiveCompatPorts {
         &mut self,
         config: CompatListenerConfig,
         compat_routes: Router,
-        report_handler: Arc<dyn NativeReportHandler>,
         starlet_control: Arc<dyn listeners::StarletControl>,
     ) -> Result<(), String> {
         self.listeners = Some(CompatListenerGroup::start(
             config,
             compat_routes,
-            report_handler,
             starlet_control,
         )?);
         Ok(())

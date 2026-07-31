@@ -32,8 +32,8 @@ use novarocks::query_execution::artifact::{
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
-    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest, ProfileReportBuilder,
-    QueryId,
+    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
+    ProfileTerminalBuilder, QueryId,
 };
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
@@ -41,13 +41,13 @@ use novarocks::query_execution::fragment_transport::{
 use novarocks::query_execution::lifecycle::{
     AttemptId, QueryExecutionId, QueryInitOptions, QueryLifecycleTransport,
 };
-use novarocks::query_execution::write::WriteReportBuilder;
+use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
 use super::query_registry::FrontendQueryRegistry;
-use super::report::{FrontendCoordinatorReportHandler, FrontendCoordinatorTerminalIngress};
+use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
@@ -627,10 +627,6 @@ impl FrontendDistributedQueryCoordinator {
         }
     }
 
-    pub fn report_handler(&self) -> FrontendCoordinatorReportHandler {
-        FrontendCoordinatorReportHandler::new(Arc::clone(&self.registry))
-    }
-
     pub fn terminal_ingress(&self) -> FrontendCoordinatorTerminalIngress {
         FrontendCoordinatorTerminalIngress::new(Arc::clone(&self.registry))
     }
@@ -774,7 +770,6 @@ impl FrontendDistributedQueryCoordinator {
             query_deadline_unix_ms,
             Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
             self.report_endpoint.resolve()?,
-            dispatcher.needs_fragment_status_report() || intent == DistributedQueryIntent::Profile,
         )?;
         let connector_binding_dispatcher =
             Arc::clone(&backend_services.connector_binding_dispatcher);
@@ -789,15 +784,6 @@ impl FrontendDistributedQueryCoordinator {
             .prepare_connector_bindings(&connector_bindings)?
             .prepare_stage()?;
         self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
-        let registration = stage_prepared.execution_registration_view();
-        let writer_identities = registration.writer_identities().to_vec();
-        if let Err(error) = self.registry.set_execution_instances(
-            query_id,
-            registration.attempted_instances(),
-            &writer_identities,
-        ) {
-            return Err(error);
-        }
         let staged = stage_prepared.stage(&lifecycle_barrier)?;
         for batch in staged.batches() {
             self.backend_topology.record_successful_stage(
@@ -904,16 +890,13 @@ impl FrontendDistributedQueryCoordinator {
             ));
         }
 
-        let (query_failure, _reports) = match self.registry.seal_and_take_completion(query_id) {
-            Ok(completion) => completion,
-            Err(error) => return Err(error),
-        };
+        let query_failure = self.registry.first_failure(query_id);
         let outcome = (|| {
             let result = expected_output.into_query_result(batches)?;
             match intent {
                 DistributedQueryIntent::Result => parts.completion.result(result),
                 DistributedQueryIntent::Write => {
-                    let mut builder = WriteReportBuilder::new(writer_registrations)?;
+                    let mut builder = WriteTerminalBuilder::new(writer_registrations)?;
                     if let Some(message) = query_failure {
                         builder.latch_failure(message);
                     }
@@ -925,7 +908,7 @@ impl FrontendDistributedQueryCoordinator {
                     parts.completion.write(result, commit, abort)
                 }
                 DistributedQueryIntent::Profile => {
-                    let mut builder = ProfileReportBuilder::new();
+                    let mut builder = ProfileTerminalBuilder::new();
                     for fragment in terminal_set.fragments() {
                         builder.apply_terminal(fragment)?;
                     }

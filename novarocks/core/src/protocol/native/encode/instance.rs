@@ -23,7 +23,7 @@ use crate::common::types::UniqueId;
 use crate::exec::spill::{SpillConfig, SpillMode};
 use crate::proto::{common, novarocks};
 use crate::query_execution::schedule::FragmentInstancePlacement;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range;
 
@@ -32,7 +32,6 @@ pub(crate) fn encode_instance_params(
     placement: &FragmentInstancePlacement,
     query_options: &QueryOptions,
     backend_num: i32,
-    report_endpoint: Option<&RuntimeEndpoint>,
     typed_result_sink: bool,
 ) -> Result<novarocks::InstanceParams, String> {
     Ok(novarocks::InstanceParams {
@@ -65,7 +64,6 @@ pub(crate) fn encode_instance_params(
             .map(encode_destination)
             .collect::<Result<Vec<_>, _>>()?,
         query_options: Some(encode_query_options(query_options)),
-        report_endpoint: report_endpoint.map(RuntimeEndpoint::as_host_port),
         typed_result_sink,
     })
 }

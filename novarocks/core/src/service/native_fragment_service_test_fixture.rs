@@ -28,7 +28,6 @@ use crate::common::types::UniqueId;
 use crate::exec::fragment::program::FragmentSinkKind;
 use crate::novarocks_logging::{error, info, warn};
 use crate::protocol::native::decode::decode_fragment_submission;
-use crate::query_execution::native_fragment_report;
 use crate::runtime::exchange;
 use crate::runtime::fragment::error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
@@ -177,17 +176,9 @@ fn spawn_exec_fragment_native(
                 exchange::cancel_fragment(id.hi, id.lo);
             }
         }
-        let report_decision = mgr.finish_fragment_for_report(query_id);
-        native_fragment_report::report_terminal(
-            finst_id,
-            crate::runtime::fragment::io::FragmentTerminalReport::new(
-                report_error,
-                report_decision.include_runtime_filter_profile,
-            ),
-        );
+        mgr.finish_fragment(query_id);
         exchange::remove_fragment(finst_id.hi, finst_id.lo);
         mgr.unregister_finst(finst_id);
-        mgr.cleanup_after_fragment_report(query_id, report_decision);
         if let Some(error) = pre_ready_failure {
             worker_readiness.fail_after_cleanup(error);
         }
@@ -292,29 +283,6 @@ pub(crate) fn submit_exec_plan_fragment_native_with_manager(
     } else {
         None
     };
-    let report_interval_ns = profile_report_interval_ns(enable_profile, Some(&query_opts));
-    if let Some(report_endpoint) = metadata.report_endpoint().cloned() {
-        native_fragment_report::register(
-            crate::runtime::fragment::io::FragmentReportRegistration::new(
-                finst_id,
-                query_id,
-                instance.backend_num().get(),
-                enable_profile,
-                profiler.clone(),
-                Some(Arc::clone(&fragment_mem_tracker)),
-                Some(Arc::clone(&query_mem_tracker)),
-                report_interval_ns,
-            ),
-            report_endpoint,
-        );
-    } else {
-        warn!(
-            target: "novarocks::report",
-            finst_id = %finst_id,
-            "missing native report_endpoint for reportExecStatus"
-        );
-    }
-
     debug_assert_eq!(
         metadata.typed_result_sink(),
         instance.runtime_options().typed_result_sink()
@@ -349,7 +317,6 @@ mod tests {
         finst_mapping: Option<QueryId>,
         result_buffer: &'static str,
         exchange_receiver: bool,
-        reporter: bool,
         runtime_filter_lifecycle: bool,
     }
 
@@ -381,7 +348,6 @@ mod tests {
             result_buffer,
             exchange_receiver: crate::runtime::exchange::snapshot_receiver_state(exchange_key)
                 .is_some(),
-            reporter: native_fragment_report::is_registered(finst_id),
             runtime_filter_lifecycle:
                 crate::runtime::runtime_filter_observability::RuntimeFilterLifecycleRegistry::global()
                     .snapshot(query_key)
@@ -403,7 +369,6 @@ mod tests {
                 pipeline_dop: 1,
                 ..Default::default()
             }),
-            report_endpoint: Some("127.0.0.1:19030".to_string()),
             ..Default::default()
         }
     }
@@ -484,7 +449,6 @@ mod tests {
                 pipeline_dop: 1,
                 ..Default::default()
             }),
-            report_endpoint: Some("127.0.0.1:19030".to_string()),
             ..Default::default()
         };
         let before = registration_snapshot(query_id, finst_id);
@@ -537,7 +501,6 @@ mod tests {
                 pipeline_dop: 1,
                 ..Default::default()
             }),
-            report_endpoint: Some("127.0.0.1:19030".to_string()),
             ..Default::default()
         };
         let before = registration_snapshot(query_id, finst_id);

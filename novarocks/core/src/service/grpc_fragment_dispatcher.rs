@@ -39,7 +39,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::chunk::ChunkSchema;
 use crate::proto::common::UniqueId as ProtoUniqueId;
 use crate::proto::novarocks::{
-    CancelFragmentRequest, EnsureConnectorExecutionBindingRequest, FetchResultRequest,
+    EnsureConnectorExecutionBindingRequest, FetchResultRequest,
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
     fetch_result_response::Status as FetchStatus,
 };
@@ -342,71 +342,8 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
     }
 
-    fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]) {
-        if self.check_idx(backend_idx).is_err() {
-            return;
-        }
-        let addr = self.addrs[&backend_idx];
-        let req = CancelFragmentRequest {
-            query_id: Some(ProtoUniqueId {
-                hi: query_id.high(),
-                lo: query_id.low(),
-            }),
-            finst_ids: finst_ids
-                .iter()
-                .map(|id| ProtoUniqueId {
-                    hi: id.hi,
-                    lo: id.lo,
-                })
-                .collect(),
-            reason: "coordinator cancel".to_string(),
-            start_epoch: 0,
-        };
-        let runtime_handle = match crate::runtime::global_async_runtime::data_runtime_handle() {
-            Ok(handle) => handle,
-            Err(e) => {
-                warn!(
-                    "remote cancel_fragment runtime unavailable for {}: {}",
-                    addr, e
-                );
-                return;
-            }
-        };
-        #[cfg(test)]
-        let rpc_timeout = self.rpc_timeout;
-        runtime_handle.spawn(async move {
-            match NovaRocksGrpcRemoteClient::new(addr) {
-                Ok(client) => {
-                    #[cfg(test)]
-                    let response = if let Some(timeout) = rpc_timeout {
-                        client
-                            .cancel_fragment_async_with_timeout(req, timeout)
-                            .await
-                    } else {
-                        client.cancel_fragment_async(req).await
-                    };
-                    #[cfg(not(test))]
-                    let response = client.cancel_fragment_async(req).await;
-                    match response {
-                        Ok(resp) if resp.status_code == 0 => {}
-                        Ok(resp) => warn!(
-                            "remote cancel_fragment returned nonzero status from {}: {}",
-                            addr, resp.status_code
-                        ),
-                        Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
-                    }
-                }
-                Err(e) => warn!("remote cancel_fragment failed for {}: {}", addr, e),
-            }
-        });
-    }
-
     fn backend_count(&self) -> usize {
         self.clients.len()
-    }
-
-    fn needs_fragment_status_report(&self) -> bool {
-        true
     }
 }
 
@@ -419,7 +356,7 @@ mod tests {
     use super::*;
 
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     use crate::proto;
     use crate::query_execution::contract::QueryId;
@@ -428,12 +365,11 @@ mod tests {
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
-        BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
         EnsureConnectorExecutionBindingRequest, EnsureConnectorExecutionBindingResponse,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
-        HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
-        ReportQueryTerminalRequest, ReportQueryTerminalResponse,
-        RetireConnectorExecutionBindingRequest, RetireConnectorExecutionBindingResponse,
+        HeartbeatRequest, HeartbeatResponse, ReportQueryTerminalRequest,
+        ReportQueryTerminalResponse, RetireConnectorExecutionBindingRequest,
+        RetireConnectorExecutionBindingResponse,
     };
     use tonic::{Request, Response, Status, Streaming};
 
@@ -448,11 +384,6 @@ mod tests {
         fetch_status: AtomicI32,
         fetch_eos: AtomicBool,
         fetch_arrow: Mutex<Vec<u8>>,
-        cancel_count: AtomicUsize,
-        cancel_request: Mutex<Option<CancelFragmentRequest>>,
-        cancel_delay_ms: AtomicU64,
-        report_status_code: AtomicI32,
-        report_message: Mutex<String>,
     }
 
     impl Default for MockState {
@@ -461,11 +392,6 @@ mod tests {
                 fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
                 fetch_eos: AtomicBool::new(false),
                 fetch_arrow: Mutex::new(Vec::new()),
-                cancel_count: AtomicUsize::new(0),
-                cancel_request: Mutex::new(None),
-                cancel_delay_ms: AtomicU64::new(0),
-                report_status_code: AtomicI32::new(0),
-                report_message: Mutex::new(String::new()),
             }
         }
     }
@@ -522,22 +448,6 @@ mod tests {
                 packet_seq: 0,
                 eos: self.0.fetch_eos.load(Ordering::SeqCst),
                 result_arrow_ipc: self.0.fetch_arrow.lock().expect("fetch arrow lock").clone(),
-            }))
-        }
-
-        async fn cancel_fragment(
-            &self,
-            request: Request<CancelFragmentRequest>,
-        ) -> Result<Response<proto::novarocks::CancelFragmentResponse>, Status> {
-            let delay_ms = self.0.cancel_delay_ms.load(Ordering::SeqCst);
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            *self.0.cancel_request.lock().expect("cancel request lock") =
-                Some(request.into_inner());
-            self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::new(proto::novarocks::CancelFragmentResponse {
-                status_code: 0,
             }))
         }
 
@@ -608,38 +518,6 @@ mod tests {
                 status_code: 0,
             }))
         }
-
-        async fn report_exec_status(
-            &self,
-            _request: Request<ReportExecStatusRequest>,
-        ) -> Result<Response<ReportExecStatusResponse>, Status> {
-            Ok(Response::new(ReportExecStatusResponse {
-                status_code: self.0.report_status_code.load(Ordering::SeqCst),
-                message: self
-                    .0
-                    .report_message
-                    .lock()
-                    .expect("report message lock")
-                    .clone(),
-                error_code: String::new(),
-            }))
-        }
-
-        async fn batch_report_exec_status(
-            &self,
-            _request: Request<BatchReportExecStatusRequest>,
-        ) -> Result<Response<BatchReportExecStatusResponse>, Status> {
-            Ok(Response::new(BatchReportExecStatusResponse {
-                status_code: self.0.report_status_code.load(Ordering::SeqCst),
-                message: self
-                    .0
-                    .report_message
-                    .lock()
-                    .expect("report message lock")
-                    .clone(),
-                error_code: String::new(),
-            }))
-        }
     }
 
     fn spawn_mock_server(state: Arc<MockState>) -> std::net::SocketAddr {
@@ -678,23 +556,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         addr
-    }
-
-    #[test]
-    fn grpc_client_report_exec_status_preserves_business_error() {
-        let state = Arc::new(MockState::default());
-        state.report_status_code.store(7, Ordering::SeqCst);
-        *state.report_message.lock().expect("report message lock") = "report failed".to_string();
-        let addr = spawn_mock_server(Arc::clone(&state));
-        let client =
-            NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("construct grpc client");
-
-        let resp = client
-            .blocking_report_exec_status(ReportExecStatusRequest { report: None })
-            .expect("RPC level success");
-
-        assert_ne!(resp.status_code, 0);
-        assert!(!resp.message.is_empty());
     }
 
     #[test]
@@ -779,58 +640,6 @@ mod tests {
         };
 
         assert!(err.contains("result_arrow_ipc"), "{err}");
-    }
-
-    #[test]
-    fn remote_dispatcher_cancel_is_sent() {
-        let state = Arc::new(MockState::default());
-        let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
-        let query_id = QueryId::new(11, 12);
-
-        dispatcher.cancel_fragments(0, query_id, &[make_finst_id(1, 2)]);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while state.cancel_count.load(Ordering::SeqCst) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cancel rpc was not observed by mock server"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let request = state
-            .cancel_request
-            .lock()
-            .expect("cancel request lock")
-            .clone()
-            .expect("cancel request");
-        assert_eq!(request.query_id, Some(ProtoUniqueId { hi: 11, lo: 12 }));
-    }
-
-    #[test]
-    fn remote_dispatcher_cancel_returns_promptly_when_rpc_blocks() {
-        let state = Arc::new(MockState::default());
-        state.cancel_delay_ms.store(1_000, Ordering::SeqCst);
-        let addr = spawn_mock_server(Arc::clone(&state));
-        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
-
-        let start = std::time::Instant::now();
-        dispatcher.cancel_fragments(0, QueryId::new(21, 22), &[make_finst_id(7, 8)]);
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "cancel_fragments should return promptly, took {elapsed:?}"
-        );
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while state.cancel_count.load(Ordering::SeqCst) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cancel rpc was not observed by mock server"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
     }
 
     #[test]

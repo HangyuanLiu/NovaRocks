@@ -353,61 +353,6 @@ impl NovaRocksGrpcRemoteClient {
         })?
     }
 
-    pub fn blocking_cancel_fragment(
-        &self,
-        req: proto::novarocks::CancelFragmentRequest,
-    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
-        let mut cli = self.make_client()?;
-        data_block_on(async move {
-            cli.cancel_fragment(req)
-                .await
-                .map(|r| r.into_inner())
-                .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
-        })?
-    }
-
-    #[cfg(test)]
-    pub(crate) fn blocking_cancel_fragment_with_timeout(
-        &self,
-        req: proto::novarocks::CancelFragmentRequest,
-        timeout: Duration,
-    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
-        data_block_on(self.cancel_fragment_async_with_timeout(req, timeout))?
-    }
-
-    pub fn blocking_report_exec_status(
-        &self,
-        req: proto::novarocks::ReportExecStatusRequest,
-    ) -> Result<proto::novarocks::ReportExecStatusResponse, String> {
-        self.blocking_report_exec_status_with_timeout(req, REPORT_EXEC_STATUS_RPC_TIMEOUT)
-    }
-
-    fn blocking_report_exec_status_with_timeout(
-        &self,
-        req: proto::novarocks::ReportExecStatusRequest,
-        timeout: Duration,
-    ) -> Result<proto::novarocks::ReportExecStatusResponse, String> {
-        data_block_on(async {
-            let deadline_at = tokio::time::Instant::now() + timeout;
-            let mut client = self
-                .make_deadline_async_client("report_exec_status", deadline_at)
-                .await?;
-            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(
-                    "report_exec_status deadline exceeded before unary RPC submission".to_string(),
-                );
-            }
-            let mut request = Request::new(req);
-            request.set_timeout(remaining);
-            tokio::time::timeout_at(deadline_at, client.report_exec_status(request))
-                .await
-                .map_err(|_| "report_exec_status deadline exceeded during unary RPC".to_string())?
-                .map(|response| response.into_inner())
-                .map_err(|error| format!("report_exec_status rpc failed: {error}"))
-        })?
-    }
-
     pub fn blocking_report_query_terminal_with_timeout(
         &self,
         req: proto::novarocks::ReportQueryTerminalRequest,
@@ -435,51 +380,6 @@ impl NovaRocksGrpcRemoteClient {
                 .map(|response| response.into_inner())
                 .map_err(|error| format!("report_query_terminal rpc failed: {error}"))
         })?
-    }
-
-    pub fn blocking_batch_report_exec_status(
-        &self,
-        req: proto::novarocks::BatchReportExecStatusRequest,
-    ) -> Result<proto::novarocks::BatchReportExecStatusResponse, String> {
-        let mut cli = self.make_client()?;
-        data_block_on(async move {
-            cli.batch_report_exec_status(req)
-                .await
-                .map(|r| r.into_inner())
-                .map_err(|e| format!("batch_report_exec_status rpc failed: {e}"))
-        })?
-    }
-
-    pub async fn cancel_fragment_async(
-        &self,
-        req: proto::novarocks::CancelFragmentRequest,
-    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
-        let mut cli = self.make_async_client().await?;
-        let mut req = Request::new(req);
-        req.set_timeout(Duration::from_secs(3));
-        cli.cancel_fragment(req)
-            .await
-            .map(|r| r.into_inner())
-            .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn cancel_fragment_async_with_timeout(
-        &self,
-        req: proto::novarocks::CancelFragmentRequest,
-        timeout: Duration,
-    ) -> Result<proto::novarocks::CancelFragmentResponse, String> {
-        let deadline_at = tokio::time::Instant::now() + timeout;
-        let mut client = self
-            .make_deadline_async_client("cancel_fragment", deadline_at)
-            .await?;
-        let mut request = Request::new(req);
-        request.set_timeout(timeout);
-        tokio::time::timeout_at(deadline_at, client.cancel_fragment(request))
-            .await
-            .map_err(|_| "cancel_fragment deadline exceeded".to_string())?
-            .map(|response| response.into_inner())
-            .map_err(|error| format!("cancel_fragment rpc failed: {error}"))
     }
 
     pub async fn heartbeat_async(
@@ -719,115 +619,9 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
 mod pr3_tests {
     use super::*;
 
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::sync_channel;
     use std::time::Instant;
 
-    use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::service::grpc_server::GrpcService;
-
-    pub(super) struct DelayedReportHandler(pub(super) Duration);
-
-    impl NativeReportHandler for DelayedReportHandler {
-        fn handle_native_report(
-            &self,
-            _report: proto::novarocks::ExecStatusReport,
-        ) -> Result<(), NativeReportHandlerError> {
-            std::thread::sleep(self.0);
-            Ok(())
-        }
-    }
-
-    struct CountingReportHandler(Arc<AtomicUsize>);
-
-    impl NativeReportHandler for CountingReportHandler {
-        fn handle_native_report(
-            &self,
-            _report: proto::novarocks::ExecStatusReport,
-        ) -> Result<(), NativeReportHandlerError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    fn spawn_combined_execution_server(report_handler: Arc<dyn NativeReportHandler>) -> SocketAddr {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind combined execution server");
-        let addr = listener
-            .local_addr()
-            .expect("combined execution server address");
-        listener
-            .set_nonblocking(true)
-            .expect("set combined execution listener nonblocking");
-        data_block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener)
-                .expect("create combined execution Tokio listener");
-            let incoming = futures::stream::unfold(listener, |listener| async {
-                let item = listener.accept().await.map(|(stream, _)| stream);
-                Some((item, listener))
-            });
-            let service = GrpcService::with_fragment_execution(
-                crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
-                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
-                report_handler,
-            );
-            tokio::spawn(
-                tonic::transport::Server::builder()
-                    .add_service(
-                        proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service),
-                    )
-                    .serve_with_incoming(incoming),
-            );
-        })
-        .expect("spawn combined execution server");
-        let ready_deadline = Instant::now() + Duration::from_secs(1);
-        while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_err() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "combined execution server did not become ready at {addr}"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        addr
-    }
-
-    fn spawn_delayed_report_server(delay: Duration) -> SocketAddr {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind delayed report server");
-        let addr = listener
-            .local_addr()
-            .expect("delayed report server address");
-        listener
-            .set_nonblocking(true)
-            .expect("set delayed report listener nonblocking");
-        data_block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener)
-                .expect("create delayed report Tokio listener");
-            let incoming = futures::stream::unfold(listener, |listener| async {
-                let item = listener.accept().await.map(|(stream, _)| stream);
-                Some((item, listener))
-            });
-            let service = GrpcService::report_ingress_only(Arc::new(DelayedReportHandler(delay)));
-            tokio::spawn(
-                tonic::transport::Server::builder()
-                    .add_service(
-                        proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service),
-                    )
-                    .serve_with_incoming(incoming),
-            );
-        })
-        .expect("spawn delayed report server");
-        let ready_deadline = Instant::now() + Duration::from_secs(1);
-        while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(20)).is_err() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "delayed report server did not become ready at {addr}"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        addr
-    }
 
     #[test]
     fn remote_client_connect_accepts_socket_addr() {
@@ -854,99 +648,6 @@ mod pr3_tests {
             .expect("connect wrapper should accept IPv6 SocketAddr");
         assert_eq!(client.host, "::1");
         assert_eq!(client.port, 19030);
-    }
-
-    #[test]
-    fn all_in_one_combined_ingress_routes_reports_and_fragments_over_the_socket() {
-        let report_calls = Arc::new(AtomicUsize::new(0));
-        let addr = spawn_combined_execution_server(Arc::new(CountingReportHandler(Arc::clone(
-            &report_calls,
-        ))));
-        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr)
-            .expect("connect all-in-one loopback client");
-
-        let report_response = client
-            .blocking_report_exec_status(proto::novarocks::ReportExecStatusRequest {
-                report: Some(proto::novarocks::ExecStatusReport {
-                    query_id: Some(proto::common::UniqueId { hi: 61, lo: 71 }),
-                    fragment_instance_id: Some(proto::common::UniqueId { hi: 61, lo: 72 }),
-                    status: Some(proto::common::Status::default()),
-                    done: true,
-                    ..Default::default()
-                }),
-            })
-            .expect("loopback report RPC");
-        assert_eq!(report_response.status_code, 0, "{report_response:?}");
-        assert_eq!(report_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn report_exec_status_deadline_bounds_channel_acquisition() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve endpoint");
-        let addr = listener.local_addr().expect("reserved endpoint address");
-        drop(listener);
-        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("test client");
-        let deadline = Duration::from_millis(30);
-        let (started_tx, started_rx) = sync_channel(1);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        set_deadline_channel_acquisition_test_hook(
-            "report_exec_status",
-            format!("{}:{}", addr.ip(), addr.port()),
-            started_tx,
-            release_rx,
-        );
-        let (result_tx, result_rx) = sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            let started_at = Instant::now();
-            let result = client.blocking_report_exec_status_with_timeout(
-                proto::novarocks::ReportExecStatusRequest { report: None },
-                deadline,
-            );
-            result_tx.send((result, started_at.elapsed())).unwrap();
-        });
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("fake channel acquisition starts");
-        let (result, elapsed) = result_rx
-            .recv_timeout(Duration::from_millis(200))
-            .expect("report deadline bounds channel acquisition");
-        drop(release_tx);
-        worker.join().expect("report deadline worker");
-
-        let error = result.expect_err("stalled channel acquisition must exceed the deadline");
-        assert!(
-            error.contains("report_exec_status deadline exceeded during channel acquisition"),
-            "{error}"
-        );
-        assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
-    }
-
-    #[test]
-    fn report_exec_status_deadline_bounds_tonic_request_and_outer_future() {
-        let addr = spawn_delayed_report_server(Duration::from_millis(250));
-        let client = NovaRocksGrpcRemoteClient::connect_blocking(addr).expect("test client");
-        let deadline = Duration::from_millis(30);
-        let started_at = Instant::now();
-
-        let result = client.blocking_report_exec_status_with_timeout(
-            proto::novarocks::ReportExecStatusRequest {
-                report: Some(proto::novarocks::ExecStatusReport::default()),
-            },
-            deadline,
-        );
-        let elapsed = started_at.elapsed();
-
-        let error = result.expect_err("delayed report RPC must exceed the deadline");
-        let lowercase_error = error.to_ascii_lowercase();
-        assert!(
-            error.contains("report_exec_status deadline exceeded during unary RPC")
-                || (error.contains("report_exec_status rpc failed")
-                    && (lowercase_error.contains("deadline")
-                        || lowercase_error.contains("timeout expired"))),
-            "{error}"
-        );
-        assert!(elapsed < Duration::from_millis(200), "elapsed={elapsed:?}");
     }
 }
 
@@ -1030,9 +731,6 @@ pub fn lookup(
 #[cfg(test)]
 mod lookup_tests {
     use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use crate::runtime::global_async_runtime::data_block_on;
     use crate::service::grpc_server::GrpcService;
 
@@ -1057,7 +755,6 @@ mod lookup_tests {
                                 ),
                                 crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(
                                 ),
-                                Arc::new(super::pr3_tests::DelayedReportHandler(Duration::ZERO)),
                             ),
                         ),
                     )

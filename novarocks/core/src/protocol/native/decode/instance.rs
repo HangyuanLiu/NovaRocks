@@ -34,29 +34,19 @@ use super::NativeFragmentDecodeError;
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSubmissionMetadata {
     backend_num: i32,
-    report_endpoint: Option<RuntimeEndpoint>,
     typed_result_sink: bool,
 }
 
 impl NativeSubmissionMetadata {
-    pub(crate) fn new(
-        backend_num: i32,
-        report_endpoint: Option<RuntimeEndpoint>,
-        typed_result_sink: bool,
-    ) -> Self {
+    pub(crate) fn new(backend_num: i32, typed_result_sink: bool) -> Self {
         Self {
             backend_num,
-            report_endpoint,
             typed_result_sink,
         }
     }
 
     pub(crate) fn backend_num(&self) -> i32 {
         self.backend_num
-    }
-
-    pub(crate) fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
-        self.report_endpoint.as_ref()
     }
 
     pub(crate) fn typed_result_sink(&self) -> bool {
@@ -106,13 +96,6 @@ pub(crate) fn decode_query_options(
         },
         spill: decode_spill_config(src, path.field("spill_options"))?,
     })
-}
-
-pub(crate) fn decode_endpoint(src: &str) -> Result<RuntimeEndpoint, NativeFragmentDecodeError> {
-    decode_endpoint_at(
-        src,
-        FieldPath::root("instance_params").field("report_endpoint"),
-    )
 }
 
 pub(crate) fn decode_destinations(

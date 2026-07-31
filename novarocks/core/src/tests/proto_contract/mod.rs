@@ -25,5 +25,4 @@ mod filter;
 mod instance_params;
 mod plan;
 mod release_fixtures;
-mod report;
 mod service;

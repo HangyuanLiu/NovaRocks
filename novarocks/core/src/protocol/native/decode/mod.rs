@@ -29,8 +29,7 @@ pub(crate) use crate::protocol::native::type_mapping::{decode_field_type, decode
 pub(crate) use error::NativeFragmentDecodeError;
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    NativeSubmissionMetadata, decode_destinations, decode_endpoint, decode_query_options,
-    decode_scan_range_params,
+    NativeSubmissionMetadata, decode_destinations, decode_query_options, decode_scan_range_params,
 };
 #[allow(unused_imports)]
 pub(crate) use node::{

@@ -281,7 +281,6 @@ async fn absent_config_opens_disabled_host() {
             .is_none()
     );
     let _query_execution = host.query_execution_service();
-    let _report_handler = host.coordinator_report_handler();
     let _backend_activity = host.backend_query_activity();
     let _backend_event_sink = host.backend_query_event_sink();
     assert!(

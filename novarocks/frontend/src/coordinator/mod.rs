@@ -16,7 +16,6 @@
 // under the License.
 
 mod backend_events;
-mod contract_probe;
 mod execution;
 // Task 5 deliberately lands the lifecycle client seam before Task 6 wires the
 // production transport and Task 7 cuts over coordinator submission.
@@ -28,5 +27,5 @@ mod scheduler;
 
 pub use backend_events::BackendQueryActivity;
 pub use execution::FrontendDistributedQueryCoordinator;
-pub use report::{FrontendCoordinatorReportHandler, FrontendCoordinatorTerminalIngress};
+pub use report::FrontendCoordinatorTerminalIngress;
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,7 @@ use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent, QueryId,
 };
-use novarocks::query_execution::fragment_transport::FragmentDispatcher;
 use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
-use novarocks::query_execution::write::NativeExecutionReport;
 
 type QueryKey = (i64, i64);
 
@@ -60,16 +58,7 @@ struct RetainedTerminalIngress {
 }
 
 struct ActiveQuery {
-    intent: DistributedQueryIntent,
     scheduled_backends: BTreeMap<usize, u64>,
-    attempted: BTreeMap<usize, Vec<UniqueId>>,
-    writer_instances: BTreeMap<UniqueId, i32>,
-    reports: Vec<NativeExecutionReport>,
-    writer_report_indexes: BTreeMap<UniqueId, usize>,
-    reports_sealed: bool,
-    final_report_instances: BTreeSet<UniqueId>,
-    profile_report_instances: BTreeSet<UniqueId>,
-    has_failed_final_report: bool,
     first_failure: Option<String>,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
@@ -116,24 +105,15 @@ impl FrontendQueryRegistry {
     pub(crate) fn register(
         self: &Arc<Self>,
         query_id: QueryId,
-        intent: DistributedQueryIntent,
-        _dispatcher: Arc<dyn FragmentDispatcher>,
+        _intent: DistributedQueryIntent,
+        _dispatcher: Arc<dyn novarocks::query_execution::fragment_transport::FragmentDispatcher>,
     ) -> Result<ActiveQueryGuard, DistributedQueryError> {
         let key = query_key(query_id);
         let mut active = self.active.lock().expect("frontend query registry lock");
         match active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveQuery {
-                    intent,
                     scheduled_backends: BTreeMap::new(),
-                    attempted: BTreeMap::new(),
-                    writer_instances: BTreeMap::new(),
-                    reports: Vec::new(),
-                    writer_report_indexes: BTreeMap::new(),
-                    reports_sealed: false,
-                    final_report_instances: BTreeSet::new(),
-                    profile_report_instances: BTreeSet::new(),
-                    has_failed_final_report: false,
                     first_failure: None,
                     cancellation_requested: false,
                     cancellation_dispatched: false,
@@ -295,66 +275,6 @@ impl FrontendQueryRegistry {
         control.report_terminal_snapshot(snapshot)
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_attempt(
-        &self,
-        query_id: QueryId,
-        backend_idx: usize,
-        finst_id: UniqueId,
-    ) -> Result<(), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        if let Some(message) = query.first_failure.as_ref() {
-            return Err(failed(message.clone()));
-        }
-        if query.cancellation_requested {
-            return Err(failed("frontend query cancellation is already requested"));
-        }
-        query
-            .attempted
-            .entry(backend_idx)
-            .or_default()
-            .push(finst_id);
-        Ok(())
-    }
-
-    /// Registers every execution identity before Stage begins.  This closes
-    /// the race where a just-released worker can report before the frontend
-    /// has recorded its identity.
-    pub(crate) fn set_execution_instances(
-        &self,
-        query_id: QueryId,
-        instances: &[(usize, UniqueId)],
-        writer_identities: &[(UniqueId, i32)],
-    ) -> Result<(), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        if !query.attempted.is_empty() || !query.writer_instances.is_empty() {
-            return Err(contract_violation(
-                "frontend query execution identities are already registered",
-            ));
-        }
-        for &(backend_idx, finst_id) in instances {
-            query
-                .attempted
-                .entry(backend_idx)
-                .or_default()
-                .push(finst_id);
-        }
-        for &(finst_id, sink_id) in writer_identities {
-            if query.writer_instances.insert(finst_id, sink_id).is_some() {
-                return Err(contract_violation(
-                    "frontend query writer registration contains duplicate fragment instance",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn set_scheduled_backend_ownership(
         &self,
         query_id: QueryId,
@@ -479,140 +399,6 @@ impl FrontendQueryRegistry {
         Err(inactive_query(query_id))
     }
 
-    pub(crate) fn record_report(
-        &self,
-        report: NativeExecutionReport,
-    ) -> Result<(), DistributedQueryError> {
-        let query_id = report.query_id();
-        let fragment_instance_id = report.fragment_instance_id();
-        let backend_num = report.backend_num();
-        let has_write_metadata = report.has_write_metadata();
-        let report_failure = report.failure_message().map(ToString::to_string);
-        let (cancellation, report_error) = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let query = active
-                .get_mut(&query_key(query_id))
-                .ok_or_else(|| inactive_query(query_id))?;
-            if query.reports_sealed {
-                return Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::Rejected,
-                    "frontend query report aggregation is already sealed",
-                ));
-            }
-            let was_attempted = query
-                .attempted
-                .values()
-                .any(|instances| instances.contains(&fragment_instance_id));
-            if !was_attempted {
-                return Err(contract_violation(format!(
-                    "frontend query received a report for unattempted fragment instance {}/{}",
-                    fragment_instance_id.hi, fragment_instance_id.lo
-                )));
-            }
-            let expected_writer = query
-                .writer_instances
-                .get(&fragment_instance_id)
-                .is_some_and(|expected_backend_num| *expected_backend_num == backend_num);
-            let unexpected_writer_error = (query.intent == DistributedQueryIntent::Write
-                && !expected_writer
-                && has_write_metadata)
-                .then(|| {
-                    format!(
-                        "unknown writer report with write metadata for query {}/{}, fragment {}/{}",
-                        query_id.high(),
-                        query_id.low(),
-                        fragment_instance_id.hi,
-                        fragment_instance_id.lo
-                    )
-                });
-            let mut conflicting_writer_error = None;
-            if report.is_final() {
-                query.has_failed_final_report |= report.is_failed();
-                match query.intent {
-                    DistributedQueryIntent::Write if expected_writer => {
-                        query.final_report_instances.insert(fragment_instance_id);
-                        if let Some(&index) = query.writer_report_indexes.get(&fragment_instance_id)
-                        {
-                            if !query.reports[index].same_write_report(&report) {
-                                let message =
-                                    "frontend query received conflicting final writer output"
-                                        .to_string();
-                                conflicting_writer_error = Some(message);
-                            }
-                        } else {
-                            query
-                                .writer_report_indexes
-                                .insert(fragment_instance_id, query.reports.len());
-                            query.reports.push(report);
-                        }
-                    }
-                    DistributedQueryIntent::Write => {}
-                    DistributedQueryIntent::Profile if report.has_profile() => {
-                        query.profile_report_instances.insert(fragment_instance_id);
-                        if let Some(existing) = query.reports.iter_mut().find(|existing| {
-                            existing.fragment_instance_id() == report.fragment_instance_id()
-                        }) {
-                            *existing = report;
-                        } else {
-                            query.reports.push(report);
-                        }
-                    }
-                    DistributedQueryIntent::Result | DistributedQueryIntent::Profile => {}
-                }
-            }
-            if let Some(message) = unexpected_writer_error
-                .as_ref()
-                .or(conflicting_writer_error.as_ref())
-            {
-                query.first_failure.get_or_insert_with(|| message.clone());
-            }
-            if let Some(message) = report_failure {
-                query.first_failure.get_or_insert(message);
-            }
-            (
-                query
-                    .first_failure
-                    .is_some()
-                    .then(|| request_cancellation(query)),
-                unexpected_writer_error.or(conflicting_writer_error),
-            )
-        };
-        dispatch_cancellation(cancellation);
-        match report_error {
-            Some(message) => Err(contract_violation(message)),
-            None => Ok(()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_writer_instances(
-        &self,
-        query_id: QueryId,
-        writer_instances: &[(UniqueId, i32)],
-    ) -> Result<(), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        if query.intent != DistributedQueryIntent::Write && !writer_instances.is_empty() {
-            return Err(contract_violation(
-                "non-write frontend query has writer registrations",
-            ));
-        }
-        for &(fragment_instance_id, backend_num) in writer_instances {
-            if query
-                .writer_instances
-                .insert(fragment_instance_id, backend_num)
-                .is_some()
-            {
-                return Err(contract_violation(
-                    "frontend query has duplicate writer fragment instances",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn first_failure(&self, query_id: QueryId) -> Option<String> {
         self.active
             .lock()
@@ -658,60 +444,13 @@ impl FrontendQueryRegistry {
         Ok(message)
     }
 
-    pub(crate) fn seal_and_take_completion(
-        &self,
-        query_id: QueryId,
-    ) -> Result<(Option<String>, Vec<NativeExecutionReport>), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        if query.reports_sealed {
-            return Err(contract_violation(
-                "frontend query reports are already sealed",
-            ));
-        }
-        query.reports_sealed = true;
-        query.writer_report_indexes.clear();
-        Ok((
-            query.first_failure.clone(),
-            std::mem::take(&mut query.reports),
-        ))
-    }
-
-    pub(crate) fn report_progress(
-        &self,
-        query_id: QueryId,
-        expected_instances: &[UniqueId],
-    ) -> Result<(usize, Option<String>, bool), DistributedQueryError> {
-        let active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get(&query_key(query_id))
-            .ok_or_else(|| inactive_query(query_id))?;
-        let completed_instances = match query.intent {
-            DistributedQueryIntent::Profile => &query.profile_report_instances,
-            DistributedQueryIntent::Result | DistributedQueryIntent::Write => {
-                &query.final_report_instances
-            }
-        };
-        let final_count = expected_instances
-            .iter()
-            .filter(|instance| completed_instances.contains(instance))
-            .count();
-        Ok((
-            final_count,
-            query.first_failure.clone(),
-            query.has_failed_final_report,
-        ))
-    }
-
     pub(crate) fn backend_failed(&self, backend_idx: usize, message: String) -> Vec<QueryId> {
         let (affected, cancellations) = {
             let mut active = self.active.lock().expect("frontend query registry lock");
             let mut affected = Vec::new();
             let mut cancellations = Vec::new();
             for (&(high, low), query) in active.iter_mut() {
-                if query.reports_sealed || !query.scheduled_backends.contains_key(&backend_idx) {
+                if !query.scheduled_backends.contains_key(&backend_idx) {
                     continue;
                 }
                 if query.first_failure.is_none() {
@@ -740,9 +479,7 @@ impl FrontendQueryRegistry {
             let mut affected = Vec::new();
             let mut cancellations = Vec::new();
             for (&(high, low), query) in active.iter_mut() {
-                if query.reports_sealed
-                    || query.scheduled_backends.get(&backend_idx) != Some(&old_epoch)
-                {
+                if query.scheduled_backends.get(&backend_idx) != Some(&old_epoch) {
                     continue;
                 }
                 if query.first_failure.is_none() {
@@ -765,9 +502,7 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend query registry lock")
             .values()
-            .any(|query| {
-                !query.reports_sealed && query.scheduled_backends.contains_key(&backend_idx)
-            })
+            .any(|query| query.scheduled_backends.contains_key(&backend_idx))
     }
 
     fn unregister(&self, key: QueryKey) {

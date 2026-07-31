@@ -25,8 +25,8 @@ use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,6 +137,109 @@ fn query_frontend_backend_topology(
 const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
 const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
+const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
+const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
+
+const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 10] = [
+    "stage_active_builders",
+    "stage_encoded_bytes",
+    "stage_dormant_workers",
+    "fragment_controls_reserved",
+    "fragment_controls_running",
+    "native_query_contexts_active",
+    "native_query_contexts_second_chance",
+    "native_query_active_fragments",
+    "native_runtime_filter_services",
+    "connector_query_leases",
+];
+
+const QUERY_EXECUTION_RESOURCE_BINDING_LEASE: &str = "connector_binding_leases";
+const TERMINAL_RETAINED_OUTCOME: &str = "terminal_retained";
+const TERMINAL_RETAINED_BYTES_OUTCOME: &str = "terminal_retained_bytes";
+const TERMINAL_RETAINED_CAPACITY_OUTCOME: &str = "terminal_retained_capacity";
+const TERMINAL_MAX_RETAINED_BYTES_OUTCOME: &str = "terminal_max_retained_bytes";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BackendResourceSnapshot {
+    pub(crate) index: usize,
+    pub(crate) process_running: bool,
+    pub(crate) resources: BTreeMap<String, f64>,
+    pub(crate) terminal_retained: f64,
+    pub(crate) terminal_retained_bytes: f64,
+    pub(crate) terminal_retained_capacity: f64,
+    pub(crate) terminal_max_retained_bytes: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QueryExecutionResourceSnapshot {
+    pub(crate) fe_running: bool,
+    pub(crate) backends: Vec<BackendResourceSnapshot>,
+}
+
+impl QueryExecutionResourceSnapshot {
+    fn convergence_failure(&self, baseline: &Self, permits_terminal_retention: bool) -> Option<String> {
+        if self.backends.len() != baseline.backends.len() {
+            return Some(format!(
+                "backend cardinality changed: before={} current={}",
+                baseline.backends.len(),
+                self.backends.len()
+            ));
+        }
+        let mut deltas = Vec::new();
+        for (before, current) in baseline.backends.iter().zip(&self.backends) {
+            if before.index != current.index {
+                return Some(format!(
+                    "backend ordering changed: before BE[{}] current BE[{}]",
+                    before.index, current.index
+                ));
+            }
+            if !current.process_running {
+                // A killed BE that has not restarted proves heavy-resource release by
+                // process exit; do not misclassify that as a metrics scrape failure.
+                continue;
+            }
+            for (resource, before_value) in &before.resources {
+                let current_value = current.resources.get(resource).copied().unwrap_or(f64::NAN);
+                if current_value != *before_value {
+                    deltas.push(format!(
+                        "BE[{}] {resource}: before={before_value} current={current_value} delta={}",
+                        current.index,
+                        current_value - before_value
+                    ));
+                }
+            }
+            if self.fe_running
+                && !permits_terminal_retention
+                && (current.terminal_retained != before.terminal_retained
+                    || current.terminal_retained_bytes != before.terminal_retained_bytes)
+            {
+                deltas.push(format!(
+                    "BE[{}] terminal retention: before=({}, {}) current=({}, {})",
+                    current.index,
+                    before.terminal_retained,
+                    before.terminal_retained_bytes,
+                    current.terminal_retained,
+                    current.terminal_retained_bytes
+                ));
+            }
+            if (!self.fe_running || permits_terminal_retention)
+                && (current.terminal_retained > current.terminal_retained_capacity
+                    || current.terminal_retained_bytes > current.terminal_max_retained_bytes)
+            {
+                deltas.push(format!(
+                    "BE[{}] terminal retention exceeds published limit: retained=({}, {}) limits=({}, {})",
+                    current.index,
+                    current.terminal_retained,
+                    current.terminal_retained_bytes,
+                    current.terminal_retained_capacity,
+                    current.terminal_max_retained_bytes
+                ));
+            }
+        }
+        (!deltas.is_empty()).then(|| deltas.join("; "))
+    }
+}
 
 fn bounded_backend_topology_timeout(requested: Duration) -> Duration {
     requested.min(BACKEND_TOPOLOGY_TIMEOUT_CAP)
@@ -280,11 +383,128 @@ fn wait_for_live_backend_topology(
     Ok(())
 }
 
+fn scrape_prometheus_metrics(port: u16) -> Result<String> {
+    let address = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect_timeout(
+        &address
+            .parse()
+            .with_context(|| format!("parse BE metrics address {address}"))?,
+        TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+    )
+    .with_context(|| format!("connect BE metrics endpoint {address}"))?;
+    stream
+        .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .context("set BE metrics read timeout")?;
+    stream
+        .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .context("set BE metrics write timeout")?;
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .context("request BE /metrics")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read BE /metrics response")?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("malformed BE /metrics HTTP response")?;
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        bail!(
+            "BE /metrics returned non-success status: {}",
+            headers.lines().next().unwrap_or("<missing status>")
+        );
+    }
+    Ok(body.to_string())
+}
+
+fn prometheus_labeled_gauge(
+    body: &str,
+    metric: &str,
+    label_name: &str,
+    label_value: &str,
+) -> Result<f64> {
+    let label = format!("{label_name}=\"{label_value}\"");
+    let mut values = body
+        .lines()
+        .filter(|line| line.starts_with(metric))
+        .filter(|line| line.contains(&label))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|value| value.parse::<f64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse {metric} label {label}"))?;
+    match values.len() {
+        1 => Ok(values.remove(0)),
+        0 => bail!("missing required {metric}{{{label}}} gauge in BE /metrics"),
+        count => bail!("ambiguous {metric}{{{label}}} gauge in BE /metrics: {count} samples"),
+    }
+}
+
 pub(crate) trait ServerHandle: Send {
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
     fn supports_fault_injection(&self) -> bool {
         false
+    }
+    fn supports_query_execution_resource_oracle(&self) -> bool {
+        false
+    }
+    fn query_execution_resource_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryExecutionResourceSnapshot>> {
+        Ok(None)
+    }
+    fn query_execution_resource_diagnostics(&self) -> String {
+        "resource diagnostics unavailable for this server mode".to_string()
+    }
+    fn await_query_execution_resource_convergence(
+        &mut self,
+        baseline: &QueryExecutionResourceSnapshot,
+        permits_terminal_retention: bool,
+        deadline: Instant,
+    ) -> Result<()> {
+        loop {
+            let current = match self.query_execution_resource_snapshot() {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    let error = anyhow::anyhow!("query execution resource oracle is unavailable");
+                    if Instant::now() >= deadline {
+                        return Err(error.context(self.query_execution_resource_diagnostics()));
+                    }
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(RESOURCE_CONVERGENCE_POLL_INTERVAL),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        return Err(error.context(self.query_execution_resource_diagnostics()));
+                    }
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(RESOURCE_CONVERGENCE_POLL_INTERVAL),
+                    );
+                    continue;
+                }
+            };
+            if let Some(failure) = current.convergence_failure(baseline, permits_terminal_retention) {
+                if Instant::now() < deadline {
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(RESOURCE_CONVERGENCE_POLL_INTERVAL),
+                    );
+                    continue;
+                }
+                bail!(
+                    "query execution resources did not converge before deadline: {failure}; baseline={baseline:?}; current={current:?}; {}",
+                    self.query_execution_resource_diagnostics()
+                );
+            }
+            return Ok(());
+        }
     }
     fn kill_be(&mut self, index: usize) -> Result<()> {
         bail!("BE kill is unsupported by this server mode (index={index})")
@@ -765,7 +985,7 @@ fn render_cross_process_launch_config(
                 runtime_dir
                     .join("query-lifecycle-faults")
                     .to_string_lossy()
-                .into_owned(),
+                    .into_owned(),
             ),
         );
         // The production terminal-retention contract remains 120s.  Runner
@@ -1315,6 +1535,130 @@ impl CrossProcessServerHandle {
         }
         Ok(())
     }
+
+    fn query_execution_resource_snapshot_impl(&mut self) -> Result<QueryExecutionResourceSnapshot> {
+        let fe_running = self
+            .fe_process
+            .is_running()
+            .context("inspect FE process state")?;
+        let mut backends = Vec::with_capacity(self.be_processes.len());
+        for (index, (process, ports)) in self
+            .be_processes
+            .iter()
+            .zip(self.runtime.be.iter())
+            .enumerate()
+        {
+            let process_running = process
+                .is_running()
+                .with_context(|| format!("inspect cross-process BE[{index}] state"))?;
+            if !process_running {
+                backends.push(BackendResourceSnapshot {
+                    index,
+                    process_running,
+                    resources: BTreeMap::new(),
+                    terminal_retained: 0.0,
+                    terminal_retained_bytes: 0.0,
+                    terminal_retained_capacity: 0.0,
+                    terminal_max_retained_bytes: 0.0,
+                });
+                continue;
+            }
+
+            let metrics = scrape_prometheus_metrics(ports.http)
+                .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+            let mut resources = BTreeMap::new();
+            for resource in HEAVY_QUERY_EXECUTION_RESOURCES
+                .into_iter()
+                .chain(std::iter::once(QUERY_EXECUTION_RESOURCE_BINDING_LEASE))
+            {
+                let value = prometheus_labeled_gauge(
+                    &metrics,
+                    QUERY_EXECUTION_RESOURCE_METRIC,
+                    "resource",
+                    resource,
+                )
+                .with_context(|| format!("read BE[{index}] heavy resource {resource}"))?;
+                resources.insert(resource.to_string(), value);
+            }
+            backends.push(BackendResourceSnapshot {
+                index,
+                process_running,
+                resources,
+                terminal_retained: prometheus_labeled_gauge(
+                    &metrics,
+                    QUERY_LIFECYCLE_TERMINAL_METRIC,
+                    "outcome",
+                    TERMINAL_RETAINED_OUTCOME,
+                )
+                .with_context(|| format!("read BE[{index}] terminal retained count"))?,
+                terminal_retained_bytes: prometheus_labeled_gauge(
+                    &metrics,
+                    QUERY_LIFECYCLE_TERMINAL_METRIC,
+                    "outcome",
+                    TERMINAL_RETAINED_BYTES_OUTCOME,
+                )
+                .with_context(|| format!("read BE[{index}] terminal retained bytes"))?,
+                terminal_retained_capacity: prometheus_labeled_gauge(
+                    &metrics,
+                    QUERY_LIFECYCLE_TERMINAL_METRIC,
+                    "outcome",
+                    TERMINAL_RETAINED_CAPACITY_OUTCOME,
+                )
+                .with_context(|| format!("read BE[{index}] terminal retained capacity"))?,
+                terminal_max_retained_bytes: prometheus_labeled_gauge(
+                    &metrics,
+                    QUERY_LIFECYCLE_TERMINAL_METRIC,
+                    "outcome",
+                    TERMINAL_MAX_RETAINED_BYTES_OUTCOME,
+                )
+                .with_context(|| format!("read BE[{index}] terminal retained byte limit"))?,
+            });
+        }
+        Ok(QueryExecutionResourceSnapshot {
+            fe_running,
+            backends,
+        })
+    }
+
+    fn query_execution_resource_diagnostics_impl(&self) -> String {
+        let tail = |contents: Result<String>| match contents {
+            Ok(contents) => contents
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\\n"),
+            Err(error) => format!("<read failed: {error:#}>"),
+        };
+        let fe_state = self
+            .fe_process
+            .is_running()
+            .map(|running| if running { "running" } else { "exited" })
+            .unwrap_or("unknown");
+        let be = self
+            .be_processes
+            .iter()
+            .enumerate()
+            .map(|(index, process)| {
+                let state = process
+                    .is_running()
+                    .map(|running| if running { "running" } else { "exited" })
+                    .unwrap_or("unknown");
+                format!(
+                    "BE[{index}]={state} log_tail={:?}",
+                    tail(process.log_contents())
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "FE={fe_state} log_tail={:?}; {}",
+            tail(self.fe_process.log_contents()),
+            be.join("; ")
+        )
+    }
 }
 
 impl ServerHandle for CrossProcessServerHandle {
@@ -1328,6 +1672,20 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn supports_fault_injection(&self) -> bool {
         true
+    }
+
+    fn supports_query_execution_resource_oracle(&self) -> bool {
+        true
+    }
+
+    fn query_execution_resource_snapshot(
+        &mut self,
+    ) -> Result<Option<QueryExecutionResourceSnapshot>> {
+        self.query_execution_resource_snapshot_impl().map(Some)
+    }
+
+    fn query_execution_resource_diagnostics(&self) -> String {
+        self.query_execution_resource_diagnostics_impl()
     }
 
     fn be_count(&self) -> usize {
@@ -3412,5 +3770,111 @@ exec_node_output = true
             "step-token-17"
         );
         fs::remove_dir_all(dir).expect("cleanup fragment failure test dir");
+    }
+
+    #[test]
+    fn prometheus_labeled_gauge_requires_one_exact_sample() {
+        let metrics = concat!(
+            "novarocks_backend_query_execution_resources{resource=\"stage_active_builders\"} 7\n",
+            "novarocks_backend_query_execution_resources{resource=\"stage_encoded_bytes\"} 11\n",
+        );
+        assert_eq!(
+            prometheus_labeled_gauge(
+                metrics,
+                QUERY_EXECUTION_RESOURCE_METRIC,
+                "resource",
+                "stage_active_builders"
+            )
+            .expect("read exact resource sample"),
+            7.0
+        );
+        assert!(
+            prometheus_labeled_gauge(
+                metrics,
+                QUERY_EXECUTION_RESOURCE_METRIC,
+                "resource",
+                "native_query_contexts_active"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resource_convergence_allows_a_killed_backend_but_not_a_live_leak() {
+        let baseline = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+        let exited = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: false,
+                resources: BTreeMap::new(),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 0.0,
+                terminal_max_retained_bytes: 0.0,
+            }],
+        };
+        assert!(exited.convergence_failure(&baseline, false).is_none());
+
+        let leaked = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 1.0)]),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+        assert!(
+            leaked
+                .convergence_failure(&baseline, false)
+                .expect("live leak must be reported")
+                .contains("native_query_contexts_active")
+        );
+    }
+
+    #[test]
+    fn resource_convergence_allows_bounded_terminal_retention_after_frontend_crash() {
+        let baseline = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+        let retained = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
+                terminal_retained: 2.0,
+                terminal_retained_bytes: 512.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+
+        assert!(retained.convergence_failure(&baseline, true).is_none());
+        assert!(retained.convergence_failure(&baseline, false).is_some());
     }
 }

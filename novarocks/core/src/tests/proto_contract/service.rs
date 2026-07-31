@@ -61,24 +61,6 @@ fn read_varint(bytes: &[u8], offset: &mut usize) -> u64 {
     }
 }
 
-fn sample_exec_status_report() -> novarocks::ExecStatusReport {
-    novarocks::ExecStatusReport {
-        query_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-        fragment_instance_id: Some(common::UniqueId { hi: 3, lo: 4 }),
-        backend_num: 5,
-        status: Some(common::Status {
-            code: 0,
-            message: String::new(),
-        }),
-        done: true,
-        iceberg_commits: Vec::new(),
-        loaded_rows: 0,
-        sink_load_bytes: 0,
-        filtered_rows: 0,
-        profile: None,
-    }
-}
-
 #[test]
 fn fetch_result_response_uses_pre_release_reset_tags() {
     use novarocks::fetch_result_response::Status;
@@ -106,34 +88,5 @@ fn fetch_result_response_uses_pre_release_reset_tags() {
     assert!(
         !fields.contains(&6),
         "pre-release reset must not keep the old eos tag"
-    );
-}
-
-#[test]
-fn exec_status_report_requests_use_pre_release_reset_tags() {
-    let single = novarocks::ReportExecStatusRequest {
-        report: Some(sample_exec_status_report()),
-    };
-    let single_fields = encoded_field_numbers(&single);
-    assert!(
-        single_fields.contains(&1),
-        "native report must use reset tag 1"
-    );
-    assert!(
-        !single_fields.contains(&2),
-        "pre-release reset must not keep the old native report tag 2"
-    );
-
-    let batch = novarocks::BatchReportExecStatusRequest {
-        reports: vec![sample_exec_status_report()],
-    };
-    let batch_fields = encoded_field_numbers(&batch);
-    assert!(
-        batch_fields.contains(&1),
-        "native repeated reports must use reset tag 1"
-    );
-    assert!(
-        !batch_fields.contains(&2),
-        "pre-release reset must not keep the old native reports tag 2"
     );
 }

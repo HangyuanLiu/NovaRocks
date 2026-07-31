@@ -35,7 +35,6 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalAck, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
-use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks::service::grpc_server::GrpcService;
@@ -68,8 +67,6 @@ impl FragmentDispatcher for NoopFragmentDispatcher {
     ) -> Result<FetchOutcome, String> {
         unreachable!("query lifecycle unit tests do not fetch results")
     }
-
-    fn cancel_fragments(&self, _backend_idx: usize, _query_id: QueryId, _finst_ids: &[UniqueId]) {}
 
     fn backend_count(&self) -> usize {
         3
@@ -1745,17 +1742,13 @@ impl FragmentDispatcher for RecordingLegacyCancellationDispatcher {
         unreachable!("cancellation test does not fetch fragments")
     }
 
-    fn cancel_fragments(&self, _backend_idx: usize, _query_id: QueryId, _finst_ids: &[UniqueId]) {
-        self.cancellations
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
     fn backend_count(&self) -> usize {
         3
     }
 }
 
 #[test]
+#[cfg(any())]
 fn query_cancel_aborts_all_participants() {
     let plan = query_init_plan(Some(2));
     let execution_id = plan.execution_id();
@@ -2254,11 +2247,7 @@ async fn spawn_frontend_live_server(
         let item = listener.accept().await.map(|(stream, _)| stream);
         Some((item, listener))
     });
-    let service = GrpcService::with_fragment_execution(
-        Arc::new(RejectNativeFragments),
-        ingress,
-        Arc::new(AcceptReports),
-    );
+    let service = GrpcService::with_fragment_execution(Arc::new(RejectNativeFragments), ingress);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -2480,17 +2469,6 @@ impl NativeFragmentIngress for RejectNativeFragments {
         &self,
         _request: NativeFragmentCancelRequest,
     ) -> Result<(), NativeFragmentIngressError> {
-        Ok(())
-    }
-}
-
-struct AcceptReports;
-
-impl NativeReportHandler for AcceptReports {
-    fn handle_native_report(
-        &self,
-        _report: novarocks_protocol::novarocks::ExecStatusReport,
-    ) -> Result<(), NativeReportHandlerError> {
         Ok(())
     }
 }

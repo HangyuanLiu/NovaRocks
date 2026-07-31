@@ -17,60 +17,17 @@
 
 use std::sync::Arc;
 
-use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use novarocks::query_execution::contract::DistributedQueryErrorKind;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminalIngress, QueryTerminalReportAck,
     QueryTerminalReportOutcome, QueryTerminalSnapshot,
 };
-use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
-use novarocks::query_execution::write::{NativeExecutionReport, decode_native_execution_report};
 
 use super::query_registry::FrontendQueryRegistry;
 
-#[derive(Clone)]
-pub struct FrontendCoordinatorReportHandler {
-    registry: Arc<FrontendQueryRegistry>,
-}
-
-impl FrontendCoordinatorReportHandler {
-    pub(crate) fn new(registry: Arc<FrontendQueryRegistry>) -> Self {
-        Self { registry }
-    }
-
-    pub fn handle_native_report(
-        &self,
-        report: NativeExecutionReport,
-    ) -> Result<(), DistributedQueryError> {
-        self.registry.record_report(report)
-    }
-}
-
-impl NativeReportHandler for FrontendCoordinatorReportHandler {
-    fn handle_native_report(
-        &self,
-        report: novarocks_protocol::novarocks::ExecStatusReport,
-    ) -> Result<(), NativeReportHandlerError> {
-        let report = decode_native_execution_report(report)
-            .map_err(NativeReportHandlerError::contract_violation)?;
-        FrontendCoordinatorReportHandler::handle_native_report(self, report).map_err(|error| {
-            match error.kind() {
-                DistributedQueryErrorKind::Rejected => {
-                    NativeReportHandlerError::query_gone(error.message())
-                }
-                DistributedQueryErrorKind::ContractViolation => {
-                    NativeReportHandlerError::contract_violation(error.message())
-                }
-                DistributedQueryErrorKind::Failed => {
-                    NativeReportHandlerError::failed(error.message())
-                }
-            }
-        })
-    }
-}
-
 /// Typed unary fallback owner for QLC-4 terminal delivery.  It shares the
 /// query registry with stream delivery but is intentionally not a fragment
-/// ReportExecStatus handler.
+/// execution-status handler.
 #[derive(Clone)]
 pub struct FrontendCoordinatorTerminalIngress {
     registry: Arc<FrontendQueryRegistry>,

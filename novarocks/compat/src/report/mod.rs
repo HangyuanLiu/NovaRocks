@@ -137,11 +137,6 @@ impl CompatReportService {
             .get(&finst_id)
             .cloned();
         let Some(instance) = instance else {
-            // The StarRocks fragment adapter can also launch a native
-            // coordinator-destination fragment. Its opaque report handle is
-            // owned by core; this fallback keeps the event adapter neutral
-            // without putting native queue state in compat.
-            novarocks::query_execution::native_fragment_report::report_progress(finst_id);
             return;
         };
         enqueue_progress(&self.reporter, &self.tracking, finst_id, instance);
@@ -361,21 +356,6 @@ pub(crate) fn fetch_query_profile(
     query_id: &str,
 ) -> Result<String, String> {
     crate::frontend_rpc::fetch_query_profile(coord, query_id)
-}
-
-pub(crate) fn register_novarocks_report(
-    registration: FragmentReportRegistration,
-    endpoint: novarocks::runtime::endpoint::RuntimeEndpoint,
-) {
-    novarocks::query_execution::native_fragment_report::register(registration, endpoint);
-}
-
-pub(crate) fn unregister_novarocks_report(finst_id: UniqueId) {
-    novarocks::query_execution::native_fragment_report::unregister(finst_id);
-}
-
-pub(crate) fn report_novarocks_terminal(finst_id: UniqueId, terminal: FragmentTerminalReport) {
-    novarocks::query_execution::native_fragment_report::report_terminal(finst_id, terminal);
 }
 
 pub(crate) fn new_report_service() -> Arc<CompatReportService> {

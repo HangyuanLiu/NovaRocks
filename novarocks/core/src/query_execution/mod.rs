@@ -21,18 +21,14 @@ pub mod backend;
 pub mod cancellation;
 mod connector_binding;
 pub mod contract;
-#[cfg(feature = "query-execution-contract-test-support")]
-pub mod contract_test_support;
 pub mod control;
 pub mod fragment_transport;
 #[cfg(test)]
 pub(crate) mod in_process_test;
 pub mod lifecycle;
-pub mod native_fragment_report;
 pub(crate) mod outcome;
 pub(crate) mod preparation;
 pub(crate) mod profile;
-pub mod report;
 pub mod request_context;
 mod runtime_filter;
 pub(crate) mod schedule;

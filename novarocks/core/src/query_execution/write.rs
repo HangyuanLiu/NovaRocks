@@ -20,31 +20,16 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
-use crate::proto::{common, novarocks};
+use crate::proto::novarocks;
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::{FragmentTerminalOutcome, FragmentTerminalSnapshot};
-use crate::runtime::profile::RuntimeProfileTree;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct WriterKey {
     pub(crate) query_id: UniqueId,
     pub(crate) fragment_instance_id: UniqueId,
     pub(crate) backend_num: i32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FragmentExecStatusReport {
-    pub(crate) query_id: UniqueId,
-    pub(crate) fragment_instance_id: UniqueId,
-    pub(crate) backend_num: i32,
-    pub(crate) done: bool,
-    pub(crate) status: common::Status,
-    pub(crate) iceberg_commits: Vec<novarocks::IcebergCommitInfo>,
-    pub(crate) load_counters: BTreeMap<String, String>,
-    pub(crate) loaded_rows: i64,
-    pub(crate) loaded_bytes: i64,
-    pub(crate) filtered_rows: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,173 +64,6 @@ impl WriteAbortInput {
     }
 }
 
-/// Neutral frontend-facing report value decoded by core from native wire data.
-/// Native protobuf fields and runtime cleanup capabilities are not exposed.
-pub struct NativeExecutionReport {
-    write: FragmentExecStatusReport,
-    profile: Option<RuntimeProfileTree>,
-}
-
-impl NativeExecutionReport {
-    pub fn query_id(&self) -> crate::query_execution::contract::QueryId {
-        crate::query_execution::contract::QueryId::new(
-            self.write.query_id.hi,
-            self.write.query_id.lo,
-        )
-    }
-
-    pub fn fragment_instance_id(&self) -> UniqueId {
-        self.write.fragment_instance_id
-    }
-
-    pub fn backend_num(&self) -> i32 {
-        self.write.backend_num
-    }
-
-    pub fn is_final(&self) -> bool {
-        self.write.done
-    }
-
-    pub fn is_failed(&self) -> bool {
-        self.write.status.code != 0
-    }
-
-    pub fn has_profile(&self) -> bool {
-        self.profile.is_some()
-    }
-
-    pub fn has_write_metadata(&self) -> bool {
-        !self.write.iceberg_commits.is_empty()
-    }
-
-    pub fn same_write_report(&self, other: &Self) -> bool {
-        self.write == other.write
-    }
-
-    pub fn failure_message(&self) -> Option<&str> {
-        self.is_failed()
-            .then_some(if self.write.status.message.is_empty() {
-                "native fragment execution failed"
-            } else {
-                self.write.status.message.as_str()
-            })
-    }
-
-    pub(crate) fn into_parts(self) -> (FragmentExecStatusReport, Option<RuntimeProfileTree>) {
-        (self.write, self.profile)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_in_process_runtime(
-        query_id: UniqueId,
-        fragment_instance_id: UniqueId,
-        backend_num: i32,
-        snapshot: crate::runtime::sink_commit::SinkCommitReportSnapshot,
-        profile: Option<RuntimeProfileTree>,
-    ) -> Self {
-        let mut loaded_rows = snapshot.load_stats.loaded_rows.max(0);
-        let mut loaded_bytes = snapshot.load_stats.loaded_bytes.max(0);
-        for commit in &snapshot.iceberg_commits {
-            if let Some(file) = commit.iceberg_data_file.as_ref() {
-                loaded_rows =
-                    loaded_rows.saturating_add(file.record_count.unwrap_or_default().max(0));
-                loaded_bytes =
-                    loaded_bytes.saturating_add(file.file_size_in_bytes.unwrap_or_default().max(0));
-            }
-        }
-        Self {
-            write: FragmentExecStatusReport {
-                query_id,
-                fragment_instance_id,
-                backend_num,
-                done: true,
-                status: common::Status {
-                    code: 0,
-                    message: String::new(),
-                },
-                iceberg_commits: snapshot.iceberg_commits,
-                load_counters: BTreeMap::new(),
-                loaded_rows,
-                loaded_bytes,
-                filtered_rows: snapshot.load_stats.filtered_rows.max(0),
-            },
-            profile,
-        }
-    }
-
-    #[cfg(feature = "query-execution-contract-test-support")]
-    pub(crate) fn for_contract_test(
-        query_id: UniqueId,
-        fragment_instance_id: UniqueId,
-        backend_num: i32,
-        status: common::Status,
-        profile: Option<RuntimeProfileTree>,
-    ) -> Self {
-        Self {
-            write: FragmentExecStatusReport {
-                query_id,
-                fragment_instance_id,
-                backend_num,
-                done: true,
-                status,
-                iceberg_commits: Vec::new(),
-                load_counters: BTreeMap::new(),
-                loaded_rows: 1,
-                loaded_bytes: 8,
-                filtered_rows: 0,
-            },
-            profile,
-        }
-    }
-
-    #[cfg(feature = "query-execution-contract-test-support")]
-    pub(crate) fn for_contract_test_with_write_metadata(
-        query_id: UniqueId,
-        fragment_instance_id: UniqueId,
-        backend_num: i32,
-        done: bool,
-    ) -> Self {
-        let mut report = Self::for_contract_test(
-            query_id,
-            fragment_instance_id,
-            backend_num,
-            common::Status {
-                code: 0,
-                message: String::new(),
-            },
-            None,
-        );
-        report
-            .write
-            .iceberg_commits
-            .push(novarocks::IcebergCommitInfo::default());
-        report.write.done = done;
-        report
-    }
-
-    #[cfg(feature = "query-execution-contract-test-support")]
-    pub fn successful_terminal_snapshot_for_contract_test(
-        &self,
-    ) -> Result<FragmentTerminalSnapshot, crate::query_execution::lifecycle::QueryLifecycleError>
-    {
-        FragmentTerminalSnapshot::new(
-            self.write.fragment_instance_id,
-            self.write.backend_num,
-            FragmentTerminalOutcome::Succeeded,
-            crate::runtime::sink_commit::SinkCommitReportSnapshot {
-                iceberg_commits: self.write.iceberg_commits.clone(),
-                load_stats: crate::runtime::sink_commit::SinkLoadStats {
-                    loaded_rows: self.write.loaded_rows,
-                    loaded_bytes: self.write.loaded_bytes,
-                    filtered_rows: self.write.filtered_rows,
-                },
-                ..Default::default()
-            },
-            self.profile.clone(),
-        )
-    }
-}
-
 pub struct WriteReportOutcome {
     commit: Option<WriteCommitInput>,
     abort: Option<WriteAbortInput>,
@@ -263,14 +81,14 @@ impl WriteReportOutcome {
 
 /// Pure consuming builder from neutral native reports to the intent-safe write
 /// completion payload.
-pub struct WriteReportBuilder {
+pub struct WriteTerminalBuilder {
     write_id: UniqueId,
     expected: BTreeMap<WriterKey, (usize, u32)>,
     completed: BTreeMap<WriterKey, WriterCommitInput>,
     failure: Option<String>,
 }
 
-impl WriteReportBuilder {
+impl WriteTerminalBuilder {
     pub fn new(registrations: WriterRegistrationSet) -> Result<Self, DistributedQueryError> {
         let registrations = registrations.into_registrations();
         let write_id = registrations
@@ -306,63 +124,7 @@ impl WriteReportBuilder {
         })
     }
 
-    pub fn apply(&mut self, report: NativeExecutionReport) -> Result<(), DistributedQueryError> {
-        let (report, _) = report.into_parts();
-        let key = WriterKey {
-            query_id: report.query_id,
-            fragment_instance_id: report.fragment_instance_id,
-            backend_num: report.backend_num,
-        };
-        let Some((writer_id, fragment_id)) = self.expected.get(&key).copied() else {
-            self.failure.get_or_insert_with(|| {
-                format!(
-                    "native report references an unregistered writer {}/{}",
-                    key.fragment_instance_id.hi, key.fragment_instance_id.lo
-                )
-            });
-            return Ok(());
-        };
-        if !report.done {
-            self.failure
-                .get_or_insert_with(|| "write report builder requires final native reports".into());
-            return Ok(());
-        }
-        if report.status.code != 0 {
-            self.failure.get_or_insert_with(|| {
-                if report.status.message.is_empty() {
-                    format!("native writer failed with status {}", report.status.code)
-                } else {
-                    report.status.message
-                }
-            });
-            return Ok(());
-        }
-        let output = WriterCommitInput {
-            writer_id,
-            fragment_id,
-            writer_key: key.clone(),
-            iceberg_commits: report.iceberg_commits,
-            load_counters: report.load_counters,
-            loaded_rows: report.loaded_rows,
-            loaded_bytes: report.loaded_bytes,
-            filtered_rows: report.filtered_rows,
-        };
-        if let Some(existing) = self.completed.get(&key) {
-            if existing == &output {
-                return Ok(());
-            }
-            self.failure.get_or_insert_with(|| {
-                "write report builder received conflicting final writer output".into()
-            });
-            return Ok(());
-        }
-        self.completed.insert(key, output);
-        Ok(())
-    }
-
-    /// Applies an immutable QLC-4 terminal fact.  Native `ReportExecStatus`
-    /// remains a compatibility observation stream; it is intentionally not
-    /// needed to decide whether a writer completed.
+    /// Applies an immutable QLC-4 terminal fact.
     pub fn apply_terminal(
         &mut self,
         fragment: &FragmentTerminalSnapshot,
@@ -456,56 +218,4 @@ impl WriteReportBuilder {
 
 fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
-}
-
-pub(crate) fn unique_id_from_native(
-    id: Option<common::UniqueId>,
-    missing_message: &'static str,
-) -> Result<UniqueId, String> {
-    let id = id.ok_or_else(|| missing_message.to_string())?;
-    Ok(UniqueId {
-        hi: id.hi,
-        lo: id.lo,
-    })
-}
-
-pub(crate) fn report_from_native(
-    report: novarocks::ExecStatusReport,
-) -> Result<FragmentExecStatusReport, String> {
-    Ok(FragmentExecStatusReport {
-        query_id: unique_id_from_native(report.query_id, "ExecStatusReport missing query_id")?,
-        fragment_instance_id: unique_id_from_native(
-            report.fragment_instance_id,
-            "ExecStatusReport missing fragment_instance_id",
-        )?,
-        backend_num: report.backend_num,
-        done: report.done,
-        status: report.status.unwrap_or(common::Status {
-            code: 1,
-            message: "ExecStatusReport missing status".to_string(),
-        }),
-        iceberg_commits: report.iceberg_commits,
-        load_counters: BTreeMap::new(),
-        loaded_rows: report.loaded_rows,
-        loaded_bytes: report.sink_load_bytes,
-        filtered_rows: report.filtered_rows,
-    })
-}
-
-/// Decode the native report wire DTO into the frontend-owned coordinator value.
-///
-/// The protobuf remains a transport concern while role crates receive the
-/// capability-safe value used by the distributed-query contract.
-pub fn decode_native_execution_report(
-    report: novarocks::ExecStatusReport,
-) -> Result<NativeExecutionReport, String> {
-    let profile = report
-        .profile
-        .as_ref()
-        .map(RuntimeProfileTree::from_proto)
-        .transpose()?;
-    Ok(NativeExecutionReport {
-        write: report_from_native(report)?,
-        profile,
-    })
 }

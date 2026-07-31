@@ -273,7 +273,7 @@ impl QueryTerminalReportAck {
 }
 
 /// FE-owned ingress for immutable terminal snapshots.  It is intentionally
-/// distinct from fragment `NativeReportHandler` and from FE-to-BE lifecycle RPCs.
+/// distinct from FE-to-BE lifecycle RPCs.
 pub trait QueryTerminalIngress: Send + Sync + 'static {
     fn report_query_terminal(
         &self,

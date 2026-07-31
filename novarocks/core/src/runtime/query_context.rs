@@ -783,6 +783,14 @@ pub struct QueryContextManager {
     stopped: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeQueryExecutionResourceSnapshot {
+    pub active_contexts: usize,
+    pub second_chance_contexts: usize,
+    pub active_fragments: usize,
+    pub runtime_filter_services: usize,
+}
+
 fn runtime_filter_terminal_now(_inner: &QueryContextManagerInner) -> Instant {
     #[cfg(test)]
     if let Some(now) = _inner.runtime_filter_terminal_now {
@@ -911,6 +919,31 @@ pub(crate) struct StarRocksQueryHandoff {
 }
 
 impl QueryContextManager {
+    pub fn native_execution_resource_snapshot(&self) -> NativeQueryExecutionResourceSnapshot {
+        let inner = self.inner.lock().expect("query context manager lock");
+        let mut snapshot = NativeQueryExecutionResourceSnapshot::default();
+        for context in inner.active.values() {
+            if matches!(
+                context.execution_generation,
+                QueryContextGeneration::Native(_)
+            ) {
+                snapshot.active_contexts += 1;
+                snapshot.active_fragments += context.num_active_fragments;
+                snapshot.runtime_filter_services += 1;
+            }
+        }
+        for context in inner.second_chance.values() {
+            if matches!(
+                context.execution_generation,
+                QueryContextGeneration::Native(_)
+            ) {
+                snapshot.second_chance_contexts += 1;
+                snapshot.active_fragments += context.num_active_fragments;
+                snapshot.runtime_filter_services += 1;
+            }
+        }
+        snapshot
+    }
     fn new() -> Arc<Self> {
         let manager = Arc::new(Self {
             inner: Mutex::new(QueryContextManagerInner::default()),
@@ -3295,7 +3328,7 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         err: String,
     ) -> Vec<UniqueId> {
-        let (cancellation, finsts) = {
+        let (cancellation, finsts, detached_native_context) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let query_id = execution.query_id();
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
@@ -3309,12 +3342,24 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            (cancellation, finsts)
+            let detached_native_context = (execution.native_attempt_id().is_some()
+                && finsts.is_empty()
+                && guard.active.get(&query_id).is_some_and(|context| {
+                    context.matches_execution(execution) && context.num_active_fragments == 0
+                }))
+            .then(|| guard.active.remove(&query_id))
+            .flatten();
+            (cancellation, finsts, detached_native_context)
         };
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(execution.query_id(), cancellation);
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
+        }
+        if let Some(context) = detached_native_context {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(execution.query_id());
         }
         finsts
     }
@@ -3482,6 +3527,20 @@ impl QueryContextManager {
         if !no_active_fragments {
             guard.active.insert(query_id, ctx);
             return FragmentFinishReportDecision::default();
+        }
+        // Native lifecycle completion has already transferred its terminal fact
+        // into the control plane. Do not retain the heavy execution context for
+        // a legacy report-delivery retry window: a later attempt for the same
+        // query id must be able to own the slot independently.
+        if execution.is_some_and(|execution| execution.native_attempt_id().is_some()) {
+            let decision = FragmentFinishReportDecision {
+                include_runtime_filter_profile: true,
+                remove_runtime_filter_lifecycle_after_report: true,
+            };
+            drop(guard);
+            ctx.runtime_filter_service().shutdown();
+            drop(ctx);
+            return decision;
         }
         if ctx.runtime_filter_cancel_is_retained(runtime_filter_terminal_now(&guard)) {
             ctx.extend_delivery_lifetime();

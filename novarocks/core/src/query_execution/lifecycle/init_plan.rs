@@ -75,7 +75,6 @@ pub struct QueryInitOptions {
     query_deadline_unix_ms: u64,
     pre_start_timeout: Duration,
     report_endpoint: QueryControlEndpoint,
-    needs_fragment_status_report: bool,
 }
 
 impl QueryInitOptions {
@@ -89,7 +88,6 @@ impl QueryInitOptions {
         query_deadline_unix_ms: u64,
         pre_start_timeout: Duration,
         report_endpoint: CoordinatorReportEndpoint,
-        needs_fragment_status_report: bool,
     ) -> Result<Self, DistributedQueryError> {
         if live_backends.is_empty() {
             return Err(contract_error(
@@ -147,7 +145,6 @@ impl QueryInitOptions {
             query_deadline_unix_ms,
             pre_start_timeout,
             report_endpoint,
-            needs_fragment_status_report,
         })
     }
 
@@ -171,16 +168,9 @@ impl QueryInitOptions {
         &self,
     ) -> Result<crate::query_execution::artifact::NativeSubmissionContext, DistributedQueryError>
     {
-        let report_endpoint = RuntimeEndpoint::new(
-            self.report_endpoint.host(),
-            i32::from(self.report_endpoint.port()),
-        )
-        .map_err(contract_error)?;
         Ok(crate::query_execution::artifact::NativeSubmissionContext {
             query_id: self.execution_id.query_id(),
             options: self.query_options.clone(),
-            report_endpoint,
-            needs_fragment_status_report: self.needs_fragment_status_report,
         })
     }
 }
@@ -703,7 +693,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid init options");
 
@@ -749,7 +738,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid init options");
 
@@ -797,7 +785,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid restarted snapshot");
 
@@ -831,7 +818,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid init options");
 
@@ -872,7 +858,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid init options");
 
@@ -898,7 +883,6 @@ mod tests {
             CoordinatorReportEndpoint::from_socket_addr(
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
-            false,
         )
         .expect("valid changed options");
         let deadline_error =

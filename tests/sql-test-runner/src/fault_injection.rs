@@ -170,6 +170,13 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.query_control_fragment_backend_limit.is_some()
 }
 
+/// A frontend crash may leave bounded terminal delivery records after the FE
+/// process is restarted. They are not execution resources and must therefore
+/// be checked against their published limits rather than a pre-fault zero.
+pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
+    meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some()
+}
+
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
     let fragment_fault_count = [
         meta.kill_be_index.is_some(),
@@ -206,9 +213,12 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     .into_iter()
     .filter(|configured| *configured)
     .count();
-    if lifecycle_fault_count > 1 {
+    let start_ack_and_terminal_ack_compound = meta.suppress_start_ack_be_index.is_some()
+        && meta.drop_next_terminal_ack_be_index.is_some()
+        && lifecycle_fault_count == 2;
+    if lifecycle_fault_count > 1 && !start_ack_and_terminal_ack_compound {
         bail!(
-            "a SQL step may configure at most one query lifecycle fault directive; hold_start_until_early_ingress is schedule-shaping and may be combined"
+            "a SQL step may configure at most one query lifecycle fault directive; hold_start_until_early_ingress is schedule-shaping and persistent StartAck suppression may be combined with one TerminalAck drop"
         );
     }
 
@@ -1382,6 +1392,29 @@ mod tests {
             vec![
                 "arm-start-ack-drop:1".to_string(),
                 "arm-hold-start-until-early-ingress".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_start_ack_suppression_may_compose_with_terminal_ack_drop() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            suppress_start_ack_be_index: Some(2),
+            drop_next_terminal_ack_be_index: Some(1),
+            query_control_fragment_backend_limit: Some(2),
+            ..QueryMeta::default()
+        };
+
+        apply_pre_query(&meta, &mut server)
+            .expect("QLC composite Start/Terminal ACK fault may compose");
+
+        assert_eq!(
+            server.events,
+            vec![
+                "arm-start-ack-suppress:2".to_string(),
+                "arm-terminal-ack-drop:1".to_string(),
+                "arm-fragment-limit:2".to_string(),
             ]
         );
     }

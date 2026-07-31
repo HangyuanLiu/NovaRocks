@@ -219,7 +219,6 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         per_exch_num_senders: HashMap::new(),
         destinations: vec![destination()],
         query_options: Some(query_options()),
-        report_endpoint: Some("10.0.0.10:9070".to_string()),
         typed_result_sink: true,
     };
     let params_fields = encoded_field_numbers(&params);
@@ -228,8 +227,8 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         "InstanceParams tag 7 is a permanent runtime_filter_params tombstone"
     );
     assert!(
-        params_fields.contains(&9),
-        "InstanceParams endpoint reporting field must keep tag 9 stable"
+        !params_fields.contains(&9),
+        "InstanceParams tag 9 is a permanent native report field tombstone"
     );
 }
 
@@ -256,7 +255,6 @@ fn instance_params_survives_proto_roundtrip() {
         per_exch_num_senders: HashMap::from([(20, 3)]),
         destinations: vec![destination()],
         query_options: Some(query_options()),
-        report_endpoint: Some("10.0.0.10:9070".to_string()),
         typed_result_sink: true,
     };
 
@@ -284,7 +282,6 @@ fn stage_fragment_request_carries_native_fields_only() {
                 per_exch_num_senders: HashMap::new(),
                 destinations: vec![destination()],
                 query_options: Some(query_options()),
-                report_endpoint: Some("10.0.0.10:9070".to_string()),
                 typed_result_sink: true,
             }),
         }],

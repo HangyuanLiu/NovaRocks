@@ -27,7 +27,7 @@ pub use crate::query_execution::outcome::DistributedQueryOutcome;
 pub use crate::query_execution::outcome::FragmentProfileSet;
 pub use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::preparation::PreparedFragmentSet;
-pub use crate::query_execution::profile::ProfileReportBuilder;
+pub use crate::query_execution::profile::ProfileTerminalBuilder;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
 

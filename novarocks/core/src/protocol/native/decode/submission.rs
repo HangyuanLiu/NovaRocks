@@ -72,7 +72,6 @@ struct DecodedNativeInstanceParts {
     pipeline_dop: NonZeroUsize,
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
     exchange_inputs: ExchangeInputAssignments,
-    report_endpoint: Option<crate::runtime::endpoint::RuntimeEndpoint>,
     typed_result_sink: bool,
 }
 
@@ -174,7 +173,6 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     );
     let metadata = NativeSubmissionMetadata::new(
         instance_parts.backend_num.get(),
-        instance_parts.report_endpoint.clone(),
         instance_parts.typed_result_sink,
     );
     let instance = FragmentInstanceSpec::new_native(
@@ -396,12 +394,6 @@ fn decode_instance_parts(
             ExchangeInputAssignment::new(count),
         );
     }
-    let report_endpoint = src
-        .report_endpoint
-        .as_deref()
-        .map(super::decode_endpoint)
-        .transpose()?;
-
     Ok(DecodedNativeInstanceParts {
         query_id: query_id_from_native(query_id),
         fragment_instance_id: FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
@@ -410,7 +402,6 @@ fn decode_instance_parts(
         pipeline_dop,
         raw_scan_ranges,
         exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-        report_endpoint,
         typed_result_sink: src.typed_result_sink,
     })
 }

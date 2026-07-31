@@ -6,22 +6,6 @@ use novarocks::runtime::profile::Profiler;
 
 use crate::query_lifecycle::QueryLifecycleRegistry;
 
-pub(crate) fn native_fragment_event_sink() -> Arc<dyn FragmentEventSink> {
-    Arc::new(NativeFragmentEventSink)
-}
-
-struct NativeFragmentEventSink;
-
-impl FragmentEventSink for NativeFragmentEventSink {
-    fn record(&self, event: FragmentEvent) {
-        if let FragmentEvent::Progress(progress) = event {
-            novarocks::query_execution::native_fragment_report::report_progress(
-                progress.fragment_instance_id(),
-            );
-        }
-    }
-}
-
 /// Native lifecycle observations are emitted from the same progress sampling
 /// tick as the pipeline. The control-stream registry owns sequencing and the
 /// latest-only transport slot; this adapter never blocks a driver.

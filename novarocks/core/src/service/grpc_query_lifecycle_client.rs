@@ -710,7 +710,6 @@ mod tests {
         QueryLifecycleErrorCode, QueryLifecycleIngress, QueryLifecycleTarget,
         QueryLifecycleTransportErrorKind, QueryTerminationAck, QueryTerminationReason,
     };
-    use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::runtime::query_options::QueryOptions;
     use crate::service::grpc_client::QueryLifecycleRpcError;
     use crate::service::grpc_server::{GrpcService, rejecting_test_native_fragment_ingress};
@@ -802,7 +801,6 @@ mod tests {
         let (address, shutdown, server) = spawn_loopback(GrpcService::with_fragment_execution(
             rejecting_test_native_fragment_ingress(),
             ingress.clone(),
-            Arc::new(AcceptingReportHandler),
         ))
         .await;
         let live = LiveBackendTarget::new(7, address, 77);
@@ -903,7 +901,6 @@ mod tests {
         let (address, shutdown, server) = spawn_loopback(GrpcService::with_fragment_execution(
             rejecting_test_native_fragment_ingress(),
             ingress,
-            Arc::new(AcceptingReportHandler),
         ))
         .await;
         let live = LiveBackendTarget::new(7, address, 88);
@@ -1029,17 +1026,6 @@ mod tests {
                 .expect("serve loopback");
         });
         (address, shutdown_tx, server)
-    }
-
-    struct AcceptingReportHandler;
-
-    impl NativeReportHandler for AcceptingReportHandler {
-        fn handle_native_report(
-            &self,
-            _report: crate::proto::novarocks::ExecStatusReport,
-        ) -> Result<(), NativeReportHandlerError> {
-            Ok(())
-        }
     }
 
     #[derive(Default)]

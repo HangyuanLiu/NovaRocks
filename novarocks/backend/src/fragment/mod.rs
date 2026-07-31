@@ -23,7 +23,7 @@ mod lookup_io;
 mod result_io;
 mod service;
 
-pub(crate) use event_io::{lifecycle_fragment_event_sink, native_fragment_event_sink};
+pub(crate) use event_io::lifecycle_fragment_event_sink;
 pub(crate) use io::grpc_exchange_transmitter;
 pub(crate) use lookup_io::grpc_fragment_lookup_client;
 pub(crate) use result_io::native_result_writer;
