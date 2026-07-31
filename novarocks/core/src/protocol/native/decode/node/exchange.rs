@@ -128,7 +128,7 @@ pub(super) fn lower_exchange_receiver(
             }
         }
         plan::exchange_flavor::Kind::TopnSplit(topn) => {
-            let order_by = sort::lower_sort_items(
+            let order_by = sort::lower_sort_items_with_context(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
                 path.clone()
@@ -137,6 +137,7 @@ pub(super) fn lower_exchange_receiver(
                     .field("items"),
                 arena,
                 &lowered.layout,
+                ctx,
             )?;
             let limit = NativeFragmentDecodeError::map_invalid(
                 path.clone()

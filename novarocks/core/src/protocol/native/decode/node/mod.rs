@@ -1709,7 +1709,7 @@ fn lower_physical_node(
             ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
-            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
+            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena, ctx)
         }
         plan::plan_node::Kind::SetOp(set_op) => set_op::lower_set_op_node(
             node,
