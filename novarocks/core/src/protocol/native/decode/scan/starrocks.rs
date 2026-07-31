@@ -97,7 +97,7 @@ pub(super) fn lower_starrocks_scan(
             ctx.query_options()
                 .and_then(|options| options.exec_mem_limit),
         )?;
-        let predicate = lower_scan_predicate(scan, arena, &layout)?;
+        let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
         let min_max_predicates = predicate
             .map(|root| {
                 super::super::expr::extract_min_max_predicates(arena, root, output_schema.as_ref())

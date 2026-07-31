@@ -46,7 +46,7 @@ use crate::runtime::query_context::QueryId;
 use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
 use super::{
     NativeFragmentDecodeError, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
-    decode_fragment_sink_assignment, decode_fragment_sink_program,
+    decode_fragment_sink_assignment, decode_fragment_sink_program_with_context,
     decode_node_with_runtime_filters, decode_query_options,
 };
 
@@ -272,7 +272,8 @@ where
         arena,
         root: decoded_root.node,
     };
-    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
+    let sink_program =
+        decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;

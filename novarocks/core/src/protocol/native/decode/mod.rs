@@ -41,7 +41,10 @@ pub(in crate::protocol::native) use runtime_filter::{
     decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
     decode_runtime_filter_logical_domain_and_reduction,
 };
-pub(crate) use sink::{decode_fragment_sink_assignment, decode_fragment_sink_program};
+pub(crate) use sink::{
+    decode_fragment_sink_assignment, decode_fragment_sink_program,
+    decode_fragment_sink_program_with_context,
+};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use submission::decode_fragment_submission;
