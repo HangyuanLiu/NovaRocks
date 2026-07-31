@@ -3405,6 +3405,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("scan leaf binding");
         let ExecNodeKind::Scan(scan) = &lowered.node.kind else {
@@ -3444,6 +3445,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("exchange leaf binding");
         let ExecNodeKind::ExchangeSource(exchange) = &lowered.node.kind else {
@@ -3491,6 +3493,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("exchange leaf binding");
 
@@ -3515,6 +3518,7 @@ mod tests {
             &mut children,
             &mut arena,
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("attach");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
@@ -3537,6 +3541,7 @@ mod tests {
             &mut children,
             &mut arena,
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("unique left input");
         assert!(matches!(
@@ -3561,6 +3566,7 @@ mod tests {
                 &mut children,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );
@@ -3576,6 +3582,7 @@ mod tests {
                 &mut children,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );
@@ -3599,6 +3606,7 @@ mod tests {
             &mut children,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("filter input boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
@@ -3620,6 +3628,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("values source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
@@ -3652,6 +3661,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("generate series source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
@@ -3679,6 +3689,7 @@ mod tests {
                 &mut lowered,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );
