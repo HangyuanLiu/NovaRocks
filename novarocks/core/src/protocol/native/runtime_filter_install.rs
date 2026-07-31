@@ -45,15 +45,15 @@ use crate::runtime_filter::port::routing::{
 };
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
 
-use super::decode::{
-    decode_runtime_filter_activation, decode_runtime_filter_capability,
-    decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
-    decode_runtime_filter_logical_domain_and_reduction,
-};
 use super::encode::plan::{
     encode_runtime_filter_activation, encode_runtime_filter_capability,
     encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
     encode_runtime_filter_logical_domain, encode_runtime_filter_reduction_requirement,
+};
+use super::runtime_filter_contract_codec::{
+    decode_runtime_filter_activation, decode_runtime_filter_capability,
+    decode_runtime_filter_completion, decode_runtime_filter_contribution_kind,
+    decode_runtime_filter_logical_domain_and_reduction,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

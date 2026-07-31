@@ -21,9 +21,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
-use super::{DecodedNode, sort};
+use super::super::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -44,6 +43,7 @@ pub(super) fn lower_window_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     if window.window_exprs.is_empty() {
@@ -66,14 +66,9 @@ pub(super) fn lower_window_node(
             "WindowNode output_columns missing",
         ));
     }
-    let final_layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let final_output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let final_layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let final_output_schema = output_layout.chunk_schema();
 
     let groups = group_window_exprs_by_spec(&window.window_exprs);
     if groups.is_empty() {
@@ -103,6 +98,7 @@ pub(super) fn lower_window_node(
                 path.clone().field("window_exprs").index(first_idx),
                 current,
                 arena,
+                ctx,
             )?;
             next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
                 NativeFragmentDecodeError::out_of_range(
@@ -131,7 +127,7 @@ pub(super) fn lower_window_node(
             .iter()
             .enumerate()
             .map(|(idx, expr)| {
-                decode_expr_at(
+                ctx.decode_expression(
                     expr,
                     path.clone()
                         .field("window_exprs")
@@ -160,7 +156,7 @@ pub(super) fn lower_window_node(
                         format!("WindowNode group {group_idx} order_by[{idx}] expr missing"),
                     )
                 })?;
-                decode_expr_at(expr, item_path.field("expr"), arena, &current.layout)
+                ctx.decode_expression(expr, item_path.field("expr"), arena, &current.layout)
             })
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let frame = first
@@ -192,6 +188,7 @@ pub(super) fn lower_window_node(
                 path.clone().field("window_exprs").index(expr_idx),
                 arena,
                 &current.layout,
+                ctx,
             )?);
         }
 
@@ -258,10 +255,11 @@ fn sort_window_group_input(
     path: FieldPath,
     input: DecodedNode,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
     for (idx, expr) in first.partition_by.iter().enumerate() {
-        let expr = decode_expr_at(
+        let expr = ctx.decode_expression(
             expr,
             path.clone().field("partition_by").index(idx),
             arena,
@@ -273,12 +271,13 @@ fn sort_window_group_input(
             nulls_first: true,
         });
     }
-    order_by.extend(sort::lower_sort_items(
+    order_by.extend(sort::lower_sort_items_with_context(
         &format!("WindowNode group {group_idx} sort"),
         &first.order_by,
         path.field("order_by"),
         arena,
         &input.layout,
+        ctx,
     )?);
 
     Ok(DecodedNode {
@@ -421,6 +420,7 @@ fn lower_window_function(
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &Layout,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<WindowFunctionSpec, NativeFragmentDecodeError> {
     let name = expr.name.to_ascii_lowercase();
     let kind = NativeFragmentDecodeError::map_invalid(
@@ -442,7 +442,7 @@ fn lower_window_function(
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            decode_expr_at(
+            ctx.decode_expression(
                 arg,
                 path.clone().field("args").index(idx),
                 arena,

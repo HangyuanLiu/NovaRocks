@@ -21,8 +21,8 @@ use arrow::datatypes::{DataType, Field};
 
 use super::super::NativeFragmentDecodeError;
 use super::super::layout::Layout;
-use super::DecodedNode;
-use super::values::materialize_values_chunk;
+use super::values::materialize_values_chunk_with_context;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
@@ -38,6 +38,7 @@ pub(super) fn lower_generate_series_node(
     path: FieldPath,
     _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     if generate_series.step == 0 {
         return Err(NativeFragmentDecodeError::invalid_value(
@@ -70,8 +71,14 @@ pub(super) fn lower_generate_series_node(
             int64_literal_expr(generate_series.step),
         ],
     }];
-    let input_chunk =
-        materialize_values_chunk(&rows, &param_columns, input_schema, arena, path.clone())?;
+    let input_chunk = materialize_values_chunk_with_context(
+        &rows,
+        &param_columns,
+        input_schema,
+        arena,
+        path.clone(),
+        Some(ctx),
+    )?;
 
     let output_columns = vec![bigint_output_column(
         generate_series.output_column_id,
@@ -187,11 +194,36 @@ fn int64_literal_expr(value: i64) -> expr::Expr {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::array::Int64Array;
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
     use crate::exec::expr::ExprArena;
+    use crate::protocol::native_fragment_assembly_port::{
+        NativeExpressionDecoder, NativeExpressionInputLayout,
+    };
+    use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+
+    struct RejectingBackendExpressionDecoder;
+
+    impl NativeExpressionDecoder for RejectingBackendExpressionDecoder {
+        fn decode_expression(
+            &self,
+            _expression: &expr::Expr,
+            path: FieldPath,
+            _arena: &mut ExprArena,
+            _input: &NativeExpressionInputLayout,
+        ) -> Result<crate::exec::expr::ExprId, ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolFamily::Native,
+                path,
+                ProtocolErrorKind::InvalidValue,
+                "backend expression decoder invoked",
+            ))
+        }
+    }
 
     fn physical_node(
         node_id: i32,
@@ -291,6 +323,29 @@ mod tests {
             let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
             assert_eq!(values.value(0), expected);
         }
+    }
+
+    #[test]
+    fn generate_series_uses_backend_expression_decoder_for_synthetic_values() {
+        let node = physical_node(
+            20,
+            plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut arena = ExprArena::default();
+        let context = NativePlanDecodeContext::default()
+            .with_expression_decoder(Arc::new(RejectingBackendExpressionDecoder));
+
+        let err = decode_node(&node, &mut arena, &context).expect_err("decoder must be invoked");
+        assert!(err.contains("backend expression decoder invoked"), "{err}");
     }
 
     #[test]

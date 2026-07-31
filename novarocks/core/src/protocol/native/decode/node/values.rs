@@ -23,9 +23,10 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::super::NativeFragmentDecodeError;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
+use super::super::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::values::ValuesNode;
@@ -41,6 +42,7 @@ pub(super) fn lower_values_node(
     physical_output_path: FieldPath,
     _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let columns = if values.columns.is_empty() {
         &physical.output_columns
@@ -52,20 +54,16 @@ pub(super) fn lower_values_node(
     } else {
         path.clone().field("columns")
     };
-    let layout = NativeFragmentDecodeError::map_invalid(
-        columns_path.clone(),
-        layout_from_output_columns(columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        columns_path,
-        chunk_schema_from_output_columns(columns),
-    )?;
-    let chunk = materialize_values_chunk(
+    let output_layout = ctx.decode_output_layout(columns, columns_path)?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    let chunk = materialize_values_chunk_with_context(
         &values.rows,
         columns,
         output_schema.clone(),
         arena,
         path.clone(),
+        Some(ctx),
     )?;
     Ok(DecodedNode {
         node: ExecNode {
@@ -85,6 +83,17 @@ pub(super) fn materialize_values_chunk(
     output_schema: ChunkSchemaRef,
     arena: &mut ExprArena,
     path: FieldPath,
+) -> Result<Chunk, NativeFragmentDecodeError> {
+    materialize_values_chunk_with_context(rows, columns, output_schema, arena, path, None)
+}
+
+pub(super) fn materialize_values_chunk_with_context(
+    rows: &[plan::ExprList],
+    columns: &[proto_common::OutputColumn],
+    output_schema: ChunkSchemaRef,
+    arena: &mut ExprArena,
+    path: FieldPath,
+    ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<Chunk, NativeFragmentDecodeError> {
     if columns.is_empty() {
         return NativeFragmentDecodeError::map_invalid(
@@ -139,7 +148,22 @@ pub(super) fn materialize_values_chunk(
                 .index(row_idx)
                 .field("values")
                 .index(col_idx);
-            let expr_id = decode_expr_at(expr, expr_path.clone(), arena, &input_layout)?;
+            let expr_id = match ctx {
+                Some(ctx) => ctx.decode_expression(expr, expr_path.clone(), arena, &input_layout),
+                None => {
+                    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+                    {
+                        decode_expr_at(expr, expr_path.clone(), arena, &input_layout)
+                    }
+                    #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+                    {
+                        Err(NativeFragmentDecodeError::unsupported(
+                            expr_path.clone(),
+                            "native expression decoder must be supplied by the backend runtime",
+                        ))
+                    }
+                }
+            }?;
             let array = arena
                 .eval(expr_id, &one_row)
                 .map_err(|err| NativeFragmentDecodeError::invalid_value(expr_path.clone(), err))?;

@@ -1,6 +1,7 @@
 mod application;
 pub mod connector;
 mod fragment;
+pub(crate) mod native;
 mod query_lifecycle;
 
 pub use application::{

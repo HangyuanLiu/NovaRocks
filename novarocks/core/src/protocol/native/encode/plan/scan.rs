@@ -34,7 +34,7 @@ use crate::connector::scan_model::starrocks::{
     StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
 };
 use crate::proto::{common, plan};
-use crate::protocol::native::type_mapping::{decode_field_type, encode_type};
+use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
 };
@@ -256,9 +256,11 @@ pub(super) fn encode_table_def_with_context(
         source: Some(encode_scan_source(
             &src.source,
             scan_node_id,
+            scan_columns,
             scan_output_columns,
             scan_required_columns,
             scan_variant_columns.unwrap_or_default(),
+            binding,
             ctx,
         )?),
     })
@@ -625,9 +627,11 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
 fn encode_scan_source(
     src: &table_model::ScanSource,
     scan_node_id: Option<i32>,
+    scan_analysis_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
     scan_required_columns: Option<&[String]>,
     scan_variant_columns: &[crate::sql::common::ScanVariantColumn],
+    binding: Option<&ResolvedScanBinding>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
@@ -661,9 +665,11 @@ fn encode_scan_source(
                 .map_err(|_| "connector total payload budget does not fit u64".to_string())?,
                 expected_schema_ipc: encode_connector_expected_schema_ipc(
                     scan_output_columns.unwrap_or_default(),
+                    scan_analysis_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
                     iceberg_schema_for_connector_source(src),
                     scan_variant_columns,
+                    binding,
                 )?,
             })),
         });
@@ -804,9 +810,11 @@ fn iceberg_schema_for_connector_source(
 
 fn encode_connector_expected_schema_ipc(
     output_columns: &[common::OutputColumn],
+    analysis_columns: &[AnalysisOutputColumn],
     required_columns: &[String],
     iceberg_schema: Option<&iceberg_scan_model::IcebergSchemaDef>,
     variant_columns: &[crate::sql::common::ScanVariantColumn],
+    binding: Option<&ResolvedScanBinding>,
 ) -> Result<Vec<u8>, String> {
     let required = (!required_columns.is_empty()).then(|| {
         required_columns
@@ -838,14 +846,31 @@ fn encode_connector_expected_schema_ipc(
                         .contains(&crate::sql::column_id::ColumnId(column.column_id)))
         })
         .map(|column| {
-            let type_desc = column.r#type.as_ref().ok_or_else(|| {
-                format!(
-                    "ConnectorReadSource output column {} is missing its type",
-                    column.column_id
-                )
-            })?;
-            decode_field_type(&column.name, column.nullable, type_desc)
-                .map_err(|error| format!("decode ConnectorReadSource output schema: {error}"))
+            let domain_column = binding
+                .and_then(|binding| {
+                    binding
+                        .physical_columns
+                        .iter()
+                        .find(|bound| bound.planner.column_id.0 == column.column_id)
+                        .map(|bound| (&bound.source.data_type, bound.source.nullable))
+                })
+                .or_else(|| {
+                    analysis_columns
+                        .iter()
+                        .find(|candidate| candidate.column_id.0 == column.column_id)
+                        .map(|candidate| (&candidate.data_type, candidate.nullable))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "ConnectorReadSource output column {} is missing its domain type",
+                        column.column_id
+                    )
+                })?;
+            Ok::<Field, String>(Field::new(
+                &column.name,
+                domain_column.0.clone(),
+                domain_column.1,
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let schema = if let Some(iceberg_schema) = iceberg_schema {
@@ -1136,5 +1161,42 @@ fn encode_iceberg_partition_value(
                 Value::BinaryValue(value.clone())
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use super::encode_connector_expected_schema_ipc;
+    use crate::proto::common;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn connector_expected_schema_uses_domain_columns_not_encoded_type_desc() {
+        let bytes = encode_connector_expected_schema_ipc(
+            &[common::OutputColumn {
+                column_id: 7,
+                name: "id".to_string(),
+                r#type: None,
+                nullable: false,
+                is_internal: false,
+            }],
+            &[OutputColumn {
+                column_id: ColumnId(7),
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .expect("domain schema should encode without a protobuf type descriptor");
+
+        assert!(!bytes.is_empty());
     }
 }

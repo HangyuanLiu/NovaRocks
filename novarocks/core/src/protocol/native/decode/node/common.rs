@@ -19,12 +19,8 @@ use std::collections::HashSet;
 
 use super::super::NativeFragmentDecodeError;
 use super::super::error::NativeFragmentLeafDecodeError;
-use super::super::layout::{
-    Layout, chunk_schema_from_output_columns, layout_from_output_columns,
-    slot_schemas_from_output_columns,
-};
-use super::DecodedNode;
-use crate::common::ids::SlotId;
+use super::super::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::join::JoinType;
 use crate::exec::node::project::ProjectNode;
@@ -102,17 +98,6 @@ pub(crate) fn require_min_children(
     actual: usize,
 ) -> Result<(), NativeFragmentDecodeError> {
     check_children_arity(node_path, kind, &format!(">={min}"), actual, actual >= min)
-}
-
-pub(crate) fn slot_ids_from_columns(
-    cols: &[proto_common::OutputColumn],
-    path: FieldPath,
-) -> Result<Vec<SlotId>, NativeFragmentDecodeError> {
-    Ok(
-        NativeFragmentDecodeError::map_invalid(path, layout_from_output_columns(cols))?
-            .order()
-            .to_vec(),
-    )
 }
 
 pub(crate) fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, String> {
@@ -206,19 +191,12 @@ pub(super) fn build_slot_projection(
     path: FieldPath,
     node_id: i32,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    let layout = NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        chunk_schema_from_output_columns(output_columns),
-    )?;
-    let expr_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        path.clone(),
-        slot_schemas_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, path.clone())?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    let expr_slot_schemas = output_layout.slot_schemas().to_vec();
     let mut exprs = Vec::with_capacity(layout.order().len());
     for slot in layout.order().iter().copied() {
         if !input.layout.contains_slot(slot) {

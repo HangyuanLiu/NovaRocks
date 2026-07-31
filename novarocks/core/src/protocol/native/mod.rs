@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod codec;
 pub(crate) mod decode;
 pub(crate) mod encode;
+pub(crate) mod query_options_contract;
+pub(crate) mod runtime_filter_contract_codec;
 mod runtime_filter_install;
+pub(crate) mod type_encode;
 pub(crate) mod type_mapping;
 
 // Narrow Task 4/5 surface: handlers and client adapters need only these DTOs

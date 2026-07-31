@@ -44,5 +44,5 @@ pub use connector as novarocks_connectors;
 pub use connector::starrocks as novarocks_connector_starrocks;
 
 pub use common::types::{FetchResult, UniqueId};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub use service::grpc_server::start_grpc_exchange_server;
-pub use service::grpc_server::start_grpc_server_with_native_fragment_ingress;

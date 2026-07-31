@@ -60,7 +60,8 @@ impl RuntimeEndpoint {
         }
     }
 
-    pub(crate) fn parse(src: &str) -> Result<Self, String> {
+    /// Parse the neutral execution endpoint value used at role boundaries.
+    pub fn parse(src: &str) -> Result<Self, String> {
         let (host, port) = src
             .rsplit_once(':')
             .ok_or_else(|| format!("native runtime endpoint must be host:port, got '{src}'"))?;

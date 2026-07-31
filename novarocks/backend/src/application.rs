@@ -12,13 +12,14 @@ use novarocks::query_execution::lifecycle::{
     QueryLifecycleError, QueryLifecycleIngress, QueryStageAck, QueryStageOutcome,
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
-use novarocks::service::{MetricsHttpServer, grpc_server};
+use novarocks::service::MetricsHttpServer;
 
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_result_writer,
 };
+use crate::native::service::{NativeBackendGrpcService, NativeGrpcServerHandle};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
@@ -75,6 +76,7 @@ impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
     ready_marker: String,
+    grpc_server: NativeGrpcServerHandle,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_host: Arc<crate::ConnectorExecutionHost>,
@@ -295,7 +297,8 @@ impl BackendApplicationHost {
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
-        grpc_server::poll_grpc_server_failure()
+        self.grpc_server
+            .poll_failure()
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Supervision, error)
             })
@@ -307,14 +310,14 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        let listener_shutdown = self.grpc_server.stop();
         let execution_shutdown = self
             .execution_host
             .shutdown()
             .map_err(|error| error.to_string());
-        let resource_result = stop_backend_resources();
         let sweep_result = self.query_lifecycle_sweep.stop();
         let metrics_result = self.metrics_http_server.stop();
-        combine_shutdown_results(sweep_result, resource_result)
+        combine_shutdown_results(listener_shutdown, sweep_result)
             .and_then(|()| metrics_result)
             .and_then(|()| execution_shutdown)
             .map_err(|error| {
@@ -364,28 +367,35 @@ impl BackendApplicationHost {
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
 
-        if let Err(error) = grpc_server::start_grpc_exchange_server_with_terminal_ingress(
+        let mut grpc_server = NativeGrpcServerHandle::start(
             &bind_host,
             grpc_port,
-            native_fragment_service.clone(),
-            services.query_lifecycle_ingress.clone(),
-            terminal_ingress,
-        ) {
+            NativeBackendGrpcService::new(
+                native_fragment_service.clone(),
+                services.query_lifecycle_ingress.clone(),
+                terminal_ingress,
+            ),
+        )
+        .map_err(|error| {
             let _ = query_lifecycle_sweep.stop();
-            let _ = metrics_http_server.stop();
-            return Err(BackendApplicationError::new(
+            BackendApplicationError::new(
                 BackendApplicationErrorKind::Start,
                 format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
-            ));
-        }
+            )
+        })?;
 
         if let Err(error) = wait_for_tcp_ready(readiness_addr, readiness_timeout) {
+            let listener_result = grpc_server.stop();
             let _ = query_lifecycle_sweep.stop();
             let _ = metrics_http_server.stop();
-            return Err(cleanup_after_primary_error(BackendApplicationError::new(
+            let primary = BackendApplicationError::new(
                 BackendApplicationErrorKind::Readiness,
                 format!("advertised endpoint readiness failed: {error}"),
-            )));
+            );
+            return Err(match listener_result {
+                Ok(()) => primary,
+                Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
+            });
         }
 
         Ok(Self {
@@ -394,6 +404,7 @@ impl BackendApplicationHost {
                 advertise_endpoint.host,
                 std::process::id()
             ),
+            grpc_server,
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
             execution_host: services.execution_host,
@@ -488,23 +499,11 @@ fn combine_primary_and_shutdown(
     }
 }
 
-fn cleanup_after_primary_error(primary: BackendApplicationError) -> BackendApplicationError {
-    match stop_backend_resources() {
-        Ok(()) => primary,
-        Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
-    }
-}
-
-fn stop_backend_resources() -> Result<(), String> {
-    let grpc_result = grpc_server::stop_grpc_server();
-    grpc_result
-}
-
 fn combine_shutdown_results(
+    listener: Result<(), String>,
     sweep: Result<(), String>,
-    resources: Result<(), String>,
 ) -> Result<(), String> {
-    match (sweep, resources) {
+    match (listener, sweep) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(sweep), Err(resources)) => Err(format!("{sweep}; {resources}")),

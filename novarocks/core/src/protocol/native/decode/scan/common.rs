@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use super::super::expr::decode_expr;
 use super::super::layout::Layout;
+use super::super::node::NativePlanDecodeContext;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -277,17 +277,25 @@ pub(super) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
     layout: &super::super::layout::Layout,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<Option<crate::exec::expr::ExprId>, NativeFragmentLeafDecodeError> {
     let mut predicate = None;
     for (idx, expr) in scan.predicates.iter().enumerate() {
-        let expr_id = decode_expr(expr, arena, layout).map_err(|err| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "predicates",
-                format!("ScanNode predicate {idx}: {err}"),
+        let expr_id = ctx
+            .decode_expression(
+                expr,
+                FieldPath::root("scan").field("predicates").index(idx),
+                arena,
+                layout,
             )
-            .append_index(idx)
-        })?;
+            .map_err(|err| {
+                NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InvalidValue,
+                    "predicates",
+                    format!("ScanNode predicate {idx}: {err}"),
+                )
+                .append_index(idx)
+            })?;
         predicate = Some(match predicate {
             Some(prev) => arena.push_typed(ExprNode::And(prev, expr_id), DataType::Boolean),
             None => expr_id,

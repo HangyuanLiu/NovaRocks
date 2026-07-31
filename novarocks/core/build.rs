@@ -66,7 +66,6 @@ fn main() {
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .codec_path("crate::protocol::native::codec::NativeProstCodec")
         .extern_path(".novarocks.common", "::novarocks_protocol::common")
         .extern_path(".novarocks.expr", "::novarocks_protocol::expr")
         .extern_path(".novarocks.filter", "::novarocks_protocol::filter")

@@ -495,8 +495,6 @@ fn print_release_fixture_hex() {
 fn release_stage_fragments_request_fixture_decodes() {
     let request = release_stage_fragments_request();
     let bytes = request.encode_to_vec();
-    crate::protocol::native::codec::validate_stage_fragments_request_wire(&bytes)
-        .expect("StageFragmentsRequest fixture must satisfy the native wire boundary");
     let request = novarocks::StageFragmentsRequest::decode(bytes.as_slice())
         .expect("StageFragmentsRequest fixture decodes");
     assert_eq!(request.stage_digest_version, 1);

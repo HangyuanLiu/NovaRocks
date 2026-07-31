@@ -29,6 +29,12 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
+use crate::protocol::native_fragment_assembly_port::{
+    NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
+    NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
+    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder,
+    NativeRuntimeFilterContractDecoder, NativeScanSourceContractDecoder,
+};
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use crate::runtime::fragment::instance::{
@@ -38,11 +44,13 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use super::decode_fragment_sink_assignment;
 use super::instance::{NativeSubmissionMetadata, decode_scan_range_params_at};
 use super::{
     NativeFragmentDecodeError, NativePlanDecodeContext, NativeRuntimeFilterDecodeLedger,
-    decode_fragment_sink_assignment, decode_fragment_sink_program,
-    decode_node_with_runtime_filters, decode_query_options,
+    decode_fragment_sink_program_with_context, decode_node_with_runtime_filters,
+    decode_query_options,
 };
 
 #[derive(Debug)]
@@ -64,17 +72,7 @@ impl DecodedNativeFragment {
     }
 }
 
-struct DecodedNativeInstanceParts {
-    query_id: QueryId,
-    fragment_instance_id: FragmentInstanceId,
-    backend_num: BackendNum,
-    query_options: crate::runtime::query_options::QueryOptions,
-    pipeline_dop: NonZeroUsize,
-    raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<crate::runtime::scan_range::ScanRangeParams>>,
-    exchange_inputs: ExchangeInputAssignments,
-    typed_result_sink: bool,
-}
-
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_submission_with_connectors(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
@@ -88,6 +86,7 @@ pub(crate) fn decode_fragment_submission_with_connectors(
     )
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     fragment: &plan::PlanFragment,
     instance_params: &novarocks::InstanceParams,
@@ -95,30 +94,181 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let instance_parts = decode_instance_parts(instance_params)?;
+    assemble_fragment_submission_with_sink_assignment(
+        fragment,
+        instance_parts,
+        connectors,
+        execution_resolver,
+        |fragment| {
+            fragment.root.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    FieldPath::root("plan_fragment").field("root"),
+                    "native PlanFragment requires root",
+                )
+            })
+        },
+        None,
+        |fragment| {
+            fragment.sink.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    FieldPath::root("plan_fragment").field("sink"),
+                    "native PlanFragment requires sink",
+                )
+            })
+        },
+        |sink| decode_fragment_sink_assignment(sink, instance_params),
+        None,
+        None,
+        |root, path| decode_scan_source_contracts(root, path),
+        |root, path| decode_exchange_contracts(root, path),
+        |fragment| decode_runtime_filter_contract(fragment),
+    )
+}
+
+pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolver(
+    fragment: &plan::PlanFragment,
+    instance_parts: NativeFragmentInstanceInput,
+    instance_params: &novarocks::InstanceParams,
+    envelope_decoder: &dyn NativeFragmentEnvelopeDecoder,
+    submission_validator: &dyn NativeFragmentSubmissionValidator,
+    sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
+    expression_decoder: Arc<dyn NativeExpressionDecoder>,
+    output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
+    scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
+    exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
+    runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    assemble_fragment_submission_with_sink_assignment(
+        fragment,
+        instance_parts,
+        connectors,
+        execution_resolver,
+        |fragment| {
+            envelope_decoder
+                .require_root(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        Some(submission_validator),
+        |fragment| {
+            envelope_decoder
+                .require_sink(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        |sink| {
+            sink_assignment_decoder
+                .decode_sink_assignment(sink, instance_params)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        Some(expression_decoder),
+        Some(output_layout_decoder),
+        |root, path| {
+            scan_source_contract_decoder
+                .decode_scan_source_contracts(root, path)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        |root, path| {
+            exchange_contract_decoder
+                .decode_exchange_contracts(root, path)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+        |fragment| {
+            runtime_filter_contract_decoder
+                .decode_runtime_filter_contract(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
+    )
+}
+
+fn assemble_fragment_submission_with_sink_assignment<F>(
+    fragment: &plan::PlanFragment,
+    instance_parts: NativeFragmentInstanceInput,
+    connectors: Arc<crate::connector::ConnectorRegistry>,
+    execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
+    require_root: impl FnOnce(
+        &plan::PlanFragment,
+    ) -> Result<&plan::DistributedNode, NativeFragmentDecodeError>,
+    submission_validator: Option<&dyn NativeFragmentSubmissionValidator>,
+    require_sink: impl FnOnce(&plan::PlanFragment) -> Result<&plan::DataSink, NativeFragmentDecodeError>,
+    decode_sink_assignment: F,
+    expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
+    output_layout_decoder: Option<Arc<dyn NativeOutputLayoutDecoder>>,
+    decode_scan_source_contracts: impl FnOnce(
+        &plan::DistributedNode,
+        FieldPath,
+    ) -> Result<
+        BTreeMap<FragmentNodeId, ScanSourceContract>,
+        NativeFragmentDecodeError,
+    >,
+    decode_exchange_contracts: impl FnOnce(
+        &plan::DistributedNode,
+        FieldPath,
+    ) -> Result<
+        BTreeMap<FragmentNodeId, ExchangeInputContract>,
+        NativeFragmentDecodeError,
+    >,
+    decode_runtime_filter_contract: impl FnOnce(
+        &plan::PlanFragment,
+    ) -> Result<
+        RuntimeFilterContract,
+        NativeFragmentDecodeError,
+    >,
+) -> Result<DecodedNativeFragment, NativeFragmentDecodeError>
+where
+    F: FnOnce(
+        &plan::DataSink,
+    ) -> Result<
+        crate::runtime::fragment::instance::FragmentSinkAssignment,
+        NativeFragmentDecodeError,
+    >,
+{
     let root_path = FieldPath::root("plan_fragment").field("root");
-    let root = fragment.root.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(root_path.clone(), "native PlanFragment requires root")
-    })?;
-    validate_node_required_fields(root, root_path.clone())?;
+    let root = require_root(fragment)?;
+    if let Some(submission_validator) = submission_validator {
+        submission_validator
+            .validate_root_node(root, root_path.clone())
+            .map_err(NativeFragmentDecodeError::from)?;
+    } else {
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        validate_node_required_fields(root, root_path.clone())?;
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        return Err(NativeFragmentDecodeError::unsupported(
+            root_path,
+            "native submission validator must be supplied by the backend runtime",
+        ));
+    }
     let sink_path = FieldPath::root("plan_fragment").field("sink");
-    let sink = fragment.sink.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(sink_path.clone(), "native PlanFragment requires sink")
-    })?;
+    let sink = require_sink(fragment)?;
     if sink.kind.is_none() {
         return Err(NativeFragmentDecodeError::missing(
             sink_path.clone().field("kind"),
             "native DataSink requires kind",
         ));
     }
-    for (index, expression) in fragment.output_exprs.iter().enumerate() {
-        super::expr::validate_proto_expr_shape_at(
-            expression,
-            FieldPath::root("plan_fragment")
-                .field("output_exprs")
-                .index(index),
-        )?;
+    if let Some(submission_validator) = submission_validator {
+        submission_validator
+            .validate_fragment_expressions(fragment)
+            .map_err(NativeFragmentDecodeError::from)?;
+    } else {
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            for (index, expression) in fragment.output_exprs.iter().enumerate() {
+                super::expr::validate_proto_expr_shape_at(
+                    expression,
+                    FieldPath::root("plan_fragment")
+                        .field("output_exprs")
+                        .index(index),
+                )?;
+            }
+            validate_runtime_filter_binding_expressions(fragment)?;
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        return Err(NativeFragmentDecodeError::unsupported(
+            FieldPath::root("plan_fragment"),
+            "native submission validator must be supplied by the backend runtime",
+        ));
     }
-    validate_runtime_filter_binding_expressions(fragment)?;
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())?;
     // Preserve the old cross-check: every FE-provided scan-range node must map
@@ -130,11 +280,11 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         &instance_parts.raw_scan_ranges,
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
     )?;
-    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)?;
+    let sink_assignment = decode_sink_assignment(sink)?;
 
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(instance_parts.query_options.allow_throw_exception);
-    let context = NativePlanDecodeContext::from_parts(
+    let mut context = NativePlanDecodeContext::from_parts(
         instance_parts.exchange_inputs.clone(),
         instance_parts.raw_scan_ranges,
         instance_parts.query_options.clone(),
@@ -143,6 +293,12 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         instance_parts.fragment_instance_id,
     )
     .with_execution_resolver(execution_resolver);
+    if let Some(expression_decoder) = expression_decoder {
+        context = context.with_expression_decoder(expression_decoder);
+    }
+    if let Some(output_layout_decoder) = output_layout_decoder {
+        context = context.with_output_layout_decoder(output_layout_decoder);
+    }
     let mut runtime_filter_ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
@@ -158,7 +314,8 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         arena,
         root: decoded_root.node,
     };
-    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
+    let sink_program =
+        decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let exchange_inputs = decode_exchange_contracts(root, root_path)?;
@@ -195,8 +352,10 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
     Ok(DecodedNativeFragment::new(submission, metadata))
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 struct MissingExecutionResolver;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionResolver {
     fn resolve(
         &self,
@@ -212,6 +371,7 @@ impl novarocks_spi::connector::ConnectorExecutionResolver for MissingExecutionRe
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_query_execution_id(
     execution_id: &novarocks::QueryExecutionId,
 ) -> Result<QueryExecutionId, NativeFragmentDecodeError> {
@@ -311,9 +471,10 @@ fn validate_runtime_filter_binding_expressions(
     Ok(())
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_instance_parts(
     src: &novarocks::InstanceParams,
-) -> Result<DecodedNativeInstanceParts, NativeFragmentDecodeError> {
+) -> Result<NativeFragmentInstanceInput, NativeFragmentDecodeError> {
     let path = FieldPath::root("instance_params");
     let query_id = src.query_id.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -394,16 +555,16 @@ fn decode_instance_parts(
             ExchangeInputAssignment::new(count),
         );
     }
-    Ok(DecodedNativeInstanceParts {
-        query_id: query_id_from_native(query_id),
-        fragment_instance_id: FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
+    Ok(NativeFragmentInstanceInput::new(
+        query_id_from_native(query_id),
+        FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
         backend_num,
         query_options,
         pipeline_dop,
         raw_scan_ranges,
-        exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-        typed_result_sink: src.typed_result_sink,
-    })
+        ExchangeInputAssignments::new(exchange_inputs),
+        src.typed_result_sink,
+    ))
 }
 
 /// Cross-check that every FE-provided per-node scan-range entry maps to a
@@ -430,6 +591,7 @@ fn validate_raw_scan_range_nodes(
     Ok(())
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_scan_source_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
@@ -442,6 +604,7 @@ fn decode_scan_source_contracts(
     })
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_exchange_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
@@ -489,6 +652,7 @@ fn decode_exchange_contracts(
     Ok(contracts)
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
 ) -> Result<RuntimeFilterContract, NativeFragmentDecodeError> {

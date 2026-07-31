@@ -41,7 +41,7 @@ mod unary;
 
 pub(crate) use min_max::extract_min_max_predicates;
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_expr(
     e: &expr::Expr,
     arena: &mut ExprArena,

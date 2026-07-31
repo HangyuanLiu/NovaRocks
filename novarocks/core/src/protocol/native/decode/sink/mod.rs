@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use super::decode_type;
 use super::error::NativeFragmentLeafDecodeError;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::expr::decode_expr;
+use super::node::NativePlanDecodeContext;
 use crate::common::ids::SlotId;
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteExpectedBinding;
 use crate::connector::iceberg::schema::build_full_output_schema;
@@ -41,9 +43,12 @@ use crate::exec::fragment::sink::{
     IcebergChangeStreamRouterProgram, IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::DataStreamPartitionType;
-use crate::proto::{common, expr, novarocks, plan};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use crate::proto::novarocks;
+use crate::proto::{common, expr, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::runtime::fragment::instance::FragmentSinkAssignment;
 
 use self::equality_delete::{
@@ -60,9 +65,18 @@ use self::partition::{
 };
 use self::position_delete::bind_position_delete_descriptor_from_native;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_sink_program(
     fragment: &plan::PlanFragment,
     layout: &super::layout::Layout,
+) -> Result<FragmentSinkProgram, super::NativeFragmentDecodeError> {
+    decode_fragment_sink_program_with_context(fragment, layout, None)
+}
+
+pub(crate) fn decode_fragment_sink_program_with_context(
+    fragment: &plan::PlanFragment,
+    layout: &super::layout::Layout,
+    ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<FragmentSinkProgram, super::NativeFragmentDecodeError> {
     let path = FieldPath::root("plan_fragment").field("sink");
     let sink = fragment.sink.as_ref().ok_or_else(|| {
@@ -102,6 +116,7 @@ pub(crate) fn decode_fragment_sink_program(
                 &mut partition_arena,
                 layout,
                 "native DATA_STREAM_SINK",
+                ctx,
             )
             .map_err(|error| error.into_native(path.clone().field("data_stream")))?;
             branch
@@ -119,6 +134,7 @@ pub(crate) fn decode_fragment_sink_program(
                         &mut partition_arena,
                         layout,
                         &format!("native MULTI_CAST_DATA_STREAM_SINK sink[{index}]"),
+                        ctx,
                     )
                     .map_err(|error| {
                         error.into_native(
@@ -135,11 +151,12 @@ pub(crate) fn decode_fragment_sink_program(
                 .map_err(super::NativeFragmentDecodeError::from)
         }
         plan::data_sink::Kind::IcebergWrite(iceberg) => {
-            let (input, _mode) = decode_iceberg_write_sink_factory_input(
+            let (input, _mode) = decode_iceberg_write_sink_factory_input_with_context(
                 iceberg,
                 &fragment.output_exprs,
                 &fragment.output_columns,
                 layout,
+                ctx,
             )
             .map_err(|error| error.into_native(path.clone().field("iceberg_write")))?;
             IcebergTableSinkProgram::try_from_factory_input(input)
@@ -147,11 +164,12 @@ pub(crate) fn decode_fragment_sink_program(
                 .map_err(super::NativeFragmentDecodeError::from)
         }
         plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
-            decode_change_stream_router_program(
+            decode_change_stream_router_program_with_context(
                 router,
                 &fragment.output_exprs,
                 &fragment.output_columns,
                 layout,
+                ctx,
             )
             .map(FragmentSinkProgram::IcebergChangeStreamRouter)
             .map_err(|error| error.into_native(path.field("iceberg_change_stream_router")))
@@ -159,6 +177,7 @@ pub(crate) fn decode_fragment_sink_program(
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
     instance: &novarocks::InstanceParams,
@@ -241,6 +260,7 @@ fn decode_data_stream_branch(
     partition_arena: &mut ExprArena,
     layout: &super::layout::Layout,
     context: &str,
+    ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
     let decoded = (|| -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
         let partition = stream.output_partition.as_ref().ok_or_else(|| {
@@ -260,16 +280,18 @@ fn decode_data_stream_branch(
                 .iter()
                 .enumerate()
                 .map(|(index, expression)| {
-                    decode_expr(expression, partition_arena, layout).map_err(|error| {
-                        NativeFragmentLeafDecodeError::at_field(
-                            ProtocolErrorKind::InvalidValue,
-                            "expr",
-                            error,
-                        )
-                        .prepend_index(index)
-                        .prepend_field("exprs")
-                        .prepend_field("output_partition")
-                    })
+                    decode_expr_with_context(expression, partition_arena, layout, ctx).map_err(
+                        |error| {
+                            NativeFragmentLeafDecodeError::at_field(
+                                ProtocolErrorKind::InvalidValue,
+                                "expr",
+                                error,
+                            )
+                            .prepend_index(index)
+                            .prepend_field("exprs")
+                            .prepend_field("output_partition")
+                        },
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
@@ -331,6 +353,22 @@ fn decode_change_stream_router_program(
     output_columns: &[common::OutputColumn],
     layout: &super::layout::Layout,
 ) -> Result<IcebergChangeStreamRouterProgram, NativeFragmentLeafDecodeError> {
+    decode_change_stream_router_program_with_context(
+        router,
+        output_exprs,
+        output_columns,
+        layout,
+        None,
+    )
+}
+
+fn decode_change_stream_router_program_with_context(
+    router: &plan::IcebergChangeStreamRouterSink,
+    output_exprs: &[expr::Expr],
+    output_columns: &[common::OutputColumn],
+    layout: &super::layout::Layout,
+    ctx: Option<&NativePlanDecodeContext>,
+) -> Result<IcebergChangeStreamRouterProgram, NativeFragmentLeafDecodeError> {
     let decoded =
         (|| -> Result<IcebergChangeStreamRouterProgram, NativeFragmentLeafDecodeError> {
             let change_op_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
@@ -375,7 +413,7 @@ fn decode_change_stream_router_program(
                     .iter()
                     .enumerate()
                     .map(|(expr_index, expression)| {
-                        decode_expr(expression, &mut partition_arena, layout).map_err(|error| {
+                        decode_expr_with_context(expression, &mut partition_arena, layout, ctx).map_err(|error| {
                             NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "exprs", format!(
                                 "native ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] partition expr[{expr_index}]: {error}"
                             )).append_index(expr_index).prepend_field("output_partition").prepend_index(index).prepend_field("branches")
@@ -570,6 +608,22 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
     fragment_output_columns: &[common::OutputColumn],
     layout: &super::layout::Layout,
 ) -> Result<(IcebergSinkFactoryInput, IcebergSinkMode), NativeFragmentLeafDecodeError> {
+    decode_iceberg_write_sink_factory_input_with_context(
+        sink,
+        fragment_output_exprs,
+        fragment_output_columns,
+        layout,
+        None,
+    )
+}
+
+fn decode_iceberg_write_sink_factory_input_with_context(
+    sink: &plan::IcebergWriteFragmentSink,
+    fragment_output_exprs: &[expr::Expr],
+    fragment_output_columns: &[common::OutputColumn],
+    layout: &super::layout::Layout,
+    ctx: Option<&NativePlanDecodeContext>,
+) -> Result<(IcebergSinkFactoryInput, IcebergSinkMode), NativeFragmentLeafDecodeError> {
     let decoded =
         (|| -> Result<(IcebergSinkFactoryInput, IcebergSinkMode), NativeFragmentLeafDecodeError> {
         let spec = sink
@@ -593,7 +647,7 @@ pub(crate) fn decode_iceberg_write_sink_factory_input(
                 &mut arena,
             )?
         } else {
-            lower_output_exprs(fragment_output_exprs, &mut arena, layout)?
+            lower_output_exprs(fragment_output_exprs, &mut arena, layout, ctx)?
         };
 
         let target_table = spec
@@ -815,10 +869,40 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
     }
 }
 
+fn decode_expr_with_context(
+    expression: &expr::Expr,
+    arena: &mut ExprArena,
+    layout: &super::layout::Layout,
+    ctx: Option<&NativePlanDecodeContext>,
+) -> Result<ExprId, super::NativeFragmentDecodeError> {
+    match ctx {
+        Some(ctx) => ctx.decode_expression(
+            expression,
+            FieldPath::root("plan_fragment").field("sink"),
+            arena,
+            layout,
+        ),
+        None => {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                decode_expr(expression, arena, layout)
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                Err(super::NativeFragmentDecodeError::unsupported(
+                    FieldPath::root("plan_fragment").field("sink"),
+                    "native expression decoder must be supplied by the backend runtime",
+                ))
+            }
+        }
+    }
+}
+
 fn lower_output_exprs(
     output_exprs: &[expr::Expr],
     arena: &mut ExprArena,
     layout: &super::layout::Layout,
+    ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<Vec<ExprId>, NativeFragmentLeafDecodeError> {
     if output_exprs.is_empty() {
         return Err(NativeFragmentLeafDecodeError::at_field(
@@ -831,7 +915,7 @@ fn lower_output_exprs(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            decode_expr(expr, arena, layout).map_err(|err| {
+            decode_expr_with_context(expr, arena, layout, ctx).map_err(|err| {
                 NativeFragmentLeafDecodeError::at_field(
                     ProtocolErrorKind::InvalidValue,
                     "output_exprs",

@@ -18,9 +18,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::super::expr::decode_expr_at;
 use super::super::layout::Layout;
-use super::DecodedNode;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
@@ -36,6 +35,7 @@ pub(super) fn lower_project_node(
     path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, super::super::NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
@@ -59,7 +59,7 @@ pub(super) fn lower_project_node(
                     "native ProjectNode item requires expr",
                 )
             })?;
-            decode_expr_at(
+            ctx.decode_expression(
                 expr,
                 path.clone().field("items").index(*idx).field("expr"),
                 arena,

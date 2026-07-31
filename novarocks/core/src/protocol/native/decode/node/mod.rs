@@ -63,6 +63,10 @@ use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
+use crate::protocol::native_fragment_assembly_port::{
+    NativeExpressionDecoder, NativeExpressionInputLayout, NativeOutputLayout,
+    NativeOutputLayoutDecoder,
+};
 use crate::runtime::exchange::ExchangeKey;
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
@@ -94,6 +98,8 @@ pub(crate) struct NativePlanDecodeContext {
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<crate::connector::ConnectorRegistry>>,
     execution_resolver: Option<Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>>,
+    expression_decoder: Option<Arc<dyn NativeExpressionDecoder>>,
+    output_layout_decoder: Option<Arc<dyn NativeOutputLayoutDecoder>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
 }
@@ -107,6 +113,8 @@ impl Default for NativePlanDecodeContext {
             query_options: None,
             connectors: None,
             execution_resolver: None,
+            expression_decoder: None,
+            output_layout_decoder: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(crate::common::types::UniqueId {
                 hi: 0,
@@ -132,6 +140,8 @@ impl NativePlanDecodeContext {
             query_options: Some(query_options),
             connectors: Some(connectors),
             execution_resolver: None,
+            expression_decoder: None,
+            output_layout_decoder: None,
             query_id: Some(query_id),
             fragment_instance_id,
         }
@@ -143,6 +153,87 @@ impl NativePlanDecodeContext {
     ) -> Self {
         self.execution_resolver = Some(resolver);
         self
+    }
+
+    pub(crate) fn with_expression_decoder(
+        mut self,
+        decoder: Arc<dyn NativeExpressionDecoder>,
+    ) -> Self {
+        self.expression_decoder = Some(decoder);
+        self
+    }
+
+    pub(crate) fn with_output_layout_decoder(
+        mut self,
+        decoder: Arc<dyn NativeOutputLayoutDecoder>,
+    ) -> Self {
+        self.output_layout_decoder = Some(decoder);
+        self
+    }
+
+    pub(crate) fn decode_output_layout(
+        &self,
+        columns: &[crate::proto::common::OutputColumn],
+        path: FieldPath,
+    ) -> Result<NativeOutputLayout, super::NativeFragmentDecodeError> {
+        let Some(decoder) = self.output_layout_decoder.as_ref() else {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                let layout = super::NativeFragmentDecodeError::map_invalid(
+                    path.clone(),
+                    super::layout::layout_from_output_columns(columns),
+                )?;
+                let chunk_schema = super::NativeFragmentDecodeError::map_invalid(
+                    path.clone(),
+                    super::layout::chunk_schema_from_output_columns(columns),
+                )?;
+                let slot_schemas = super::NativeFragmentDecodeError::map_invalid(
+                    path,
+                    super::layout::slot_schemas_from_output_columns(columns),
+                )?;
+                return Ok(NativeOutputLayout::new(
+                    layout.order().to_vec(),
+                    chunk_schema,
+                    slot_schemas,
+                ));
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                return Err(super::NativeFragmentDecodeError::unsupported(
+                    path,
+                    "native output layout decoder must be supplied by the backend runtime",
+                ));
+            }
+        };
+        decoder
+            .decode_output_layout(columns, path)
+            .map_err(super::NativeFragmentDecodeError::from)
+    }
+
+    pub(crate) fn decode_expression(
+        &self,
+        expression: &crate::proto::expr::Expr,
+        path: FieldPath,
+        arena: &mut ExprArena,
+        layout: &Layout,
+    ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
+        let Some(decoder) = self.expression_decoder.as_ref() else {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            {
+                return super::expr::decode_expr_at(expression, path, arena, layout);
+            }
+            #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+            {
+                return Err(super::NativeFragmentDecodeError::unsupported(
+                    path,
+                    "native expression decoder must be supplied by the backend runtime",
+                ));
+            }
+        };
+        let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
+        decoder
+            .decode_expression(expression, path, arena, &input)
+            .map_err(super::NativeFragmentDecodeError::from)
     }
 
     /// Record a scan node's enriched connector ranges (produced during node
@@ -446,6 +537,7 @@ fn decode_node_inner(
             &mut children,
             arena,
             path.clone().field("runtime_filter_binding_ids"),
+            ctx,
         )?;
     }
 
@@ -475,7 +567,14 @@ fn decode_node_inner(
         ),
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
+        attach_leaf_consumers(
+            node,
+            &consumer_bindings,
+            &mut lowered,
+            arena,
+            path.clone(),
+            ctx,
+        )?;
     }
     let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
@@ -586,6 +685,7 @@ fn attach_direct_input_consumers(
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
     path: FieldPath,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<NativeRuntimeFilterConsumerSpec>>::new();
     for binding in bindings {
@@ -621,7 +721,7 @@ fn attach_direct_input_consumers(
             )
         })?;
         let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena, ctx)?;
         grouped
             .entry(index)
             .or_default()
@@ -650,6 +750,7 @@ fn attach_leaf_consumers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<(), super::NativeFragmentDecodeError> {
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
@@ -674,8 +775,13 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id =
-                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
+            let expr_id = lower_binding_expression(
+                binding,
+                &lowered.layout,
+                &lowered.output_schema,
+                arena,
+                ctx,
+            )?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 super::NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -1248,6 +1354,7 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<crate::exec::expr::ExprId, super::NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
@@ -1257,7 +1364,7 @@ fn lower_binding_expression(
         schema,
         expression_path.clone(),
     )?;
-    super::expr::decode_expr_at(&binding.expression, expression_path, arena, layout)
+    ctx.decode_expression(&binding.expression, expression_path, arena, layout)
 }
 
 fn validate_column_refs_exact(
@@ -1627,6 +1734,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Project(project) => project::lower_project_node(
             node,
@@ -1634,10 +1742,16 @@ fn lower_physical_node(
             path.clone().field("project"),
             children,
             arena,
+            ctx,
         ),
-        plan::plan_node::Kind::Filter(filter) => {
-            filter::lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
-        }
+        plan::plan_node::Kind::Filter(filter) => filter::lower_filter_node(
+            node,
+            filter,
+            path.clone().field("filter"),
+            children,
+            arena,
+            ctx,
+        ),
         plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(
             node,
             limit,
@@ -1653,9 +1767,10 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
-            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
+            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena, ctx)
         }
         plan::plan_node::Kind::SetOp(set_op) => set_op::lower_set_op_node(
             node,
@@ -1665,6 +1780,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::AssertOneRow(assert) => assert::lower_assert_one_row_node(
             node,
@@ -1688,6 +1804,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::HashJoin(join) => hash_join::lower_hash_join_node(
             node,
@@ -1698,6 +1815,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::NestLoopJoin(join) => nestloop_join::lower_nest_loop_join_node(
             node,
@@ -1708,6 +1826,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Window(window) => window::lower_window_node(
             node,
@@ -1717,6 +1836,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Repeat(repeat) => {
             repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
@@ -1728,6 +1848,7 @@ fn lower_physical_node(
                 path.clone().field("generate_series"),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::TableFunction(table_function) => {
@@ -1737,6 +1858,7 @@ fn lower_physical_node(
                 path.clone().field("table_function"),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::Decode(_) => Err(super::NativeFragmentDecodeError::unsupported(
@@ -1752,6 +1874,7 @@ fn lower_physical_node(
                 physical_output_path.clone(),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::CteAnchor(_) => Err(super::NativeFragmentDecodeError::unsupported(
@@ -1773,6 +1896,7 @@ fn lower_physical_node(
             physical_output_path,
             children,
             arena,
+            ctx,
         ),
     }
 }
@@ -3282,6 +3406,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("scan leaf binding");
         let ExecNodeKind::Scan(scan) = &lowered.node.kind else {
@@ -3321,6 +3446,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("exchange leaf binding");
         let ExecNodeKind::ExchangeSource(exchange) = &lowered.node.kind else {
@@ -3368,6 +3494,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("exchange leaf binding");
 
@@ -3392,6 +3519,7 @@ mod tests {
             &mut children,
             &mut arena,
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("attach");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
@@ -3414,6 +3542,7 @@ mod tests {
             &mut children,
             &mut arena,
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("unique left input");
         assert!(matches!(
@@ -3438,6 +3567,7 @@ mod tests {
                 &mut children,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );
@@ -3453,6 +3583,7 @@ mod tests {
                 &mut children,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );
@@ -3476,6 +3607,7 @@ mod tests {
             &mut children,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("filter input boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = &children[0].node.kind else {
@@ -3497,6 +3629,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("values source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
@@ -3529,6 +3662,7 @@ mod tests {
             &mut lowered,
             &mut ExprArena::default(),
             FieldPath::root("test_node"),
+            &NativePlanDecodeContext::default(),
         )
         .expect("generate series source boundary");
         let ExecNodeKind::NativeRuntimeFilterConsumer(consumer) = lowered.node.kind else {
@@ -3556,6 +3690,7 @@ mod tests {
                 &mut lowered,
                 &mut ExprArena::default(),
                 FieldPath::root("test_node"),
+                &NativePlanDecodeContext::default(),
             )
             .is_err()
         );

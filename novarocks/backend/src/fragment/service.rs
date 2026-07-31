@@ -36,10 +36,6 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::profile::Profiler;
-use novarocks::service::native_fragment_ingress::{
-    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
-    NativeFragmentRequest,
-};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };
@@ -51,6 +47,10 @@ use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
+use crate::native::decode::NativeFragmentRequest;
+use crate::native::ingress::{
+    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
+};
 use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +265,9 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request.cache_options()?;
+        let cache_options = request
+            .cache_options()
+            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -388,7 +390,10 @@ impl NativeFragmentService {
 
 #[cfg(test)]
 impl NativeFragmentService {
-    fn submit(&self, request: NativeFragmentRequest) -> Result<(), NativeFragmentIngressError> {
+    fn submit(
+        &self,
+        request: novarocks::service::native_fragment_ingress::NativeFragmentRequest,
+    ) -> Result<(), NativeFragmentIngressError> {
         let query_id = request.query_id();
         let execution_id = request.execution_id();
         let fragment_instance_id = request.fragment_instance_id();
@@ -403,7 +408,9 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
-        let cache_options = request.cache_options()?;
+        let cache_options = request
+            .cache_options()
+            .map_err(NativeFragmentIngressError::new)?;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -714,15 +721,14 @@ mod tests {
     };
     use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::service::native_fragment_ingress::{
-        NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentRequest,
-    };
+    use novarocks::service::native_fragment_ingress::NativeFragmentRequest;
     use novarocks_protocol as proto;
 
     use crate::fragment::control::{FragmentControlHandle, FragmentControlRegistry};
     use crate::fragment::failure_injection::{
         FRAGMENT_EXECUTOR_FAILURE_MESSAGE, start_with_fragment_failure_trigger,
     };
+    use crate::native::ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 
     use super::{
         NativeFragmentLifecycleEvent, NativeFragmentService, RunningFragmentControl,

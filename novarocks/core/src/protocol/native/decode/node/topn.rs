@@ -16,9 +16,9 @@
 // under the License.
 
 use super::super::NativeFragmentDecodeError;
-use super::DecodedNode;
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
-use super::sort::{lower_sort_items, parse_sort_topn_type};
+use super::sort::{lower_sort_items_with_context, parse_sort_topn_type};
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -31,6 +31,7 @@ pub(super) fn lower_topn_node(
     path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let payload_limit = NativeFragmentDecodeError::map_invalid(
@@ -74,12 +75,13 @@ pub(super) fn lower_topn_node(
             "TopNNode final split must be represented as ExchangeReceiver TopNSplit",
         ));
     }
-    let order_by = lower_sort_items(
+    let order_by = lower_sort_items_with_context(
         "TopNNode",
         &topn.items,
         path.clone().field("items"),
         arena,
         &child.layout,
+        ctx,
     )?;
     let topn_type = NativeFragmentDecodeError::map_invalid(
         path.clone().field("topn_type"),

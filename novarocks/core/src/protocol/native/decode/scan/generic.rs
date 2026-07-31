@@ -255,7 +255,7 @@ pub(super) fn lower_connector_read_scan(
         batch,
         context: request_context,
     };
-    let predicate = lower_scan_predicate(scan, arena, &layout)?;
+    let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
     let source = Arc::new(
         ConnectorReadScanSource::new_scheduled_execution_with_batch_transform(
             binding,

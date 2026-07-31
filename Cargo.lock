@@ -3264,14 +3264,19 @@ dependencies = [
 name = "novarocks-backend"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-buffer",
  "bytes",
  "novarocks",
  "novarocks-protocol",
  "novarocks-spi",
+ "novarocks-types",
  "prost 0.13.5",
+ "protoc-bin-vendored",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-build",
 ]
 
 [[package]]

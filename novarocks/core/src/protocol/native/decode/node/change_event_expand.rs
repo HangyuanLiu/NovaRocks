@@ -20,9 +20,8 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
+use super::super::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::change_event_expand::{
@@ -41,6 +40,7 @@ pub(super) fn lower_change_event_expand_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let (output_columns, output_columns_path) = if expand.output_columns.is_empty() {
@@ -48,14 +48,9 @@ pub(super) fn lower_change_event_expand_node(
     } else {
         (&expand.output_columns, path.clone().field("output_columns"))
     };
-    let layout = NativeFragmentDecodeError::map_invalid(
-        output_columns_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        output_columns_path,
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
     let output_slot_ids = layout.order().to_vec();
     let output_set = output_slot_ids.iter().copied().collect::<HashSet<_>>();
     let change_op_slot_id = SlotId::new(expand.change_op_column_id);
@@ -150,7 +145,7 @@ pub(super) fn lower_change_event_expand_node(
             .predicate
             .as_ref()
             .map(|expr| {
-                decode_expr_at(
+                ctx.decode_expression(
                     expr,
                     event_path.clone().field("predicate"),
                     arena,
@@ -173,7 +168,7 @@ pub(super) fn lower_change_event_expand_node(
                 let expr = assignment
                     .expr
                     .as_ref()
-                    .map(|expr| decode_expr_at(expr, event_path.clone().field("assignments").index(assign_idx).field("expr"), arena, &child.layout))
+                    .map(|expr| ctx.decode_expression(expr, event_path.clone().field("assignments").index(assign_idx).field("expr"), arena, &child.layout))
                     .transpose()?;
                 Ok(ChangeEventRuntimeOutputExpr {
                     output_slot_id: slot_id,

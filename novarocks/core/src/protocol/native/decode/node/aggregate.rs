@@ -20,10 +20,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, layout_from_output_columns, slot_schemas_from_output_columns};
-use super::DecodedNode;
+use super::super::layout::Layout;
 use super::common::build_slot_projection;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -43,6 +42,7 @@ pub(super) fn lower_hash_aggregate_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     if aggregate.is_merge.len() != aggregate.aggregates.len() {
@@ -81,14 +81,16 @@ pub(super) fn lower_hash_aggregate_node(
         .clone()
         .field("output_layout")
         .field("aggregate_columns");
-    let mut aggregate_slot_schemas = NativeFragmentDecodeError::map_invalid(
-        group_key_path,
-        slot_schemas_from_output_columns(&output_layout.group_key_columns),
-    )?;
-    aggregate_slot_schemas.extend(NativeFragmentDecodeError::map_invalid(
-        aggregate_columns_path,
-        slot_schemas_from_output_columns(&output_layout.aggregate_columns),
-    )?);
+    let mut aggregate_slot_schemas = ctx
+        .decode_output_layout(&output_layout.group_key_columns, group_key_path)?
+        .slot_schemas()
+        .to_vec();
+    aggregate_slot_schemas.extend(
+        ctx.decode_output_layout(&output_layout.aggregate_columns, aggregate_columns_path)?
+            .slot_schemas()
+            .iter()
+            .cloned(),
+    );
     let aggregate_layout =
         Layout::for_slots(aggregate_slot_schemas.iter().map(|slot| slot.slot_id()));
     let aggregate_output_schema = Arc::new(ChunkSchema::try_new(aggregate_slot_schemas).map_err(
@@ -124,7 +126,7 @@ pub(super) fn lower_hash_aggregate_node(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            decode_expr_at(
+            ctx.decode_expression(
                 expr,
                 path.clone().field("group_by").index(idx),
                 arena,
@@ -205,6 +207,7 @@ pub(super) fn lower_hash_aggregate_node(
                 path.clone().field("aggregates").index(idx),
                 &child,
                 arena,
+                ctx,
             )?
         };
         let inputs = NativeFragmentDecodeError::map_invalid(
@@ -256,10 +259,12 @@ pub(super) fn lower_hash_aggregate_node(
     }) else {
         return Ok(aggregate_node);
     };
-    let visible_layout = NativeFragmentDecodeError::map_invalid(
-        visible_path.clone(),
-        layout_from_output_columns(visible_output_columns),
-    )?;
+    let visible_layout = Layout::for_slots(
+        ctx.decode_output_layout(visible_output_columns, visible_path.clone())?
+            .slot_ids()
+            .iter()
+            .copied(),
+    );
     if visible_layout.order() == aggregate_node.layout.order() {
         return Ok(aggregate_node);
     }
@@ -270,6 +275,7 @@ pub(super) fn lower_hash_aggregate_node(
         visible_path,
         node.node_id,
         arena,
+        ctx,
     )
 }
 
@@ -336,6 +342,7 @@ fn lower_aggregate_update_inputs(
     path: FieldPath,
     child: &DecodedNode,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<Vec<crate::exec::expr::ExprId>, NativeFragmentDecodeError> {
     if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
         return Err(NativeFragmentDecodeError::unsupported(
@@ -347,7 +354,7 @@ fn lower_aggregate_update_inputs(
     }
     let mut inputs = Vec::with_capacity(call.args.len() + call.order_by.len());
     for (arg_idx, expr) in call.args.iter().enumerate() {
-        inputs.push(decode_expr_at(
+        inputs.push(ctx.decode_expression(
             expr,
             path.clone().field("args").index(arg_idx),
             arena,
@@ -364,12 +371,7 @@ fn lower_aggregate_update_inputs(
                 ),
             )
         })?;
-        inputs.push(decode_expr_at(
-            expr,
-            item_path.field("expr"),
-            arena,
-            &child.layout,
-        )?);
+        inputs.push(ctx.decode_expression(expr, item_path.field("expr"), arena, &child.layout)?);
     }
     Ok(inputs)
 }

@@ -16,9 +16,8 @@
 // under the License.
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
-use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
+use super::super::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
@@ -30,6 +29,7 @@ pub(super) fn lower_redistribute_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let mode = redistribute
@@ -68,7 +68,7 @@ pub(super) fn lower_redistribute_node(
         }
     }
     for (idx, expr) in redistribute.partition_exprs.iter().enumerate() {
-        decode_expr_at(
+        ctx.decode_expression(
             expr,
             path.clone().field("partition_exprs").index(idx),
             arena,
@@ -86,10 +86,8 @@ pub(super) fn lower_redistribute_node(
     if output_columns.is_empty() {
         return Ok(child);
     }
-    let layout = NativeFragmentDecodeError::map_invalid(
-        output_path.clone(),
-        layout_from_output_columns(output_columns),
-    )?;
+    let output_layout = ctx.decode_output_layout(output_columns, output_path.clone())?;
+    let layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
     if layout.order() != child.layout.order() {
         return Err(NativeFragmentDecodeError::inconsistent(
             output_path.clone(),
@@ -100,10 +98,7 @@ pub(super) fn lower_redistribute_node(
             ),
         ));
     }
-    let output_schema = NativeFragmentDecodeError::map_invalid(
-        output_path,
-        chunk_schema_from_output_columns(output_columns),
-    )?;
+    let output_schema = output_layout.chunk_schema();
     Ok(DecodedNode {
         node: child.node,
         layout,

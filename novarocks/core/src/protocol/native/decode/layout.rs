@@ -18,14 +18,19 @@
 //! Proto layout lowering placeholder.
 
 use std::collections::HashMap;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use arrow::datatypes::{Field, Schema, SchemaRef};
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::decode_field_type;
 use super::error::NativeFragmentLeafDecodeError;
 use crate::common::ids::SlotId;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::proto::common;
 use crate::protocol::common::error::ProtocolErrorKind;
 
@@ -94,7 +99,7 @@ impl Layout {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn layout_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<Layout, NativeFragmentLeafDecodeError> {
@@ -102,7 +107,7 @@ pub(crate) fn layout_from_output_columns(
     Ok(Layout::for_slots(decoded.slot_ids))
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn schema_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<SchemaRef, NativeFragmentLeafDecodeError> {
@@ -110,7 +115,7 @@ pub(crate) fn schema_from_output_columns(
     Ok(schema_from_fields(decoded.fields))
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn chunk_schema_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<ChunkSchemaRef, NativeFragmentLeafDecodeError> {
@@ -139,7 +144,7 @@ pub(crate) fn chunk_schema_from_output_columns(
     })
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn slot_schemas_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<Vec<ChunkSlotSchema>, NativeFragmentLeafDecodeError> {
@@ -165,24 +170,27 @@ pub(crate) fn slot_schemas_from_output_columns(
         })
 }
 
-#[allow(dead_code)]
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub(crate) fn slot_ids_from_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
     Ok(decode_output_columns(cols)?.slot_ids)
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn schema_from_fields(fields: Vec<Field>) -> SchemaRef {
     Arc::new(Schema::new(
         fields.into_iter().map(Arc::new).collect::<Vec<_>>(),
     ))
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 struct DecodedOutputColumns {
     slot_ids: Vec<SlotId>,
     fields: Vec<Field>,
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn decode_output_columns(
     cols: &[common::OutputColumn],
 ) -> Result<DecodedOutputColumns, NativeFragmentLeafDecodeError> {

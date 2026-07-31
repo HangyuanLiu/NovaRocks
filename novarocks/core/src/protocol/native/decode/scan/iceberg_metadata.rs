@@ -65,7 +65,7 @@ pub(super) fn lower_iceberg_metadata_scan(
         output_columns: metadata_output_columns(output_columns),
         profile_label: Some(format!("native_scan_node_id={}", node.node_id)),
     };
-    let predicate = lower_scan_predicate(scan, arena, &layout)?;
+    let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
     let query_options = ctx.query_options().cloned().unwrap_or_default();
     let source =
         plan_native_iceberg_metadata_read_source(ctx.query_id(), node.node_id, cfg, &query_options)

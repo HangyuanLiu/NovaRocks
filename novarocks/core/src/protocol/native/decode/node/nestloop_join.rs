@@ -18,11 +18,10 @@
 use std::sync::Arc;
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
-use super::super::layout::{Layout, chunk_schema_from_output_columns};
-use super::DecodedNode;
+use super::super::layout::Layout;
 use super::common::concat_layouts;
 use super::hash_join;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
@@ -39,6 +38,7 @@ pub(super) fn lower_nest_loop_join_node(
     physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut it = children.into_iter();
     let mut left = it.next().expect("left");
@@ -78,22 +78,23 @@ pub(super) fn lower_nest_loop_join_node(
             | NestedLoopJoinType::NullAwareLeftAnti
     );
     let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
-        NativeFragmentDecodeError::map_invalid(
-            physical_output_path.clone(),
-            chunk_schema_from_output_columns(&physical.output_columns),
-        )?
+        ctx.decode_output_layout(&physical.output_columns, physical_output_path.clone())?
+            .chunk_schema()
     } else {
         hash_join::join_output_chunk_schema(
             physical,
             join_scope_chunk_schema.clone(),
             "NestLoopJoinNode",
             physical_output_path,
+            ctx,
         )?
     };
     let join_conjunct = join
         .condition
         .as_ref()
-        .map(|expr| decode_expr_at(expr, path.clone().field("condition"), arena, &join_layout))
+        .map(|expr| {
+            ctx.decode_expression(expr, path.clone().field("condition"), arena, &join_layout)
+        })
         .transpose()?;
     let output_layout = if is_semi_anti {
         Layout::for_slots(output_schema.slot_ids().iter().copied())

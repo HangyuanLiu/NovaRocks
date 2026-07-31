@@ -1379,7 +1379,7 @@ fn decode_participant_manifest(
         .as_ref()
         .ok_or_else(|| QueryLifecycleError::invalid_manifest("query options are required"))
         .and_then(|wire| {
-            crate::protocol::native::decode::decode_query_options(wire)
+            crate::protocol::native::query_options_contract::decode_query_options(wire)
                 .map(ParticipantQueryOptions::new)
                 .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))
         })?;
