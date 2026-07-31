@@ -1976,6 +1976,7 @@ mod tests {
 
     #[test]
     fn grpc_poll_reports_post_ready_supervisor_error() {
+        let _test_guard = crate::engine::acquire_standalone_test_guard();
         let (failure_tx, failure_rx) = mpsc::channel();
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -2012,6 +2013,7 @@ mod tests {
 
     #[test]
     fn grpc_poll_reports_unexpected_post_ready_supervisor_exit() {
+        let _test_guard = crate::engine::acquire_standalone_test_guard();
         let (failure_tx, failure_rx) = mpsc::channel();
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -2046,6 +2048,7 @@ mod tests {
 
     #[test]
     fn grpc_poll_ignores_requested_stop_after_supervisor_exit() {
+        let _test_guard = crate::engine::acquire_standalone_test_guard();
         let (failure_tx, failure_rx) = mpsc::channel();
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -2077,6 +2080,9 @@ mod tests {
 
     #[test]
     fn concurrent_standalone_grpc_start_releases_the_losing_listener() {
+        let _test_guard = crate::engine::acquire_standalone_test_guard();
+        super::stop_grpc_server().expect("reset any prior standalone gRPC server");
+
         fn unused_port() -> u16 {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
             let port = listener.local_addr().expect("read ephemeral port").port();

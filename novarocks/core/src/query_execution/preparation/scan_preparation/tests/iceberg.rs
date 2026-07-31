@@ -104,6 +104,23 @@ fn unsupported_id_predicate() -> crate::sql::analysis::TypedExpr {
     }
 }
 
+fn planned_data_files(
+    bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
+    node_id: i32,
+) -> Vec<IcebergDataFileInfo> {
+    let planned = bindings
+        .connector_read(0, node_id)
+        .expect("opaque connector read");
+    planned
+        .splits
+        .iter()
+        .map(|split| {
+            crate::connector::iceberg::provider::planned_split_data_file_for_test(split)
+                .expect("decode test Iceberg split")
+        })
+        .collect()
+}
+
 #[test]
 fn metadata_scan_uses_native_sentinel_range() {
     let direct = super::super::iceberg::build_iceberg_metadata_scan_range_params();
@@ -162,10 +179,10 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
     let read = bindings
         .connector_read(0, 10)
         .expect("opaque connector read");
+    assert_eq!(read.splits.len(), 1);
     assert_eq!(
-        read.splits.len(),
-        2,
-        "fixture provider does not claim predicate execution or file pruning"
+        planned_data_files(&bindings, 10)[0].path,
+        "s3://bucket/id-10-20.parquet"
     );
     assert_eq!(read.static_predicates.len(), 1);
     assert_eq!(
@@ -173,7 +190,7 @@ fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
         format!("{:?}", vec![id_eq(12)])
     );
     assert!(read.predicate_dispositions.iter().all(|disposition| {
-        disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported
+        disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::PruningOnly
     }));
 }
 
@@ -260,7 +277,11 @@ fn identity_partition_predicate_stays_on_opaque_connector_path() {
     let read = bindings
         .connector_read(0, 10)
         .expect("opaque connector read");
-    assert_eq!(read.splits.len(), 2);
+    assert_eq!(read.splits.len(), 1);
+    assert_eq!(
+        planned_data_files(&bindings, 10)[0].path,
+        "s3://bucket/id-12.parquet"
+    );
     assert_eq!(
         format!("{:?}", read.residual_predicates),
         format!("{:?}", vec![id_eq(12)])
@@ -268,17 +289,22 @@ fn identity_partition_predicate_stays_on_opaque_connector_path() {
 }
 
 #[test]
-fn large_plain_file_stays_an_opaque_connector_split() {
+fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
     let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
     let mut file = data_file("s3://bucket/large.parquet");
     file.size = 300 * 1024 * 1024;
     let bindings =
         prepare_scan_bindings(&plan, &registry(vec![file]), None).expect("prepare large-file scan");
-    let read = bindings
-        .connector_read(0, 10)
-        .expect("opaque connector read");
-    assert_eq!(read.splits.len(), 1);
-    assert_eq!(read.splits[0].split_id(), "fixture-0");
+    assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
+    let planned = bindings.connector_read(0, 10).expect("connector read");
+
+    assert_eq!(planned.splits.len(), 1);
+    assert_eq!(planned.splits[0].estimated_bytes(), Some(300 * 1024 * 1024));
+    let file =
+        crate::connector::iceberg::provider::planned_split_data_file_for_test(&planned.splits[0])
+            .expect("decode test Iceberg split");
+    assert_eq!(file.path, "s3://bucket/large.parquet");
+    assert_eq!(file.size, 300 * 1024 * 1024);
 }
 
 #[test]
@@ -296,7 +322,7 @@ fn excessive_delete_apply_cost_preserves_exact_planning_error() {
 
     assert_eq!(
         err,
-        "scan preparation node_id=10: too many Iceberg delete files attached to data file s3://bucket/data.parquet: count=1025 max=1024"
+        "scan preparation node_id=10: ResourceExhausted: too many Iceberg delete files attached to s3://bucket/data.parquet: count=1025 max=1024"
     );
 }
 

@@ -186,11 +186,20 @@ fn prepare_scan_node(
     reject_target_equality_deletes(node_id, &scan.table.source, &execution)?;
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
-        ResolvedScanExecution::IcebergFiles(_) => {
+        ResolvedScanExecution::IcebergFiles(files) => {
             // Design: ADR-0017 (docs/adr/ADR-0017-static-connector-predicate-disposition.md)
             let static_predicates = options
                 .enable_connector_static_predicate_pushdown
-                .then(|| lower_static_connector_predicates(scan))
+                .then(|| {
+                    let connector_schema_fields = files
+                        .table
+                        .schema
+                        .fields
+                        .iter()
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>();
+                    lower_static_connector_predicates(scan, &connector_schema_fields)
+                })
                 .unwrap_or_default();
             let planned = plan_iceberg_connector_read(
                 controls,

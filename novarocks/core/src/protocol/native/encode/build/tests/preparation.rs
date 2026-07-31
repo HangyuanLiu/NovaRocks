@@ -45,7 +45,16 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
                         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
                             table_location: "s3://bucket/test_table".to_string(),
                             data_columns: Vec::new(),
-                            change_files: Vec::new(),
+                            change_files: vec![crate::connector::iceberg::delta::DeltaSourceFile {
+                                path: "s3://bucket/delta-added.parquet".to_string(),
+                                size: 128,
+                                role: crate::connector::iceberg::delta::DeltaSourceRole::DataFile,
+                                partition_spec_id: Some(0),
+                                partition_key: Some("Struct([])".to_string()),
+                                first_row_id: Some(100),
+                                data_sequence_number: Some(7),
+                                row_id_allow_list: None,
+                            }],
                             delete_side: None,
                         },
                 },
@@ -74,11 +83,18 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
     let resolver = SentinelDeltaResolver {
         calls: AtomicUsize::new(0),
     };
+    let connectors = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &connectors,
+        "test_catalog",
+        Vec::new(),
+        None,
+    );
 
     let result = build_for_test(TestBuildRequest {
         distributed_plan: &plan,
         catalog: &EmptyCatalog,
-        connectors: &ConnectorRegistry::new(),
+        connectors: &connectors,
         scan_binding_resolver: Some(&resolver),
     })
     .expect("build prepared delta fragment");
@@ -93,11 +109,18 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
         .0
         .scheduling_view()
         .scan_ranges(0, 10)
-        .expect("delta sentinel range by original node id");
-    assert_eq!(ranges.len(), 1);
-    let file = native_file_range(&ranges[0]);
-    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
-    assert!(file.use_iceberg_jni_metadata_reader);
+        .expect("delta ranges by original node id");
+    assert!(ranges.is_empty());
+    assert_eq!(
+        result
+            .0
+            .scheduling_view()
+            .connector_read(0, 10)
+            .expect("delta opaque connector read")
+            .splits
+            .len(),
+        1
+    );
 }
 
 #[test]

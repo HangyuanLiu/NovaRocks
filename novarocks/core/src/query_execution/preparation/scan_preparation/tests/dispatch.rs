@@ -76,7 +76,7 @@ fn scan_preparation_propagates_caller_cancellation() {
     };
 
     assert!(
-        err.contains("planned-files fixture observed caller cancellation"),
+        err.contains("Cancelled: connector request was cancelled"),
         "{err}"
     );
 }
@@ -94,7 +94,15 @@ fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
 
     assert_eq!(format!("{plan:#?}"), before);
     assert!(bindings.binding(10).is_some());
-    assert_eq!(bindings.scan_ranges(0, 10).expect("ranges").len(), 1);
+    assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
+    assert_eq!(
+        bindings
+            .connector_read(0, 10)
+            .expect("opaque connector read")
+            .splits
+            .len(),
+        1
+    );
 }
 
 #[test]

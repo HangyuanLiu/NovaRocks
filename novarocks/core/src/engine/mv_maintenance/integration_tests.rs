@@ -168,6 +168,22 @@ fn open_env(catalog: &str, current_db: &str) -> MaintenanceTestEnv {
             )
             .expect("create iceberg catalog");
     }
+    {
+        let entry = state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs")
+            .get(catalog)
+            .expect("catalog");
+        for namespace in [current_db, "sales"] {
+            if !crate::connector::iceberg::catalog::registry::namespace_exists(&entry, namespace)
+                .expect("inspect maintenance namespace")
+            {
+                crate::connector::iceberg::catalog::registry::create_namespace(&entry, namespace)
+                    .expect("create maintenance namespace");
+            }
+        }
+    }
     crate::engine::register_iceberg_control_binding(&state, catalog)
         .expect("register iceberg connector control");
     state
@@ -328,6 +344,12 @@ fn create_aggregate_fact_table(
             default: None,
         },
     ];
+    if !crate::connector::iceberg::catalog::registry::namespace_exists(&entry, namespace)
+        .expect("inspect aggregate fact namespace")
+    {
+        crate::connector::iceberg::catalog::registry::create_namespace(&entry, namespace)
+            .expect("create aggregate fact namespace");
+    }
     crate::connector::iceberg::catalog::registry::create_table(
         &entry,
         namespace,

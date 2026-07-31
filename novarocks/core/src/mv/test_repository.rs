@@ -19,7 +19,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -51,6 +51,7 @@ pub struct InMemoryMvRepository {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestMvRepositoryFailurePoint {
+    Create,
     CreateWithId,
     DropById,
     FinalizeRefresh,
@@ -59,6 +60,7 @@ pub(crate) enum TestMvRepositoryFailurePoint {
 
 thread_local! {
     static NEXT_FAILURE: RefCell<Option<TestMvRepositoryFailurePoint>> = const { RefCell::new(None) };
+    static AFTER_CREATE: RefCell<Option<Arc<dyn Fn() + Send + Sync>>> = const { RefCell::new(None) };
 }
 
 pub(crate) struct TestMvRepositoryFailureGuard;
@@ -76,12 +78,27 @@ impl Drop for TestMvRepositoryFailureGuard {
     }
 }
 
+pub(crate) struct TestMvRepositoryAfterCreateGuard;
+
+pub(crate) fn after_next_mv_repository_create(
+    callback: Arc<dyn Fn() + Send + Sync>,
+) -> TestMvRepositoryAfterCreateGuard {
+    AFTER_CREATE.with(|slot| *slot.borrow_mut() = Some(callback));
+    TestMvRepositoryAfterCreateGuard
+}
+
+impl Drop for TestMvRepositoryAfterCreateGuard {
+    fn drop(&mut self) {
+        AFTER_CREATE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 fn fail_if_requested(point: TestMvRepositoryFailurePoint) -> Result<(), MvRepositoryError> {
     let requested = NEXT_FAILURE.with(|slot| slot.borrow_mut().take());
     if requested == Some(point) {
         return Err(MvRepositoryError::new(
             MvRepositoryErrorKind::InvalidRequest,
-            "injected MV repository command failure",
+            format!("test-only injected MV repository failure at {point:?}"),
         ));
     }
     Ok(())
@@ -238,9 +255,16 @@ impl MvRepository for InMemoryMvRepository {
         _: Uuid,
         request: CreateMvRepositoryRequest,
     ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        let mut state = self.state()?;
-        let id = Self::allocate(&mut state);
-        Self::create_locked(&mut state, id, request)
+        fail_if_requested(TestMvRepositoryFailurePoint::Create)?;
+        let definition = {
+            let mut state = self.state()?;
+            let id = Self::allocate(&mut state);
+            Self::create_locked(&mut state, id, request)?
+        };
+        if let Some(callback) = AFTER_CREATE.with(|slot| slot.borrow_mut().take()) {
+            callback();
+        }
+        Ok(definition)
     }
     fn create_with_id(
         &self,
@@ -355,6 +379,13 @@ impl MvRepository for InMemoryMvRepository {
                     format!("MV definition {} does not exist", request.mv_id),
                 )
             })?;
+            let schema = definition.schema_contract.as_mut().ok_or_else(|| {
+                MvRepositoryError::new(
+                    MvRepositoryErrorKind::Corruption,
+                    "MV definition has no schema contract",
+                )
+            })?;
+            schema.target.partition = Some(request.partition_spec.clone());
             definition.partition_spec = Some(request.partition_spec);
             definition.partition_state_complete = false;
             definition.clone()
@@ -514,9 +545,32 @@ impl MvRepository for InMemoryMvRepository {
     }
     fn clear_refresh_progress(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
         let mut state = self.state()?;
-        let Some(definition) = state.definitions.get_mut(&mv_id) else {
+        let Some(active_refresh_id) = state
+            .definitions
+            .get(&mv_id)
+            .map(|definition| definition.active_refresh_id)
+        else {
             return Ok(false);
         };
+        if let Some(refresh_id) = active_refresh_id {
+            let refresh = Self::refresh_mut(&mut state, refresh_id)?;
+            if refresh.state == MvRefreshState::CommitUnknown {
+                return Err(MvRepositoryError::new(
+                    MvRepositoryErrorKind::Conflict,
+                    format!("mv definition {mv_id} active refresh {refresh_id} is commit-unknown"),
+                ));
+            }
+            if !matches!(
+                refresh.state,
+                MvRefreshState::Finalized | MvRefreshState::Aborted
+            ) {
+                refresh.state = MvRefreshState::Aborted;
+            }
+        }
+        let definition = state
+            .definitions
+            .get_mut(&mv_id)
+            .expect("definition checked above");
         definition.refresh_in_progress = false;
         definition.active_refresh_id = None;
         definition.refresh_target_snapshots.clear();

@@ -196,22 +196,40 @@ fn native_root_scan(
     scan
 }
 
-fn native_file_ranges(
+fn native_connector_splits(
     result: &(
         PreparedFragmentSet,
         NativeFragmentBundle,
         Vec<BoundarySchemaReport>,
     ),
-) -> &[crate::runtime::scan_range::ScanRangeParams] {
+) -> &[novarocks_spi::connector::ConnectorSplit] {
     result
         .0
         .scheduling_view()
-        .scan_ranges(0, 10)
-        .expect("scan node ranges")
+        .connector_read(0, 10)
+        .expect("opaque connector read")
+        .splits
+        .as_slice()
+}
+
+fn native_planned_data_files(
+    result: &(
+        PreparedFragmentSet,
+        NativeFragmentBundle,
+        Vec<BoundarySchemaReport>,
+    ),
+) -> Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo> {
+    native_connector_splits(result)
+        .iter()
+        .map(|split| {
+            crate::connector::iceberg::provider::planned_split_data_file_for_test(split)
+                .expect("decode test Iceberg split")
+        })
+        .collect()
 }
 
 #[test]
-fn equality_delete_field_ids_are_merged_into_native_required_columns() {
+fn equality_delete_field_ids_remain_provider_owned() {
     let plan = iceberg_scan_plan(Some(vec!["id"]));
     let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
         Vec::new(),
@@ -226,14 +244,11 @@ fn equality_delete_field_ids_are_merged_into_native_required_columns() {
     ))
     .expect("build native Iceberg scan");
 
-    assert_eq!(
-        native_root_scan(&result).required_columns,
-        vec!["id", "category"]
-    );
+    assert_eq!(native_root_scan(&result).required_columns, vec!["id"]);
 }
 
 #[test]
-fn equality_delete_column_names_are_merged_into_native_required_columns() {
+fn equality_delete_column_names_remain_provider_owned() {
     let plan = iceberg_scan_plan(Some(vec!["id"]));
     let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
         vec!["category"],
@@ -248,10 +263,7 @@ fn equality_delete_column_names_are_merged_into_native_required_columns() {
     ))
     .expect("build native Iceberg scan");
 
-    assert_eq!(
-        native_root_scan(&result).required_columns,
-        vec!["id", "category"]
-    );
+    assert_eq!(native_root_scan(&result).required_columns, vec!["id"]);
 }
 
 #[test]
@@ -271,7 +283,7 @@ fn equality_delete_key_from_planned_splits_is_hidden_from_query_projection() {
     .expect("build native Iceberg scan");
     let scan = native_root_scan(&result);
 
-    assert_eq!(scan.required_columns, vec!["id", "category"]);
+    assert_eq!(scan.required_columns, vec!["id"]);
     assert_eq!(
         scan.columns
             .iter()
@@ -282,7 +294,7 @@ fn equality_delete_key_from_planned_splits_is_hidden_from_query_projection() {
 }
 
 #[test]
-fn equality_delete_with_unrestricted_non_key_projection_preserves_full_read_layout() {
+fn equality_delete_with_non_key_projection_keeps_provider_hidden_layout_private() {
     let plan = iceberg_scan_plan_with_outputs(None, &["id"]);
     let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
         Vec::new(),
@@ -298,7 +310,7 @@ fn equality_delete_with_unrestricted_non_key_projection_preserves_full_read_layo
     .expect("build unrestricted native Iceberg scan");
     let scan = native_root_scan(&result);
 
-    assert_eq!(scan.required_columns, vec!["id", "category"]);
+    assert_eq!(scan.required_columns, vec!["id"]);
     assert_eq!(
         scan.columns
             .iter()
@@ -419,13 +431,10 @@ fn native_iceberg_scan_predicate_prunes_file_stats_for_id_12() {
         None,
     ))
     .expect("build native Iceberg scan");
-    let ranges = native_file_ranges(&result);
+    let files = native_planned_data_files(&result);
 
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(
-        native_file_range(&ranges[0]).full_path.as_deref(),
-        Some("s3://bucket/id-10-20.parquet")
-    );
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "s3://bucket/id-10-20.parquet");
 }
 
 #[test]
@@ -443,17 +452,14 @@ fn native_iceberg_scan_predicate_prunes_identity_partition_for_id_12() {
         None,
     ))
     .expect("build native Iceberg scan");
-    let ranges = native_file_ranges(&result);
+    let files = native_planned_data_files(&result);
 
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(
-        native_file_range(&ranges[0]).full_path.as_deref(),
-        Some("s3://bucket/id-12.parquet")
-    );
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "s3://bucket/id-12.parquet");
 }
 
 #[test]
-fn native_iceberg_scan_splits_large_plain_file() {
+fn native_iceberg_scan_keeps_large_file_in_provider_owned_split() {
     let plan = iceberg_scan_plan(None);
     let mut file = iceberg_data_file(Vec::new());
     file.path = "s3://bucket/large.parquet".to_string();
@@ -467,13 +473,14 @@ fn native_iceberg_scan_splits_large_plain_file() {
         None,
     ))
     .expect("build native Iceberg scan");
-    let ranges = native_file_ranges(&result);
+    let splits = native_connector_splits(&result);
 
-    assert_eq!(ranges.len(), 3);
-    assert_eq!(native_file_range(&ranges[0]).offset, 0);
-    assert_eq!(native_file_range(&ranges[1]).offset, 128 * 1024 * 1024);
-    assert_eq!(native_file_range(&ranges[2]).offset, 256 * 1024 * 1024);
-    assert_eq!(native_file_range(&ranges[2]).length, 44 * 1024 * 1024);
+    assert_eq!(splits.len(), 1);
+    assert_eq!(splits[0].estimated_bytes(), Some(300 * 1024 * 1024));
+    let file = crate::connector::iceberg::provider::planned_split_data_file_for_test(&splits[0])
+        .expect("decode test Iceberg split");
+    assert_eq!(file.path, "s3://bucket/large.parquet");
+    assert_eq!(file.size, 300 * 1024 * 1024);
 }
 
 #[test]
@@ -524,5 +531,5 @@ fn native_iceberg_scan_unsupported_predicate_does_not_guess_pruning() {
     ))
     .expect("unsupported pruning predicate must preserve scan semantics");
 
-    assert_eq!(native_file_ranges(&result).len(), 2);
+    assert_eq!(native_planned_data_files(&result).len(), 2);
 }

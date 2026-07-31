@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use sha2::{Digest, Sha256};
 
 use crate::common::ids::SlotId;
@@ -36,7 +38,8 @@ use crate::query_execution::contract::{
 use crate::query_execution::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
 use crate::query_execution::lifecycle::{
     ExchangeRouteManifest, QueryExecutionId, QueryInitBarrier, QueryInitOptions,
-    QueryLaunchBarrier, QueryLifecycleLease, StageBatch, StageFragment, StageParticipantBinding,
+    QueryLaunchBarrier, QueryLifecycleLease, RuntimeFilterContribution, StageBatch, StageFragment,
+    StageParticipantBinding,
 };
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
@@ -166,6 +169,80 @@ impl ScheduleBoundDistributedQuery {
             options,
             query_lifecycle_lease,
             stage_bindings,
+        })
+    }
+
+    /// Assemble the sealed request for the core-only semantic test runtime.
+    ///
+    /// This deliberately bypasses lifecycle transport only under `cfg(test)`;
+    /// frontend production tests continue to exercise the full Init/Stage/Start
+    /// protocol and all-in-one production never calls this path.
+    #[cfg(test)]
+    pub(crate) fn assemble_for_in_process_test(
+        self,
+        query_id: QueryId,
+        options: &ResolvedQueryOptions,
+        live_backends: &[LiveBackendTarget],
+    ) -> Result<InProcessTestArtifact, DistributedQueryError> {
+        let runtime_filters = crate::query_execution::runtime_filter::compile_contribution_plan(
+            self.schedule.execution_id,
+            self.prepared.runtime_filter_graph(),
+            self.prepared.runtime_filter_join_progress(),
+            self.prepared.scheduling_view().edges(),
+            &self.schedule.inner,
+            live_backends,
+            1,
+            options.runtime_filter_lifecycle(),
+        )?
+        .into_iter()
+        .map(|contribution| {
+            let (_, participant_id, lifecycle, install) = contribution.into_parts();
+            RuntimeFilterContribution::from_compiled(
+                self.schedule.execution_id,
+                participant_id,
+                lifecycle,
+                install,
+            )
+            .map_err(|error| contract_error(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        let install_plan = crate::query_execution::connector_binding::compile_install_plan(
+            &self.prepared,
+            &self.schedule.inner,
+        )?;
+        let declarations = install_plan
+            .backends()
+            .iter()
+            .flat_map(|backend| backend.declarations().iter().cloned())
+            .collect::<Vec<_>>();
+        let assembled = assemble_native_execution(
+            self.prepared,
+            self.native_bundle,
+            self.schedule.inner,
+            self.schedule.execution_id,
+            NativeSubmissionContext {
+                query_id,
+                options: options.runtime_options().clone(),
+                report_endpoint: RuntimeEndpoint::from_socket_addr(
+                    "127.0.0.1:1".parse().expect("static test endpoint"),
+                ),
+                needs_fragment_status_report: true,
+            },
+        )?;
+        Ok(InProcessTestArtifact {
+            submissions: assembled
+                .submissions
+                .into_iter()
+                .map(|submission| InProcessTestSubmission {
+                    plan: submission.plan,
+                    instance_params: submission.instance_params,
+                })
+                .collect(),
+            root_fetch: assembled.root_fetch,
+            writer_registrations: assembled.writer_registrations,
+            expected_output: assembled.expected_output,
+            declarations,
+            runtime_filters,
         })
     }
 }
@@ -1046,6 +1123,22 @@ struct AssembledNativeExecution {
     root_fetch: RootFetchMetadata,
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
+}
+
+#[cfg(test)]
+pub(crate) struct InProcessTestSubmission {
+    pub(crate) plan: crate::proto::plan::PlanFragment,
+    pub(crate) instance_params: crate::proto::novarocks::InstanceParams,
+}
+
+#[cfg(test)]
+pub(crate) struct InProcessTestArtifact {
+    pub(crate) submissions: Vec<InProcessTestSubmission>,
+    pub(crate) root_fetch: RootFetchMetadata,
+    pub(crate) writer_registrations: WriterRegistrationSet,
+    pub(crate) expected_output: ExpectedOutputSchema,
+    pub(crate) declarations: Vec<ConnectorExecutionDeclaration>,
+    pub(crate) runtime_filters: Vec<RuntimeFilterContribution>,
 }
 
 impl StagePreparedDistributedQuery {

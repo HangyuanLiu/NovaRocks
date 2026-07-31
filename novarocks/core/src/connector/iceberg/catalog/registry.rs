@@ -593,9 +593,15 @@ pub(crate) fn create_table(
     partition_fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
     properties: &[(String, String)],
 ) -> Result<(), String> {
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let namespace_name = normalize_identifier(namespace_name)?;
+    if !namespace_exists(entry, &namespace_name)? {
+        return Err(format!(
+            "create iceberg table failed: namespace {namespace_name} does not exist"
+        ));
+    }
+    let namespace = NamespaceIdent::new(namespace_name.clone());
     let table_name = normalize_identifier(table_name)?;
-    entry.invalidate_table_cache(namespace_name, &table_name);
+    entry.invalidate_table_cache(&namespace_name, &table_name);
     let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
     let schema = build_iceberg_schema(columns, format_version)?;
     validate_create_table_variant_shredding_properties(&all_properties, &schema)?;
@@ -914,10 +920,18 @@ pub(crate) fn load_table(
 
     // Check cache first
     {
-        let cache = entry
-            .table_cache
-            .read()
-            .map_err(|e| format!("table cache lock: {e}"))?;
+        let cache = match entry.table_cache.read() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                let message = format!("table cache lock: {poisoned}");
+                drop(poisoned.into_inner());
+                entry.table_cache.clear_poison();
+                if let Ok(mut cache) = entry.table_cache.write() {
+                    cache.clear();
+                }
+                return Err(message);
+            }
+        };
         if let Some(cached) = cache.get(&(ns_name.clone(), tbl_name.clone())) {
             return Ok(cached.clone());
         }

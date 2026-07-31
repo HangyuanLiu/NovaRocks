@@ -135,6 +135,44 @@ impl NativeExecutionReport {
         (self.write, self.profile)
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_in_process_runtime(
+        query_id: UniqueId,
+        fragment_instance_id: UniqueId,
+        backend_num: i32,
+        snapshot: crate::runtime::sink_commit::SinkCommitReportSnapshot,
+        profile: Option<RuntimeProfileTree>,
+    ) -> Self {
+        let mut loaded_rows = snapshot.load_stats.loaded_rows.max(0);
+        let mut loaded_bytes = snapshot.load_stats.loaded_bytes.max(0);
+        for commit in &snapshot.iceberg_commits {
+            if let Some(file) = commit.iceberg_data_file.as_ref() {
+                loaded_rows =
+                    loaded_rows.saturating_add(file.record_count.unwrap_or_default().max(0));
+                loaded_bytes =
+                    loaded_bytes.saturating_add(file.file_size_in_bytes.unwrap_or_default().max(0));
+            }
+        }
+        Self {
+            write: FragmentExecStatusReport {
+                query_id,
+                fragment_instance_id,
+                backend_num,
+                done: true,
+                status: common::Status {
+                    code: 0,
+                    message: String::new(),
+                },
+                iceberg_commits: snapshot.iceberg_commits,
+                load_counters: BTreeMap::new(),
+                loaded_rows,
+                loaded_bytes,
+                filtered_rows: snapshot.load_stats.filtered_rows.max(0),
+            },
+            profile,
+        }
+    }
+
     #[cfg(feature = "query-execution-contract-test-support")]
     pub(crate) fn for_contract_test(
         query_id: UniqueId,

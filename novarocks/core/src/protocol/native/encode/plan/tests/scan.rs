@@ -174,7 +174,10 @@ fn planned_connector_read_for_test()
         scan: ConnectorScan {
             handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
                 .expect("scan handle"),
-            output_schema: Arc::new(arrow::datatypes::Schema::empty()),
+            output_schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("physical_order_id", DataType::Int64, false),
+                arrow::datatypes::Field::new("tenant_id", DataType::Int64, false),
+            ])),
             predicate_dispositions: Vec::new(),
         },
         splits: Vec::new(),
@@ -293,6 +296,7 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
     ];
 
     for source in refresh_sources {
+        let expected_source = source.clone();
         let plan = iceberg_delta_distributed_plan_for_test();
         let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
             &plan,
@@ -396,24 +400,26 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
                 .collect::<Vec<_>>(),
             vec!["_file"]
         );
-        let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+        let encoded_source = table
             .source
             .as_ref()
             .and_then(|source| source.kind.as_ref())
-        else {
-            panic!("refresh source must encode as resolved IcebergDataFiles");
-        };
-        assert_eq!(
-            files.table.as_ref().expect("resolved table").location,
-            "s3://resolved/orders"
-        );
-        assert_eq!(
-            files.binding,
-            crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
-        );
-        assert_eq!(
-            files.binding,
-            crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32
+            .expect("encoded refresh source");
+        assert!(
+            matches!(
+                (&expected_source, encoded_source),
+                (
+                    table_model::ScanSource::IcebergVersionTable { .. },
+                    crate::proto::plan::scan_source::Kind::IcebergVersionTable(_)
+                ) | (
+                    table_model::ScanSource::IcebergMvTargetLocator(_),
+                    crate::proto::plan::scan_source::Kind::IcebergMvTargetLocator(_)
+                ) | (
+                    table_model::ScanSource::IcebergMvTargetState(_),
+                    crate::proto::plan::scan_source::Kind::IcebergMvTargetState(_)
+                )
+            ),
+            "resolved file bindings must not erase the typed refresh source kind"
         );
     }
 }
@@ -740,15 +746,20 @@ fn iceberg_table_info_for_test() -> iceberg_scan_model::IcebergTableInfo {
         schema_id: 1,
         location: "file:///warehouse/orders".to_string(),
         schema: iceberg_scan_model::IcebergSchemaDef {
-            fields: vec![iceberg_scan_model::IcebergSchemaFieldDef {
-                field_id: 1,
-                name: "order_id".to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: Vec::new(),
-            }],
+            fields: [(1, "order_id"), (2, "physical_order_id"), (3, "tenant_id")]
+                .into_iter()
+                .map(
+                    |(field_id, name)| iceberg_scan_model::IcebergSchemaFieldDef {
+                        field_id,
+                        name: name.to_string(),
+                        initial_default: None,
+                        write_default: None,
+                        initial_default_json: None,
+                        write_default_json: None,
+                        children: Vec::new(),
+                    },
+                )
+                .collect(),
         },
         serialized_metadata: None,
         serialized_metadata_rows: None,

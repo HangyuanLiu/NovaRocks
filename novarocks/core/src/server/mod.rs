@@ -1655,9 +1655,19 @@ mod legacy {
     }
 
     fn parse_kill_query(query: &str) -> Result<Option<u32>, (ErrorKind, String)> {
-        let first = query.split_whitespace().next().unwrap_or_default();
+        let mut words = query.split_whitespace();
+        let first = words.next().unwrap_or_default();
         if !first.eq_ignore_ascii_case("kill") {
             return Ok(None);
+        }
+        if !words
+            .next()
+            .is_some_and(|modifier| modifier.eq_ignore_ascii_case("query"))
+        {
+            return Err((
+                ErrorKind::ER_NOT_SUPPORTED_YET,
+                "only KILL QUERY <connection_id> is supported".to_string(),
+            ));
         }
         let statements = sqlparser::parser::Parser::parse_sql(&StarRocksDialect, query)
             .map_err(|error| (ErrorKind::ER_PARSE_ERROR, error.to_string()))?;

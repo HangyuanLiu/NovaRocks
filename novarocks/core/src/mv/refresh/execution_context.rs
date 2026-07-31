@@ -1405,11 +1405,42 @@ mod tests {
             .name("imv-join-fragment-lowering-test".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let (_warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
+                let (warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
                 let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering(
                     &refresh_ctx.rewrite,
                 );
                 let connectors = crate::connector::ConnectorRegistry::default();
+                let catalogs = Arc::new(std::sync::RwLock::new(
+                    crate::connector::iceberg::catalog::IcebergCatalogRegistry::default(),
+                ));
+                for (catalog, directory) in [("ice", "base"), ("tgt", "target")] {
+                    catalogs
+                        .write()
+                        .expect("fixture catalog registry")
+                        .create_catalog(
+                            catalog,
+                            &[
+                                ("type".to_string(), "iceberg".to_string()),
+                                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                                (
+                                    "iceberg.catalog.warehouse".to_string(),
+                                    format!(
+                                        "file://{}",
+                                        warehouse.path().join(directory).display()
+                                    ),
+                                ),
+                            ],
+                        )
+                        .expect("register fixture Iceberg catalog");
+                    connectors.register_fixture_control(
+                        crate::connector::iceberg::provider::IcebergControlProvider::new_control(
+                            novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+                                .expect("fixture connector instance"),
+                            Arc::clone(&catalogs),
+                        )
+                        .expect("fixture Iceberg control binding"),
+                    );
+                }
                 let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
                 let physical_plan =
                     crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)

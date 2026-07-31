@@ -206,6 +206,21 @@ impl IcebergReadBinding {
             })
     }
 
+    pub(crate) fn resolve_access_for_locations<I, S>(
+        &self,
+        locations: I,
+    ) -> Result<FsAccessHandle, ConnectorError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.access_resolver
+            .resolve_locations(locations, self.object_store_config.as_ref())
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
+    }
+
     pub(crate) fn file_read_context(
         &self,
         cancellation: novarocks_fs::FileCancellation,
@@ -483,7 +498,19 @@ impl IcebergReadOnlyConnectorInstance {
             novarocks_fs::FileCancellation::new(),
             request.context.deadline(),
         )?;
-        let access = self.binding.resolve_access(&payload.data_file.path)?;
+        // A split is the authorization unit for its data file and every
+        // provider-planned delete side file. Resolve one least-common access
+        // root up front so partitioned data and sibling delete staging paths
+        // remain inside the same explicit capability.
+        let access = self.binding.resolve_access_for_locations(
+            std::iter::once(payload.data_file.path.as_str()).chain(
+                payload
+                    .data_file
+                    .delete_files
+                    .iter()
+                    .map(|delete| delete.path.as_str()),
+            ),
+        )?;
         IcebergBatchReader::try_new(
             &payload.data_file,
             &payload.physical_predicates,
@@ -2679,6 +2706,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                     .collect()
             }
         };
+        super::planning::validate_planned_files(scan.table.table_info.as_ref(), &files)?;
         if let Some(snapshot_id) = scan.snapshot_id {
             let table_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
                 ConnectorError::new(
@@ -3304,6 +3332,15 @@ pub(crate) fn plan_scan_files(
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn planned_split_data_file_for_test(
+    split: &ConnectorSplit,
+) -> Result<IcebergDataFileInfo, String> {
+    decode_payload::<SplitPayload>(split.payload(), "test Iceberg split")
+        .map(|payload| payload.data_file)
+        .map_err(|error| error.to_string())
+}
+
 /// Fully plans an Iceberg read through its real connector instance.  The
 /// returned scan handle and splits are provider-owned bytes; callers may only
 /// schedule and carry them.  This is intentionally separate from range
@@ -3635,30 +3672,17 @@ fn internal(message: String) -> ConnectorError {
 }
 
 #[cfg(test)]
-pub(crate) fn replace_split_path_for_test(
-    split: &ConnectorSplit,
-    path: &str,
-) -> Result<ConnectorSplit, ConnectorError> {
-    let mut payload: SplitPayload = decode_payload(split.payload(), "split")?;
-    payload.data_file.path = path.to_string();
-    ConnectorSplit::try_new(
-        split.owner().clone(),
-        split.split_id(),
-        encode_payload(
-            &payload,
-            "split",
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        )?,
-        split.estimated_bytes(),
-    )
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::connector::iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
+
+    #[test]
+    fn unknown_table_catalog_error_is_not_found() {
+        let error = map_iceberg_error("unknown table: analytics.orders".to_string());
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
 
     struct NotCancelled;
 
@@ -4212,6 +4236,8 @@ fn planned_table_files_fixture_binding(
                     .expect("fixture projection lock")
                     .push(request.projection.clone());
             }
+            let (physical_predicates, predicate_dispositions) =
+                negotiate_static_predicates(&table, &request.static_predicates);
             Ok(ConnectorScan {
                 handle: ConnectorScanHandle::try_new(
                     self.instance_id.clone(),
@@ -4222,21 +4248,14 @@ fn planned_table_files_fixture_binding(
                             table_uuid: None,
                             projection: request.projection,
                             limit: request.limit,
-                            physical_predicates: Vec::new(),
+                            physical_predicates,
                         },
                         "fixture scan handle",
                         request.context.max_handle_payload_bytes(),
                     )?,
                 )?,
                 output_schema: Arc::new(Schema::empty()),
-                predicate_dispositions: request
-                    .static_predicates
-                    .iter()
-                    .map(|predicate| novarocks_spi::connector::ConnectorPredicateDisposition {
-                        predicate_id: predicate.id,
-                        kind: novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported,
-                    })
-                    .collect(),
+                predicate_dispositions,
             })
         }
 
@@ -4246,7 +4265,8 @@ fn planned_table_files_fixture_binding(
             request: ConnectorSplitPlanningRequest,
         ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
             let scan: ScanPayload = decode_payload(scan.payload(), "fixture scan handle")?;
-            self.files_by_table
+            let files = self
+                .files_by_table
                 .get(&scan.table.table)
                 .or_else(|| self.files_by_table.get("*"))
                 .ok_or_else(|| {
@@ -4254,17 +4274,32 @@ fn planned_table_files_fixture_binding(
                         ConnectorErrorKind::NotFound,
                         format!("no planned files for fixture table {}", scan.table.table),
                     )
-                })?
+                })?;
+            super::planning::validate_planned_files(scan.table.table_info.as_ref(), files)?;
+            let candidate_units_considered = files.len() as u64;
+            let mut pruning_counters = super::file_pruning::IcebergFilePruningCounters::default();
+            let files = files
                 .iter()
+                .filter(|file| {
+                    super::file_pruning::file_may_satisfy_physical_predicates(
+                        file,
+                        &scan.physical_predicates,
+                        &mut pruning_counters,
+                    )
+                })
                 .cloned()
+                .collect::<Vec<_>>();
+            let splits = files
+                .into_iter()
                 .enumerate()
                 .map(|(index, data_file)| {
+                    let estimated_bytes = u64::try_from(data_file.size).ok();
                     ConnectorSplit::try_new(
                         self.instance_id.clone(),
                         format!("fixture-{index}"),
                         encode_payload(
                             &SplitPayload {
-                                version: ICEBERG_SPLIT_V1,
+                                version: ICEBERG_SPLIT_V2,
                                 owner_instance_id: self.instance_id.as_str().to_string(),
                                 incarnation: [0; 16],
                                 namespace: scan.table.namespace.clone(),
@@ -4275,22 +4310,25 @@ fn planned_table_files_fixture_binding(
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
-                                physical_predicates: Vec::new(),
+                                physical_predicates: scan.physical_predicates.clone(),
                                 delta: None,
                             },
                             "fixture split",
                             request.context.max_handle_payload_bytes(),
                         )?,
-                        None,
+                        estimated_bytes,
                     )
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|splits| {
-                    ConnectorSplitPlanningResult::try_new(
-                        splits,
-                        ConnectorSplitPlanningMetrics::default(),
-                    )
-                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ConnectorSplitPlanningResult::try_new(
+                splits,
+                ConnectorSplitPlanningMetrics {
+                    candidate_units_considered,
+                    candidate_units_pruned: u64::try_from(pruning_counters.files_pruned)
+                        .unwrap_or(u64::MAX)
+                        .min(candidate_units_considered),
+                },
+            )
         }
     }
 
