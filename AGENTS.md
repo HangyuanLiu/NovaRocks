@@ -872,9 +872,9 @@ Durable design decisions, philosophies, and their honestly-recorded trade-offs l
 `docs/adr/` (index and authoring rules: `docs/adr/README.md`).
 Before changing architecture-level behavior, check the index for the affected domain.
 Any PR that embodies a new design decision or accepts a compromise must add or
-supersede an ADR — use the `/adr` skill (`skills/adr/`, exposed to Claude Code via the
-`.claude/skills/adr` symlink), which embeds the template, numbering, supersede, and
-collision-renumbering rules.
+supersede an ADR — use the `/adr` skill (`.agents/skills/adr/`, exposed directly
+to Codex and to Claude Code via the `.claude/skills/adr` symlink), which embeds the
+template, numbering, supersede, and collision-renumbering rules.
 
 ---
 
@@ -885,7 +885,7 @@ project documentation root from memory. Use the newest directly applicable,
 existing path; when memory has no usable project documentation path, use
 `<repo-root>/docs/workflow`.
 
-Use the generic skills-only plugin under `skills/dev-workflow/`:
+Use the generic skills-only plugin under `.agents/skills/dev-workflow/`:
 
 - `dev-workflow`: identify and route the current stage;
 - `dev-workflow-discuss-design`: settle the problem and major design decisions;
@@ -896,13 +896,15 @@ Use the generic skills-only plugin under `skills/dev-workflow/`:
   verification;
 - `dev-workflow-finish`: publish and archive only when authorized.
 
+Codex discovers the project-local skill sources directly under `.agents/skills/`.
+
 Do not skip the accepted-design and approved-plan gates. Sub-agents are allowed
 in every stage when they provide useful parallel investigation, independent
 verification, isolated implementation, or risk review. The main agent retains
 ownership and verifies their results.
 
 The bundle's
-`skills/dev-workflow/skills/dev-workflow/references/workflow-contract.md` is the
+`.agents/skills/dev-workflow/skills/dev-workflow/references/workflow-contract.md` is the
 only development-workflow contract. Do not depend on an external workflow
 document. In Plan mode, produce a task DAG with hard dependencies, parallel
 waves, non-overlapping file ownership, sub-agent scheduling labels, independent
