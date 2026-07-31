@@ -41,6 +41,8 @@ use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info};
 use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
+#[cfg(all(test, feature = "compat"))]
+use crate::runtime::fragment::io::SyncFragmentExecutor;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
 use crate::service::grpc_query_lifecycle_adapter::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
