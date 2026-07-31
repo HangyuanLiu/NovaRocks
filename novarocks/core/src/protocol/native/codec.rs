@@ -348,7 +348,10 @@ impl std::fmt::Display for WireScanError {
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTANCE_PARAMS_FIELD, STAGE_FRAGMENTS_FIELD, validate_stage_fragments_request_wire,
+        INSTANCE_PARAMS_FIELD, PLAN_FIELD, PLAN_RUNTIME_FILTER_BINDINGS_FIELD,
+        PRODUCER_AGGREGATE_TOPN_KEY_FIELD, PRODUCER_JOIN_BUILD_KEY_FIELD,
+        RUNTIME_FILTER_BINDING_PRODUCER_FIELD, RUNTIME_FILTER_TABLE_BINDING_FIELD,
+        STAGE_FRAGMENTS_FIELD, validate_stage_fragments_request_wire,
     };
 
     fn length_delimited(field: u32, payload: &[u8]) -> Vec<u8> {
@@ -364,11 +367,37 @@ mod tests {
         length_delimited(STAGE_FRAGMENTS_FIELD, &stage_fragment)
     }
 
+    fn stage_with_ambiguous_producer_target() -> Vec<u8> {
+        let producer = [
+            length_delimited(PRODUCER_JOIN_BUILD_KEY_FIELD, &[]),
+            length_delimited(PRODUCER_AGGREGATE_TOPN_KEY_FIELD, &[]),
+        ]
+        .concat();
+        let binding = length_delimited(RUNTIME_FILTER_BINDING_PRODUCER_FIELD, &producer);
+        let table = length_delimited(RUNTIME_FILTER_TABLE_BINDING_FIELD, &binding);
+        let plan = length_delimited(PLAN_RUNTIME_FILTER_BINDINGS_FIELD, &table);
+        let stage_fragment = length_delimited(PLAN_FIELD, &plan);
+        length_delimited(STAGE_FRAGMENTS_FIELD, &stage_fragment)
+    }
+
     #[test]
     fn stage_scanner_rejects_retired_instance_params_tag_in_nested_fragments() {
         let error = validate_stage_fragments_request_wire(&stage_with_instance(&[0x3a, 0]))
             .expect_err("nested retired tag must be rejected before Prost drops it");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("tag 7"), "{error}");
+    }
+
+    #[test]
+    fn stage_scanner_rejects_ambiguous_producer_target_before_prost_decode() {
+        let error = validate_stage_fragments_request_wire(&stage_with_ambiguous_producer_target())
+            .expect_err("ambiguous producer target must be rejected before Prost selects one arm");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("both join_build_key and aggregate_topn_key"),
+            "{error}"
+        );
     }
 }

@@ -21,7 +21,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/catalog", "novarocks/compat", "novarocks/core", "novarocks/frontend", "novarocks/fs", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
+members = ["novarocks/backend", "novarocks/catalog", "novarocks/compat", "novarocks/core", "novarocks/frontend", "novarocks/fs", "novarocks/protocol", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
 default-members = ["novarocks-server"]
 # Existing standalone crates under the workspace tree are excluded rather than
 # pulled in as members: they run independently via `--manifest-path`, and

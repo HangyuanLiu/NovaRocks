@@ -189,7 +189,7 @@ mod tests {
         fn native_wire_report_on_submit(
             &self,
             submit_count: usize,
-            report: novarocks::proto::novarocks::ExecStatusReport,
+            report: novarocks_protocol::novarocks::ExecStatusReport,
             coordinator: &FrontendDistributedQueryCoordinator,
         ) {
             let handler = coordinator.report_handler();

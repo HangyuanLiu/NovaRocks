@@ -712,14 +712,14 @@ mod tests {
         )
         .expect("all-in-one loopback client");
         let report_response = client
-            .blocking_report_exec_status(novarocks::proto::novarocks::ReportExecStatusRequest {
-                report: Some(novarocks::proto::novarocks::ExecStatusReport {
-                    query_id: Some(novarocks::proto::common::UniqueId { hi: 61, lo: 71 }),
-                    fragment_instance_id: Some(novarocks::proto::common::UniqueId {
+            .blocking_report_exec_status(novarocks_protocol::novarocks::ReportExecStatusRequest {
+                report: Some(novarocks_protocol::novarocks::ExecStatusReport {
+                    query_id: Some(novarocks_protocol::common::UniqueId { hi: 61, lo: 71 }),
+                    fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
                         hi: 61,
                         lo: 72,
                     }),
-                    status: Some(novarocks::proto::common::Status::default()),
+                    status: Some(novarocks_protocol::common::Status::default()),
                     done: true,
                     ..Default::default()
                 }),

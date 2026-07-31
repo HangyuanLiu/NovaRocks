@@ -130,10 +130,8 @@ impl StageDigest {
 }
 
 static NATIVE_DESCRIPTOR_POOL: Lazy<DescriptorPool> = Lazy::new(|| {
-    DescriptorPool::decode(
-        include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin")).as_ref(),
-    )
-    .expect("native protobuf descriptor set is valid")
+    DescriptorPool::decode(novarocks_protocol::FILE_DESCRIPTOR_SET)
+        .expect("native protobuf descriptor set is valid")
 });
 
 /// Hash a decoded protobuf message through the Stage-owned canonical semantic

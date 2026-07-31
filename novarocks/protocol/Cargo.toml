@@ -1,0 +1,18 @@
+[package]
+name = "novarocks-protocol"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+prost = "0.13"
+
+[dev-dependencies]
+prost-reflect = "0.14"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
