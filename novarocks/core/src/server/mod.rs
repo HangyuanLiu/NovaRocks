@@ -1526,6 +1526,9 @@ mod legacy {
             "enable_materialized_view_rewrite" => {
                 settings.enable_materialized_view_rewrite = Some(enabled)
             }
+            "enable_connector_static_predicate_pushdown" => {
+                settings.enable_connector_static_predicate_pushdown = Some(enabled)
+            }
             "cbo_enable_dp_join_reorder" => settings.enable_dp_join_reorder = Some(enabled),
             "cbo_enable_greedy_join_reorder" => settings.enable_greedy_join_reorder = Some(enabled),
             "enable_global_runtime_filter_cross_exchange" => {
@@ -2854,6 +2857,29 @@ mod legacy {
                 "SET enable_global_runtime_filter = true"
             ));
             assert_eq!(settings.enable_global_runtime_filter, Some(true));
+        }
+
+        #[test]
+        fn connector_static_predicate_pushdown_set_stores_explicit_false_and_true() {
+            let mut settings = SessionOptimizerSettings::default();
+
+            assert!(apply_optimizer_boolean_set(
+                &mut settings,
+                "SET enable_connector_static_predicate_pushdown = false"
+            ));
+            assert_eq!(
+                settings.enable_connector_static_predicate_pushdown,
+                Some(false)
+            );
+
+            assert!(apply_optimizer_boolean_set(
+                &mut settings,
+                "SET enable_connector_static_predicate_pushdown = true"
+            ));
+            assert_eq!(
+                settings.enable_connector_static_predicate_pushdown,
+                Some(true)
+            );
         }
 
         #[test]

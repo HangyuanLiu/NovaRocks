@@ -805,6 +805,9 @@ fn apply_optimizer_session_set(
         "enable_materialized_view_rewrite" => {
             settings.enable_materialized_view_rewrite = Some(parse_bool_value()?);
         }
+        "enable_connector_static_predicate_pushdown" => {
+            settings.enable_connector_static_predicate_pushdown = Some(parse_bool_value()?);
+        }
         "cbo_enable_dp_join_reorder" => {
             settings.enable_dp_join_reorder = Some(parse_bool_value()?);
         }
@@ -1019,12 +1022,22 @@ mod tests {
         .expect("runtime filter selectivity setting");
         apply_optimizer_session_set(&mut settings, "enable_common_subexpr_reuse", "false")
             .expect("cse setting");
+        apply_optimizer_session_set(
+            &mut settings,
+            "enable_connector_static_predicate_pushdown",
+            "false",
+        )
+        .expect("connector static predicate setting");
         apply_optimizer_session_set(&mut settings, "cbo_max_reorder_node_use_exhaustive", "2")
             .expect("join reorder setting");
 
         assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(0.0));
         assert_eq!(settings.rf_probe_min_selectivity, Some(0.0));
         assert_eq!(settings.enable_common_subexpr_reuse, Some(false));
+        assert_eq!(
+            settings.enable_connector_static_predicate_pushdown,
+            Some(false)
+        );
         assert_eq!(settings.max_reorder_node_use_exhaustive, Some(2));
     }
 
