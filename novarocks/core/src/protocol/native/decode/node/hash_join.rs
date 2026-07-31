@@ -20,10 +20,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
 use super::super::layout::chunk_schema_from_output_columns;
-use super::DecodedNode;
 use super::common::{concat_layouts, proto_join_type};
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -44,6 +43,7 @@ pub(super) fn lower_hash_join_node(
     physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut it = children.into_iter();
     let left = it.next().expect("left");
@@ -92,13 +92,14 @@ pub(super) fn lower_hash_join_node(
                 format!("HashJoinNode eq_conditions[{idx}] right missing"),
             )
         })?;
-        let probe_key = decode_expr_at(
+        let probe_key = ctx.decode_expression(
             left_expr,
             cond_path.clone().field("left"),
             arena,
             &left.layout,
         )?;
-        let build_key = decode_expr_at(right_expr, cond_path.field("right"), arena, &right.layout)?;
+        let build_key =
+            ctx.decode_expression(right_expr, cond_path.field("right"), arena, &right.layout)?;
         if right_semi_physical_right_probe {
             probe_keys.push(build_key);
             build_keys.push(probe_key);
@@ -127,7 +128,7 @@ pub(super) fn lower_hash_join_node(
         .other_condition
         .as_ref()
         .map(|expr| {
-            decode_expr_at(
+            ctx.decode_expression(
                 expr,
                 path.clone().field("other_condition"),
                 arena,

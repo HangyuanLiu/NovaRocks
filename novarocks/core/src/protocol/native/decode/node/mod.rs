@@ -1724,6 +1724,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::HashJoin(join) => hash_join::lower_hash_join_node(
             node,
@@ -1734,6 +1735,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::NestLoopJoin(join) => nestloop_join::lower_nest_loop_join_node(
             node,
