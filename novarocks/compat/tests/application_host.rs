@@ -11,8 +11,6 @@ struct FakePorts {
     polls: Arc<Mutex<VecDeque<Result<Option<String>, String>>>>,
     brpc_fragment_contexts: Arc<Mutex<Vec<usize>>>,
     brpc_lake_contexts: Arc<Mutex<Vec<usize>>>,
-    native_report_rejection:
-        Arc<Mutex<Option<novarocks::query_execution::report::NativeReportHandlerError>>>,
 }
 
 impl FakePorts {
@@ -24,7 +22,6 @@ impl FakePorts {
             polls: Arc::new(Mutex::new(VecDeque::new())),
             brpc_fragment_contexts: Arc::new(Mutex::new(Vec::new())),
             brpc_lake_contexts: Arc::new(Mutex::new(Vec::new())),
-            native_report_rejection: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -56,13 +53,8 @@ impl CompatPorts for FakePorts {
         &mut self,
         _config: crate::listeners::CompatListenerConfig,
         _compat_routes: axum::Router,
-        report_handler: Arc<dyn novarocks::query_execution::report::NativeReportHandler>,
         _starlet_control: Arc<dyn crate::listeners::StarletControl>,
     ) -> Result<(), String> {
-        let rejection = report_handler
-            .handle_native_report(Default::default())
-            .expect_err("compat host must inject a rejecting native report handler");
-        *self.native_report_rejection.lock().unwrap() = Some(rejection);
         self.start("grpc")
     }
 
@@ -141,27 +133,6 @@ fn test_config() -> CompatServerConfig {
     config.runtime.be_mem_limit_bytes = 8 * 1024 * 1024 * 1024;
     config.runtime.internal_service_query_rpc_thread_num = 11;
     CompatServerConfig { config }
-}
-
-#[test]
-fn compat_backend_rejects_native_coordinator_reports_with_role_error() {
-    let ports = FakePorts::new();
-    let native_report_rejection = Arc::clone(&ports.native_report_rejection);
-    let host = CompatApplicationHost::open_with_ports(test_config(), ports)
-        .expect("open compat application");
-    let error = native_report_rejection
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("compat gRPC port receives the host-selected report handler");
-
-    assert_eq!(error.status_code(), 1);
-    assert_eq!(error.error_code(), "NativeReportRoleRejected");
-    assert_eq!(
-        error.message(),
-        "compat backend role does not own native coordinator report ingress"
-    );
-    host.shutdown().expect("shutdown compat application");
 }
 
 #[test]

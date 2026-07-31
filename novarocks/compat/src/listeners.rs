@@ -610,21 +610,7 @@ mod tests {
     use axum::Router;
 
     use super::{CompatListenerConfig, CompatListenerGroup, StarletControl, parse_bind_addr};
-    use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use novarocks::runtime::starlet_shard_registry::S3StoreConfig;
-
-    struct RejectingReportHandler;
-
-    impl NativeReportHandler for RejectingReportHandler {
-        fn handle_native_report(
-            &self,
-            _report: novarocks::proto::novarocks::ExecStatusReport,
-        ) -> Result<(), NativeReportHandlerError> {
-            Err(NativeReportHandlerError::role_rejected(
-                "test report handler",
-            ))
-        }
-    }
 
     struct TestStarletControl;
 
@@ -675,7 +661,6 @@ mod tests {
                 starlet_port,
             },
             Router::new(),
-            Arc::new(RejectingReportHandler),
             Arc::new(TestStarletControl),
         )
         .expect("start listener group");
@@ -698,7 +683,6 @@ mod tests {
                 starlet_port: 12346,
             },
             Router::new(),
-            Arc::new(RejectingReportHandler),
             Arc::new(TestStarletControl),
         ) {
             Ok(_) => panic!("duplicate ports must fail"),

@@ -305,7 +305,7 @@ struct ClusterHarness {
     be: ProcessGuard,
     _fe: ProcessGuard,
     fe_mysql: u16,
-    be_grpc: u16,
+    be_http: u16,
     _state_store_root: TempDir,
 }
 
@@ -384,7 +384,7 @@ deployment_owner = "fe-1"
             be,
             _fe: fe,
             fe_mysql: fe_mysql_port,
-            be_grpc: be_grpc_port,
+            be_http: be_http_port,
             _state_store_root: state_store_root,
         }
     }
@@ -395,7 +395,7 @@ struct MultiBeClusterHarness {
     bes: Vec<ProcessGuard>,
     fe: Option<ProcessGuard>,
     fe_mysql: u16,
-    be_grpc_ports: Vec<u16>,
+    be_http_ports: Vec<u16>,
     #[allow(dead_code)]
     _be_configs: Vec<NamedTempFile>,
     fe_config: NamedTempFile,
@@ -549,7 +549,7 @@ backends = [{backends_list}]
             bes,
             fe: Some(fe),
             fe_mysql: fe_mysql_port,
-            be_grpc_ports,
+            be_http_ports,
             _be_configs: be_configs,
             fe_config,
             be_log_dirs,
@@ -1371,13 +1371,13 @@ fn mysql_disconnect_triggers_cancel() {
     let mut cluster = ClusterHarness::start("", "");
 
     let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
-    wait_for_backend_running_fragment_control(cluster.be_grpc, Duration::from_secs(3));
+    wait_for_backend_running_fragment_control(cluster.be_http, Duration::from_secs(3));
     stream
         .shutdown(Shutdown::Both)
         .expect("shutdown raw mysql client");
 
     wait_for_backend_query_lifecycle_termination(
-        cluster.be_grpc,
+        cluster.be_http,
         "coordinator_abort",
         Duration::from_secs(3),
     );
@@ -1406,7 +1406,7 @@ fn query_timeout_triggers_cancel() {
     );
 
     wait_for_backend_query_lifecycle_termination_any(
-        cluster.be_grpc,
+        cluster.be_http,
         &["coordinator_abort", "local_failure"],
         Duration::from_secs(5),
     );
@@ -1523,7 +1523,7 @@ operator_buffer_chunks = 1
         .expect("target query must terminate after KILL QUERY")
         .expect_err("target query must not succeed after KILL QUERY");
     assert_mysql_server_error(target_error, 1317);
-    for port in &cluster.be_grpc_ports {
+    for port in &cluster.be_http_ports {
         wait_for_backend_query_lifecycle_termination(
             *port,
             "coordinator_abort",

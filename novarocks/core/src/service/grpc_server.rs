@@ -30,35 +30,35 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use tonic::service::Routes;
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::common::config::http_port;
 use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info};
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use crate::query_execution::lifecycle::QueryLifecycleIngress;
 use crate::query_execution::lifecycle::{
-    QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
-    decode_query_terminal_snapshot,
+    QueryTerminalIngress, QueryTerminalReportOutcome, decode_query_terminal_snapshot,
 };
-#[cfg(all(test, feature = "compat"))]
-use crate::runtime::fragment::io::SyncFragmentExecutor;
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeIngress;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::service::grpc_query_lifecycle_adapter::{
-    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, status_from_lifecycle_error,
+    handle_abort_query, handle_init_query, handle_query_control_stream, handle_stage_fragments,
+    handle_start_prepared_query,
 };
 use crate::service::grpc_runtime_filter_adapter::handle_runtime_filter_envelope;
 use crate::service::internal_rpc;
 use crate::service::metrics_http;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::service::native_fragment_ingress::{NativeFragmentCancelRequest, NativeFragmentIngress};
 use crate::service::runtime_filter_envelope_ingress::query_scoped_runtime_filter_envelope_ingress;
 
 pub use crate::proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const CANCEL_FRAGMENT_OK: i32 = 0;
-const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
-static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static PAUSE_STANDALONE_GRPC_STARTUP_AFTER_RESERVATION: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -137,14 +137,22 @@ impl NativeFragmentIngress for RejectingTestNativeFragmentIngress {
     }
 }
 
-fn cancel_finst_marker(
-    query_id: crate::common::types::UniqueId,
-    finst_id: crate::common::types::UniqueId,
-) -> String {
-    format!(
-        "NOVAROCKS_CANCEL_FINST query_hi={} query_lo={} finst_hi={} finst_lo={}",
-        query_id.hi, query_id.lo, finst_id.hi, finst_id.lo
-    )
+fn status_from_lifecycle_error(
+    error: crate::query_execution::lifecycle::QueryLifecycleError,
+) -> tonic::Status {
+    use crate::query_execution::lifecycle::QueryLifecycleErrorCode;
+
+    let detail = error.detail().to_string();
+    match error.code() {
+        QueryLifecycleErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),
+        QueryLifecycleErrorCode::Conflict => tonic::Status::already_exists(detail),
+        QueryLifecycleErrorCode::StaleBackend | QueryLifecycleErrorCode::Terminated => {
+            tonic::Status::failed_precondition(detail)
+        }
+        QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
+        QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
+        QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
+    }
 }
 
 #[derive(Default)]
@@ -177,8 +185,11 @@ fn pause_standalone_grpc_startup_after_reservation() {
 #[derive(Clone)]
 pub struct GrpcService {
     allow_local_execution: bool,
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     query_control_shutdown: Option<watch::Receiver<bool>>,
     terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
@@ -193,6 +204,7 @@ impl std::fmt::Debug for GrpcService {
 }
 
 impl GrpcService {
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     pub fn with_fragment_execution(
         native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
@@ -209,23 +221,34 @@ impl GrpcService {
     /// execute fragments through an out-of-band ingress (for example BRPC).
     /// It owns no listener, HTTP router, Starlet adapter, or application state.
     pub fn internal_execution_without_native_fragment_ingress() -> Self {
-        Self::with_handlers(
-            true,
-            None,
-            None,
-            query_scoped_runtime_filter_envelope_ingress(),
-        )
+        Self {
+            allow_local_execution: true,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            native_fragment_ingress: None,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            query_lifecycle_ingress: None,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            query_control_shutdown: None,
+            terminal_ingress: None,
+            runtime_filter_envelope_ingress: query_scoped_runtime_filter_envelope_ingress(),
+        }
     }
 
     pub fn terminal_ingress_only() -> Self {
-        Self::with_handlers(
-            false,
-            None,
-            None,
-            query_scoped_runtime_filter_envelope_ingress(),
-        )
+        Self {
+            allow_local_execution: false,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            native_fragment_ingress: None,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            query_lifecycle_ingress: None,
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+            query_control_shutdown: None,
+            terminal_ingress: None,
+            runtime_filter_envelope_ingress: query_scoped_runtime_filter_envelope_ingress(),
+        }
     }
 
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fn with_handlers(
         allow_local_execution: bool,
         native_fragment_ingress: Option<Arc<dyn NativeFragmentIngress>>,
@@ -279,6 +302,7 @@ impl GrpcService {
         }
     }
 
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fn require_query_lifecycle(
         &self,
         rpc_name: &str,
@@ -289,6 +313,7 @@ impl GrpcService {
         })
     }
 
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
         self.query_control_shutdown = Some(shutdown);
         self
@@ -805,37 +830,47 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         tonic::Response<proto::novarocks::EnsureConnectorExecutionBindingResponse>,
         tonic::Status,
     > {
-        self.require_local_execution("EnsureConnectorExecutionBinding")?;
-        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
-            tonic::Status::failed_precondition("connector binding ingress is not configured")
-        })?;
-        let request = request.into_inner();
-        let result = tokio::task::spawn_blocking(move || {
-            let (execution_id, declaration) =
-                crate::service::connector_binding::decode_ensure_request(request)
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            self.require_local_execution("EnsureConnectorExecutionBinding")?;
+            let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+                tonic::Status::failed_precondition("connector binding ingress is not configured")
+            })?;
+            let request = request.into_inner();
+            let result = tokio::task::spawn_blocking(move || {
+                let (execution_id, declaration) =
+                    crate::service::connector_binding::decode_ensure_request(request)
+                        .map_err(|error| error.to_string())?;
+                let context = crate::service::connector_binding::install_request_context()
                     .map_err(|error| error.to_string())?;
-            let context = crate::service::connector_binding::install_request_context()
-                .map_err(|error| error.to_string())?;
-            ingress
-                .ensure_connector_execution_binding(execution_id, declaration, context)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "ensure_connector_execution_binding handler panicked: {error}"
+                ingress
+                    .ensure_connector_execution_binding(execution_id, declaration, context)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "ensure_connector_execution_binding handler panicked: {error}"
+                ))
+            })?;
+            let (status_code, message) = match result {
+                Ok(()) => (0, String::new()),
+                Err(error) => (1, error),
+            };
+            Ok(tonic::Response::new(
+                proto::novarocks::EnsureConnectorExecutionBindingResponse {
+                    status_code,
+                    message,
+                },
             ))
-        })?;
-        let (status_code, message) = match result {
-            Ok(()) => (0, String::new()),
-            Err(error) => (1, error),
-        };
-        Ok(tonic::Response::new(
-            proto::novarocks::EnsureConnectorExecutionBindingResponse {
-                status_code,
-                message,
-            },
-        ))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects connector binding RPC",
+            ))
+        }
     }
 
     async fn retire_connector_execution_binding(
@@ -845,131 +880,202 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         tonic::Response<proto::novarocks::RetireConnectorExecutionBindingResponse>,
         tonic::Status,
     > {
-        self.require_local_execution("RetireConnectorExecutionBinding")?;
-        let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
-            tonic::Status::failed_precondition("connector binding ingress is not configured")
-        })?;
-        let request = request.into_inner();
-        let result = tokio::task::spawn_blocking(move || {
-            let key = crate::service::connector_binding::decode_retire_request(request)
-                .map_err(|error| error.to_string())?;
-            ingress
-                .retire_connector_execution_binding(key)
-                .map_err(|error| error.to_string())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "retire_connector_execution_binding handler panicked: {error}"
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            self.require_local_execution("RetireConnectorExecutionBinding")?;
+            let ingress = self.native_fragment_ingress.clone().ok_or_else(|| {
+                tonic::Status::failed_precondition("connector binding ingress is not configured")
+            })?;
+            let request = request.into_inner();
+            let result = tokio::task::spawn_blocking(move || {
+                let key = crate::service::connector_binding::decode_retire_request(request)
+                    .map_err(|error| error.to_string())?;
+                ingress
+                    .retire_connector_execution_binding(key)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!(
+                    "retire_connector_execution_binding handler panicked: {error}"
+                ))
+            })?;
+            let (status_code, message) = match result {
+                Ok(()) => (0, String::new()),
+                Err(error) => (1, error),
+            };
+            Ok(tonic::Response::new(
+                proto::novarocks::RetireConnectorExecutionBindingResponse {
+                    status_code,
+                    message,
+                },
             ))
-        })?;
-        let (status_code, message) = match result {
-            Ok(()) => (0, String::new()),
-            Err(error) => (1, error),
-        };
-        Ok(tonic::Response::new(
-            proto::novarocks::RetireConnectorExecutionBindingResponse {
-                status_code,
-                message,
-            },
-        ))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects connector binding RPC",
+            ))
+        }
     }
 
     async fn heartbeat(
         &self,
         request: tonic::Request<proto::novarocks::HeartbeatRequest>,
     ) -> Result<tonic::Response<proto::novarocks::HeartbeatResponse>, tonic::Status> {
-        let req = request.into_inner();
-        if let Some(ingress) = self.query_lifecycle_ingress.as_ref() {
-            ingress
-                .bind_backend_identity(u64::from(req.assigned_be_id))
-                .map_err(status_from_lifecycle_error)?;
-            crate::runtime::backend_id::set_backend_id(i64::from(req.assigned_be_id));
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let req = request.into_inner();
+            if let Some(ingress) = self.query_lifecycle_ingress.as_ref() {
+                ingress
+                    .bind_backend_identity(u64::from(req.assigned_be_id))
+                    .map_err(status_from_lifecycle_error)?;
+                crate::runtime::backend_id::set_backend_id(i64::from(req.assigned_be_id));
+            }
+            let num_cores = std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1);
+            Ok(tonic::Response::new(proto::novarocks::HeartbeatResponse {
+                start_epoch: crate::runtime::start_epoch::start_epoch(),
+                version: crate::version::short_version().to_string(),
+                num_cores,
+                status_code: 0,
+            }))
         }
-        let num_cores = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1);
-        Ok(tonic::Response::new(proto::novarocks::HeartbeatResponse {
-            start_epoch: crate::runtime::start_epoch::start_epoch(),
-            version: crate::version::short_version().to_string(),
-            num_cores,
-            status_code: 0,
-        }))
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects heartbeat RPC",
+            ))
+        }
     }
 
     async fn init_query(
         &self,
         request: tonic::Request<proto::novarocks::InitQueryRequest>,
     ) -> Result<tonic::Response<proto::novarocks::InitQueryResponse>, tonic::Status> {
-        let ingress = self.require_query_lifecycle("InitQuery")?;
-        let request = request.into_inner();
-        let response =
-            tokio::task::spawn_blocking(move || handle_init_query(ingress.as_ref(), request))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("init_query handler panicked: {error}"))
-                })??;
-        Ok(tonic::Response::new(response))
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let ingress = self.require_query_lifecycle("InitQuery")?;
+            let request = request.into_inner();
+            let response =
+                tokio::task::spawn_blocking(move || handle_init_query(ingress.as_ref(), request))
+                    .await
+                    .map_err(|error| {
+                        tonic::Status::internal(format!("init_query handler panicked: {error}"))
+                    })??;
+            Ok(tonic::Response::new(response))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects query lifecycle RPC",
+            ))
+        }
     }
 
     async fn stage_fragments(
         &self,
         request: tonic::Request<proto::novarocks::StageFragmentsRequest>,
     ) -> Result<tonic::Response<proto::novarocks::StageFragmentsResponse>, tonic::Status> {
-        let ingress = self.require_query_lifecycle("StageFragments")?;
-        let request = request.into_inner();
-        let response =
-            tokio::task::spawn_blocking(move || handle_stage_fragments(ingress.as_ref(), request))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("stage_fragments handler panicked: {error}"))
-                })??;
-        Ok(tonic::Response::new(response))
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let ingress = self.require_query_lifecycle("StageFragments")?;
+            let request = request.into_inner();
+            let response = tokio::task::spawn_blocking(move || {
+                handle_stage_fragments(ingress.as_ref(), request)
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("stage_fragments handler panicked: {error}"))
+            })??;
+            Ok(tonic::Response::new(response))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects query lifecycle RPC",
+            ))
+        }
     }
 
     async fn start_prepared_query(
         &self,
         request: tonic::Request<proto::novarocks::StartPreparedQueryRequest>,
     ) -> Result<tonic::Response<proto::novarocks::StartPreparedQueryResponse>, tonic::Status> {
-        let ingress = self.require_query_lifecycle("StartPreparedQuery")?;
-        let request = request.into_inner();
-        let response = tokio::task::spawn_blocking(move || {
-            handle_start_prepared_query(ingress.as_ref(), request)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("start_prepared_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let ingress = self.require_query_lifecycle("StartPreparedQuery")?;
+            let request = request.into_inner();
+            let response = tokio::task::spawn_blocking(move || {
+                handle_start_prepared_query(ingress.as_ref(), request)
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("start_prepared_query handler panicked: {error}"))
+            })??;
+            Ok(tonic::Response::new(response))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects query lifecycle RPC",
+            ))
+        }
     }
 
     async fn abort_query(
         &self,
         request: tonic::Request<proto::novarocks::AbortQueryRequest>,
     ) -> Result<tonic::Response<proto::novarocks::AbortQueryResponse>, tonic::Status> {
-        let ingress = self.require_query_lifecycle("AbortQuery")?;
-        let request = request.into_inner();
-        let response =
-            tokio::task::spawn_blocking(move || handle_abort_query(ingress.as_ref(), request))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("abort_query handler panicked: {error}"))
-                })??;
-        Ok(tonic::Response::new(response))
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let ingress = self.require_query_lifecycle("AbortQuery")?;
+            let request = request.into_inner();
+            let response =
+                tokio::task::spawn_blocking(move || handle_abort_query(ingress.as_ref(), request))
+                    .await
+                    .map_err(|error| {
+                        tonic::Status::internal(format!("abort_query handler panicked: {error}"))
+                    })??;
+            Ok(tonic::Response::new(response))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects query lifecycle RPC",
+            ))
+        }
     }
 
     async fn query_control_stream(
         &self,
         request: tonic::Request<tonic::Streaming<proto::novarocks::QueryControlRequest>>,
     ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
-        let ingress = self.require_query_lifecycle("QueryControlStream")?;
-        let stream: QueryControlResponseStream = handle_query_control_stream(
-            ingress,
-            request.into_inner(),
-            self.query_control_shutdown.clone(),
-        )
-        .await?;
-        Ok(tonic::Response::new(Box::pin(stream)))
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            let ingress = self.require_query_lifecycle("QueryControlStream")?;
+            let stream = handle_query_control_stream(
+                ingress,
+                request.into_inner(),
+                self.query_control_shutdown.clone(),
+            )
+            .await?;
+            Ok(tonic::Response::new(Box::pin(stream)))
+        }
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        {
+            let _ = request;
+            Err(tonic::Status::failed_precondition(
+                "core neutral NovaRocksGrpc handler rejects query lifecycle RPC",
+            ))
+        }
     }
 
     async fn report_query_terminal(
@@ -1070,12 +1176,14 @@ where
     }
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
     grpc_routes
         .into_axum_router()
         .route("/metrics", get(metrics_http::handle_metrics))
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn start_grpc_server_with_native_fragment_ingress(
     host: &str,
     native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
@@ -1089,6 +1197,7 @@ pub fn start_grpc_server_with_native_fragment_ingress(
     )
 }
 
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 fn start_grpc_http_server(
     host: &str,
     grpc_http_port: u16,
@@ -1367,6 +1476,7 @@ fn bind_tcp_listener(host: &str, port: u16, role: &str) -> Result<TcpListener, S
 
 #[derive(Clone)]
 enum StandaloneGrpcMode {
+    #[cfg(any(test, feature = "query-execution-contract-test-support"))]
     FullExecution(
         Arc<dyn NativeFragmentIngress>,
         Arc<dyn QueryLifecycleIngress>,
@@ -1377,6 +1487,7 @@ enum StandaloneGrpcMode {
 impl std::fmt::Debug for StandaloneGrpcMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             Self::FullExecution(_, _) => formatter.write_str("FullExecution"),
             Self::TerminalIngressOnly => formatter.write_str("TerminalIngressOnly"),
         }
@@ -1386,6 +1497,7 @@ impl std::fmt::Debug for StandaloneGrpcMode {
 impl StandaloneGrpcMode {
     fn service(self) -> GrpcService {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             StandaloneGrpcMode::FullExecution(ingress, query_lifecycle_ingress) => {
                 GrpcService::with_fragment_execution(ingress, query_lifecycle_ingress)
             }
@@ -1395,6 +1507,7 @@ impl StandaloneGrpcMode {
 
     fn label(&self) -> &'static str {
         match self {
+            #[cfg(any(test, feature = "query-execution-contract-test-support"))]
             StandaloneGrpcMode::FullExecution(_, _) => "standalone grpc exchange",
             StandaloneGrpcMode::TerminalIngressOnly => "standalone grpc terminal ingress",
         }
@@ -1419,6 +1532,7 @@ pub fn start_grpc_terminal_server(
 ///
 /// This does not require global config to be initialised: the caller supplies
 /// the bind address and native fragment ingress directly.
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn start_grpc_exchange_server(
     host: &str,
     port: u16,
@@ -1437,6 +1551,7 @@ pub fn start_grpc_exchange_server(
 /// Starts a native fragment endpoint with an optional FE-owned terminal
 /// fallback ingress.  Backend-only and compat composition deliberately pass
 /// `None`, so their endpoint rejects `ReportQueryTerminal`.
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
 pub fn start_grpc_exchange_server_with_terminal_ingress(
     host: &str,
     port: u16,
@@ -1514,12 +1629,14 @@ fn start_standalone_grpc_server(
                     format!("create standalone grpc/http tokio listener failed: {error}")
                 })?;
                 let mut shutdown = shutdown_rx.clone();
+                #[cfg(any(test, feature = "query-execution-contract-test-support"))]
                 let query_control_shutdown = shutdown_rx.clone();
 
                 let mut svc = mode.service();
                 if let Some(terminal_ingress) = terminal_ingress {
                     svc = svc.with_terminal_ingress(terminal_ingress);
                 }
+                #[cfg(any(test, feature = "query-execution-contract-test-support"))]
                 let svc = svc.with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)

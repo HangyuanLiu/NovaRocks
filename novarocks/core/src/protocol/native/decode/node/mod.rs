@@ -1848,6 +1848,7 @@ fn lower_physical_node(
                 path.clone().field("generate_series"),
                 children,
                 arena,
+                ctx,
             )
         }
         plan::plan_node::Kind::TableFunction(table_function) => {

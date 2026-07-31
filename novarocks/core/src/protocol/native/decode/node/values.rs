@@ -87,7 +87,7 @@ pub(super) fn materialize_values_chunk(
     materialize_values_chunk_with_context(rows, columns, output_schema, arena, path, None)
 }
 
-fn materialize_values_chunk_with_context(
+pub(super) fn materialize_values_chunk_with_context(
     rows: &[plan::ExprList],
     columns: &[proto_common::OutputColumn],
     output_schema: ChunkSchemaRef,

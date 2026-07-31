@@ -203,6 +203,10 @@ pub async fn handle_query_control_stream(
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
     let execution_id = attach.execution_id();
     let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
+    let terminal_snapshot_stream_drop = claim_backend_fault(
+        QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
+        execution_id,
+    )?;
     let attachment = ingress
         .attach_control(attach)
         .map_err(status_from_lifecycle_error)?;
@@ -215,6 +219,7 @@ pub async fn handle_query_control_stream(
         outbound_tx,
         shutdown,
         heartbeat_stop,
+        terminal_snapshot_stream_drop,
         execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
@@ -227,6 +232,7 @@ async fn run_attached_control_stream(
     outbound: tokio::sync::mpsc::Sender<Result<proto::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
+    terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
     execution_id: novarocks::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
@@ -269,32 +275,6 @@ async fn run_attached_control_stream(
     let mut awaiting_graceful_termination = false;
     let mut heartbeat_stop_logged = false;
     loop {
-        if awaiting_graceful_termination {
-            let event = tokio::select! {
-                biased;
-                _ = wait_for_query_control_shutdown(&mut shutdown) => break,
-                event = events.recv() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let termination_accepted =
-                matches!(event, QueryControlEvent::TerminationAccepted { .. });
-            if !send_control_response(
-                &outbound,
-                Ok(encode_query_control_event(&event)),
-                &mut shutdown,
-            )
-            .await
-            {
-                break;
-            }
-            if termination_accepted {
-                lease.mark_graceful();
-                break;
-            }
-            continue;
-        }
         tokio::select! {
             biased;
             _ = wait_for_query_control_shutdown(&mut shutdown) => {
@@ -342,6 +322,7 @@ async fn run_attached_control_stream(
                         break;
                     }
                 };
+                let terminal_ack = matches!(command, QueryControlCommand::TerminalAck { .. });
                 let result = match command {
                     QueryControlCommand::Heartbeat { sequence, .. } => {
                         if let Some(scope) = heartbeat_stop
@@ -396,11 +377,34 @@ async fn run_attached_control_stream(
                     .await;
                     break;
                 }
+                if terminal_ack {
+                    // TerminalSnapshot is store-before-ACK.  Keep the
+                    // bidirectional stream open after Finalize until that
+                    // ACK has crossed the command side; otherwise the
+                    // compatibility TerminationAccepted event can race the
+                    // frontend's ACK and lose the retained record.
+                    break;
+                }
             }
             event = events.recv() => {
                 let Some(event) = event else {
                     break;
                 };
+                if matches!(event, QueryControlEvent::TerminalSnapshot { .. })
+                    && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
+                {
+                    eprintln!(
+                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                        scope.execution_id.query_id().high(),
+                        scope.execution_id.query_id().low(),
+                        scope.execution_id.attempt_id().get(),
+                        scope.backend_index,
+                        scope.backend_id,
+                        scope.start_epoch,
+                        scope.token,
+                    );
+                    break;
+                }
                 let termination_accepted =
                     matches!(event, QueryControlEvent::TerminationAccepted { .. });
                 if !send_control_response(
@@ -413,6 +417,14 @@ async fn run_attached_control_stream(
                     break;
                 }
                 if termination_accepted {
+                    if awaiting_graceful_termination {
+                        // Abort may publish its legacy acknowledgement before
+                        // the asynchronous immutable TerminalSnapshot. Both
+                        // terminal paths retain that record until the
+                        // frontend acknowledges it, so this latch never
+                        // closes the command side by itself.
+                        continue;
+                    }
                     lease.mark_graceful();
                     break;
                 }
