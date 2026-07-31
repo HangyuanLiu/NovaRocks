@@ -178,6 +178,10 @@ fn planned_connector_read_for_test()
             predicate_dispositions: Vec::new(),
         },
         splits: Vec::new(),
+        planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(),
+        static_predicates: Vec::new(),
+        predicate_dispositions: Vec::new(),
+        residual_predicates: Vec::new(),
         batch: ConnectorBatchBudget {
             max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),

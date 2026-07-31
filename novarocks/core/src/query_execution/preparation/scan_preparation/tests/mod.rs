@@ -54,6 +54,7 @@ fn prepare_scan_bindings(
         &controls,
         &crate::connector::test_request_context(),
         resolver,
+        super::ScanPreparationOptions::default(),
     )
 }
 

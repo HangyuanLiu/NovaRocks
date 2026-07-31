@@ -50,7 +50,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicateLiteral, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy,
     DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, validate_static_predicates,
+    ExternalMutationOutcome, normalize_predicate_dispositions, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2886,6 +2886,7 @@ pub(crate) fn plan_scan_files(
         binding,
         file_override,
         projection,
+        Vec::new(),
     )?;
     planned
         .splits
@@ -2910,6 +2911,7 @@ pub(crate) fn plan_native_iceberg_read(
     binding: super::scan_model::IcebergDataFileBinding,
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
+    static_predicates: Vec<ConnectorStaticPredicate>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     plan_native_iceberg_read_with_file_override(
         controls,
@@ -2918,6 +2920,7 @@ pub(crate) fn plan_native_iceberg_read(
         binding,
         Some(explicit_files),
         projection,
+        static_predicates,
     )
 }
 
@@ -2928,6 +2931,7 @@ fn plan_native_iceberg_read_with_file_override(
     binding: super::scan_model::IcebergDataFileBinding,
     explicit_files: Option<&[IcebergDataFileInfo]>,
     projection: &[usize],
+    static_predicates: Vec<ConnectorStaticPredicate>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     use std::num::NonZeroUsize;
 
@@ -2977,7 +2981,7 @@ fn plan_native_iceberg_read_with_file_override(
             &table_handle,
             novarocks_spi::connector::ConnectorBeginScanRequest {
                 projection: projection.to_vec(),
-                static_predicates: Vec::new(),
+                static_predicates: static_predicates.clone(),
                 selector: table
                     .current_snapshot_id
                     .filter(|_| {
@@ -3000,7 +3004,9 @@ fn plan_native_iceberg_read_with_file_override(
             },
         )
         .map_err(|error| error.to_string())?;
-    let splits = control_binding
+    normalize_predicate_dispositions(&static_predicates, &scan.predicate_dispositions)
+        .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
+    let split_result = control_binding
         .planning()
         .plan_splits(
             &scan.handle,
@@ -3010,8 +3016,8 @@ fn plan_native_iceberg_read_with_file_override(
                 context,
             },
         )
-        .map_err(|error| error.to_string())?
-        .splits;
+        .map_err(|error| error.to_string())?;
+    let splits = split_result.splits;
     if splits
         .iter()
         .any(|split| split.owner() != &control_binding.descriptor().instance_id)
@@ -3023,6 +3029,7 @@ fn plan_native_iceberg_read_with_file_override(
         planning_lease: lease,
         scan,
         splits,
+        planning_metrics: split_result.metrics,
         batch: novarocks_spi::connector::ConnectorBatchBudget {
             max_rows: NonZeroUsize::new(4096).expect("batch rows are nonzero"),
             max_bytes: NonZeroUsize::new(
@@ -3050,6 +3057,7 @@ pub(crate) fn plan_native_iceberg_delta_read(
         super::scan_model::IcebergDataFileBinding::ExplicitFiles,
         &[],
         &[],
+        Vec::new(),
     )?;
     let owner = planned.declaration.descriptor().instance_id.clone();
     let incarnation = planned.declaration.incarnation().to_bytes();
@@ -3109,6 +3117,7 @@ pub(crate) struct PlannedIcebergConnectorRead {
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
+    pub(crate) planning_metrics: ConnectorSplitPlanningMetrics,
     pub(crate) batch: novarocks_spi::connector::ConnectorBatchBudget,
 }
 

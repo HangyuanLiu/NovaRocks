@@ -179,6 +179,7 @@ pub fn validate_static_predicates(
 }
 
 /// Validate a provider disposition response and normalize it to request order.
+// Design: ADR-0017 (docs/adr/ADR-0017-static-connector-predicate-disposition.md)
 pub fn normalize_predicate_dispositions(
     predicates: &[ConnectorStaticPredicate],
     dispositions: &[ConnectorPredicateDisposition],

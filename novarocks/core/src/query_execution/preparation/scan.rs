@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
-    ConnectorScan, ConnectorSplit,
+    ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorStaticPredicate,
 };
 
 use crate::connector::iceberg::scan_model::{
@@ -28,6 +29,7 @@ use crate::connector::iceberg::scan_model::{
 use crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
+use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
@@ -69,6 +71,13 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) declaration: ConnectorExecutionDeclaration,
     pub(crate) scan: ConnectorScan,
     pub(crate) splits: Vec<ConnectorSplit>,
+    /// Provider split-planning evidence retained only in FE preparation.
+    pub(crate) planning_metrics: ConnectorSplitPlanningMetrics,
+    /// Submitted predicate requests and their normalized provider response.
+    pub(crate) static_predicates: Vec<ConnectorStaticPredicate>,
+    pub(crate) predicate_dispositions: Vec<ConnectorPredicateDisposition>,
+    /// Ordered Core residuals after removing only negotiated `Exact` IDs.
+    pub(crate) residual_predicates: Vec<TypedExpr>,
     pub(crate) batch: ConnectorBatchBudget,
     /// Keeps the exact FE control generation alive through the BE ensure
     /// barrier. It is never encoded into a fragment carrier.
@@ -288,6 +297,10 @@ impl ScanExecutionBindings {
                     .then_some((fragment_id, read))
                     .map(|(_, read)| read)
             })
+    }
+
+    pub(crate) fn connector_reads(&self) -> impl Iterator<Item = &PlannedConnectorRead> {
+        self.connector_reads.values()
     }
 
     pub(super) fn connector_read_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
