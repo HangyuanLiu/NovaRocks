@@ -16,9 +16,8 @@
 // under the License.
 
 use super::super::NativeFragmentDecodeError;
-use super::super::expr::decode_expr_at;
 use super::super::layout::{chunk_schema_from_output_columns, layout_from_output_columns};
-use super::DecodedNode;
+use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
@@ -30,6 +29,7 @@ pub(super) fn lower_redistribute_node(
     physical_output_path: FieldPath,
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let mode = redistribute
@@ -68,7 +68,7 @@ pub(super) fn lower_redistribute_node(
         }
     }
     for (idx, expr) in redistribute.partition_exprs.iter().enumerate() {
-        decode_expr_at(
+        ctx.decode_expression(
             expr,
             path.clone().field("partition_exprs").index(idx),
             arena,

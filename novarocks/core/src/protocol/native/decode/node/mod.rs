@@ -1664,6 +1664,7 @@ fn lower_physical_node(
             path.clone().field("project"),
             children,
             arena,
+            ctx,
         ),
         plan::plan_node::Kind::Filter(filter) => filter::lower_filter_node(
             node,
@@ -1808,6 +1809,7 @@ fn lower_physical_node(
             physical_output_path,
             children,
             arena,
+            ctx,
         ),
     }
 }
