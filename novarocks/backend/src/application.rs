@@ -34,7 +34,7 @@ struct BackendNativeReportHandler;
 impl NativeReportHandler for BackendNativeReportHandler {
     fn handle_native_report(
         &self,
-        _report: novarocks::proto::novarocks::ExecStatusReport,
+        _report: novarocks_protocol::novarocks::ExecStatusReport,
     ) -> Result<(), NativeReportHandlerError> {
         Err(NativeReportHandlerError::role_rejected(
             BACKEND_REPORT_ROLE_REJECTION,
@@ -565,11 +565,7 @@ mod tests {
         BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
     };
     use novarocks::common::app_config::NovaRocksConfig;
-    use novarocks::proto::common::{Status, UniqueId};
-    use novarocks::proto::novarocks::{
-        AbortQueryRequest as ProtoAbortQueryRequest, ExecStatusReport, HeartbeatRequest,
-        InitQueryRequest as ProtoInitQueryRequest, ReportExecStatusRequest,
-    };
+    use novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::lifecycle::contract::{
         decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
@@ -583,6 +579,11 @@ mod tests {
     };
     use novarocks::runtime::query_options::QueryOptions;
     use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
+    use novarocks_protocol::common::{Status, UniqueId};
+    use novarocks_protocol::novarocks::{
+        AbortQueryRequest as ProtoAbortQueryRequest, ExecStatusReport, HeartbeatRequest,
+        InitQueryRequest as ProtoInitQueryRequest, ReportExecStatusRequest,
+    };
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -637,16 +638,10 @@ mod tests {
         )
     }
 
-    async fn connect_live_client(
-        grpc_port: u16,
-    ) -> novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient<
-        tonic::transport::Channel,
-    > {
-        novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::connect(format!(
-            "http://127.0.0.1:{grpc_port}"
-        ))
-        .await
-        .expect("connect native backend gRPC")
+    async fn connect_live_client(grpc_port: u16) -> NovaRocksGrpcClient<tonic::transport::Channel> {
+        NovaRocksGrpcClient::connect(format!("http://127.0.0.1:{grpc_port}"))
+            .await
+            .expect("connect native backend gRPC")
     }
 
     #[test]
@@ -869,7 +864,7 @@ mod tests {
             .into_inner();
         assert_eq!(
             termination.accepted_reason,
-            novarocks::proto::novarocks::QueryTerminationReason::
+            novarocks_protocol::novarocks::QueryTerminationReason::
                 QueryTerminationCoordinatorHeartbeatTimeout as i32
         );
 

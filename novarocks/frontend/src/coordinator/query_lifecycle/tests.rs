@@ -2068,7 +2068,7 @@ struct AcceptReports;
 impl NativeReportHandler for AcceptReports {
     fn handle_native_report(
         &self,
-        _report: novarocks::proto::novarocks::ExecStatusReport,
+        _report: novarocks_protocol::novarocks::ExecStatusReport,
     ) -> Result<(), NativeReportHandlerError> {
         Ok(())
     }

@@ -784,7 +784,6 @@ mod tests {
 
     use novarocks::UniqueId;
     use novarocks::connector::ConnectorRegistry;
-    use novarocks::proto;
     use novarocks::query_execution::contract::QueryId as ExecutionQueryId;
     use novarocks::query_execution::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
@@ -796,6 +795,7 @@ mod tests {
     use novarocks::service::native_fragment_ingress::{
         NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentRequest,
     };
+    use novarocks_protocol as proto;
 
     use crate::fragment::control::{FragmentControlHandle, FragmentControlRegistry};
     use crate::fragment::failure_injection::{

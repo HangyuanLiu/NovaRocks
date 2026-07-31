@@ -19,7 +19,6 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
-use novarocks::proto::{common, novarocks as proto_novarocks, plan};
 use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
@@ -34,6 +33,7 @@ use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks::runtime::query_options::QueryOptions;
+use novarocks_protocol::{common, novarocks as proto_novarocks, plan};
 use prost::Message;
 
 use super::entry::QueryLifecyclePhase;

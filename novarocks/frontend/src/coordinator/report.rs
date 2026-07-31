@@ -44,7 +44,7 @@ impl FrontendCoordinatorReportHandler {
 impl NativeReportHandler for FrontendCoordinatorReportHandler {
     fn handle_native_report(
         &self,
-        report: novarocks::proto::novarocks::ExecStatusReport,
+        report: novarocks_protocol::novarocks::ExecStatusReport,
     ) -> Result<(), NativeReportHandlerError> {
         let report = decode_native_execution_report(report)
             .map_err(NativeReportHandlerError::contract_violation)?;
