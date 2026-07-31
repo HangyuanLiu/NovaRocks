@@ -613,14 +613,9 @@ impl IcebergControlProvider {
                             table: &str|
          -> Result<Option<(String, Option<String>)>, ConnectorError> {
             let entry = self.entry(self.instance_id.as_str())?;
-            let exists = list_tables(&entry, namespace)
-                .map_err(map_iceberg_error)?
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(table));
-            if !exists {
+            let Some(loaded) = load_existing_table_for_reconcile(&entry, namespace, table)? else {
                 return Ok(None);
-            }
-            let loaded = load_table(&entry, namespace, table).map_err(map_iceberg_error)?;
+            };
             Ok(Some((
                 loaded.table.metadata().uuid().to_string(),
                 loaded.table.metadata_location().map(ToString::to_string),
@@ -980,13 +975,9 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         Ok(entry) => entry,
                         Err(error) => return Err(error),
                     };
-                    let existing = list_tables(&entry, &table.namespace)
-                        .map_err(map_iceberg_error)
-                        .map(|tables| {
-                            tables
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
-                        });
+                    let existing =
+                        load_existing_table_for_reconcile(&entry, &table.namespace, &table.table)
+                            .map(|loaded| loaded.is_some());
                     match existing {
                         Ok(true) if policy == CreatePolicy::NoOpIfExists => {
                             Ok(ExternalMutationEffect::NoOp)
@@ -1029,13 +1020,9 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         Ok(entry) => entry,
                         Err(error) => return Err(error),
                     };
-                    let existing = list_tables(&entry, &table.namespace)
-                        .map_err(map_iceberg_error)
-                        .map(|tables| {
-                            tables
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(&table.table))
-                        });
+                    let existing =
+                        load_existing_table_for_reconcile(&entry, &table.namespace, &table.table)
+                            .map(|loaded| loaded.is_some());
                     match existing {
                         Ok(false) if policy == DropPolicy::NoOpIfMissing => {
                             Ok(ExternalMutationEffect::NoOp)
@@ -1380,17 +1367,12 @@ fn load_existing_table_for_reconcile(
     namespace: &str,
     table: &str,
 ) -> Result<Option<super::catalog::IcebergLoadedTable>, ConnectorError> {
-    let exists = list_tables(entry, namespace)
-        .map_err(map_iceberg_error)?
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(table));
-    if !exists {
-        return Ok(None);
-    }
     entry.invalidate_table_cache(namespace, table);
-    load_table(entry, namespace, table)
-        .map(Some)
-        .map_err(map_iceberg_error)
+    match load_table(entry, namespace, table).map_err(map_iceberg_error) {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(error) if error.kind() == ConnectorErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn reconcile_iceberg_mutation_evidence(
@@ -3054,8 +3036,24 @@ fn decode_payload<T: for<'de> Deserialize<'de>>(
 }
 
 fn map_iceberg_error(error: String) -> ConnectorError {
-    let kind = if error.contains("not found") || error.contains("does not exist") {
+    let normalized = error.to_ascii_lowercase();
+    let kind = if normalized.contains("not found")
+        || normalized.contains("does not exist")
+        || normalized.contains("no metadata files")
+    {
         ConnectorErrorKind::NotFound
+    } else if normalized.contains("format-version 3")
+        || normalized.contains("nanosecond")
+        || normalized.contains("invalid partition")
+        || normalized.contains("unsupported iceberg type evolution")
+        || normalized.contains("decimal scale change is not allowed")
+        || normalized.contains("format-version is reserved")
+    {
+        // These are local Iceberg semantic rejections, before any catalog
+        // commit can have been dispatched.  Keeping them out of the unknown
+        // outcome path preserves the SQL-level validation error instead of
+        // replacing it with reconciliation evidence.
+        ConnectorErrorKind::InvalidRequest
     } else {
         ConnectorErrorKind::Internal
     };

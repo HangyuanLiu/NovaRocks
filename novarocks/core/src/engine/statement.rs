@@ -1191,11 +1191,31 @@ pub(crate) fn execute_drop_database_statement(
             .read()
             .map_err(|error| format!("iceberg catalog registry read lock: {error}"))?
             .get(&target.catalog)?;
+        // `IF EXISTS` applies to the complete FORCE decomposition.  In
+        // particular, do not ask a remote catalog to enumerate a namespace
+        // which the final DropNamespace mutation would correctly treat as a
+        // no-op.
+        let namespace_exists = crate::connector::iceberg::catalog::registry::namespace_exists(
+            &entry,
+            &target.namespace,
+        )?;
+        if !namespace_exists {
+            if if_exists {
+                return Ok(StatementResult::Ok);
+            }
+            return Err(format!("namespace `{}` does not exist", target.namespace));
+        }
         let mut tables =
             crate::connector::iceberg::catalog::registry::list_tables(&entry, &target.namespace)?;
         tables.sort();
-        let mut views =
-            crate::connector::iceberg::catalog::views::list_views(&entry, &target.namespace)?;
+        let mut views = if matches!(
+            entry.kind,
+            crate::connector::iceberg::catalog::registry::IcebergCatalogKind::Rest
+        ) {
+            crate::connector::iceberg::catalog::views::list_views(&entry, &target.namespace)?
+        } else {
+            Vec::new()
+        };
         views.sort();
         let instance_id = mutation_instance_id(&target.catalog)?;
         for table in tables {
