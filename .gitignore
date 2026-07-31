@@ -31,5 +31,6 @@ nosetests.xml
 /docker/iceberg-hive/runtime/
 /docker/mysql-state-store/runtime/
 /logs/
+/reports/
 __pycache__/
 *.pyc
