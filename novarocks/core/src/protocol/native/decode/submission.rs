@@ -222,7 +222,13 @@ where
             .validate_root_node(root, root_path.clone())
             .map_err(NativeFragmentDecodeError::from)?;
     } else {
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
         validate_node_required_fields(root, root_path.clone())?;
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        return Err(NativeFragmentDecodeError::unsupported(
+            root_path,
+            "native submission validator must be supplied by the backend runtime",
+        ));
     }
     let sink_path = FieldPath::root("plan_fragment").field("sink");
     let sink = require_sink(fragment)?;
@@ -237,15 +243,23 @@ where
             .validate_fragment_expressions(fragment)
             .map_err(NativeFragmentDecodeError::from)?;
     } else {
-        for (index, expression) in fragment.output_exprs.iter().enumerate() {
-            super::expr::validate_proto_expr_shape_at(
-                expression,
-                FieldPath::root("plan_fragment")
-                    .field("output_exprs")
-                    .index(index),
-            )?;
+        #[cfg(any(test, feature = "query-execution-contract-test-support"))]
+        {
+            for (index, expression) in fragment.output_exprs.iter().enumerate() {
+                super::expr::validate_proto_expr_shape_at(
+                    expression,
+                    FieldPath::root("plan_fragment")
+                        .field("output_exprs")
+                        .index(index),
+                )?;
+            }
+            validate_runtime_filter_binding_expressions(fragment)?;
         }
-        validate_runtime_filter_binding_expressions(fragment)?;
+        #[cfg(not(any(test, feature = "query-execution-contract-test-support")))]
+        return Err(NativeFragmentDecodeError::unsupported(
+            FieldPath::root("plan_fragment"),
+            "native submission validator must be supplied by the backend runtime",
+        ));
     }
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())?;
