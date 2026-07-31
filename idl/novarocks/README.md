@@ -26,6 +26,18 @@ active evolution surface; remaining StarRocks imports here are transitional.
 Arc: NIDL (NovaRocks-native IDL & StarRocks-protocol retirement). This directory
 is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
 
+## Ownership
+
+- This repository-level directory is the long-term, language-neutral source of
+  the NovaRocks-native wire contract. It is not a staging location to be moved
+  into a Rust crate.
+- `novarocks-protocol` is the sole Rust owner of generated DTOs and the native
+  descriptor set.
+- Frontend owns semantic encoding from its private plan to these DTOs; Backend
+  owns wire validation and semantic decoding to its private execution domain.
+- Core's `novarocks::proto` facade is transitional transport compatibility.
+  It re-exports protocol DTOs and does not generate a second native DTO tree.
+
 ## Package layout
 
 - `novarocks` (service.proto) — RPC envelope package: the `NovaRocksGrpc`
@@ -59,9 +71,9 @@ is the NIDL-0 baseline; later NIDL tasks add the staged packages below.
   READY = 0` predates this rule and is fixed in NIDL-1.)
 - Presence checks for message fields are centralized in the two conversion layers
   (FE encode, BE prepare), at the decode boundary via `ok_or(...)`. Business code
-  never re-checks `Option`. Generated wire types must not escape those layers
-  (planner and exec code do not import `crate::proto`; to be enforced by the
-  NIDL-D2 guard).
+  never re-checks `Option`. Generated wire types remain protocol-boundary
+  inputs: SQL/planner and execution kernel code do not gain a shared Rust plan
+  dependency through this IDL.
 - proto2-only features are not used.
 
 ## Compatibility stance

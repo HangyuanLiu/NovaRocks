@@ -3216,6 +3216,7 @@ dependencies = [
  "mysql_common 0.32.4",
  "novarocks-catalog",
  "novarocks-fs",
+ "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-types",
@@ -3268,6 +3269,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "novarocks",
+ "novarocks-protocol",
  "novarocks-spi",
  "prost 0.13.5",
  "tokio",
@@ -3326,6 +3328,7 @@ dependencies = [
  "hex",
  "novarocks",
  "novarocks-catalog",
+ "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store",
  "serde",
@@ -3354,6 +3357,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "novarocks-protocol"
+version = "0.1.0"
+dependencies = [
+ "prost 0.13.5",
+ "prost-build",
+ "prost-reflect",
+ "protoc-bin-vendored",
 ]
 
 [[package]]
