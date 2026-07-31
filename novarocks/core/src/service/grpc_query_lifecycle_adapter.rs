@@ -37,10 +37,10 @@ use crate::query_execution::lifecycle::{
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
 
-pub(crate) type QueryControlResponseStream =
+pub type QueryControlResponseStream =
     ReceiverStream<Result<novarocks::QueryControlResponse, tonic::Status>>;
 
-pub(crate) fn handle_init_query(
+pub fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::InitQueryRequest,
 ) -> Result<novarocks::InitQueryResponse, tonic::Status> {
@@ -83,7 +83,7 @@ pub(crate) fn handle_init_query(
     Ok(encode_query_init_response(&ack))
 }
 
-pub(crate) fn handle_abort_query(
+pub fn handle_abort_query(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::AbortQueryRequest,
 ) -> Result<novarocks::AbortQueryResponse, tonic::Status> {
@@ -102,7 +102,7 @@ fn emit_query_lifecycle_abort_marker() {
     }
 }
 
-pub(crate) fn handle_stage_fragments(
+pub fn handle_stage_fragments(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::StageFragmentsRequest,
 ) -> Result<novarocks::StageFragmentsResponse, tonic::Status> {
@@ -136,7 +136,7 @@ pub(crate) fn handle_stage_fragments(
     Ok(encode_query_stage_response(&response))
 }
 
-pub(crate) fn handle_start_prepared_query(
+pub fn handle_start_prepared_query(
     ingress: &dyn QueryLifecycleIngress,
     request: novarocks::StartPreparedQueryRequest,
 ) -> Result<novarocks::StartPreparedQueryResponse, tonic::Status> {
@@ -178,7 +178,7 @@ pub(crate) fn handle_start_prepared_query(
     Ok(encode_query_start_response(&response))
 }
 
-pub(crate) async fn handle_query_control_stream(
+pub async fn handle_query_control_stream(
     ingress: Arc<dyn QueryLifecycleIngress>,
     mut inbound: tonic::Streaming<novarocks::QueryControlRequest>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
@@ -614,7 +614,7 @@ impl Drop for CoordinatorLease {
     }
 }
 
-pub(crate) fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
+pub fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
     let detail = error.detail().to_string();
     match error.code() {
         QueryLifecycleErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),

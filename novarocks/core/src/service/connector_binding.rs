@@ -34,7 +34,7 @@ use crate::query_execution::lifecycle::QueryExecutionId;
 
 const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) fn decode_ensure_request(
+pub fn decode_ensure_request(
     request: EnsureConnectorExecutionBindingRequest,
 ) -> Result<(QueryExecutionId, ConnectorExecutionDeclaration), ConnectorError> {
     let execution_id = request.execution_id.as_ref().ok_or_else(|| {
@@ -60,7 +60,7 @@ pub(crate) fn decode_ensure_request(
     Ok((execution_id, declaration))
 }
 
-pub(crate) fn decode_retire_request(
+pub fn decode_retire_request(
     request: RetireConnectorExecutionBindingRequest,
 ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
     Ok(ConnectorExecutionBindingKey {
@@ -69,7 +69,7 @@ pub(crate) fn decode_retire_request(
     })
 }
 
-pub(crate) fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
+pub fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
     ConnectorRequestContext::try_new(
         Instant::now() + CONNECTOR_BINDING_CONTEXT_TIMEOUT,
         Arc::new(NotCancelled),
