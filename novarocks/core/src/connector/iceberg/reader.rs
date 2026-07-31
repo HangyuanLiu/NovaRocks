@@ -335,7 +335,7 @@ fn physical_format(path: &str) -> Result<FileFormat, ConnectorError> {
     ))
 }
 
-fn delete_specs(file: &IcebergDataFileInfo) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
+pub(super) fn validate_delete_apply_cost(file: &IcebergDataFileInfo) -> Result<(), ConnectorError> {
     const MAX_DELETE_FILES: usize = 1024;
     const MAX_DELETE_BYTES: i64 = 512 * 1024 * 1024;
     if file.delete_files.len() > MAX_DELETE_FILES {
@@ -369,6 +369,11 @@ fn delete_specs(file: &IcebergDataFileInfo) -> Result<Vec<IcebergDeleteFileSpec>
             ),
         ));
     }
+    Ok(())
+}
+
+fn delete_specs(file: &IcebergDataFileInfo) -> Result<Vec<IcebergDeleteFileSpec>, ConnectorError> {
+    validate_delete_apply_cost(file)?;
     file.delete_files
         .iter()
         .map(|delete| {

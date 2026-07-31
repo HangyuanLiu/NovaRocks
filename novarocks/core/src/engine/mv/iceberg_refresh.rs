@@ -15479,7 +15479,8 @@ mod tests {
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::PartitionPruningPolicy;
     use crate::mv::test_repository::{
-        TestMvRepositoryFailurePoint, fail_next_mv_repository_command,
+        TestMvRepositoryFailurePoint, after_next_mv_repository_create,
+        fail_next_mv_repository_command,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
@@ -18118,173 +18119,6 @@ mod tests {
         _metadata_dir: TempDir,
         _warehouse_dir: TempDir,
         _loopback_backend: crate::engine::StandaloneLoopbackTestBackend,
-    }
-
-    struct TestMetaStoreProvider {
-        inner: Arc<crate::meta::SqliteMetaStoreProvider>,
-        reject_write_message: Option<&'static str>,
-        after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
-    }
-
-    impl TestMetaStoreProvider {
-        fn reject_writes(
-            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
-            message: &'static str,
-        ) -> Self {
-            Self {
-                inner,
-                reject_write_message: Some(message),
-                after_commit: None,
-            }
-        }
-
-        fn after_commit(
-            inner: Arc<crate::meta::SqliteMetaStoreProvider>,
-            after_commit: Arc<dyn Fn() + Send + Sync>,
-        ) -> Self {
-            Self {
-                inner,
-                reject_write_message: None,
-                after_commit: Some(after_commit),
-            }
-        }
-    }
-
-    impl MetaStoreProvider for TestMetaStoreProvider {
-        fn provider_name(&self) -> &'static str {
-            "test-instrumented-sqlite"
-        }
-
-        fn capabilities(&self) -> MetaStoreCapabilities {
-            self.inner.capabilities()
-        }
-
-        fn begin_read(&self) -> Result<Box<dyn MetaReadTxn>, MetaError> {
-            self.inner.begin_read()
-        }
-
-        fn begin_write(&self, purpose: &str) -> Result<Box<dyn MetaWriteTxn>, MetaError> {
-            if let Some(message) = self.reject_write_message {
-                return Err(MetaError::new(
-                    MetaErrorKind::DefiniteCommitFailure,
-                    message,
-                ));
-            }
-            Ok(Box::new(TestMetaWriteTxn {
-                inner: Some(self.inner.begin_write(purpose)?),
-                after_commit: self.after_commit.clone(),
-            }))
-        }
-    }
-
-    struct TestMetaWriteTxn {
-        inner: Option<Box<dyn MetaWriteTxn>>,
-        after_commit: Option<Arc<dyn Fn() + Send + Sync>>,
-    }
-
-    impl TestMetaWriteTxn {
-        fn inner(&self) -> &dyn MetaWriteTxn {
-            self.inner.as_deref().expect("test write transaction")
-        }
-
-        fn inner_mut(&mut self) -> &mut dyn MetaWriteTxn {
-            self.inner.as_deref_mut().expect("test write transaction")
-        }
-    }
-
-    impl MetaReadTxn for TestMetaWriteTxn {
-        fn get(&self, key: &MetaKey) -> Result<Option<MetaRecord>, MetaError> {
-            self.inner().get(key)
-        }
-
-        fn scan(
-            &self,
-            prefix: &crate::meta::MetaKeyPrefix,
-            limit: Option<usize>,
-        ) -> Result<Vec<MetaRecord>, MetaError> {
-            self.inner().scan(prefix, limit)
-        }
-    }
-
-    impl MetaWriteTxn for TestMetaWriteTxn {
-        fn put(&mut self, record: MetaRecordPut) -> Result<(), MetaError> {
-            self.inner_mut().put(record)
-        }
-
-        fn delete(&mut self, key: &MetaKey, expected: ExpectedRevision) -> Result<(), MetaError> {
-            self.inner_mut().delete(key, expected)
-        }
-
-        fn allocate_id(&mut self, scope: IdScope) -> Result<i64, MetaError> {
-            self.inner_mut().allocate_id(scope)
-        }
-
-        fn commit(mut self: Box<Self>) -> Result<MetaCommitOutcome, MetaError> {
-            let outcome = self
-                .inner
-                .take()
-                .expect("test write transaction")
-                .commit()?;
-            if let Some(after_commit) = &self.after_commit {
-                after_commit();
-            }
-            Ok(outcome)
-        }
-
-        fn abort(mut self: Box<Self>) -> Result<(), MetaError> {
-            self.inner.take().expect("test write transaction").abort()
-        }
-    }
-
-    fn open_test_state_with_custom_metadata_provider(
-        catalog: &str,
-        current_db: &str,
-        metadata_dir: TempDir,
-        metadata_provider: Arc<dyn MetaStoreProvider>,
-    ) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
-        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
-        let state = Arc::new(StandaloneState {
-            mv_repository: crate::engine::test_mv_repository(),
-            metadata_provider: Some(metadata_provider),
-            exchange_port: loopback_backend.exchange_port,
-            ..StandaloneState::default()
-        });
-        crate::connector::register_standalone_backends(&state);
-        {
-            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
-            catalogs
-                .create_catalog(
-                    catalog,
-                    &[
-                        ("type".to_string(), "iceberg".to_string()),
-                        ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-                        (
-                            "iceberg.catalog.warehouse".to_string(),
-                            warehouse_dir.path().display().to_string(),
-                        ),
-                    ],
-                )
-                .expect("create iceberg catalog");
-        }
-        initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
-        crate::engine::register_iceberg_control_binding(&state, catalog)
-            .expect("register Iceberg connector control binding");
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
-                catalog,
-                Arc::clone(&state.connector_control)
-                    as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
-        IcebergMvTestState {
-            state,
-            current_db: current_db.to_string(),
-            _metadata_dir: metadata_dir,
-            _warehouse_dir: warehouse_dir,
-            _loopback_backend: loopback_backend,
-        }
     }
 
     fn parse_create_mv(sql: &str) -> CreateMaterializedViewStmt {
@@ -23275,12 +23109,16 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_mv_target_create_failure_leaves_no_target_or_metadata() {
+    fn create_iceberg_mv_target_preflight_failure_leaves_no_repository_metadata() {
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
-        let blocked_namespace = env._warehouse_dir.path().join("analytics");
-        std::fs::write(&blocked_namespace, b"not a directory")
-            .expect("block target namespace creation");
+        let blocked_target = env
+            ._warehouse_dir
+            .path()
+            .join("analytics")
+            .join("mv_orders");
+        std::fs::write(&blocked_target, b"not a directory")
+            .expect("block target table directory creation");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_orders
              DISTRIBUTED BY HASH(id) BUCKETS 1
@@ -23299,14 +23137,13 @@ mod tests {
             "file://{}/analytics/mv_orders/metadata/v1.metadata.json",
             canonical_warehouse.display()
         );
-        assert_eq!(
-            err,
-            format!(
-                "create iceberg table failed: Unexpected => write metadata to {metadata_location}: DataInvalid => fs write({metadata_location}) resolve path: init opendal fs operator"
-            )
+        assert!(
+            err.contains("read iceberg metadata dir")
+                && err.contains("/analytics/mv_orders/metadata failed")
+                && err.contains("Not a directory"),
+            "unexpected target preflight error for {metadata_location}: {err}"
         );
-        assert!(blocked_namespace.is_file());
-        assert!(!blocked_namespace.join("mv_orders").exists());
+        assert!(blocked_target.is_file());
         let provider = env
             .state
             .metadata_provider
@@ -23437,23 +23274,7 @@ mod tests {
 
     #[test]
     fn create_iceberg_mv_repository_open_failure_cleans_created_target() {
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let sqlite = Arc::new(
-            crate::meta::SqliteMetaStoreProvider::open(
-                metadata_dir.path().join("standalone.sqlite"),
-            )
-            .expect("open meta provider"),
-        );
-        let provider = Arc::new(TestMetaStoreProvider::reject_writes(
-            Arc::clone(&sqlite),
-            "injected repository write failure",
-        ));
-        let env = open_test_state_with_custom_metadata_provider(
-            "ice",
-            "analytics",
-            metadata_dir,
-            provider,
-        );
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
             "CREATE MATERIALIZED VIEW mv_orders
@@ -23462,11 +23283,12 @@ mod tests {
              AS SELECT id, name FROM ice.sales.orders",
         );
 
+        let _failure = fail_next_mv_repository_command(TestMvRepositoryFailurePoint::Create);
         let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect_err("repository write open must fail");
         assert_eq!(
             err,
-            "create iceberg MV repository metadata failed: DefiniteCommitFailure: injected repository write failure; target cleanup=Ok(())"
+            "create iceberg MV repository metadata failed: test-only injected MV repository failure at Create; target cleanup=Ok(())"
         );
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
@@ -23477,7 +23299,6 @@ mod tests {
                 .is_err(),
             "known repository failure must clean the created target"
         );
-        let read = sqlite.begin_read().expect("underlying repository read");
         assert!(
             env.state
                 .mv_repository
@@ -23489,34 +23310,19 @@ mod tests {
 
     #[test]
     fn create_iceberg_mv_descriptor_sync_failure_retains_target_and_committed_metadata() {
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let sqlite = Arc::new(
-            crate::meta::SqliteMetaStoreProvider::open(
-                metadata_dir.path().join("standalone.sqlite"),
-            )
-            .expect("open meta provider"),
-        );
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         let state_slot = Arc::new(std::sync::Mutex::new(None::<Arc<StandaloneState>>));
         let hook_slot = Arc::clone(&state_slot);
-        let provider = Arc::new(TestMetaStoreProvider::after_commit(
-            Arc::clone(&sqlite),
-            Arc::new(move || {
-                let state = hook_slot
-                    .lock()
-                    .expect("state slot")
-                    .as_ref()
-                    .expect("test state installed")
-                    .clone();
-                corrupt_mv_descriptor_for_test(&state, "ice", "analytics", "mv_orders")
-                    .expect("corrupt descriptor after repository commit");
-            }),
-        ));
-        let env = open_test_state_with_custom_metadata_provider(
-            "ice",
-            "analytics",
-            metadata_dir,
-            provider,
-        );
+        let _after_create = after_next_mv_repository_create(Arc::new(move || {
+            let state = hook_slot
+                .lock()
+                .expect("state slot")
+                .as_ref()
+                .expect("test state installed")
+                .clone();
+            corrupt_mv_descriptor_for_test(&state, "ice", "analytics", "mv_orders")
+                .expect("corrupt descriptor after repository commit");
+        }));
         *state_slot.lock().expect("state slot") = Some(Arc::clone(&env.state));
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
@@ -23538,7 +23344,6 @@ mod tests {
         };
         crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
             .expect("descriptor sync failure must retain the committed target");
-        let read = sqlite.begin_read().expect("underlying repository read");
         let definitions = env
             .state
             .mv_repository
@@ -23562,38 +23367,23 @@ mod tests {
 
     #[test]
     fn create_iceberg_mv_catalog_register_failure_keeps_target_and_committed_metadata() {
-        let metadata_dir = TempDir::new().expect("metadata tempdir");
-        let sqlite = Arc::new(
-            crate::meta::SqliteMetaStoreProvider::open(
-                metadata_dir.path().join("standalone.sqlite"),
-            )
-            .expect("open meta provider"),
-        );
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         let state_slot = Arc::new(std::sync::Mutex::new(None::<Arc<StandaloneState>>));
         let hook_slot = Arc::clone(&state_slot);
-        let provider = Arc::new(TestMetaStoreProvider::after_commit(
-            Arc::clone(&sqlite),
-            Arc::new(move || {
-                let state = hook_slot
-                    .lock()
-                    .expect("state slot")
-                    .as_ref()
-                    .expect("test state installed")
-                    .clone();
-                let local = Arc::clone(state.catalog_service.local());
-                let _ = std::thread::spawn(move || {
-                    let _guard = local.write().expect("local catalog write");
-                    panic!("injected catalog register failure");
-                })
-                .join();
-            }),
-        ));
-        let env = open_test_state_with_custom_metadata_provider(
-            "ice",
-            "analytics",
-            metadata_dir,
-            provider,
-        );
+        let _after_create = after_next_mv_repository_create(Arc::new(move || {
+            let state = hook_slot
+                .lock()
+                .expect("state slot")
+                .as_ref()
+                .expect("test state installed")
+                .clone();
+            let local = Arc::clone(state.catalog_service.local());
+            let _ = std::thread::spawn(move || {
+                let _guard = local.write().expect("local catalog write");
+                panic!("injected catalog register failure");
+            })
+            .join();
+        }));
         *state_slot.lock().expect("state slot") = Some(Arc::clone(&env.state));
         create_base_table(&env.state, "ice", "sales", "orders");
         let stmt = parse_create_mv(
@@ -23615,7 +23405,6 @@ mod tests {
         };
         crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
             .expect("register failure occurs after target create and descriptor sync");
-        let read = sqlite.begin_read().expect("underlying repository read");
         let definition = env
             .state
             .mv_repository

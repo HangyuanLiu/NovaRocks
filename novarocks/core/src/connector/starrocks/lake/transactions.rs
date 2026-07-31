@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn partial_target_bundle_keeps_shared_bundle_page_and_segments() {
         let root = test_root();
-        let bundle_path = write_bundle(&root, 1);
+        let bundle_path = write_bundle(&root, 2);
         let segment = join_tablet_path(&root, "data/target.segment").expect("segment path");
         write_bytes(&segment, b"segment".to_vec()).expect("write segment");
 
@@ -1210,14 +1210,14 @@ mod tests {
     #[test]
     fn fully_targeted_bundle_removes_tablet_root() {
         let root = test_root();
-        let _ = write_bundle(&root, 1);
+        let _ = write_bundle(&root, 2);
         let segment = join_tablet_path(&root, "data/target.segment").expect("segment path");
         write_bytes(&segment, b"segment".to_vec()).expect("write segment");
 
         let provider = BundleProvider {
             includes_alive_tablet: false,
         };
-        let bundle = load_bundle_file_with_provider(&root, 1, &provider)
+        let bundle = load_bundle_file_with_provider(&root, 2, &provider)
             .expect("load bundle")
             .expect("bundle exists");
         assert!(bundle_is_fully_targeted(&bundle, &HashSet::from([1])));
@@ -1229,11 +1229,11 @@ mod tests {
     #[test]
     fn vacuum_keeps_partial_bundle_ownership() {
         let root = test_root();
-        let bundle_path = write_bundle(&root, 1);
+        let bundle_path = write_bundle(&root, 2);
         let provider = BundleProvider {
             includes_alive_tablet: true,
         };
-        let bundle = load_bundle_file_with_provider(&root, 1, &provider)
+        let bundle = load_bundle_file_with_provider(&root, 2, &provider)
             .expect("load bundle")
             .expect("bundle exists");
         assert!(bundle.tablet_metadata_pages.contains_key(&2));

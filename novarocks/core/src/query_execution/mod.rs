@@ -25,6 +25,8 @@ pub mod contract;
 pub mod contract_test_support;
 pub mod control;
 pub mod fragment_transport;
+#[cfg(test)]
+pub(crate) mod in_process_test;
 pub mod lifecycle;
 pub mod native_fragment_report;
 pub(crate) mod outcome;

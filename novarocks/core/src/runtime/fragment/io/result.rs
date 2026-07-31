@@ -112,6 +112,11 @@ pub(crate) fn discard_result_writer() -> Arc<dyn FragmentResultWriter> {
 }
 
 #[cfg(test)]
+pub(crate) fn in_process_test_result_writer() -> Arc<dyn FragmentResultWriter> {
+    Arc::new(InProcessTestResultWriter)
+}
+
+#[cfg(test)]
 pub(crate) fn discard_result_session() -> Arc<dyn FragmentResultSession> {
     Arc::new(DiscardResultSession)
 }
@@ -143,4 +148,89 @@ impl FragmentResultSession for DiscardResultSession {
     }
 
     fn abort(&self, _reason: ResultAbort) {}
+}
+
+#[cfg(test)]
+struct InProcessTestResultWriter;
+
+#[cfg(test)]
+impl FragmentResultWriter for InProcessTestResultWriter {
+    fn open(
+        &self,
+        spec: ResultWriteSpec,
+    ) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+        if spec.presentation() == ResultPresentation::Statistic {
+            return Err(FragmentIoError::new(
+                super::FragmentIoOperation::ResultOpen,
+                super::FragmentIoErrorKind::RemoteRejected,
+                "in-process native tests do not support STATISTIC result presentation",
+            ));
+        }
+        let handle = crate::runtime::result_buffer::ResultBufferWriteHandle::open(
+            spec.fragment_instance_id(),
+            spec.is_typed(),
+            None,
+        )
+        .map_err(|error| {
+            FragmentIoError::new(
+                super::FragmentIoOperation::ResultOpen,
+                super::FragmentIoErrorKind::Internal,
+                error,
+            )
+        })?;
+        Ok(Arc::new(InProcessTestResultSession { spec, handle }))
+    }
+}
+
+#[cfg(test)]
+struct InProcessTestResultSession {
+    spec: ResultWriteSpec,
+    handle: crate::runtime::result_buffer::ResultBufferWriteHandle,
+}
+
+#[cfg(test)]
+impl FragmentResultSession for InProcessTestResultSession {
+    fn write(&self, chunk: Chunk) -> Result<(), FragmentIoError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if !self.spec.is_typed() {
+            return Err(FragmentIoError::new(
+                super::FragmentIoOperation::ResultWrite,
+                super::FragmentIoErrorKind::InvalidResponse,
+                "in-process native tests require typed result output",
+            ));
+        }
+        let payload = crate::runtime::exchange::encode_chunks(&[chunk], true).map_err(|error| {
+            FragmentIoError::new(
+                super::FragmentIoOperation::ResultWrite,
+                super::FragmentIoErrorKind::Internal,
+                error,
+            )
+        })?;
+        self.handle
+            .write_typed(payload)
+            .map(|_| ())
+            .map_err(|error| {
+                FragmentIoError::new(
+                    super::FragmentIoOperation::ResultWrite,
+                    super::FragmentIoErrorKind::Internal,
+                    error,
+                )
+            })
+    }
+
+    fn finish(&self) -> Result<(), FragmentIoError> {
+        self.handle.finish().map(|_| ()).map_err(|error| {
+            FragmentIoError::new(
+                super::FragmentIoOperation::ResultFinish,
+                super::FragmentIoErrorKind::Internal,
+                error,
+            )
+        })
+    }
+
+    fn abort(&self, reason: ResultAbort) {
+        self.handle.abort(reason);
+    }
 }

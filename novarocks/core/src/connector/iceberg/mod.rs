@@ -35,6 +35,7 @@ pub mod metadata;
 pub(crate) mod metadata_read;
 pub(crate) mod operation_lifecycle;
 pub(crate) mod partition_spec;
+pub(crate) mod planning;
 pub mod position_delete;
 pub mod position_delete_descriptor;
 pub(crate) mod provider;

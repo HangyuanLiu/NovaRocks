@@ -962,7 +962,7 @@ mod tests {
         };
 
         assert!(
-            err.contains("schema table loads requires StarRocks FE compatibility mode"),
+            err.contains("StarRocks schema-load capability is unavailable for this fragment"),
             "err={err}"
         );
     }

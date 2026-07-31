@@ -74,7 +74,10 @@ impl Default for RuntimeState {
             query_options: None,
             cache_options: None,
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
-            last_report_exec_state_ns: AtomicI64::new(0),
+            // A newly admitted fragment starts its report interval now. Using
+            // the process-relative zero would make the first poll fire
+            // immediately once the process had been alive for one interval.
+            last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id: None,
             fragment_instance_id: None,
             backend_num: None,
@@ -137,7 +140,7 @@ impl RuntimeState {
             query_options,
             cache_options,
             error_state: std::sync::Arc::new(RuntimeErrorState::default()),
-            last_report_exec_state_ns: AtomicI64::new(0),
+            last_report_exec_state_ns: AtomicI64::new(monotonic_now_ns()),
             query_id,
             fragment_instance_id,
             backend_num,

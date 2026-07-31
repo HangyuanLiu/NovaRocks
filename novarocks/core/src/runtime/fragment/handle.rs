@@ -77,7 +77,7 @@ impl Default for FragmentPrepareContext {
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             lookup_client: Arc::new(UnavailableFragmentLookupClient),
-            result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
+            result_writer: crate::runtime::fragment::io::result::in_process_test_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
             load_tracking_sink: None,
             result_spec: None,
@@ -349,6 +349,10 @@ struct RunningFragmentState {
 }
 
 impl RunningFragmentHandle {
+    pub fn fragment_instance_id(&self) -> crate::common::types::UniqueId {
+        self.inner.fragment_instance_id
+    }
+
     pub fn submitted_driver_count(&self) -> usize {
         self.inner.pipeline.submitted_driver_count()
     }

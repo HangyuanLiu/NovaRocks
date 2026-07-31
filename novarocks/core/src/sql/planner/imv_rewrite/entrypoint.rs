@@ -1059,7 +1059,22 @@ pub(crate) mod tests {
                             current_snapshot_id: Some(current_snapshot_id),
                             schema_id: 7,
                             location: format!("file:///tmp/ice/db/{table}"),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
+                            schema: IcebergSchemaDef {
+                                fields: [(1, "k"), (2, "v")]
+                                    .into_iter()
+                                    .map(|(field_id, name)| {
+                                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                                            field_id,
+                                            name: name.to_string(),
+                                            initial_default: None,
+                                            write_default: None,
+                                            initial_default_json: None,
+                                            write_default_json: None,
+                                            children: Vec::new(),
+                                        }
+                                    })
+                                    .collect(),
+                            },
                             serialized_metadata: None,
                             serialized_metadata_rows: None,
                         },

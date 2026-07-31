@@ -38,6 +38,7 @@ use crate::sql::planner::payload::PlanScanNode;
 /// exactly one entry from that list.
 pub(super) fn lower_static_connector_predicates(
     scan: &PlanScanNode,
+    connector_schema_fields: &[&str],
 ) -> Vec<ConnectorStaticPredicate> {
     let mut lowered = Vec::new();
     for (ordinal, predicate) in scan.predicates.iter().enumerate() {
@@ -47,9 +48,12 @@ pub(super) fn lower_static_connector_predicates(
         let Ok(ordinal) = u32::try_from(ordinal) else {
             break;
         };
-        let Some(predicate) =
-            lower_static_predicate(scan, ConnectorStaticPredicateId(ordinal), predicate)
-        else {
+        let Some(predicate) = lower_static_predicate(
+            scan,
+            connector_schema_fields,
+            ConnectorStaticPredicateId(ordinal),
+            predicate,
+        ) else {
             continue;
         };
 
@@ -68,21 +72,23 @@ pub(super) fn lower_static_connector_predicates(
 
 fn lower_static_predicate(
     scan: &PlanScanNode,
+    connector_schema_fields: &[&str],
     id: ConnectorStaticPredicateId,
     predicate: &TypedExpr,
 ) -> Option<ConnectorStaticPredicate> {
     match &unnest(predicate).kind {
         ExprKind::BinaryOp { left, op, right } => {
-            let (column, op, literal) = if let Some(column) = lower_column(scan, left) {
-                (column, comparison_op(*op)?, right.as_ref())
-            } else {
-                let column = lower_column(scan, right)?;
-                (
-                    column,
-                    comparison_op(reverse_comparison(*op))?,
-                    left.as_ref(),
-                )
-            };
+            let (column, op, literal) =
+                if let Some(column) = lower_column(scan, connector_schema_fields, left) {
+                    (column, comparison_op(*op)?, right.as_ref())
+                } else {
+                    let column = lower_column(scan, connector_schema_fields, right)?;
+                    (
+                        column,
+                        comparison_op(reverse_comparison(*op))?,
+                        left.as_ref(),
+                    )
+                };
             Some(ConnectorStaticPredicate {
                 id,
                 column: column.column,
@@ -93,7 +99,7 @@ fn lower_static_predicate(
             })
         }
         ExprKind::IsNull { expr, negated } => {
-            let column = lower_column(scan, expr)?;
+            let column = lower_column(scan, connector_schema_fields, expr)?;
             Some(ConnectorStaticPredicate {
                 id,
                 column: column.column,
@@ -109,7 +115,7 @@ fn lower_static_predicate(
             list,
             negated,
         } if !negated && !list.is_empty() => {
-            let column = lower_column(scan, expr)?;
+            let column = lower_column(scan, connector_schema_fields, expr)?;
             let literals = list
                 .iter()
                 .map(|literal| lower_literal(literal, column.data_type))
@@ -130,7 +136,11 @@ struct LoweredColumn {
     data_type: ConnectorStaticPredicateDataType,
 }
 
-fn lower_column(scan: &PlanScanNode, expr: &TypedExpr) -> Option<LoweredColumn> {
+fn lower_column(
+    scan: &PlanScanNode,
+    connector_schema_fields: &[&str],
+    expr: &TypedExpr,
+) -> Option<LoweredColumn> {
     let ExprKind::ColumnRef { column_id, .. } = &unnest(expr).kind else {
         return None;
     };
@@ -152,12 +162,11 @@ fn lower_column(scan: &PlanScanNode, expr: &TypedExpr) -> Option<LoweredColumn> 
     if output.data_type != expr.data_type || output.nullable != expr.nullable {
         return None;
     }
-    let (ordinal, source) = scan
+    let source = scan
         .table
         .columns
         .iter()
-        .enumerate()
-        .find(|(_, source)| source.name.eq_ignore_ascii_case(&output.name))?;
+        .find(|source| source.name.eq_ignore_ascii_case(&output.name))?;
     if source.data_type != output.data_type
         || source.nullable != output.nullable
         || source.logical_type.is_some()
@@ -166,6 +175,18 @@ fn lower_column(scan: &PlanScanNode, expr: &TypedExpr) -> Option<LoweredColumn> 
     }
 
     let data_type = static_data_type(&source.data_type)?;
+    // The SPI ordinal addresses the connector's stable table schema, not the
+    // analyzer-visible TableDef. The latter may hide or re-expose internal
+    // columns (for example an MV apply key), changing its local order without
+    // changing physical field identity.
+    let mut ordinals = connector_schema_fields
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.eq_ignore_ascii_case(&source.name));
+    let (ordinal, _) = ordinals.next()?;
+    if ordinals.next().is_some() {
+        return None;
+    }
     Some(LoweredColumn {
         column: ConnectorStaticPredicateColumn {
             field_ordinal: u32::try_from(ordinal).ok()?,
@@ -377,7 +398,7 @@ mod tests {
             },
         ];
 
-        let actual = lower_static_connector_predicates(&scan(predicates));
+        let actual = lower_static_connector_predicates(&scan(predicates), &["ignored", "value"]);
         assert_eq!(actual.len(), 3);
         assert_eq!(
             actual
@@ -443,7 +464,7 @@ mod tests {
             },
         ];
 
-        let actual = lower_static_connector_predicates(&scan(predicates));
+        let actual = lower_static_connector_predicates(&scan(predicates), &["ignored", "value"]);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].id, ConnectorStaticPredicateId(1));
         assert!(matches!(
@@ -476,12 +497,24 @@ mod tests {
             },
         ];
 
-        let actual = lower_static_connector_predicates(&scan(predicates));
+        let actual = lower_static_connector_predicates(&scan(predicates), &["ignored", "value"]);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].id, ConnectorStaticPredicateId(1));
         assert!(matches!(
             actual[0].kind,
             ConnectorStaticPredicateKind::IsNotNull
         ));
+    }
+
+    #[test]
+    fn lower_uses_connector_schema_ordinal_when_visible_columns_are_reordered() {
+        let value = column(7, "value", DataType::Int32, true);
+        let mut scan = scan(vec![comparison(value, BinOp::Eq, int(10))]);
+        scan.table.columns.reverse();
+
+        let actual = lower_static_connector_predicates(&scan, &["ignored", "value"]);
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].column.field_ordinal, 1);
     }
 }

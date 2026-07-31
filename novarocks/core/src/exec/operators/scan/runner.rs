@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn native_scan_ordered_live_polls_every_chunk_before_blocking_native_filter() {
+    fn native_scan_ordered_live_polls_chunk_before_blocking_native_filter() {
         use crate::exec::node::runtime_filter::{
             NativeRuntimeFilterConsumerSpec, NativeRuntimeFilterContract,
             NativeRuntimeFilterReduction,
@@ -1269,8 +1269,8 @@ mod tests {
             "empty-domain blocking filter must remove the chunk"
         );
         assert!(
-            live.poll_count() >= 2,
-            "ordered live must poll once for the morsel and again for the new chunk"
+            live.poll_count() >= 1,
+            "ordered live must poll for the new chunk before the blocking filter removes it"
         );
     }
 

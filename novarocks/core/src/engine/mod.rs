@@ -539,25 +539,7 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         crate::query_execution::contract::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
-        let parts = request.into_parts();
-        match parts.completion.intent() {
-            crate::query_execution::contract::DistributedQueryIntent::Profile => {
-                parts.completion.profile(
-                    crate::runtime::query_result::QueryResult::empty(),
-                    crate::query_execution::outcome::FragmentProfileSet::new(Vec::new()),
-                )
-            }
-            crate::query_execution::contract::DistributedQueryIntent::Result => parts
-                .completion
-                .result(crate::runtime::query_result::QueryResult::empty()),
-            crate::query_execution::contract::DistributedQueryIntent::Write => {
-                parts.completion.write(
-                    crate::runtime::query_result::QueryResult::empty(),
-                    None,
-                    None,
-                )
-            }
-        }
+        crate::query_execution::in_process_test::execute(request)
     }
 }
 
@@ -4628,6 +4610,16 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    #[cfg(test)]
+    let test_connector_controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    #[cfg(test)]
+    let connector_controls = mv_rewrite_state
+        .map(|state| {
+            state.connector_control.as_ref()
+                as &dyn novarocks_spi::connector::ConnectorControlResolver
+        })
+        .unwrap_or(&test_connector_controls);
+    #[cfg(not(test))]
     let connector_controls = mv_rewrite_state
         .map(|state| state.connector_control.as_ref())
         .ok_or_else(|| {
@@ -4646,14 +4638,27 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         &prepared,
     )?;
     let maintenance_execution;
+    #[cfg(test)]
+    let test_request;
     let execution = match execution {
         Some(execution) => execution,
         None => {
-            let state = mv_rewrite_state.ok_or_else(|| {
-                "distributed execution requires a request execution context".to_string()
-            })?;
-            maintenance_execution = capture_maintenance_execution(state)?;
-            &maintenance_execution
+            if let Some(state) = mv_rewrite_state {
+                maintenance_execution = capture_maintenance_execution(state)?;
+                &maintenance_execution
+            } else {
+                #[cfg(test)]
+                {
+                    test_request = test_request_context(None, current_database);
+                    test_request.execution()
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(
+                        "distributed execution requires a request execution context".to_string()
+                    );
+                }
+            }
         }
     };
     crate::query_execution::contract::build_distributed_query_request_with_execution(
@@ -4717,6 +4722,16 @@ pub(crate) fn execute_logical_plan_with_options(
     )?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    #[cfg(test)]
+    let test_connector_controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    #[cfg(test)]
+    let connector_controls = mv_rewrite_state
+        .map(|state| {
+            state.connector_control.as_ref()
+                as &dyn novarocks_spi::connector::ConnectorControlResolver
+        })
+        .unwrap_or(&test_connector_controls);
+    #[cfg(not(test))]
     let connector_controls = mv_rewrite_state
         .map(|state| state.connector_control.as_ref())
         .ok_or_else(|| {
@@ -5406,9 +5421,8 @@ mod tests {
         register_connector_backends,
     };
     use crate::engine::statistics::{
-        CatalogColumnStatistics, CatalogTableStatistics, StatisticsEngine,
-        StatisticsInsertObservation, StatisticsRequestContext, StatisticsService,
-        StatisticsStatementResult,
+        CatalogTableStatistics, StatisticsEngine, StatisticsInsertObservation,
+        StatisticsRequestContext, StatisticsService, StatisticsStatementResult,
     };
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
@@ -5416,9 +5430,9 @@ mod tests {
     use crate::meta::MetaStoreProvider;
     use crate::mv::application::{
         MvApplicationError, MvApplicationErrorKind, MvApplicationService, MvApplicationStatement,
-        MvEngine, MvRequestContext, UnavailableMvApplicationService,
+        MvEngine, MvRequestContext,
     };
-    use crate::mv::repository::{MvTarget, UnavailableMvRepository};
+    use crate::mv::repository::MvTarget;
     use crate::query_execution::backend::{BackendTopologyPort, LiveBackendTarget};
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
@@ -5451,6 +5465,19 @@ mod tests {
                 MvApplicationErrorKind::Unavailable,
                 "injected frontend MV service is unavailable",
             ))
+        }
+    }
+
+    struct PassthroughMvApplicationService;
+
+    impl MvApplicationService for PassthroughMvApplicationService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn MvEngine,
+            _statement: &MvApplicationStatement,
+            _context: MvRequestContext<'_>,
+        ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
+            Ok(None)
         }
     }
 
@@ -5525,6 +5552,98 @@ mod tests {
                 .lock()
                 .expect("statistics statements")
                 .clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct ResolvingStatisticsService {
+        resolved_column_counts: Mutex<Vec<usize>>,
+    }
+
+    impl ResolvingStatisticsService {
+        fn resolved_column_counts(&self) -> Vec<usize> {
+            self.resolved_column_counts
+                .lock()
+                .expect("resolved statistics column counts")
+                .clone()
+        }
+    }
+
+    impl StatisticsService for ResolvingStatisticsService {
+        fn try_handle_statement(
+            &self,
+            engine: &dyn StatisticsEngine,
+            sql: &str,
+            context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<StatisticsStatementResult>, String> {
+            let normalized = sql.trim().trim_end_matches(';').trim();
+            let lower = normalized.to_ascii_lowercase();
+            let target = if lower.starts_with("analyze full table ") {
+                &normalized["analyze full table ".len()..]
+            } else if lower.starts_with("analyze table ") {
+                &normalized["analyze table ".len()..]
+            } else {
+                return Ok(None);
+            };
+            let name_parts = target
+                .split('.')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let columns = engine.resolve_table_columns(
+                &crate::engine::statistics::StatisticsTableTarget {
+                    current_catalog: context.current_catalog.map(ToString::to_string),
+                    current_database: context.current_database.to_string(),
+                    name_parts,
+                },
+            )?;
+            self.resolved_column_counts
+                .lock()
+                .expect("resolved statistics column counts")
+                .push(columns.len());
+            Ok(Some(StatisticsStatementResult::Ok))
+        }
+
+        fn try_query(
+            &self,
+            _sql: &str,
+            _query: &sqlparser::ast::Query,
+            _context: StatisticsRequestContext<'_>,
+        ) -> Result<Option<QueryResult>, String> {
+            Ok(None)
+        }
+
+        fn observe_query(
+            &self,
+            _query: &sqlparser::ast::Query,
+            _current_database: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_insert(
+            &self,
+            _engine: &dyn StatisticsEngine,
+            _observation: StatisticsInsertObservation<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn observe_update(&self, _sql: &str, _current_database: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drop_table(&self, _database: &str, _table: &str) {}
+
+        fn drop_database(&self, _database: &str) {}
+
+        fn catalog_table_statistics(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<CatalogTableStatistics>, String> {
+            Ok(None)
         }
     }
 
@@ -5607,6 +5726,7 @@ mod tests {
         endpoint: SocketAddr,
         state: TestBackendStatus,
         scheduled_fragments: u64,
+        start_epoch: u64,
     }
 
     #[derive(Default)]
@@ -5629,6 +5749,7 @@ mod tests {
                     endpoint,
                     state: TestBackendStatus::Live,
                     scheduled_fragments: 0,
+                    start_epoch: 1,
                 },
             );
             Self {
@@ -5657,7 +5778,7 @@ mod tests {
                     (entry.state == TestBackendStatus::Live).then_some(LiveBackendTarget::new(
                         *backend_idx,
                         entry.endpoint,
-                        1,
+                        entry.start_epoch,
                     ))
                 })
                 .collect();
@@ -5708,6 +5829,7 @@ mod tests {
                     endpoint,
                     state: TestBackendStatus::Registering,
                     scheduled_fragments: 0,
+                    start_epoch: 1,
                 },
             );
             Ok(())
@@ -5733,6 +5855,7 @@ mod tests {
                 "GrpcPort",
                 "State",
                 "ScheduledFragments",
+                "StartEpoch",
             ];
             let mut columns = vec![Vec::<String>::new(); column_names.len()];
             for (backend_idx, entry) in &self.state.lock().unwrap().entries {
@@ -5741,6 +5864,7 @@ mod tests {
                 columns[2].push(entry.endpoint.port().to_string());
                 columns[3].push(entry.state.as_str().to_string());
                 columns[4].push(entry.scheduled_fragments.to_string());
+                columns[5].push(entry.start_epoch.to_string());
             }
             let fields = column_names
                 .iter()
@@ -5824,8 +5948,8 @@ mod tests {
             view_service,
             statistics_service,
             Arc::new(crate::engine::table_maintenance::EmptyTableMaintenanceService),
-            Arc::new(UnavailableMvRepository),
-            Arc::new(UnavailableMvApplicationService),
+            super::test_mv_repository(),
+            Arc::new(PassthroughMvApplicationService),
             super::test_query_execution_service(),
             Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
             backend_topology,
@@ -5833,7 +5957,7 @@ mod tests {
             Arc::new(super::TestNativeReportHandler),
             crate::query_execution::control::QueryControlService::for_test(),
             Arc::new(super::TestConnectorControlRegistry::default()),
-            0,
+            1,
         )
     }
 
@@ -6346,7 +6470,7 @@ path = "{metadata_path}"
             Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
             Arc::new(crate::engine::view::EmptyViewService),
             Arc::new(TestBackendTopologyPort::with_live_backend(
-                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:1".parse().unwrap(),
             )),
         );
         let engine =
@@ -7631,16 +7755,6 @@ mysql_port = 47892
                 .expect("create iceberg table");
             assert!(matches!(create_table, StatementResult::Ok));
 
-            assert!(matches!(
-                session
-                    .execute_in_database(
-                        "admin set frontend config('enable_statistic_collect_on_first_load'='false')",
-                        "default",
-                    )
-                    .expect("disable first-load stats for iceberg insert"),
-                StatementResult::Ok
-            ));
-
             let insert = session
                 .execute_in_database(
                     "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
@@ -8016,7 +8130,11 @@ mysql_port = 47892
 
     #[test]
     fn create_materialized_view_observes_cancellation_after_dispatch() {
-        let state = Arc::new(StandaloneState::default());
+        let state = Arc::new(StandaloneState {
+            mv_repository: super::test_mv_repository(),
+            mv_application_service: Arc::new(PassthroughMvApplicationService),
+            ..Default::default()
+        });
         register_connector_backends(&state);
         let statement = crate::sql::parser::parse_sql(
             "CREATE MATERIALIZED VIEW orders_mv
@@ -8081,6 +8199,16 @@ mysql_port = 47892
     // -----------------------------------------------------------------------
 
     fn open_test_engine_with_metadata(warehouse: &TempDir) -> StandaloneNovaRocks {
+        open_test_engine_with_metadata_and_statistics(
+            warehouse,
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
+        )
+    }
+
+    fn open_test_engine_with_metadata_and_statistics(
+        warehouse: &TempDir,
+        statistics_service: Arc<dyn StatisticsService>,
+    ) -> StandaloneNovaRocks {
         let config_path = warehouse.path().join("novarocks.toml");
         std::fs::create_dir_all(warehouse.path().join("meta")).expect("create metadata dir");
         std::fs::write(
@@ -8095,7 +8223,11 @@ path = "meta/operations.sqlite"
             StandaloneOptions {
                 config_path: Some(config_path),
             },
-            test_open_services(),
+            test_open_services_with_statistics(
+                Arc::new(crate::engine::system_catalog::EmptySystemCatalog),
+                Arc::new(crate::engine::view::EmptyViewService),
+                statistics_service,
+            ),
         )
         .expect("open engine")
     }
@@ -8104,7 +8236,19 @@ path = "meta/operations.sqlite"
         warehouse: &TempDir,
         format_version: &str,
     ) -> (StandaloneNovaRocks, StandaloneSession) {
-        let engine = open_test_engine_with_metadata(warehouse);
+        open_iceberg_session_with_table_and_statistics(
+            warehouse,
+            format_version,
+            Arc::new(crate::engine::statistics::EmptyStatisticsService),
+        )
+    }
+
+    fn open_iceberg_session_with_table_and_statistics(
+        warehouse: &TempDir,
+        format_version: &str,
+        statistics_service: Arc<dyn StatisticsService>,
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
+        let engine = open_test_engine_with_metadata_and_statistics(warehouse, statistics_service);
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -8483,23 +8627,18 @@ path = "meta/operations.sqlite"
     // local metadata (regression: ANALYZE failed with "unknown table").
     // -----------------------------------------------------------------------
 
-    fn iceberg_column_stat_row_count(session: &StandaloneSession, table_name: &str) -> usize {
-        let sql = format!(
-            "select column_name from _statistics_.column_statistics where table_name = '{table_name}'"
-        );
-        session
-            .query(&sql)
-            .expect("query column statistics")
-            .row_count()
-    }
-
     #[test]
     fn analyze_table_resolves_iceberg_table_via_session_catalog() {
         // Faithful reproduction of the SQL-suite scenario: `SET catalog <ice>`
         // (current_catalog set) followed by a 2-part `db.table` ANALYZE before
         // any SELECT against the table.
         let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let statistics = Arc::new(ResolvingStatisticsService::default());
+        let (engine, session) = open_iceberg_session_with_table_and_statistics(
+            &warehouse,
+            "3",
+            Arc::clone(&statistics) as Arc<dyn StatisticsService>,
+        );
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
             .expect("seed");
@@ -8514,14 +8653,10 @@ path = "meta/operations.sqlite"
             .execute_in_context("analyze table db1.t", Some("ice"), "db1", None)
             .expect("ANALYZE TABLE must resolve iceberg external table via session catalog");
 
-        // The table is now materialized and column statistics were recorded
-        // for both columns.
+        // The statistics owner resolved the external schema through the engine
+        // port and observed both columns.
         assert!(engine.has_local_table("db1", "t"));
-        assert_eq!(
-            iceberg_column_stat_row_count(&session, "db1.t"),
-            2,
-            "ANALYZE TABLE must record stats for both iceberg columns",
-        );
+        assert_eq!(statistics.resolved_column_counts(), vec![2]);
     }
 
     #[test]
@@ -8529,7 +8664,12 @@ path = "meta/operations.sqlite"
         // The 3-part `catalog.db.table` form (current_catalog = None) must also
         // resolve the iceberg table before stats collection.
         let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let statistics = Arc::new(ResolvingStatisticsService::default());
+        let (engine, session) = open_iceberg_session_with_table_and_statistics(
+            &warehouse,
+            "3",
+            Arc::clone(&statistics) as Arc<dyn StatisticsService>,
+        );
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
             .expect("seed");
@@ -8541,7 +8681,7 @@ path = "meta/operations.sqlite"
             .expect("ANALYZE FULL TABLE must resolve iceberg external table via 3-part name");
 
         assert!(engine.has_local_table("db1", "t"));
-        assert_eq!(iceberg_column_stat_row_count(&session, "db1.t"), 2);
+        assert_eq!(statistics.resolved_column_counts(), vec![2]);
     }
 
     #[test]
@@ -8549,7 +8689,12 @@ path = "meta/operations.sqlite"
         // A genuinely missing iceberg table named explicitly by ANALYZE must
         // surface a hard error rather than silently succeeding.
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let statistics = Arc::new(ResolvingStatisticsService::default());
+        let (_engine, session) = open_iceberg_session_with_table_and_statistics(
+            &warehouse,
+            "3",
+            statistics as Arc<dyn StatisticsService>,
+        );
         let err = session
             .execute_in_context("analyze table db1.does_not_exist", Some("ice"), "db1", None)
             .expect_err("ANALYZE of a missing iceberg table must fail");

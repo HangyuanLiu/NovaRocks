@@ -236,7 +236,7 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
 }
 
 #[test]
-fn hidden_equality_key_is_sidecar_read_without_plan_mutation() {
+fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
@@ -255,7 +255,7 @@ fn hidden_equality_key_is_sidecar_read_without_plan_mutation() {
     let binding = bindings.binding(10).expect("binding");
 
     assert_eq!(format!("{plan:#?}"), before);
-    assert_eq!(binding.required_reads.len(), 2);
+    assert_eq!(binding.required_reads.len(), 1);
     assert_eq!(
         binding.required_reads[0].planner_column_id,
         Some(ColumnId::new_for_test(1))
@@ -264,20 +264,17 @@ fn hidden_equality_key_is_sidecar_read_without_plan_mutation() {
         binding.required_reads[0].reason,
         ResolvedReadReason::PlannerRequiredOrOutput
     );
-    assert_eq!(binding.required_reads[1].source.name, "category");
-    assert_eq!(binding.required_reads[1].planner_column_id, None);
-    assert_eq!(
-        binding.required_reads[1].reason,
-        ResolvedReadReason::EqualityDeleteKey
-    );
-    let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected file range");
-    };
+    assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
+    let planned = bindings
+        .connector_read(0, 10)
+        .expect("opaque connector read");
+    let file =
+        crate::connector::iceberg::provider::planned_split_data_file_for_test(&planned.splits[0])
+            .expect("decode test Iceberg split");
     assert_eq!(file.delete_files.len(), 1);
     assert_eq!(
         file.delete_files[0].file_content,
-        crate::runtime::scan_range::IcebergFileContent::EqualityDeletes
+        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
     );
     assert_eq!(
         seen_column_names
@@ -285,7 +282,7 @@ fn hidden_equality_key_is_sidecar_read_without_plan_mutation() {
             .expect("seen column names lock")
             .last()
             .cloned(),
-        Some(vec![0, 1])
+        Some(vec![0])
     );
 }
 
@@ -358,6 +355,7 @@ fn equality_key_already_in_planner_output_keeps_column_id() {
         .push(source_column("category", DataType::Utf8, true));
     scan.columns
         .push(column(3, "category", DataType::Utf8, true));
+    scan.required_columns = Some(vec!["id".to_string(), "category".to_string()]);
     let mut file = data_file("s3://bucket/data.parquet");
     file.delete_files = vec![equality_delete_file(Vec::new(), vec![3])];
 
