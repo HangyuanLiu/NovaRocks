@@ -32,7 +32,6 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 
-use crate::common::config::http_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info};
@@ -1190,104 +1189,6 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
     grpc_routes
         .into_axum_router()
         .route("/metrics", get(metrics_http::handle_metrics))
-}
-
-pub fn start_grpc_server_with_native_fragment_ingress(
-    host: &str,
-    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
-    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
-    report_handler: Arc<dyn NativeReportHandler>,
-) -> Result<(), String> {
-    start_grpc_http_server(
-        host,
-        http_port(),
-        native_fragment_ingress,
-        query_lifecycle_ingress,
-        report_handler,
-    )
-}
-
-fn start_grpc_http_server(
-    host: &str,
-    grpc_http_port: u16,
-    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
-    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
-    report_handler: Arc<dyn NativeReportHandler>,
-) -> Result<(), String> {
-    {
-        let state = grpc_server_state()
-            .lock()
-            .map_err(|_| "lock grpc server state failed".to_string())?;
-        if state.started {
-            return Ok(());
-        }
-    }
-
-    let host = host.to_string();
-    let std_listener = bind_tcp_listener(&host, grpc_http_port, "novarocks grpc/http")?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (failure_tx, failure_rx) = mpsc::channel();
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let stop_requested_for_thread = Arc::clone(&stop_requested);
-
-    let join_handle = std::thread::spawn(move || {
-        supervise_grpc_server_thread(stop_requested_for_thread, failure_tx, move || {
-            info!(
-                target: "novarocks::grpc",
-                host = %host,
-                http_port = grpc_http_port,
-                "starting grpc server"
-            );
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(8)
-                .thread_stack_size(crate::runtime::global_async_runtime::WORKER_STACK_SIZE_BYTES)
-                .build()
-                .map_err(|error| format!("build grpc server runtime failed: {error}"))?;
-
-            rt.block_on(async move {
-                let listener = TokioTcpListener::from_std(std_listener)
-                    .map_err(|error| format!("create grpc/http tokio listener failed: {error}"))?;
-                let mut http_shutdown = shutdown_rx.clone();
-                let query_control_shutdown = shutdown_rx.clone();
-
-                let svc = GrpcService::with_fragment_execution(
-                    native_fragment_ingress,
-                    query_lifecycle_ingress,
-                    report_handler,
-                )
-                .with_query_control_shutdown(query_control_shutdown);
-                let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
-                    .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                let app = build_novarocks_http_app(Routes::new(svc));
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        while !*http_shutdown.borrow() {
-                            if http_shutdown.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                    .await
-                    .map_err(|error| format!("grpc/http serve future failed: {error}"))
-            })
-        });
-    });
-
-    let mut state = grpc_server_state()
-        .lock()
-        .map_err(|_| "lock grpc server state failed".to_string())?;
-    if state.started {
-        return Ok(());
-    }
-    state.started = true;
-    state.bound_port = Some(grpc_http_port);
-    state.shutdown_tx = Some(shutdown_tx);
-    state.join_handle = Some(join_handle);
-    state.stop_requested = Some(stop_requested);
-    state.failure_rx = Some(failure_rx);
-    Ok(())
 }
 
 fn supervise_grpc_server_thread<F>(
