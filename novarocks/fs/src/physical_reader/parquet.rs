@@ -23,11 +23,11 @@ use std::time::Instant;
 use arrow::array::UInt64Array;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
     ParquetRecordBatchReaderBuilder, RowSelection,
 };
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
@@ -439,6 +439,15 @@ fn delayed_projection_plan(
     let predicate_roots = predicates
         .iter()
         .filter_map(|predicate| {
+            if let Some(field_id) = predicate.physical_field_id() {
+                return schema.fields().iter().position(|field| {
+                    field
+                        .metadata()
+                        .get(PARQUET_FIELD_ID_META_KEY)
+                        .and_then(|value| value.parse::<i32>().ok())
+                        == Some(field_id)
+                });
+            }
             let root_name = predicate.column().split('.').next()?;
             schema.index_of(root_name).ok()
         })
@@ -718,6 +727,10 @@ fn explicit_page_ranges(
 fn row_group_may_match(row_group: &RowGroupMetaData, predicates: &[ScanPredicate]) -> bool {
     predicates.iter().all(|predicate| {
         let column = row_group.columns().iter().find(|column| {
+            if let Some(field_id) = predicate.physical_field_id() {
+                let info = column.column_descr().self_type().get_basic_info();
+                return info.has_id() && info.id() == field_id;
+            }
             column
                 .column_path()
                 .parts()

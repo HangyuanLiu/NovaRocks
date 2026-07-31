@@ -22,7 +22,8 @@ use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
 use crate::connector::iceberg::scan_model::{
-    IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue,
+    IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue, IcebergPhysicalPredicate,
+    IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +139,75 @@ pub(crate) fn file_may_satisfy_scan_predicates(
 
     counters.files_selected += 1;
     true
+}
+
+/// Evaluate provider-owned predicates against Iceberg manifest metadata. The
+/// physical field ID is intentionally not converted into an FS/public DTO
+/// here: manifest statistics are keyed by the table's current logical name.
+/// The predicate was resolved from that same schema before it entered the
+/// opaque scan payload.
+pub(crate) fn file_may_satisfy_physical_predicates(
+    file: &IcebergDataFileInfo,
+    predicates: &[IcebergPhysicalPredicate],
+    counters: &mut IcebergFilePruningCounters,
+) -> bool {
+    let Some(predicates) = physical_predicates_to_scan_predicates(predicates) else {
+        counters.files_total += 1;
+        counters.files_selected += 1;
+        counters.unsupported += 1;
+        return true;
+    };
+    file_may_satisfy_scan_predicates(file, &predicates, counters)
+}
+
+fn physical_predicates_to_scan_predicates(
+    predicates: &[IcebergPhysicalPredicate],
+) -> Option<Vec<ScanPredicate>> {
+    predicates
+        .iter()
+        .map(|predicate| {
+            let value = |value: &IcebergPhysicalPredicateValue| match value {
+                IcebergPhysicalPredicateValue::Boolean(value) => {
+                    MinMaxPredicateValue::Boolean(*value)
+                }
+                IcebergPhysicalPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(*value),
+                IcebergPhysicalPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(*value),
+                // Iceberg dates and Parquet DATE physical values are both
+                // signed day counts. Reuse the Int32 min/max domain because
+                // manifest statistics are stored as primitive physical bytes.
+                IcebergPhysicalPredicateValue::Date32(value) => MinMaxPredicateValue::Int32(*value),
+            };
+            let domain = match &predicate.domain {
+                IcebergPhysicalPredicateDomain::Range { op, value: literal } => {
+                    ScanPredicateDomain::Range {
+                        op: match op {
+                            IcebergPhysicalPredicateOp::Eq => MinMaxPredicateOp::Eq,
+                            IcebergPhysicalPredicateOp::Lt => MinMaxPredicateOp::Lt,
+                            IcebergPhysicalPredicateOp::Le => MinMaxPredicateOp::Le,
+                            IcebergPhysicalPredicateOp::Gt => MinMaxPredicateOp::Gt,
+                            IcebergPhysicalPredicateOp::Ge => MinMaxPredicateOp::Ge,
+                        },
+                        value: value(literal),
+                    }
+                }
+                IcebergPhysicalPredicateDomain::DiscreteSet { values } => {
+                    let values = values.iter().map(value).collect::<Vec<_>>();
+                    let first = values.first()?.clone();
+                    let last = values.last()?.clone();
+                    ScanPredicateDomain::DiscreteSet {
+                        values,
+                        min: first,
+                        max: last,
+                    }
+                }
+            };
+            Some(ScanPredicate::new(
+                predicate.column.clone(),
+                domain,
+                ScanPredicateSource::Static,
+            ))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -35,7 +35,8 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileBatchReader, FileCancellation, FileError, FileErrorKind, FileFormat, FileIdentity,
     FileMetricsSnapshot, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
+    FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPruning,
+    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
@@ -48,7 +49,11 @@ use super::equality_delete::{
     EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
 };
 use super::position_delete::load_position_deletes_with_context;
-use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
+use super::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+    IcebergPhysicalPredicateValue,
+};
 
 pub(crate) struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
@@ -70,11 +75,20 @@ pub(crate) struct IcebergBatchReader {
 impl IcebergBatchReader {
     pub(crate) fn try_new(
         file: &IcebergDataFileInfo,
+        physical_predicates: &[IcebergPhysicalPredicate],
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_equality_mode(file, access, request, file_context, false, true)
+        Self::try_new_with_equality_mode(
+            file,
+            physical_predicates,
+            access,
+            request,
+            file_context,
+            false,
+            true,
+        )
     }
 
     /// Build a reverse-projection reader for an equality-delete delta role.
@@ -86,7 +100,7 @@ impl IcebergBatchReader {
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_equality_mode(file, access, request, file_context, true, true)
+        Self::try_new_with_equality_mode(file, &[], access, request, file_context, true, true)
     }
 
     /// Build one child of a multi-file delta reader.  The parent owns the
@@ -101,6 +115,7 @@ impl IcebergBatchReader {
     ) -> Result<Self, ConnectorError> {
         Self::try_new_with_equality_mode(
             file,
+            &[],
             access,
             request,
             file_context,
@@ -111,6 +126,7 @@ impl IcebergBatchReader {
 
     fn try_new_with_equality_mode(
         file: &IcebergDataFileInfo,
+        physical_predicates: &[IcebergPhysicalPredicate],
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
@@ -139,16 +155,24 @@ impl IcebergBatchReader {
         let bound_file = access
             .bind_location(&file.path, FileIdentity::new(&file.path, file_size, None))
             .map_err(map_file_error)?;
+        let format = physical_format(&file.path)?;
+        // ORC has no physical predicate support. Its SQL residual stays in
+        // Core because Iceberg reports such predicates as Unsupported.
+        let predicates = if format == FileFormat::Parquet {
+            physical_predicates_to_file_predicates(physical_predicates)
+        } else {
+            Vec::new()
+        };
         let reader = open_file_reader(FileReadRequest {
             file: bound_file,
-            format: physical_format(&file.path)?,
+            format,
             range: FileReadRange::WholeFile,
             projection: FileProjection::All,
             budget: FileReadBudget {
                 max_rows: request.batch.max_rows,
                 max_bytes: request.batch.max_bytes,
             },
-            predicates: Vec::new(),
+            predicates,
             pruning: PhysicalPruning::default(),
             cache: None,
             context: file_context,
@@ -179,6 +203,56 @@ impl IcebergBatchReader {
         }
         Ok(())
     }
+}
+
+fn physical_predicates_to_file_predicates(
+    predicates: &[IcebergPhysicalPredicate],
+) -> Vec<ScanPredicate> {
+    predicates
+        .iter()
+        .filter_map(|predicate| {
+            let value = |value: &IcebergPhysicalPredicateValue| match value {
+                IcebergPhysicalPredicateValue::Boolean(value) => {
+                    MinMaxPredicateValue::Boolean(*value)
+                }
+                IcebergPhysicalPredicateValue::Int32(value) => MinMaxPredicateValue::Int32(*value),
+                IcebergPhysicalPredicateValue::Int64(value) => MinMaxPredicateValue::Int64(*value),
+                // Parquet exposes DATE statistics as INT32 day counts.
+                IcebergPhysicalPredicateValue::Date32(value) => MinMaxPredicateValue::Int32(*value),
+            };
+            let domain = match &predicate.domain {
+                IcebergPhysicalPredicateDomain::Range { op, value: literal } => {
+                    ScanPredicateDomain::Range {
+                        op: match op {
+                            IcebergPhysicalPredicateOp::Eq => MinMaxPredicateOp::Eq,
+                            IcebergPhysicalPredicateOp::Lt => MinMaxPredicateOp::Lt,
+                            IcebergPhysicalPredicateOp::Le => MinMaxPredicateOp::Le,
+                            IcebergPhysicalPredicateOp::Gt => MinMaxPredicateOp::Gt,
+                            IcebergPhysicalPredicateOp::Ge => MinMaxPredicateOp::Ge,
+                        },
+                        value: value(literal),
+                    }
+                }
+                IcebergPhysicalPredicateDomain::DiscreteSet { values } => {
+                    let values = values.iter().map(value).collect::<Vec<_>>();
+                    if values.is_empty() {
+                        return None;
+                    }
+                    let min = values.first()?.clone();
+                    let max = values.last()?.clone();
+                    ScanPredicateDomain::DiscreteSet { values, min, max }
+                }
+            };
+            Some(
+                ScanPredicate::new(
+                    predicate.column.clone(),
+                    domain,
+                    ScanPredicateSource::Static,
+                )
+                .with_physical_field_id(predicate.field_id),
+            )
+        })
+        .collect()
 }
 
 impl ConnectorBatchReader for IcebergBatchReader {

@@ -71,6 +71,10 @@ pub enum ScanPredicateDomain {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanPredicate {
     column: String,
+    /// Optional physical field identifier. When present, readers must bind the
+    /// predicate by this identifier and must not fall back to a same-named
+    /// column. This keeps Iceberg rename/reorder reads conservative.
+    physical_field_id: Option<i32>,
     domain: ScanPredicateDomain,
     source: ScanPredicateSource,
 }
@@ -83,13 +87,23 @@ impl ScanPredicate {
     ) -> Self {
         Self {
             column: column.into(),
+            physical_field_id: None,
             domain,
             source,
         }
     }
 
+    pub fn with_physical_field_id(mut self, physical_field_id: i32) -> Self {
+        self.physical_field_id = Some(physical_field_id);
+        self
+    }
+
     pub fn column(&self) -> &str {
         &self.column
+    }
+
+    pub fn physical_field_id(&self) -> Option<i32> {
+        self.physical_field_id
     }
 
     pub fn domain(&self) -> &ScanPredicateDomain {

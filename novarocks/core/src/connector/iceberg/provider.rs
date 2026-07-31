@@ -42,13 +42,15 @@ use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
-    CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    validate_static_predicates,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorReadSelector, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
+    ConnectorStaticPredicateLiteral, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy,
+    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +61,10 @@ use super::catalog::registry::{
 };
 use super::catalog::views;
 use super::reader::IcebergBatchReader;
-use super::scan_model::IcebergDataFileInfo;
+use super::scan_model::{
+    IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -296,6 +301,7 @@ pub fn build_compat_read_splits(
                 data_file,
                 projection: Vec::new(),
                 limit: None,
+                physical_predicates: Vec::new(),
                 delta: None,
             };
             ConnectorSplit::try_new(
@@ -352,6 +358,7 @@ pub fn build_compat_delta_read_splits(
                 data_file,
                 projection: Vec::new(),
                 limit: None,
+                physical_predicates: Vec::new(),
                 delta: Some(IcebergDeltaSplitPayload {
                     source,
                     delete_side: delete_side.clone(),
@@ -443,12 +450,16 @@ impl IcebergReadOnlyConnectorInstance {
             ));
         }
         ensure_owner(split.owner(), &self.key.instance_id)?;
-        let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
-        if payload.version != ICEBERG_SPLIT_V1 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!("unsupported Iceberg split version {}", payload.version),
-            ));
+        let mut payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
+        match payload.version {
+            ICEBERG_SPLIT_V1 => payload.physical_predicates.clear(),
+            ICEBERG_SPLIT_V2 => {}
+            version => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!("unsupported Iceberg split version {version}"),
+                ));
+            }
         }
         if payload.owner_instance_id != self.key.instance_id.as_str()
             || payload.incarnation != self.key.incarnation.to_bytes()
@@ -472,8 +483,14 @@ impl IcebergReadOnlyConnectorInstance {
             request.context.deadline(),
         )?;
         let access = self.binding.resolve_access(&payload.data_file.path)?;
-        IcebergBatchReader::try_new(&payload.data_file, access, request, file_context)
-            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
+        IcebergBatchReader::try_new(
+            &payload.data_file,
+            &payload.physical_predicates,
+            access,
+            request,
+            file_context,
+        )
+        .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>)
     }
 }
 
@@ -2200,12 +2217,15 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 self.select_snapshot(&entry, &table, request.selector)?;
             (snapshot_id, Some(table_uuid))
         };
+        let (physical_predicates, predicate_dispositions) =
+            negotiate_static_predicates(&table, &request.static_predicates);
         let payload = ScanPayload {
             table,
             snapshot_id,
             table_uuid,
             projection: request.projection,
             limit: request.limit,
+            physical_predicates,
         };
         Ok(ConnectorScan {
             handle: ConnectorScanHandle::try_new(
@@ -2217,19 +2237,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 )?,
             )?,
             output_schema,
-            predicate_dispositions:
-                request
-                    .static_predicates
-                    .iter()
-                    .map(
-                        |predicate| {
-                            novarocks_spi::connector::ConnectorPredicateDisposition {
-                    predicate_id: predicate.id,
-                    kind: novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported,
-                }
-                        },
-                    )
-                    .collect(),
+            predicate_dispositions,
         })
     }
 
@@ -2288,10 +2296,23 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 ),
             )?;
         }
+        // Cache the entire pinned snapshot before applying optional pruning.
+        // Delete applicability must never depend on a predicate-selected view.
+        let candidate_units_considered = files.len() as u64;
+        let mut pruning_counters = super::file_pruning::IcebergFilePruningCounters::default();
+        let files = files
+            .into_iter()
+            .filter(|file| {
+                super::file_pruning::file_may_satisfy_physical_predicates(
+                    file,
+                    &scan.physical_predicates,
+                    &mut pruning_counters,
+                )
+            })
+            .collect::<Vec<_>>();
         let mut remaining = scan.limit;
         let mut splits = Vec::new();
         let mut total_payload_bytes = 0usize;
-        let candidate_units_considered = files.len() as u64;
         for (index, file) in files.into_iter().enumerate() {
             if let Some(remaining_rows) = remaining.as_mut() {
                 if *remaining_rows == 0 {
@@ -2304,7 +2325,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             }
             let estimated_bytes = u64::try_from(file.size).ok();
             let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V1,
+                version: ICEBERG_SPLIT_V2,
                 owner_instance_id: self.instance_id.as_str().to_string(),
                 incarnation: self.incarnation.to_bytes(),
                 namespace: scan.table.namespace.clone(),
@@ -2315,6 +2336,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 data_file: file,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
+                physical_predicates: scan.physical_predicates.clone(),
                 delta: None,
             };
             push_split_with_budget(
@@ -2336,10 +2358,108 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             splits,
             ConnectorSplitPlanningMetrics {
                 candidate_units_considered,
-                candidate_units_pruned: 0,
+                candidate_units_pruned: u64::try_from(pruning_counters.files_pruned)
+                    .unwrap_or(u64::MAX)
+                    .min(candidate_units_considered),
             },
         )
     }
+}
+
+fn negotiate_static_predicates(
+    table: &TablePayload,
+    predicates: &[ConnectorStaticPredicate],
+) -> (
+    Vec<IcebergPhysicalPredicate>,
+    Vec<ConnectorPredicateDisposition>,
+) {
+    // Metadata and delta scans deliberately keep their Core residuals in V1.
+    // Ordinary table data scans are safe to use manifest statistics and
+    // Parquet row-group metadata as a pruning-only optimization.
+    let table_info = (table.metadata_table_type.is_none())
+        .then_some(table.table_info.as_ref())
+        .flatten();
+    let mut physical_predicates = Vec::new();
+    let mut dispositions = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        let physical = table_info.and_then(|table_info| {
+            let field = table_info
+                .schema
+                .fields
+                .get(predicate.column.field_ordinal as usize)?;
+            static_predicate_to_physical(predicate, field.field_id, &field.name)
+        });
+        let kind = if let Some(predicate) = physical {
+            physical_predicates.push(predicate);
+            ConnectorPredicateDispositionKind::PruningOnly
+        } else {
+            ConnectorPredicateDispositionKind::Unsupported
+        };
+        dispositions.push(ConnectorPredicateDisposition {
+            predicate_id: predicate.id,
+            kind,
+        });
+    }
+    (physical_predicates, dispositions)
+}
+
+fn static_predicate_to_physical(
+    predicate: &ConnectorStaticPredicate,
+    field_id: i32,
+    column: &str,
+) -> Option<IcebergPhysicalPredicate> {
+    use ConnectorStaticPredicateDataType::{Boolean, Date32, Int32, Int64};
+
+    let value = |literal: &ConnectorStaticPredicateLiteral| match literal {
+        ConnectorStaticPredicateLiteral::Boolean(value)
+            if predicate.column.data_type == Boolean =>
+        {
+            Some(IcebergPhysicalPredicateValue::Boolean(*value))
+        }
+        ConnectorStaticPredicateLiteral::Int32(value) if predicate.column.data_type == Int32 => {
+            Some(IcebergPhysicalPredicateValue::Int32(*value))
+        }
+        ConnectorStaticPredicateLiteral::Int64(value) if predicate.column.data_type == Int64 => {
+            Some(IcebergPhysicalPredicateValue::Int64(*value))
+        }
+        ConnectorStaticPredicateLiteral::Date32(value) if predicate.column.data_type == Date32 => {
+            Some(IcebergPhysicalPredicateValue::Date32(*value))
+        }
+        _ => None,
+    };
+    let domain = match &predicate.kind {
+        ConnectorStaticPredicateKind::Comparison { op, literal } => {
+            let op = match op {
+                ConnectorStaticComparisonOp::Eq => IcebergPhysicalPredicateOp::Eq,
+                ConnectorStaticComparisonOp::Lt => IcebergPhysicalPredicateOp::Lt,
+                ConnectorStaticComparisonOp::Le => IcebergPhysicalPredicateOp::Le,
+                ConnectorStaticComparisonOp::Gt => IcebergPhysicalPredicateOp::Gt,
+                ConnectorStaticComparisonOp::Ge => IcebergPhysicalPredicateOp::Ge,
+                ConnectorStaticComparisonOp::Ne => return None,
+                _ => return None,
+            };
+            IcebergPhysicalPredicateDomain::Range {
+                op,
+                value: value(literal)?,
+            }
+        }
+        ConnectorStaticPredicateKind::In { literals } => {
+            let values = literals.iter().map(value).collect::<Option<Vec<_>>>()?;
+            if values.is_empty() {
+                return None;
+            }
+            IcebergPhysicalPredicateDomain::DiscreteSet { values }
+        }
+        ConnectorStaticPredicateKind::IsNull | ConnectorStaticPredicateKind::IsNotNull => {
+            return None;
+        }
+        _ => return None,
+    };
+    Some(IcebergPhysicalPredicate {
+        field_id,
+        column: column.to_string(),
+        domain,
+    })
 }
 
 fn resolve_table_request(
@@ -2499,6 +2619,8 @@ struct ScanPayload {
     table_uuid: Option<String>,
     projection: Vec<usize>,
     limit: Option<u64>,
+    #[serde(default)]
+    physical_predicates: Vec<IcebergPhysicalPredicate>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2520,10 +2642,13 @@ struct SplitPayload {
     projection: Vec<usize>,
     limit: Option<u64>,
     #[serde(default)]
+    physical_predicates: Vec<IcebergPhysicalPredicate>,
+    #[serde(default)]
     delta: Option<IcebergDeltaSplitPayload>,
 }
 
 const ICEBERG_SPLIT_V1: u16 = 1;
+const ICEBERG_SPLIT_V2: u16 = 2;
 
 fn default_iceberg_split_version() -> u16 {
     ICEBERG_SPLIT_V1
@@ -2958,6 +3083,7 @@ pub(crate) fn plan_native_iceberg_delta_read(
             data_file,
             projection: Vec::new(),
             limit: None,
+            physical_predicates: Vec::new(),
             delta: Some(IcebergDeltaSplitPayload {
                 source,
                 delete_side: delete_side.cloned(),
@@ -3111,7 +3237,9 @@ pub(crate) fn replace_split_path_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
+    use crate::connector::iceberg::scan_model::{
+        IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    };
 
     struct NotCancelled;
 
@@ -3238,6 +3366,85 @@ mod tests {
     }
 
     #[test]
+    fn icebergs_static_predicates_are_pruning_only_and_resolve_field_ids() {
+        let table = TablePayload {
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_info: Some(IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                table_uuid: None,
+                current_snapshot_id: Some(7),
+                schema_id: 1,
+                location: "s3://warehouse/db/orders".to_string(),
+                schema: IcebergSchemaDef {
+                    fields: vec![IcebergSchemaFieldDef {
+                        field_id: 42,
+                        name: "renamed_id".to_string(),
+                        initial_default: None,
+                        write_default: None,
+                        initial_default_json: None,
+                        write_default_json: None,
+                        children: Vec::new(),
+                    }],
+                },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            }),
+            metadata_columns: Vec::new(),
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+            logical_type_columns: BTreeMap::new(),
+            hidden_columns: Vec::new(),
+        };
+        let supported = ConnectorStaticPredicate {
+            id: novarocks_spi::connector::ConnectorStaticPredicateId(3),
+            column: novarocks_spi::connector::ConnectorStaticPredicateColumn {
+                field_ordinal: 0,
+                data_type: ConnectorStaticPredicateDataType::Int32,
+                nullable: false,
+            },
+            kind: ConnectorStaticPredicateKind::Comparison {
+                op: ConnectorStaticComparisonOp::Ge,
+                literal: ConnectorStaticPredicateLiteral::Int32(10),
+            },
+        };
+        let unsupported = ConnectorStaticPredicate {
+            id: novarocks_spi::connector::ConnectorStaticPredicateId(4),
+            column: supported.column.clone(),
+            kind: ConnectorStaticPredicateKind::Comparison {
+                op: ConnectorStaticComparisonOp::Ne,
+                literal: ConnectorStaticPredicateLiteral::Int32(11),
+            },
+        };
+
+        let (physical, dispositions) =
+            negotiate_static_predicates(&table, &[supported, unsupported]);
+        assert_eq!(physical.len(), 1);
+        assert_eq!(physical[0].field_id, 42);
+        assert_eq!(physical[0].column, "renamed_id");
+        assert!(matches!(
+            physical[0].domain,
+            IcebergPhysicalPredicateDomain::Range {
+                op: IcebergPhysicalPredicateOp::Ge,
+                value: IcebergPhysicalPredicateValue::Int32(10),
+            }
+        ));
+        assert_eq!(
+            dispositions
+                .iter()
+                .map(|disposition| disposition.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ConnectorPredicateDispositionKind::PruningOnly,
+                ConnectorPredicateDispositionKind::Unsupported,
+            ]
+        );
+    }
+
+    #[test]
     fn split_payload_does_not_repeat_serialized_table_metadata() {
         let table = TablePayload {
             namespace: "db".to_string(),
@@ -3277,6 +3484,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            physical_predicates: Vec::new(),
             delta: None,
         };
 
@@ -3315,6 +3523,7 @@ mod tests {
             ),
             projection: vec![0],
             limit: None,
+            physical_predicates: Vec::new(),
             delta: None,
         };
         let first = payload("first");
@@ -3432,6 +3641,7 @@ mod tests {
                 data_file,
                 projection: vec![0],
                 limit: None,
+                physical_predicates: Vec::new(),
                 delta: None,
             })
             .collect::<Vec<_>>();
@@ -3462,6 +3672,7 @@ mod tests {
                     table_uuid: None,
                     projection: vec![0],
                     limit: None,
+                    physical_predicates: Vec::new(),
                 },
                 "scan handle",
                 novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -3586,6 +3797,7 @@ fn planned_table_files_fixture_binding(
                             table_uuid: None,
                             projection: request.projection,
                             limit: request.limit,
+                            physical_predicates: Vec::new(),
                         },
                         "fixture scan handle",
                         request.context.max_handle_payload_bytes(),
@@ -3638,6 +3850,7 @@ fn planned_table_files_fixture_binding(
                                 data_file,
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
+                                physical_predicates: Vec::new(),
                                 delta: None,
                             },
                             "fixture split",
