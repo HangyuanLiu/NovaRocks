@@ -28,7 +28,7 @@ mod tests {
     use novarocks::query_execution::contract::QueryId;
     use novarocks::query_execution::contract_test_support::{
         assert_profile_outcome_preserved, assert_result_outcome_preserved,
-        assert_write_abort_reason, assert_write_outcome_preserved,
+        assert_write_commit_outcome_preserved, assert_write_outcome_preserved,
         non_empty_profile_contract_fixture,
         non_empty_profile_contract_fixture_with_query_timeout_seconds,
         non_empty_result_contract_fixture, non_empty_runtime_filter_contract_fixture,
@@ -39,11 +39,14 @@ mod tests {
         FetchOutcome, FetchedQueryBatch, FragmentDispatcher,
     };
     use novarocks::query_execution::lifecycle::{
-        ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
-        QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome, QueryInitRequest,
-        QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck,
-        QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-        QueryTerminationAck, QueryTerminationReason, StageFragment,
+        FragmentTerminalOutcome, FragmentTerminalSnapshot, ParticipantBackendIdentity,
+        ParticipantManifestDigest, ParticipantRole, QueryAbortRequest, QueryControlAttach,
+        QueryControlCommand, QueryControlEvent, QueryControlSession, QueryExecutionId,
+        QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleTarget,
+        QueryLifecycleTransport, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
+        QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+        QueryStartRequest, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
+        StageFragment,
     };
     use novarocks::query_execution::write::NativeExecutionReport;
 
@@ -71,6 +74,7 @@ mod tests {
             )>,
         >,
         report_on_submit: Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
+        terminal_fragments: Mutex<BTreeMap<UniqueId, FragmentTerminalSnapshot>>,
         events: Option<Arc<Mutex<Vec<&'static str>>>>,
     }
 
@@ -210,6 +214,7 @@ mod tests {
             reports: Vec<NativeExecutionReport>,
             coordinator: &FrontendDistributedQueryCoordinator,
         ) {
+            self.record_successful_terminal_fragments(&reports);
             let handler = coordinator.report_handler();
             *self.report_on_submit.lock().unwrap() = Some((
                 submit_count,
@@ -229,6 +234,7 @@ mod tests {
             reports: Vec<NativeExecutionReport>,
             coordinator: &FrontendDistributedQueryCoordinator,
         ) {
+            self.record_successful_terminal_fragments(&reports);
             let handler = coordinator.report_handler();
             *self.report_on_submit.lock().unwrap() = Some((
                 submit_count,
@@ -273,6 +279,7 @@ mod tests {
             rejected: NativeExecutionReport,
             coordinator: &FrontendDistributedQueryCoordinator,
         ) {
+            self.record_successful_terminal_fragments(std::slice::from_ref(&accepted));
             let handler = coordinator.report_handler();
             *self.report_on_submit.lock().unwrap() = Some((
                 submit_count,
@@ -289,6 +296,27 @@ mod tests {
                     );
                 }),
             ));
+        }
+
+        fn record_successful_terminal_fragments(&self, reports: &[NativeExecutionReport]) {
+            let mut terminal_fragments = self.terminal_fragments.lock().unwrap();
+            for report in reports {
+                let fragment = report
+                    .successful_terminal_snapshot_for_contract_test()
+                    .expect("contract report produces a terminal fragment fixture");
+                terminal_fragments.insert(fragment.fragment_instance_id(), fragment);
+            }
+        }
+
+        fn terminal_fragment(
+            &self,
+            fragment_instance_id: UniqueId,
+        ) -> Option<FragmentTerminalSnapshot> {
+            self.terminal_fragments
+                .lock()
+                .unwrap()
+                .get(&fragment_instance_id)
+                .cloned()
         }
 
         fn backend_loss_on_submit(
@@ -346,8 +374,102 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct TerminalSnapshotFixtureStore {
+        participants: Arc<Mutex<BTreeMap<usize, ParticipantTerminalFixture>>>,
+    }
+
+    struct ParticipantTerminalFixture {
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        digest: ParticipantManifestDigest,
+        fragments: BTreeMap<UniqueId, FragmentTerminalSnapshot>,
+    }
+
+    impl TerminalSnapshotFixtureStore {
+        fn record_init(&self, backend_idx: usize, request: &QueryInitRequest) {
+            self.participants.lock().unwrap().insert(
+                backend_idx,
+                ParticipantTerminalFixture {
+                    execution_id: request.manifest().execution_id(),
+                    backend: request.manifest().backend().clone(),
+                    digest: request.digest(),
+                    fragments: BTreeMap::new(),
+                },
+            );
+        }
+
+        fn record_stage(&self, backend_idx: usize, request: &QueryStageRequest) {
+            let mut participants = self.participants.lock().unwrap();
+            let participant = participants
+                .get_mut(&backend_idx)
+                .expect("Stage follows Init in the contract fixture");
+            participant.fragments = request
+                .fragments()
+                .iter()
+                .map(|fragment| {
+                    let fragment_instance_id = fragment.fragment_instance_id();
+                    let fact = FragmentTerminalSnapshot::new(
+                        fragment_instance_id,
+                        fragment.instance_params().backend_num,
+                        FragmentTerminalOutcome::Succeeded,
+                        Default::default(),
+                        None,
+                    )
+                    .expect("staged contract fragment produces a terminal fact");
+                    (fragment_instance_id, fact)
+                })
+                .collect();
+        }
+
+        fn snapshot(
+            &self,
+            backend_idx: usize,
+            dispatcher: Option<&RecordingDispatcher>,
+        ) -> Result<QueryTerminalSnapshot, QueryLifecycleTransportError> {
+            let participants = self.participants.lock().unwrap();
+            let participant = participants.get(&backend_idx).ok_or_else(|| {
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::InvalidResponse,
+                    format!("terminal fixture has no participant for backend {backend_idx}"),
+                )
+            })?;
+            let fragments = participant
+                .fragments
+                .iter()
+                .map(|(fragment_instance_id, staged)| {
+                    dispatcher
+                        .and_then(|dispatcher| dispatcher.terminal_fragment(*fragment_instance_id))
+                        .unwrap_or_else(|| staged.clone())
+                })
+                .collect();
+            QueryTerminalSnapshot::new(
+                participant.execution_id,
+                participant.backend.clone(),
+                participant.digest,
+                fragments,
+            )
+            .map_err(|error| {
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::InvalidResponse,
+                    error.to_string(),
+                )
+            })
+        }
+    }
+
     struct RecordingLifecycleSession {
+        backend_idx: usize,
+        terminal_store: TerminalSnapshotFixtureStore,
+        dispatcher: Arc<RecordingDispatcher>,
         events: Mutex<VecDeque<QueryControlEvent>>,
+    }
+
+    fn ready_and_locally_drained_events() -> VecDeque<QueryControlEvent> {
+        VecDeque::from([
+            QueryControlEvent::ControlReady,
+            QueryControlEvent::LocalDrained,
+        ])
     }
 
     impl QueryControlSession for RecordingLifecycleSession {
@@ -359,9 +481,17 @@ mod tests {
                 QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
                     reason: QueryTerminationReason::CoordinatorAbort,
                 },
-                QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
-                    reason: QueryTerminationReason::CoordinatorFinalize,
-                },
+                QueryControlCommand::Finalize => {
+                    let snapshot = self
+                        .terminal_store
+                        .snapshot(self.backend_idx, Some(self.dispatcher.as_ref()))?;
+                    let mut events = self.events.lock().unwrap();
+                    events.push_back(QueryControlEvent::TerminalSnapshot { snapshot });
+                    events.push_back(QueryControlEvent::TerminationAccepted {
+                        reason: QueryTerminationReason::CoordinatorFinalize,
+                    });
+                    return Ok(());
+                }
                 QueryControlCommand::TerminalAck { .. } => return Ok(()),
             };
             self.events.lock().unwrap().push_back(event);
@@ -383,21 +513,27 @@ mod tests {
 
     struct RecordingLifecycleTransport {
         dispatcher: Arc<RecordingDispatcher>,
+        terminal_store: TerminalSnapshotFixtureStore,
     }
 
     impl RecordingLifecycleTransport {
         fn new(dispatcher: Arc<RecordingDispatcher>) -> Self {
-            Self { dispatcher }
+            Self {
+                dispatcher,
+                terminal_store: TerminalSnapshotFixtureStore::default(),
+            }
         }
     }
 
     impl QueryLifecycleTransport for RecordingLifecycleTransport {
         fn init_query(
             &self,
-            _target: QueryLifecycleTarget,
+            target: QueryLifecycleTarget,
             request: QueryInitRequest,
             _timeout: Duration,
         ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            self.terminal_store
+                .record_init(target.backend_idx(), &request);
             Ok(QueryInitAck::new(
                 request.manifest().execution_id(),
                 request.digest(),
@@ -407,12 +543,15 @@ mod tests {
 
         fn attach_control(
             &self,
-            _target: QueryLifecycleTarget,
+            target: QueryLifecycleTarget,
             _attach: QueryControlAttach,
             _timeout: Duration,
         ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
             Ok(Arc::new(RecordingLifecycleSession {
-                events: Mutex::new(VecDeque::from([QueryControlEvent::ControlReady])),
+                backend_idx: target.backend_idx(),
+                terminal_store: self.terminal_store.clone(),
+                dispatcher: Arc::clone(&self.dispatcher),
+                events: Mutex::new(ready_and_locally_drained_events()),
             }))
         }
 
@@ -422,6 +561,8 @@ mod tests {
             request: &QueryStageRequest,
             _timeout: Duration,
         ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+            self.terminal_store
+                .record_stage(target.backend_idx(), request);
             self.dispatcher
                 .stage_fragments(target.backend_idx(), request.fragments());
             Ok(QueryStageAck::new(
@@ -476,6 +617,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct AllReadyBoundary {
         state: Arc<(Mutex<AllReadyBoundaryState>, Condvar)>,
+        terminal_store: TerminalSnapshotFixtureStore,
     }
 
     struct AllReadySession {
@@ -493,9 +635,20 @@ mod tests {
                 QueryControlCommand::Abort { .. } => QueryControlEvent::TerminationAccepted {
                     reason: QueryTerminationReason::CoordinatorAbort,
                 },
-                QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
-                    reason: QueryTerminationReason::CoordinatorFinalize,
-                },
+                QueryControlCommand::Finalize => {
+                    let snapshot = self
+                        .boundary
+                        .terminal_store
+                        .snapshot(self.backend_idx, None)?;
+                    let mut events = self.events.lock().expect("all-ready events");
+                    events.push_back(QueryControlEvent::TerminalSnapshot { snapshot });
+                    events.push_back(QueryControlEvent::TerminationAccepted {
+                        reason: QueryTerminationReason::CoordinatorFinalize,
+                    });
+                    drop(events);
+                    self.boundary.state.1.notify_all();
+                    return Ok(());
+                }
                 QueryControlCommand::TerminalAck { .. } => return Ok(()),
             };
             self.events
@@ -539,6 +692,8 @@ mod tests {
             request: QueryInitRequest,
             _timeout: Duration,
         ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            self.terminal_store
+                .record_init(target.backend_idx(), &request);
             let mut state = self.state.0.lock().expect("all-ready boundary");
             state.initialized.insert(target.backend_idx());
             state.saw_fragment_executor |= request
@@ -566,7 +721,7 @@ mod tests {
             Ok(Arc::new(AllReadySession {
                 backend_idx: target.backend_idx(),
                 boundary: self.clone(),
-                events: Mutex::new(VecDeque::from([QueryControlEvent::ControlReady])),
+                events: Mutex::new(ready_and_locally_drained_events()),
             }))
         }
 
@@ -576,6 +731,8 @@ mod tests {
             request: &QueryStageRequest,
             _timeout: Duration,
         ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+            self.terminal_store
+                .record_stage(target.backend_idx(), request);
             let (lock, ready) = &*self.state;
             let mut state = lock.lock().expect("all-ready boundary");
             if !state.first_submit_entered {
@@ -640,6 +797,19 @@ mod tests {
             Arc::new(()),
             lifecycle,
         )
+    }
+
+    fn expect_execution_error(
+        outcome: Result<
+            novarocks::query_execution::contract::DistributedQueryOutcome,
+            novarocks::query_execution::contract::DistributedQueryError,
+        >,
+        context: &str,
+    ) -> novarocks::query_execution::contract::DistributedQueryError {
+        match outcome {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
     }
 
     #[test]
@@ -884,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_final_writer_retry_returns_structured_abort() {
+    fn conflicting_final_writer_retry_fences_the_terminal_attempt() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let successful = fixture.successful_writer_report();
@@ -901,11 +1071,14 @@ mod tests {
             &coordinator,
         );
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("conflicting writer retry must retain abort recovery data");
-        assert_write_abort_reason(outcome, "conflicting final writer output")
-            .expect("conflicting writer output cannot commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "conflicting writer retry must fence terminal finalization",
+        );
+        assert!(
+            error.message().contains("conflicting final writer output"),
+            "{error}"
+        );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
@@ -1006,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_backend_writer_identity_returns_structured_abort() {
+    fn wrong_backend_writer_identity_fences_the_terminal_attempt() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let report = fixture.wrong_backend_writer_report();
@@ -1017,16 +1190,21 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("writer identity mismatch must retain abort recovery data");
-        assert_write_abort_reason(outcome, "unknown writer report with write metadata")
-            .expect("wrong writer backend cannot commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "writer identity mismatch must fence terminal finalization",
+        );
+        assert!(
+            error
+                .message()
+                .contains("unknown writer report with write metadata"),
+            "{error}"
+        );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn failed_non_writer_report_forces_write_abort_even_after_writer_success() {
+    fn failed_non_writer_report_fences_the_terminal_attempt() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let reports = vec![
@@ -1040,16 +1218,19 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.reports_on_submit(2, reports, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("producer failure is represented by write abort");
-        assert_write_abort_reason(outcome, "contract producer failure")
-            .expect("producer failure must prevent commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "producer failure must fence terminal finalization",
+        );
+        assert!(
+            error.message().contains("contract producer failure"),
+            "{error}"
+        );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn non_writer_write_metadata_is_rejected_and_forces_abort() {
+    fn non_writer_write_metadata_rejection_fences_the_terminal_attempt() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let report = fixture.non_writer_report_with_write_metadata();
@@ -1060,15 +1241,20 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("unexpected writer output is represented by write abort");
-        assert_write_abort_reason(outcome, "unknown writer report with write metadata")
-            .expect("unexpected writer metadata must prevent commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "unexpected writer metadata must fence terminal finalization",
+        );
+        assert!(
+            error
+                .message()
+                .contains("unknown writer report with write metadata"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn nonfinal_non_writer_write_metadata_is_rejected_and_forces_abort() {
+    fn nonfinal_non_writer_write_metadata_rejection_fences_the_terminal_attempt() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let report = fixture.nonfinal_non_writer_report_with_write_metadata();
@@ -1079,15 +1265,20 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.rejected_report_on_submit(2, report, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("periodic unknown writer output is represented by write abort");
-        assert_write_abort_reason(outcome, "unknown writer report with write metadata")
-            .expect("periodic unexpected writer metadata must prevent commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "periodic unexpected writer metadata must fence terminal finalization",
+        );
+        assert!(
+            error
+                .message()
+                .contains("unknown writer report with write metadata"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn backend_loss_cannot_turn_a_missing_writer_report_into_commit() {
+    fn backend_loss_fences_terminal_finalization() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let request = fixture.into_request();
@@ -1097,17 +1288,17 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.backend_loss_on_submit(1, 3, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("backend loss must produce a recoverable write abort");
-        assert_write_abort_reason(outcome, "backend 3 lost")
-            .expect("backend loss without writer output cannot commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "backend loss must fence terminal finalization",
+        );
+        assert!(error.message().contains("backend 3 lost"), "{error}");
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
         assert!(dispatcher.fetches.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn missing_writer_report_times_out_to_structured_abort_without_direct_cancellation() {
+    fn missing_legacy_writer_report_does_not_gate_terminal_snapshot_commit() {
         let fixture = non_empty_write_contract_fixture_with_query_timeout_seconds(0);
         let backends = fixture.backends().to_vec();
         let request = fixture.into_request();
@@ -1119,15 +1310,15 @@ mod tests {
 
         let outcome = coordinator
             .execute(request)
-            .expect("write timeout must preserve the structured abort recovery payload");
+            .expect("terminal snapshots are the writer completion source of truth");
 
-        assert_write_abort_reason(outcome, "waiting for write final reports")
-            .expect("missing writer output cannot commit");
+        assert_write_commit_outcome_preserved(outcome)
+            .expect("terminal snapshots preserve a non-empty writer commit");
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn write_cancellation_after_partial_submit_returns_abort_payload() {
+    fn write_cancellation_after_partial_submit_fences_terminal_finalization() {
         let fixture = non_empty_write_contract_fixture();
         let backends = fixture.backends().to_vec();
         let cancellation = fixture.cancellation_source();
@@ -1137,11 +1328,11 @@ mod tests {
             FrontendFragmentScheduler::new(FrontendBackendSnapshot::for_test(backends).unwrap());
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("write cancellation must retain abort recovery data");
-        assert_write_abort_reason(outcome, "query cancelled")
-            .expect("cancelled write cannot commit");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "write cancellation must fence terminal finalization",
+        );
+        assert!(error.message().contains("query cancelled"), "{error}");
         assert!(
             !dispatcher.submissions.lock().unwrap().is_empty(),
             "the cancellation must be observed after at least one StartPreparedQuery release"
@@ -1173,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_profile_report_times_out_without_direct_cancellation() {
+    fn missing_terminal_profile_is_rejected_without_direct_cancellation() {
         let fixture = non_empty_profile_contract_fixture_with_query_timeout_seconds(1);
         let backends = fixture.backends().to_vec();
         let batch = fixture.result_batch();
@@ -1192,7 +1383,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("waiting for fragment profile reports"),
+                .contains("terminal snapshot is missing its final profile"),
             "{error}"
         );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
@@ -1379,11 +1570,15 @@ mod tests {
         let coordinator = test_coordinator(QueryId::new(51, 91), scheduler, dispatcher.clone());
         dispatcher.report_on_submit(2, report, &coordinator);
 
-        let outcome = coordinator
-            .execute(request)
-            .expect("failed writer report returns abort payload");
+        let error = expect_execution_error(
+            coordinator.execute(request),
+            "failed writer report fences terminal finalization",
+        );
 
-        assert_write_outcome_preserved(outcome).expect("engine preserves Write abort payload");
+        assert!(
+            error.message().contains("contract writer failure"),
+            "{error}"
+        );
         assert!(dispatcher.cancellations.lock().unwrap().is_empty());
         assert!(dispatcher.fetches.lock().unwrap().is_empty());
     }

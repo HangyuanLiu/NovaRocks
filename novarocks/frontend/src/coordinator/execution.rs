@@ -30,7 +30,6 @@ use novarocks::query_execution::artifact::{
     new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
-use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest, ProfileReportBuilder,
@@ -879,6 +878,18 @@ impl FrontendDistributedQueryCoordinator {
             }
         }
 
+        if parts.cancellation.is_cancelled() {
+            return Err(self.fail_cancel_then_abort_query_lifecycle(
+                query_id,
+                &mut query_lifecycle_lease,
+                "query cancelled before terminal finalization",
+            ));
+        }
+        if let Some(message) = self.registry.first_failure(query_id) {
+            let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
+            return Err(failed(message));
+        }
+
         let terminal_set = match query_lifecycle_lease
             .take()
             .expect("query lifecycle lease is present through query completion")
@@ -929,61 +940,6 @@ impl FrontendDistributedQueryCoordinator {
             return Err(DistributedQueryError::new(error.kind(), error.message()));
         }
         outcome
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn wait_for_reports(
-        &self,
-        query_id: QueryId,
-        expected_instances: &[novarocks::UniqueId],
-        deadline: Instant,
-        timeout_ms: i64,
-        cancellation: &QueryCancellationView,
-        final_report_failure_completes_wait: bool,
-        report_kind: &str,
-    ) -> Result<(), DistributedQueryError> {
-        const REPORT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-        if expected_instances.is_empty() {
-            return Ok(());
-        }
-
-        loop {
-            let (received, first_failure, has_failed_final_report) = self
-                .registry
-                .report_progress(query_id, expected_instances)?;
-            if let Some(message) = first_failure {
-                if final_report_failure_completes_wait && has_failed_final_report {
-                    return Ok(());
-                }
-                return Err(self.fail_and_cancel(query_id, message));
-            }
-            if received >= expected_instances.len() {
-                return Ok(());
-            }
-            if cancellation.is_cancelled() {
-                return Err(self.fail_and_cancel(
-                    query_id,
-                    format!("query cancelled while waiting for {report_kind}"),
-                ));
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(self.fail_and_cancel(
-                    query_id,
-                    format!(
-                        "query timed out after {timeout_ms} ms waiting for {report_kind}: received {received} of {}",
-                        expected_instances.len()
-                    ),
-                ));
-            }
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(now)
-                    .min(REPORT_POLL_INTERVAL),
-            );
-        }
     }
 
     fn fail_and_cancel(

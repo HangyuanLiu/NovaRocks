@@ -590,6 +590,25 @@ fn final_complete_races_cancel_deadline_and_shutdown_without_late_publish() {
                         1
                     );
                 }
+                LivePollOutcome::Updated {
+                    bundle,
+                    terminal: Some(observed),
+                } if observed == expected_losing_terminal => {
+                    // Completion was already admitted and published before
+                    // close reached quiescence; cancellation/deadline then
+                    // terminalized the subscription while retaining its
+                    // latest bundle. This is the same linearization guaranteed
+                    // by the live-subscription cancellation contract.
+                    assert_eq!(complete_outcome, SubmitOutcome::Completed);
+                    assert_eq!(bundle.version(), LogicalVersion::FIRST);
+                    assert_eq!(
+                        event_count(&recorded, |event| matches!(
+                            event,
+                            RuntimeFilterEvent::ArtifactPublished { .. }
+                        )),
+                        1
+                    );
+                }
                 LivePollOutcome::Idle {
                     latest_version: None,
                     terminal: Some(observed),

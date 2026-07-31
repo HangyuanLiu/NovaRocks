@@ -642,6 +642,19 @@ pub fn assert_write_outcome_preserved(
     }
 }
 
+pub fn assert_write_commit_outcome_preserved(
+    outcome: DistributedQueryOutcome,
+) -> Result<(), DistributedQueryError> {
+    let (_, commit, abort) = outcome.into_write()?.into_parts();
+    match (commit, abort) {
+        (Some(commit), None) if !commit.writers.is_empty() => Ok(()),
+        _ => Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "engine did not receive a non-empty terminal-snapshot commit payload",
+        )),
+    }
+}
+
 pub fn assert_write_abort_reason(
     outcome: DistributedQueryOutcome,
     expected: &str,

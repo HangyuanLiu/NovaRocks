@@ -222,6 +222,28 @@ impl NativeExecutionReport {
         report.write.done = done;
         report
     }
+
+    #[cfg(feature = "query-execution-contract-test-support")]
+    pub fn successful_terminal_snapshot_for_contract_test(
+        &self,
+    ) -> Result<FragmentTerminalSnapshot, crate::query_execution::lifecycle::QueryLifecycleError>
+    {
+        FragmentTerminalSnapshot::new(
+            self.write.fragment_instance_id,
+            self.write.backend_num,
+            FragmentTerminalOutcome::Succeeded,
+            crate::runtime::sink_commit::SinkCommitReportSnapshot {
+                iceberg_commits: self.write.iceberg_commits.clone(),
+                load_stats: crate::runtime::sink_commit::SinkLoadStats {
+                    loaded_rows: self.write.loaded_rows,
+                    loaded_bytes: self.write.loaded_bytes,
+                    filtered_rows: self.write.filtered_rows,
+                },
+                ..Default::default()
+            },
+            self.profile.clone(),
+        )
+    }
 }
 
 pub struct WriteReportOutcome {
