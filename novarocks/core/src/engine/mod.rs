@@ -353,7 +353,7 @@ impl Default for StandaloneState {
 #[cfg(test)]
 #[derive(Default)]
 struct TestConnectorControlRegistry {
-    bindings: Mutex<
+    active: std::sync::Mutex<
         std::collections::HashMap<
             novarocks_spi::connector::ConnectorInstanceId,
             Arc<novarocks_spi::connector::ConnectorControlBinding>,
@@ -371,15 +371,23 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
-            .bindings
+            .active
             .lock()
-            .expect("test connector control registry lock")
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
             .get(instance_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                    "test connector control registry has no active binding",
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
                 )
             })?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
@@ -396,15 +404,23 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
-            .bindings
+            .active
             .lock()
-            .expect("test connector control registry lock")
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
             .get(instance_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                    "test connector control registry has no active mutation binding",
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active mutation binding",
+                        instance_id.as_str()
+                    ),
                 )
             })?;
         let mutation = binding.mutation().cloned().ok_or_else(|| {
@@ -428,10 +444,27 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
         &self,
         binding: novarocks_spi::connector::ConnectorControlBinding,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.bindings
-            .lock()
-            .expect("test connector control registry lock")
-            .insert(binding.descriptor().instance_id.clone(), Arc::new(binding));
+        let instance_id = binding.descriptor().instance_id.clone();
+        let incarnation = binding.incarnation();
+        let mut active = self.active.lock().map_err(|_| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                "test connector control registry lock poisoned",
+            )
+        })?;
+        if let Some(existing) = active.get(&instance_id) {
+            if existing.incarnation() == incarnation {
+                return Ok(());
+            }
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "connector control instance `{}` already has an active generation",
+                    instance_id.as_str()
+                ),
+            ));
+        }
+        active.insert(instance_id, Arc::new(binding));
         Ok(())
     }
 
@@ -439,11 +472,25 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.bindings
+        let removed = self
+            .active
             .lock()
-            .expect("test connector control registry lock")
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
             .remove(instance_id);
-        Ok(())
+        removed.map(|_| ()).ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                format!(
+                    "connector control instance `{}` is not active",
+                    instance_id.as_str()
+                ),
+            )
+        })
     }
 }
 
@@ -5723,6 +5770,47 @@ mod tests {
     }
 
     #[test]
+    fn test_connector_control_registry_tracks_binding_lifecycle() {
+        let registry = super::TestConnectorControlRegistry::default();
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+            .expect("connector instance ID");
+        let binding = crate::connector::iceberg::provider::IcebergControlProvider::new_control(
+            instance_id.clone(),
+            Arc::new(std::sync::RwLock::new(
+                crate::connector::IcebergCatalogRegistry::default(),
+            )),
+        )
+        .expect("connector control binding");
+
+        novarocks_spi::connector::ConnectorControlRegistry::register(&registry, binding)
+            .expect("register connector control binding");
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            &registry,
+            &instance_id,
+        )
+        .expect("acquire registered connector control binding");
+        assert_eq!(
+            planning_lease.binding().descriptor().instance_id,
+            instance_id
+        );
+        drop(planning_lease);
+
+        novarocks_spi::connector::ConnectorControlRegistry::retire_current(&registry, &instance_id)
+            .expect("retire connector control binding");
+        let error = match novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            &registry,
+            &instance_id,
+        ) {
+            Ok(_) => panic!("retired connector control binding must not be acquired"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn open_with_config_uses_injected_statistics_service() {
         let service = Arc::new(RecordingStatisticsService::default());
         let engine = StandaloneNovaRocks::open_with_config(
@@ -7998,6 +8086,17 @@ path = "meta/operations.sqlite"
                 .get("ice_one")
                 .is_ok()
         );
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice_one")
+            .expect("connector instance ID");
+        let planning_lease = state
+            .connector_control
+            .acquire_current(&instance_id)
+            .expect("catalog creation registers its connector control binding");
+        assert_eq!(
+            planning_lease.binding().descriptor().instance_id,
+            instance_id
+        );
+        drop(planning_lease);
 
         session
             .execute_in_database("drop catalog Ice_One", "default")
@@ -8009,6 +8108,14 @@ path = "meta/operations.sqlite"
                 .expect("iceberg catalog registry")
                 .get("ice_one")
                 .is_err()
+        );
+        let retired_error = match state.connector_control.acquire_current(&instance_id) {
+            Ok(_) => panic!("catalog drop must retire its connector control binding"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            retired_error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::NotFound
         );
     }
 

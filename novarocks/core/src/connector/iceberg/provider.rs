@@ -3494,6 +3494,35 @@ pub(crate) fn register_planned_table_files_fixture(
     files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
     seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
 ) {
+    registry.register_fixture_control(planned_table_files_fixture_binding(
+        catalog,
+        files_by_table,
+        seen_projections,
+    ));
+}
+
+#[cfg(test)]
+pub(crate) fn register_planned_table_files_control_fixture(
+    controls: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    catalog: &str,
+    files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
+) -> Result<(), ConnectorError> {
+    let binding = planned_table_files_fixture_binding(catalog, files_by_table, None);
+    let instance_id = binding.descriptor().instance_id.clone();
+    match controls.retire_current(&instance_id) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ConnectorErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    controls.register(binding)
+}
+
+#[cfg(test)]
+fn planned_table_files_fixture_binding(
+    catalog: &str,
+    files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
+    seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
+) -> ConnectorControlBinding {
     struct Fixture {
         instance_id: ConnectorInstanceId,
         files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
@@ -3640,18 +3669,16 @@ pub(crate) fn register_planned_table_files_fixture(
         instance_id,
     };
     let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
-    registry.register_fixture_control(
-        ConnectorControlBinding::try_new(
-            descriptor.clone(),
+    ConnectorControlBinding::try_new(
+        descriptor.clone(),
+        incarnation,
+        read.clone(),
+        read,
+        Arc::new(IcebergInstanceDistribution {
+            descriptor,
             incarnation,
-            read.clone(),
-            read,
-            Arc::new(IcebergInstanceDistribution {
-                descriptor,
-                incarnation,
-            }),
-            None,
-        )
-        .expect("fixture connector control binding"),
-    );
+        }),
+        None,
+    )
+    .expect("fixture connector control binding")
 }
