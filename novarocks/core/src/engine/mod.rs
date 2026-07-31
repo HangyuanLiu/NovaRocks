@@ -183,6 +183,7 @@ struct PreparedProfileFormatter {
     distributed_plan: crate::sql::planner::distributed::DistributedPlan,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
+    connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
 }
 
 impl PreparedQueryCompletion {
@@ -231,11 +232,28 @@ impl PreparedQueryCompletion {
                 ) {
                     lines.push(apply.to_string());
                 }
+                if let Some(apply) = crate::query_execution::profile::collect_native_scan_conjunct_apply_from_profile_trees(
+                    &fragment_profiles,
+                ) {
+                    lines.push(apply.to_string());
+                }
+                if !formatter.connector_static_planning.is_empty() {
+                    lines.push(formatter.connector_static_planning.to_string());
+                }
                 if let Some(counters) =
                     crate::query_execution::profile::format_counter_sums_from_profile_trees(
                         &fragment_profiles,
                         ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
                         "ProfileCounters",
+                    )
+                {
+                    lines.push(counters);
+                }
+                if let Some(counters) =
+                    crate::query_execution::profile::format_counter_sums_from_profile_trees(
+                        &fragment_profiles,
+                        CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
+                        "ConnectorFileMetrics",
                     )
                 {
                     lines.push(counters);
@@ -1239,11 +1257,13 @@ impl StandaloneSession {
             self.inner.connector_control.as_ref(),
             connector_context,
             None,
+            scan_preparation_options(&optimizer_settings),
         )?;
         let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
             &distributed_plan,
             &prepared,
         )?;
+        let connector_static_planning = connector_static_planning_metrics(&prepared)?;
         let request =
             crate::query_execution::contract::build_distributed_query_request_with_execution(
                 prepared,
@@ -1261,6 +1281,7 @@ impl StandaloneSession {
                         distributed_plan,
                         planning_elapsed: planning_start.elapsed(),
                         execution_started_at: std::time::Instant::now(),
+                        connector_static_planning,
                     }),
                 },
             },
@@ -3184,6 +3205,28 @@ fn optimizer_settings_for_execution(
     settings
 }
 
+fn scan_preparation_options(
+    settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+) -> crate::query_execution::preparation::ScanPreparationOptions {
+    crate::query_execution::preparation::ScanPreparationOptions {
+        enable_connector_static_predicate_pushdown: settings
+            .connector_static_predicate_pushdown_enabled(),
+    }
+}
+
+fn connector_static_planning_metrics(
+    prepared: &crate::query_execution::preparation::PreparedFragmentSet,
+) -> Result<crate::query_execution::profile::ConnectorStaticPlanningMetrics, String> {
+    let mut metrics = crate::query_execution::profile::ConnectorStaticPlanningMetrics::default();
+    for read in prepared.scan_bindings().connector_reads() {
+        metrics.record(
+            read.planning_metrics.candidate_units_considered,
+            read.planning_metrics.candidate_units_pruned,
+        )?;
+    }
+    Ok(metrics)
+}
+
 fn capture_maintenance_execution(
     state: &StandaloneState,
 ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
@@ -3308,11 +3351,13 @@ fn explain_analyze_query(
         connector_controls,
         connector_context,
         None,
+        scan_preparation_options(&optimizer_settings),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
         &prepared,
     )?;
+    let connector_static_planning = connector_static_planning_metrics(&prepared)?;
     let planning_elapsed = planning_start.elapsed();
 
     let query_opts = query_options_for_explain_analyze(query_opts);
@@ -3358,10 +3403,27 @@ fn explain_analyze_query(
     {
         lines.push(apply.to_string());
     }
+    if let Some(apply) =
+        crate::query_execution::profile::collect_native_scan_conjunct_apply_from_profile_trees(
+            &outcome.fragment_profiles,
+        )
+    {
+        lines.push(apply.to_string());
+    }
+    if !connector_static_planning.is_empty() {
+        lines.push(connector_static_planning.to_string());
+    }
     if let Some(counters) = crate::query_execution::profile::format_counter_sums_from_profile_trees(
         &outcome.fragment_profiles,
         ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES,
         "ProfileCounters",
+    ) {
+        lines.push(counters);
+    }
+    if let Some(counters) = crate::query_execution::profile::format_counter_sums_from_profile_trees(
+        &outcome.fragment_profiles,
+        CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES,
+        "ConnectorFileMetrics",
     ) {
         lines.push(counters);
     }
@@ -3388,6 +3450,9 @@ const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[
     "IcebergRuntimeFilePruning/Unsupported",
     "IcebergRuntimeFilePruning/Unavailable",
 ];
+
+const CONNECTOR_FILE_ROW_GROUP_COUNTER_NAMES: &[&str] =
+    &["ConnectorFileRowGroupsRead", "ConnectorFileRowGroupsPruned"];
 
 fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,
@@ -3827,6 +3892,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         state.connector_control.as_ref(),
         &connector_context,
         None,
+        scan_preparation_options(&optimizer_settings),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4032,6 +4098,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         state.connector_control.as_ref(),
         connector_context,
         scan_binding_resolver,
+        crate::query_execution::preparation::ScanPreparationOptions::default(),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4556,6 +4623,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         connector_controls,
         connector_context,
         scan_binding_resolver,
+        scan_preparation_options(&optimizer_settings),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4644,6 +4712,7 @@ pub(crate) fn execute_logical_plan_with_options(
         connector_controls,
         &connector_context,
         scan_binding_resolver,
+        scan_preparation_options(&optimizer_settings),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,

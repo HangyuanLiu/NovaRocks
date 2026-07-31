@@ -1412,6 +1412,7 @@ mod tests {
                     &controls,
                     &crate::connector::test_request_context(),
                     None,
+                    crate::query_execution::preparation::ScanPreparationOptions::default(),
                 )?;
                 crate::protocol::native::encode::encode_native_fragment_bundle(
                     &distributed_plan,

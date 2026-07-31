@@ -20,12 +20,16 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use super::{ConnectorError, ConnectorRequestContext, ConnectorScanHandle};
+use super::{
+    ConnectorError, ConnectorPredicateDisposition, ConnectorRequestContext, ConnectorScanHandle,
+    ConnectorSplit, ConnectorStaticPredicate,
+};
 
 #[derive(Clone)]
 pub struct ConnectorScan {
     pub handle: ConnectorScanHandle,
     pub output_schema: SchemaRef,
+    pub predicate_dispositions: Vec<ConnectorPredicateDisposition>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +48,7 @@ pub struct ConnectorBatchBudget {
 #[derive(Clone)]
 pub struct ConnectorBeginScanRequest {
     pub projection: Vec<usize>,
+    pub static_predicates: Vec<ConnectorStaticPredicate>,
     pub selector: ConnectorReadSelector,
     pub limit: Option<u64>,
     pub batch: ConnectorBatchBudget,
@@ -55,6 +60,33 @@ pub struct ConnectorSplitPlanningRequest {
     pub target_parallelism: NonZeroUsize,
     pub max_split_bytes: Option<NonZeroU64>,
     pub context: ConnectorRequestContext,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorSplitPlanningMetrics {
+    pub candidate_units_considered: u64,
+    pub candidate_units_pruned: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectorSplitPlanningResult {
+    pub splits: Vec<ConnectorSplit>,
+    pub metrics: ConnectorSplitPlanningMetrics,
+}
+
+impl ConnectorSplitPlanningResult {
+    pub fn try_new(
+        splits: Vec<ConnectorSplit>,
+        metrics: ConnectorSplitPlanningMetrics,
+    ) -> Result<Self, ConnectorError> {
+        if metrics.candidate_units_pruned > metrics.candidate_units_considered {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::CorruptData,
+                "connector split planning metrics report more pruned units than considered units",
+            ));
+        }
+        Ok(Self { splits, metrics })
+    }
 }
 
 #[derive(Clone)]

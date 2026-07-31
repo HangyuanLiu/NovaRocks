@@ -500,7 +500,8 @@ mod tests {
             &self,
             _scan: &ConnectorScanHandle,
             _request: ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        ) -> Result<novarocks_spi::connector::ConnectorSplitPlanningResult, ConnectorError>
+        {
             Err(unsupported())
         }
     }

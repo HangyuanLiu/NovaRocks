@@ -21,8 +21,8 @@ use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorTableHandle,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -40,7 +40,7 @@ pub trait ConnectorScanPlanning: Send + Sync {
         &self,
         scan: &ConnectorScanHandle,
         request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError>;
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError>;
 }
 
 /// FE-only capability that turns a logical control binding into the bounded,

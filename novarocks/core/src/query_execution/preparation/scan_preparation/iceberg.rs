@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_spi::connector::{
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticPredicate,
+    normalize_predicate_dispositions,
+};
+
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
+use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
 
@@ -56,6 +62,7 @@ pub(super) fn plan_iceberg_connector_read(
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
+    static_predicates: Vec<ConnectorStaticPredicate>,
 ) -> Result<PlannedConnectorRead, String> {
     let ResolvedScanExecution::IcebergFiles(files) = execution else {
         return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
@@ -78,11 +85,20 @@ pub(super) fn plan_iceberg_connector_read(
         files.binding,
         &files.files,
         &projection,
+        static_predicates.clone(),
     )?;
+    let predicate_dispositions =
+        normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
+            .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
+    let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
     Ok(PlannedConnectorRead {
         declaration: planned.declaration,
         scan: planned.scan,
         splits: planned.splits,
+        planning_metrics: planned.planning_metrics,
+        static_predicates,
+        predicate_dispositions,
+        residual_predicates,
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
     })
@@ -116,7 +132,71 @@ pub(super) fn plan_iceberg_delta_connector_read(
         declaration: planned.declaration,
         scan: planned.scan,
         splits: planned.splits,
+        planning_metrics: planned.planning_metrics,
+        static_predicates: Vec::new(),
+        predicate_dispositions: Vec::new(),
+        residual_predicates: scan.predicates.clone(),
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
     })
+}
+
+fn residual_predicates(
+    predicates: &[TypedExpr],
+    dispositions: &[ConnectorPredicateDisposition],
+) -> Result<Vec<TypedExpr>, String> {
+    let exact = dispositions
+        .iter()
+        .filter(|disposition| disposition.kind == ConnectorPredicateDispositionKind::Exact)
+        .map(|disposition| usize::try_from(disposition.predicate_id.0))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|_| "connector predicate ID does not fit the local ordinal".to_string())?;
+    Ok(predicates
+        .iter()
+        .enumerate()
+        .filter(|(ordinal, _)| !exact.contains(ordinal))
+        .map(|(_, predicate)| predicate.clone())
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{ExprKind, LiteralValue};
+    use arrow::datatypes::DataType;
+    use novarocks_spi::connector::{ConnectorPredicateDisposition, ConnectorStaticPredicateId};
+
+    fn predicate(value: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Bool(value)),
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn only_exact_dispositions_remove_ordered_core_residuals() {
+        let predicates = vec![predicate(false), predicate(true), predicate(false)];
+        let dispositions = vec![
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(0),
+                kind: ConnectorPredicateDispositionKind::Exact,
+            },
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(1),
+                kind: ConnectorPredicateDispositionKind::PruningOnly,
+            },
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(2),
+                kind: ConnectorPredicateDispositionKind::Exact,
+            },
+        ];
+
+        let residual = residual_predicates(&predicates, &dispositions).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(matches!(
+            &residual[0].kind,
+            ExprKind::Literal(LiteralValue::Bool(true))
+        ));
+    }
 }

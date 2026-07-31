@@ -139,7 +139,7 @@ fn metadata_scan_uses_native_sentinel_range() {
 }
 
 #[test]
-fn ordinary_iceberg_scan_preserves_min_max_pruning() {
+fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
     let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
@@ -154,16 +154,27 @@ fn ordinary_iceberg_scan_preserves_min_max_pruning() {
         None,
     )
     .expect("prepare pruned scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected file range");
-    };
-    assert_eq!(
-        file.full_path.as_deref(),
-        Some("s3://bucket/id-10-20.parquet")
+    assert!(
+        bindings
+            .scan_ranges(0, 10)
+            .is_some_and(|ranges| ranges.is_empty())
     );
+    let read = bindings
+        .connector_read(0, 10)
+        .expect("opaque connector read");
+    assert_eq!(
+        read.splits.len(),
+        2,
+        "fixture provider does not claim predicate execution or file pruning"
+    );
+    assert_eq!(read.static_predicates.len(), 1);
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![id_eq(12)])
+    );
+    assert!(read.predicate_dispositions.iter().all(|disposition| {
+        disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported
+    }));
 }
 
 #[test]
@@ -231,7 +242,7 @@ fn explicit_files_plan_opaque_connector_splits() {
 }
 
 #[test]
-fn identity_partition_predicate_prunes_non_matching_file() {
+fn identity_partition_predicate_stays_on_opaque_connector_path() {
     let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
@@ -245,39 +256,29 @@ fn identity_partition_predicate_prunes_non_matching_file() {
         ]),
         None,
     )
-    .expect("prepare partition-pruned scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected file range");
-    };
-    assert_eq!(file.full_path.as_deref(), Some("s3://bucket/id-12.parquet"));
+    .expect("prepare connector scan");
+    let read = bindings
+        .connector_read(0, 10)
+        .expect("opaque connector read");
+    assert_eq!(read.splits.len(), 2);
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![id_eq(12)])
+    );
 }
 
 #[test]
-fn large_plain_file_preserves_split_order_and_lengths() {
+fn large_plain_file_stays_an_opaque_connector_split() {
     let plan = plan(scan_node(10, IcebergDataFileBinding::ExplicitFiles));
     let mut file = data_file("s3://bucket/large.parquet");
     file.size = 300 * 1024 * 1024;
     let bindings =
         prepare_scan_bindings(&plan, &registry(vec![file]), None).expect("prepare large-file scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-
-    assert_eq!(ranges.len(), 3);
-    let files = ranges
-        .iter()
-        .map(|range| {
-            let crate::runtime::scan_range::ScanRange::File(file) = &range.range else {
-                panic!("expected file range");
-            };
-            file
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(files[0].offset, 0);
-    assert_eq!(files[1].offset, 128 * 1024 * 1024);
-    assert_eq!(files[2].offset, 256 * 1024 * 1024);
-    assert_eq!(files[2].length, 44 * 1024 * 1024);
+    let read = bindings
+        .connector_read(0, 10)
+        .expect("opaque connector read");
+    assert_eq!(read.splits.len(), 1);
+    assert_eq!(read.splits[0].split_id(), "fixture-0");
 }
 
 #[test]
@@ -316,5 +317,13 @@ fn unsupported_predicate_does_not_guess_pruning() {
     )
     .expect("unsupported pruning predicate must preserve scan semantics");
 
-    assert_eq!(bindings.scan_ranges(0, 10).expect("ranges").len(), 2);
+    let read = bindings
+        .connector_read(0, 10)
+        .expect("opaque connector read");
+    assert!(read.static_predicates.is_empty());
+    assert_eq!(
+        format!("{:?}", read.residual_predicates),
+        format!("{:?}", vec![unsupported_id_predicate()])
+    );
+    assert_eq!(read.splits.len(), 2);
 }

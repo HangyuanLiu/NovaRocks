@@ -1626,6 +1626,159 @@ emit_connector_reader_marker = true
 }
 
 #[test]
+fn cross_process_three_be_connector_static_predicate_prunes_files_and_row_groups() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _guard = lock_cluster_mvp();
+    let metadata_dir =
+        tempfile::tempdir_in(runtime_dir()).expect("create static-pruning metadata directory");
+    let metadata_config = format!(
+        r#"
+[metadata]
+provider = "sqlite"
+path = "{}"
+"#,
+        metadata_dir.path().join("catalog.db").display()
+    );
+    let mut cluster = MultiBeClusterHarness::start_n_be(
+        3,
+        r#"
+[debug]
+emit_connector_reader_marker = true
+"#,
+        &metadata_config,
+    );
+    let warehouse = tempfile::tempdir_in(runtime_dir()).expect("create static-pruning warehouse");
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG static_pruning_catalog PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
+        warehouse.path().display()
+    ))
+    .expect("create static-pruning catalog");
+    conn.query_drop("CREATE DATABASE static_pruning_catalog.static_pruning")
+        .expect("create static-pruning database");
+    conn.query_drop("CREATE TABLE static_pruning_catalog.static_pruning.data (id BIGINT)")
+        .expect("create static-pruning table");
+
+    // Keep six non-overlapping data files. `id >= 175001` eliminates the first
+    // three files, then prunes row groups in the first retained file while
+    // retaining exactly one opaque split for every BE.
+    for range in [
+        "1, 50000",
+        "50001, 100000",
+        "100001, 150000",
+        "150001, 200000",
+        "200001, 250000",
+        "250001, 300000",
+    ] {
+        conn.query_drop(format!(
+            "INSERT INTO static_pruning_catalog.static_pruning.data \
+             SELECT generate_series FROM TABLE(generate_series({range}))"
+        ))
+        .expect("write a distinct static-pruning data-file range");
+    }
+
+    let query = "SELECT count(*), min(id), max(id) \
+                 FROM static_pruning_catalog.static_pruning.data WHERE id >= 175001";
+    let split_counts = |output: &[Vec<String>]| {
+        output
+            .iter()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .find(|line| line.contains("NOVAROCKS_CONNECTOR_READ_SOURCE"))
+                    .and_then(|line| line.split("splits=").nth(1))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("each BE connector-source marker must include a numeric split count")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    conn.query_drop("SET enable_connector_static_predicate_pushdown = false")
+        .expect("disable static connector predicate pushdown");
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+    let disabled_rows: Vec<Row> = conn
+        .query(query)
+        .expect("disabled static pruning query must succeed");
+    let disabled_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READ_SOURCE",
+        Duration::from_secs(15),
+    );
+    let disabled_splits = split_counts(&disabled_output);
+    assert!(
+        disabled_splits.iter().all(|count| *count > 0),
+        "disabled path must still distribute real connector reads: {disabled_output:?}"
+    );
+
+    conn.query_drop("SET enable_connector_static_predicate_pushdown = true")
+        .expect("enable static connector predicate pushdown");
+    for be in &mut cluster.bes {
+        while be.stdout_rx.try_recv().is_ok() {}
+    }
+    let enabled_rows: Vec<Row> = conn
+        .query(query)
+        .expect("enabled static pruning query must succeed");
+    let enabled_output = cluster.wait_for_every_be_output_contains(
+        "NOVAROCKS_CONNECTOR_READ_SOURCE",
+        Duration::from_secs(15),
+    );
+    let enabled_splits = split_counts(&enabled_output);
+    assert_eq!(
+        enabled_rows, disabled_rows,
+        "the production rollback setting must preserve query results"
+    );
+    assert!(
+        enabled_splits.iter().all(|count| *count > 0),
+        "enabled path must retain a non-empty split and reader activity on every BE: {enabled_output:?}"
+    );
+    assert!(
+        enabled_splits.iter().sum::<usize>() < disabled_splits.iter().sum::<usize>(),
+        "PruningOnly must reduce opaque connector splits without removing the core residual: disabled={disabled_splits:?}, enabled={enabled_splits:?}"
+    );
+
+    let profile: Vec<String> = conn
+        .query(format!("EXPLAIN ANALYZE {query}"))
+        .expect("EXPLAIN ANALYZE must render connector static-pruning evidence");
+    let profile = profile.join("\n");
+    assert!(
+        profile.contains("ConnectorStaticPlanning:") && profile.contains("candidate_units_pruned="),
+        "profile must include provider-neutral connector pruning metrics: {profile}"
+    );
+    assert!(
+        profile.contains("ScanConjunctApply:"),
+        "profile must show the core residual conjunct remains active for PruningOnly: {profile}"
+    );
+    let scan_conjunct_counter = |name: &str| {
+        profile
+            .lines()
+            .find(|line| line.starts_with("ScanConjunctApply:"))
+            .and_then(|line| {
+                line.split_whitespace().find_map(|part| {
+                    part.strip_prefix(name)
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+            })
+            .expect("scan-conjunct profile entry must include the requested counter")
+    };
+    let input_rows = scan_conjunct_counter("input_rows=");
+    let output_rows = scan_conjunct_counter("output_rows=");
+    assert!(
+        profile.contains("ConnectorFileMetrics:")
+            && profile.contains("ConnectorFileRowGroupsRead="),
+        "profile must report connector row-group counters: {profile}"
+    );
+    assert!(
+        input_rows > output_rows && input_rows - output_rows < 4_096,
+        "row-group pruning must leave only the boundary group's non-matching rows for the core residual: input={input_rows}, output={output_rows}, profile={profile}"
+    );
+}
+
+#[test]
 fn cross_process_three_be_connector_read_applies_deletion_vectors() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {

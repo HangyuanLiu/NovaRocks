@@ -40,6 +40,7 @@ pub(crate) use projection::{
 pub(crate) use projection::{
     prepared_fragment_set_for_test, prepared_fragment_set_with_runtime_filter_for_test,
 };
+pub(crate) use scan_preparation::ScanPreparationOptions;
 use scan_preparation::prepare_scan_bindings;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
 
@@ -49,6 +50,7 @@ pub(crate) fn prepare_fragments(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn scan::ScanBindingResolver>,
+    scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
     let sealed_ids = plan
         .fragments()
@@ -112,7 +114,8 @@ pub(crate) fn prepare_fragments(
             plan.runtime_filter_graph(),
             plan.fragments(),
         )?;
-    let scan_bindings = prepare_scan_bindings(plan, connectors, controls, context, resolver)?;
+    let scan_bindings =
+        prepare_scan_bindings(plan, connectors, controls, context, resolver, scan_options)?;
 
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
@@ -576,6 +579,7 @@ mod tests {
             &controls,
             &crate::connector::test_request_context(),
             None,
+            ScanPreparationOptions::default(),
         )
         .expect("sealed write output absence is legal");
         assert!(
@@ -602,6 +606,7 @@ mod tests {
             &controls,
             &crate::connector::test_request_context(),
             None,
+            ScanPreparationOptions::default(),
         ) {
             Ok(_) => {
                 panic!("non-write output absence must fail through production preparation")
@@ -632,6 +637,7 @@ mod tests {
             &controls,
             &crate::connector::test_request_context(),
             None,
+            ScanPreparationOptions::default(),
         )
         .expect("prepare sealed graph");
 

@@ -17,6 +17,45 @@
 
 use std::collections::HashMap;
 
+/// Provider-owned static predicate carried only inside an opaque Iceberg split.
+/// `field_id` is authoritative for physical reads; `column` is retained for
+/// manifest statistics and identity partition metadata, which are keyed by
+/// their current logical names.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct IcebergPhysicalPredicate {
+    pub(crate) field_id: i32,
+    pub(crate) column: String,
+    pub(crate) domain: IcebergPhysicalPredicateDomain,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum IcebergPhysicalPredicateDomain {
+    Range {
+        op: IcebergPhysicalPredicateOp,
+        value: IcebergPhysicalPredicateValue,
+    },
+    DiscreteSet {
+        values: Vec<IcebergPhysicalPredicateValue>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum IcebergPhysicalPredicateOp {
+    Eq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) enum IcebergPhysicalPredicateValue {
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Date32(i32),
+}
+
 /// Raw per-column statistics from Iceberg manifest DataFile entries.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct IcebergColumnStats {

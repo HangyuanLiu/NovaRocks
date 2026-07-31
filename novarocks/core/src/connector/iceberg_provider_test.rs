@@ -229,6 +229,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
             &resolved.table,
             ConnectorBeginScanRequest {
                 projection: vec![0],
+                static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -250,6 +251,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
             },
         )
         .expect("plan split")
+        .splits
         .remove(0);
     let installed = install_execution(&planning);
 
@@ -396,6 +398,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
             &resolved.table,
             ConnectorBeginScanRequest {
                 projection: vec![0],
+                static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -416,7 +419,8 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
                 context: context(),
             },
         )
-        .expect("plan splits");
+        .expect("plan splits")
+        .splits;
     assert_eq!(splits.len(), 1);
     assert_eq!(splits[0].owner(), &instance_id);
     assert!(splits[0].estimated_bytes().is_some_and(|bytes| bytes > 0));
@@ -507,6 +511,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             &resolved.table,
             ConnectorBeginScanRequest {
                 projection: vec![0],
+                static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -528,6 +533,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             },
         )
         .expect("plan original splits")
+        .splits
         .remove(0);
     let original = load_table(&entry, "db", "orders").expect("load original table");
     let reused_snapshot_id = original
@@ -617,6 +623,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             &current.table,
             ConnectorBeginScanRequest {
                 projection: vec![0],
+                static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch: ConnectorBatchBudget {
@@ -638,6 +645,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
             },
         )
         .expect("plan current splits")
+        .splits
         .remove(0);
     let mut reader = execution
         .read()

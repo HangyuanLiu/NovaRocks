@@ -30,10 +30,28 @@ use crate::sql::planner::table::ScanSource;
 mod iceberg;
 mod projection;
 mod pruning;
+mod static_predicate;
 
 pub(crate) use iceberg::build_iceberg_metadata_scan_range_params;
 use iceberg::{plan_iceberg_connector_read, plan_iceberg_delta_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
+use static_predicate::lower_static_connector_predicates;
+
+/// Immutable scan-planning choices derived from the session before connector
+/// negotiation begins. Keeping this outside the native carrier makes an
+/// explicit disabled setting a safe FE-side rollback.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanPreparationOptions {
+    pub(crate) enable_connector_static_predicate_pushdown: bool,
+}
+
+impl Default for ScanPreparationOptions {
+    fn default() -> Self {
+        Self {
+            enable_connector_static_predicate_pushdown: true,
+        }
+    }
+}
 
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -41,6 +59,7 @@ pub(super) fn prepare_scan_bindings(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
+    options: ScanPreparationOptions,
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
@@ -52,6 +71,7 @@ pub(super) fn prepare_scan_bindings(
             controls,
             context,
             resolver,
+            options,
             &mut seen_scan_node_ids,
             &mut bindings,
         )?;
@@ -66,6 +86,7 @@ fn collect_scan_bindings(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
+    options: ScanPreparationOptions,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
@@ -81,6 +102,7 @@ fn collect_scan_bindings(
             controls,
             context,
             resolver,
+            options,
             bindings,
         )?;
     }
@@ -93,6 +115,7 @@ fn collect_scan_bindings(
                 controls,
                 context,
                 resolver,
+                options,
                 seen_scan_node_ids,
                 bindings,
             )?;
@@ -109,6 +132,7 @@ fn prepare_scan_node(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     resolver: Option<&dyn ScanBindingResolver>,
+    options: ScanPreparationOptions,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
     let execution = match &scan.table.source {
@@ -163,8 +187,19 @@ fn prepare_scan_node(
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, connector_read) = match &execution {
         ResolvedScanExecution::IcebergFiles(_) => {
-            let planned = plan_iceberg_connector_read(controls, context.clone(), scan, &execution)
-                .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            // Design: ADR-0017 (docs/adr/ADR-0017-static-connector-predicate-disposition.md)
+            let static_predicates = options
+                .enable_connector_static_predicate_pushdown
+                .then(|| lower_static_connector_predicates(scan))
+                .unwrap_or_default();
+            let planned = plan_iceberg_connector_read(
+                controls,
+                context.clone(),
+                scan,
+                &execution,
+                static_predicates,
+            )
+            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             // The provider reader projects physical equality keys internally
             // and drops them before delivery. Core therefore never owns a
             // hidden Iceberg delete column or file range.

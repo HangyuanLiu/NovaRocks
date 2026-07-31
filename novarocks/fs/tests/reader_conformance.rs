@@ -158,6 +158,36 @@ fn parquet_predicate_prunes_row_groups() {
 }
 
 #[test]
+fn parquet_predicate_binds_field_id_before_column_name() {
+    let fixture = Fixture::parquet();
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.predicates.push(
+        ScanPredicate::new(
+            "renamed_id",
+            ScanPredicateDomain::Range {
+                op: MinMaxPredicateOp::Ge,
+                value: MinMaxPredicateValue::Int32(4),
+            },
+            ScanPredicateSource::Static,
+        )
+        .with_physical_field_id(10),
+    );
+    let mut reader = open_file_reader(request).expect("open reader");
+    let batches = collect(reader.as_mut()).expect("read Parquet");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        4
+    );
+    assert_eq!(
+        batches[0].physical_row_positions.as_ref().unwrap().value(0),
+        4
+    );
+}
+
+#[test]
 fn parquet_honors_explicit_page_selection_and_positions() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);

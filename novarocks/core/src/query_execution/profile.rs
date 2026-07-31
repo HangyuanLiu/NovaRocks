@@ -24,6 +24,9 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::write::NativeExecutionReport;
 
+const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
+const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
+
 /// Pure consuming builder from neutral native reports to the intent-safe
 /// profile completion payload.
 ///
@@ -120,6 +123,116 @@ pub(crate) fn collect_native_runtime_filter_apply_from_profile_trees(
         input_rows,
         output_rows,
     })
+}
+
+/// Core residual scan-conjunct application observed on backend profiles.
+///
+/// Connector predicates declared `PruningOnly` intentionally remain in this
+/// path, so this summary is the execution-side proof that correctness did not
+/// depend on connector pruning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeScanConjunctApply {
+    pub(crate) input_rows: i64,
+    pub(crate) output_rows: i64,
+}
+
+impl std::fmt::Display for NativeScanConjunctApply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ScanConjunctApply: input_rows={} output_rows={}",
+            self.input_rows, self.output_rows
+        )
+    }
+}
+
+pub(crate) fn collect_native_scan_conjunct_apply_from_profile_trees(
+    trees: &[RuntimeProfileTree],
+) -> Option<NativeScanConjunctApply> {
+    fn visit(
+        node: &ProfileNode,
+        input_rows: &mut i64,
+        output_rows: &mut i64,
+        counters_present: &mut bool,
+    ) {
+        if node.name == COMMON_METRICS {
+            *counters_present |= node.counters.iter().any(|counter| {
+                counter.name == SCAN_CONJUNCT_INPUT_ROWS
+                    || counter.name == SCAN_CONJUNCT_OUTPUT_ROWS
+            });
+            *input_rows = input_rows.saturating_add(native_counter(node, SCAN_CONJUNCT_INPUT_ROWS));
+            *output_rows =
+                output_rows.saturating_add(native_counter(node, SCAN_CONJUNCT_OUTPUT_ROWS));
+        }
+        for child in &node.children {
+            visit(child, input_rows, output_rows, counters_present);
+        }
+    }
+
+    let mut input_rows = 0_i64;
+    let mut output_rows = 0_i64;
+    let mut counters_present = false;
+    for tree in trees {
+        visit(
+            &tree.root,
+            &mut input_rows,
+            &mut output_rows,
+            &mut counters_present,
+        );
+    }
+    counters_present.then_some(NativeScanConjunctApply {
+        input_rows,
+        output_rows,
+    })
+}
+
+/// Frontend-side aggregation of connector split-planning evidence.
+///
+/// Planning happens before fragments are serialized, therefore these values
+/// deliberately stay in the prepared-query formatter instead of native
+/// fragment profiles or the generic execution wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnectorStaticPlanningMetrics {
+    connector_scan_count: u64,
+    candidate_units_considered: u64,
+    candidate_units_pruned: u64,
+}
+
+impl ConnectorStaticPlanningMetrics {
+    pub(crate) fn record(
+        &mut self,
+        candidate_units_considered: u64,
+        candidate_units_pruned: u64,
+    ) -> Result<(), String> {
+        if candidate_units_pruned > candidate_units_considered {
+            return Err(
+                "connector static planning metrics report more pruned units than considered units"
+                    .to_string(),
+            );
+        }
+        self.connector_scan_count = self.connector_scan_count.saturating_add(1);
+        self.candidate_units_considered = self
+            .candidate_units_considered
+            .saturating_add(candidate_units_considered);
+        self.candidate_units_pruned = self
+            .candidate_units_pruned
+            .saturating_add(candidate_units_pruned);
+        Ok(())
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.connector_scan_count == 0
+    }
+}
+
+impl std::fmt::Display for ConnectorStaticPlanningMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ConnectorStaticPlanning: scans={} candidate_units_considered={} candidate_units_pruned={}",
+            self.connector_scan_count, self.candidate_units_considered, self.candidate_units_pruned,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -568,6 +681,49 @@ mod tests {
             ])
             .is_none()
         );
+    }
+
+    #[test]
+    fn scan_conjunct_apply_sums_common_metrics_across_fragments() {
+        let fragment_one = Profiler::new("fragment-one");
+        let common_one = fragment_one
+            .child("SCAN (plan_node_id=1)")
+            .child(COMMON_METRICS);
+        common_one.counter_set("ScanConjunctInputRows", ProfileUnit::Unit, 40);
+        common_one.counter_set("ScanConjunctOutputRows", ProfileUnit::Unit, 10);
+
+        let fragment_two = Profiler::new("fragment-two");
+        let common_two = fragment_two
+            .child("SCAN (plan_node_id=2)")
+            .child(COMMON_METRICS);
+        common_two.counter_set("ScanConjunctInputRows", ProfileUnit::Unit, 60);
+        common_two.counter_set("ScanConjunctOutputRows", ProfileUnit::Unit, 20);
+        let unrelated = fragment_two.child(UNIQUE_METRICS);
+        unrelated.counter_set("ScanConjunctInputRows", ProfileUnit::Unit, 1_000);
+        unrelated.counter_set("ScanConjunctOutputRows", ProfileUnit::Unit, 1_000);
+
+        let apply = super::collect_native_scan_conjunct_apply_from_profile_trees(&[
+            fragment_one.to_native_tree(),
+            fragment_two.to_native_tree(),
+        ])
+        .expect("scan-conjunct counters must produce a summary");
+        assert_eq!((apply.input_rows, apply.output_rows), (100, 30));
+        assert_eq!(
+            apply.to_string(),
+            "ScanConjunctApply: input_rows=100 output_rows=30"
+        );
+    }
+
+    #[test]
+    fn connector_static_planning_metrics_validate_and_format() {
+        let mut metrics = super::ConnectorStaticPlanningMetrics::default();
+        metrics.record(7, 2).expect("valid first scan");
+        metrics.record(3, 1).expect("valid second scan");
+        assert_eq!(
+            metrics.to_string(),
+            "ConnectorStaticPlanning: scans=2 candidate_units_considered=10 candidate_units_pruned=3"
+        );
+        assert!(metrics.record(1, 2).is_err());
     }
 
     fn add_operator_metrics(

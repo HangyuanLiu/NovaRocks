@@ -28,10 +28,15 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorProviderId,
+    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
     ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    normalize_predicate_dispositions, validate_static_predicates,
 };
 
 struct OwnerExecution {
@@ -84,7 +89,7 @@ impl ConnectorScanPlanning for OwnerPlanning {
         &self,
         _: &ConnectorScanHandle,
         _: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
         unreachable!("control binding construction must not plan splits")
     }
 }
@@ -356,5 +361,107 @@ fn reader_metrics_snapshot_add_and_delta_are_saturating() {
             })
             .bytes_read,
         0
+    );
+}
+
+fn static_int_predicate(id: u32) -> ConnectorStaticPredicate {
+    ConnectorStaticPredicate {
+        id: ConnectorStaticPredicateId(id),
+        column: ConnectorStaticPredicateColumn {
+            field_ordinal: 2,
+            data_type: ConnectorStaticPredicateDataType::Int32,
+            nullable: false,
+        },
+        kind: ConnectorStaticPredicateKind::Comparison {
+            op: ConnectorStaticComparisonOp::Ge,
+            literal: ConnectorStaticPredicateLiteral::Int32(42),
+        },
+    }
+}
+
+#[test]
+fn static_predicate_conformance_normalizes_a_total_out_of_order_response() {
+    let predicates = vec![static_int_predicate(4), static_int_predicate(8)];
+    let normalized = normalize_predicate_dispositions(
+        &predicates,
+        &[
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(8),
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            },
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(4),
+                kind: ConnectorPredicateDispositionKind::Exact,
+            },
+        ],
+    )
+    .expect("total response is valid");
+
+    assert_eq!(normalized[0].predicate_id, ConnectorStaticPredicateId(4));
+    assert_eq!(normalized[0].kind, ConnectorPredicateDispositionKind::Exact);
+    assert_eq!(normalized[1].predicate_id, ConnectorStaticPredicateId(8));
+}
+
+#[test]
+fn static_predicate_conformance_rejects_unknown_or_duplicate_response_ids() {
+    let predicates = vec![static_int_predicate(4), static_int_predicate(8)];
+    let unknown = normalize_predicate_dispositions(
+        &predicates,
+        &[
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(4),
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            },
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(9),
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            },
+        ],
+    )
+    .expect_err("unknown ID is malformed provider output");
+    assert_eq!(unknown.kind(), ConnectorErrorKind::CorruptData);
+
+    let duplicate = normalize_predicate_dispositions(
+        &predicates,
+        &[
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(4),
+                kind: ConnectorPredicateDispositionKind::Unsupported,
+            },
+            ConnectorPredicateDisposition {
+                predicate_id: ConnectorStaticPredicateId(4),
+                kind: ConnectorPredicateDispositionKind::PruningOnly,
+            },
+        ],
+    )
+    .expect_err("duplicate ID is malformed provider output");
+    assert_eq!(duplicate.kind(), ConnectorErrorKind::CorruptData);
+}
+
+#[test]
+fn static_predicate_conformance_rejects_type_mismatch_and_invalid_planning_metrics() {
+    let mut predicate = static_int_predicate(4);
+    predicate.kind = ConnectorStaticPredicateKind::Comparison {
+        op: ConnectorStaticComparisonOp::Eq,
+        literal: ConnectorStaticPredicateLiteral::Int64(42),
+    };
+    assert_eq!(
+        validate_static_predicates(&[predicate])
+            .expect_err("literal and column types must match")
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+
+    assert_eq!(
+        novarocks_spi::connector::ConnectorSplitPlanningResult::try_new(
+            Vec::new(),
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 1,
+                candidate_units_pruned: 2,
+            },
+        )
+        .expect_err("pruned candidates cannot exceed considered candidates")
+        .kind(),
+        ConnectorErrorKind::CorruptData
     );
 }

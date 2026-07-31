@@ -209,6 +209,7 @@ fn real_execution_artifacts() -> (
         &controls,
         &crate::connector::test_request_context(),
         None,
+        crate::query_execution::preparation::ScanPreparationOptions::default(),
     )
     .expect("prepare production execution artifact");
     let native_bundle =

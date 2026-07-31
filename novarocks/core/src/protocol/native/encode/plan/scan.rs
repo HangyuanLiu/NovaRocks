@@ -57,6 +57,13 @@ pub(super) fn encode_scan_node(
         || src.required_columns.clone().unwrap_or_default(),
         |binding| encode_bound_required_columns(src, binding),
     );
+    // Connector planning may remove only predicates explicitly negotiated as
+    // Exact. All other scan sources, and PruningOnly/Unsupported connector
+    // predicates, retain the original Core residuals.
+    let residual_predicates = optional_context_ref(ctx.scan_bindings)
+        .and_then(|bindings| bindings.connector_read_for_node(node_id))
+        .map(|planned| planned.residual_predicates.as_slice())
+        .unwrap_or(&src.predicates);
     Ok(plan::ScanNode {
         database: src.database.clone(),
         table: Some(encode_table_def_with_context(
@@ -71,7 +78,7 @@ pub(super) fn encode_scan_node(
         )?),
         alias: src.alias.clone(),
         columns,
-        predicates: encode_exprs(&src.predicates)?,
+        predicates: encode_exprs(residual_predicates)?,
         required_columns,
         dict_columns: Vec::new(),
         variant_columns: src

@@ -1423,6 +1423,7 @@ mod tests {
                     &controls,
                     &crate::connector::test_request_context(),
                     Some(&refresh_ctx),
+                    crate::query_execution::preparation::ScanPreparationOptions::default(),
                 )
                 .expect("join projection coalesce plan must prepare");
                 crate::protocol::native::encode::encode_native_fragment_bundle(

@@ -51,6 +51,11 @@ pub struct SessionOptimizerSettings {
     /// Session override for transparent MV query rewrite.
     /// `None` means the default (enabled).
     pub enable_materialized_view_rewrite: Option<bool>,
+    /// Session override for connector static predicate pushdown.
+    /// `None` means the default (enabled). This controls only whether Core
+    /// offers static predicates to a connector; it never changes residual
+    /// predicate evaluation.
+    pub enable_connector_static_predicate_pushdown: Option<bool>,
     /// Session override for `cbo_enable_dp_join_reorder` (None = default true).
     pub enable_dp_join_reorder: Option<bool>,
     /// Session override for `cbo_enable_greedy_join_reorder` (None = default true).
@@ -103,6 +108,11 @@ impl SessionOptimizerSettings {
 
     pub(crate) fn mv_rewrite_enabled(&self) -> bool {
         self.enable_materialized_view_rewrite.unwrap_or(true)
+    }
+
+    pub(crate) fn connector_static_predicate_pushdown_enabled(&self) -> bool {
+        self.enable_connector_static_predicate_pushdown
+            .unwrap_or(true)
     }
 }
 
@@ -524,5 +534,19 @@ mod tests {
         let mut on = SessionOptimizerSettings::default();
         on.enable_materialized_view_rewrite = Some(true);
         assert!(on.mv_rewrite_enabled());
+    }
+
+    #[test]
+    fn connector_static_predicate_pushdown_defaults_enabled_and_honors_override() {
+        let settings = SessionOptimizerSettings::default();
+        assert!(settings.connector_static_predicate_pushdown_enabled());
+
+        let mut off = SessionOptimizerSettings::default();
+        off.enable_connector_static_predicate_pushdown = Some(false);
+        assert!(!off.connector_static_predicate_pushdown_enabled());
+
+        let mut on = SessionOptimizerSettings::default();
+        on.enable_connector_static_predicate_pushdown = Some(true);
+        assert!(on.connector_static_predicate_pushdown_enabled());
     }
 }

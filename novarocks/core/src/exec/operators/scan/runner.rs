@@ -55,6 +55,12 @@ const SLOW_SCAN_PROGRESS_THRESHOLD: Duration = Duration::from_secs(5);
 const SLOW_SCAN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
+// These counters describe the core-owned residual scan conjunct. They are
+// intentionally separate from runtime-filter counters because a connector may
+// use the same source predicate for pruning while the core still evaluates it
+// for correctness.
+const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
+const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 
 type PositionedChunk = (Chunk, Option<Vec<i64>>);
 
@@ -334,6 +340,8 @@ impl ScanAsyncRunner {
             return Ok(Some(chunk));
         }
 
+        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+
         let chunk = if let Some(policy) = self.conjunct_encoding_policy.as_ref() {
             hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
                 policy.accepts_encoded_column(slot_id, data_type)
@@ -352,6 +360,16 @@ impl ScanAsyncRunner {
             .ok_or_else(|| "scan conjunct predicate must return boolean array".to_string())?;
         let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
             .map_err(|e| format!("scan conjunct filter failed: {}", e))?;
+        if let Some(profiles) = self.profiles.as_ref() {
+            profiles
+                .common
+                .counter_add(SCAN_CONJUNCT_INPUT_ROWS, ProfileUnit::Unit, input_rows);
+            profiles.common.counter_add(
+                SCAN_CONJUNCT_OUTPUT_ROWS,
+                ProfileUnit::Unit,
+                i64::try_from(filtered_batch.num_rows()).unwrap_or(i64::MAX),
+            );
+        }
         if filtered_batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -738,6 +756,7 @@ mod tests {
         RUNTIME_FILTER_JOIN_MODE_BROADCAST, RuntimeBloomFilter, RuntimeEmptyFilter,
         RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
+    use crate::runtime::profile::{OperatorProfiles, Profiler};
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, LateApplyGranularity,
     };
@@ -1340,6 +1359,8 @@ mod tests {
             morsels.morsels,
             morsels.has_more,
         )));
+        let profiler = Profiler::new("scan-conjunct-profile");
+        let profiles = OperatorProfiles::new(profiler.child("SCAN (plan_node_id=1)"));
 
         let mut runner = ScanAsyncRunner::new(
             "scan".to_string(),
@@ -1349,7 +1370,7 @@ mod tests {
             None,
             None,
             arena,
-            None,
+            Some(profiles.clone()),
             0,
         );
 
@@ -1368,6 +1389,14 @@ mod tests {
             .map(|idx| values.value(idx))
             .collect::<Vec<_>>();
         assert_eq!(actual, vec![1, 2]);
+        assert_eq!(
+            profiles.common.counter_value(SCAN_CONJUNCT_INPUT_ROWS),
+            Some(4)
+        );
+        assert_eq!(
+            profiles.common.counter_value(SCAN_CONJUNCT_OUTPUT_ROWS),
+            Some(2)
+        );
         assert!(
             runner.next_chunk().expect("scan eof").is_none(),
             "runner should reach EOF after single morsel"
