@@ -21,7 +21,7 @@ use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorTableHandle,
 };
 
