@@ -39,6 +39,7 @@ use novarocks_spi::connector::ConnectorExecutionResolver;
 
 use super::ingress::NativeFragmentIngressError;
 use super::instance::decode_instance_params;
+use super::runtime_filter::BackendNativeRuntimeFilterContractDecoder;
 use super::sink_assignment::BackendNativeFragmentSinkAssignmentDecoder;
 
 pub(crate) struct NativeFragmentRequest {
@@ -118,6 +119,7 @@ impl NativeFragmentRequest {
             instance,
             &instance_params,
             &BackendNativeFragmentSinkAssignmentDecoder,
+            &BackendNativeRuntimeFilterContractDecoder,
             connectors,
             execution_resolver,
         )

@@ -28,6 +28,7 @@ pub(crate) mod ingress;
 pub(crate) mod instance;
 pub(crate) mod lifecycle_adapter;
 pub(crate) mod report;
+pub(crate) mod runtime_filter;
 pub(crate) mod service;
 pub(crate) mod sink_assignment;
 

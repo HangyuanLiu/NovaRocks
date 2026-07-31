@@ -31,6 +31,7 @@ use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native_fragment_assembly_port::{
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
+    NativeRuntimeFilterContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -93,6 +94,7 @@ pub(crate) fn decode_fragment_submission_with_connectors_and_execution_resolver(
         connectors,
         execution_resolver,
         |sink| decode_fragment_sink_assignment(sink, instance_params),
+        |fragment| decode_runtime_filter_contract(fragment),
     )
 }
 
@@ -101,6 +103,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     instance_parts: NativeFragmentInstanceInput,
     instance_params: &novarocks::InstanceParams,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
+    runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
@@ -114,6 +117,11 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
                 .decode_sink_assignment(sink, instance_params)
                 .map_err(NativeFragmentDecodeError::from)
         },
+        |fragment| {
+            runtime_filter_contract_decoder
+                .decode_runtime_filter_contract(fragment)
+                .map_err(NativeFragmentDecodeError::from)
+        },
     )
 }
 
@@ -123,6 +131,12 @@ fn assemble_fragment_submission_with_sink_assignment<F>(
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
     decode_sink_assignment: F,
+    decode_runtime_filter_contract: impl FnOnce(
+        &plan::PlanFragment,
+    ) -> Result<
+        RuntimeFilterContract,
+        NativeFragmentDecodeError,
+    >,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError>
 where
     F: FnOnce(

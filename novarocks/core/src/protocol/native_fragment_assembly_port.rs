@@ -17,18 +17,18 @@
 
 //! Execution-domain assembly seam for a backend-decoded native fragment.
 //!
-//! The `InstanceParams` execution values and sink assignment are decoded by the
-//! backend role. This module builds the shared execution submission without
-//! exposing decode contexts, registries, or runtime state. It invokes the
-//! backend sink decoder at the former core validation point, preserving error
-//! ordering relative to root, runtime-filter, and scan-contract checks.
+//! The `InstanceParams` execution values, sink assignment, and fragment-level
+//! runtime-filter contract are decoded by the backend role. This module builds
+//! the shared execution submission without exposing decode contexts,
+//! registries, or runtime state. It invokes the backend decoders at their
+//! former core validation points, preserving error ordering.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::connector::ConnectorRegistry;
-use crate::exec::fragment::program::FragmentNodeId;
+use crate::exec::fragment::program::{FragmentNodeId, RuntimeFilterContract};
 use crate::proto::novarocks;
 use crate::proto::plan;
 use crate::protocol::ProtocolError;
@@ -93,6 +93,15 @@ pub trait NativeFragmentSinkAssignmentDecoder: Send + Sync {
     ) -> Result<FragmentSinkAssignment, ProtocolError>;
 }
 
+/// Backend-owned runtime-filter contract decoder invoked after plan assembly
+/// has consumed the binding table.
+pub trait NativeRuntimeFilterContractDecoder: Send + Sync {
+    fn decode_runtime_filter_contract(
+        &self,
+        fragment: &plan::PlanFragment,
+    ) -> Result<RuntimeFilterContract, ProtocolError>;
+}
+
 pub struct AssembledNativeFragmentSubmission {
     submission: FragmentSubmission,
     backend_num: i32,
@@ -110,6 +119,7 @@ pub fn assemble_fragment_submission_for_backend(
     instance: NativeFragmentInstanceInput,
     sink_assignment_params: &novarocks::InstanceParams,
     sink_assignment_decoder: &dyn NativeFragmentSinkAssignmentDecoder,
+    runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
     connectors: Arc<ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<AssembledNativeFragmentSubmission, String> {
@@ -118,6 +128,7 @@ pub fn assemble_fragment_submission_for_backend(
         instance,
         sink_assignment_params,
         sink_assignment_decoder,
+        runtime_filter_contract_decoder,
         connectors,
         execution_resolver,
     )
