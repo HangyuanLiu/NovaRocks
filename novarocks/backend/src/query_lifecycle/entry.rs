@@ -79,6 +79,15 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    /// LocalDrained is a correctness barrier, not best-effort telemetry. Keep
+    /// one queue slot reserved so heartbeat ACK backpressure cannot drop it.
+    pub(crate) local_drained_event_permit:
+        Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
+    /// TerminalSnapshot must remain deliverable even when the normal event
+    /// budget is saturated. Unary fallback is recovery, not a substitute for
+    /// a reliable attached control stream.
+    pub(crate) terminal_snapshot_event_permit:
+        Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
     pub(crate) terminal_event_permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
     /// The opaque QLC-3 batch identity.  The state-only slice owns no fragment
     /// workspace yet, but it still has to make Stage and Start idempotent.
@@ -117,6 +126,8 @@ impl QueryLifecycleEntry {
                 last_heartbeat: None,
                 frontend_owner_epoch: None,
                 events: None,
+                local_drained_event_permit: None,
+                terminal_snapshot_event_permit: None,
                 terminal_event_permit: None,
                 stage_digest: None,
                 start_gate: None,

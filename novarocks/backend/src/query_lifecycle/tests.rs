@@ -26,8 +26,8 @@ use novarocks::query_execution::lifecycle::{
     ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
     QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     QueryLifecycleError, QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest,
-    QueryStartOutcome, QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution,
-    StageDigest, StageDigestVersion, StageFragment,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -817,6 +817,74 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
         }),
         "terminal acceptance must not be dropped behind heartbeat ACKs: {events:?}"
     );
+}
+
+#[test]
+fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 104, &[]);
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+
+    // ControlReady and the three reserved correctness permits leave exactly
+    // the normal sixteen-event heartbeat budget available.
+    for sequence in 1..=16 {
+        attachment
+            .control
+            .heartbeat(sequence)
+            .expect("heartbeat ACK fits the normal event budget");
+    }
+    assert_eq!(
+        registry
+            .start_prepared_query(QueryStartRequest::new(
+                execution_id,
+                StageDigestVersion::V1,
+                stage.digest(),
+            ))
+            .outcome(),
+        QueryStartOutcome::Applied
+    );
+    let mut saw_local_drained = false;
+    while let Ok(event) = attachment.events.try_recv() {
+        saw_local_drained |= event == QueryControlEvent::LocalDrained;
+    }
+    assert!(
+        saw_local_drained,
+        "LocalDrained must use its reserved correctness permit"
+    );
+
+    for sequence in 17..=32 {
+        attachment
+            .control
+            .heartbeat(sequence)
+            .expect("heartbeat ACK fits the normal event budget");
+    }
+    attachment
+        .control
+        .finalize()
+        .expect("locally drained participant finalizes");
+    let snapshot = loop {
+        match attachment.events.try_recv() {
+            Ok(QueryControlEvent::TerminalSnapshot { snapshot }) => break snapshot,
+            Ok(_) => {}
+            Err(error) => {
+                panic!("TerminalSnapshot must use its reserved correctness permit: {error}")
+            }
+        }
+    };
+    attachment
+        .control
+        .terminal_ack(QueryTerminalAck::from_snapshot(&snapshot))
+        .expect("terminal snapshot ACK");
 }
 
 #[test]

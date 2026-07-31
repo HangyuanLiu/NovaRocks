@@ -41,6 +41,22 @@ use prost::Message;
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
+const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
+
+fn send_reserved_control_event(
+    permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
+    events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    event: QueryControlEvent,
+) {
+    if let Some(permit) = permit {
+        drop(permit.send(event));
+    } else if let Some(events) = events {
+        // The fallback is only reachable for entries created before a permit
+        // was installed or after a duplicate terminal transition. Preserve
+        // the existing best-effort behavior without blocking a runtime thread.
+        let _ = events.try_send(event);
+    }
+}
 
 pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn install_runtime_filter(
@@ -877,13 +893,29 @@ impl QueryLifecycleRegistry {
                 "digest_mismatch",
             ));
         }
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_BUFFER_CAPACITY + 2);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(
+            CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
+        );
         events_tx
             .try_send(QueryControlEvent::ControlReady)
             .map_err(|error| {
                 QueryLifecycleError::new(
                     QueryLifecycleErrorCode::Internal,
                     format!("publish ControlReady failed: {error}"),
+                )
+            })?;
+        let local_drained_event_permit =
+            events_tx.clone().try_reserve_owned().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    format!("reserve LocalDrained control event failed: {error}"),
+                )
+            })?;
+        let terminal_snapshot_event_permit =
+            events_tx.clone().try_reserve_owned().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    format!("reserve TerminalSnapshot control event failed: {error}"),
                 )
             })?;
         let terminal_event_permit = events_tx.clone().try_reserve_owned().map_err(|error| {
@@ -927,6 +959,8 @@ impl QueryLifecycleRegistry {
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
+            state.local_drained_event_permit = Some(local_drained_event_permit);
+            state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
             if !entry
                 .manifest
@@ -1218,7 +1252,10 @@ impl QueryLifecycleRegistry {
                         && !state.local_drained_emitted
                     {
                         state.local_drained_emitted = true;
-                        local_drained_event = state.events.clone();
+                        local_drained_event = Some((
+                            state.local_drained_event_permit.take(),
+                            state.events.clone(),
+                        ));
                     }
                     let released = gate.release();
                     debug_assert!(released, "a staged start gate must be pending");
@@ -1259,8 +1296,8 @@ impl QueryLifecycleRegistry {
             ),
         };
         drop(state);
-        if let Some(events) = local_drained_event {
-            let _ = events.try_send(QueryControlEvent::LocalDrained);
+        if let Some((permit, events)) = local_drained_event {
+            send_reserved_control_event(permit, events, QueryControlEvent::LocalDrained);
         }
         // The gate has been released under the entry lock.  Once Running is
         // visible there can be no dormant workers or retained stage payload,
@@ -1745,18 +1782,21 @@ impl QueryLifecycleRegistry {
                 && !state.local_drained_emitted
             {
                 state.local_drained_emitted = true;
-                state.events.clone()
+                Some((
+                    state.local_drained_event_permit.take(),
+                    state.events.clone(),
+                ))
             } else {
                 None
             };
             local_drained
         };
-        if let Some(events) = local_drained {
+        if let Some((permit, events)) = local_drained {
             self.increment_terminal_metric(|metrics| {
                 metrics.terminal_locally_drained =
                     metrics.terminal_locally_drained.saturating_add(1);
             });
-            let _ = events.try_send(QueryControlEvent::LocalDrained);
+            send_reserved_control_event(permit, events, QueryControlEvent::LocalDrained);
         }
         self.increment_terminal_metric(|metrics| {
             metrics.terminal_facts = metrics.terminal_facts.saturating_add(1);
@@ -1873,7 +1913,7 @@ impl QueryLifecycleRegistry {
             warn!(target: "novarocks::query_lifecycle", error = %error, "failed to retain failed query terminal snapshot");
             return;
         }
-        let events = {
+        let terminal_delivery = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if state.terminal_record.is_some() || !state.failure_drain_scheduled {
                 self.release_terminal_record(execution_id);
@@ -1882,15 +1922,20 @@ impl QueryLifecycleRegistry {
             state.terminal_record = Some(record.clone());
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.terminated_at = Some(self.clock.now());
-            state.events.clone()
+            (
+                state.terminal_snapshot_event_permit.take(),
+                state.events.clone(),
+            )
         };
         let _ = self.local_runtime.abort_runtime_filter(execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
-        if let Some(events) = events {
-            let _ = events.try_send(QueryControlEvent::TerminalSnapshot {
+        send_reserved_control_event(
+            terminal_delivery.0,
+            terminal_delivery.1,
+            QueryControlEvent::TerminalSnapshot {
                 snapshot: record.snapshot().clone(),
-            });
-        }
+            },
+        );
         self.schedule_terminal_fallback(entry, record.snapshot().clone());
         self.increment_terminal_metric(|metrics| {
             metrics.terminal_records_frozen = metrics.terminal_records_frozen.saturating_add(1);
@@ -1942,7 +1987,7 @@ impl QueryLifecycleRegistry {
         let record =
             ImmutableQueryTerminalRecord::new(snapshot, self.config.terminal_max_encoded_bytes)?;
         self.reserve_terminal_record(execution_id, record.encoded_len())?;
-        let events = {
+        let terminal_delivery = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if state.phase != QueryLifecyclePhase::Running || state.terminal_record.is_some() {
                 self.release_terminal_record(execution_id);
@@ -1954,7 +1999,10 @@ impl QueryLifecycleRegistry {
             state.terminal_record = Some(record.clone());
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.terminated_at = Some(self.clock.now());
-            state.events.clone()
+            (
+                state.terminal_snapshot_event_permit.take(),
+                state.events.clone(),
+            )
         };
         // All execution-owned resources are detached before the immutable record is delivered.
         self.local_runtime.terminate_query(
@@ -1965,10 +2013,14 @@ impl QueryLifecycleRegistry {
         );
         let _ = self.local_runtime.abort_runtime_filter(execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
-        if let Some(events) = events {
-            let _ = events.try_send(QueryControlEvent::TerminalSnapshot {
+        send_reserved_control_event(
+            terminal_delivery.0,
+            terminal_delivery.1.clone(),
+            QueryControlEvent::TerminalSnapshot {
                 snapshot: record.snapshot().clone(),
-            });
+            },
+        );
+        if let Some(events) = terminal_delivery.1 {
             // Retain the QLC-3 acknowledgement as a compatibility latch. The
             // immutable snapshot above is the terminal payload; FE v4 stores
             // it before acknowledging the retained record.
