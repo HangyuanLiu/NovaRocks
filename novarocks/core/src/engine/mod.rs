@@ -105,7 +105,6 @@ pub struct StandaloneOptions {
     pub config_path: Option<PathBuf>,
 }
 
-use crate::sql::parser::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use novarocks_catalog::partition::LegacyRangePartition;
 
 #[cfg(feature = "compat")]
@@ -1329,6 +1328,7 @@ impl StandaloneSession {
                     None,
                     None,
                     Some(&self.inner),
+                    true,
                     false,
                     Some(request_context.execution()),
                 )?;
@@ -1517,6 +1517,16 @@ impl StandaloneSession {
                     StatementResult::Query(result)
                 }
             });
+        }
+        if crate::sql::parser::procedure::looks_like_call_procedure(&normalized) {
+            let statement = crate::sql::parser::procedure::parse_call_procedure_sql(&normalized)?;
+            if statement.procedure == crate::engine::mv::stateless_rebuild::PROCEDURE_NAME {
+                return crate::engine::mv::stateless_rebuild::execute_novarocks_imv_stateless_rebuild(
+                    &self.inner,
+                    &statement,
+                    current_database,
+                );
+            }
         }
         if let Some(result) = self.inner.table_maintenance_service.try_handle_statement(
             self.inner.as_ref(),
@@ -2001,14 +2011,21 @@ impl StandaloneSession {
     }
 
     fn is_query_sql(sql: &str) -> bool {
-        matches!(
-            sql.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-                .as_str(),
-            "select" | "with" | "explain"
-        )
+        let mut words = sql.split_whitespace();
+        match words.next().map(|word| word.to_ascii_lowercase()) {
+            Some(keyword) if matches!(keyword.as_str(), "select" | "with") => true,
+            Some(keyword) if keyword == "explain" => {
+                let mut target = words.next().map(|word| word.to_ascii_lowercase());
+                while matches!(
+                    target.as_deref(),
+                    Some("analyze" | "verbose" | "costs" | "logical")
+                ) {
+                    target = words.next().map(|word| word.to_ascii_lowercase());
+                }
+                matches!(target.as_deref(), Some("select" | "with"))
+            }
+            _ => false,
+        }
     }
 
     /// Handle ALTER TABLE ... ADD FILES FROM '...'
@@ -2288,6 +2305,9 @@ impl StandaloneSession {
             .expect("standalone iceberg catalog write lock");
         let created = !guard.contains_catalog(&stmt.name)?;
         guard.create_catalog(&stmt.name, &stmt.properties)?;
+        if !created {
+            return Ok(StatementResult::Ok);
+        }
         let persisted_properties = guard.get(&stmt.name)?.properties().to_vec();
         drop(guard);
         if let Err(error) = register_iceberg_control_binding(&self.inner, &normalized_catalog) {
@@ -2300,12 +2320,6 @@ impl StandaloneSession {
             }
             return Err(error);
         }
-        let connectors = self
-            .inner
-            .connectors
-            .read()
-            .expect("connector registry read lock")
-            .clone();
         self.inner
             .catalog_service
             .register_catalog(crate::sql::catalog::build_iceberg_catalog(
@@ -3579,6 +3593,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         None,
         Some(state),
         false,
+        false,
         Some(&maintenance_execution),
     )
 }
@@ -4073,6 +4088,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         None,
         mv_rewrite_state,
+        true,
         false,
         None,
     )
@@ -4107,6 +4123,7 @@ fn execute_query_with_catalog_provider_with_execution(
         None,
         None,
         mv_rewrite_state,
+        true,
         false,
         Some(execution),
     )
@@ -4189,6 +4206,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
+        true,
         mv_refresh_ctx.is_some(),
         None,
     )
@@ -4226,6 +4244,7 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         mv_refresh_ctx,
         None,
         None,
+        false,
         false,
         None,
     )
@@ -4353,6 +4372,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    allow_mv_rewrite_candidates: bool,
     run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
@@ -4370,6 +4390,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         mv_refresh_ctx,
         imv_rewrite_validator,
         mv_rewrite_state,
+        allow_mv_rewrite_candidates,
         run_imv_rewrite,
         execution,
     )?;
@@ -4395,6 +4416,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    allow_mv_rewrite_candidates: bool,
     run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
@@ -4443,7 +4465,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
     // queries never rewrite onto the MV they are computing.
     let mv_candidates = match mv_rewrite_state {
-        Some(state) if mv_refresh_ctx.is_none() => {
+        Some(state) if allow_mv_rewrite_candidates && mv_refresh_ctx.is_none() => {
             crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
                 state,
                 analyzer_catalog,
@@ -6227,6 +6249,14 @@ path = "{metadata_path}"
             warehouse.path().display()
         );
         engine.session().execute(&sql).expect("create catalog");
+        engine
+            .session()
+            .execute(&sql.replacen(
+                "CREATE EXTERNAL CATALOG",
+                "CREATE EXTERNAL CATALOG IF NOT EXISTS",
+                1,
+            ))
+            .expect("CREATE CATALOG IF NOT EXISTS must keep the active control binding");
 
         let registry = engine
             .inner

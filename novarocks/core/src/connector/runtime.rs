@@ -38,9 +38,17 @@ use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
 pub(crate) struct ConnectorBatchReaderIter {
     reader: Option<Box<dyn ConnectorBatchReader>>,
     chunk_schema: ChunkSchemaRef,
+    batch_transform: Option<Arc<dyn ConnectorBatchTransform>>,
     profile: Option<RuntimeProfile>,
     last_metrics: ConnectorReaderMetricsSnapshot,
     finished: bool,
+}
+
+pub(crate) trait ConnectorBatchTransform: Send + Sync {
+    fn transform(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String>;
 }
 
 /// Fragment-local ownership of readers opened by a connector scan source.
@@ -453,6 +461,7 @@ impl ConnectorBatchReaderIter {
         Self {
             reader: Some(reader),
             chunk_schema,
+            batch_transform: None,
             profile: None,
             last_metrics: ConnectorReaderMetricsSnapshot::default(),
             finished: false,
@@ -466,6 +475,17 @@ impl ConnectorBatchReaderIter {
     ) -> Self {
         let mut iter = Self::new(reader, chunk_schema);
         iter.profile = profile;
+        iter
+    }
+
+    fn with_profile_and_transform(
+        reader: Box<dyn ConnectorBatchReader>,
+        chunk_schema: ChunkSchemaRef,
+        profile: Option<RuntimeProfile>,
+        batch_transform: Option<Arc<dyn ConnectorBatchTransform>>,
+    ) -> Self {
+        let mut iter = Self::with_profile(reader, chunk_schema, profile);
+        iter.batch_transform = batch_transform;
         iter
     }
 
@@ -572,9 +592,15 @@ impl Iterator for ConnectorBatchReaderIter {
         self.flush_metrics_snapshot(metrics);
         match next_batch {
             Ok(Some(batch)) => Some(
-                Chunk::try_new_with_chunk_schema(batch, self.chunk_schema.clone())
-                    .map_err(|error| error.to_string())
-                    .or_else(|error| self.finish_with_primary_error(error)),
+                (match self.batch_transform.as_ref() {
+                    Some(transform) => transform.transform(batch),
+                    None => Ok(batch),
+                })
+                .and_then(|batch| {
+                    Chunk::try_new_with_chunk_schema(batch, self.chunk_schema.clone())
+                        .map_err(|error| error.to_string())
+                })
+                .or_else(|error| self.finish_with_primary_error(error)),
             ),
             Ok(None) => {
                 self.finished = true;
@@ -604,6 +630,7 @@ pub struct ConnectorReadScanSource {
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
+    batch_transform: Option<Arc<dyn ConnectorBatchTransform>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }
@@ -658,6 +685,7 @@ impl ConnectorReadScanSource {
             ))),
             request,
             chunk_schema,
+            batch_transform: None,
             incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -679,6 +707,7 @@ impl ConnectorReadScanSource {
             ))),
             request,
             chunk_schema,
+            batch_transform: None,
             incremental: Some(incremental),
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -695,6 +724,7 @@ impl ConnectorReadScanSource {
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
             request,
             chunk_schema,
+            batch_transform: None,
             incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -714,6 +744,7 @@ impl ConnectorReadScanSource {
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
             request,
             chunk_schema,
+            batch_transform: None,
             incremental,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -725,11 +756,28 @@ impl ConnectorReadScanSource {
         request: ConnectorOpenReaderRequest,
         chunk_schema: ChunkSchemaRef,
     ) -> Self {
+        Self::new_scheduled_execution_with_batch_transform(
+            binding,
+            scheduled,
+            request,
+            chunk_schema,
+            None,
+        )
+    }
+
+    pub(crate) fn new_scheduled_execution_with_batch_transform(
+        binding: Arc<ConnectorExecutionBinding>,
+        scheduled: Vec<ConnectorScheduledSplit>,
+        request: ConnectorOpenReaderRequest,
+        chunk_schema: ChunkSchemaRef,
+        batch_transform: Option<Arc<dyn ConnectorBatchTransform>>,
+    ) -> Self {
         Self {
             binding: ConnectorReadBinding::Execution(binding),
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, false))),
             request,
             chunk_schema,
+            batch_transform,
             incremental: None,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -749,6 +797,7 @@ impl ConnectorReadScanSource {
             splits: Arc::new(RwLock::new(ConnectorSplitState::new(scheduled, has_more))),
             request,
             chunk_schema,
+            batch_transform: None,
             incremental,
             reader_group: Arc::new(ConnectorReaderGroup::default()),
         }
@@ -765,6 +814,7 @@ impl ScanSource for ConnectorReadScanSource {
             splits: Arc::clone(&self.splits),
             request: self.request.clone(),
             chunk_schema: Arc::clone(&self.chunk_schema),
+            batch_transform: self.batch_transform.clone(),
             incremental: self.incremental.clone(),
             reader_group: Arc::clone(&self.reader_group),
         }))
@@ -776,6 +826,7 @@ struct ConnectorReadScanOp {
     splits: Arc<RwLock<ConnectorSplitState>>,
     request: ConnectorOpenReaderRequest,
     chunk_schema: ChunkSchemaRef,
+    batch_transform: Option<Arc<dyn ConnectorBatchTransform>>,
     incremental: Option<Arc<dyn IncrementalConnectorSplitAdapter>>,
     reader_group: Arc<ConnectorReaderGroup>,
 }
@@ -817,11 +868,14 @@ impl ScanOp for ConnectorReadScanOp {
             }
         });
         let reader = self.reader_group.register(reader, marker)?;
-        Ok(Box::new(ConnectorBatchReaderIter::with_profile(
-            reader,
-            Arc::clone(&self.chunk_schema),
-            profile,
-        )))
+        Ok(Box::new(
+            ConnectorBatchReaderIter::with_profile_and_transform(
+                reader,
+                Arc::clone(&self.chunk_schema),
+                profile,
+                self.batch_transform.clone(),
+            ),
+        ))
     }
 
     fn storage_tablet_id(&self, morsel: &ScanMorsel) -> Result<Option<i64>, String> {

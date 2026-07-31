@@ -291,7 +291,7 @@ fn query_result_columns_to_table_column_defs(
 /// error message directing users to the explicit CREATE TABLE + INSERT path.
 ///
 /// Note: FixedSizeBinary(16) (LARGEINT) is accepted — it maps to
-/// `SqlType::LargeInt` which the Iceberg writer stores as a BINARY(16) column
+/// `SqlType::LargeInt` which the Iceberg writer stores as a FIXED(16) column
 /// with a logical-type property.
 pub(crate) fn arrow_schema_to_table_column_defs(
     schema: &arrow::datatypes::Schema,

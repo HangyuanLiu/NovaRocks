@@ -89,6 +89,17 @@ fn parquet_projects_field_ids() {
     .expect("open reader");
     let batches = collect(reader.as_mut()).expect("read Parquet");
     assert_eq!(batches[0].batch.schema().field(0).name(), "name");
+    assert_eq!(
+        batches[0]
+            .batch
+            .schema()
+            .field(0)
+            .metadata()
+            .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            .map(String::as_str),
+        Some("20"),
+        "physical Parquet decoding must retain field IDs for Iceberg schema evolution"
+    );
 }
 
 #[test]

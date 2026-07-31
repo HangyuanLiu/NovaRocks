@@ -294,35 +294,15 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
 }
 
 fn looks_like_maintenance_statement(sql: &str) -> bool {
+    if crate::sql::parser::procedure::looks_like_call_procedure(sql) {
+        return true;
+    }
     let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;
     };
     let Ok(mut parser) = Parser::new(&StarRocksDialect).try_with_sql(&normalized) else {
         return false;
     };
-    if parser.parse_keyword(Keyword::CALL) {
-        let Ok(name) = parser.parse_object_name(false) else {
-            return false;
-        };
-        let normalized_name = name
-            .to_string()
-            .replace(['`', '"', ' '], "")
-            .to_ascii_lowercase();
-        let parts = normalized_name.split('.').collect::<Vec<_>>();
-        let [_, namespace, procedure] = parts.as_slice() else {
-            return false;
-        };
-        return *namespace == "system"
-            && [
-                "rewrite_data_files",
-                "rewrite_manifests",
-                "expire_snapshots",
-                "remove_orphan_files",
-                "rewrite_position_delete_files",
-            ]
-            .iter()
-            .any(|candidate| procedure == candidate);
-    }
     if parser.parse_keyword(Keyword::SHOW) {
         return parser.parse_keyword(Keyword::ALTER)
             && parser.parse_keyword(Keyword::TABLE)

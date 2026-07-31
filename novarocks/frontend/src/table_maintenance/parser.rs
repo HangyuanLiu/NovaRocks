@@ -25,14 +25,6 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-const PROCEDURES: [&str; 5] = [
-    "rewrite_data_files",
-    "rewrite_manifests",
-    "expire_snapshots",
-    "remove_orphan_files",
-    "rewrite_position_delete_files",
-];
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsedMaintenanceStatement {
     Execute {
@@ -265,11 +257,7 @@ pub(super) fn is_spark_maintenance_call(sql: &str) -> bool {
 fn maintenance_candidate(sql: &str) -> Option<MaintenanceCandidate> {
     let mut parser = Parser::new(&MaintenanceSqlDialect).try_with_sql(sql).ok()?;
     if parser.parse_keyword(Keyword::CALL) {
-        let name = parser.parse_object_name(false).ok()?;
-        let procedure = raw_object_name_parts(&name).ok()?.pop()?;
-        return PROCEDURES
-            .contains(&procedure.to_ascii_lowercase().as_str())
-            .then_some(MaintenanceCandidate::SparkCall);
+        return Some(MaintenanceCandidate::SparkCall);
     }
     if parser.parse_keyword(Keyword::SHOW) {
         return (parser.parse_keyword(Keyword::ALTER)

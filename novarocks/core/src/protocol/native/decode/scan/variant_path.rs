@@ -34,19 +34,12 @@ pub(super) struct NativeVariantPathPlan {
 
 pub(super) fn parse_native_scan_variant_path_columns(
     scan: &plan::ScanNode,
-    table: &plan::IcebergTableInfo,
+    table: &plan::TableDef,
     output_columns: &[common::OutputColumn],
 ) -> Result<NativeVariantPathPlan, NativeFragmentLeafDecodeError> {
     if scan.variant_columns.is_empty() {
         return Ok(NativeVariantPathPlan::default());
     }
-    let table_def = scan.table.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "table",
-            "ScanNode table missing",
-        )
-    })?;
     let output_by_slot = output_columns
         .iter()
         .map(|col| (SlotId::new(col.column_id), col))
@@ -97,7 +90,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
                 ),
             ));
         }
-        let source_table_column = table_def
+        let source_table_column = table
             .columns
             .iter()
             .find(|col| col.name == source_name)
@@ -125,14 +118,6 @@ pub(super) fn parse_native_scan_variant_path_columns(
                 ),
             ));
         }
-        let source_field_id = iceberg_schema_field_id(table, &source_name).ok_or_else(|| {
-            variant_error(
-                idx,
-                "source_column",
-                ProtocolErrorKind::InvalidValue,
-                format!("source_column={source_name:?} is missing from Iceberg schema"),
-            )
-        })?;
 
         let output_column = output_by_slot.get(&output_slot_id).ok_or_else(|| {
             variant_error(
@@ -204,7 +189,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
             source_slot_id,
             source_read_slot_id: source_slot_id,
             output_slot_id,
-            source_field_id: Some(source_field_id),
+            source_field_id: None,
             source_name: source_name.clone(),
             output_name: output_name.clone(),
             source_field: Field::new(source_name, source_type, source_table_column.nullable),
@@ -286,12 +271,4 @@ fn is_supported_native_variant_path_requested_type(data_type: &DataType) -> bool
         data_type,
         DataType::Boolean | DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Date32
     )
-}
-
-fn iceberg_schema_field_id(table: &plan::IcebergTableInfo, name: &str) -> Option<i32> {
-    table
-        .schema
-        .as_ref()
-        .and_then(|schema| schema.fields.iter().find(|field| field.name == name))
-        .map(|field| field.field_id)
 }

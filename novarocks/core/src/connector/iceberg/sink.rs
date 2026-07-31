@@ -66,7 +66,7 @@ use crate::connector::iceberg::sink_plan::{
     PositionDeleteDataFilePartition,
 };
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -410,6 +410,7 @@ impl IcebergTableSinkFactory {
 struct SharedDeletionVectorState {
     pending: BTreeMap<String, crate::connector::iceberg::commit::DeletionVector>,
     finished_drivers: usize,
+    query_id: Option<crate::runtime::query_context::QueryId>,
 }
 
 struct IcebergTableSinkBackend {
@@ -429,6 +430,17 @@ impl AsyncSinkBackend for IcebergTableSinkBackend {
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
         self.runtime_state = Some(state.clone());
+        if self.plan.mode == IcebergSinkMode::DeletionVectors {
+            let query_id = state.query_id();
+            let mut shared = self.shared_deletion_vectors.lock().map_err(|error| {
+                format!("iceberg deletion-vector sink shared state lock failed: {error}")
+            })?;
+            if shared.query_id != query_id {
+                shared.pending.clear();
+                shared.finished_drivers = 0;
+                shared.query_id = query_id;
+            }
+        }
         Ok(())
     }
 
@@ -452,7 +464,7 @@ impl AsyncSinkBackend for IcebergTableSinkBackend {
 
     async fn finish(&mut self) -> Result<(), String> {
         if self.plan.mode == IcebergSinkMode::DeletionVectors {
-            return self.finish_deletion_vectors();
+            return self.finish_deletion_vectors().await;
         }
         Ok(())
     }
@@ -798,7 +810,7 @@ impl IcebergTableSinkBackend {
         Ok(())
     }
 
-    fn finish_deletion_vectors(&mut self) -> Result<(), String> {
+    async fn finish_deletion_vectors(&mut self) -> Result<(), String> {
         if self.deletion_vectors_finished {
             return Ok(());
         }
@@ -832,11 +844,22 @@ impl IcebergTableSinkBackend {
         // The existing-delete read factory itself is rooted from table metadata.
         let file_io =
             build_staged_file_io(&self.plan.data_location, self.plan.object_store_s3.as_ref())?;
-        let existing = self.read_existing_dv_positions(
-            &metadata,
-            &file_io,
-            pending_deletion_vectors.keys().map(String::as_str),
-        )?;
+        let plan = Arc::clone(&self.plan);
+        let existing_metadata = metadata.clone();
+        let existing_file_io = file_io.clone();
+        let owned_files = pending_deletion_vectors.keys().cloned().collect::<Vec<_>>();
+        let existing = tokio::task::spawn_blocking(move || {
+            Self::read_existing_dv_positions(
+                &plan,
+                &existing_metadata,
+                &existing_file_io,
+                owned_files,
+            )
+        })
+        .await
+        .map_err(|error| {
+            format!("iceberg deletion-vector sink join existing-delete read: {error}")
+        })??;
         let vectors =
             merge_existing_with_pending_deletion_vectors(existing, &pending_deletion_vectors);
 
@@ -858,13 +881,13 @@ impl IcebergTableSinkBackend {
                 })?
                 .to_string()
                 + ".puffin";
-            let written = data_block_on(write_single_deletion_vector_puffin(
+            let written = write_single_deletion_vector_puffin(
                 &file_io,
                 &puffin_path,
                 &referenced_data_file,
                 &dv,
-            ))
-            .map_err(|e| format!("iceberg deletion-vector sink wait for Puffin write failed: {e}"))?
+            )
+            .await
             .map_err(|e| format!("iceberg deletion-vector sink write Puffin failed: {e}"))?;
             let cardinality = i64::try_from(written.cardinality).map_err(|_| {
                 format!(
@@ -959,18 +982,16 @@ impl IcebergTableSinkBackend {
         self.plan.build_target_table_metadata(&writer_schema)
     }
 
-    fn read_existing_dv_positions<'a>(
-        &self,
+    fn read_existing_dv_positions(
+        plan: &IcebergSinkPlan,
         metadata: &iceberg::spec::TableMetadata,
         file_io: &iceberg::io::FileIO,
-        owned_files: impl IntoIterator<Item = &'a str>,
+        owned_files: Vec<String>,
     ) -> Result<HashMap<String, crate::connector::iceberg::commit::DeletionVector>, String> {
-        let Some(snapshot_id) = delete_target_snapshot_id(metadata, self.plan.target_snapshot_id)
-        else {
+        let Some(snapshot_id) = delete_target_snapshot_id(metadata, plan.target_snapshot_id) else {
             return Ok(HashMap::new());
         };
-        let object_store_cfg = self
-            .plan
+        let object_store_cfg = plan
             .object_store_s3
             .as_ref()
             .map(IcebergSinkObjectStoreConfig::to_object_store_config);
@@ -989,7 +1010,7 @@ impl IcebergTableSinkBackend {
         )?;
         let expected_object_store_bucket =
             crate::connector::iceberg::changes::expected_object_store_bucket_for_table(&table)?;
-        let owned_files: HashSet<&str> = owned_files.into_iter().collect();
+        let owned_files: HashSet<String> = owned_files.into_iter().collect();
         let existing = crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
             &table,
             snapshot_id,
@@ -1325,7 +1346,16 @@ fn align_arrays_to_schema(
                 return Ok(array);
             }
 
-            let casted = cast(array.as_ref(), target_type).map_err(|e| {
+            let casted = if matches!(
+                target_type,
+                DataType::FixedSizeBinary(width)
+                    if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+            ) {
+                cast_with_special_rules(&array, target_type)
+            } else {
+                cast(array.as_ref(), target_type).map_err(|e| e.to_string())
+            }
+            .map_err(|e| {
                 format!(
                     "iceberg sink cast failed at column index {} name={} from {:?} to {:?}: {}",
                     idx,
@@ -2457,7 +2487,9 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
-    use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
+    use arrow::array::{
+        Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::basic::Compression;
@@ -3779,6 +3811,31 @@ mod tests {
         assert_eq!(out.value(0), 1);
         assert!(out.is_null(1));
         assert_eq!(out.value(2), 2);
+    }
+
+    #[test]
+    fn test_align_arrays_to_schema_casts_int64_to_largeint() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c0",
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+            true,
+        )]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(-1), None, Some(2)]))];
+
+        let aligned = align_arrays_to_schema(arrays, &schema).expect("align arrays");
+        let out = aligned[0]
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint array");
+        assert_eq!(
+            novarocks_types::largeint::value_at(out, 0).expect("first value"),
+            -1
+        );
+        assert!(out.is_null(1));
+        assert_eq!(
+            novarocks_types::largeint::value_at(out, 2).expect("last value"),
+            2
+        );
     }
 
     #[test]

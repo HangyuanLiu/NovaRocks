@@ -2304,10 +2304,13 @@ pub(crate) fn iceberg_type_for_sql_type(
             scale: *scale as u32,
         }),
         SqlType::BigInt => Type::Primitive(PrimitiveType::Long),
-        SqlType::LargeInt => Type::Primitive(PrimitiveType::Decimal {
-            precision: 38,
-            scale: 0,
-        }),
+        // Iceberg DECIMAL is capped at 38 digits, while StarRocks LARGEINT
+        // covers the complete signed i128 range (including -2^127). Preserve
+        // the SQL representation as its native fixed-width two's-complement
+        // payload instead of silently coercing out-of-range values to NULL.
+        SqlType::LargeInt => Type::Primitive(PrimitiveType::Fixed(
+            novarocks_types::largeint::LARGEINT_BYTE_WIDTH as u64,
+        )),
         SqlType::String | SqlType::Json => Type::Primitive(PrimitiveType::String),
         SqlType::Binary | SqlType::Bitmap | SqlType::Hll => Type::Primitive(PrimitiveType::Binary),
         SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
@@ -2975,6 +2978,7 @@ pub(crate) fn logical_type_property_value(data_type: &SqlType) -> Option<String>
     match data_type {
         SqlType::TinyInt => Some("tinyint".to_string()),
         SqlType::SmallInt => Some("smallint".to_string()),
+        SqlType::LargeInt => Some("largeint".to_string()),
         SqlType::Date => Some("date".to_string()),
         SqlType::Bitmap => Some("bitmap".to_string()),
         SqlType::Hll => Some("hll".to_string()),
@@ -2987,6 +2991,7 @@ fn parse_logical_type_property_value(value: &str) -> Option<SqlType> {
     match value {
         "tinyint" => Some(SqlType::TinyInt),
         "smallint" => Some(SqlType::SmallInt),
+        "largeint" => Some(SqlType::LargeInt),
         "date" => Some(SqlType::Date),
         "bitmap" => Some(SqlType::Bitmap),
         "hll" => Some(SqlType::Hll),
@@ -3461,7 +3466,7 @@ mod table_property_tests {
     }
 
     #[test]
-    fn bitmap_hll_columns_are_persisted_as_logical_type_properties() {
+    fn special_columns_are_persisted_as_logical_type_properties() {
         let columns = vec![
             crate::sql::parser::ast::TableColumnDef {
                 name: "bm".to_string(),
@@ -3477,6 +3482,13 @@ mod table_property_tests {
                 aggregation: None,
                 default: None,
             },
+            crate::sql::parser::ast::TableColumnDef {
+                name: "li".to_string(),
+                data_type: SqlType::LargeInt,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
         ];
 
         let props = build_logical_type_properties(&columns).expect("logical properties");
@@ -3485,10 +3497,29 @@ mod table_property_tests {
             "bitmap".to_string()
         )));
         assert!(props.contains(&("novarocks.logical_type.hv".to_string(), "hll".to_string())));
+        assert!(props.contains(&(
+            "novarocks.logical_type.li".to_string(),
+            "largeint".to_string()
+        )));
 
         let parsed = parse_logical_type_properties(&props.into_iter().collect()).expect("parse");
         assert_eq!(parsed.get("bm"), Some(&SqlType::Bitmap));
         assert_eq!(parsed.get("hv"), Some(&SqlType::Hll));
+        assert_eq!(parsed.get("li"), Some(&SqlType::LargeInt));
+    }
+
+    #[test]
+    fn largeint_schema_uses_fixed_width_payload() {
+        let mut next_field_id = 1;
+        let iceberg_type = iceberg_type_for_sql_type(&SqlType::LargeInt, &mut next_field_id)
+            .expect("map largeint");
+
+        assert_eq!(
+            iceberg_type,
+            Type::Primitive(PrimitiveType::Fixed(
+                novarocks_types::largeint::LARGEINT_BYTE_WIDTH as u64
+            ))
+        );
     }
 
     #[test]

@@ -1073,6 +1073,11 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
         DataType::Int16 => SqlType::SmallInt,
         DataType::Int32 => SqlType::Int,
         DataType::Int64 => SqlType::BigInt,
+        DataType::FixedSizeBinary(width)
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            SqlType::LargeInt
+        }
         DataType::Float32 => SqlType::Float,
         DataType::Float64 => SqlType::Double,
         DataType::Decimal128(precision, scale) => SqlType::Decimal {
@@ -1842,6 +1847,16 @@ mod tests {
                 "case={name}"
             );
         }
+    }
+
+    #[test]
+    fn fixed_size_binary_largeint_maps_to_largeint_sql_type() {
+        assert_eq!(
+            arrow_data_type_to_sql_type(&DataType::FixedSizeBinary(
+                novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+            )),
+            Ok(SqlType::LargeInt)
+        );
     }
 
     #[test]

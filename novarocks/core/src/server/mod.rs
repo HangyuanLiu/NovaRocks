@@ -65,7 +65,12 @@ use crate::query_execution::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
 };
+#[cfg(test)]
 use crate::runtime::query_result::QueryResult;
+#[cfg(test)]
+use crate::runtime::user_variable::{
+    query_result_to_user_variable_literal, user_variable_literal_to_sql,
+};
 use crate::sql::optimizer::options::SessionOptimizerSettings;
 use crate::sql::parser::dialect::StarRocksDialect;
 use crate::sql::parser::dialect::backend::{
@@ -1386,6 +1391,25 @@ mod legacy {
         value_str.parse::<u64>().ok()
     }
 
+    fn parse_set_i64(query: &str, keyword: &str) -> Option<i64> {
+        let normalized = query.replace('=', " = ");
+        let mut parts = normalized.split_whitespace();
+        let head = parts.next()?;
+        if !head.eq_ignore_ascii_case("set") {
+            return None;
+        }
+        let actual_keyword = parts.next()?;
+        if !actual_keyword.eq_ignore_ascii_case(keyword) {
+            return None;
+        }
+        let next = parts.next()?;
+        let value_str = if next == "=" { parts.next()? } else { next };
+        if parts.next().is_some() {
+            return None;
+        }
+        value_str.parse::<i64>().ok()
+    }
+
     /// Parse `SET <keyword> = <float>`. Uses the same keyword-exact-match logic as
     /// `parse_set_non_negative_integer`: the keyword must be followed by whitespace
     /// or `=`, so `..._min_size` cannot match `..._min_selectivity` and vice versa.
@@ -1441,11 +1465,9 @@ mod legacy {
     }
 
     /// Parse `SET group_concat_max_len = N` and `SET group_concat_max_len=N`.
-    /// `N` must be a non-negative integer and is clamped later by FE-compatible
-    /// lowering rules.
+    /// Signed values are accepted and clamped later by aggregate lowering.
     fn parse_set_group_concat_max_len(query: &str) -> Option<i64> {
-        let value = parse_set_non_negative_integer(query, "group_concat_max_len")?;
-        i64::try_from(value).ok()
+        parse_set_i64(query, "group_concat_max_len")
     }
 
     fn apply_broadcast_profile_set(settings: &mut SessionOptimizerSettings, trimmed: &str) -> bool {
@@ -2083,7 +2105,8 @@ mod legacy {
         let rewritten = substitute_session_user_variables(inner_query, &shim.user_variables)
             .map_err(|err| (ErrorKind::ER_PARSE_ERROR, err))?;
         match execute_sql_in_worker(shim, rewritten).await? {
-            StatementResult::Query(result) => query_result_to_user_variable_literal(&result),
+            StatementResult::Query(result) => query_result_to_user_variable_literal(&result)
+                .map_err(|message| (ErrorKind::ER_UNKNOWN_ERROR, message)),
             StatementResult::Ok => Err((
                 ErrorKind::ER_WRONG_VALUE,
                 "user variable assignment query did not return a value".to_string(),
@@ -2096,200 +2119,6 @@ mod legacy {
         let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?.trim();
         let lower = inner.to_ascii_lowercase();
         (lower.starts_with("select ") || lower.starts_with("with ")).then_some(inner)
-    }
-
-    fn query_result_to_user_variable_literal(
-        result: &QueryResult,
-    ) -> Result<String, (ErrorKind, String)> {
-        if result.columns.len() != 1 {
-            return Err((
-                ErrorKind::ER_OPERAND_COLUMNS,
-                format!(
-                    "user variable assignment expected 1 column, got {}",
-                    result.columns.len()
-                ),
-            ));
-        }
-        let row_count = result.row_count();
-        if row_count == 0 {
-            return Ok("null".to_string());
-        }
-        if row_count > 1 {
-            return Err((
-                ErrorKind::ER_SUBQUERY_NO_1_ROW,
-                "Subquery returns more than 1 row".to_string(),
-            ));
-        }
-        for chunk in &result.chunks {
-            if chunk.len() == 0 {
-                continue;
-            }
-            let column = chunk
-                .columns()
-                .first()
-                .ok_or((ErrorKind::ER_UNKNOWN_ERROR, "empty query chunk".to_string()))?;
-            let declared = result.columns.first().ok_or((
-                ErrorKind::ER_UNKNOWN_ERROR,
-                "user variable assignment missing column metadata".to_string(),
-            ))?;
-            return Ok(
-                query_result_cell_to_user_variable_sql(column, &declared.data_type, 0)
-                    .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err))?,
-            );
-        }
-        Ok("null".to_string())
-    }
-
-    fn query_result_cell_to_user_variable_sql(
-        column: &arrow::array::ArrayRef,
-        declared_type: &arrow::datatypes::DataType,
-        row_idx: usize,
-    ) -> Result<String, String> {
-        if column.is_null(row_idx) {
-            return Ok("NULL".to_string());
-        }
-        if let Some(text) = arrow_text_cell(column, row_idx) {
-            return user_variable_text_to_sql(&text?, declared_type);
-        }
-        let literal = crate::sql::literal::literal_from_batch(column, row_idx)?;
-        user_variable_literal_to_sql(&literal)
-    }
-
-    fn arrow_text_cell(
-        column: &arrow::array::ArrayRef,
-        row_idx: usize,
-    ) -> Option<Result<String, String>> {
-        match column.data_type() {
-            arrow::datatypes::DataType::Utf8 => {
-                let arr = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .ok_or_else(|| {
-                        "failed to downcast user variable value to StringArray".to_string()
-                    });
-                Some(arr.map(|arr| arr.value(row_idx).to_string()))
-            }
-            arrow::datatypes::DataType::LargeUtf8 => {
-                let arr = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::LargeStringArray>()
-                    .ok_or_else(|| {
-                        "failed to downcast user variable value to LargeStringArray".to_string()
-                    });
-                Some(arr.map(|arr| arr.value(row_idx).to_string()))
-            }
-            arrow::datatypes::DataType::Binary => {
-                let arr = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::BinaryArray>()
-                    .ok_or_else(|| {
-                        "failed to downcast user variable value to BinaryArray".to_string()
-                    });
-                Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
-            }
-            arrow::datatypes::DataType::LargeBinary => {
-                let arr = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::LargeBinaryArray>()
-                    .ok_or_else(|| {
-                        "failed to downcast user variable value to LargeBinaryArray".to_string()
-                    });
-                Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
-            }
-            _ => None,
-        }
-    }
-
-    fn user_variable_text_to_sql(
-        text: &str,
-        declared_type: &arrow::datatypes::DataType,
-    ) -> Result<String, String> {
-        use arrow::datatypes::DataType;
-
-        Ok(match declared_type {
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _) => text.to_string(),
-            DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::Map(_, _)
-            | DataType::Struct(_) => text.to_string(),
-            DataType::Null => "NULL".to_string(),
-            _ => single_quoted_user_variable_sql(text),
-        })
-    }
-
-    fn user_variable_literal_to_sql(
-        literal: &crate::sql::parser::ast::Literal,
-    ) -> Result<String, String> {
-        use crate::sql::parser::ast::Literal;
-
-        Ok(match literal {
-            Literal::Null => "NULL".to_string(),
-            Literal::Bool(value) => {
-                if *value {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                }
-            }
-            Literal::Int(value) => value.to_string(),
-            Literal::Float(value) => {
-                if !value.is_finite() {
-                    return Err(format!(
-                        "non-finite floating literal is not supported: {value}"
-                    ));
-                }
-                value.to_string()
-            }
-            Literal::String(value) | Literal::Date(value) => single_quoted_user_variable_sql(value),
-            Literal::Array(items) => format!(
-                "[{}]",
-                items
-                    .iter()
-                    .map(user_variable_literal_to_sql)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ")
-            ),
-            Literal::Map(entries) => {
-                let mut args = Vec::with_capacity(entries.len() * 2);
-                for (key, value) in entries {
-                    args.push(user_variable_literal_to_sql(key)?);
-                    args.push(user_variable_literal_to_sql(value)?);
-                }
-                format!("map({})", args.join(", "))
-            }
-            Literal::Struct(values) => format!(
-                "row({})",
-                values
-                    .iter()
-                    .map(user_variable_literal_to_sql)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(", ")
-            ),
-        })
-    }
-
-    fn single_quoted_user_variable_sql(value: &str) -> String {
-        let mut escaped = String::with_capacity(value.len() + 2);
-        for ch in value.chars() {
-            match ch {
-                '\'' => escaped.push_str("''"),
-                '\\' => escaped.push_str(r"\\"),
-                _ => escaped.push(ch),
-            }
-        }
-        format!("'{escaped}'")
     }
 
     fn resolve_catalog_name(
@@ -2854,6 +2683,10 @@ mod legacy {
             assert_eq!(
                 parse_set_group_concat_max_len("SET GROUP_CONCAT_MAX_LEN = 0"),
                 Some(0)
+            );
+            assert_eq!(
+                parse_set_group_concat_max_len("SET group_concat_max_len = -121"),
+                Some(-121)
             );
         }
 

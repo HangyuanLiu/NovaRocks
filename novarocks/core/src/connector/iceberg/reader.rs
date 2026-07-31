@@ -530,6 +530,13 @@ fn align_batch_to_schema(
                     let source = batch.column(index).clone();
                     if source.data_type() == target.data_type() {
                         source
+                    } else if matches!(target.data_type(), DataType::LargeBinary)
+                        && crate::formats::parquet::is_variant_struct_data_type(source.data_type())
+                    {
+                        crate::formats::parquet::collapse_variant_struct_to_largebinary(
+                            &source,
+                            target.name(),
+                        )?
                     } else {
                         cast(source.as_ref(), target.data_type()).map_err(|error| {
                             format!(
@@ -543,6 +550,15 @@ fn align_batch_to_schema(
                 }
                 None if is_iceberg_virtual(target.name()) => {
                     iceberg_virtual_column(target, batch.num_rows(), positions, &facts)?
+                }
+                None if target.metadata().contains_key(
+                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY,
+                ) =>
+                {
+                    crate::formats::parquet::build_iceberg_default_array(
+                        target.as_ref(),
+                        batch.num_rows(),
+                    )?
                 }
                 None if target.is_nullable() => {
                     new_null_array(target.data_type(), batch.num_rows())
@@ -809,6 +825,46 @@ mod tests {
             20
         );
         assert_eq!(aligned.column(2).null_count(), 1);
+    }
+
+    #[test]
+    fn aligns_iceberg_output_with_initial_default_for_missing_field() {
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field_with_id("id", 1, false)])),
+            vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+        )
+        .expect("source batch");
+        let expected = Arc::new(Schema::new(vec![
+            field_with_id("id", 1, false),
+            Field::new("introduced", DataType::Int32, true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string()),
+                (
+                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+                    "5".to_string(),
+                ),
+            ])),
+        ]));
+
+        let aligned = align_batch_to_schema(
+            &expected,
+            source,
+            None,
+            IcebergFileFacts {
+                path: "file:///test.parquet",
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+            },
+        )
+        .expect("initial default must fill older data files");
+
+        let introduced = aligned
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("introduced column");
+        assert_eq!(introduced.value(0), 5);
+        assert_eq!(introduced.null_count(), 0);
     }
 
     #[test]

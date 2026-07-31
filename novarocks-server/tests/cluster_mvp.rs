@@ -2171,6 +2171,18 @@ fn cross_process_three_be_mv_state_store_restart() {
     .expect("create restart base table");
     conn.query_drop("INSERT INTO orders VALUES (1, 10), (2, 20)")
         .expect("seed restart base table");
+    let base_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders ORDER BY k1")
+        .expect("read restart base table before MV refresh");
+    assert_eq!(base_rows, vec![(1, 10), (2, 20)]);
+    let row_ids: Vec<i64> = conn
+        .query("SELECT _row_id FROM orders ORDER BY k1")
+        .expect("read restart base row lineage before MV refresh");
+    assert_eq!(row_ids.len(), 2);
+    let physical_rows: Vec<(i32, i64, i64)> = conn
+        .query("SELECT k1, v2, _row_id AS __nova_base_row_id FROM orders ORDER BY k1")
+        .expect("read restart base physical projection before MV refresh");
+    assert_eq!(physical_rows.len(), 2);
     conn.query_drop(
         "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 \
          AS SELECT k1, v2 FROM orders",

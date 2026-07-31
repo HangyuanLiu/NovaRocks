@@ -76,30 +76,81 @@ fn explain_distributed_plan_inner(
     let fragments = explain_fragment_order(dp);
     let detailed = is_detailed(level);
 
-    if detailed && !dp.runtime_filter_graph().is_empty() {
-        out.push("RUNTIME FILTER GRAPH".to_string());
-        for channel in dp.runtime_filter_graph().channels() {
-            out.push("  runtime filter".to_string());
-            out.push(format!(
-                "    domain = {}",
-                format_runtime_filter_domain(&channel.logical_domain)
-            ));
-            for binding in dp
+    let visible_runtime_filter_channels = dp
+        .runtime_filter_graph()
+        .channels()
+        .filter(|channel| {
+            matches!(
+                channel.logical_domain,
+                RuntimeFilterLogicalDomain::Membership { .. }
+            ) || dp
                 .runtime_filter_graph()
                 .bindings()
-                .filter(|binding| binding.channel_id == channel.channel_id)
-            {
-                match &binding.role {
-                    RuntimeFilterBindingRole::Producer(requirement) => out.push(format!(
-                        "    producer binding: target = {}, expr = ({})",
-                        format_runtime_filter_producer_target(&requirement.target),
-                        format_expr(&binding.expression),
-                    )),
-                    RuntimeFilterBindingRole::Consumer(requirement) => out.push(format!(
-                        "    consumer binding: activation = {}, expr = ({})",
-                        format_runtime_filter_activation(requirement.activation),
-                        format_expr(&binding.expression),
-                    )),
+                .filter(|binding| {
+                    binding.channel_id == channel.channel_id
+                        && matches!(binding.role, RuntimeFilterBindingRole::Consumer(_))
+                })
+                .count()
+                == 1
+        })
+        .collect::<Vec<_>>();
+    if detailed && !visible_runtime_filter_channels.is_empty() {
+        out.push("RUNTIME FILTER GRAPH".to_string());
+        for channel in visible_runtime_filter_channels {
+            match &channel.logical_domain {
+                RuntimeFilterLogicalDomain::Membership { .. } => {
+                    out.push(format!(
+                        "  runtime filter channel {}",
+                        channel.channel_id.get()
+                    ));
+                    for binding in dp
+                        .runtime_filter_graph()
+                        .bindings()
+                        .filter(|binding| binding.channel_id == channel.channel_id)
+                    {
+                        match &binding.role {
+                            RuntimeFilterBindingRole::Producer(_) => out.push(format!(
+                                "    producer binding {}, fragment = {}, node = {}, expr = ({})",
+                                binding.binding_id.get(),
+                                binding.location.fragment_id.get(),
+                                binding.location.node_id.get(),
+                                format_expr(&binding.expression)
+                            )),
+                            RuntimeFilterBindingRole::Consumer(requirement) => out.push(format!(
+                                "    consumer binding {}, fragment = {}, node = {}, expr = ({}), activation = {:?}",
+                                binding.binding_id.get(),
+                                binding.location.fragment_id.get(),
+                                binding.location.node_id.get(),
+                                format_expr(&binding.expression),
+                                requirement.activation
+                            )),
+                        }
+                    }
+                }
+                RuntimeFilterLogicalDomain::OrderedBound(_) => {
+                    out.push("  runtime filter".to_string());
+                    out.push(format!(
+                        "    domain = {}",
+                        format_runtime_filter_domain(&channel.logical_domain)
+                    ));
+                    for binding in dp
+                        .runtime_filter_graph()
+                        .bindings()
+                        .filter(|binding| binding.channel_id == channel.channel_id)
+                    {
+                        match &binding.role {
+                            RuntimeFilterBindingRole::Producer(requirement) => out.push(format!(
+                                "    producer binding: target = {}, expr = ({})",
+                                format_runtime_filter_producer_target(&requirement.target),
+                                format_expr(&binding.expression),
+                            )),
+                            RuntimeFilterBindingRole::Consumer(requirement) => out.push(format!(
+                                "    consumer binding: activation = {}, expr = ({})",
+                                format_runtime_filter_activation(requirement.activation),
+                                format_expr(&binding.expression),
+                            )),
+                        }
+                    }
                 }
             }
         }
@@ -2091,13 +2142,13 @@ mod tests {
                 "missing graph header at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("domain = Membership(")
-                    && text.contains("target = JoinBuildKey(ordinal=0)")
+                text.contains("runtime filter channel ")
+                    && text.contains("fragment =")
                     && text.contains("activation = BlockingSnapshot"),
-                "missing stable Join runtime-filter contract at {level:?}:\n{text}"
+                "missing stable Join runtime-filter graph at {level:?}:\n{text}"
             );
             assert!(
-                text.contains("producer binding:") && text.contains("consumer binding:"),
+                text.contains("producer binding ") && text.contains("consumer binding "),
                 "missing graph bindings at {level:?}:\n{text}"
             );
         }

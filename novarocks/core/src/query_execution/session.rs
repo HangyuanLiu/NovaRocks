@@ -71,15 +71,10 @@ impl SessionExecutionSettings {
         self.query_timeout_secs = (seconds > 0).then_some(seconds);
     }
 
-    pub fn set_group_concat_max_len(&mut self, value: i64) -> Result<(), QueryServiceError> {
-        if value < 0 {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                "group_concat_max_len must be non-negative",
-            ));
-        }
+    /// Keep the session value verbatim; aggregate lowering clamps it to the
+    /// supported minimum before execution.
+    pub fn set_group_concat_max_len(&mut self, value: i64) {
         self.group_concat_max_len = value;
-        Ok(())
     }
 
     pub fn set_pipeline_dop(&mut self, value: i32) {
@@ -228,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_settings_validate_before_materializing_runtime_options() {
+    fn execution_settings_preserve_group_concat_value_before_materializing_options() {
         let mut settings = SessionExecutionSettings::default();
         settings.set_query_timeout_secs(17);
         settings.set_pipeline_dop(4);
@@ -236,13 +231,8 @@ mod tests {
             .set_runtime_filter_scan_wait_time_ms(0)
             .expect("zero is valid");
         assert_eq!(settings.query_timeout_secs(), Some(17));
-        assert_eq!(
-            settings
-                .set_group_concat_max_len(-1)
-                .expect_err("negative values are rejected")
-                .kind(),
-            QueryServiceErrorKind::InvalidValue
-        );
+        settings.set_group_concat_max_len(-1);
+        assert_eq!(settings.query_options().group_concat_max_len(), Some(-1));
         let _opaque_runtime_options = settings.query_options();
     }
 }

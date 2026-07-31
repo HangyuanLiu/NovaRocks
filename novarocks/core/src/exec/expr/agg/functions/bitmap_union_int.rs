@@ -18,17 +18,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, FixedSizeBinaryArray, Int8Array,
-    Int16Array, Int32Array, Int64Array, Int64Builder, LargeBinaryArray, LargeStringArray,
-    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int8Array, Int16Array, Int32Array,
+    Int64Array, Int64Builder, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 
-use crate::exec::node::aggregate::AggFunction;
-use novarocks_types::largeint;
-
 use super::super::*;
 use super::AggregateFunction;
+use crate::exec::node::aggregate::AggFunction;
 
 pub(super) struct BitmapUnionIntAgg;
 
@@ -304,7 +302,6 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     | DataType::LargeUtf8
                     | DataType::Binary
                     | DataType::LargeBinary
-                    | DataType::FixedSizeBinary(_)
             ) {
                 return Err(format!(
                     "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
@@ -635,34 +632,6 @@ impl AggregateFunction for BitmapUnionIntAgg {
                 }
                 Ok(())
             }
-            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let Ok(value) = largeint::i128_from_be_bytes(arr.value(row)) else {
-                        continue;
-                    };
-                    if !include_negative && value < 0 {
-                        continue;
-                    }
-                    if value < i64::MIN as i128 || value > u64::MAX as i128 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    if value < 0 {
-                        state.values.insert((value as i64) as u64);
-                    } else {
-                        state.values.insert(value as u64);
-                    }
-                }
-                Ok(())
-            }
             other => Err(format!(
                 "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
                 other
@@ -769,6 +738,21 @@ mod tests {
         AggregateFunction, BITMAP_TYPE_EMPTY, BitmapUnionIntAgg, decode_bitmap, encode_bitmap,
     };
     use crate::exec::expr::agg::functions::{AggInputView, AggKind, AggSpec, AggStatePtr};
+    use crate::exec::node::aggregate::AggFunction;
+
+    #[test]
+    fn bitmap_agg_rejects_largeint_input() {
+        let function = AggFunction {
+            name: "bitmap_agg".to_string(),
+            ..Default::default()
+        };
+
+        let error = BitmapUnionIntAgg
+            .build_spec_from_type(&function, Some(&DataType::FixedSizeBinary(16)), false)
+            .expect_err("LARGEINT must not be accepted as a bitmap aggregate input");
+
+        assert!(error.contains("bitmap aggregate expects"), "{error}");
+    }
 
     #[test]
     fn bitmap_union_int_encodes_single32() {
