@@ -175,6 +175,7 @@ fn planned_connector_read_for_test()
             handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"delta-scan"))
                 .expect("scan handle"),
             output_schema: Arc::new(arrow::datatypes::Schema::empty()),
+            predicate_dispositions: Vec::new(),
         },
         splits: Vec::new(),
         batch: ConnectorBatchBudget {

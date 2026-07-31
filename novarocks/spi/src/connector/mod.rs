@@ -24,6 +24,7 @@ mod handle;
 mod identity;
 mod metadata;
 mod mutation;
+mod predicate;
 mod read;
 
 pub mod conformance;
@@ -65,8 +66,17 @@ pub use mutation::{
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
+pub use predicate::{
+    normalize_predicate_dispositions, validate_static_predicates, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
+    ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType, ConnectorStaticPredicateId,
+    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
+    MAX_CONNECTOR_STATIC_IN_LITERALS, MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATIC_PREDICATES, MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES,
+};
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
     ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
-    ConnectorScan, ConnectorSplitPlanningRequest,
+    ConnectorScan, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult,
 };

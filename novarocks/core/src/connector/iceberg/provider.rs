@@ -47,6 +47,8 @@ use novarocks_spi::connector::{
     ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution,
     CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2186,6 +2188,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         request: ConnectorBeginScanRequest,
     ) -> Result<ConnectorScan, ConnectorError> {
         self.validate_context(&request.context)?;
+        validate_static_predicates(&request.static_predicates)?;
         let table = self.table_payload(table)?;
         let entry = self.entry(self.instance_id.as_str())?;
         let output_schema =
@@ -2214,6 +2217,19 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 )?,
             )?,
             output_schema,
+            predicate_dispositions:
+                request
+                    .static_predicates
+                    .iter()
+                    .map(
+                        |predicate| {
+                            novarocks_spi::connector::ConnectorPredicateDisposition {
+                    predicate_id: predicate.id,
+                    kind: novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported,
+                }
+                        },
+                    )
+                    .collect(),
         })
     }
 
@@ -2221,7 +2237,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         &self,
         scan: &ConnectorScanHandle,
         request: ConnectorSplitPlanningRequest,
-    ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
         self.validate_context(&request.context)?;
         let scan = self.scan_payload(scan)?;
         let files = match (&scan.table.explicit_files, scan.snapshot_id) {
@@ -2275,6 +2291,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         let mut remaining = scan.limit;
         let mut splits = Vec::new();
         let mut total_payload_bytes = 0usize;
+        let candidate_units_considered = files.len() as u64;
         for (index, file) in files.into_iter().enumerate() {
             if let Some(remaining_rows) = remaining.as_mut() {
                 if *remaining_rows == 0 {
@@ -2315,7 +2332,13 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 &request.context,
             )?;
         }
-        Ok(splits)
+        ConnectorSplitPlanningResult::try_new(
+            splits,
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered,
+                candidate_units_pruned: 0,
+            },
+        )
     }
 }
 
@@ -2829,6 +2852,7 @@ fn plan_native_iceberg_read_with_file_override(
             &table_handle,
             novarocks_spi::connector::ConnectorBeginScanRequest {
                 projection: projection.to_vec(),
+                static_predicates: Vec::new(),
                 selector: table
                     .current_snapshot_id
                     .filter(|_| {
@@ -2861,7 +2885,8 @@ fn plan_native_iceberg_read_with_file_override(
                 context,
             },
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .splits;
     if splits
         .iter()
         .any(|split| split.owner() != &control_binding.descriptor().instance_id)
@@ -3567,6 +3592,14 @@ fn planned_table_files_fixture_binding(
                     )?,
                 )?,
                 output_schema: Arc::new(Schema::empty()),
+                predicate_dispositions: request
+                    .static_predicates
+                    .iter()
+                    .map(|predicate| novarocks_spi::connector::ConnectorPredicateDisposition {
+                        predicate_id: predicate.id,
+                        kind: novarocks_spi::connector::ConnectorPredicateDispositionKind::Unsupported,
+                    })
+                    .collect(),
             })
         }
 
@@ -3574,7 +3607,7 @@ fn planned_table_files_fixture_binding(
             &self,
             scan: &ConnectorScanHandle,
             request: ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<ConnectorSplit>, ConnectorError> {
+        ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
             let scan: ScanPayload = decode_payload(scan.payload(), "fixture scan handle")?;
             self.files_by_table
                 .get(&scan.table.table)
@@ -3613,7 +3646,13 @@ fn planned_table_files_fixture_binding(
                         None,
                     )
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|splits| {
+                    ConnectorSplitPlanningResult::try_new(
+                        splits,
+                        ConnectorSplitPlanningMetrics::default(),
+                    )
+                })
         }
     }
 
