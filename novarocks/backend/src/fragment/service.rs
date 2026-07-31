@@ -37,7 +37,6 @@ use novarocks::runtime::fragment::{
 };
 use novarocks::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks::runtime::profile::Profiler;
-use novarocks::service::native_fragment_ingress::NativeFragmentRequest;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
 };
@@ -49,6 +48,7 @@ use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
 use crate::ConnectorExecutionHost;
+use crate::native::decode::NativeFragmentRequest;
 use crate::native::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
@@ -860,7 +860,6 @@ mod tests {
     };
     use novarocks::runtime::fragment::{DormantFragmentHandle, FragmentOutcome, prepare_fragment};
     use novarocks::runtime::query_context::QueryId;
-    use novarocks::service::native_fragment_ingress::NativeFragmentRequest;
     use novarocks_protocol as proto;
 
     use crate::fragment::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -870,8 +869,8 @@ mod tests {
 
     use super::{
         NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentLifecycleEvent,
-        NativeFragmentService, RunningFragmentControl, consume_terminal_fact,
-        test_lifecycle_registry,
+        NativeFragmentRequest, NativeFragmentService, RunningFragmentControl,
+        consume_terminal_fact, test_lifecycle_registry,
     };
 
     static SERVICE_TEST_LOCK: Mutex<()> = Mutex::new(());

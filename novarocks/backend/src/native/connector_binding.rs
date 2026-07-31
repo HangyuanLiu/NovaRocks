@@ -27,10 +27,11 @@ use novarocks_spi::connector::{
 };
 
 use novarocks::query_execution::lifecycle::QueryExecutionId;
-use novarocks::service::native_fragment_ingress::decode_native_query_execution_id;
 use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
+
+use super::decode::decode_native_query_execution_id;
 
 const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
 
