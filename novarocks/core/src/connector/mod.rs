@@ -257,7 +257,6 @@ mod tests {
 
 #[derive(Clone)]
 pub struct ConnectorRegistry {
-    starrocks_table_state: Option<std::sync::Weak<crate::engine::StandaloneState>>,
     table_sinks: HashMap<&'static str, Arc<dyn TableSink>>,
     mv_backends: HashMap<&'static str, Arc<dyn MvBackend>>,
     #[cfg(test)]
@@ -271,7 +270,6 @@ pub struct ConnectorRegistry {
 impl ConnectorRegistry {
     pub fn new() -> Self {
         Self {
-            starrocks_table_state: None,
             table_sinks: HashMap::new(),
             mv_backends: HashMap::new(),
             #[cfg(test)]
@@ -316,24 +314,6 @@ impl ConnectorRegistry {
                 )
             })?;
         Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn bind_starrocks_table_state(
-        &mut self,
-        state: &Arc<crate::engine::StandaloneState>,
-    ) {
-        self.starrocks_table_state = Some(Arc::downgrade(state));
-    }
-
-    #[cfg(feature = "compat")]
-    pub(crate) fn starrocks_table_state(
-        &self,
-    ) -> Result<Arc<crate::engine::StandaloneState>, String> {
-        self.starrocks_table_state
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-            .ok_or_else(|| "standalone StarRocks table state is unavailable".to_string())
     }
 
     pub(crate) fn register_table_sink(&mut self, sink: Arc<dyn TableSink>) {
@@ -434,8 +414,6 @@ pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::Standalone
             .connectors
             .write()
             .expect("standalone connector registry write lock");
-        #[cfg(feature = "compat")]
-        connectors.bind_starrocks_table_state(state);
         connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
             Arc::clone(&iceberg_catalogs),
         )));
