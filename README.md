@@ -408,12 +408,44 @@ Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
 
 ## Development Workflow
 
+### Native development (default)
+
+The root workspace defaults to `novarocks-server`. Its `compat` dependency is
+optional, so ordinary native development does not build the StarRocks generated
+code, C++ shim, or third-party compat toolchain.
+
 ```bash
 cargo fmt --all
-cargo clippy --all-targets --all-features
-./build.sh
+cargo clippy --all-targets
+cargo build
 cargo test
 ```
+
+Use targeted package tests while iterating on a native crate:
+
+```bash
+cargo test -p novarocks
+cargo test -p novarocks-backend
+cargo test -p novarocks-server
+```
+
+Do not use `--workspace` or `--all-features` for routine native development:
+the former includes `novarocks-compat` as a workspace member, while the latter
+enables `novarocks-server/compat`. Both intentionally enter the compatibility
+toolchain.
+
+### Compatibility validation (explicit opt-in)
+
+Only use the compatibility path when changing `novarocks-compat`, the
+StarRocks wire/shim boundary, or FE-compatible behavior:
+
+```bash
+tools/ci/local-full-ci.sh --with-compat
+```
+
+This opt-in builds a separate compat artifact and runs the StarRocks-compatible
+cluster suite. It requires the StarRocks third-party environment described in
+the compatibility test guide.
 
 For focused standalone validation:
 
