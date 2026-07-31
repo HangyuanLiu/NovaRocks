@@ -124,7 +124,7 @@ fn lower_static_predicate(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LoweredColumn {
     column: ConnectorStaticPredicateColumn,
     data_type: ConnectorStaticPredicateDataType,
