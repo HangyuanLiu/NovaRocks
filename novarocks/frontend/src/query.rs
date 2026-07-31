@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
-        let delete_engine = RecordingDeleteEngine;
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
@@ -1272,7 +1272,7 @@ mod tests {
     #[test]
     fn frontend_router_passes_one_request_context_to_dml() {
         let engine = RecordingInsertEngine::default();
-        let delete_engine = RecordingDeleteEngine;
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
@@ -1336,7 +1336,7 @@ mod tests {
     #[test]
     fn non_insert_still_reaches_core_command_executor() {
         let engine = RecordingInsertEngine::default();
-        let delete_engine = RecordingDeleteEngine;
+        let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
         let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
         let cancellation = QueryCancellationSource::new();
