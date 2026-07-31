@@ -474,7 +474,10 @@ fn validate_query_control_event(
         QueryControlEvent::ControlReady
         | QueryControlEvent::LocalFailure { .. }
         | QueryControlEvent::LocalDrained
-        | QueryControlEvent::TerminalSnapshot { .. } => Ok(()),
+        | QueryControlEvent::TerminalSnapshot { .. }
+        // Live observations are best-effort telemetry. They are deliberately
+        // not coupled to the command/ack state machine.
+        | QueryControlEvent::FragmentObservation { .. } => Ok(()),
         QueryControlEvent::HeartbeatAck { sequence } => match state.pending.front() {
             Some(PendingQueryControlCommand::Heartbeat { sequence: expected })
                 if sequence == expected =>
@@ -707,7 +710,6 @@ mod tests {
         QueryLifecycleErrorCode, QueryLifecycleIngress, QueryLifecycleTarget,
         QueryLifecycleTransportErrorKind, QueryTerminationAck, QueryTerminationReason,
     };
-    use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
     use crate::runtime::query_options::QueryOptions;
     use crate::service::grpc_client::QueryLifecycleRpcError;
     use crate::service::grpc_server::{GrpcService, rejecting_test_native_fragment_ingress};
@@ -799,7 +801,6 @@ mod tests {
         let (address, shutdown, server) = spawn_loopback(GrpcService::with_fragment_execution(
             rejecting_test_native_fragment_ingress(),
             ingress.clone(),
-            Arc::new(AcceptingReportHandler),
         ))
         .await;
         let live = LiveBackendTarget::new(7, address, 77);
@@ -900,7 +901,6 @@ mod tests {
         let (address, shutdown, server) = spawn_loopback(GrpcService::with_fragment_execution(
             rejecting_test_native_fragment_ingress(),
             ingress,
-            Arc::new(AcceptingReportHandler),
         ))
         .await;
         let live = LiveBackendTarget::new(7, address, 88);
@@ -1028,17 +1028,6 @@ mod tests {
         (address, shutdown_tx, server)
     }
 
-    struct AcceptingReportHandler;
-
-    impl NativeReportHandler for AcceptingReportHandler {
-        fn handle_native_report(
-            &self,
-            _report: crate::proto::novarocks::ExecStatusReport,
-        ) -> Result<(), NativeReportHandlerError> {
-            Ok(())
-        }
-    }
-
     #[derive(Default)]
     struct LoopbackLifecycleIngress {
         initialized: Mutex<
@@ -1097,6 +1086,7 @@ mod tests {
                 ));
             }
             let (events, receiver) = tokio::sync::mpsc::channel(32);
+            let (_observations, observations) = tokio::sync::watch::channel(None);
             events
                 .try_send(QueryControlEvent::ControlReady)
                 .expect("ControlReady");
@@ -1106,6 +1096,7 @@ mod tests {
                     gate: self.gate.clone(),
                 }),
                 events: receiver,
+                observations,
             })
         }
     }

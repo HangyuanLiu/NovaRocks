@@ -66,6 +66,24 @@ impl Default for BindingCell {
 }
 
 impl ConnectorExecutionHost {
+    pub fn publish_resource_snapshot(&self) {
+        let (query_leases, binding_leases) = {
+            let state = self.state.lock().expect("connector execution host lock");
+            (
+                state.query_leases.len(),
+                state.query_leases.values().map(BTreeSet::len).sum(),
+            )
+        };
+        novarocks::service::publish_backend_query_execution_resource(
+            "connector_query_leases",
+            query_leases,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "connector_binding_leases",
+            binding_leases,
+        );
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -131,6 +149,8 @@ impl ConnectorExecutionHost {
         let mut state = self.lock_state()?;
         ensure_admissible(&state, query, &key)?;
         state.query_leases.entry(query).or_default().insert(key);
+        drop(state);
+        self.publish_resource_snapshot();
         Ok(())
     }
 
@@ -177,6 +197,8 @@ impl ConnectorExecutionHost {
         let mut state = self.lock_state()?;
         state.shutting_down = true;
         state.query_leases.clear();
+        drop(state);
+        self.publish_resource_snapshot();
         Ok(())
     }
 
@@ -333,16 +355,30 @@ fn release_query(
     state: &Arc<Mutex<ExecutionHostState>>,
     query: QueryExecutionId,
 ) -> Result<(), ConnectorError> {
-    state
-        .lock()
-        .map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution host lock poisoned",
-            )
-        })?
-        .query_leases
-        .remove(&query);
+    let mut guard = state.lock().map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "connector execution host lock poisoned",
+        )
+    })?;
+    guard.query_leases.remove(&query);
+    let (query_leases, binding_leases) = (
+        guard.query_leases.len(),
+        guard
+            .query_leases
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>(),
+    );
+    drop(guard);
+    novarocks::service::publish_backend_query_execution_resource(
+        "connector_query_leases",
+        query_leases,
+    );
+    novarocks::service::publish_backend_query_execution_resource(
+        "connector_binding_leases",
+        binding_leases,
+    );
     Ok(())
 }
 

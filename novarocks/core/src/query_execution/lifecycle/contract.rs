@@ -33,6 +33,7 @@ use super::stage::{
 use super::terminal::{QueryTerminalSnapshot, QueryTerminalSnapshotDigest};
 use crate::common::types::UniqueId;
 use crate::proto::{common, filter, novarocks};
+use crate::runtime::profile::RuntimeProfileTree;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleErrorCode {
@@ -80,14 +81,112 @@ impl std::fmt::Display for QueryLifecycleError {
 
 impl std::error::Error for QueryLifecycleError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FragmentLiveObservation {
+    execution_id: QueryExecutionId,
+    init_digest: ParticipantManifestDigest,
+    backend: ParticipantBackendIdentity,
+    fragment_instance_id: UniqueId,
+    sequence: u64,
+    input_rows: u64,
+    output_rows: u64,
+    elapsed_ms: u64,
+    profile: Option<RuntimeProfileTree>,
+}
+
+impl FragmentLiveObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        execution_id: QueryExecutionId,
+        init_digest: ParticipantManifestDigest,
+        backend: ParticipantBackendIdentity,
+        fragment_instance_id: UniqueId,
+        sequence: u64,
+        input_rows: u64,
+        output_rows: u64,
+        elapsed_ms: u64,
+        profile: Option<RuntimeProfileTree>,
+    ) -> Result<Self, QueryLifecycleError> {
+        if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "fragment observation instance id must be nonzero",
+            ));
+        }
+        if sequence == 0 {
+            return Err(QueryLifecycleError::invalid_manifest(
+                "fragment observation sequence must be nonzero",
+            ));
+        }
+        Ok(Self {
+            execution_id,
+            init_digest,
+            backend,
+            fragment_instance_id,
+            sequence,
+            input_rows,
+            output_rows,
+            elapsed_ms,
+            profile,
+        })
+    }
+
+    pub const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub const fn init_digest(&self) -> ParticipantManifestDigest {
+        self.init_digest
+    }
+
+    pub const fn backend(&self) -> &ParticipantBackendIdentity {
+        &self.backend
+    }
+
+    pub const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn input_rows(&self) -> u64 {
+        self.input_rows
+    }
+
+    pub const fn output_rows(&self) -> u64 {
+        self.output_rows
+    }
+
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+
+    pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
+        self.profile.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueryControlEvent {
     ControlReady,
-    HeartbeatAck { sequence: u64 },
-    LocalFailure { code: String, detail: String },
+    HeartbeatAck {
+        sequence: u64,
+    },
+    LocalFailure {
+        code: String,
+        detail: String,
+    },
     LocalDrained,
-    TerminalSnapshot { snapshot: QueryTerminalSnapshot },
-    TerminationAccepted { reason: QueryTerminationReason },
+    TerminalSnapshot {
+        snapshot: QueryTerminalSnapshot,
+    },
+    TerminationAccepted {
+        reason: QueryTerminationReason,
+    },
+    FragmentObservation {
+        observation: FragmentLiveObservation,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,7 +273,7 @@ impl QueryTerminalReportAck {
 }
 
 /// FE-owned ingress for immutable terminal snapshots.  It is intentionally
-/// distinct from fragment `NativeReportHandler` and from FE-to-BE lifecycle RPCs.
+/// distinct from FE-to-BE lifecycle RPCs.
 pub trait QueryTerminalIngress: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
@@ -369,6 +468,10 @@ pub trait BackendQueryControl: Send + Sync + 'static {
 pub struct QueryControlAttachment {
     pub control: Arc<dyn BackendQueryControl>,
     pub events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    /// A single-slot, replaceable telemetry view. Correctness events remain on
+    /// `events` so a congested profiler/progress producer cannot delay an ACK,
+    /// drain barrier, or terminal snapshot.
+    pub observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
 #[derive(Clone, Debug)]
@@ -938,6 +1041,11 @@ pub fn encode_query_control_event(event: &QueryControlEvent) -> novarocks::Query
                 },
             )
         }
+        QueryControlEvent::FragmentObservation { observation } => {
+            novarocks::query_control_response::Event::FragmentObservation(
+                encode_fragment_live_observation(observation),
+            )
+        }
     };
     novarocks::QueryControlResponse { event: Some(event) }
 }
@@ -975,6 +1083,11 @@ pub fn decode_query_control_event(
                 snapshot: decode_query_terminal_snapshot(snapshot)?,
             })
         }
+        Some(novarocks::query_control_response::Event::FragmentObservation(observation)) => {
+            Ok(QueryControlEvent::FragmentObservation {
+                observation: decode_fragment_live_observation(observation)?,
+            })
+        }
         Some(novarocks::query_control_response::Event::LocalFailure(_)) => {
             Err(QueryLifecycleError::invalid_manifest(
                 "local failure code and detail must not be empty",
@@ -984,6 +1097,50 @@ pub fn decode_query_control_event(
             "query control event is required",
         )),
     }
+}
+
+pub fn encode_fragment_live_observation(
+    observation: &FragmentLiveObservation,
+) -> novarocks::FragmentLiveObservation {
+    novarocks::FragmentLiveObservation {
+        execution_id: Some(encode_execution_id(observation.execution_id())),
+        init_digest: observation.init_digest().as_bytes().to_vec(),
+        backend: Some(encode_backend_identity(observation.backend())),
+        fragment_instance_id: Some(encode_unique_id(observation.fragment_instance_id())),
+        sequence: observation.sequence(),
+        input_rows: observation.input_rows(),
+        output_rows: observation.output_rows(),
+        elapsed_ms: observation.elapsed_ms(),
+        profile: observation.profile().map(RuntimeProfileTree::to_proto),
+    }
+}
+
+pub fn decode_fragment_live_observation(
+    observation: &novarocks::FragmentLiveObservation,
+) -> Result<FragmentLiveObservation, QueryLifecycleError> {
+    let profile = observation
+        .profile
+        .as_ref()
+        .map(RuntimeProfileTree::from_proto)
+        .transpose()
+        .map_err(QueryLifecycleError::invalid_manifest)?;
+    FragmentLiveObservation::new(
+        decode_required_execution_id(observation.execution_id.as_ref())?,
+        ParticipantManifestDigest::try_from_slice(&observation.init_digest)?,
+        decode_backend_identity(observation.backend.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest(
+                "fragment observation backend identity is required",
+            )
+        })?)?,
+        decode_unique_id(observation.fragment_instance_id.as_ref().ok_or_else(|| {
+            QueryLifecycleError::invalid_manifest("fragment observation instance id is required")
+        })?)?,
+        observation.sequence,
+        observation.input_rows,
+        observation.output_rows,
+        observation.elapsed_ms,
+        profile,
+    )
 }
 
 pub fn encode_query_terminal_snapshot(
@@ -1557,9 +1714,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        QueryInitRequest, decode_query_init_request, decode_query_stage_request,
+        FragmentLiveObservation, QueryInitRequest, decode_fragment_live_observation,
+        decode_query_control_event, decode_query_init_request, decode_query_stage_request,
         decode_query_stage_response, decode_query_start_request, decode_query_start_response,
-        decode_query_terminal_snapshot, encode_query_init_request, encode_query_stage_request,
+        decode_query_terminal_snapshot, encode_fragment_live_observation,
+        encode_query_control_event, encode_query_init_request, encode_query_stage_request,
         encode_query_stage_response, encode_query_start_request, encode_query_start_response,
         encode_query_terminal_snapshot,
     };
@@ -1637,6 +1796,114 @@ mod tests {
             .expect("terminal snapshot wire round trip");
         assert_eq!(decoded.digest(), snapshot.digest());
         assert_eq!(decoded.canonical_bytes(), snapshot.canonical_bytes());
+    }
+
+    fn observation_backend() -> ParticipantBackendIdentity {
+        ParticipantBackendIdentity::new(
+            3,
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            11,
+        )
+        .expect("backend identity")
+    }
+
+    #[test]
+    fn fragment_live_observation_wire_round_trips_full_snapshot() {
+        let profile = RuntimeProfile::new("live-profile");
+        profile.counter_set("RowsRead", ProfileUnit::Unit, 7);
+        let observation = FragmentLiveObservation::new(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([9; 32]),
+            observation_backend(),
+            crate::common::types::UniqueId { hi: 7, lo: 9 },
+            1,
+            11,
+            7,
+            5,
+            Some(profile.to_native_tree()),
+        )
+        .expect("valid observation");
+
+        let decoded =
+            decode_fragment_live_observation(&encode_fragment_live_observation(&observation))
+                .expect("observation wire round trip");
+        assert_eq!(decoded, observation);
+
+        let event = super::QueryControlEvent::FragmentObservation { observation };
+        assert_eq!(
+            decode_query_control_event(&encode_query_control_event(&event))
+                .expect("event wire round trip"),
+            event
+        );
+    }
+
+    #[test]
+    fn fragment_live_observation_accepts_progress_without_profile() {
+        let observation = FragmentLiveObservation::new(
+            execution_id(),
+            crate::query_execution::lifecycle::ParticipantManifestDigest::new([8; 32]),
+            observation_backend(),
+            crate::common::types::UniqueId { hi: 1, lo: 2 },
+            u64::MAX,
+            1,
+            2,
+            3,
+            None,
+        )
+        .expect("valid profile-less observation");
+
+        assert_eq!(
+            decode_fragment_live_observation(&encode_fragment_live_observation(&observation))
+                .expect("observation decodes"),
+            observation
+        );
+    }
+
+    #[test]
+    fn fragment_live_observation_rejects_invalid_identity_and_sequence() {
+        let digest = crate::query_execution::lifecycle::ParticipantManifestDigest::new([7; 32]);
+        assert!(
+            FragmentLiveObservation::new(
+                execution_id(),
+                digest,
+                observation_backend(),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+                1,
+                0,
+                0,
+                0,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            FragmentLiveObservation::new(
+                execution_id(),
+                digest,
+                observation_backend(),
+                crate::common::types::UniqueId { hi: 1, lo: 2 },
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            .is_err()
+        );
+
+        let invalid_profile = crate::proto::novarocks::FragmentLiveObservation {
+            execution_id: Some(super::encode_execution_id(execution_id())),
+            init_digest: digest.as_bytes().to_vec(),
+            backend: Some(super::encode_backend_identity(&observation_backend())),
+            fragment_instance_id: Some(super::encode_unique_id(crate::common::types::UniqueId {
+                hi: 1,
+                lo: 2,
+            })),
+            sequence: 1,
+            profile: Some(crate::proto::novarocks::RuntimeProfileTree::default()),
+            ..Default::default()
+        };
+        assert!(decode_fragment_live_observation(&invalid_profile).is_err());
     }
 
     fn service_only_request() -> QueryInitRequest {

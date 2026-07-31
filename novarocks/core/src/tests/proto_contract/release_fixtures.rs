@@ -26,8 +26,6 @@ use crate::protocol::native::decode::{
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
-const BATCH_REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
 const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0ab401080112080a040801100210011a140809120e0a093132372e302e302e3110903f184d222011111111111111111111111111111111111111111111111111111111111111112a202222222222222222222222222222222222222222222222222222222222222222324c0a0408031004100918013a04086410094a060809105a180152320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d66697874757265";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
@@ -352,7 +350,6 @@ fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
                 per_exch_num_senders: HashMap::from([(12, 3)]),
                 destinations: vec![release_destination()],
                 query_options: Some(release_query_options()),
-                report_endpoint: Some("10.0.0.10:9070".to_string()),
                 typed_result_sink: true,
             }),
         }],
@@ -366,86 +363,6 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
         result_arrow_ipc: b"NRX1-fixture".to_vec(),
         packet_seq: 9,
         eos: true,
-    }
-}
-
-fn release_exec_status_report() -> novarocks::ExecStatusReport {
-    novarocks::ExecStatusReport {
-        query_id: Some(id(1, 2)),
-        fragment_instance_id: Some(id(3, 4)),
-        backend_num: 9,
-        status: Some(common::Status {
-            code: 0,
-            message: String::new(),
-        }),
-        done: true,
-        iceberg_commits: vec![novarocks::IcebergCommitInfo {
-            iceberg_data_file: Some(novarocks::IcebergDataFile {
-                path: Some("s3://warehouse/db/t/data-1.parquet".to_string()),
-                format: Some("parquet".to_string()),
-                record_count: Some(9),
-                file_size_in_bytes: Some(90),
-                partition_path: Some("region=us".to_string()),
-                split_offsets: Some(novarocks::Int64List { values: vec![4, 8] }),
-                column_stats: Some(novarocks::IcebergColumnStats {
-                    column_sizes: HashMap::from([(1, 100)]),
-                    value_counts: HashMap::from([(1, 9)]),
-                    null_value_counts: HashMap::from([(1, 0)]),
-                    nan_value_counts: HashMap::from([(1, 0)]),
-                    lower_bounds: HashMap::from([(1, vec![0x01])]),
-                    upper_bounds: HashMap::from([(1, vec![0x09])]),
-                }),
-                partition_null_fingerprint: Some("0".to_string()),
-                file_content: novarocks::IcebergFileContent::Data as i32,
-                referenced_data_file: Some("s3://warehouse/db/t/base.parquet".to_string()),
-                first_row_id: Some(77),
-                equality_ids: Some(novarocks::Int32List { values: vec![1, 2] }),
-                key_metadata: Some(vec![0xaa, 0xbb]),
-                partition_spec_id: Some(5),
-                partition_values_descriptor: Some(novarocks::IcebergPartitionDescriptor {
-                    values: vec![novarocks::IcebergPartitionValue {
-                        is_null: Some(false),
-                        datum_bytes: Some(b"us".to_vec()),
-                    }],
-                }),
-                content_offset: Some(128),
-                content_size_in_bytes: Some(256),
-                cardinality: Some(4),
-            }),
-            is_overwrite: Some(true),
-            is_rewrite: Some(false),
-        }],
-        loaded_rows: 9,
-        sink_load_bytes: 90,
-        filtered_rows: 1,
-        profile: Some(novarocks::RuntimeProfileTree {
-            root: Some(novarocks::ProfileNode {
-                name: "FragmentRoot".to_string(),
-                node_id: 10,
-                counters: vec![novarocks::Counter {
-                    name: "RowsRead".to_string(),
-                    parent_name: String::new(),
-                    unit: novarocks::ProfileUnit::Unit as i32,
-                    value: 9,
-                    min_value: Some(4),
-                    max_value: Some(12),
-                }],
-                info_strings: HashMap::from([("table".to_string(), "lineitem".to_string())]),
-                children: vec![],
-            }),
-        }),
-    }
-}
-
-fn release_report_exec_status_request() -> novarocks::ReportExecStatusRequest {
-    novarocks::ReportExecStatusRequest {
-        report: Some(release_exec_status_report()),
-    }
-}
-
-fn release_batch_report_exec_status_request() -> novarocks::BatchReportExecStatusRequest {
-    novarocks::BatchReportExecStatusRequest {
-        reports: vec![release_exec_status_report()],
     }
 }
 
@@ -564,14 +481,6 @@ fn print_release_fixture_hex() {
         &release_stage_fragments_request(),
     );
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
-    print_fixture(
-        "REPORT_EXEC_STATUS_REQUEST",
-        &release_report_exec_status_request(),
-    );
-    print_fixture(
-        "BATCH_REPORT_EXEC_STATUS_REQUEST",
-        &release_batch_report_exec_status_request(),
-    );
     print_fixture(
         "REPORT_QUERY_TERMINAL_REQUEST",
         &release_report_query_terminal_request(),
@@ -750,129 +659,6 @@ fn release_fetch_result_response_fixture_decodes() {
     assert_eq!(response.result_arrow_ipc, b"NRX1-fixture");
     assert_eq!(response.packet_seq, 9);
     assert!(response.eos, "FetchResultResponse fixture eos");
-}
-
-#[test]
-fn release_exec_status_report_fixtures_decode() {
-    let single: novarocks::ReportExecStatusRequest = decode_fixture(
-        "ReportExecStatusRequest",
-        REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX,
-    );
-    let report = single
-        .report
-        .as_ref()
-        .expect("ReportExecStatusRequest fixture report");
-    assert_eq!(report.query_id.as_ref().expect("report query_id").hi, 1);
-    assert_eq!(
-        report
-            .fragment_instance_id
-            .as_ref()
-            .expect("report fragment_instance_id")
-            .lo,
-        4
-    );
-    assert_eq!(report.backend_num, 9);
-    assert_eq!(report.status.as_ref().expect("report status").code, 0);
-    assert!(report.done);
-    assert_eq!(report.loaded_rows, 9);
-    assert_eq!(report.iceberg_commits.len(), 1);
-    let commit = report
-        .iceberg_commits
-        .first()
-        .expect("ReportExecStatusRequest fixture iceberg_commits[0]");
-    assert_eq!(
-        commit.is_overwrite,
-        Some(true),
-        "ReportExecStatusRequest fixture iceberg_commits[0].is_overwrite"
-    );
-    assert_eq!(
-        commit.is_rewrite,
-        Some(false),
-        "ReportExecStatusRequest fixture iceberg_commits[0].is_rewrite"
-    );
-    let data_file = commit
-        .iceberg_data_file
-        .as_ref()
-        .expect("ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file");
-    assert_eq!(
-        data_file.path.as_deref(),
-        Some("s3://warehouse/db/t/data-1.parquet"),
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.path"
-    );
-    assert_eq!(
-        data_file.record_count,
-        Some(9),
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.record_count"
-    );
-    assert_eq!(
-        data_file.file_size_in_bytes,
-        Some(90),
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.file_size_in_bytes"
-    );
-    assert_eq!(
-        data_file.file_content,
-        novarocks::IcebergFileContent::Data as i32,
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.file_content"
-    );
-    assert_eq!(
-        data_file.partition_spec_id,
-        Some(5),
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.partition_spec_id"
-    );
-    assert_eq!(
-        data_file.content_size_in_bytes,
-        Some(256),
-        "ReportExecStatusRequest fixture iceberg_commits[0].iceberg_data_file.content_size_in_bytes"
-    );
-    let profile_root = report
-        .profile
-        .as_ref()
-        .and_then(|profile| profile.root.as_ref())
-        .expect("ReportExecStatusRequest fixture profile.root");
-    assert_eq!(
-        profile_root.name, "FragmentRoot",
-        "ReportExecStatusRequest fixture profile.root.name"
-    );
-    assert_eq!(
-        profile_root.node_id, 10,
-        "ReportExecStatusRequest fixture profile.root.node_id"
-    );
-    assert_eq!(
-        profile_root.info_strings.get("table").map(String::as_str),
-        Some("lineitem"),
-        "ReportExecStatusRequest fixture profile.root.info_strings[table]"
-    );
-    assert_eq!(
-        profile_root.counters.len(),
-        1,
-        "ReportExecStatusRequest fixture profile.root.counters.len"
-    );
-    let counter = &profile_root.counters[0];
-    assert_eq!(
-        counter.name, "RowsRead",
-        "ReportExecStatusRequest fixture profile.root.counters[0].name"
-    );
-    assert_eq!(
-        counter.value, 9,
-        "ReportExecStatusRequest fixture profile.root.counters[0].value"
-    );
-    assert_eq!(
-        counter.min_value,
-        Some(4),
-        "ReportExecStatusRequest fixture profile.root.counters[0].min_value"
-    );
-    assert_eq!(
-        counter.max_value,
-        Some(12),
-        "ReportExecStatusRequest fixture profile.root.counters[0].max_value"
-    );
-
-    let batch: novarocks::BatchReportExecStatusRequest = decode_fixture(
-        "BatchReportExecStatusRequest",
-        BATCH_REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX,
-    );
-    assert_eq!(batch.reports.len(), 1);
-    assert_eq!(batch.reports[0].filtered_rows, 1);
 }
 
 #[test]

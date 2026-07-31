@@ -21,9 +21,9 @@ use std::time::Instant;
 
 use novarocks::UniqueId;
 use novarocks::query_execution::lifecycle::{
-    FragmentTerminalSnapshot, ImmutableQueryTerminalRecord, ParticipantManifest,
-    ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome, QueryTerminationReason,
-    StageDigest,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
+    ParticipantManifest, ParticipantManifestDigest, QueryControlEvent, QueryInitOutcome,
+    QueryTerminationReason, StageDigest,
 };
 
 use super::stage::StartGate;
@@ -79,6 +79,11 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    /// Latest-only telemetry slot, intentionally independent from correctness
+    /// delivery permits. `watch` replaces an unread observation without making
+    /// a fragment producer wait for the control-stream consumer.
+    pub(crate) observations: Option<tokio::sync::watch::Sender<Option<FragmentLiveObservation>>>,
+    pub(crate) observation_sequences: BTreeMap<UniqueId, u64>,
     /// LocalDrained is a correctness barrier, not best-effort telemetry. Keep
     /// one queue slot reserved so heartbeat ACK backpressure cannot drop it.
     pub(crate) local_drained_event_permit:
@@ -126,6 +131,8 @@ impl QueryLifecycleEntry {
                 last_heartbeat: None,
                 frontend_owner_epoch: None,
                 events: None,
+                observations: None,
+                observation_sequences: BTreeMap::new(),
                 local_drained_event_permit: None,
                 terminal_snapshot_event_permit: None,
                 terminal_event_permit: None,

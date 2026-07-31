@@ -1030,7 +1030,8 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
-    if meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some() {
+    if meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some()
+    {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return (
                 false,
@@ -1483,6 +1484,41 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         );
 
         let compat_deadline = compat_directive::step_evidence_deadline(&step.meta);
+        let resource_baseline = if fault_injection::has_fault(&step.meta) {
+            match ctx.server_handle.lock() {
+                Ok(mut server_handle)
+                    if server_handle.supports_query_execution_resource_oracle() =>
+                {
+                    match server_handle.query_execution_resource_snapshot() {
+                        Ok(Some(snapshot)) => Some(snapshot),
+                        Ok(None) => {
+                            case_failed = true;
+                            let _ = writeln!(
+                                log,
+                                "    ❌ query-execution resource oracle was advertised but returned no baseline"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            case_failed = true;
+                            let _ = writeln!(
+                                log,
+                                "    ❌ failed to capture pre-fault query-execution resource baseline: {error:#}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => None,
+                Err(_) => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ server handle mutex is poisoned");
+                    break;
+                }
+            }
+        } else {
+            None
+        };
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
                 .server_handle
@@ -2256,6 +2292,37 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if let Some(baseline) = resource_baseline {
+            let convergence_deadline = Instant::now() + Duration::from_secs(30);
+            let resource_result = ctx
+                .server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
+                .and_then(|mut server_handle| {
+                    server_handle
+                        .await_query_execution_resource_convergence(
+                            &baseline,
+                            fault_injection::permits_terminal_retention(&step.meta),
+                            convergence_deadline,
+                        )
+                });
+            match resource_result {
+                Ok(()) => {
+                    let _ = writeln!(
+                        log,
+                        "    ✅ query-execution resources converged to the pre-fault baseline"
+                    );
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(
+                        log,
+                        "    ❌ query-execution resource convergence failed: {error:#}"
+                    );
                 }
             }
         }

@@ -21,11 +21,13 @@
 //! native fragment around the protocol-neutral fragment kernel. The underlying
 //! query manager remains private to core.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::CacheOptions;
 use crate::common::types::UniqueId;
+use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::runtime::fragment::FragmentPrepareContext;
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
@@ -33,7 +35,7 @@ use crate::runtime::fragment::io::{
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
-    FragmentFinishReportDecision, QueryContextManager, QueryId, query_context_manager,
+    QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
 use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
@@ -43,12 +45,106 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
+    pub fn publish_resource_snapshot(&self) {
+        let snapshot = self.manager.native_execution_resource_snapshot();
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_contexts_active",
+            snapshot.active_contexts,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_contexts_second_chance",
+            snapshot.second_chance_contexts,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_query_active_fragments",
+            snapshot.active_fragments,
+        );
+        crate::service::publish_backend_query_execution_resource(
+            "native_runtime_filter_services",
+            snapshot.runtime_filter_services,
+        );
+    }
     pub fn global() -> Self {
         Self {
             manager: query_context_manager(),
         }
     }
 
+    pub fn prepare_admission_execution(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        cache_options: CacheOptions,
+        has_runtime_filter_bindings: bool,
+    ) -> Result<NativeFragmentAdmissionResources, String> {
+        let execution = execution_key(execution_id);
+        self.manager.ensure_native_context_execution(
+            execution,
+            false,
+            delivery_expire,
+            query_expire,
+        )?;
+        let runtime_filter = if has_runtime_filter_bindings {
+            Some(
+                self.manager
+                    .runtime_filter_context_for_native_execution_attempt(
+                        execution,
+                        fragment_instance_id,
+                    )?,
+            )
+        } else {
+            None
+        };
+        self.manager
+            .set_cache_options_execution(execution, cache_options)?;
+        let query_mem_tracker = self
+            .manager
+            .query_mem_tracker_execution(execution)
+            .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
+        let fragment_label = format!(
+            "fragment_{:x}_{:x}",
+            fragment_instance_id.hi, fragment_instance_id.lo
+        );
+        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
+        let resources = NativeFragmentAdmissionResources {
+            query_mem_tracker,
+            fragment_mem_tracker,
+            runtime_filter,
+        };
+        self.publish_resource_snapshot();
+        Ok(resources)
+    }
+
+    pub fn register_fragment_execution(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<NativeFragmentRegistrationLease, String> {
+        let execution = execution_key(execution_id);
+        self.manager.get_or_register_native_execution(
+            execution,
+            false,
+            delivery_expire,
+            query_expire,
+        )?;
+        self.manager
+            .register_native_finst_execution(fragment_instance_id, execution)?;
+        let lease = NativeFragmentRegistrationLease {
+            runtime: self.clone(),
+            execution,
+            fragment_instance_id,
+            active: true,
+        };
+        self.publish_resource_snapshot();
+        Ok(lease)
+    }
+
+    /// Legacy native admission retained for non-lifecycle test fixtures. The
+    /// distributed backend always calls the attempt-aware variant above.
     pub fn prepare_admission(
         &self,
         query_id: QueryId,
@@ -97,7 +193,7 @@ impl NativeFragmentQueryRuntime {
         self.manager.register_finst(fragment_instance_id, query_id);
         Ok(NativeFragmentRegistrationLease {
             runtime: self.clone(),
-            query_id,
+            execution: QueryExecutionKey::native(query_id),
             fragment_instance_id,
             active: true,
         })
@@ -107,29 +203,42 @@ impl NativeFragmentQueryRuntime {
         self.manager.cancel_query(query_id, reason)
     }
 
-    pub fn finish_fragment_for_report(&self, query_id: QueryId) -> NativeFragmentReportDecision {
-        NativeFragmentReportDecision {
-            inner: self.manager.finish_fragment_for_report(query_id),
-        }
+    pub fn cancel_execution(
+        &self,
+        execution_id: QueryExecutionId,
+        reason: String,
+    ) -> Vec<UniqueId> {
+        let cancelled = self
+            .manager
+            .cancel_query_execution(execution_key(execution_id), reason);
+        self.publish_resource_snapshot();
+        cancelled
+    }
+
+    pub fn finish_fragment(&self, execution_id: QueryExecutionId) {
+        self.manager
+            .finish_fragment_execution(execution_key(execution_id));
+        self.publish_resource_snapshot();
     }
 
     pub fn unregister_fragment(&self, fragment_instance_id: UniqueId) {
         self.manager.unregister_finst(fragment_instance_id);
     }
 
-    pub fn cleanup_after_fragment_report(
+    pub fn unregister_fragment_execution(
         &self,
-        query_id: QueryId,
-        decision: NativeFragmentReportDecision,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
     ) {
         self.manager
-            .cleanup_after_fragment_report(query_id, decision.inner);
+            .unregister_finst_execution(fragment_instance_id, execution_key(execution_id));
+        self.publish_resource_snapshot();
     }
 }
 
 pub struct NativeFragmentRegistrationLease {
     runtime: NativeFragmentQueryRuntime,
-    query_id: QueryId,
+    execution: QueryExecutionKey,
     fragment_instance_id: UniqueId,
     active: bool,
 }
@@ -146,10 +255,24 @@ impl Drop for NativeFragmentRegistrationLease {
             let _ = self
                 .runtime
                 .manager
-                .rollback_pre_ready_native_fragment(self.query_id, self.fragment_instance_id);
+                .rollback_pre_ready_native_fragment_execution(
+                    self.execution,
+                    self.fragment_instance_id,
+                );
             self.active = false;
         }
     }
+}
+
+fn execution_key(execution_id: QueryExecutionId) -> QueryExecutionKey {
+    QueryExecutionKey::native_attempt(
+        QueryId::new(
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+        ),
+        NonZeroU64::new(execution_id.attempt_id().get())
+            .expect("QueryExecutionId always has a nonzero attempt"),
+    )
 }
 
 pub struct NativeFragmentAdmissionResources {
@@ -184,16 +307,6 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
-    }
-}
-
-pub struct NativeFragmentReportDecision {
-    inner: FragmentFinishReportDecision,
-}
-
-impl NativeFragmentReportDecision {
-    pub fn include_runtime_filter_profile(&self) -> bool {
-        self.inner.include_runtime_filter_profile
     }
 }
 

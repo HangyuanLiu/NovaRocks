@@ -223,10 +223,6 @@ impl ScheduleBoundDistributedQuery {
             NativeSubmissionContext {
                 query_id,
                 options: options.runtime_options().clone(),
-                report_endpoint: RuntimeEndpoint::from_socket_addr(
-                    "127.0.0.1:1".parse().expect("static test endpoint"),
-                ),
-                needs_fragment_status_report: true,
             },
         )?;
         Ok(InProcessTestArtifact {
@@ -953,22 +949,13 @@ fn populate_sender_counts(
 pub struct NativeSubmissionContext {
     pub(crate) query_id: QueryId,
     pub(crate) options: crate::runtime::query_options::QueryOptions,
-    pub(crate) report_endpoint: RuntimeEndpoint,
-    pub(crate) needs_fragment_status_report: bool,
 }
 
 impl NativeSubmissionContext {
-    pub fn new(
-        query_id: QueryId,
-        options: &ResolvedQueryOptions,
-        report_endpoint: crate::query_execution::backend::CoordinatorReportEndpoint,
-        needs_fragment_status_report: bool,
-    ) -> Self {
+    pub fn new(query_id: QueryId, options: &ResolvedQueryOptions) -> Self {
         Self {
             query_id,
             options: options.runtime_options().clone(),
-            report_endpoint: report_endpoint.into_runtime_endpoint(),
-            needs_fragment_status_report,
         }
     }
 }
@@ -1424,8 +1411,6 @@ fn assemble_native_execution(
             fragment.boundary_projection().cte_id().is_some(),
         )
         .map_err(contract_error)?;
-        let report_endpoint =
-            (is_writer || context.needs_fragment_status_report).then_some(&context.report_endpoint);
         let fragment_submissions = placements
             .iter()
             .map(|placement| {
@@ -1474,8 +1459,7 @@ fn assemble_native_execution(
                     placement,
                     &context.options,
                     placement.instance_index as i32,
-                    report_endpoint,
-                    fragment_id == root_fragment_id && context.needs_fragment_status_report,
+                    fragment_id == root_fragment_id,
                 )
                 .map_err(contract_error)?;
                 Ok(ValidatedNativeSubmission {

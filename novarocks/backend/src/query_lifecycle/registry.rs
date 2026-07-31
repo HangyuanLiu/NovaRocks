@@ -24,17 +24,19 @@ use novarocks::UniqueId;
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, FragmentTerminalOutcome, FragmentTerminalSnapshot,
-    ImmutableQueryTerminalRecord, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
-    QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
-    QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
+    BackendQueryControl, FragmentLiveObservation, FragmentTerminalOutcome,
+    FragmentTerminalSnapshot, ImmutableQueryTerminalRecord, ParticipantManifestDigest,
+    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
+    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+    QueryLifecycleTransportError, QueryLifecycleTransportErrorKind, QueryStageAck,
+    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
+    QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
     QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
 use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
+use novarocks::runtime::profile::RuntimeProfileTree;
 use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use prost::Message;
 
@@ -189,6 +191,23 @@ struct StageResourceLedger {
     dormant_workers: usize,
 }
 
+impl StageResourceLedger {
+    fn publish_snapshot(active_builders: usize, encoded_bytes: usize, dormant_workers: usize) {
+        novarocks::service::publish_backend_query_execution_resource(
+            "stage_active_builders",
+            active_builders,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "stage_encoded_bytes",
+            encoded_bytes,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "stage_dormant_workers",
+            dormant_workers,
+        );
+    }
+}
+
 /// RAII reservation for one participant-local Stage bundle.  It first owns a
 /// builder slot, then transfers the encoded-byte and dormant-worker portions
 /// to the lifecycle entry after a successful commit.  Drop is intentionally
@@ -229,7 +248,13 @@ impl StageResourceReservation {
         state.active_builders += 1;
         state.encoded_bytes = next_bytes;
         state.dormant_workers = next_workers;
+        let snapshot = (
+            state.active_builders,
+            state.encoded_bytes,
+            state.dormant_workers,
+        );
         drop(state);
+        StageResourceLedger::publish_snapshot(snapshot.0, snapshot.1, snapshot.2);
         Ok(Self {
             ledger,
             encoded_bytes,
@@ -247,6 +272,13 @@ impl StageResourceReservation {
             .lock()
             .expect("query lifecycle Stage resource ledger lock");
         state.active_builders = state.active_builders.saturating_sub(1);
+        let snapshot = (
+            state.active_builders,
+            state.encoded_bytes,
+            state.dormant_workers,
+        );
+        drop(state);
+        StageResourceLedger::publish_snapshot(snapshot.0, snapshot.1, snapshot.2);
         self.builder_active = false;
     }
 }
@@ -262,6 +294,13 @@ impl Drop for StageResourceReservation {
         }
         state.encoded_bytes = state.encoded_bytes.saturating_sub(self.encoded_bytes);
         state.dormant_workers = state.dormant_workers.saturating_sub(self.dormant_workers);
+        let snapshot = (
+            state.active_builders,
+            state.encoded_bytes,
+            state.dormant_workers,
+        );
+        drop(state);
+        StageResourceLedger::publish_snapshot(snapshot.0, snapshot.1, snapshot.2);
     }
 }
 
@@ -527,6 +566,26 @@ impl QueryLifecycleRegistry {
         clock: Arc<dyn MonotonicClock>,
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
     ) -> Arc<Self> {
+        Self::new_with_clock_metrics_and_terminal_fallback(
+            local_backend_id,
+            local_start_epoch,
+            local_runtime,
+            config,
+            clock,
+            metrics,
+            Arc::new(GrpcQueryTerminalFallbackTransport),
+        )
+    }
+
+    pub(crate) fn new_with_clock_metrics_and_terminal_fallback(
+        local_backend_id: u64,
+        local_start_epoch: u64,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        clock: Arc<dyn MonotonicClock>,
+        metrics: Arc<dyn QueryLifecycleMetricsSink>,
+        terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
+    ) -> Arc<Self> {
         Self::new_with_backend_identity(
             Some(local_backend_id),
             local_start_epoch,
@@ -534,6 +593,7 @@ impl QueryLifecycleRegistry {
             config,
             clock,
             metrics,
+            terminal_fallback,
         )
     }
 
@@ -549,6 +609,7 @@ impl QueryLifecycleRegistry {
             config,
             Arc::new(SystemMonotonicClock),
             Arc::new(PrometheusQueryLifecycleMetricsSink),
+            Arc::new(GrpcQueryTerminalFallbackTransport),
         )
     }
 
@@ -559,6 +620,7 @@ impl QueryLifecycleRegistry {
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
+        terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -576,7 +638,12 @@ impl QueryLifecycleRegistry {
         assert!(!config.terminal_retention.is_zero());
         assert!(config.terminal_retained_capacity > 0);
         assert!(config.terminal_max_retained_bytes > 0);
-        Arc::new_cyclic(|self_weak| Self {
+        novarocks::service::publish_backend_query_lifecycle_terminal_limits(
+            config.terminal_retained_capacity,
+            config.terminal_max_retained_bytes,
+        );
+        StageResourceLedger::publish_snapshot(0, 0, 0);
+        let registry = Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
             config,
@@ -585,9 +652,11 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
-            terminal_fallback: Arc::new(GrpcQueryTerminalFallbackTransport),
+            terminal_fallback,
             self_weak: self_weak.clone(),
-        })
+        });
+        registry.publish_metrics();
+        registry
     }
 
     fn local_backend_id(&self) -> Option<u64> {
@@ -896,6 +965,7 @@ impl QueryLifecycleRegistry {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(
             CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
         );
+        let (observations_tx, observations_rx) = tokio::sync::watch::channel(None);
         events_tx
             .try_send(QueryControlEvent::ControlReady)
             .map_err(|error| {
@@ -959,6 +1029,7 @@ impl QueryLifecycleRegistry {
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
+            state.observations = Some(observations_tx);
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
@@ -996,7 +1067,79 @@ impl QueryLifecycleRegistry {
                 execution_id: attach.execution_id(),
             }),
             events: events_rx,
+            observations: observations_rx,
         })
+    }
+
+    /// Publishes a best-effort, latest-only fragment observation. This path is
+    /// intentionally unable to wait on transport I/O or mutate correctness
+    /// state: a full/stalled stream may lose observations but must still carry
+    /// heartbeat acknowledgements, drain barriers, and terminal facts.
+    pub(crate) fn publish_fragment_observation(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        input_rows: u64,
+        output_rows: u64,
+        elapsed_ms: u64,
+        profile: Option<RuntimeProfileTree>,
+    ) -> bool {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return false;
+        };
+        let (sender, observation) = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if !matches!(
+                state.phase,
+                QueryLifecyclePhase::ControlAttached
+                    | QueryLifecyclePhase::Staging
+                    | QueryLifecyclePhase::Staged
+                    | QueryLifecyclePhase::Running
+            ) || !entry
+                .manifest
+                .expected_fragment_instance_ids()
+                .contains(&fragment_instance_id)
+            {
+                return false;
+            }
+            let sequence = state
+                .observation_sequences
+                .get(&fragment_instance_id)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(1);
+            let Some(sequence) = sequence else {
+                return false;
+            };
+            let Some(sender) = state.observations.clone() else {
+                return false;
+            };
+            let observation = FragmentLiveObservation::new(
+                execution_id,
+                entry.digest,
+                entry.manifest.backend().clone(),
+                fragment_instance_id,
+                sequence,
+                input_rows,
+                output_rows,
+                elapsed_ms,
+                profile,
+            )
+            .expect("registry-owned fragment observation is structurally valid");
+            state
+                .observation_sequences
+                .insert(fragment_instance_id, sequence);
+            (sender, observation)
+        };
+        sender.send_replace(Some(observation));
+        true
     }
 
     pub(crate) fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
@@ -2180,6 +2323,14 @@ impl QueryLifecycleRegistry {
                                 detail = %ack.detail(),
                                 "query terminal fallback was rejected"
                             );
+                            if ack.outcome() == QueryTerminalReportOutcome::RejectedConflict {
+                                registry.discard_terminal_record(
+                                    &entry,
+                                    snapshot.execution_id(),
+                                    snapshot.digest(),
+                                );
+                                return;
+                            }
                         }
                         Err(error) => {
                             registry.increment_terminal_metric(|metrics| {
@@ -2270,6 +2421,34 @@ impl QueryLifecycleRegistry {
             QueryTerminationReason::CoordinatorFinalize,
         );
         Ok(())
+    }
+
+    /// A conflict is a terminal answer from a live FE: retrying the immutable
+    /// snapshot cannot change the rejected identity. Drop only this bounded
+    /// delivery record; execution resources were detached before it existed.
+    fn discard_terminal_record(
+        &self,
+        entry: &Arc<QueryLifecycleEntry>,
+        execution_id: QueryExecutionId,
+        digest: novarocks::query_execution::lifecycle::QueryTerminalSnapshotDigest,
+    ) {
+        let reason = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            let retained = state
+                .terminal_record
+                .as_ref()
+                .is_some_and(|record| record.snapshot().digest() == digest);
+            if !retained {
+                return;
+            }
+            state.terminal_record = None;
+            state
+                .termination_reason
+                .unwrap_or(QueryTerminationReason::CoordinatorFinalize)
+        };
+        entry.terminal_delivery_completed.notify_all();
+        self.release_terminal_record(execution_id);
+        self.publish_tombstone(entry, execution_id, reason);
     }
 
     fn try_complete_runtime_filter_cleanup(

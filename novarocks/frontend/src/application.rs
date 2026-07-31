@@ -27,9 +27,7 @@ use novarocks_state_store::{
 };
 
 use crate::connector::ConnectorControlHost;
-use crate::coordinator::{
-    BackendQueryActivity, FrontendCoordinatorReportHandler, FrontendDistributedQueryCoordinator,
-};
+use crate::coordinator::{BackendQueryActivity, FrontendDistributedQueryCoordinator};
 use crate::deployment::{FeDeploymentViewSource, SqliteSingleFeDeploymentViewSource};
 use crate::dml::{DmlService, StateStoreOperationJournal};
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
@@ -349,19 +347,6 @@ impl FrontendApplicationHost {
         &self,
     ) -> novarocks::query_execution::control::QueryControlService {
         self.query_control.clone()
-    }
-
-    pub fn coordinator_report_handler(&self) -> FrontendCoordinatorReportHandler {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .report_handler()
-    }
-
-    pub fn native_report_handler(
-        &self,
-    ) -> Arc<dyn novarocks::query_execution::report::NativeReportHandler> {
-        Arc::new(self.coordinator_report_handler())
     }
 
     pub fn terminal_ingress(

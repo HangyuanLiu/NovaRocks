@@ -19,7 +19,7 @@
 
 -- query 1
 -- @skip_result_check=true
-CREATE TABLE ${case_db}.fragment_report_failure (
+CREATE TABLE ${case_db}.fragment_execution_failure (
   id BIGINT,
   delay_s BIGINT
 )
@@ -27,20 +27,25 @@ TBLPROPERTIES ("format-version" = "3");
 
 -- query 2
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (1, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES (1, 5);
 
 -- query 3
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (2, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES (2, 5);
 
 -- query 4
 -- @skip_result_check=true
-INSERT INTO ${case_db}.fragment_report_failure VALUES (3, 5);
+INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 
 -- query 5
 -- @fail_fragment_after_start_be_index=1
 -- @expect_error=fragment executor failure injected after start
 -- @be_log_exact_fragment_cancellation=3
 SELECT COUNT(*)
-FROM ${case_db}.fragment_report_failure
+FROM ${case_db}.fragment_execution_failure
 WHERE sleep(delay_s);
+
+-- query 6
+-- A destructive local executor failure must leave the following query healthy.
+-- @result_contains=3
+SELECT COUNT(*) FROM ${case_db}.fragment_execution_failure;

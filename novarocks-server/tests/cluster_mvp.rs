@@ -1031,6 +1031,34 @@ fn backend_query_lifecycle_termination_count(port: u16, reason: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn wait_for_backend_running_fragment_control(port: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let metrics = fetch_http_text(port, "/metrics");
+        let running = metrics
+            .lines()
+            .find(|line| {
+                line.starts_with("novarocks_backend_query_execution_resources")
+                    && line.contains("resource=\"fragment_controls_running\"")
+            })
+            .and_then(|line| line.split_ascii_whitespace().last())
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if running >= 1.0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {port} did not start a fragment control before client disconnect; metrics={:?}",
+            metrics
+                .lines()
+                .filter(|line| line.starts_with("novarocks_backend_query_execution_resources"))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_backend_query_lifecycle_termination(port: u16, reason: &str, timeout: Duration) {
     wait_for_backend_query_lifecycle_termination_any(port, &[reason], timeout);
 }
@@ -1340,18 +1368,10 @@ fn mysql_disconnect_triggers_cancel() {
     }
     let _lock = lock_cluster_mvp();
 
-    let mut cluster = ClusterHarness::start(
-        r#"
-[debug]
-emit_grpc_fragment_marker = true
-"#,
-        "",
-    );
+    let mut cluster = ClusterHarness::start("", "");
 
     let stream = send_mysql_query(cluster.fe_mysql, disconnect_blocking_query_sql());
-    cluster
-        .be
-        .wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
+    wait_for_backend_running_fragment_control(cluster.be_grpc, Duration::from_secs(3));
     stream
         .shutdown(Shutdown::Both)
         .expect("shutdown raw mysql client");

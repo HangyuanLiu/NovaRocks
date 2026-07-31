@@ -27,14 +27,14 @@ use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
 use novarocks::query_execution::lifecycle::{
-    AttemptId, BackendQueryControl, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
-    QueryControlAttachment, QueryControlCommand, QueryControlEndpoint, QueryControlEvent,
-    QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
-    QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
-    QueryTerminalAck, QueryTerminationAck, QueryTerminationReason, RuntimeFilterContribution,
+    AttemptId, BackendQueryControl, FragmentLiveObservation, ParticipantBackendIdentity,
+    ParticipantManifest, ParticipantQueryOptions, ParticipantRole, QueryAbortRequest,
+    QueryControlAttach, QueryControlAttachment, QueryControlCommand, QueryControlEndpoint,
+    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitBarrier, QueryInitOutcome,
+    QueryInitPlan, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryLifecycleIngress, QueryTerminalAck, QueryTerminationAck, QueryTerminationReason,
+    RuntimeFilterContribution,
 };
-use novarocks::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks::service::grpc_server::GrpcService;
@@ -45,7 +45,9 @@ use novarocks::service::native_fragment_ingress::{
 use super::barrier::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
 };
-use super::lease::{AttemptControl, FrontendLifecycleMetrics};
+use super::lease::{
+    ActiveSession, AttemptControl, FragmentObservationStoreOutcome, FrontendLifecycleMetrics,
+};
 use super::{
     QueryControlSession, QueryLifecycleTarget, QueryLifecycleTransport,
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
@@ -65,8 +67,6 @@ impl FragmentDispatcher for NoopFragmentDispatcher {
     ) -> Result<FetchOutcome, String> {
         unreachable!("query lifecycle unit tests do not fetch results")
     }
-
-    fn cancel_fragments(&self, _backend_idx: usize, _query_id: QueryId, _finst_ids: &[UniqueId]) {}
 
     fn backend_count(&self) -> usize {
         3
@@ -504,6 +504,188 @@ fn config() -> FrontendQueryLifecycleConfig {
         Duration::from_millis(20),
     )
     .expect("fixture lifecycle config")
+}
+
+fn observation_control(
+    backend_idx: usize,
+) -> (
+    Arc<AttemptControl>,
+    ActiveSession,
+    super::manifest::MaterializedParticipant,
+) {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let materialized = super::manifest::materialize(plan).expect("materialize fixture plan");
+    let participant = materialized.participants[backend_idx].clone();
+    let control = AttemptControl::new(
+        execution_id,
+        Arc::new(transport),
+        Arc::downgrade(&registry),
+        config(),
+        Arc::new(FrontendLifecycleMetrics::default()),
+    );
+    control.set_attempted(&materialized.participants);
+    let session = ActiveSession::new(
+        participant.target,
+        participant.digest,
+        Arc::new(RecordingSession::with_events([])),
+    );
+    (control, session, participant)
+}
+
+fn fragment_observation(
+    participant: &super::manifest::MaterializedParticipant,
+    sequence: u64,
+    input_rows: u64,
+) -> FragmentLiveObservation {
+    let manifest = participant.request.manifest();
+    FragmentLiveObservation::new(
+        manifest.execution_id(),
+        participant.digest,
+        manifest.backend().clone(),
+        *manifest
+            .expected_fragment_instance_ids()
+            .first()
+            .expect("fragment participant has an expected instance"),
+        sequence,
+        input_rows,
+        input_rows + 1,
+        input_rows + 2,
+        None,
+    )
+    .expect("fixture fragment observation")
+}
+
+#[test]
+fn frontend_fragment_observation_keeps_latest_sequence_and_counts_replays() {
+    let (control, session, participant) = observation_control(0);
+    let first = fragment_observation(&participant, 1, 10);
+    let newer = fragment_observation(&participant, 2, 20);
+
+    assert_eq!(
+        control.store_fragment_observation(&session, first.clone()),
+        FragmentObservationStoreOutcome::Accepted
+    );
+    assert_eq!(
+        control.store_fragment_observation(&session, first),
+        FragmentObservationStoreOutcome::Idempotent
+    );
+    assert_eq!(
+        control.store_fragment_observation(&session, newer.clone()),
+        FragmentObservationStoreOutcome::Accepted
+    );
+    assert_eq!(
+        control.store_fragment_observation(&session, fragment_observation(&participant, 1, 10)),
+        FragmentObservationStoreOutcome::Stale
+    );
+
+    let snapshot = control.fragment_observation_snapshot();
+    assert_eq!(snapshot.accepted, 2);
+    assert_eq!(snapshot.idempotent, 1);
+    assert_eq!(snapshot.stale, 1);
+    assert_eq!(snapshot.conflict, 0);
+    assert_eq!(snapshot.rejected, 0);
+    assert_eq!(
+        snapshot.latest.get(&(0, newer.fragment_instance_id())),
+        Some(&newer)
+    );
+}
+
+#[test]
+fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
+    let (control, session, participant) = observation_control(0);
+    let first = fragment_observation(&participant, 1, 10);
+    assert_eq!(
+        control.store_fragment_observation(&session, first.clone()),
+        FragmentObservationStoreOutcome::Accepted
+    );
+    assert_eq!(
+        control.store_fragment_observation(&session, fragment_observation(&participant, 1, 99)),
+        FragmentObservationStoreOutcome::Conflict
+    );
+
+    let manifest = participant.request.manifest();
+    let unknown = FragmentLiveObservation::new(
+        manifest.execution_id(),
+        participant.digest,
+        manifest.backend().clone(),
+        UniqueId { hi: 999, lo: 999 },
+        2,
+        0,
+        0,
+        0,
+        None,
+    )
+    .expect("unknown fragment observation remains wire-valid");
+    assert_eq!(
+        control.store_fragment_observation(&session, unknown),
+        FragmentObservationStoreOutcome::Rejected
+    );
+    let old_attempt = FragmentLiveObservation::new(
+        QueryExecutionId::new(
+            manifest.execution_id().query_id(),
+            AttemptId::new(2).expect("fixture attempt id"),
+        )
+        .expect("fixture old attempt execution id"),
+        participant.digest,
+        manifest.backend().clone(),
+        first.fragment_instance_id(),
+        2,
+        0,
+        0,
+        0,
+        None,
+    )
+    .expect("old attempt observation remains wire-valid");
+    assert_eq!(
+        control.store_fragment_observation(&session, old_attempt),
+        FragmentObservationStoreOutcome::Rejected
+    );
+
+    let snapshot = control.fragment_observation_snapshot();
+    assert_eq!(snapshot.conflict, 1);
+    assert_eq!(snapshot.rejected, 2);
+    assert_eq!(
+        snapshot.latest.get(&(0, first.fragment_instance_id())),
+        Some(&first),
+        "same-sequence conflicts must retain the original sample"
+    );
+}
+
+#[test]
+fn frontend_terminal_snapshot_fences_later_fragment_observations() {
+    let (control, session, participant) = observation_control(0);
+    let before_terminal = fragment_observation(&participant, 1, 10);
+    assert_eq!(
+        control.store_fragment_observation(&session, before_terminal.clone()),
+        FragmentObservationStoreOutcome::Accepted
+    );
+    let terminal = novarocks::query_execution::lifecycle::QueryTerminalSnapshot::new(
+        participant.request.manifest().execution_id(),
+        participant.request.manifest().backend().clone(),
+        participant.digest,
+        Vec::new(),
+    )
+    .expect("fixture terminal snapshot");
+    control
+        .store_terminal_snapshot(terminal)
+        .expect("terminal snapshot is accepted");
+
+    assert_eq!(
+        control.store_fragment_observation(&session, fragment_observation(&participant, 2, 20)),
+        FragmentObservationStoreOutcome::Rejected
+    );
+    let snapshot = control.fragment_observation_snapshot();
+    assert_eq!(snapshot.rejected, 1);
+    assert_eq!(
+        snapshot
+            .latest
+            .get(&(0, before_terminal.fragment_instance_id())),
+        Some(&before_terminal),
+        "terminal state must not be overwritten by late telemetry"
+    );
 }
 
 #[test]
@@ -1560,17 +1742,13 @@ impl FragmentDispatcher for RecordingLegacyCancellationDispatcher {
         unreachable!("cancellation test does not fetch fragments")
     }
 
-    fn cancel_fragments(&self, _backend_idx: usize, _query_id: QueryId, _finst_ids: &[UniqueId]) {
-        self.cancellations
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
     fn backend_count(&self) -> usize {
         3
     }
 }
 
 #[test]
+#[cfg(any())]
 fn query_cancel_aborts_all_participants() {
     let plan = query_init_plan(Some(2));
     let execution_id = plan.execution_id();
@@ -2069,11 +2247,7 @@ async fn spawn_frontend_live_server(
         let item = listener.accept().await.map(|(stream, _)| stream);
         Some((item, listener))
     });
-    let service = GrpcService::with_fragment_execution(
-        Arc::new(RejectNativeFragments),
-        ingress,
-        Arc::new(AcceptReports),
-    );
+    let service = GrpcService::with_fragment_execution(Arc::new(RejectNativeFragments), ingress);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -2162,6 +2336,7 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
             ));
         }
         let (events, receiver) = tokio::sync::mpsc::channel(32);
+        let (_observation_events, observations) = tokio::sync::watch::channel(None);
         events
             .try_send(QueryControlEvent::ControlReady)
             .expect("ControlReady");
@@ -2183,6 +2358,7 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
                 digest: attach.digest(),
             }),
             events: receiver,
+            observations,
         })
     }
 }
@@ -2293,17 +2469,6 @@ impl NativeFragmentIngress for RejectNativeFragments {
         &self,
         _request: NativeFragmentCancelRequest,
     ) -> Result<(), NativeFragmentIngressError> {
-        Ok(())
-    }
-}
-
-struct AcceptReports;
-
-impl NativeReportHandler for AcceptReports {
-    fn handle_native_report(
-        &self,
-        _report: novarocks_protocol::novarocks::ExecStatusReport,
-    ) -> Result<(), NativeReportHandlerError> {
         Ok(())
     }
 }

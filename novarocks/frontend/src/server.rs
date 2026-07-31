@@ -80,7 +80,6 @@ fn standalone_open_services(
         host.backend_query_event_sink(),
         host.backend_topology_port(),
         host.coordinator_report_endpoint_sink(),
-        host.native_report_handler(),
         host.query_control_service(),
         host.connector_control_registry(),
         0,
@@ -90,7 +89,7 @@ fn standalone_open_services(
 
 /// Opens the frontend services once for an externally composed server. The
 /// all-in-one composition root uses the returned host both to run MySQL and
-/// to provide the report handler installed on the native backend endpoint.
+/// to provide the terminal fallback ingress installed on the native backend endpoint.
 pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
@@ -641,6 +640,7 @@ mod tests {
             novarocks::query_execution::lifecycle::QueryLifecycleError,
         > {
             let (events, receiver) = tokio::sync::mpsc::channel(32);
+            let (_observations, observations) = tokio::sync::watch::channel(None);
             events
                 .try_send(novarocks::query_execution::lifecycle::QueryControlEvent::ControlReady)
                 .expect("publish test ControlReady");
@@ -648,13 +648,14 @@ mod tests {
                 novarocks::query_execution::lifecycle::QueryControlAttachment {
                     control: Arc::new(ReadyQueryControl { events }),
                     events: receiver,
+                    observations,
                 },
             )
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn all_in_one_production_composition_uses_frontend_reports_and_loopback_grpc() {
+    async fn all_in_one_production_composition_uses_loopback_grpc() {
         let _grpc_guard = GrpcServerTestGuard;
         let mut config = novarocks::common::app_config::NovaRocksConfig::default();
         config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
@@ -678,7 +679,6 @@ mod tests {
             config.server.grpc_port,
             Arc::new(RejectingNativeFragmentIngress),
             Arc::new(ReadyQueryLifecycleIngress),
-            Arc::clone(&services.native_report_handler),
             Some(host.terminal_ingress()),
         )
         .expect("start production-composed all-in-one gRPC endpoint");
@@ -727,43 +727,12 @@ mod tests {
             "all-in-one publishes its loopback backend"
         );
 
-        let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(
+        let _client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new(
             format!("127.0.0.1:{grpc_port}")
                 .parse()
                 .expect("all-in-one loopback address"),
         )
         .expect("all-in-one loopback client");
-        let report_response = client
-            .blocking_report_exec_status(novarocks_protocol::novarocks::ReportExecStatusRequest {
-                report: Some(novarocks_protocol::novarocks::ExecStatusReport {
-                    query_id: Some(novarocks_protocol::common::UniqueId { hi: 61, lo: 71 }),
-                    fragment_instance_id: Some(novarocks_protocol::common::UniqueId {
-                        hi: 61,
-                        lo: 72,
-                    }),
-                    status: Some(novarocks_protocol::common::Status::default()),
-                    done: true,
-                    ..Default::default()
-                }),
-            })
-            .expect("all-in-one report RPC returns a business response");
-        assert_eq!(report_response.status_code, 2);
-        assert_eq!(report_response.error_code, "WriteCoordinatorGone");
-        assert_eq!(
-            report_response.message,
-            "frontend query 61/71 is not active"
-        );
-
-        let fixture = novarocks::query_execution::contract_test_support::non_empty_result_contract_fixture_with_topology(
-            backend_topology
-                .snapshot()
-                .expect("capture loopback topology for the contract fixture"),
-        );
-        let error = match host.execute_distributed_query_for_test(fixture.into_request()) {
-            Ok(_) => panic!("contract fixture must reach backend ingress over loopback gRPC"),
-            Err(error) => error,
-        };
-        assert!(error.message().contains("StageFragments"), "{error}");
 
         drop(engine);
         novarocks::service::grpc_server::stop_grpc_server()

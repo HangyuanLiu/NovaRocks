@@ -7,3 +7,7 @@
 -- query 4
 
 -- query 5
+
+-- query 6
+count(*)
+3

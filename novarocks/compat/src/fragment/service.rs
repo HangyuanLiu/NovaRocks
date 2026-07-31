@@ -769,7 +769,6 @@ fn prepare_starrocks_draft(
     query_globals: Option<&internal_service::TQueryGlobals>,
     db_name: Option<&str>,
     coord: Option<&types::TNetworkAddress>,
-    novarocks_report_addr: Option<&types::TNetworkAddress>,
     backend_num: Option<i32>,
     pipeline_dop: i32,
     group_execution_scan_dop: Option<i32>,
@@ -792,15 +791,6 @@ fn prepare_starrocks_draft(
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
-    let novarocks_report_endpoint = novarocks_report_addr
-        .map(|address| {
-            decode_runtime_endpoint(
-                address,
-                FieldPath::root("exec_plan_fragment").field("novarocks_report_addr"),
-            )
-            .map_err(|error| error.to_string())
-        })
-        .transpose()?;
     let draft = prepare_fragment_submission(StarRocksDecodeInput {
         fragment,
         descriptors: descriptor,
@@ -809,7 +799,6 @@ fn prepare_starrocks_draft(
         query_globals,
         db_name,
         coord,
-        novarocks_report_endpoint: novarocks_report_endpoint.as_ref(),
         backend_num,
         pipeline_dop,
         group_execution_scan_dop,
@@ -1234,23 +1223,6 @@ fn register_fragment_reports(
             ));
         }
         match worker.report_destination.as_ref() {
-            Some(StarRocksReportDestination::NovaRocks(endpoint)) => {
-                report::register_novarocks_report(
-                    FragmentReportRegistration::new(
-                        worker.finst_id,
-                        query_id,
-                        worker.backend_num,
-                        worker.enable_profile,
-                        worker.profiler.clone(),
-                        Some(Arc::clone(&worker.fragment_mem_tracker)),
-                        Some(Arc::clone(&worker.query_mem_tracker)),
-                        worker.report_interval_ns,
-                    ),
-                    endpoint.clone(),
-                );
-                registered.push(worker.finst_id);
-                record_report_registration(query_id, worker.finst_id);
-            }
             Some(StarRocksReportDestination::Coordinator(endpoint)) => {
                 service.report_service.register(
                     FragmentReportRegistration::new(
@@ -1290,9 +1262,6 @@ fn unregister_fragment_reports(
             .find(|worker| worker.finst_id == *finst_id)
             .and_then(|worker| worker.report_destination.as_ref())
         {
-            Some(StarRocksReportDestination::NovaRocks(_)) => {
-                report::unregister_novarocks_report(*finst_id);
-            }
             Some(StarRocksReportDestination::Coordinator(_)) => {
                 report_service.unregister(*finst_id);
             }
@@ -1709,9 +1678,6 @@ fn spawn_dormant_workers(
                             decision.include_runtime_filter_profile(),
                         );
                         match report_destination.as_ref() {
-                            Some(StarRocksReportDestination::NovaRocks(_)) => {
-                                report::report_novarocks_terminal(finst_id, terminal);
-                            }
                             Some(StarRocksReportDestination::Coordinator(_)) => {
                                 report_service.report_terminal(finst_id, terminal);
                             }
@@ -1824,10 +1790,6 @@ fn submit_exec_batch_plan_fragments_with(
             .coord
             .as_ref()
             .or_else(|| common.and_then(|c| c.coord.as_ref()));
-        let novarocks_report_addr = one
-            .novarocks_report_addr
-            .clone()
-            .or_else(|| common.and_then(|c| c.novarocks_report_addr.clone()));
         let typed_result_sink = one
             .novarocks_typed_result_sink
             .or_else(|| common.and_then(|c| c.novarocks_typed_result_sink))
@@ -1880,7 +1842,6 @@ fn submit_exec_batch_plan_fragments_with(
             query_globals,
             db_name,
             coord,
-            novarocks_report_addr,
             backend_num,
             resolve_pipeline_dop(one),
             one.group_execution_scan_dop,
@@ -1889,7 +1850,7 @@ fn submit_exec_batch_plan_fragments_with(
         ));
     }
     let query_id = query_id_for_batch.expect("non-empty batch has query id");
-    let unique_descriptors = envelopes.iter().map(|entry| entry.11).collect::<Vec<_>>();
+    let unique_descriptors = envelopes.iter().map(|entry| entry.10).collect::<Vec<_>>();
     let descriptor_preparation =
         service
             .descriptor_cache
@@ -1922,12 +1883,11 @@ fn submit_exec_batch_plan_fragments_with(
             entry.3,
             entry.4,
             entry.5,
-            entry.6.as_ref(),
+            entry.6,
             entry.7,
             entry.8,
-            entry.9,
             &sender_counts,
-            entry.10,
+            entry.9,
             service.table_schema_provider.clone(),
             service.schema_load_provider.clone(),
             service.sink_frontend_provider.clone(),
@@ -2017,7 +1977,6 @@ fn submit_exec_plan_fragment_with(
         one.query_globals.as_ref(),
         one.db_name.as_deref(),
         one.coord.as_ref(),
-        one.novarocks_report_addr.as_ref(),
         one.backend_num,
         resolve_pipeline_dop(&one),
         one.group_execution_scan_dop,
@@ -2085,7 +2044,6 @@ fn execute_plan_fragment_sync_with(
         one.query_globals.as_ref(),
         one.db_name.as_deref(),
         one.coord.as_ref(),
-        one.novarocks_report_addr.as_ref(),
         one.backend_num,
         resolve_pipeline_dop(&one),
         one.group_execution_scan_dop,

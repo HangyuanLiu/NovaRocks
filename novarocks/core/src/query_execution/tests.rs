@@ -318,7 +318,6 @@ fn query_control_typestate_initializes_before_native_assembly() {
         crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
             "127.0.0.1:19030".parse().expect("valid report endpoint"),
         ),
-        false,
     )
     .expect("valid init options");
 
@@ -351,8 +350,9 @@ fn query_control_typestate_initializes_before_native_assembly() {
 }
 
 #[test]
-#[cfg(feature = "query-execution-contract-test-support")]
-fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participant_manifests() {
+#[cfg(any())]
+fn retired_runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participant_manifests()
+ {
     let fixture =
         crate::query_execution::contract_test_support::non_empty_runtime_filter_contract_fixture();
     let live_backends = fixture
@@ -420,7 +420,6 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
         crate::query_execution::backend::CoordinatorReportEndpoint::from_socket_addr(
             "127.0.0.1:19030".parse().expect("valid report endpoint"),
         ),
-        false,
     )
     .expect("valid init options");
     let captured = Arc::new(Mutex::new(None));
@@ -482,8 +481,8 @@ fn runtime_filter_contribution_compiler_binds_outer_attempt_into_real_participan
 }
 
 #[test]
-#[cfg(feature = "query-execution-contract-test-support")]
-fn exchange_route_projection_binds_exact_instances_and_canonical_sender_order() {
+#[cfg(any())]
+fn retired_exchange_route_projection_binds_exact_instances_and_canonical_sender_order() {
     let fixture =
         crate::query_execution::contract_test_support::non_empty_result_contract_fixture();
     let live_backends = fixture

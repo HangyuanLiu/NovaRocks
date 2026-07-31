@@ -83,8 +83,12 @@ impl StarRocksQueryGeneration {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum QueryExecutionGeneration {
-    Native,
+    Native(NonZeroU64),
     StarRocks(StarRocksQueryGeneration),
+}
+
+fn legacy_native_attempt() -> NonZeroU64 {
+    NonZeroU64::new(1).expect("one is a nonzero native attempt")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -94,10 +98,20 @@ pub(crate) struct QueryExecutionKey {
 }
 
 impl QueryExecutionKey {
-    pub(crate) const fn native(query_id: QueryId) -> Self {
+    /// Legacy native callers predate lifecycle attempts. New native lifecycle
+    /// code must use `native_attempt`; keeping this constructor preserves the
+    /// standalone/compat-neutral internal helpers until their owners migrate.
+    pub(crate) fn native(query_id: QueryId) -> Self {
         Self {
             query_id,
-            generation: QueryExecutionGeneration::Native,
+            generation: QueryExecutionGeneration::Native(legacy_native_attempt()),
+        }
+    }
+
+    pub(crate) const fn native_attempt(query_id: QueryId, attempt: NonZeroU64) -> Self {
+        Self {
+            query_id,
+            generation: QueryExecutionGeneration::Native(attempt),
         }
     }
 
@@ -114,15 +128,22 @@ impl QueryExecutionKey {
 
     pub(crate) const fn starrocks_generation(self) -> Option<StarRocksQueryGeneration> {
         match self.generation {
-            QueryExecutionGeneration::Native => None,
+            QueryExecutionGeneration::Native(_) => None,
             QueryExecutionGeneration::StarRocks(generation) => Some(generation),
+        }
+    }
+
+    pub(crate) const fn native_attempt_id(self) -> Option<NonZeroU64> {
+        match self.generation {
+            QueryExecutionGeneration::Native(attempt) => Some(attempt),
+            QueryExecutionGeneration::StarRocks(_) => None,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueryContextGeneration {
-    Native,
+    Native(NonZeroU64),
     StarRocksUnbound,
     StarRocks(StarRocksQueryGeneration),
 }
@@ -368,7 +389,7 @@ impl QueryContext {
     ) -> Self {
         Self::new_with_generation(
             query_id,
-            QueryContextGeneration::Native,
+            QueryContextGeneration::Native(legacy_native_attempt()),
             delivery_expire,
             query_expire,
         )
@@ -417,8 +438,8 @@ impl QueryContext {
             && matches!(
                 (self.execution_generation, key.generation),
                 (
-                    QueryContextGeneration::Native,
-                    QueryExecutionGeneration::Native
+                    QueryContextGeneration::Native(_),
+                    QueryExecutionGeneration::Native(_)
                 ) | (
                     QueryContextGeneration::StarRocks(_),
                     QueryExecutionGeneration::StarRocks(_)
@@ -429,7 +450,10 @@ impl QueryContext {
                     QueryContextGeneration::StarRocks(current),
                     QueryExecutionGeneration::StarRocks(requested),
                 ) => current == requested,
-                (QueryContextGeneration::Native, QueryExecutionGeneration::Native) => true,
+                (
+                    QueryContextGeneration::Native(current),
+                    QueryExecutionGeneration::Native(requested),
+                ) => current == requested,
                 _ => false,
             }
     }
@@ -453,7 +477,7 @@ impl QueryContext {
                 current.get(),
                 generation.get()
             )),
-            QueryContextGeneration::Native => {
+            QueryContextGeneration::Native(_) => {
                 Err("cannot bind StarRocks generation to native query context".to_string())
             }
         }
@@ -759,6 +783,14 @@ pub struct QueryContextManager {
     stopped: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeQueryExecutionResourceSnapshot {
+    pub active_contexts: usize,
+    pub second_chance_contexts: usize,
+    pub active_fragments: usize,
+    pub runtime_filter_services: usize,
+}
+
 fn runtime_filter_terminal_now(_inner: &QueryContextManagerInner) -> Instant {
     #[cfg(test)]
     if let Some(now) = _inner.runtime_filter_terminal_now {
@@ -887,6 +919,31 @@ pub(crate) struct StarRocksQueryHandoff {
 }
 
 impl QueryContextManager {
+    pub fn native_execution_resource_snapshot(&self) -> NativeQueryExecutionResourceSnapshot {
+        let inner = self.inner.lock().expect("query context manager lock");
+        let mut snapshot = NativeQueryExecutionResourceSnapshot::default();
+        for context in inner.active.values() {
+            if matches!(
+                context.execution_generation,
+                QueryContextGeneration::Native(_)
+            ) {
+                snapshot.active_contexts += 1;
+                snapshot.active_fragments += context.num_active_fragments;
+                snapshot.runtime_filter_services += 1;
+            }
+        }
+        for context in inner.second_chance.values() {
+            if matches!(
+                context.execution_generation,
+                QueryContextGeneration::Native(_)
+            ) {
+                snapshot.second_chance_contexts += 1;
+                snapshot.active_fragments += context.num_active_fragments;
+                snapshot.runtime_filter_services += 1;
+            }
+        }
+        snapshot
+    }
     fn new() -> Arc<Self> {
         let manager = Arc::new(Self {
             inner: Mutex::new(QueryContextManagerInner::default()),
@@ -1214,7 +1271,7 @@ impl QueryContextManager {
             delivery_expire,
             query_expire,
             true,
-            QueryContextGeneration::Native,
+            QueryContextGeneration::Native(legacy_native_attempt()),
             true,
         )
     }
@@ -1232,7 +1289,49 @@ impl QueryContextManager {
             delivery_expire,
             query_expire,
             false,
-            QueryContextGeneration::Native,
+            QueryContextGeneration::Native(legacy_native_attempt()),
+            true,
+        )
+    }
+
+    pub(crate) fn ensure_native_context_execution(
+        &self,
+        execution: QueryExecutionKey,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        let Some(attempt) = execution.native_attempt_id() else {
+            return Err("native context requires a native execution key".to_string());
+        };
+        self.get_or_register_internal_with_generation(
+            execution.query_id(),
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            false,
+            QueryContextGeneration::Native(attempt),
+            true,
+        )
+    }
+
+    pub(crate) fn get_or_register_native_execution(
+        &self,
+        execution: QueryExecutionKey,
+        return_error_if_not_exist: bool,
+        delivery_expire: Duration,
+        query_expire: Duration,
+    ) -> Result<(), String> {
+        let Some(attempt) = execution.native_attempt_id() else {
+            return Err("native context requires a native execution key".to_string());
+        };
+        self.get_or_register_internal_with_generation(
+            execution.query_id(),
+            return_error_if_not_exist,
+            delivery_expire,
+            query_expire,
+            true,
+            QueryContextGeneration::Native(attempt),
             true,
         )
     }
@@ -2006,7 +2105,7 @@ impl QueryContextManager {
             delivery_expire,
             query_expire,
             increment,
-            QueryContextGeneration::Native,
+            QueryContextGeneration::Native(legacy_native_attempt()),
             false,
         )
     }
@@ -2201,7 +2300,7 @@ impl QueryContextManager {
                         generation.get()
                     ));
                 }
-                QueryContextGeneration::Native => {
+                QueryContextGeneration::Native(_) => {
                     return Err(
                         "cannot bind StarRocks generation to native query context".to_string()
                     );
@@ -2289,6 +2388,22 @@ impl QueryContextManager {
         self.with_context_mut(query_id, |ctx| ctx.set_cache_options(options))
     }
 
+    pub(crate) fn set_cache_options_execution(
+        &self,
+        execution: QueryExecutionKey,
+        options: CacheOptions,
+    ) -> Result<(), String> {
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let ctx = guard
+            .active
+            .get_mut(&execution.query_id())
+            .ok_or_else(|| "QueryContext not found".to_string())?;
+        if !ctx.matches_execution(execution) {
+            return Err("query execution generation is not active".to_string());
+        }
+        ctx.set_cache_options(options)
+    }
+
     pub(crate) fn attach_cleanup_lease(
         &self,
         query_id: QueryId,
@@ -2370,6 +2485,53 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .ok_or_else(|| "runtime filter native execution QueryContext not found".to_string())?;
+        if context.cancelled_by_fe {
+            return Err("runtime filter deployment query was cancelled".to_string());
+        }
+        let claim = context.runtime_filter_deployment.as_ref().ok_or_else(|| {
+            "runtime filter native execution requires deployment state Installed".to_string()
+        })?;
+        if claim.state != RuntimeFilterDeploymentClaimState::Installed {
+            return Err(format!(
+                "runtime filter native execution requires deployment state Installed, current={:?}",
+                claim.state
+            ));
+        }
+        Ok(NativeRuntimeFilterExecutionContext::new(
+            context.runtime_filter_service(),
+            UniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            },
+            claim.install.epoch(),
+            fragment_instance_id,
+        ))
+    }
+
+    pub(crate) fn runtime_filter_context_for_native_execution_attempt(
+        &self,
+        execution: QueryExecutionKey,
+        fragment_instance_id: UniqueId,
+    ) -> Result<NativeRuntimeFilterExecutionContext, String> {
+        let query_id = execution.query_id();
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        if guard
+            .runtime_filter_deployment_terminals
+            .contains_key(&query_id)
+            || guard
+                .runtime_filter_query_cancellations
+                .contains_key(&query_id)
+        {
+            return Err("runtime filter deployment query was cancelled".to_string());
+        }
+        let context = guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .ok_or_else(|| "runtime filter native execution QueryContext not found".to_string())?;
+        if !context.matches_execution(execution) {
+            return Err("runtime filter native execution belongs to another attempt".to_string());
+        }
         if context.cancelled_by_fe {
             return Err("runtime filter deployment query was cancelled".to_string());
         }
@@ -2542,6 +2704,19 @@ impl QueryContextManager {
             .map(|ctx| ctx.mem_tracker())
     }
 
+    pub(crate) fn query_mem_tracker_execution(
+        &self,
+        execution: QueryExecutionKey,
+    ) -> Option<Arc<MemTracker>> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&execution.query_id())
+            .or_else(|| guard.second_chance.get(&execution.query_id()))
+            .filter(|context| context.matches_execution(execution))
+            .map(QueryContext::mem_tracker)
+    }
+
     pub(crate) fn descriptor_snapshot(&self, query_id: QueryId) -> Option<Arc<DescriptorSnapshot>> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
@@ -2662,6 +2837,26 @@ impl QueryContextManager {
             .insert(finst_id, QueryExecutionKey::native(query_id));
     }
 
+    pub(crate) fn register_native_finst_execution(
+        &self,
+        finst_id: UniqueId,
+        execution: QueryExecutionKey,
+    ) -> Result<(), String> {
+        if execution.native_attempt_id().is_none() {
+            return Err("native finst registration requires a native execution key".to_string());
+        }
+        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+        let context = guard
+            .active
+            .get(&execution.query_id())
+            .ok_or_else(|| "QueryContext not found".to_string())?;
+        if !context.matches_execution(execution) {
+            return Err("native finst registration belongs to another attempt".to_string());
+        }
+        guard.finst_to_query.insert(finst_id, execution);
+        Ok(())
+    }
+
     pub(crate) fn register_finsts<I>(&self, finst_ids: I, query_id: QueryId)
     where
         I: IntoIterator<Item = UniqueId>,
@@ -2767,6 +2962,52 @@ impl QueryContextManager {
                 return false;
             }
 
+            guard.finst_to_query.remove(&finst_id);
+            let remove_empty_context = {
+                let context = guard
+                    .active
+                    .get_mut(&query_id)
+                    .expect("checked active context");
+                context.rollback_inc_fragments();
+                context.num_fragments == 0
+                    && context.num_active_fragments == 0
+                    && context.runtime_filter_deployment.is_none()
+            };
+            remove_empty_context.then(|| {
+                guard
+                    .active
+                    .remove(&query_id)
+                    .expect("checked empty active context")
+            })
+        };
+        if let Some(context) = removed {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
+        }
+        true
+    }
+
+    pub(crate) fn rollback_pre_ready_native_fragment_execution(
+        &self,
+        execution: QueryExecutionKey,
+        finst_id: UniqueId,
+    ) -> bool {
+        let query_id = execution.query_id();
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if guard.finst_to_query.get(&finst_id) != Some(&execution) {
+                return false;
+            }
+            let Some(context) = guard.active.get(&query_id) else {
+                return false;
+            };
+            if !context.matches_execution(execution)
+                || context.num_fragments == 0
+                || context.num_active_fragments == 0
+            {
+                return false;
+            }
             guard.finst_to_query.remove(&finst_id);
             let remove_empty_context = {
                 let context = guard
@@ -2940,7 +3181,10 @@ impl QueryContextManager {
                 .as_ref()
                 .map(|claim| (claim.install.epoch(), claim.completion.clone()));
             let retain_epochless_cancellation = claim.is_none()
-                && matches!(context.execution_generation, QueryContextGeneration::Native);
+                && matches!(
+                    context.execution_generation,
+                    QueryContextGeneration::Native(_)
+                );
             if retain_epochless_cancellation {
                 context.runtime_filter_cancel_retain_until = Some(expires_at);
             }
@@ -3084,7 +3328,7 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         err: String,
     ) -> Vec<UniqueId> {
-        let (cancellation, finsts) = {
+        let (cancellation, finsts, detached_native_context) = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
             let query_id = execution.query_id();
             let cancellation = Self::prepare_runtime_filter_query_cancellation(
@@ -3098,12 +3342,24 @@ impl QueryContextManager {
                 .iter()
                 .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
                 .collect::<Vec<_>>();
-            (cancellation, finsts)
+            let detached_native_context = (execution.native_attempt_id().is_some()
+                && finsts.is_empty()
+                && guard.active.get(&query_id).is_some_and(|context| {
+                    context.matches_execution(execution) && context.num_active_fragments == 0
+                }))
+            .then(|| guard.active.remove(&query_id))
+            .flatten();
+            (cancellation, finsts, detached_native_context)
         };
         let cancellation_unwind =
             self.execute_runtime_filter_query_cancellation(execution.query_id(), cancellation);
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
+        }
+        if let Some(context) = detached_native_context {
+            context.runtime_filter_service().shutdown();
+            drop(context);
+            self.remove_runtime_filter_lifecycle_if_context_absent(execution.query_id());
         }
         finsts
     }
@@ -3271,6 +3527,20 @@ impl QueryContextManager {
         if !no_active_fragments {
             guard.active.insert(query_id, ctx);
             return FragmentFinishReportDecision::default();
+        }
+        // Native lifecycle completion has already transferred its terminal fact
+        // into the control plane. Do not retain the heavy execution context for
+        // a legacy report-delivery retry window: a later attempt for the same
+        // query id must be able to own the slot independently.
+        if execution.is_some_and(|execution| execution.native_attempt_id().is_some()) {
+            let decision = FragmentFinishReportDecision {
+                include_runtime_filter_profile: true,
+                remove_runtime_filter_lifecycle_after_report: true,
+            };
+            drop(guard);
+            ctx.runtime_filter_service().shutdown();
+            drop(ctx);
+            return decision;
         }
         if ctx.runtime_filter_cancel_is_retained(runtime_filter_terminal_now(&guard)) {
             ctx.extend_delivery_lifetime();

@@ -517,19 +517,6 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 struct TestDistributedQueryCoordinator;
 
 #[cfg(test)]
-struct TestNativeReportHandler;
-
-#[cfg(test)]
-impl crate::query_execution::report::NativeReportHandler for TestNativeReportHandler {
-    fn handle_native_report(
-        &self,
-        _report: crate::proto::novarocks::ExecStatusReport,
-    ) -> Result<(), crate::query_execution::report::NativeReportHandlerError> {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
 impl crate::query_execution::contract::DistributedQueryCoordinator
     for TestDistributedQueryCoordinator
 {
@@ -649,8 +636,6 @@ pub struct StandaloneOpenServices {
     pub backend_topology: crate::query_execution::backend::BackendTopologyService,
     pub coordinator_report_endpoint:
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
-    pub native_report_handler:
-        std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
     /// FE-only ingress for retained terminal snapshot fallback reports. Backend
     /// and compat composition deliberately leave this absent.
     pub terminal_ingress:
@@ -682,9 +667,6 @@ impl StandaloneOpenServices {
         coordinator_report_endpoint: std::sync::Arc<
             dyn crate::query_execution::backend::CoordinatorReportEndpointSink,
         >,
-        native_report_handler: std::sync::Arc<
-            dyn crate::query_execution::report::NativeReportHandler,
-        >,
         query_control: crate::query_execution::control::QueryControlService,
         connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
         exchange_port: u16,
@@ -702,7 +684,6 @@ impl StandaloneOpenServices {
             backend_query_events,
             backend_topology,
             coordinator_report_endpoint,
-            native_report_handler,
             terminal_ingress: None,
             query_control,
             exchange_port,
@@ -710,7 +691,7 @@ impl StandaloneOpenServices {
     }
 
     /// Installs the FE-owned terminal fallback ingress before opening the
-    /// report-only gRPC endpoint.
+    /// terminal-fallback gRPC endpoint.
     pub fn with_terminal_ingress(
         mut self,
         ingress: std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>,
@@ -793,7 +774,6 @@ impl StandaloneNovaRocks {
             backend_query_events,
             backend_topology,
             coordinator_report_endpoint,
-            native_report_handler: _,
             terminal_ingress: _,
             query_control: _,
             exchange_port,
@@ -4869,7 +4849,7 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test()
 -> Result<StandaloneLoopbackTestBackend, String> {
     let test_guard = acquire_standalone_test_guard();
     crate::novarocks_config::install_default_for_test();
-    let exchange_port = ensure_standalone_exchange_server(Arc::new(TestNativeReportHandler))?;
+    let exchange_port = ensure_standalone_exchange_server()?;
     Ok(StandaloneLoopbackTestBackend {
         exchange_port,
         _test_guard: test_guard,
@@ -4877,9 +4857,7 @@ pub(crate) fn install_all_in_one_loopback_backend_for_test()
 }
 
 #[cfg(test)]
-fn ensure_standalone_exchange_server(
-    native_report_handler: Arc<dyn crate::query_execution::report::NativeReportHandler>,
-) -> Result<u16, String> {
+fn ensure_standalone_exchange_server() -> Result<u16, String> {
     static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
 
     if let Some(port) = STANDALONE_EXCHANGE_PORT.get() {
@@ -4892,7 +4870,6 @@ fn ensure_standalone_exchange_server(
         default_port,
         crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
         crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
-        Arc::clone(&native_report_handler),
     ) {
         Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
             .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
@@ -4912,7 +4889,6 @@ fn ensure_standalone_exchange_server(
                 fallback_port,
                 crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
                 crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
-                native_report_handler,
             )
             .map_err(|start_err| {
                 format!(
@@ -6061,7 +6037,6 @@ mod tests {
             Arc::new(crate::query_execution::backend::NoopBackendQueryEventSink),
             backend_topology,
             Arc::new(crate::query_execution::backend::NoopCoordinatorReportEndpointSink),
-            Arc::new(super::TestNativeReportHandler),
             crate::query_execution::control::QueryControlService::for_test(),
             Arc::new(super::TestConnectorControlRegistry::default()),
             1,

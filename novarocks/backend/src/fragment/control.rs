@@ -47,6 +47,32 @@ pub(crate) struct FragmentControlRegistry {
 }
 
 impl FragmentControlRegistry {
+    pub(crate) fn publish_resource_snapshot(&self) {
+        let (reserved, running) = {
+            let state = self.state.lock().expect("fragment control registry lock");
+            (
+                state
+                    .entries
+                    .values()
+                    .filter(|entry| matches!(entry.state, FragmentControlState::Reserved { .. }))
+                    .count(),
+                state
+                    .entries
+                    .values()
+                    .filter(|entry| matches!(entry.state, FragmentControlState::Running(_)))
+                    .count(),
+            )
+        };
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_reserved",
+            reserved,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_running",
+            running,
+        );
+    }
+
     pub(super) fn reserve(
         self: &Arc<Self>,
         fragment_instance_id: UniqueId,
@@ -67,6 +93,27 @@ impl FragmentControlRegistry {
                     pending_cancel: None,
                 },
             },
+        );
+        let snapshot = (
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Reserved { .. }))
+                .count(),
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Running(_)))
+                .count(),
+        );
+        drop(state);
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_reserved",
+            snapshot.0,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_running",
+            snapshot.1,
         );
         Ok(FragmentControlReservation {
             registry: Arc::clone(self),
@@ -125,6 +172,27 @@ impl FragmentControlRegistry {
             }
         };
         entry.state = FragmentControlState::Running(handle);
+        let snapshot = (
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Reserved { .. }))
+                .count(),
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Running(_)))
+                .count(),
+        );
+        drop(state);
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_reserved",
+            snapshot.0,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_running",
+            snapshot.1,
+        );
         pending_cancel
     }
 
@@ -137,6 +205,27 @@ impl FragmentControlRegistry {
         {
             state.entries.remove(&fragment_instance_id);
         }
+        let snapshot = (
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Reserved { .. }))
+                .count(),
+            state
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, FragmentControlState::Running(_)))
+                .count(),
+        );
+        drop(state);
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_reserved",
+            snapshot.0,
+        );
+        novarocks::service::publish_backend_query_execution_resource(
+            "fragment_controls_running",
+            snapshot.1,
+        );
     }
 }
 

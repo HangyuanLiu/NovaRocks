@@ -71,11 +71,11 @@ pub enum FetchOutcome {
     Err(String),
 }
 
-/// Result and cancellation transport for an already-running native query.
+/// Result transport for an already-running native query.
 ///
 /// Query startup belongs exclusively to the query lifecycle Stage/Start
-/// barrier. This port deliberately exposes only the residual fetch, cancel,
-/// and reporting policy needed after that barrier has entered `Running`.
+/// barrier. Query lifecycle owns cancellation and terminal convergence after
+/// that barrier has entered `Running`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
     /// Poll for the next result chunk from the root fragment on the given backend.
     fn fetch_result(
@@ -86,16 +86,8 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<FetchOutcome, String>;
 
-    /// Cancel all listed fragment instances owned by the given query on the backend. Idempotent.
-    fn cancel_fragments(&self, backend_idx: usize, query_id: QueryId, finst_ids: &[UniqueId]);
-
     /// Number of backends this dispatcher can route to.
     fn backend_count(&self) -> usize;
-
-    /// Whether non-write fragments need final status reports back to the coordinator.
-    fn needs_fragment_status_report(&self) -> bool {
-        false
-    }
 }
 
 /// Build the production result/cancellation transport from one explicit

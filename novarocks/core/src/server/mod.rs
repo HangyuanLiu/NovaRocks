@@ -209,13 +209,11 @@ where
     F: Future<Output = ()> + Send,
     B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
-    let native_report_handler = Arc::clone(&services.native_report_handler);
     let terminal_ingress = services.terminal_ingress.clone();
     let grpc_endpoint = start_standalone_grpc_endpoint(
         &resolved.grpc_bind_host,
         resolved.grpc_port,
         resolved.grpc_endpoint,
-        native_report_handler,
         terminal_ingress,
     )?;
     let report_port = grpc_endpoint
@@ -408,27 +406,28 @@ fn start_standalone_grpc_endpoint(
     grpc_bind_host: &str,
     grpc_port: u16,
     ownership: StandaloneGrpcEndpointOwnership,
-    native_report_handler: Arc<dyn crate::query_execution::report::NativeReportHandler>,
     terminal_ingress: Option<Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>>,
 ) -> Result<Option<StartedStandaloneGrpcEndpoint>, String> {
     if !ownership.hosts_report_endpoint() {
         return Ok(None);
     }
 
-    crate::service::grpc_server::start_grpc_report_server_with_terminal_ingress(
+    let terminal_ingress = terminal_ingress.ok_or_else(|| {
+        "standalone coordinator grpc endpoint requires terminal fallback ingress".to_string()
+    })?;
+    crate::service::grpc_server::start_grpc_terminal_server(
         grpc_bind_host,
         grpc_port,
-        native_report_handler,
         terminal_ingress,
     )
     .map_err(|error| {
         format!(
-            "failed to start required standalone coordinator grpc report endpoint on {}:{}: {}",
+            "failed to start required standalone coordinator grpc terminal endpoint on {}:{}: {}",
             grpc_bind_host, grpc_port, error
         )
     })?;
     info!(
-        "standalone coordinator grpc report endpoint started on {}:{}",
+        "standalone coordinator grpc terminal endpoint started on {}:{}",
         grpc_bind_host, grpc_port
     );
     let bound_port = crate::service::grpc_server::grpc_server_bound_port()?;

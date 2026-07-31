@@ -16,16 +16,102 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::net::TcpListener;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use axum::extract::Query;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Router, routing::get};
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, TextEncoder,
     register_histogram, register_int_counter, register_int_gauge, register_int_gauge_vec,
 };
+use tokio::net::TcpListener as TokioTcpListener;
+use tokio::sync::watch;
+
+/// Dedicated HTTP listener for process metrics.  Native execution continues to
+/// expose `/metrics` on its gRPC/HTTP endpoint for compatibility, while
+/// backend deployments use this listener at the configured HTTP port.
+pub struct MetricsHttpServer {
+    shutdown_tx: Option<watch::Sender<bool>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl MetricsHttpServer {
+    /// Use this when the caller intentionally shares `/metrics` with a
+    /// gRPC/HTTP listener on the same configured port.
+    pub const fn shared_with_grpc() -> Self {
+        Self {
+            shutdown_tx: None,
+            join_handle: None,
+        }
+    }
+
+    pub fn start(host: &str, port: u16) -> Result<Self, String> {
+        let bind_addr = crate::service::grpc_server::parse_grpc_bind_addr(host, port)
+            .map_err(|error| format!("parse metrics HTTP bind address failed: {error}"))?;
+        let listener = TcpListener::bind(bind_addr).map_err(|error| {
+            format!("bind metrics HTTP listener on {bind_addr} failed: {error}")
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            format!("configure metrics HTTP listener on {bind_addr} failed: {error}")
+        })?;
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let join_handle = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("failed to build metrics HTTP runtime: {error}");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let listener = match TokioTcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("failed to create metrics HTTP listener: {error}");
+                        return;
+                    }
+                };
+                let app = Router::new().route("/metrics", get(handle_metrics));
+                if let Err(error) = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        while !*shutdown_rx.borrow() {
+                            if shutdown_rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                {
+                    eprintln!("metrics HTTP server exited with error: {error}");
+                }
+            });
+        });
+        Ok(Self {
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Some(join_handle),
+        })
+    }
+
+    pub fn stop(mut self) -> Result<(), String> {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(true);
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            join_handle
+                .join()
+                .map_err(|_| "metrics HTTP server thread panicked".to_string())?;
+        }
+        Ok(())
+    }
+}
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     register_int_counter!(
@@ -94,6 +180,15 @@ static BACKEND_QUERY_LIFECYCLE_TERMINAL: Lazy<IntGaugeVec> = Lazy::new(|| {
         &["outcome"]
     )
     .expect("register novarocks_backend_query_lifecycle_terminal_total")
+});
+
+static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "novarocks_backend_query_execution_resources",
+        "Backend execution resources as reported by their owning component.",
+        &["resource"]
+    )
+    .expect("register novarocks_backend_query_execution_resources")
 });
 
 static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
@@ -218,6 +313,23 @@ pub fn publish_backend_query_lifecycle_metrics(
             .with_label_values(&[outcome])
             .set(count as i64);
     }
+}
+
+/// Publish a scalar snapshot after its owner has released its own lock. The
+/// metrics layer deliberately holds no execution resource references.
+pub fn publish_backend_query_execution_resource(resource: &'static str, value: usize) {
+    BACKEND_QUERY_EXECUTION_RESOURCES
+        .with_label_values(&[resource])
+        .set(value as i64);
+}
+
+pub fn publish_backend_query_lifecycle_terminal_limits(capacity: usize, max_bytes: usize) {
+    BACKEND_QUERY_LIFECYCLE_TERMINAL
+        .with_label_values(&["terminal_retained_capacity"])
+        .set(capacity as i64);
+    BACKEND_QUERY_LIFECYCLE_TERMINAL
+        .with_label_values(&["terminal_max_retained_bytes"])
+        .set(max_bytes as i64);
 }
 
 pub fn publish_frontend_query_lifecycle_metrics(

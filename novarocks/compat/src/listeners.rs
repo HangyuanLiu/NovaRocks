@@ -34,7 +34,6 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks::proto::novarocks as novarocks_proto;
-use novarocks::query_execution::report::NativeReportHandler;
 use novarocks::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardInfo};
 use novarocks::service::grpc_server::GrpcService;
 use novarocks::service::{render_metrics, render_metrics_json};
@@ -292,7 +291,6 @@ impl CompatListenerGroup {
     pub(crate) fn start(
         config: CompatListenerConfig,
         compat_routes: Router,
-        report_handler: Arc<dyn NativeReportHandler>,
         starlet_control: Arc<dyn StarletControl>,
     ) -> Result<Self, String> {
         validate_ports(config.http_port, config.grpc_port, config.starlet_port)?;
@@ -363,9 +361,7 @@ impl CompatListenerGroup {
 
                     let http_service =
                         novarocks_proto::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                            GrpcService::internal_execution_without_native_fragment_ingress(
-                                Arc::clone(&report_handler),
-                            ),
+                            GrpcService::internal_execution_without_native_fragment_ingress(),
                         )
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -375,9 +371,7 @@ impl CompatListenerGroup {
                         .route("/metrics", get(handle_metrics));
                     let grpc_service =
                         novarocks_proto::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                            GrpcService::internal_execution_without_native_fragment_ingress(
-                                report_handler,
-                            ),
+                            GrpcService::internal_execution_without_native_fragment_ingress(),
                         )
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
