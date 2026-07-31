@@ -28,5 +28,5 @@ mod scheduler;
 
 pub use backend_events::BackendQueryActivity;
 pub use execution::FrontendDistributedQueryCoordinator;
-pub use report::FrontendCoordinatorReportHandler;
+pub use report::{FrontendCoordinatorReportHandler, FrontendCoordinatorTerminalIngress};
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

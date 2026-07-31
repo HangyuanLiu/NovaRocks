@@ -48,7 +48,7 @@ use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_tr
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
 use super::query_registry::FrontendQueryRegistry;
-use super::report::FrontendCoordinatorReportHandler;
+use super::report::{FrontendCoordinatorReportHandler, FrontendCoordinatorTerminalIngress};
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
@@ -325,6 +325,9 @@ impl novarocks::query_execution::lifecycle::QueryControlSession for ReadyLifecyc
             QueryControlCommand::Finalize => QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorFinalize,
             },
+            QueryControlCommand::TerminalAck { .. } => {
+                return Ok(());
+            }
         };
         self.events
             .lock()
@@ -629,6 +632,10 @@ impl FrontendDistributedQueryCoordinator {
         FrontendCoordinatorReportHandler::new(Arc::clone(&self.registry))
     }
 
+    pub fn terminal_ingress(&self) -> FrontendCoordinatorTerminalIngress {
+        FrontendCoordinatorTerminalIngress::new(Arc::clone(&self.registry))
+    }
+
     pub fn backend_query_activity(&self) -> BackendQueryActivity {
         BackendQueryActivity::new(Arc::clone(&self.registry))
     }
@@ -748,6 +755,10 @@ impl FrontendDistributedQueryCoordinator {
         .with_stage_start_timeouts(
             Duration::from_millis(runtime.query_control_stage_rpc_timeout_ms),
             Duration::from_millis(runtime.query_control_start_rpc_timeout_ms),
+        )?
+        .with_terminal_timeouts(
+            Duration::from_millis(runtime.query_control_terminal_drain_timeout_ms),
+            Duration::from_millis(runtime.query_control_terminal_ack_timeout_ms),
         )?;
         let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
             Arc::clone(&backend_services.lifecycle_transport),
@@ -780,11 +791,6 @@ impl FrontendDistributedQueryCoordinator {
             .prepare_stage()?;
         self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
         let registration = stage_prepared.execution_registration_view();
-        let submitted_instance_ids = registration
-            .attempted_instances()
-            .iter()
-            .map(|(_, finst_id)| *finst_id)
-            .collect::<Vec<_>>();
         let writer_identities = registration.writer_identities().to_vec();
         if let Err(error) = self.registry.set_execution_instances(
             query_id,
@@ -809,7 +815,6 @@ impl FrontendDistributedQueryCoordinator {
             connector_binding_lease: _connector_binding_lease,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
-        let writer_instance_ids = writer_registrations.fragment_instance_ids();
         if let Some(message) = self.registry.first_failure(query_id)
             && intent != DistributedQueryIntent::Write
         {
@@ -874,59 +879,24 @@ impl FrontendDistributedQueryCoordinator {
             }
         }
 
-        match intent {
-            DistributedQueryIntent::Result => {}
-            DistributedQueryIntent::Write => {
-                if let Err(error) = self.wait_for_reports(
-                    query_id,
-                    &writer_instance_ids,
-                    deadline,
-                    timeout_ms,
-                    &parts.cancellation,
-                    true,
-                    "write final reports",
-                ) {
-                    if self.registry.first_failure(query_id).is_none() {
-                        let _ = self
-                            .registry
-                            .latch_failure_and_cancel(query_id, error.message().to_string());
-                    }
-                    let _ = abort_query_lifecycle(
-                        &mut query_lifecycle_lease,
-                        error.message().to_string(),
-                    );
-                }
-            }
-            DistributedQueryIntent::Profile => {
-                if let Err(error) = self.wait_for_reports(
-                    query_id,
-                    &submitted_instance_ids,
-                    deadline,
-                    timeout_ms,
-                    &parts.cancellation,
-                    false,
-                    "fragment profile reports",
-                ) {
-                    let kind = error.kind();
-                    let message = abort_query_lifecycle(
-                        &mut query_lifecycle_lease,
-                        error.message().to_string(),
-                    );
-                    return Err(DistributedQueryError::new(kind, message));
-                }
-            }
+        let terminal_set = match query_lifecycle_lease
+            .take()
+            .expect("query lifecycle lease is present through query completion")
+            .finalize()
+        {
+            Ok(terminal_set) => terminal_set,
+            Err(error) => return Err(error),
+        };
+        if !terminal_set.is_success() {
+            return Err(failed(
+                "query terminal snapshot set contains a failed, cancelled, or incomplete fragment",
+            ));
         }
 
-        let (query_failure, reports) = match self.registry.seal_and_take_completion(query_id) {
+        let (query_failure, _reports) = match self.registry.seal_and_take_completion(query_id) {
             Ok(completion) => completion,
-            Err(error) => {
-                let kind = error.kind();
-                let message =
-                    abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
+            Err(error) => return Err(error),
         };
-        let mut lifecycle_failure = query_failure.clone();
         let outcome = (|| {
             let result = expected_output.into_query_result(batches)?;
             match intent {
@@ -936,23 +906,17 @@ impl FrontendDistributedQueryCoordinator {
                     if let Some(message) = query_failure {
                         builder.latch_failure(message);
                     }
-                    for report in reports {
-                        builder.apply(report)?;
+                    for fragment in terminal_set.fragments() {
+                        builder.apply_terminal(fragment)?;
                     }
                     let report_outcome = builder.finish()?;
-                    if let Some(reason) = report_outcome.abort_reason() {
-                        lifecycle_failure = Some(reason.to_string());
-                        let _ = self
-                            .registry
-                            .latch_failure_and_cancel(query_id, reason.to_string());
-                    }
                     let (commit, abort) = report_outcome.into_payloads();
                     parts.completion.write(result, commit, abort)
                 }
                 DistributedQueryIntent::Profile => {
                     let mut builder = ProfileReportBuilder::new();
-                    for report in reports {
-                        builder.apply(report)?;
+                    for fragment in terminal_set.fragments() {
+                        builder.apply_terminal(fragment)?;
                     }
                     parts.completion.profile(result, builder.finish())
                 }
@@ -962,18 +926,7 @@ impl FrontendDistributedQueryCoordinator {
             let _ = self
                 .registry
                 .latch_failure_and_cancel(query_id, error.message().to_string());
-            let kind = error.kind();
-            let message =
-                abort_query_lifecycle(&mut query_lifecycle_lease, error.message().to_string());
-            return Err(DistributedQueryError::new(kind, message));
-        }
-        if let Some(message) = lifecycle_failure {
-            let _ = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-        } else {
-            query_lifecycle_lease
-                .take()
-                .expect("query lifecycle lease is present through query completion")
-                .finalize()?;
+            return Err(DistributedQueryError::new(error.kind(), error.message()));
         }
         outcome
     }

@@ -668,6 +668,10 @@ pub struct StandaloneOpenServices {
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
     pub native_report_handler:
         std::sync::Arc<dyn crate::query_execution::report::NativeReportHandler>,
+    /// FE-only ingress for retained terminal snapshot fallback reports. Backend
+    /// and compat composition deliberately leave this absent.
+    pub terminal_ingress:
+        Option<std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>>,
     pub query_control: crate::query_execution::control::QueryControlService,
     /// Frontend-owned lifecycle port for logical connector control bindings.
     pub connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -716,9 +720,20 @@ impl StandaloneOpenServices {
             backend_topology,
             coordinator_report_endpoint,
             native_report_handler,
+            terminal_ingress: None,
             query_control,
             exchange_port,
         }
+    }
+
+    /// Installs the FE-owned terminal fallback ingress before opening the
+    /// report-only gRPC endpoint.
+    pub fn with_terminal_ingress(
+        mut self,
+        ingress: std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>,
+    ) -> Self {
+        self.terminal_ingress = Some(ingress);
+        self
     }
 }
 
@@ -796,6 +811,7 @@ impl StandaloneNovaRocks {
             backend_topology,
             coordinator_report_endpoint,
             native_report_handler: _,
+            terminal_ingress: _,
             query_control: _,
             exchange_port,
         } = services;

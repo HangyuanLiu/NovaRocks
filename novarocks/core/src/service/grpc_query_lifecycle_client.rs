@@ -300,9 +300,11 @@ impl QueryControlSession for GrpcQueryControlSession {
                     "query control command stream is closed",
                 ),
             })?;
-        state
-            .pending
-            .push_back(PendingQueryControlCommand::from(&command));
+        if !matches!(command, QueryControlCommand::TerminalAck { .. }) {
+            state
+                .pending
+                .push_back(PendingQueryControlCommand::from(&command));
+        }
         Ok(())
     }
 
@@ -410,6 +412,7 @@ enum PendingQueryControlCommand {
     Heartbeat { sequence: u64 },
     Abort,
     Finalize,
+    TerminalAck,
 }
 
 impl From<&QueryControlCommand> for PendingQueryControlCommand {
@@ -420,6 +423,7 @@ impl From<&QueryControlCommand> for PendingQueryControlCommand {
             },
             QueryControlCommand::Abort { .. } => Self::Abort,
             QueryControlCommand::Finalize => Self::Finalize,
+            QueryControlCommand::TerminalAck { .. } => Self::TerminalAck,
         }
     }
 }
@@ -450,12 +454,11 @@ fn prepare_query_control_event(
         },
         Err(error) => Err(error),
     };
-    let terminal = matches!(
-        next,
-        Ok(QueryControlEvent::LocalFailure { .. })
-            | Ok(QueryControlEvent::TerminationAccepted { .. })
-            | Err(_)
-    );
+    // QLC-4 keeps the bidirectional stream alive after a local failure or an
+    // Abort acknowledgement: the BE still has to drain facts and deliver its
+    // immutable terminal snapshot. Only an invalid/closed transport frame is
+    // terminal for the client bridge.
+    let terminal = next.is_err();
     if terminal {
         let terminal_error = terminal_command_error(&next);
         state.close(terminal_error);
@@ -468,11 +471,14 @@ fn validate_query_control_event(
     state: &mut QueryControlCommandState,
 ) -> Result<(), QueryLifecycleTransportError> {
     match event {
-        QueryControlEvent::ControlReady | QueryControlEvent::LocalFailure { .. } => Ok(()),
+        QueryControlEvent::ControlReady
+        | QueryControlEvent::LocalFailure { .. }
+        | QueryControlEvent::LocalDrained
+        | QueryControlEvent::TerminalSnapshot { .. } => Ok(()),
         QueryControlEvent::HeartbeatAck { sequence } => match state.pending.front() {
-            Some(PendingQueryControlCommand::Heartbeat {
-                sequence: expected,
-            }) if sequence == expected => {
+            Some(PendingQueryControlCommand::Heartbeat { sequence: expected })
+                if sequence == expected =>
+            {
                 state.pending.pop_front();
                 Ok(())
             }
@@ -485,7 +491,18 @@ fn validate_query_control_event(
                 format!("received unsolicited heartbeat sequence {sequence}"),
             )),
         },
-        QueryControlEvent::TerminationAccepted { reason } => match state.pending.front() {
+        QueryControlEvent::TerminationAccepted { reason } => {
+            // A local failure can race a heartbeat already written by the
+            // supervisor. The backend is entitled to fence the query instead
+            // of acknowledging that heartbeat, so discard outstanding
+            // heartbeats before matching the terminal command.
+            while matches!(
+                state.pending.front(),
+                Some(PendingQueryControlCommand::Heartbeat { .. })
+            ) {
+                state.pending.pop_front();
+            }
+            match state.pending.front() {
             Some(PendingQueryControlCommand::Abort) => {
                 state.pending.pop_front();
                 Ok(())
@@ -502,9 +519,10 @@ fn validate_query_control_event(
             )),
             None => Err(invalid_response(
                 "validate QueryControl TerminationAccepted",
-                format!("received unsolicited termination reason {reason:?}"),
+                format!("received termination reason {reason:?} without a pending terminal command"),
             )),
-        },
+            }
+        }
     }
 }
 
@@ -744,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn grpc_query_lifecycle_client_closes_commands_while_preparing_terminal_event() {
+    fn grpc_query_lifecycle_client_keeps_commands_open_after_finalize_ack() {
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(32);
         let commands = Mutex::new(QueryControlCommandState::new(command_tx));
         commands
@@ -760,26 +778,19 @@ mod tests {
             &commands,
         );
 
-        assert!(terminal);
+        assert!(!terminal);
         assert_eq!(
-            next.expect("terminal event remains observable"),
+            next.expect("termination acknowledgement remains observable"),
             QueryControlEvent::TerminationAccepted {
                 reason: QueryTerminationReason::CoordinatorFinalize,
             }
         );
         let state = commands.lock().expect("command state");
         assert!(
-            state.sender.is_none(),
-            "command sender must close before terminal event publication"
+            state.sender.is_some(),
+            "terminal ACK must remain deliverable"
         );
-        assert_eq!(
-            state
-                .terminal_error
-                .as_ref()
-                .expect("terminal command error")
-                .kind(),
-            QueryLifecycleTransportErrorKind::StreamClosed
-        );
+        assert!(state.terminal_error.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -871,6 +882,10 @@ mod tests {
             QueryTerminationReason::CoordinatorAbort
         );
 
+        // QLC-4 keeps this stream writable after terminal control events so a
+        // retained snapshot can still be acknowledged. Drop the client-side
+        // session before awaiting graceful server shutdown.
+        drop(session);
         let _ = shutdown.send(());
         server.await.expect("join loopback server");
     }

@@ -330,6 +330,17 @@ impl FrontendApplicationHost {
         Arc::new(self.coordinator_report_handler())
     }
 
+    pub fn terminal_ingress(
+        &self,
+    ) -> Arc<dyn novarocks::query_execution::lifecycle::QueryTerminalIngress> {
+        Arc::new(
+            self.coordinator
+                .as_ref()
+                .expect("frontend coordinator is installed before host open returns")
+                .terminal_ingress(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn execute_distributed_query_for_test(
         &self,

@@ -285,11 +285,29 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid suppress_start_ack_be_index: {raw_value}"))?;
                 meta.suppress_start_ack_be_index = Some(value);
             }
+            "drop_next_terminal_ack_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid drop_next_terminal_ack_be_index: {raw_value}")
+                })?;
+                meta.drop_next_terminal_ack_be_index = Some(value);
+            }
+            "drop_terminal_snapshot_stream_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid drop_terminal_snapshot_stream_be_index: {raw_value}")
+                })?;
+                meta.drop_terminal_snapshot_stream_be_index = Some(value);
+            }
+            "terminal_snapshot_conflict_be_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid terminal_snapshot_conflict_be_index: {raw_value}")
+                })?;
+                meta.terminal_snapshot_conflict_be_index = Some(value);
+            }
             "kill_query_at_lifecycle_phase" => {
                 meta.kill_query_at_lifecycle_phase = QueryLifecyclePhase::parse(&raw_value)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "invalid kill_query_at_lifecycle_phase: {raw_value}; expected staging, staged, starting, or running"
+                            "invalid kill_query_at_lifecycle_phase: {raw_value}; expected staging, staged, starting, running, or terminal-retained"
                         )
                     })
                     .map(Some)?;
@@ -297,11 +315,16 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "kill_fe_at_lifecycle_phase" => {
                 let phase = QueryLifecyclePhase::parse(&raw_value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged"
+                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
                     )
                 })?;
-                if phase != QueryLifecyclePhase::Staged {
-                    bail!("invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged");
+                if !matches!(
+                    phase,
+                    QueryLifecyclePhase::Staged | QueryLifecyclePhase::TerminalRetained
+                ) {
+                    bail!(
+                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
+                    );
                 }
                 meta.kill_fe_at_lifecycle_phase = Some(phase);
             }
@@ -486,6 +509,15 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         suppress_start_ack_be_index: override_meta
             .suppress_start_ack_be_index
             .or(base.suppress_start_ack_be_index),
+        drop_next_terminal_ack_be_index: override_meta
+            .drop_next_terminal_ack_be_index
+            .or(base.drop_next_terminal_ack_be_index),
+        drop_terminal_snapshot_stream_be_index: override_meta
+            .drop_terminal_snapshot_stream_be_index
+            .or(base.drop_terminal_snapshot_stream_be_index),
+        terminal_snapshot_conflict_be_index: override_meta
+            .terminal_snapshot_conflict_be_index
+            .or(base.terminal_snapshot_conflict_be_index),
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),
@@ -944,6 +976,7 @@ mod opt5_directive_tests {
             "-- @drop_next_stage_ack_be_index=1".to_string(),
             "-- @drop_next_start_ack_be_index=2".to_string(),
             "-- @suppress_start_ack_be_index=0".to_string(),
+            "-- @drop_next_terminal_ack_be_index=1".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
             "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
             "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
@@ -962,6 +995,7 @@ mod opt5_directive_tests {
         assert_eq!(meta.drop_next_stage_ack_be_index, Some(1));
         assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
         assert_eq!(meta.suppress_start_ack_be_index, Some(0));
+        assert_eq!(meta.drop_next_terminal_ack_be_index, Some(1));
         assert_eq!(
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
@@ -1207,6 +1241,7 @@ mod opt5_directive_tests {
             drop_next_stage_ack_be_index: Some(0),
             drop_next_start_ack_be_index: Some(1),
             suppress_start_ack_be_index: Some(2),
+            drop_next_terminal_ack_be_index: Some(1),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
             kill_fe_at_lifecycle_phase: Some(QueryLifecyclePhase::Staged),
             stop_query_control_heartbeat_after_stage_be_index: Some(1),
@@ -1224,6 +1259,7 @@ mod opt5_directive_tests {
         assert_eq!(inherited.drop_next_stage_ack_be_index, Some(0));
         assert_eq!(inherited.drop_next_start_ack_be_index, Some(1));
         assert_eq!(inherited.suppress_start_ack_be_index, Some(2));
+        assert_eq!(inherited.drop_next_terminal_ack_be_index, Some(1));
         assert_eq!(
             inherited.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Staging)
@@ -1249,6 +1285,7 @@ mod opt5_directive_tests {
             drop_next_stage_ack_be_index: Some(2),
             drop_next_start_ack_be_index: Some(0),
             suppress_start_ack_be_index: Some(1),
+            drop_next_terminal_ack_be_index: Some(0),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Running),
             stop_query_control_heartbeat_after_stage_be_index: Some(2),
             query_control_fragment_backend_limit: Some(1),
@@ -1264,6 +1301,7 @@ mod opt5_directive_tests {
         assert_eq!(overridden.drop_next_stage_ack_be_index, Some(2));
         assert_eq!(overridden.drop_next_start_ack_be_index, Some(0));
         assert_eq!(overridden.suppress_start_ack_be_index, Some(1));
+        assert_eq!(overridden.drop_next_terminal_ack_be_index, Some(0));
         assert_eq!(
             overridden.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Running)

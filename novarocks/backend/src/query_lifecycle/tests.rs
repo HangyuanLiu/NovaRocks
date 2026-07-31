@@ -22,12 +22,12 @@ use novarocks::UniqueId;
 use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantQueryOptions,
-    ParticipantRole, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
-    QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
-    QueryStartRequest, QueryTerminationReason, RuntimeFilterContribution, StageDigest,
-    StageDigestVersion, StageFragment,
+    AttemptId, FragmentTerminalOutcome, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantQueryOptions, ParticipantRole, QueryAbortRequest, QueryControlAttach,
+    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryStageOutcome, QueryStageRequest,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
@@ -256,7 +256,27 @@ fn registry_config(max_active_entries: usize) -> QueryLifecycleRegistryConfig {
         stage_max_encoded_bytes: 48 * 1024 * 1024,
         stage_max_inflight_encoded_bytes: 256 * 1024 * 1024,
         stage_max_dormant_workers: 512,
+        terminal_max_encoded_bytes: 48 * 1024 * 1024,
+        terminal_drain_timeout: Duration::from_secs(30),
+        terminal_ack_timeout: Duration::from_millis(5_000),
+        terminal_fallback_rpc_timeout: Duration::from_millis(5_000),
+        terminal_fallback_max_attempts: 5,
+        terminal_fallback_initial_backoff: Duration::from_millis(100),
+        terminal_fallback_max_backoff: Duration::from_millis(1_000),
+        terminal_retention: Duration::from_millis(120_000),
+        terminal_retained_capacity: 4_096,
+        terminal_max_retained_bytes: 256 * 1024 * 1024,
     }
+}
+
+fn wait_for_failed_terminal_freeze(registry: &QueryLifecycleRegistry) {
+    for _ in 0..100 {
+        if registry.metrics_snapshot().terminal_records_frozen > 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("failed terminal snapshot was not frozen within 100ms");
 }
 
 fn registry_with(
@@ -800,6 +820,74 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
 }
 
 #[test]
+fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    let stage = stage_request(&request, 104, &[]);
+    assert_eq!(
+        registry.stage_fragments(stage.clone()).outcome(),
+        QueryStageOutcome::Applied
+    );
+
+    // ControlReady and the three reserved correctness permits leave exactly
+    // the normal sixteen-event heartbeat budget available.
+    for sequence in 1..=16 {
+        attachment
+            .control
+            .heartbeat(sequence)
+            .expect("heartbeat ACK fits the normal event budget");
+    }
+    assert_eq!(
+        registry
+            .start_prepared_query(QueryStartRequest::new(
+                execution_id,
+                StageDigestVersion::V1,
+                stage.digest(),
+            ))
+            .outcome(),
+        QueryStartOutcome::Applied
+    );
+    let mut saw_local_drained = false;
+    while let Ok(event) = attachment.events.try_recv() {
+        saw_local_drained |= event == QueryControlEvent::LocalDrained;
+    }
+    assert!(
+        saw_local_drained,
+        "LocalDrained must use its reserved correctness permit"
+    );
+
+    for sequence in 17..=32 {
+        attachment
+            .control
+            .heartbeat(sequence)
+            .expect("heartbeat ACK fits the normal event budget");
+    }
+    attachment
+        .control
+        .finalize()
+        .expect("locally drained participant finalizes");
+    let snapshot = loop {
+        match attachment.events.try_recv() {
+            Ok(QueryControlEvent::TerminalSnapshot { snapshot }) => break snapshot,
+            Ok(_) => {}
+            Err(error) => {
+                panic!("TerminalSnapshot must use its reserved correctness permit: {error}")
+            }
+        }
+    };
+    attachment
+        .control
+        .terminal_ack(QueryTerminalAck::from_snapshot(&snapshot))
+        .expect("terminal snapshot ACK");
+}
+
+#[test]
 fn query_lifecycle_registry_different_digest_conflicts() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
@@ -1232,6 +1320,71 @@ fn fragment_failure_emits_query_local_failure() {
 }
 
 #[test]
+fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
+    let runtime = RecordingLocalRuntime::default();
+    let mut config = registry_config(8);
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    let registry = registry_with_config(runtime, config);
+    let expected = UniqueId { hi: 76, lo: 2 };
+    let request = fragment_init_request_fixture(76_002, &[expected]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry.init_query(request.clone()).outcome(),
+        QueryInitOutcome::Applied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    assert_eq!(
+        attachment.events.try_recv().expect("ControlReady event"),
+        QueryControlEvent::ControlReady
+    );
+    registry
+        .admit_fragment(execution_id, expected)
+        .expect("fragment permit")
+        .commit()
+        .expect("fragment admission commits");
+
+    registry.record_fragment_terminal(
+        execution_id,
+        expected,
+        &FragmentOutcome::Failed(FragmentExecutionError::new(
+            FragmentExecutionErrorKind::Pipeline,
+            "pipeline worker failed",
+        )),
+    );
+
+    assert!(matches!(
+        attachment.events.try_recv().expect("LocalFailure event"),
+        QueryControlEvent::LocalFailure { .. }
+    ));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let snapshot = loop {
+        match attachment.events.try_recv() {
+            Ok(event) => break event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("failed terminal snapshot is not delivered after drain: {error}"),
+        }
+    };
+    let QueryControlEvent::TerminalSnapshot { snapshot } = snapshot else {
+        panic!("expected failed terminal snapshot");
+    };
+    assert_eq!(snapshot.execution_id(), execution_id);
+    assert!(matches!(
+        snapshot
+            .fragments()
+            .first()
+            .expect("one fragment")
+            .outcome(),
+        FragmentTerminalOutcome::Failed { .. }
+    ));
+    let metrics = registry.metrics_snapshot();
+    assert_eq!(metrics.terminal_facts, 1);
+    assert_eq!(metrics.terminal_records_frozen, 1);
+    assert_eq!(metrics.terminal_locally_drained, 0);
+}
+
+#[test]
 fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
@@ -1319,12 +1472,15 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);
     config.tombstone_capacity = 1;
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
+    let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
         Arc::new(runtime.clone()),
         config,
-        Arc::new(ManualClock::default()),
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
     let fragment_instance_id = UniqueId { hi: 811, lo: 1 };
     let first = fragment_init_request_fixture(811, &[fragment_instance_id]);
@@ -1345,6 +1501,9 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
                 .expect("valid abort"),
         )
         .expect("first abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
+    clock.advance(Duration::from_millis(2));
+    registry.sweep_expired(clock.now());
 
     let second = init_request_fixture(812, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let second_execution = second.manifest().execution_id();
@@ -1397,12 +1556,15 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);
     config.tombstone_capacity = 1;
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
+    let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
         Arc::new(runtime),
         config,
-        Arc::new(ManualClock::default()),
+        Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
     let fragment_instance_id = UniqueId { hi: 814, lo: 1 };
     let first = fragment_init_request_fixture(814, &[fragment_instance_id]);
@@ -1423,6 +1585,9 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
                 .expect("valid abort"),
         )
         .expect("first abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
+    clock.advance(Duration::from_millis(2));
+    registry.sweep_expired(clock.now());
 
     let eviction = init_request_fixture(815, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let eviction_execution = eviction.manifest().execution_id();
@@ -1559,6 +1724,8 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
     let clock = Arc::new(ManualClock::default());
     let mut config = registry_config(8);
     config.tombstone_retention = Duration::from_millis(10);
+    config.terminal_drain_timeout = Duration::from_millis(1);
+    config.terminal_retention = Duration::from_millis(1);
     let registry = QueryLifecycleRegistry::new_with_clock(
         LOCAL_BACKEND_ID,
         LOCAL_START_EPOCH,
@@ -1585,7 +1752,13 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
                 .expect("valid abort"),
         )
         .expect("abort is accepted");
+    wait_for_failed_terminal_freeze(&registry);
 
+    clock.advance(Duration::from_millis(11));
+    registry.sweep_expired(clock.now());
+    // The first sweep converts the expired retained record into a tombstone
+    // and starts the independently configured tombstone TTL at that moment.
+    // Advance it before the next incremental sweep reclaims the mapping.
     clock.advance(Duration::from_millis(11));
     registry.sweep_expired(clock.now());
     assert!(!registry.contains(first_execution));

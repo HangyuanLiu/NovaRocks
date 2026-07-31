@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 use novarocks::query_execution::cancellation::QueryCancellationView;
 use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks::query_execution::lifecycle::{
-    QueryControlAttach, QueryControlEvent, QueryInitBarrier, QueryInitOutcome, QueryInitPlan,
-    QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck, StageBatch,
+    QueryControlAttach, QueryControlEvent, QueryExecutionId, QueryInitBarrier, QueryInitOutcome,
+    QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease, QueryStageAck, QueryStartAck,
+    StageBatch,
 };
 
 use super::QueryLifecycleTransport;
@@ -44,6 +45,8 @@ pub(crate) struct FrontendQueryLifecycleConfig {
     attach_timeout: Duration,
     stage_rpc_timeout: Duration,
     start_rpc_timeout: Duration,
+    terminal_drain_timeout: Duration,
+    terminal_ack_timeout: Duration,
 }
 
 impl FrontendQueryLifecycleConfig {
@@ -77,6 +80,8 @@ impl FrontendQueryLifecycleConfig {
             attach_timeout,
             stage_rpc_timeout: Duration::from_secs(5),
             start_rpc_timeout: Duration::from_secs(2),
+            terminal_drain_timeout: attach_timeout,
+            terminal_ack_timeout: attach_timeout,
         })
     }
 
@@ -92,6 +97,21 @@ impl FrontendQueryLifecycleConfig {
         }
         self.stage_rpc_timeout = stage_rpc_timeout;
         self.start_rpc_timeout = start_rpc_timeout;
+        Ok(self)
+    }
+
+    pub(crate) fn with_terminal_timeouts(
+        mut self,
+        terminal_drain_timeout: Duration,
+        terminal_ack_timeout: Duration,
+    ) -> Result<Self, DistributedQueryError> {
+        if terminal_drain_timeout.is_zero() || terminal_ack_timeout.is_zero() {
+            return Err(contract_error(
+                "frontend terminal drain and ACK timeouts must be nonzero",
+            ));
+        }
+        self.terminal_drain_timeout = terminal_drain_timeout;
+        self.terminal_ack_timeout = terminal_ack_timeout;
         Ok(self)
     }
 
@@ -117,6 +137,22 @@ impl FrontendQueryLifecycleConfig {
 
     pub(super) const fn start_rpc_timeout(self) -> Duration {
         self.start_rpc_timeout
+    }
+
+    pub(super) const fn terminal_drain_timeout(self) -> Duration {
+        self.terminal_drain_timeout
+    }
+
+    pub(super) const fn terminal_ack_timeout(self) -> Duration {
+        self.terminal_ack_timeout
+    }
+
+    /// A stream-loss fallback starts only after the normal ACK window. The
+    /// first unary RPC is allowed the same bounded window, so Finalize must
+    /// not fail exactly when the fallback becomes eligible.
+    pub(super) fn terminal_snapshot_timeout(self) -> Duration {
+        self.terminal_ack_timeout
+            .saturating_add(self.terminal_ack_timeout)
     }
 }
 
@@ -327,7 +363,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             execution_id.attempt_id().get(),
             self.config,
             self.metrics.as_ref(),
-            control.as_ref(),
+            &control,
         );
         if let Some(primary) = attach_errors.into_iter().next() {
             let message = control.abort_before_ready(primary);
@@ -336,12 +372,6 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
         }
-        if !control.is_active() {
-            return Err(failed(control.abort_before_ready(
-                "query lifecycle attempt was cancelled during control attach".to_string(),
-            )));
-        }
-
         Ok(pre_ready_guard.into_lease())
     }
 }
@@ -521,6 +551,18 @@ fn record_lifecycle_phase_marker(
     let Some(execution_id) = batches.first().map(|batch| batch.request().execution_id()) else {
         return Ok(());
     };
+    record_lifecycle_phase_marker_for_execution(phase, execution_id)
+}
+
+/// Runner-only lifecycle barrier.  The terminal snapshot reader uses this
+/// after it has durably stored a participant record but before it sends the
+/// ACK, which lets cross-process tests prove retained-record cleanup without
+/// changing production timing or adding a direct all-in-one path.
+#[cfg(debug_assertions)]
+pub(super) fn record_lifecycle_phase_marker_for_execution(
+    phase: &str,
+    execution_id: QueryExecutionId,
+) -> Result<(), DistributedQueryError> {
     let Some(root) = novarocks::common::app_config::config()
         .ok()
         .and_then(|config| config.debug.query_lifecycle_fault_dir())
@@ -573,6 +615,14 @@ fn record_lifecycle_phase_marker(
             )));
         }
     }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn record_lifecycle_phase_marker_for_execution(
+    _phase: &str,
+    _execution_id: QueryExecutionId,
+) -> Result<(), DistributedQueryError> {
     Ok(())
 }
 
@@ -781,7 +831,7 @@ fn attach_all(
     frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
-    control: &AttemptControl,
+    control: &Arc<AttemptControl>,
 ) -> Vec<String> {
     let outcomes = std::thread::scope(|scope| {
         let handles = participants

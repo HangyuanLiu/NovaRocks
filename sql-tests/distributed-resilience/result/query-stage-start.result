@@ -25,3 +25,7 @@ count(*)
 -- query 9
 count(*)
 3
+
+-- query 10
+total
+60

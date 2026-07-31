@@ -365,6 +365,15 @@ pub(crate) trait ServerHandle: Send {
     fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
         bail!("StartAck suppression is unsupported by this server mode (index={index})")
     }
+    fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
+        bail!("TerminalAck drop is unsupported by this server mode (index={index})")
+    }
+    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
+        bail!("TerminalSnapshot stream drop is unsupported by this server mode (index={index})")
+    }
+    fn arm_terminal_snapshot_conflict(&mut self, index: usize) -> Result<()> {
+        bail!("TerminalSnapshot conflict is unsupported by this server mode (index={index})")
+    }
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "KILL QUERY lifecycle phase fault is unsupported by this server mode (phase={})",
@@ -756,8 +765,33 @@ fn render_cross_process_launch_config(
                 runtime_dir
                     .join("query-lifecycle-faults")
                     .to_string_lossy()
-                    .into_owned(),
+                .into_owned(),
             ),
+        );
+        // The production terminal-retention contract remains 120s.  Runner
+        // fault scenarios use a short, self-contained lease so a deliberately
+        // crashed FE proves BE runtime release and bounded record reclamation
+        // without turning the distributed suite into a two-minute sleep.
+        let runtime_table = table_mut(root, "runtime");
+        runtime_table.insert(
+            "query_control_terminal_ack_timeout_ms".to_string(),
+            Value::Integer(500),
+        );
+        runtime_table.insert(
+            "query_control_terminal_fallback_rpc_timeout_ms".to_string(),
+            Value::Integer(500),
+        );
+        runtime_table.insert(
+            "query_control_terminal_fallback_initial_backoff_ms".to_string(),
+            Value::Integer(50),
+        );
+        runtime_table.insert(
+            "query_control_terminal_fallback_max_backoff_ms".to_string(),
+            Value::Integer(100),
+        );
+        runtime_table.insert(
+            "query_control_terminal_retention_ms".to_string(),
+            Value::Integer(2_000),
         );
     }
     toml::to_string(&value).context("serialize cross-process launch config")
@@ -821,6 +855,18 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, "start-ack-suppress")
     }
 
+    fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "terminal-ack-drop")
+    }
+
+    fn terminal_snapshot_stream_drop_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "terminal-snapshot-stream-drop")
+    }
+
+    fn terminal_snapshot_conflict_path(&self, index: usize) -> Result<PathBuf> {
+        self.be_path(index, "terminal-snapshot-conflict")
+    }
+
     fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, "heartbeat-stop-after-stage")
     }
@@ -873,6 +919,18 @@ impl QueryLifecycleFaultFiles {
 
     fn publish_start_ack_suppress(&self, index: usize) -> Result<String> {
         self.publish(self.start_ack_suppress_path(index)?, index, None)
+    }
+
+    fn publish_terminal_ack_drop(&self, index: usize) -> Result<String> {
+        self.publish(self.terminal_ack_drop_path(index)?, index, None)
+    }
+
+    fn publish_terminal_snapshot_stream_drop(&self, index: usize) -> Result<String> {
+        self.publish(self.terminal_snapshot_stream_drop_path(index)?, index, None)
+    }
+
+    fn publish_terminal_snapshot_conflict(&self, index: usize) -> Result<String> {
+        self.publish(self.terminal_snapshot_conflict_path(index)?, index, None)
     }
 
     fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
@@ -1398,6 +1456,54 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed StartAck suppression for cross-process BE[{index}] token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .start_ack_suppress_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_terminal_ack_drop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "terminal-ack-drop"), token.clone());
+        println!(
+            "armed TerminalAck drop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .terminal_ack_drop_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_terminal_snapshot_stream_drop(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "terminal-snapshot-stream-drop"), token.clone());
+        println!(
+            "armed TerminalSnapshot stream drop for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .terminal_snapshot_stream_drop_path(index)?
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_terminal_snapshot_conflict(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_terminal_snapshot_conflict(index)?;
+        self.query_lifecycle_fault_tokens
+            .insert((index, "terminal-snapshot-conflict"), token.clone());
+        println!(
+            "armed TerminalSnapshot conflict for cross-process BE[{index}] token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .terminal_snapshot_conflict_path(index)?
                 .display()
         );
         Ok(())

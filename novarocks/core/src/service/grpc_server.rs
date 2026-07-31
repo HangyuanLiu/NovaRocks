@@ -36,7 +36,10 @@ use crate::common::config::http_port;
 use crate::common::engine_error::EngineError;
 use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info};
-use crate::query_execution::lifecycle::QueryLifecycleIngress;
+use crate::query_execution::lifecycle::{
+    QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
+    decode_query_terminal_snapshot,
+};
 use crate::query_execution::report::{NativeReportHandler, NativeReportHandlerError};
 #[cfg(all(test, feature = "compat"))]
 use crate::runtime::fragment::io::SyncFragmentExecutor;
@@ -183,6 +186,7 @@ pub struct GrpcService {
     query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     runtime_filter_envelope_ingress: Arc<dyn RuntimeFilterEnvelopeIngress>,
 }
 
@@ -260,6 +264,7 @@ impl GrpcService {
             query_lifecycle_ingress,
             query_control_shutdown: None,
             report_handler,
+            terminal_ingress: None,
             runtime_filter_envelope_ingress,
         }
     }
@@ -331,6 +336,11 @@ impl GrpcService {
 
     fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
         self.query_control_shutdown = Some(shutdown);
+        self
+    }
+
+    pub fn with_terminal_ingress(mut self, ingress: Arc<dyn QueryTerminalIngress>) -> Self {
+        self.terminal_ingress = Some(ingress);
         self
     }
 }
@@ -1077,6 +1087,51 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 
+    async fn report_query_terminal(
+        &self,
+        request: tonic::Request<proto::novarocks::ReportQueryTerminalRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::ReportQueryTerminalResponse>, tonic::Status> {
+        let Some(ingress) = self.terminal_ingress.clone() else {
+            return Ok(tonic::Response::new(
+                proto::novarocks::ReportQueryTerminalResponse {
+                    outcome: proto::novarocks::ReportQueryTerminalOutcome::RejectedGone as i32,
+                    detail: "query terminal ingress is not installed for this role".to_string(),
+                },
+            ));
+        };
+        let snapshot = request.into_inner().snapshot.ok_or_else(|| {
+            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing snapshot")
+        })?;
+        let snapshot =
+            decode_query_terminal_snapshot(&snapshot).map_err(status_from_lifecycle_error)?;
+        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(snapshot))
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
+            })?
+            .map_err(status_from_lifecycle_error)?;
+        let outcome = match ack.outcome() {
+            QueryTerminalReportOutcome::Accepted => {
+                proto::novarocks::ReportQueryTerminalOutcome::Accepted
+            }
+            QueryTerminalReportOutcome::AlreadyAccepted => {
+                proto::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted
+            }
+            QueryTerminalReportOutcome::RejectedConflict => {
+                proto::novarocks::ReportQueryTerminalOutcome::RejectedConflict
+            }
+            QueryTerminalReportOutcome::RejectedGone => {
+                proto::novarocks::ReportQueryTerminalOutcome::RejectedGone
+            }
+        };
+        Ok(tonic::Response::new(
+            proto::novarocks::ReportQueryTerminalResponse {
+                outcome: outcome as i32,
+                detail: ack.detail().to_string(),
+            },
+        ))
+    }
+
     async fn report_exec_status(
         &self,
         request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
@@ -1561,11 +1616,33 @@ pub fn start_grpc_exchange_server(
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
+    start_grpc_exchange_server_with_terminal_ingress(
+        host,
+        port,
+        native_fragment_ingress,
+        query_lifecycle_ingress,
+        report_handler,
+        None,
+    )
+}
+
+/// Starts a native fragment endpoint with an optional FE-owned terminal
+/// fallback ingress.  Backend-only and compat composition deliberately pass
+/// `None`, so their endpoint rejects `ReportQueryTerminal`.
+pub fn start_grpc_exchange_server_with_terminal_ingress(
+    host: &str,
+    port: u16,
+    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
+    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+    report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+) -> Result<(), String> {
     start_standalone_grpc_server(
         host,
         port,
         StandaloneGrpcMode::FullExecution(native_fragment_ingress, query_lifecycle_ingress),
         report_handler,
+        terminal_ingress,
     )
 }
 
@@ -1575,7 +1652,26 @@ pub fn start_grpc_report_server(
     port: u16,
     report_handler: Arc<dyn NativeReportHandler>,
 ) -> Result<(), String> {
-    start_standalone_grpc_server(host, port, StandaloneGrpcMode::ReportOnly, report_handler)
+    start_grpc_report_server_with_terminal_ingress(host, port, report_handler, None)
+}
+
+/// Starts a report-only standalone NovaRocksGrpc endpoint with the optional
+/// FE-owned terminal fallback ingress. Backend-only and compat roles must
+/// pass `None` so they reject `ReportQueryTerminal` rather than accepting a
+/// terminal record locally.
+pub fn start_grpc_report_server_with_terminal_ingress(
+    host: &str,
+    port: u16,
+    report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
+) -> Result<(), String> {
+    start_standalone_grpc_server(
+        host,
+        port,
+        StandaloneGrpcMode::ReportOnly,
+        report_handler,
+        terminal_ingress,
+    )
 }
 
 fn start_standalone_grpc_server(
@@ -1583,6 +1679,7 @@ fn start_standalone_grpc_server(
     port: u16,
     mode: StandaloneGrpcMode,
     report_handler: Arc<dyn NativeReportHandler>,
+    terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
 ) -> Result<(), String> {
     {
         let mut state = grpc_server_state()
@@ -1642,9 +1739,11 @@ fn start_standalone_grpc_server(
                 let mut shutdown = shutdown_rx.clone();
                 let query_control_shutdown = shutdown_rx.clone();
 
-                let svc = mode
-                    .service(report_handler)
-                    .with_query_control_shutdown(query_control_shutdown);
+                let mut svc = mode.service(report_handler);
+                if let Some(terminal_ingress) = terminal_ingress {
+                    svc = svc.with_terminal_ingress(terminal_ingress);
+                }
+                let svc = svc.with_query_control_shutdown(query_control_shutdown);
                 let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                     .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -2542,6 +2641,10 @@ mod pr3_tests {
         );
         assert_eq!(ingress.coordinator_lost.load(Ordering::SeqCst), 0);
 
+        // Terminal control streams remain open for QLC-4 snapshot delivery.
+        // Explicitly release both halves before waiting for server shutdown.
+        drop(events);
+        drop(tx);
         let _ = shutdown.send(());
         server.await.expect("join query lifecycle server");
     }

@@ -203,6 +203,10 @@ pub(crate) async fn handle_query_control_stream(
     let attach = decode_query_control_attach(&first).map_err(status_from_lifecycle_error)?;
     let execution_id = attach.execution_id();
     let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
+    let terminal_snapshot_stream_drop = claim_backend_fault(
+        QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
+        execution_id,
+    )?;
     let attachment = ingress
         .attach_control(attach)
         .map_err(status_from_lifecycle_error)?;
@@ -215,6 +219,7 @@ pub(crate) async fn handle_query_control_stream(
         outbound_tx,
         shutdown,
         heartbeat_stop,
+        terminal_snapshot_stream_drop,
         execution_id,
     ));
     Ok(ReceiverStream::new(outbound_rx))
@@ -227,6 +232,7 @@ async fn run_attached_control_stream(
     outbound: tokio::sync::mpsc::Sender<Result<novarocks::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
+    terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
     execution_id: crate::query_execution::lifecycle::QueryExecutionId,
 ) {
     let first_event = tokio::select! {
@@ -266,35 +272,8 @@ async fn run_attached_control_stream(
         return;
     }
 
-    let mut awaiting_graceful_termination = false;
     let mut heartbeat_stop_logged = false;
     loop {
-        if awaiting_graceful_termination {
-            let event = tokio::select! {
-                biased;
-                _ = wait_for_query_control_shutdown(&mut shutdown) => break,
-                event = events.recv() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let termination_accepted =
-                matches!(event, QueryControlEvent::TerminationAccepted { .. });
-            if !send_control_response(
-                &outbound,
-                Ok(encode_query_control_event(&event)),
-                &mut shutdown,
-            )
-            .await
-            {
-                break;
-            }
-            if termination_accepted {
-                lease.mark_graceful();
-                break;
-            }
-            continue;
-        }
         tokio::select! {
             biased;
             _ = wait_for_query_control_shutdown(&mut shutdown) => {
@@ -368,16 +347,19 @@ async fn run_attached_control_stream(
                         }
                     }
                     QueryControlCommand::Abort { reason } => {
-                        awaiting_graceful_termination = true;
                         let result = lease.control().abort(reason);
                         if result.is_ok() {
                             emit_query_lifecycle_abort_marker();
                         }
                         result
                     }
-                    QueryControlCommand::Finalize => {
-                        awaiting_graceful_termination = true;
-                        lease.control().finalize()
+                    QueryControlCommand::Finalize => lease.control().finalize(),
+                    QueryControlCommand::TerminalAck { ack } => {
+                        let result = lease.control().terminal_ack(ack);
+                        if result.is_ok() {
+                            lease.mark_graceful();
+                        }
+                        result
                     }
                 };
                 if let Err(error) = result {
@@ -394,8 +376,21 @@ async fn run_attached_control_stream(
                 let Some(event) = event else {
                     break;
                 };
-                let termination_accepted =
-                    matches!(event, QueryControlEvent::TerminationAccepted { .. });
+                if matches!(event, QueryControlEvent::TerminalSnapshot { .. })
+                    && let Some(scope) = terminal_snapshot_stream_drop.as_ref()
+                {
+                    eprintln!(
+                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                        scope.execution_id.query_id().high(),
+                        scope.execution_id.query_id().low(),
+                        scope.execution_id.attempt_id().get(),
+                        scope.backend_index,
+                        scope.backend_id,
+                        scope.start_epoch,
+                        scope.token,
+                    );
+                    break;
+                }
                 if !send_control_response(
                     &outbound,
                     Ok(encode_query_control_event(&event)),
@@ -403,10 +398,6 @@ async fn run_attached_control_stream(
                 )
                 .await
                 {
-                    break;
-                }
-                if termination_accepted {
-                    lease.mark_graceful();
                     break;
                 }
             }

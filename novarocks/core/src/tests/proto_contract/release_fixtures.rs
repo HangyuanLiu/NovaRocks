@@ -28,6 +28,7 @@ const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
 const REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
 const BATCH_REPORT_EXEC_STATUS_REQUEST_FIXTURE_HEX: &str = "0a8d020a040801100212040803100418092200280132b7010ab0010a2273333a2f2f77617265686f7573652f64622f742f646174612d312e706172717565741207706172717565741809205a2a09726567696f6e3d757332040a0204083a220a04080110641204080110091a020801220208012a050801120101320508011201094201304801522073333a2f2f77617265686f7573652f64622f742f626173652e70617271756574584d62040a0201026a02aabb70057a080a060800120275738001800188018002900104100118003809405a480152390a370a0c467261676d656e74526f6f74100a1a120a08526f777352656164180120092804300c22110a057461626c6512086c696e656974656d";
+const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0ab401080112080a040801100210011a140809120e0a093132372e302e302e3110903f184d222011111111111111111111111111111111111111111111111111111111111111112a202222222222222222222222222222222222222222222222222222222222222222324c0a0408031004100918013a04086410094a060809105a180152320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d66697874757265";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
@@ -448,6 +449,58 @@ fn release_batch_report_exec_status_request() -> novarocks::BatchReportExecStatu
     }
 }
 
+fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequest {
+    novarocks::ReportQueryTerminalRequest {
+        snapshot: Some(novarocks::QueryTerminalSnapshot {
+            version: 1,
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
+            }),
+            backend: Some(novarocks::ParticipantBackendIdentity {
+                backend_id: 9,
+                endpoint: Some(novarocks::QueryControlEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 8080,
+                }),
+                start_epoch: 77,
+            }),
+            init_digest: vec![0x11; 32],
+            digest: vec![0x22; 32],
+            fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
+                fragment_instance_id: Some(id(3, 4)),
+                backend_num: 9,
+                outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
+                error_code: String::new(),
+                error_detail: String::new(),
+                iceberg_commits: vec![],
+                tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
+                    tablet_id: 100,
+                    backend_id: 9,
+                }],
+                tablet_fail_infos: vec![],
+                load_stats: Some(novarocks::QueryTerminalLoadStats {
+                    loaded_rows: 9,
+                    loaded_bytes: 90,
+                    filtered_rows: 1,
+                }),
+                profile: Some(novarocks::RuntimeProfileTree {
+                    root: Some(novarocks::ProfileNode {
+                        name: "TerminalFragment".to_string(),
+                        node_id: 9,
+                        counters: vec![],
+                        info_strings: HashMap::from([(
+                            "source".to_string(),
+                            "terminal-fixture".to_string(),
+                        )]),
+                        children: vec![],
+                    }),
+                }),
+            }],
+        }),
+    }
+}
+
 fn release_lookup_request() -> filter::LookupRequest {
     filter::LookupRequest {
         query_id: Some(id(1, 2)),
@@ -518,6 +571,10 @@ fn print_release_fixture_hex() {
     print_fixture(
         "BATCH_REPORT_EXEC_STATUS_REQUEST",
         &release_batch_report_exec_status_request(),
+    );
+    print_fixture(
+        "REPORT_QUERY_TERMINAL_REQUEST",
+        &release_report_query_terminal_request(),
     );
     print_fixture("LOOKUP_REQUEST", &release_lookup_request());
     print_fixture("LOOKUP_RESPONSE", &release_lookup_response());
@@ -816,6 +873,65 @@ fn release_exec_status_report_fixtures_decode() {
     );
     assert_eq!(batch.reports.len(), 1);
     assert_eq!(batch.reports[0].filtered_rows, 1);
+}
+
+#[test]
+fn release_report_query_terminal_request_fixture_decodes() {
+    let request: novarocks::ReportQueryTerminalRequest = decode_fixture(
+        "ReportQueryTerminalRequest",
+        REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX,
+    );
+    let snapshot = request
+        .snapshot
+        .as_ref()
+        .expect("ReportQueryTerminalRequest fixture snapshot");
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(
+        snapshot
+            .execution_id
+            .as_ref()
+            .and_then(|execution_id| execution_id.query_id.as_ref())
+            .expect("ReportQueryTerminalRequest fixture query id")
+            .hi,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .backend
+            .as_ref()
+            .expect("ReportQueryTerminalRequest fixture backend")
+            .start_epoch,
+        77
+    );
+    assert_eq!(snapshot.init_digest, vec![0x11; 32]);
+    assert_eq!(snapshot.digest, vec![0x22; 32]);
+    assert_eq!(snapshot.fragments.len(), 1);
+    let fragment = &snapshot.fragments[0];
+    assert_eq!(fragment.backend_num, 9);
+    assert_eq!(
+        fragment.outcome,
+        novarocks::QueryTerminalFragmentOutcome::Succeeded as i32
+    );
+    assert_eq!(fragment.tablet_commit_infos[0].tablet_id, 100);
+    assert_eq!(
+        fragment
+            .load_stats
+            .as_ref()
+            .expect("ReportQueryTerminalRequest fixture load stats")
+            .loaded_bytes,
+        90
+    );
+    assert_eq!(
+        fragment
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.root.as_ref())
+            .expect("ReportQueryTerminalRequest fixture profile")
+            .info_strings
+            .get("source")
+            .map(String::as_str),
+        Some("terminal-fixture")
+    );
 }
 
 #[test]

@@ -67,21 +67,23 @@ where
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let mut backend = match BackendApplicationHost::open_with_native_report_handler(
-        BackendServerConfig {
-            config: config.clone(),
-        },
-        frontend.native_report_handler(),
-    ) {
-        Ok(backend) => backend,
-        Err(error) => {
-            let frontend_cleanup = frontend.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
-                frontend_cleanup.err()
-            ));
-        }
-    };
+    let mut backend =
+        match BackendApplicationHost::open_with_native_report_handler_and_terminal_ingress(
+            BackendServerConfig {
+                config: config.clone(),
+            },
+            frontend.native_report_handler(),
+            Some(frontend.terminal_ingress()),
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                let frontend_cleanup = frontend.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
+                    frontend_cleanup.err()
+                ));
+            }
+        };
     let services = novarocks_frontend::standalone_open_services_for_server(&frontend);
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();

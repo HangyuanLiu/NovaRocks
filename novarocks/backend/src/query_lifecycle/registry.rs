@@ -24,19 +24,39 @@ use novarocks::UniqueId;
 use novarocks::novarocks_logging::{info, warn};
 use novarocks::query_execution::lifecycle::metrics::BackendQueryLifecycleMetricsSnapshot;
 use novarocks::query_execution::lifecycle::{
-    BackendQueryControl, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
+    BackendQueryControl, FragmentTerminalOutcome, FragmentTerminalSnapshot,
+    ImmutableQueryTerminalRecord, ParticipantManifestDigest, ParticipantRole, QueryAbortRequest,
     QueryControlAttach, QueryControlAttachment, QueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
-    QueryStartOutcome, QueryStartRequest, QueryTerminationAck, QueryTerminationReason,
+    QueryLifecycleIngress, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
+    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
+    QueryStartRequest, QueryTerminalAck, QueryTerminalFallbackTransport, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution, StageDigest, StageDigestVersion,
 };
-use novarocks::runtime::fragment::FragmentOutcome;
+use novarocks::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
+use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
+const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
+
+fn send_reserved_control_event(
+    permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
+    events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    event: QueryControlEvent,
+) {
+    if let Some(permit) = permit {
+        drop(permit.send(event));
+    } else if let Some(events) = events {
+        // The fallback is only reachable for entries created before a permit
+        // was installed or after a duplicate terminal transition. Preserve
+        // the existing best-effort behavior without blocking a runtime thread.
+        let _ = events.try_send(event);
+    }
+}
 
 pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn install_runtime_filter(
@@ -103,6 +123,16 @@ pub(crate) struct QueryLifecycleRegistryConfig {
     pub(crate) stage_max_encoded_bytes: usize,
     pub(crate) stage_max_inflight_encoded_bytes: usize,
     pub(crate) stage_max_dormant_workers: usize,
+    pub(crate) terminal_max_encoded_bytes: usize,
+    pub(crate) terminal_drain_timeout: Duration,
+    pub(crate) terminal_ack_timeout: Duration,
+    pub(crate) terminal_fallback_rpc_timeout: Duration,
+    pub(crate) terminal_fallback_max_attempts: usize,
+    pub(crate) terminal_fallback_initial_backoff: Duration,
+    pub(crate) terminal_fallback_max_backoff: Duration,
+    pub(crate) terminal_retention: Duration,
+    pub(crate) terminal_retained_capacity: usize,
+    pub(crate) terminal_max_retained_bytes: usize,
 }
 
 impl QueryLifecycleRegistryConfig {
@@ -123,6 +153,26 @@ impl QueryLifecycleRegistryConfig {
             stage_max_inflight_encoded_bytes: runtime
                 .query_control_stage_max_inflight_encoded_bytes,
             stage_max_dormant_workers: runtime.query_control_stage_max_dormant_workers,
+            terminal_max_encoded_bytes: runtime.query_control_terminal_max_encoded_bytes,
+            terminal_drain_timeout: Duration::from_millis(
+                runtime.query_control_terminal_drain_timeout_ms,
+            ),
+            terminal_ack_timeout: Duration::from_millis(
+                runtime.query_control_terminal_ack_timeout_ms,
+            ),
+            terminal_fallback_rpc_timeout: Duration::from_millis(
+                runtime.query_control_terminal_fallback_rpc_timeout_ms,
+            ),
+            terminal_fallback_max_attempts: runtime.query_control_terminal_fallback_max_attempts,
+            terminal_fallback_initial_backoff: Duration::from_millis(
+                runtime.query_control_terminal_fallback_initial_backoff_ms,
+            ),
+            terminal_fallback_max_backoff: Duration::from_millis(
+                runtime.query_control_terminal_fallback_max_backoff_ms,
+            ),
+            terminal_retention: Duration::from_millis(runtime.query_control_terminal_retention_ms),
+            terminal_retained_capacity: runtime.query_control_terminal_retained_capacity,
+            terminal_max_retained_bytes: runtime.query_control_terminal_max_retained_bytes,
         }
     }
 }
@@ -224,7 +274,64 @@ pub(crate) struct QueryLifecycleRegistry {
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
     stage_resources: Arc<Mutex<StageResourceLedger>>,
+    terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     self_weak: Weak<QueryLifecycleRegistry>,
+}
+
+struct GrpcQueryTerminalFallbackTransport;
+
+impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
+    fn report_query_terminal(
+        &self,
+        endpoint: &novarocks::query_execution::lifecycle::QueryControlEndpoint,
+        snapshot: QueryTerminalSnapshot,
+        timeout: Duration,
+    ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError> {
+        let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new_host_port(
+            endpoint.host().to_string(),
+            endpoint.port(),
+        )
+        .map_err(|error| {
+            QueryLifecycleTransportError::new(QueryLifecycleTransportErrorKind::Unavailable, error)
+        })?;
+        let response = client
+            .blocking_report_query_terminal_with_timeout(
+                novarocks::proto::novarocks::ReportQueryTerminalRequest {
+                    snapshot: Some(
+                        novarocks::query_execution::lifecycle::encode_query_terminal_snapshot(
+                            &snapshot,
+                        ),
+                    ),
+                },
+                timeout,
+            )
+            .map_err(|error| {
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::Unavailable,
+                    error,
+                )
+            })?;
+        let outcome = match novarocks::proto::novarocks::ReportQueryTerminalOutcome::try_from(
+            response.outcome,
+        ) {
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Accepted) => {
+                QueryTerminalReportOutcome::Accepted
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted) => {
+                QueryTerminalReportOutcome::AlreadyAccepted
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedConflict) => {
+                QueryTerminalReportOutcome::RejectedConflict
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedGone) | Err(_) => {
+                QueryTerminalReportOutcome::RejectedGone
+            }
+            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Unspecified) => {
+                QueryTerminalReportOutcome::RejectedGone
+            }
+        };
+        Ok(QueryTerminalReportAck::new(outcome, response.detail))
+    }
 }
 
 struct QueryLifecycleRegistryState {
@@ -238,6 +345,15 @@ struct QueryLifecycleRegistryState {
     terminations: u64,
     termination_reasons: [u64; 6],
     pre_init_tombstones: BTreeMap<QueryExecutionId, PreInitTombstone>,
+    terminal_retained: BTreeMap<QueryExecutionId, usize>,
+    terminal_retained_bytes: usize,
+    terminal_facts: u64,
+    terminal_locally_drained: u64,
+    terminal_records_frozen: u64,
+    terminal_acknowledged: u64,
+    terminal_retention_expired: u64,
+    terminal_fallback_accepted: u64,
+    terminal_fallback_rejected: u64,
 }
 
 struct PreInitTombstone {
@@ -272,6 +388,15 @@ impl Default for QueryLifecycleRegistryState {
             terminations: 0,
             termination_reasons: [0; 6],
             pre_init_tombstones: BTreeMap::new(),
+            terminal_retained: BTreeMap::new(),
+            terminal_retained_bytes: 0,
+            terminal_facts: 0,
+            terminal_locally_drained: 0,
+            terminal_records_frozen: 0,
+            terminal_acknowledged: 0,
+            terminal_retention_expired: 0,
+            terminal_fallback_accepted: 0,
+            terminal_fallback_rejected: 0,
         }
     }
 }
@@ -323,6 +448,30 @@ impl fmt::Debug for FragmentAdmissionPermit {
 struct RegistryQueryControl {
     registry: Weak<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
+}
+
+fn fragment_snapshot_from_outcome(
+    fragment_instance_id: UniqueId,
+    backend_num: i32,
+    outcome: &FragmentOutcome,
+) -> Result<FragmentTerminalSnapshot, QueryLifecycleError> {
+    let outcome = match outcome {
+        FragmentOutcome::Succeeded => FragmentTerminalOutcome::Succeeded,
+        FragmentOutcome::Failed(error) => FragmentTerminalOutcome::Failed {
+            code: "FRAGMENT_EXECUTION_FAILED".to_string(),
+            detail: error.to_string(),
+        },
+        FragmentOutcome::Cancelled { reason } => FragmentTerminalOutcome::Cancelled {
+            detail: reason.detail().to_string(),
+        },
+    };
+    FragmentTerminalSnapshot::new(
+        fragment_instance_id,
+        backend_num,
+        outcome,
+        SinkCommitReportSnapshot::default(),
+        None,
+    )
 }
 
 impl QueryLifecycleRegistry {
@@ -421,6 +570,12 @@ impl QueryLifecycleRegistry {
         assert!(config.stage_max_encoded_bytes > 0);
         assert!(config.stage_max_inflight_encoded_bytes >= config.stage_max_encoded_bytes);
         assert!(config.stage_max_dormant_workers >= config.stage_max_fragments);
+        assert!(!config.terminal_ack_timeout.is_zero());
+        assert!(!config.terminal_fallback_rpc_timeout.is_zero());
+        assert!(config.terminal_fallback_max_attempts > 0);
+        assert!(!config.terminal_retention.is_zero());
+        assert!(config.terminal_retained_capacity > 0);
+        assert!(config.terminal_max_retained_bytes > 0);
         Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
@@ -430,6 +585,7 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
+            terminal_fallback: Arc::new(GrpcQueryTerminalFallbackTransport),
             self_weak: self_weak.clone(),
         })
     }
@@ -633,9 +789,12 @@ impl QueryLifecycleRegistry {
                 | QueryLifecyclePhase::Running,
                 _,
             ) => QueryInitOutcome::AlreadyApplied,
-            (QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone, _) => {
-                QueryInitOutcome::RejectedTerminated
-            }
+            (
+                QueryLifecyclePhase::TerminalRetained
+                | QueryLifecyclePhase::Terminating
+                | QueryLifecyclePhase::Tombstone,
+                _,
+            ) => QueryInitOutcome::RejectedTerminated,
             (QueryLifecyclePhase::Initializing, _) => state
                 .init_outcome
                 .unwrap_or(QueryInitOutcome::RejectedInvalidManifest),
@@ -734,13 +893,29 @@ impl QueryLifecycleRegistry {
                 "digest_mismatch",
             ));
         }
-        let (events_tx, events_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_BUFFER_CAPACITY + 2);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(
+            CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
+        );
         events_tx
             .try_send(QueryControlEvent::ControlReady)
             .map_err(|error| {
                 QueryLifecycleError::new(
                     QueryLifecycleErrorCode::Internal,
                     format!("publish ControlReady failed: {error}"),
+                )
+            })?;
+        let local_drained_event_permit =
+            events_tx.clone().try_reserve_owned().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    format!("reserve LocalDrained control event failed: {error}"),
+                )
+            })?;
+        let terminal_snapshot_event_permit =
+            events_tx.clone().try_reserve_owned().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    format!("reserve TerminalSnapshot control event failed: {error}"),
                 )
             })?;
         let terminal_event_permit = events_tx.clone().try_reserve_owned().map_err(|error| {
@@ -753,7 +928,9 @@ impl QueryLifecycleRegistry {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             match state.phase {
                 QueryLifecyclePhase::Initialized => {}
-                QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => {
+                QueryLifecyclePhase::TerminalRetained
+                | QueryLifecyclePhase::Terminating
+                | QueryLifecyclePhase::Tombstone => {
                     let phase = phase_name(state.phase);
                     drop(state);
                     return Err(self.attach_error(
@@ -782,6 +959,8 @@ impl QueryLifecycleRegistry {
             state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
+            state.local_drained_event_permit = Some(local_drained_event_permit);
+            state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
             if !entry
                 .manifest
@@ -933,7 +1112,9 @@ impl QueryLifecycleRegistry {
                             None,
                         )
                     }
-                    QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+                    QueryLifecyclePhase::TerminalRetained
+                    | QueryLifecyclePhase::Terminating
+                    | QueryLifecyclePhase::Tombstone => (
                         QueryStageOutcome::RejectedTerminated,
                         "query lifecycle entry has terminated",
                         None,
@@ -965,7 +1146,9 @@ impl QueryLifecycleRegistry {
                     )
                 }
             }
-            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+            QueryLifecyclePhase::TerminalRetained
+            | QueryLifecyclePhase::Terminating
+            | QueryLifecyclePhase::Tombstone => (
                 QueryStageOutcome::RejectedTerminated,
                 "query lifecycle entry has terminated",
                 None,
@@ -1054,6 +1237,7 @@ impl QueryLifecycleRegistry {
 
         let mut state = entry.state.lock().expect("query lifecycle entry lock");
         let mut released_stage_resources = None;
+        let mut local_drained_event = None;
         let (outcome, detail) = match state.phase {
             QueryLifecyclePhase::Staged => {
                 if state.stage_digest != Some(stage_digest) {
@@ -1064,6 +1248,15 @@ impl QueryLifecycleRegistry {
                 } else if let Some(gate) = state.start_gate.clone() {
                     state.phase = QueryLifecyclePhase::Running;
                     state.pre_start_deadline = None;
+                    if entry.manifest.expected_fragment_instance_ids().is_empty()
+                        && !state.local_drained_emitted
+                    {
+                        state.local_drained_emitted = true;
+                        local_drained_event = Some((
+                            state.local_drained_event_permit.take(),
+                            state.events.clone(),
+                        ));
+                    }
                     let released = gate.release();
                     debug_assert!(released, "a staged start gate must be pending");
                     released_stage_resources = state.stage_resources.take();
@@ -1088,7 +1281,9 @@ impl QueryLifecycleRegistry {
                     )
                 }
             }
-            QueryLifecyclePhase::Terminating | QueryLifecyclePhase::Tombstone => (
+            QueryLifecyclePhase::TerminalRetained
+            | QueryLifecyclePhase::Terminating
+            | QueryLifecyclePhase::Tombstone => (
                 QueryStartOutcome::RejectedTerminated,
                 "query lifecycle entry has terminated",
             ),
@@ -1101,6 +1296,9 @@ impl QueryLifecycleRegistry {
             ),
         };
         drop(state);
+        if let Some((permit, events)) = local_drained_event {
+            send_reserved_control_event(permit, events, QueryControlEvent::LocalDrained);
+        }
         // The gate has been released under the entry lock.  Once Running is
         // visible there can be no dormant workers or retained stage payload,
         // so return the Stage reservation outside lifecycle locks.
@@ -1255,17 +1453,29 @@ impl QueryLifecycleRegistry {
             state.entries.values().cloned().collect::<Vec<_>>()
         };
         for entry in entries {
-            let (termination_retry, expiration) = {
+            let (termination_retry, expiration, terminal_retention_expired) = {
                 let state = entry.state.lock().expect("query lifecycle entry lock");
                 if state.phase == QueryLifecyclePhase::Terminating {
-                    (state.init_outcome.and(state.termination_reason), None)
+                    (
+                        state.init_outcome.and(state.termination_reason),
+                        None,
+                        false,
+                    )
+                } else if state.phase == QueryLifecyclePhase::TerminalRetained {
+                    (
+                        None,
+                        None,
+                        state.terminated_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) >= self.config.terminal_retention
+                        }),
+                    )
                 } else if state.phase == QueryLifecyclePhase::Tombstone {
-                    (None, None)
+                    (None, None, false)
                 } else if state
                     .pre_start_deadline
                     .is_some_and(|deadline| now >= deadline)
                 {
-                    (None, Some(QueryTerminationReason::PreStartTimeout))
+                    (None, Some(QueryTerminationReason::PreStartTimeout), false)
                 } else if matches!(
                     state.phase,
                     QueryLifecyclePhase::ControlAttached
@@ -1278,9 +1488,10 @@ impl QueryLifecycleRegistry {
                     (
                         None,
                         Some(QueryTerminationReason::CoordinatorHeartbeatTimeout),
+                        false,
                     )
                 } else {
-                    (None, None)
+                    (None, None, false)
                 }
             };
             if let Some(reason) = termination_retry {
@@ -1292,6 +1503,24 @@ impl QueryLifecycleRegistry {
             }
             if let Some(reason) = expiration {
                 self.request_termination(entry, reason);
+                continue;
+            }
+            if terminal_retention_expired {
+                {
+                    let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                    state.terminal_record = None;
+                }
+                entry.terminal_delivery_completed.notify_all();
+                self.release_terminal_record(entry.manifest.execution_id());
+                self.increment_terminal_metric(|metrics| {
+                    metrics.terminal_retention_expired =
+                        metrics.terminal_retention_expired.saturating_add(1);
+                });
+                self.publish_tombstone(
+                    &entry,
+                    entry.manifest.execution_id(),
+                    QueryTerminationReason::CoordinatorFinalize,
+                );
             }
         }
     }
@@ -1329,20 +1558,52 @@ impl QueryLifecycleRegistry {
         terminal_event: Option<QueryControlEvent>,
         detail: String,
     ) -> QueryTerminationReason {
+        let already_terminated = {
+            let state = entry.state.lock().expect("query lifecycle entry lock");
+            state
+                .termination_reason
+                .map(|reason| (reason, state.events.clone()))
+        };
+        if let Some((reason, events)) = already_terminated {
+            // A LocalFailure consumes the reserved terminal event permit to
+            // publish its cause.  A later coordinator Abort still needs an
+            // acknowledgement so FE cleanup can keep the stream alive for
+            // the drained immutable snapshot.
+            if terminal_event.is_none()
+                && let Some(events) = events
+            {
+                let _ = events.try_send(QueryControlEvent::TerminationAccepted { reason });
+            }
+            return reason;
+        }
         let (
             execution_id,
             expected_instances,
             initializing,
+            schedule_failure_drain,
             terminal_event_permit,
             start_gate,
             stage_resources,
         ) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            // The early check above handles the normal idempotent case. A
+            // racing caller can only observe the same first-wins reason.
             if let Some(reason) = state.termination_reason {
                 return reason;
             }
             state.termination_reason = Some(requested_reason);
             let initializing = state.phase == QueryLifecyclePhase::Initializing;
+            let running = state.phase == QueryLifecyclePhase::Running;
+            let has_admitted_fragments = !state.accepted_fragments.is_empty();
+            // A termination after Start must retain a complete immutable
+            // terminal record, even when the coordinator initiated the
+            // abort. Pre-start failures remain QLC-3 cleanup only.
+            let schedule_failure_drain = (running || has_admitted_fragments)
+                && requested_reason != QueryTerminationReason::CoordinatorFinalize
+                && !state.failure_drain_scheduled;
+            if schedule_failure_drain {
+                state.failure_drain_scheduled = true;
+            }
             state.phase = QueryLifecyclePhase::Terminating;
             entry.stage_completed.notify_all();
             if state.runtime_filter_installed {
@@ -1357,6 +1618,7 @@ impl QueryLifecycleRegistry {
                     .copied()
                     .collect::<Vec<_>>(),
                 initializing,
+                schedule_failure_drain,
                 state.terminal_event_permit.take(),
                 state.start_gate.clone(),
                 state.stage_resources.take(),
@@ -1398,8 +1660,16 @@ impl QueryLifecycleRegistry {
             state.heartbeat_timeouts = state.heartbeat_timeouts.saturating_add(1);
         }
         let cleanup_complete = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
-        if !initializing && cleanup_complete {
+        let failure_drain_pending = entry
+            .state
+            .lock()
+            .expect("query lifecycle entry lock")
+            .failure_drain_scheduled;
+        if !initializing && cleanup_complete && !failure_drain_pending {
             self.publish_tombstone(&entry, execution_id, requested_reason);
+        }
+        if schedule_failure_drain {
+            self.schedule_failed_terminal_drain(entry);
         }
         requested_reason
     }
@@ -1410,6 +1680,44 @@ impl QueryLifecycleRegistry {
         fragment_instance_id: UniqueId,
         outcome: &FragmentOutcome,
     ) {
+        let snapshot = match fragment_snapshot_from_outcome(
+            fragment_instance_id,
+            self.local_backend_id().unwrap_or_default() as i32,
+            outcome,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "rejecting terminal fragment fact");
+                return;
+            }
+        };
+        self.record_fragment_terminal_snapshot(execution_id, snapshot);
+    }
+
+    pub(crate) fn record_fragment_terminal_fact(
+        &self,
+        execution_id: QueryExecutionId,
+        fact: FragmentTerminalFact,
+        backend_num: i32,
+        sink: SinkCommitReportSnapshot,
+    ) {
+        let snapshot = match FragmentTerminalSnapshot::from_fact(fact, backend_num, sink) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "rejecting terminal fragment fact");
+                return;
+            }
+        };
+        self.record_fragment_terminal_snapshot(execution_id, snapshot);
+    }
+
+    fn record_fragment_terminal_snapshot(
+        &self,
+        execution_id: QueryExecutionId,
+        snapshot: FragmentTerminalSnapshot,
+    ) {
+        let fragment_instance_id = snapshot.fragment_instance_id();
+        let outcome = snapshot.outcome().clone();
         let committed_execution_id = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             match state
@@ -1445,9 +1753,6 @@ impl QueryLifecycleRegistry {
         let Some(execution_id) = committed_execution_id else {
             return;
         };
-        if matches!(outcome, FragmentOutcome::Succeeded) {
-            return;
-        }
         let entry = self
             .state
             .lock()
@@ -1458,21 +1763,513 @@ impl QueryLifecycleRegistry {
         let Some(entry) = entry else {
             return;
         };
-        let (code, detail) = match outcome {
-            FragmentOutcome::Failed(error) => {
-                ("FRAGMENT_EXECUTION_FAILED".to_string(), error.to_string())
+        let local_drained = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            state.completed_fragments.insert(fragment_instance_id);
+            if state
+                .terminal_facts
+                .insert(fragment_instance_id, snapshot)
+                .is_some()
+            {
+                return;
             }
-            FragmentOutcome::Cancelled { reason } => (
-                "FRAGMENT_CANCELLED".to_string(),
-                reason.detail().to_string(),
-            ),
-            FragmentOutcome::Succeeded => return,
+            let expected = entry.manifest.expected_fragment_instance_ids();
+            let complete = expected
+                .iter()
+                .all(|id| state.completed_fragments.contains(id));
+            let local_drained = if complete
+                && matches!(outcome, FragmentTerminalOutcome::Succeeded)
+                && !state.local_drained_emitted
+            {
+                state.local_drained_emitted = true;
+                Some((
+                    state.local_drained_event_permit.take(),
+                    state.events.clone(),
+                ))
+            } else {
+                None
+            };
+            local_drained
+        };
+        if let Some((permit, events)) = local_drained {
+            self.increment_terminal_metric(|metrics| {
+                metrics.terminal_locally_drained =
+                    metrics.terminal_locally_drained.saturating_add(1);
+            });
+            send_reserved_control_event(permit, events, QueryControlEvent::LocalDrained);
+        }
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_facts = metrics.terminal_facts.saturating_add(1);
+        });
+        if matches!(outcome, FragmentTerminalOutcome::Succeeded) {
+            return;
+        }
+        let (code, detail) = match outcome {
+            FragmentTerminalOutcome::Failed { code, detail } => (code, detail),
+            FragmentTerminalOutcome::Cancelled { detail } => {
+                ("FRAGMENT_CANCELLED".to_string(), detail)
+            }
+            FragmentTerminalOutcome::IncompleteDrain { detail } => {
+                ("INCOMPLETE_DRAIN".to_string(), detail)
+            }
+            FragmentTerminalOutcome::Succeeded => return,
         };
         self.request_termination_with_event(
-            entry,
+            Arc::clone(&entry),
             QueryTerminationReason::LocalFailure,
             Some(QueryControlEvent::LocalFailure { code, detail }),
         );
+    }
+
+    fn schedule_failed_terminal_drain(&self, entry: Arc<QueryLifecycleEntry>) {
+        let weak = self.self_weak.clone();
+        let timeout = self.config.terminal_drain_timeout;
+        std::thread::Builder::new()
+            .name("query-terminal-failure-drain".to_string())
+            .spawn(move || {
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(Instant::now);
+                loop {
+                    let complete = {
+                        let state = entry.state.lock().expect("query lifecycle entry lock");
+                        entry
+                            .manifest
+                            .expected_fragment_instance_ids()
+                            .iter()
+                            .all(|id| state.terminal_facts.contains_key(id))
+                    };
+                    if complete || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if let Some(registry) = weak.upgrade() {
+                    registry.freeze_failed_terminal_snapshot(entry, timeout);
+                }
+            })
+            .expect("spawn failed query terminal drain");
+    }
+
+    fn freeze_failed_terminal_snapshot(&self, entry: Arc<QueryLifecycleEntry>, timeout: Duration) {
+        let execution_id = entry.manifest.execution_id();
+        let facts = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.terminal_record.is_some() || !state.failure_drain_scheduled {
+                return;
+            }
+            let backend_num =
+                i32::try_from(self.local_backend_id().unwrap_or_default()).unwrap_or(i32::MAX);
+            for fragment_instance_id in entry.manifest.expected_fragment_instance_ids() {
+                if !state.terminal_facts.contains_key(fragment_instance_id) {
+                    let detail = format!(
+                        "fragment terminal fact was not observed within {}ms after local failure",
+                        timeout.as_millis()
+                    );
+                    let snapshot = match FragmentTerminalSnapshot::new(
+                        *fragment_instance_id,
+                        backend_num,
+                        FragmentTerminalOutcome::IncompleteDrain { detail },
+                        SinkCommitReportSnapshot::default(),
+                        None,
+                    ) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            warn!(target: "novarocks::query_lifecycle", error = %error, "failed to synthesize incomplete terminal fact");
+                            return;
+                        }
+                    };
+                    state.terminal_facts.insert(*fragment_instance_id, snapshot);
+                }
+            }
+            state.terminal_facts.values().cloned().collect::<Vec<_>>()
+        };
+        // The entry lock only freezes terminal facts. Canonical encoding and
+        // digest construction can be expensive and must not block control,
+        // fragment completion, or ACK handling.
+        let snapshot = match QueryTerminalSnapshot::new(
+            execution_id,
+            entry.manifest.backend().clone(),
+            entry.digest,
+            facts,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "failed to build failed query terminal snapshot");
+                return;
+            }
+        };
+        let record = match ImmutableQueryTerminalRecord::new(
+            snapshot,
+            self.config.terminal_max_encoded_bytes,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %error, "failed to encode failed query terminal snapshot");
+                return;
+            }
+        };
+        if let Err(error) = self.reserve_terminal_record(execution_id, record.encoded_len()) {
+            warn!(target: "novarocks::query_lifecycle", error = %error, "failed to retain failed query terminal snapshot");
+            return;
+        }
+        let terminal_delivery = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.terminal_record.is_some() || !state.failure_drain_scheduled {
+                self.release_terminal_record(execution_id);
+                return;
+            }
+            state.terminal_record = Some(record.clone());
+            state.phase = QueryLifecyclePhase::TerminalRetained;
+            state.terminated_at = Some(self.clock.now());
+            (
+                state.terminal_snapshot_event_permit.take(),
+                state.events.clone(),
+            )
+        };
+        let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
+        send_reserved_control_event(
+            terminal_delivery.0,
+            terminal_delivery.1,
+            QueryControlEvent::TerminalSnapshot {
+                snapshot: record.snapshot().clone(),
+            },
+        );
+        self.schedule_terminal_fallback(entry, record.snapshot().clone());
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_records_frozen = metrics.terminal_records_frozen.saturating_add(1);
+        });
+    }
+
+    fn finalize_from_control(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query lifecycle entry is not active",
+                )
+            })?;
+        let (backend, facts, expected) = {
+            let state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.phase != QueryLifecyclePhase::Running || !state.local_drained_emitted {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "Finalize requires locally drained participant",
+                ));
+            }
+            let expected = entry.manifest.expected_fragment_instance_ids();
+            if expected.len() != state.terminal_facts.len() {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Internal,
+                    "locally drained participant is missing terminal facts",
+                ));
+            }
+            let backend = entry.manifest.backend().clone();
+            (
+                backend,
+                state.terminal_facts.values().cloned().collect::<Vec<_>>(),
+                expected.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+        // Finish the immutable record outside the lifecycle entry lock. The
+        // local-drained gate makes the cloned fact set stable.
+        let snapshot = QueryTerminalSnapshot::new(execution_id, backend, entry.digest, facts)?;
+        let record =
+            ImmutableQueryTerminalRecord::new(snapshot, self.config.terminal_max_encoded_bytes)?;
+        self.reserve_terminal_record(execution_id, record.encoded_len())?;
+        let terminal_delivery = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.phase != QueryLifecyclePhase::Running || state.terminal_record.is_some() {
+                self.release_terminal_record(execution_id);
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query lifecycle changed while terminal record was being reserved",
+                ));
+            }
+            state.terminal_record = Some(record.clone());
+            state.phase = QueryLifecyclePhase::TerminalRetained;
+            state.terminated_at = Some(self.clock.now());
+            (
+                state.terminal_snapshot_event_permit.take(),
+                state.events.clone(),
+            )
+        };
+        // All execution-owned resources are detached before the immutable record is delivered.
+        self.local_runtime.terminate_query(
+            execution_id,
+            &expected,
+            QueryTerminationReason::CoordinatorFinalize,
+            "query finalized after local drain",
+        );
+        let _ = self.local_runtime.abort_runtime_filter(execution_id);
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
+        send_reserved_control_event(
+            terminal_delivery.0,
+            terminal_delivery.1.clone(),
+            QueryControlEvent::TerminalSnapshot {
+                snapshot: record.snapshot().clone(),
+            },
+        );
+        if let Some(events) = terminal_delivery.1 {
+            // Retain the QLC-3 acknowledgement as a compatibility latch. The
+            // immutable snapshot above is the terminal payload; FE v4 stores
+            // it before acknowledging the retained record.
+            let _ = events.try_send(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::CoordinatorFinalize,
+            });
+        }
+        self.schedule_terminal_fallback(entry, record.snapshot().clone());
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_records_frozen = metrics.terminal_records_frozen.saturating_add(1);
+        });
+        Ok(())
+    }
+
+    fn reserve_terminal_record(
+        &self,
+        execution_id: QueryExecutionId,
+        bytes: usize,
+    ) -> Result<(), QueryLifecycleError> {
+        let mut state = self.state.lock().expect("query lifecycle registry lock");
+        if state.terminal_retained.len() >= self.config.terminal_retained_capacity {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-record capacity is exhausted",
+            ));
+        }
+        if state.terminal_retained_bytes.saturating_add(bytes)
+            > self.config.terminal_max_retained_bytes
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Capacity,
+                "query terminal retained-byte capacity is exhausted",
+            ));
+        }
+        state.terminal_retained.insert(execution_id, bytes);
+        state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn release_terminal_record(&self, execution_id: QueryExecutionId) {
+        let mut state = self.state.lock().expect("query lifecycle registry lock");
+        if let Some(bytes) = state.terminal_retained.remove(&execution_id) {
+            state.terminal_retained_bytes = state.terminal_retained_bytes.saturating_sub(bytes);
+        }
+    }
+
+    fn emit_terminal_retained_marker(&self, snapshot: &QueryTerminalSnapshot, bytes: usize) {
+        if query_lifecycle_test_markers_enabled() {
+            eprintln!(
+                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} backend_id={} start_epoch={} digest={:?} bytes={}",
+                format_execution_id(snapshot.execution_id()),
+                self.local_backend_id().unwrap_or_default(),
+                self.local_start_epoch,
+                snapshot.digest(),
+                bytes,
+            );
+        }
+    }
+
+    fn schedule_terminal_fallback(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        snapshot: QueryTerminalSnapshot,
+    ) {
+        let endpoint = entry.manifest.report_endpoint().clone();
+        let weak = self.self_weak.clone();
+        let transport = Arc::clone(&self.terminal_fallback);
+        let config = self.config;
+        std::thread::Builder::new()
+            .name("query-terminal-fallback".to_string())
+            .spawn(move || {
+                let retained = entry
+                    .terminal_delivery_completed
+                    .wait_timeout_while(
+                        entry.state.lock().expect("query lifecycle entry lock"),
+                        config.terminal_ack_timeout,
+                        |state| {
+                            state.terminal_record.as_ref().is_some_and(|record| {
+                                record.snapshot().digest() == snapshot.digest()
+                            })
+                        },
+                    )
+                    .expect("query lifecycle terminal fallback wait")
+                    .0
+                    .terminal_record
+                    .as_ref()
+                    .is_some_and(|record| record.snapshot().digest() == snapshot.digest());
+                if !retained {
+                    return;
+                }
+                let mut backoff = config.terminal_fallback_initial_backoff;
+                for attempt in 0..config.terminal_fallback_max_attempts {
+                    let Some(registry) = weak.upgrade() else {
+                        return;
+                    };
+                    let retained = entry
+                        .state
+                        .lock()
+                        .expect("query lifecycle entry lock")
+                        .terminal_record
+                        .as_ref()
+                        .is_some_and(|record| record.snapshot().digest() == snapshot.digest());
+                    if !retained {
+                        return;
+                    }
+                    match transport.report_query_terminal(
+                        &endpoint,
+                        snapshot.clone(),
+                        config.terminal_fallback_rpc_timeout,
+                    ) {
+                        Ok(ack)
+                            if matches!(
+                                ack.outcome(),
+                                QueryTerminalReportOutcome::Accepted
+                                    | QueryTerminalReportOutcome::AlreadyAccepted
+                            ) =>
+                        {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_accepted = metrics
+                                    .terminal_fallback_accepted
+                                    .saturating_add(1);
+                            });
+                            if query_lifecycle_test_markers_enabled() {
+                                eprintln!(
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED execution_id={} backend_id={} attempt={} outcome={:?}",
+                                    format_execution_id(snapshot.execution_id()),
+                                    registry.local_backend_id().unwrap_or_default(),
+                                    attempt + 1,
+                                    ack.outcome(),
+                                );
+                            }
+                            let _ = registry.terminal_ack_from_control(
+                                QueryTerminalAck::from_snapshot(&snapshot),
+                            );
+                            return;
+                        }
+                        Ok(ack) => {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_rejected = metrics
+                                    .terminal_fallback_rejected
+                                    .saturating_add(1);
+                            });
+                            if query_lifecycle_test_markers_enabled() {
+                                eprintln!(
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} outcome={:?} detail={}",
+                                    format_execution_id(snapshot.execution_id()),
+                                    registry.local_backend_id().unwrap_or_default(),
+                                    attempt + 1,
+                                    ack.outcome(),
+                                    ack.detail(),
+                                );
+                            }
+                            warn!(
+                                target: "novarocks::query_lifecycle",
+                                attempt,
+                                outcome = ?ack.outcome(),
+                                detail = %ack.detail(),
+                                "query terminal fallback was rejected"
+                            );
+                        }
+                        Err(error) => {
+                            registry.increment_terminal_metric(|metrics| {
+                                metrics.terminal_fallback_rejected = metrics
+                                    .terminal_fallback_rejected
+                                    .saturating_add(1);
+                            });
+                            if query_lifecycle_test_markers_enabled() {
+                                eprintln!(
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} transport_error={}",
+                                    format_execution_id(snapshot.execution_id()),
+                                    registry.local_backend_id().unwrap_or_default(),
+                                    attempt + 1,
+                                    error,
+                                );
+                            }
+                            warn!(
+                                target: "novarocks::query_lifecycle",
+                                attempt,
+                                error = %error,
+                                "query terminal fallback delivery failed"
+                            );
+                        }
+                    }
+                    if attempt + 1 < config.terminal_fallback_max_attempts {
+                        std::thread::sleep(backoff);
+                        backoff = backoff
+                            .checked_mul(2)
+                            .unwrap_or(config.terminal_fallback_max_backoff)
+                            .min(config.terminal_fallback_max_backoff);
+                    }
+                }
+            })
+            .expect("spawn query terminal fallback delivery");
+    }
+
+    fn terminal_ack_from_control(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&ack.execution_id())
+            .cloned()
+            .ok_or_else(|| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    "query terminal record is gone",
+                )
+            })?;
+        let mut state = entry.state.lock().expect("query lifecycle entry lock");
+        let record = state.terminal_record.as_ref().ok_or_else(|| {
+            QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Terminated,
+                "query terminal record is not retained",
+            )
+        })?;
+        let snapshot = record.snapshot();
+        if ack.init_digest() != snapshot.init_digest()
+            || ack.version() != snapshot.version()
+            || ack.digest() != snapshot.digest()
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "query terminal ACK identity conflicts with retained snapshot",
+            ));
+        }
+        if query_lifecycle_test_markers_enabled() {
+            let query_id = ack.execution_id().query_id();
+            eprintln!(
+                "NOVAROCKS_QUERY_TERMINAL_ACK query_hi={} query_lo={} attempt={} backend_id={}",
+                query_id.high(),
+                query_id.low(),
+                ack.execution_id().attempt_id().get(),
+                self.local_backend_id().unwrap_or_default(),
+            );
+        }
+        state.terminal_record = None;
+        drop(state);
+        entry.terminal_delivery_completed.notify_all();
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_acknowledged = metrics.terminal_acknowledged.saturating_add(1);
+        });
+        self.release_terminal_record(ack.execution_id());
+        self.publish_tombstone(
+            &entry,
+            ack.execution_id(),
+            QueryTerminationReason::CoordinatorFinalize,
+        );
+        Ok(())
     }
 
     fn try_complete_runtime_filter_cleanup(
@@ -1812,6 +2609,14 @@ impl QueryLifecycleRegistry {
         self.metrics.publish(snapshot, termination_reasons);
     }
 
+    fn increment_terminal_metric(&self, update: impl FnOnce(&mut QueryLifecycleRegistryState)) {
+        {
+            let mut state = self.state.lock().expect("query lifecycle registry lock");
+            update(&mut state);
+        }
+        self.publish_metrics();
+    }
+
     fn log_init(&self, ack: &QueryInitAck) {
         info!(
             target: "novarocks::query_lifecycle",
@@ -2142,13 +2947,29 @@ impl BackendQueryControl for RegistryQueryControl {
     }
 
     fn finalize(&self) -> Result<(), QueryLifecycleError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?;
+        match registry.finalize_from_control(self.execution_id) {
+            Ok(()) => Ok(()),
+            // QLC-3 callers may still finalize an attempt which never reached
+            // Running.  Preserve their fail-close cleanup path; QLC-4 only
+            // freezes a snapshot after LocalDrained.
+            Err(error) if error.code() == QueryLifecycleErrorCode::Terminated => registry
+                .terminate_from_control(
+                    self.execution_id,
+                    QueryTerminationReason::CoordinatorFinalize,
+                ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn terminal_ack(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
         self.registry
             .upgrade()
             .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?
-            .terminate_from_control(
-                self.execution_id,
-                QueryTerminationReason::CoordinatorFinalize,
-            )
+            .terminal_ack_from_control(ack)
     }
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
@@ -2234,6 +3055,15 @@ fn fold_metrics_locked(
         init_conflicts: state.init_conflicts,
         heartbeat_timeouts: state.heartbeat_timeouts,
         terminations: state.terminations,
+        terminal_facts: state.terminal_facts,
+        terminal_locally_drained: state.terminal_locally_drained,
+        terminal_records_frozen: state.terminal_records_frozen,
+        terminal_acknowledged: state.terminal_acknowledged,
+        terminal_retention_expired: state.terminal_retention_expired,
+        terminal_fallback_accepted: state.terminal_fallback_accepted,
+        terminal_fallback_rejected: state.terminal_fallback_rejected,
+        terminal_retained: state.terminal_retained.len(),
+        terminal_retained_bytes: state.terminal_retained_bytes,
         ..BackendQueryLifecycleMetricsSnapshot::default()
     };
     for entry in state.entries.values() {
@@ -2248,7 +3078,8 @@ fn fold_metrics_locked(
             QueryLifecyclePhase::ControlAttached
             | QueryLifecyclePhase::Staging
             | QueryLifecyclePhase::Staged
-            | QueryLifecyclePhase::Running => snapshot.control_attached += 1,
+            | QueryLifecyclePhase::Running
+            | QueryLifecyclePhase::TerminalRetained => snapshot.control_attached += 1,
             QueryLifecyclePhase::Terminating => snapshot.terminating += 1,
             QueryLifecyclePhase::Tombstone => {}
         }
@@ -2268,6 +3099,7 @@ const fn phase_name(phase: QueryLifecyclePhase) -> &'static str {
         QueryLifecyclePhase::Staging => "staging",
         QueryLifecyclePhase::Staged => "staged",
         QueryLifecyclePhase::Running => "running",
+        QueryLifecyclePhase::TerminalRetained => "terminal_retained",
         QueryLifecyclePhase::Terminating => "terminating",
         QueryLifecyclePhase::Tombstone => "tombstone",
     }

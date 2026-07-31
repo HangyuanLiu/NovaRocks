@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use novarocks::UniqueId;
 use novarocks::query_execution::backend::LiveBackendTarget;
@@ -24,7 +25,7 @@ use novarocks::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent, QueryId,
 };
 use novarocks::query_execution::fragment_transport::FragmentDispatcher;
-use novarocks::query_execution::lifecycle::QueryExecutionId;
+use novarocks::query_execution::lifecycle::{QueryExecutionId, QueryTerminalSnapshot};
 use novarocks::query_execution::write::NativeExecutionReport;
 
 type QueryKey = (i64, i64);
@@ -33,6 +34,29 @@ pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
 
     fn request_abort(&self, reason: String);
+
+    /// The terminal ingress is deliberately routed through the active attempt
+    /// rather than the legacy execution-report registry.  This keeps the
+    /// store-before-ACK identity check in one place for stream and unary
+    /// delivery.
+    fn report_terminal_snapshot(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<bool, DistributedQueryError>;
+
+    /// Once every participant snapshot is stored, retain the FE ingress long
+    /// enough for a BE whose stream ACK was lost to complete unary fallback.
+    fn retain_terminal_ingress(&self) -> bool {
+        false
+    }
+}
+
+const TERMINAL_INGRESS_RETENTION: Duration = Duration::from_secs(120);
+const TERMINAL_INGRESS_RETAINED_CAPACITY: usize = 4_096;
+
+struct RetainedTerminalIngress {
+    control: Arc<dyn ActiveQueryAttemptControl>,
+    expires_at: Instant,
 }
 
 struct ActiveQuery {
@@ -62,6 +86,7 @@ struct BackendTopologyState {
 #[derive(Default)]
 pub(crate) struct FrontendQueryRegistry {
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
+    retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
     backend_topology: Mutex<BackendTopologyState>,
 }
 
@@ -250,6 +275,24 @@ impl FrontendQueryRegistry {
             })?;
         control.request_abort(reason);
         Ok(())
+    }
+
+    pub(crate) fn report_query_terminal(
+        &self,
+        snapshot: QueryTerminalSnapshot,
+    ) -> Result<bool, DistributedQueryError> {
+        let query_id = snapshot.execution_id().query_id();
+        let active = self
+            .active
+            .lock()
+            .expect("frontend query registry lock")
+            .get(&query_key(query_id))
+            .and_then(|query| query.active_attempt.clone());
+        let control = match active {
+            Some(control) if control.execution_id() == snapshot.execution_id() => control,
+            Some(_) | None => self.retained_terminal_control(snapshot.execution_id())?,
+        };
+        control.report_terminal_snapshot(snapshot)
     }
 
     #[cfg(test)]
@@ -735,15 +778,72 @@ impl FrontendQueryRegistry {
     }
 
     fn clear_active_attempt(&self, key: QueryKey, execution_id: QueryExecutionId) {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        if let Some(query) = active.get_mut(&key)
-            && query
+        let control = {
+            let mut active = self.active.lock().expect("frontend query registry lock");
+            let Some(query) = active.get_mut(&key) else {
+                return;
+            };
+            if query
                 .active_attempt
                 .as_ref()
                 .is_some_and(|control| control.execution_id() == execution_id)
-        {
-            query.active_attempt = None;
+            {
+                query.active_attempt.take()
+            } else {
+                None
+            }
+        };
+        if let Some(control) = control {
+            if control.retain_terminal_ingress() {
+                self.retain_terminal_control(control);
+            }
         }
+    }
+
+    fn retain_terminal_control(&self, control: Arc<dyn ActiveQueryAttemptControl>) {
+        let now = Instant::now();
+        let mut retained = self
+            .retained_terminal_ingress
+            .lock()
+            .expect("frontend retained terminal ingress lock");
+        retained.retain(|_, ingress| ingress.expires_at > now);
+        if retained.len() >= TERMINAL_INGRESS_RETAINED_CAPACITY {
+            if let Some(oldest) = retained
+                .iter()
+                .min_by_key(|(_, ingress)| ingress.expires_at)
+                .map(|(execution_id, _)| *execution_id)
+            {
+                retained.remove(&oldest);
+            }
+        }
+        retained.insert(
+            control.execution_id(),
+            RetainedTerminalIngress {
+                control,
+                expires_at: now + TERMINAL_INGRESS_RETENTION,
+            },
+        );
+    }
+
+    fn retained_terminal_control(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<Arc<dyn ActiveQueryAttemptControl>, DistributedQueryError> {
+        let now = Instant::now();
+        let mut retained = self
+            .retained_terminal_ingress
+            .lock()
+            .expect("frontend retained terminal ingress lock");
+        retained.retain(|_, ingress| ingress.expires_at > now);
+        retained
+            .get(&execution_id)
+            .map(|ingress| Arc::clone(&ingress.control))
+            .ok_or_else(|| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Rejected,
+                    "query terminal snapshot execution id is stale or has no retained ingress",
+                )
+            })
     }
 }
 
@@ -826,4 +926,85 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks::query_execution::lifecycle::{
+        AttemptId, FragmentTerminalOutcome, FragmentTerminalSnapshot, ParticipantBackendIdentity,
+        ParticipantManifestDigest, QueryControlEndpoint, QueryTerminalSnapshot,
+    };
+    use novarocks::runtime::sink_commit::SinkCommitReportSnapshot;
+
+    struct RetainedControl {
+        execution_id: QueryExecutionId,
+        reports: AtomicUsize,
+    }
+
+    impl ActiveQueryAttemptControl for RetainedControl {
+        fn execution_id(&self) -> QueryExecutionId {
+            self.execution_id
+        }
+
+        fn request_abort(&self, _reason: String) {}
+
+        fn report_terminal_snapshot(
+            &self,
+            _snapshot: QueryTerminalSnapshot,
+        ) -> Result<bool, DistributedQueryError> {
+            self.reports.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+
+        fn retain_terminal_ingress(&self) -> bool {
+            true
+        }
+    }
+
+    fn terminal_snapshot(execution_id: QueryExecutionId) -> QueryTerminalSnapshot {
+        let backend = ParticipantBackendIdentity::new(
+            7,
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            11,
+        )
+        .expect("backend identity");
+        let fragment = FragmentTerminalSnapshot::new(
+            UniqueId { hi: 1, lo: 2 },
+            7,
+            FragmentTerminalOutcome::Succeeded,
+            SinkCommitReportSnapshot::default(),
+            None,
+        )
+        .expect("fragment snapshot");
+        QueryTerminalSnapshot::new(
+            execution_id,
+            backend,
+            ParticipantManifestDigest::new([3; 32]),
+            vec![fragment],
+        )
+        .expect("terminal snapshot")
+    }
+
+    #[test]
+    fn retained_terminal_ingress_accepts_same_execution_after_active_query_unregistered() {
+        let registry = FrontendQueryRegistry::default();
+        let execution_id =
+            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
+                .expect("execution id");
+        let control = Arc::new(RetainedControl {
+            execution_id,
+            reports: AtomicUsize::new(0),
+        });
+        registry.retain_terminal_control(control.clone());
+
+        assert!(
+            !registry
+                .report_query_terminal(terminal_snapshot(execution_id))
+                .expect("retained ingress accepts duplicate terminal delivery")
+        );
+        assert_eq!(control.reports.load(Ordering::SeqCst), 1);
+    }
 }

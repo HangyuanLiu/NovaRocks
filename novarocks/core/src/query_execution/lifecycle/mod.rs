@@ -22,19 +22,23 @@ pub mod init_plan;
 pub mod manifest;
 pub mod metrics;
 pub mod stage;
+pub mod terminal;
 
 pub use contract::{
     BackendQueryControl, QueryAbortRequest, QueryControlAttach, QueryControlAttachment,
     QueryControlCommand, QueryControlEvent, QueryControlSession, QueryInitAck, QueryInitOutcome,
     QueryInitRequest, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
     QueryLifecycleTarget, QueryLifecycleTransport, QueryLifecycleTransportError,
-    QueryLifecycleTransportErrorKind, QueryTerminationAck, QueryTerminationReason,
+    QueryLifecycleTransportErrorKind, QueryTerminalAck, QueryTerminalFallbackTransport,
+    QueryTerminalIngress, QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
+    QueryTerminationReason,
 };
+pub use contract::{decode_query_terminal_snapshot, encode_query_terminal_snapshot};
 pub use identity::{AttemptId, QueryExecutionId};
 pub(crate) use init_plan::QueryInitPlanHeader;
 pub use init_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan, QueryLifecycleLease,
-    QueryLifecycleLeaseGuard,
+    QueryInitBarrier, QueryInitOptions, QueryInitParticipant, QueryInitPlan,
+    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
 pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
@@ -45,4 +49,9 @@ pub use stage::{
     QueryLaunchBarrier, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
     QueryStartOutcome, QueryStartRequest, StageBatch, StageDigest, StageDigestVersion,
     StageFragment, StageParticipantBinding,
+};
+pub use terminal::{
+    FragmentTerminalOutcome, FragmentTerminalSnapshot, ImmutableQueryTerminalRecord,
+    QUERY_TERMINAL_SNAPSHOT_VERSION_V1, QueryTerminalProfileContributionV1, QueryTerminalSet,
+    QueryTerminalSnapshot, QueryTerminalSnapshotDigest,
 };

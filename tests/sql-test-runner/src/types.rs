@@ -102,6 +102,15 @@ pub struct QueryMeta {
     pub drop_next_stage_ack_be_index: Option<usize>,
     pub drop_next_start_ack_be_index: Option<usize>,
     pub suppress_start_ack_be_index: Option<usize>,
+    /// Store the immutable terminal snapshot but deliberately omit the stream
+    /// ACK for this participant, requiring BE unary fallback delivery.
+    pub drop_next_terminal_ack_be_index: Option<usize>,
+    /// Close one BE's control stream immediately before TerminalSnapshot so
+    /// the immutable payload can only reach FE through unary fallback.
+    pub drop_terminal_snapshot_stream_be_index: Option<usize>,
+    /// Inject a second valid-but-different participant snapshot at FE ingress
+    /// before ACK, proving same-identity conflicts fail closed.
+    pub terminal_snapshot_conflict_be_index: Option<usize>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
@@ -151,6 +160,7 @@ pub enum QueryLifecyclePhase {
     Staged,
     Starting,
     Running,
+    TerminalRetained,
 }
 
 impl QueryLifecyclePhase {
@@ -160,6 +170,7 @@ impl QueryLifecyclePhase {
             "staged" => Some(Self::Staged),
             "starting" => Some(Self::Starting),
             "running" => Some(Self::Running),
+            "terminal-retained" => Some(Self::TerminalRetained),
             _ => None,
         }
     }
@@ -170,6 +181,7 @@ impl QueryLifecyclePhase {
             Self::Staged => "staged",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::TerminalRetained => "terminal-retained",
         }
     }
 }

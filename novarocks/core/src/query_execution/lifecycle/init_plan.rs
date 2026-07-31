@@ -33,7 +33,7 @@ use super::manifest::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     ParticipantQueryOptions, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
 };
-use super::{QueryExecutionId, QueryLifecycleTarget, StageParticipantBinding};
+use super::{QueryExecutionId, QueryLifecycleTarget, QueryTerminalSet, StageParticipantBinding};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -368,10 +368,40 @@ pub trait QueryInitBarrier: Send + Sync + 'static {
     ) -> Result<QueryLifecycleLease, DistributedQueryError>;
 }
 
-pub trait QueryLifecycleLeaseGuard: Send + 'static {
-    fn finalize(self: Box<Self>) -> Result<(), DistributedQueryError>;
+/// The fail-closed result of aborting an attempt that had already entered
+/// Running.  The original error is never replaced by terminal delivery
+/// cleanup; a completed terminal set is supplemental evidence only.
+#[derive(Clone, Debug)]
+pub struct QueryLifecycleAbortOutcome {
+    primary_error: String,
+    terminal_set: Option<QueryTerminalSet>,
+}
 
-    fn abort_preserving(self: Box<Self>, primary_error: String) -> String;
+impl QueryLifecycleAbortOutcome {
+    pub fn new(primary_error: impl Into<String>, terminal_set: Option<QueryTerminalSet>) -> Self {
+        Self {
+            primary_error: primary_error.into(),
+            terminal_set,
+        }
+    }
+
+    pub fn primary_error(&self) -> &str {
+        &self.primary_error
+    }
+
+    pub fn terminal_set(&self) -> Option<&QueryTerminalSet> {
+        self.terminal_set.as_ref()
+    }
+
+    pub fn into_primary_error(self) -> String {
+        self.primary_error
+    }
+}
+
+pub trait QueryLifecycleLeaseGuard: Send + 'static {
+    fn finalize(self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError>;
+
+    fn abort_preserving(self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome;
 }
 
 #[must_use = "query lifecycle must be finalized or aborted"]
@@ -384,18 +414,22 @@ impl QueryLifecycleLease {
         Self { guard: Some(guard) }
     }
 
-    pub fn finalize(mut self) -> Result<(), DistributedQueryError> {
+    pub fn finalize(mut self) -> Result<QueryTerminalSet, DistributedQueryError> {
         self.guard
             .take()
             .expect("query lifecycle lease is consumed exactly once")
             .finalize()
     }
 
-    pub fn abort_preserving(mut self, primary_error: String) -> String {
+    pub fn abort_with_outcome(mut self, primary_error: String) -> QueryLifecycleAbortOutcome {
         self.guard
             .take()
             .expect("query lifecycle lease is consumed exactly once")
             .abort_preserving(primary_error)
+    }
+
+    pub fn abort_preserving(self, primary_error: String) -> String {
+        self.abort_with_outcome(primary_error).into_primary_error()
     }
 }
 
