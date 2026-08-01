@@ -28,8 +28,8 @@ use crate::scan::{
     PartitionFilterCache,
 };
 use crate::spec::{
-    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, SchemaRef, SnapshotRef,
-    TableMetadataRef,
+    ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping, SchemaRef,
+    SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -47,6 +47,7 @@ pub(crate) struct ManifestFileContext {
     expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     delete_file_index: DeleteFileIndex,
     case_sensitive: bool,
+    name_mapping: Option<Arc<NameMapping>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -61,6 +62,7 @@ pub(crate) struct ManifestEntryContext {
     pub snapshot_schema: SchemaRef,
     pub delete_file_index: DeleteFileIndex,
     pub case_sensitive: bool,
+    pub name_mapping: Option<Arc<NameMapping>>,
 }
 
 impl ManifestFileContext {
@@ -76,6 +78,7 @@ impl ManifestFileContext {
             mut sender,
             expression_evaluator_cache,
             delete_file_index,
+            name_mapping,
             ..
         } = self;
 
@@ -92,6 +95,7 @@ impl ManifestFileContext {
                 snapshot_schema: snapshot_schema.clone(),
                 delete_file_index: delete_file_index.clone(),
                 case_sensitive: self.case_sensitive,
+                name_mapping: name_mapping.clone(),
             };
 
             sender
@@ -139,8 +143,7 @@ impl ManifestEntryContext {
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             // TODO: Pass actual PartitionSpec through context chain for native flow
             partition_spec: None,
-            // TODO: Extract name_mapping from table metadata property "schema.name-mapping.default"
-            name_mapping: None,
+            name_mapping: self.name_mapping,
             case_sensitive: self.case_sensitive,
         })
     }
@@ -159,6 +162,7 @@ pub(crate) struct PlanContext {
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
+    pub name_mapping: Option<Arc<NameMapping>>,
 
     pub partition_filter_cache: Arc<PartitionFilterCache>,
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
@@ -285,6 +289,7 @@ impl PlanContext {
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
             delete_file_index,
             case_sensitive: self.case_sensitive,
+            name_mapping: self.name_mapping.clone(),
         }
     }
 }

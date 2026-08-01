@@ -269,7 +269,7 @@ pub(crate) fn prepare_statistics_connector_read(
             },
         )
         .map_err(connector_planning_error)?;
-    let splits = lease
+    let split_result = lease
         .binding()
         .planning()
         .plan_splits(

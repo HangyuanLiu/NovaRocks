@@ -463,6 +463,7 @@ pub fn build_compat_read_splits(
                 projection: Vec::new(),
                 limit: None,
                 physical_predicates: Vec::new(),
+                name_mapping: None,
                 delta: None,
             };
             ConnectorSplit::try_new(
@@ -520,6 +521,7 @@ pub fn build_compat_delta_read_splits(
                 projection: Vec::new(),
                 limit: None,
                 physical_predicates: Vec::new(),
+                name_mapping: None,
                 delta: Some(IcebergDeltaSplitPayload {
                     source,
                     delete_side: delete_side.clone(),
@@ -616,16 +618,7 @@ impl IcebergReadOnlyConnectorInstance {
         }
         ensure_owner(split.owner(), &self.key.instance_id)?;
         let mut payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
-        match payload.version {
-            ICEBERG_SPLIT_V1 => payload.physical_predicates.clear(),
-            ICEBERG_SPLIT_V2 => {}
-            version => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    format!("unsupported Iceberg split version {version}"),
-                ));
-            }
-        }
+        validate_and_normalize_split_payload(&mut payload)?;
         if payload.owner_instance_id != self.key.instance_id.as_str()
             || payload.incarnation != self.key.incarnation.to_bytes()
         {
@@ -660,9 +653,10 @@ impl IcebergReadOnlyConnectorInstance {
                     .map(|delete| delete.path.as_str()),
             ),
         )?;
-        IcebergBatchReader::try_new(
+        IcebergBatchReader::try_new_with_name_mapping(
             &payload.data_file,
             &payload.physical_predicates,
+            payload.name_mapping.as_deref(),
             access,
             request,
             file_context,
@@ -3654,6 +3648,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         let mut remaining = scan.limit;
         let mut splits = Vec::new();
         let mut total_payload_bytes = 0usize;
+        let name_mapping = split_name_mapping(&scan.table)?;
         for (index, file) in files.into_iter().enumerate() {
             if let Some(remaining_rows) = remaining.as_mut() {
                 if *remaining_rows == 0 {
@@ -3666,7 +3661,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             }
             let estimated_bytes = u64::try_from(file.size).ok();
             let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V2,
+                version: ICEBERG_SPLIT_V3,
                 owner_instance_id: self.instance_id.as_str().to_string(),
                 incarnation: self.incarnation.to_bytes(),
                 namespace: scan.table.namespace.clone(),
@@ -3678,6 +3673,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 projection: scan.projection.clone(),
                 limit: scan.limit,
                 physical_predicates: scan.physical_predicates.clone(),
+                name_mapping: name_mapping.clone(),
                 delta: None,
             };
             push_split_with_budget(
@@ -3985,14 +3981,85 @@ struct SplitPayload {
     #[serde(default)]
     physical_predicates: Vec<IcebergPhysicalPredicate>,
     #[serde(default)]
+    name_mapping: Option<String>,
+    #[serde(default)]
     delta: Option<IcebergDeltaSplitPayload>,
 }
 
 const ICEBERG_SPLIT_V1: u16 = 1;
 const ICEBERG_SPLIT_V2: u16 = 2;
+const ICEBERG_SPLIT_V3: u16 = 3;
 
 fn default_iceberg_split_version() -> u16 {
     ICEBERG_SPLIT_V1
+}
+
+fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorError> {
+    let Some(serialized_metadata) = table
+        .table_info
+        .as_ref()
+        .and_then(|table| table.serialized_metadata.as_deref())
+    else {
+        return Ok(None);
+    };
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized_metadata)
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode pinned Iceberg metadata for name mapping: {error}"),
+            )
+        })?;
+    let Some(mapping) = metadata
+        .properties()
+        .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+    else {
+        return Ok(None);
+    };
+    canonical_split_name_mapping(mapping).map(Some)
+}
+
+fn canonical_split_name_mapping(mapping: &str) -> Result<String, ConnectorError> {
+    if mapping.len() > novarocks_spi::connector::MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg name mapping exceeds the provider-private split bound",
+        ));
+    }
+    super::catalog::add_files::canonical_name_mapping(mapping)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))
+}
+
+fn validate_split_name_mapping(mapping: Option<&str>) -> Result<(), ConnectorError> {
+    let Some(mapping) = mapping else {
+        return Ok(());
+    };
+    let canonical = canonical_split_name_mapping(mapping)?;
+    if canonical != mapping {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg split name mapping is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_and_normalize_split_payload(payload: &mut SplitPayload) -> Result<(), ConnectorError> {
+    match payload.version {
+        ICEBERG_SPLIT_V1 => {
+            payload.physical_predicates.clear();
+            payload.name_mapping = None;
+        }
+        ICEBERG_SPLIT_V2 => payload.name_mapping = None,
+        ICEBERG_SPLIT_V3 => validate_split_name_mapping(payload.name_mapping.as_deref())?,
+        version => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("unsupported Iceberg split version {version}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_schema_table_def(
@@ -4463,6 +4530,7 @@ pub(crate) fn plan_native_iceberg_delta_read(
             projection: Vec::new(),
             limit: None,
             physical_predicates: Vec::new(),
+            name_mapping: None,
             delta: Some(IcebergDeltaSplitPayload {
                 source,
                 delete_side: delete_side.cloned(),
@@ -5043,6 +5111,7 @@ mod tests {
             projection: vec![0],
             limit: None,
             physical_predicates: Vec::new(),
+            name_mapping: None,
             delta: None,
         };
 
@@ -5057,6 +5126,75 @@ mod tests {
                 <= novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             "ordinary 512-split planning exceeds the total payload budget"
         );
+    }
+
+    #[test]
+    fn split_v3_preserves_only_canonical_name_mapping() {
+        let mut payload = SplitPayload {
+            version: ICEBERG_SPLIT_V3,
+            owner_instance_id: "ice".to_string(),
+            incarnation: [0; 16],
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            snapshot_id: Some(7),
+            table_uuid: Some("table-uuid".to_string()),
+            schema_id: Some(1),
+            data_file: IcebergDataFileInfo::for_test(
+                "s3://warehouse/db/orders/data-1.parquet",
+                1024,
+                10,
+            ),
+            projection: vec![0],
+            limit: None,
+            physical_predicates: Vec::new(),
+            name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
+            delta: None,
+        };
+        validate_and_normalize_split_payload(&mut payload).expect("canonical V3 mapping");
+        assert!(payload.name_mapping.is_some());
+
+        payload.name_mapping = Some(r#"[{"names":["legacy_id"],"field-id":1}]"#.to_string());
+        let error = validate_and_normalize_split_payload(&mut payload)
+            .expect_err("non-canonical V3 mapping must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn legacy_split_versions_cannot_carry_name_mapping() {
+        for version in [ICEBERG_SPLIT_V1, ICEBERG_SPLIT_V2] {
+            let mut payload = SplitPayload {
+                version,
+                owner_instance_id: "ice".to_string(),
+                incarnation: [0; 16],
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                snapshot_id: Some(7),
+                table_uuid: Some("table-uuid".to_string()),
+                schema_id: Some(1),
+                data_file: IcebergDataFileInfo::for_test(
+                    "s3://warehouse/db/orders/data-1.parquet",
+                    1024,
+                    10,
+                ),
+                projection: vec![0],
+                limit: None,
+                physical_predicates: vec![IcebergPhysicalPredicate {
+                    field_id: 1,
+                    column: "id".to_string(),
+                    domain: IcebergPhysicalPredicateDomain::Range {
+                        op: IcebergPhysicalPredicateOp::Ge,
+                        value: IcebergPhysicalPredicateValue::Int32(0),
+                    },
+                }],
+                name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
+                delta: None,
+            };
+            validate_and_normalize_split_payload(&mut payload).expect("legacy split");
+            assert!(payload.name_mapping.is_none());
+            if version == ICEBERG_SPLIT_V1 {
+                assert!(payload.physical_predicates.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -5082,6 +5220,7 @@ mod tests {
             projection: vec![0],
             limit: None,
             physical_predicates: Vec::new(),
+            name_mapping: None,
             delta: None,
         };
         let first = payload("first");
@@ -5200,6 +5339,7 @@ mod tests {
                 projection: vec![0],
                 limit: None,
                 physical_predicates: Vec::new(),
+                name_mapping: None,
                 delta: None,
             })
             .collect::<Vec<_>>();
@@ -5420,6 +5560,7 @@ fn planned_table_files_fixture_binding(
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
                                 physical_predicates: scan.physical_predicates.clone(),
+                                name_mapping: None,
                                 delta: None,
                             },
                             "fixture split",

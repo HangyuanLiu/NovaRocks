@@ -281,6 +281,8 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
     pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
+    pub(crate) unified_statistics:
+        Arc<crate::connector::unified_statistics::UnifiedStatisticsResolver>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -343,6 +345,9 @@ impl Default for StandaloneState {
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
+            ),
+            unified_statistics: Arc::new(
+                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
             unified_statistics: Arc::new(
@@ -466,6 +471,93 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
             || {},
         )
     }
+}
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorControlRegistry {
+    fn acquire_current_data_mutation(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active data mutation binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        test_data_mutation_lease(binding)
+    }
+
+    fn acquire_exact_data_mutation(
+        &self,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(&key.instance_id)
+            .filter(|binding| binding.incarnation() == key.incarnation)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector data mutation generation is unavailable",
+                )
+            })?;
+        test_data_mutation_lease(binding)
+    }
+}
+
+#[cfg(test)]
+fn test_data_mutation_lease(
+    binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
+) -> Result<
+    novarocks_spi::connector::ConnectorDataMutationLease,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let mutation = binding.data_mutation().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no data mutation capability",
+        )
+    })?;
+    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    novarocks_spi::connector::ConnectorDataMutationLease::new(
+        binding.descriptor().clone(),
+        key,
+        Arc::clone(binding.metadata()),
+        mutation,
+        || {},
+    )
 }
 
 #[cfg(test)]
@@ -965,6 +1057,9 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
+            unified_statistics: Arc::new(
+                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
+            ),
             connector_control,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),

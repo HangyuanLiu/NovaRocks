@@ -288,6 +288,13 @@ impl<'a> TableScanBuilder<'a> {
             snapshot_bound_predicate: snapshot_bound_predicate.map(Arc::new),
             object_cache: self.table.object_cache(),
             field_ids: Arc::new(field_ids),
+            name_mapping: self
+                .table
+                .metadata()
+                .properties()
+                .get(crate::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+                .map(|mapping| parse_table_name_mapping(mapping))
+                .transpose()?,
             partition_filter_cache: Arc::new(PartitionFilterCache::new()),
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
@@ -305,6 +312,58 @@ impl<'a> TableScanBuilder<'a> {
             row_selection_enabled: self.row_selection_enabled,
         })
     }
+}
+
+fn parse_table_name_mapping(mapping: &str) -> Result<Arc<crate::spec::NameMapping>> {
+    fn validate(fields: &serde_json::Value) -> Result<()> {
+        let fields = fields.as_array().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "schema.name-mapping.default root and nested fields must be arrays",
+            )
+        })?;
+        for field in fields {
+            let object = field.as_object().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "schema.name-mapping.default entries must be objects",
+                )
+            })?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "field-id" | "names" | "fields"))
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "schema.name-mapping.default contains an unknown field",
+                ));
+            }
+            if let Some(children) = object.get("fields")
+                && !children.is_null()
+            {
+                validate(children)?;
+            }
+        }
+        Ok(())
+    }
+
+    let value: serde_json::Value = serde_json::from_str(mapping).map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Invalid schema.name-mapping.default table property",
+        )
+        .with_source(error)
+    })?;
+    validate(&value)?;
+    serde_json::from_value(value)
+        .map(Arc::new)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Invalid schema.name-mapping.default table property",
+            )
+            .with_source(error)
+        })
 }
 
 /// Table scan.
@@ -1290,6 +1349,67 @@ pub mod tests {
             tasks[1].data_file_path,
             format!("{}/3.parquet", &fixture.table_location)
         );
+    }
+
+    #[tokio::test]
+    async fn scan_task_uses_table_name_mapping() {
+        let mut fixture = TableTestFixture::new();
+        let serialized = r#"[{"field-id":1,"names":["legacy_x"]}]"#;
+        let expected: crate::spec::NameMapping =
+            serde_json::from_str(serialized).expect("name mapping");
+        let identifier = fixture.table.identifier().clone();
+        let file_io = fixture.table.file_io().clone();
+        let metadata_location = fixture
+            .table
+            .metadata_location()
+            .expect("metadata location")
+            .to_string();
+        let metadata = fixture
+            .table
+            .metadata()
+            .clone()
+            .into_builder(Some(metadata_location.clone()))
+            .set_properties(HashMap::from([(
+                crate::spec::DEFAULT_SCHEMA_NAME_MAPPING.to_string(),
+                serialized.to_string(),
+            )]))
+            .expect("set name mapping")
+            .build()
+            .expect("build metadata")
+            .metadata;
+        fixture.table = Table::builder()
+            .metadata(metadata)
+            .identifier(identifier)
+            .file_io(file_io)
+            .metadata_location(metadata_location)
+            .build()
+            .expect("rebuild fixture table");
+        fixture.setup_manifest_files().await;
+
+        let tasks = fixture
+            .table
+            .scan()
+            .build()
+            .expect("scan")
+            .plan_files()
+            .await
+            .expect("plan files")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("tasks");
+        assert!(!tasks.is_empty());
+        assert!(tasks.iter().all(|task| {
+            task.name_mapping.as_deref() == Some(&expected)
+        }));
+    }
+
+    #[test]
+    fn invalid_table_name_mapping_fails_scan_planning() {
+        let error = super::parse_table_name_mapping(
+            r#"[{"field-id":1,"names":["legacy_x"],"credential":"secret"}]"#,
+        )
+        .expect_err("unknown mapping fields must be rejected");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[tokio::test]

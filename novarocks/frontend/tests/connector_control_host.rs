@@ -25,15 +25,18 @@ use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorCatalogMutationResolver, ConnectorControlBinding, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningRequest,
-    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetricRequest,
-    StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsProvenance,
+    StatisticsReadRequest, StatisticsReader,
 };
 
 struct TestControl {
@@ -180,6 +183,66 @@ fn binding_with_mutation(incarnation: u8) -> ConnectorControlBinding {
     .expect("control binding with mutation")
 }
 
+struct TestDataMutation {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorDataMutation for TestDataMutation {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_mutation(
+        &self,
+        _request: ConnectorDataMutationPlanningRequest,
+    ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn execute(
+        &self,
+        _request: ConnectorDataMutationExecuteRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn reconcile(
+        &self,
+        _request: ConnectorDataMutationReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
+    let binding = binding(incarnation_byte);
+    let descriptor = binding.descriptor().clone();
+    let incarnation = binding.incarnation();
+    let key = ConnectorExecutionBindingKey {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    };
+    let provider = Arc::new(TestControl {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    });
+    ConnectorControlBinding::try_new_with_data_mutation(
+        descriptor.clone(),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+        None,
+        Some(Arc::new(TestDataMutation { descriptor, key })),
+    )
+    .expect("control binding with data mutation")
+}
+
 struct TestStatistics {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
@@ -303,6 +366,92 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
     assert!(host.take_ready_retires().expect("retire queue").is_empty());
     drop(mutation);
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7))
+        .expect("register no-data-mutation generation");
+    let error = match host.acquire_current_data_mutation(&instance_id) {
+        Ok(_) => panic!("missing capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire no-data-mutation generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_data_mutation(8))
+        .expect("register data-mutation generation");
+    let lease = host
+        .acquire_current_data_mutation(&instance_id)
+        .expect("data-mutation lease");
+    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.metadata().instance_id(), &instance_id);
+    host.retire_current(&instance_id)
+        .expect("retire data-mutation generation");
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(lease);
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn exact_data_mutation_lease_never_uses_a_replacement_incarnation() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    host.register(binding_with_data_mutation(7))
+        .expect("register old generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let error = match host.acquire_current_data_mutation(&instance_id) {
+        Ok(_) => panic!("retiring generation must not accept current acquisition"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    host.register(binding_with_data_mutation(8))
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_data_mutation(&instance_id)
+        .expect("replacement data-mutation lease");
+    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+
+    let exact_old = host
+        .acquire_exact_data_mutation(&old_key)
+        .expect("exact retiring generation lease");
+    assert_eq!(exact_old.binding_key(), &old_key);
+
+    let unknown_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+    };
+    let error = match host.acquire_exact_data_mutation(&unknown_key) {
+        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_data_mutation(&old_key) {
+        Ok(_) => panic!("retired generation must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
 }
 
 #[test]
