@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use novarocks_execution::runtime_filter as execution;
+
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprNode};
@@ -543,14 +545,45 @@ struct NativeConsumerBinding {
 
 enum NativeConsumerBindingState {
     Unbound,
-    BoundBlocking(Arc<dyn BlockingSnapshotSubscription>),
+    BoundBlocking(Arc<dyn execution::BlockingSnapshotSubscription>),
     BoundLive {
+        subscription: Arc<dyn execution::NonBlockingLiveSubscription>,
+        observed: Option<execution::LogicalVersion>,
+    },
+    Acquiring,
+    Active(NativeConsumerPredicate),
+    PassThrough,
+    #[cfg(test)]
+    TestBoundBlocking(Arc<dyn BlockingSnapshotSubscription>),
+    #[cfg(test)]
+    TestBoundLive {
         subscription: Arc<dyn NonBlockingLiveSubscription>,
         observed: Option<LogicalVersion>,
     },
-    Acquiring,
-    Active(NativeRuntimeFilterPredicate),
-    PassThrough,
+}
+
+enum NativeConsumerPredicate {
+    Execution(Arc<execution::RuntimeFilterSnapshot>),
+    #[cfg(test)]
+    Test(NativeRuntimeFilterPredicate),
+}
+
+enum NativeConsumerPredicateForApply {
+    Execution(Arc<execution::RuntimeFilterSnapshot>),
+    #[cfg(test)]
+    Test(NativeRuntimeFilterPredicate),
+}
+
+impl NativeConsumerPredicate {
+    fn clone_for_apply(&self) -> NativeConsumerPredicateForApply {
+        match self {
+            Self::Execution(snapshot) => {
+                NativeConsumerPredicateForApply::Execution(Arc::clone(snapshot))
+            }
+            #[cfg(test)]
+            Self::Test(predicate) => NativeConsumerPredicateForApply::Test(predicate.clone()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,7 +631,7 @@ impl RuntimeFilterConsumerSet {
             .zip(subscriptions)
             .map(|(spec, subscription)| NativeConsumerBinding {
                 spec,
-                state: NativeConsumerBindingState::BoundBlocking(subscription),
+                state: NativeConsumerBindingState::TestBoundBlocking(subscription),
             })
             .collect();
         Self {
@@ -625,7 +658,7 @@ impl RuntimeFilterConsumerSet {
             .zip(subscriptions)
             .map(|(spec, subscription)| NativeConsumerBinding {
                 spec,
-                state: NativeConsumerBindingState::BoundLive {
+                state: NativeConsumerBindingState::TestBoundLive {
                     subscription,
                     observed: None,
                 },
@@ -657,10 +690,10 @@ impl RuntimeFilterConsumerSet {
                 spec,
                 state: match subscription {
                     NativeConsumerTestSubscription::Blocking(subscription) => {
-                        NativeConsumerBindingState::BoundBlocking(subscription)
+                        NativeConsumerBindingState::TestBoundBlocking(subscription)
                     }
                     NativeConsumerTestSubscription::Live(subscription) => {
-                        NativeConsumerBindingState::BoundLive {
+                        NativeConsumerBindingState::TestBoundLive {
                             subscription,
                             observed: None,
                         }
@@ -706,49 +739,55 @@ impl RuntimeFilterConsumerSet {
             if !matches!(binding.state, NativeConsumerBindingState::Unbound) {
                 continue;
             }
-            let resolved = match context.resolve_consumer(
-                BindingId::new(binding.spec.binding_id),
-                ChannelId::new(binding.spec.channel_id),
-                subscription_kind_for_activation(binding.spec.activation)?,
-            ) {
-                Ok(resolved) => resolved,
-                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+            let request = execution::RuntimeFilterSubscriptionRequest::new(
+                execution_membership_consumer_contract(&binding.spec)?,
+            );
+            match execution::RuntimeFilterSession::subscribe(context, request) {
+                Ok(execution::RuntimeFilterBindOutcome::Bound(
+                    execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+                )) if matches!(
+                    binding.spec.activation,
+                    ConsumerActivation::BlockingSnapshot
+                ) =>
+                {
+                    binding.state = NativeConsumerBindingState::BoundBlocking(subscription);
+                }
+                Ok(execution::RuntimeFilterBindOutcome::Bound(
+                    execution::RuntimeFilterSubscriptionHandle::Live(subscription),
+                )) if matches!(
+                    binding.spec.activation,
+                    ConsumerActivation::NonBlockingLive {
+                        late_apply: LateApplyGranularity::Batch,
+                    }
+                ) =>
+                {
+                    binding.state = NativeConsumerBindingState::BoundLive {
+                        subscription,
+                        observed: None,
+                    };
+                }
+                Ok(execution::RuntimeFilterBindOutcome::Unavailable(_)) => {
                     binding.state = NativeConsumerBindingState::PassThrough;
-                    continue;
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "native Join runtime-filter binding_id={} session returned an activation-mismatched subscription",
+                        binding.spec.binding_id
+                    ));
+                }
+                Err(error)
+                    if error.kind()
+                        == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                {
+                    binding.state = NativeConsumerBindingState::PassThrough;
                 }
                 Err(error) => return Err(error.to_string()),
-            };
-            validate_resolved_consumer(&binding.spec, &resolved)?;
+            }
             match binding.spec.activation {
-                ConsumerActivation::BlockingSnapshot => match resolved.subscribe() {
-                    Ok(handle) => {
-                        binding.state = NativeConsumerBindingState::BoundBlocking(
-                            handle.into_blocking().map_err(|error| error.to_string())?,
-                        );
-                    }
-                    Err(error)
-                        if error.kind() == RuntimeContractViolationKind::ServiceUnavailable =>
-                    {
-                        binding.state = NativeConsumerBindingState::PassThrough;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                },
-                ConsumerActivation::NonBlockingLive {
+                ConsumerActivation::BlockingSnapshot
+                | ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
-                } => match resolved.subscribe() {
-                    Ok(handle) => {
-                        binding.state = NativeConsumerBindingState::BoundLive {
-                            subscription: handle.into_live().map_err(|error| error.to_string())?,
-                            observed: None,
-                        };
-                    }
-                    Err(error)
-                        if error.kind() == RuntimeContractViolationKind::ServiceUnavailable =>
-                    {
-                        binding.state = NativeConsumerBindingState::PassThrough;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                },
+                } => {}
                 ConsumerActivation::NonBlockingLive { .. } => {
                     return Err(format!(
                         "native Join runtime-filter binding_id={} has unsupported activation",
@@ -815,7 +854,13 @@ impl RuntimeFilterConsumerSet {
                     );
                     match state {
                         NativeConsumerBindingState::BoundBlocking(subscription) => {
-                            Some((index, binding.spec.clone(), subscription))
+                            Some((index, subscription))
+                        }
+                        #[cfg(test)]
+                        NativeConsumerBindingState::TestBoundBlocking(subscription) => {
+                            binding.state =
+                                NativeConsumerBindingState::TestBoundBlocking(subscription);
+                            None
                         }
                         state => {
                             binding.state = state;
@@ -826,22 +871,62 @@ impl RuntimeFilterConsumerSet {
                 .collect::<Vec<_>>()
         };
 
-        for (index, spec, subscription) in pending {
+        for (index, subscription) in pending {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let state = match subscription.acquire(remaining) {
-                ArtifactAcquireOutcome::Published(bundle) => {
-                    let contract = membership_predicate_contract(&spec)?;
-                    NativeConsumerBindingState::Active(
-                        NativeRuntimeFilterPredicate::compile(&bundle, &contract)
-                            .map_err(|error| error.to_string())?,
-                    )
+                execution::SnapshotAcquireOutcome::Published(snapshot) => {
+                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(snapshot))
                 }
-                ArtifactAcquireOutcome::Unsupported(_)
-                | ArtifactAcquireOutcome::Unavailable(_)
-                | ArtifactAcquireOutcome::Cancelled
-                | ArtifactAcquireOutcome::TimedOut => NativeConsumerBindingState::PassThrough,
+                execution::SnapshotAcquireOutcome::Unsupported(_)
+                | execution::SnapshotAcquireOutcome::Unavailable(_)
+                | execution::SnapshotAcquireOutcome::Cancelled
+                | execution::SnapshotAcquireOutcome::TimedOut => {
+                    NativeConsumerBindingState::PassThrough
+                }
             };
             self.inner.bindings.lock().expect("native RF consumer lock")[index].state = state;
+        }
+        #[cfg(test)]
+        {
+            let pending = {
+                let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+                bindings
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(index, binding)| {
+                        let state = std::mem::replace(
+                            &mut binding.state,
+                            NativeConsumerBindingState::Acquiring,
+                        );
+                        match state {
+                            NativeConsumerBindingState::TestBoundBlocking(subscription) => {
+                                Some((index, binding.spec.clone(), subscription))
+                            }
+                            state => {
+                                binding.state = state;
+                                None
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (index, spec, subscription) in pending {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let state = match subscription.acquire(remaining) {
+                    ArtifactAcquireOutcome::Published(bundle) => {
+                        let contract = membership_predicate_contract(&spec)?;
+                        NativeConsumerBindingState::Active(NativeConsumerPredicate::Test(
+                            NativeRuntimeFilterPredicate::compile(&bundle, &contract)
+                                .map_err(|error| error.to_string())?,
+                        ))
+                    }
+                    ArtifactAcquireOutcome::Unsupported(_)
+                    | ArtifactAcquireOutcome::Unavailable(_)
+                    | ArtifactAcquireOutcome::Cancelled
+                    | ArtifactAcquireOutcome::TimedOut => NativeConsumerBindingState::PassThrough,
+                };
+                self.inner.bindings.lock().expect("native RF consumer lock")[index].state = state;
+            }
         }
         Ok(())
     }
@@ -900,12 +985,19 @@ impl RuntimeFilterConsumerSet {
         let active = {
             let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
             if bindings.iter().any(|binding| {
-                matches!(
+                let unacquired = matches!(
                     binding.state,
                     NativeConsumerBindingState::Unbound
                         | NativeConsumerBindingState::BoundBlocking(_)
                         | NativeConsumerBindingState::Acquiring
-                )
+                );
+                #[cfg(test)]
+                let unacquired = unacquired
+                    || matches!(
+                        binding.state,
+                        NativeConsumerBindingState::TestBoundBlocking(_)
+                    );
+                unacquired
             }) {
                 return Err("native runtime-filter consumers must acquire before apply".into());
             }
@@ -914,7 +1006,7 @@ impl RuntimeFilterConsumerSet {
                 .enumerate()
                 .filter_map(|(index, binding)| match &binding.state {
                     NativeConsumerBindingState::Active(predicate) => {
-                        Some((index, binding.spec.expr_id, predicate.clone()))
+                        Some((index, binding.spec.expr_id, predicate.clone_for_apply()))
                     }
                     _ => None,
                 })
@@ -930,15 +1022,24 @@ impl RuntimeFilterConsumerSet {
                 return Ok(None);
             };
             let array = self.inner.arena.eval(expr_id, &input)?;
-            let mask = match predicate.evaluate(array.as_ref()) {
-                Ok(mask) => mask,
-                Err(PredicateEvaluationError::ResourceUnavailable) => {
-                    self.inner.bindings.lock().expect("native RF consumer lock")[index].state =
-                        NativeConsumerBindingState::PassThrough;
-                    current = Some(input);
-                    continue;
+            let mask = match predicate {
+                NativeConsumerPredicateForApply::Execution(snapshot) => snapshot
+                    .predicate()
+                    .evaluate(&array)
+                    .map_err(|error| error.to_string())?,
+                #[cfg(test)]
+                NativeConsumerPredicateForApply::Test(predicate) => {
+                    match predicate.evaluate(array.as_ref()) {
+                        Ok(mask) => mask,
+                        Err(PredicateEvaluationError::ResourceUnavailable) => {
+                            self.inner.bindings.lock().expect("native RF consumer lock")[index]
+                                .state = NativeConsumerBindingState::PassThrough;
+                            current = Some(input);
+                            continue;
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
                 }
-                Err(error) => return Err(error.to_string()),
             };
             if mask.iter().all(|value| value == Some(true)) {
                 current = Some(input);
@@ -975,16 +1076,111 @@ impl RuntimeFilterConsumerSet {
         };
         for (index, spec, subscription, observed) in pending {
             let outcome = subscription.poll_after(observed);
-            self.apply_live_poll_outcome(index, &spec, outcome)?;
+            self.apply_execution_live_poll_outcome(index, &spec, outcome)?;
+        }
+        #[cfg(test)]
+        {
+            let pending = {
+                let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+                bindings
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, binding)| match &binding.state {
+                        NativeConsumerBindingState::TestBoundLive {
+                            subscription,
+                            observed,
+                        } => Some((
+                            index,
+                            binding.spec.clone(),
+                            Arc::clone(subscription),
+                            *observed,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (index, spec, subscription, observed) in pending {
+                self.apply_test_live_poll_outcome(index, &spec, subscription.poll_after(observed))?;
+            }
         }
         Ok(())
     }
 
-    fn apply_live_poll_outcome(
+    #[cfg(test)]
+    fn apply_test_live_poll_outcome(
         &self,
         index: usize,
         spec: &RuntimeFilterConsumerBinding,
         outcome: LivePollOutcome,
+    ) -> Result<(), String> {
+        let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+        let Some(binding) = bindings.get_mut(index) else {
+            return Err("native Join runtime-filter binding index drifted".into());
+        };
+        let NativeConsumerBindingState::TestBoundLive { observed, .. } = &mut binding.state else {
+            return Ok(());
+        };
+        let observed_version = *observed;
+        if observed_version.is_some_and(|version| version != LogicalVersion::FIRST) {
+            return Err(format!(
+                "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST",
+                spec.binding_id
+            ));
+        }
+        match outcome {
+            LivePollOutcome::Updated { bundle, terminal } => {
+                if bundle.version() != LogicalVersion::FIRST
+                    || terminal != Some(LiveTerminal::Completed)
+                {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} returned an invalid terminal update",
+                        spec.binding_id
+                    ));
+                }
+                let contract = membership_predicate_contract(spec)?;
+                binding.state = NativeConsumerBindingState::Active(NativeConsumerPredicate::Test(
+                    NativeRuntimeFilterPredicate::compile(&bundle, &contract)
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            LivePollOutcome::Idle {
+                latest_version,
+                terminal,
+            } => {
+                if latest_version.is_some_and(|version| version != LogicalVersion::FIRST) {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} Idle latest version is invalid",
+                        spec.binding_id
+                    ));
+                }
+                if terminal == Some(LiveTerminal::Completed) {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} completed without final artifact",
+                        spec.binding_id
+                    ));
+                }
+                if matches!(
+                    (observed_version, latest_version),
+                    (None, Some(_)) | (Some(_), None)
+                ) {
+                    return Err(format!(
+                        "native Join CompleteOnce runtime-filter binding_id={} private cursor drifted",
+                        spec.binding_id
+                    ));
+                }
+                if terminal.is_some() {
+                    binding.state = NativeConsumerBindingState::PassThrough;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_execution_live_poll_outcome(
+        &self,
+        index: usize,
+        spec: &RuntimeFilterConsumerBinding,
+        outcome: execution::LivePollOutcome,
     ) -> Result<(), String> {
         let mut bindings = self.inner.bindings.lock().expect("native RF consumer lock");
         let Some(binding) = bindings.get_mut(index) else {
@@ -995,7 +1191,7 @@ impl RuntimeFilterConsumerSet {
         };
         let observed_version = *observed;
         if let Some(version) = observed_version
-            && version != LogicalVersion::FIRST
+            && version != execution::LogicalVersion::FIRST
         {
             return Err(format!(
                 "native Join CompleteOnce runtime-filter binding_id={} private cursor must use LogicalVersion::FIRST, got {version:?}",
@@ -1003,38 +1199,36 @@ impl RuntimeFilterConsumerSet {
             ));
         }
         match outcome {
-            LivePollOutcome::Updated { bundle, terminal } => {
-                if bundle.version() != LogicalVersion::FIRST {
+            execution::LivePollOutcome::Updated { snapshot, terminal } => {
+                if snapshot.logical_version() != execution::LogicalVersion::FIRST {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Updated artifact must use LogicalVersion::FIRST",
                         spec.binding_id
                     ));
                 }
-                if terminal != Some(LiveTerminal::Completed) {
+                if terminal != Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Updated artifact requires terminal Completed, got {terminal:?}",
                         spec.binding_id
                     ));
                 }
-                let contract = membership_predicate_contract(spec)?;
                 binding.state = NativeConsumerBindingState::Active(
-                    NativeRuntimeFilterPredicate::compile(&bundle, &contract)
-                        .map_err(|error| error.to_string())?,
+                    NativeConsumerPredicate::Execution(snapshot),
                 );
             }
-            LivePollOutcome::Idle {
+            execution::LivePollOutcome::Idle {
                 latest_version,
                 terminal,
             } => {
                 if let Some(version) = latest_version
-                    && version != LogicalVersion::FIRST
+                    && version != execution::LogicalVersion::FIRST
                 {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} Idle latest version must use LogicalVersion::FIRST, got {version:?}",
                         spec.binding_id
                     ));
                 }
-                if terminal == Some(LiveTerminal::Completed) {
+                if terminal == Some(execution::LiveTerminal::Completed) {
                     return Err(format!(
                         "native Join CompleteOnce runtime-filter binding_id={} reported Completed without the final artifact",
                         spec.binding_id
@@ -1058,16 +1252,13 @@ impl RuntimeFilterConsumerSet {
                 match terminal {
                     None => {}
                     Some(
-                        LiveTerminal::CompletedWithoutArtifact
-                        | LiveTerminal::DegradedLogical(_)
-                        | LiveTerminal::DegradedArtifact(_)
-                        | LiveTerminal::DegradedDelivery(_)
-                        | LiveTerminal::Unavailable(_)
-                        | LiveTerminal::Cancelled,
+                        execution::LiveTerminal::CompletedWithoutArtifact
+                        | execution::LiveTerminal::Unavailable(_)
+                        | execution::LiveTerminal::Cancelled,
                     ) => {
                         binding.state = NativeConsumerBindingState::PassThrough;
                     }
-                    Some(LiveTerminal::Completed) => unreachable!("handled above"),
+                    Some(execution::LiveTerminal::Completed) => unreachable!("handled above"),
                 }
             }
         }
@@ -1081,6 +1272,42 @@ fn join_profile() -> Result<ConsumerArtifactProfile, String> {
         None,
     )
     .map_err(|error| format!("invalid native Join runtime-filter profile: {error:?}"))
+}
+
+fn execution_membership_consumer_contract(
+    spec: &RuntimeFilterConsumerBinding,
+) -> Result<execution::RuntimeFilterConsumerContract, String> {
+    let RuntimeFilterExecutionContract::Membership {
+        canonical_schema,
+        schema_digest,
+    } = &spec.contract
+    else {
+        return Err(format!(
+            "native Join runtime-filter binding_id={} requires a Membership contract",
+            spec.binding_id
+        ));
+    };
+    let activation = match spec.activation {
+        ConsumerActivation::BlockingSnapshot => execution::ConsumerActivation::BlockingSnapshot,
+        ConsumerActivation::NonBlockingLive {
+            late_apply: LateApplyGranularity::Batch,
+        } => execution::ConsumerActivation::NonBlockingLive,
+        ConsumerActivation::NonBlockingLive { .. } => {
+            return Err(format!(
+                "native Join runtime-filter binding_id={} has unsupported activation",
+                spec.binding_id
+            ));
+        }
+    };
+    Ok(execution::RuntimeFilterConsumerContract::new(
+        execution::RuntimeFilterBindingId::new(spec.binding_id),
+        execution::RuntimeFilterChannelId::new(spec.channel_id),
+        activation,
+        execution::RuntimeFilterExecutionContract::Membership {
+            canonical_schema: Arc::clone(canonical_schema),
+            schema_digest: *schema_digest,
+        },
+    ))
 }
 
 fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> Result<(), String> {
@@ -1797,7 +2024,8 @@ mod tests {
             .bindings
             .lock()
             .expect("native RF consumer lock");
-        let NativeConsumerBindingState::BoundLive { observed, .. } = &mut bindings[0].state else {
+        let NativeConsumerBindingState::TestBoundLive { observed, .. } = &mut bindings[0].state
+        else {
             panic!("fixture binding is live");
         };
         *observed = next;
