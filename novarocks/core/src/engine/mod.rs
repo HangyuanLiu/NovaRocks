@@ -4212,6 +4212,61 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
     )
 }
 
+/// Execute an admitted connector write as a result-free staging operation.
+///
+/// This is the native consumer used by MV first-refresh staging: callers get
+/// only the bounded SPI completion/summary, never a `QueryResult`, `Chunk` or
+/// `RecordBatch`. The existing generic writer remains responsible for BE-side
+/// scan, exchange, shuffle and connector writer execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    let result = execute_query_as_iceberg_write_in_operation_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution_resolver,
+        execution,
+        connector_context,
+        connector_write,
+    )?;
+    if !result.query_result.columns.is_empty() || !result.query_result.chunks.is_empty() {
+        return Err("connector staging terminal returned a result payload".to_string());
+    }
+    if let Some(abort) = result.write_abort {
+        return Err(format!(
+            "connector staging terminal aborted: {}",
+            abort.reason
+        ));
+    }
+    let completion = result.connector_completion.ok_or_else(|| {
+        "connector staging terminal has no accepted connector completion".to_string()
+    })?;
+    let summary = completion
+        .staging_summary()
+        .map_err(|error| error.to_string())?;
+    Ok((completion, summary))
+}
+
 enum DistributedConnectorWrite {
     Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
     Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
