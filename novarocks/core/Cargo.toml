@@ -26,6 +26,7 @@ doctest = false
 
 [dependencies]
 novarocks-catalog = { path = "../catalog" }
+novarocks-execution = { path = "../execution" }
 novarocks-fs = { path = "../fs" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
