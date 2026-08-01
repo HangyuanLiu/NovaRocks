@@ -586,12 +586,12 @@ mod tests {
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,
     };
-    use novarocks_types::QueryId;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorErrorKind, ConnectorExecutionDeclaration,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
         ConnectorProviderId, ConnectorRequestContext,
     };
+    use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
