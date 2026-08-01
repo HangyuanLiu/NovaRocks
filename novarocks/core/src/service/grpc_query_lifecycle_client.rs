@@ -389,6 +389,7 @@ async fn run_query_control_bridge(
 struct QueryControlCommandState {
     sender: Option<mpsc::Sender<crate::proto::novarocks::QueryControlRequest>>,
     pending: VecDeque<PendingQueryControlCommand>,
+    local_failure_observed: bool,
     terminal_error: Option<QueryLifecycleTransportError>,
 }
 
@@ -397,6 +398,7 @@ impl QueryControlCommandState {
         Self {
             sender: Some(sender),
             pending: VecDeque::new(),
+            local_failure_observed: false,
             terminal_error: None,
         }
     }
@@ -471,8 +473,11 @@ fn validate_query_control_event(
     state: &mut QueryControlCommandState,
 ) -> Result<(), QueryLifecycleTransportError> {
     match event {
+        QueryControlEvent::LocalFailure { .. } => {
+            state.local_failure_observed = true;
+            Ok(())
+        }
         QueryControlEvent::ControlReady
-        | QueryControlEvent::LocalFailure { .. }
         | QueryControlEvent::LocalDrained
         | QueryControlEvent::TerminalSnapshot { .. }
         // Live observations are best-effort telemetry. They are deliberately
@@ -520,6 +525,13 @@ fn validate_query_control_event(
                 "validate QueryControl TerminationAccepted",
                 format!("expected {expected:?}, received termination reason {reason:?}"),
             )),
+            None
+                if state.local_failure_observed
+                    && *reason
+                        == crate::query_execution::lifecycle::QueryTerminationReason::LocalFailure =>
+            {
+                Ok(())
+            }
             None => Err(invalid_response(
                 "validate QueryControl TerminationAccepted",
                 format!("received termination reason {reason:?} without a pending terminal command"),
@@ -793,6 +805,55 @@ mod tests {
             "terminal ACK must remain deliverable"
         );
         assert!(state.terminal_error.is_none());
+    }
+
+    #[test]
+    fn grpc_query_lifecycle_client_accepts_local_failure_first_wins_termination() {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(32);
+        let commands = Mutex::new(QueryControlCommandState::new(command_tx));
+
+        let (failure, terminal) = prepare_query_control_event(
+            Ok(QueryControlEvent::LocalFailure {
+                code: "FRAGMENT_EXECUTION_FAILED".to_string(),
+                detail: "injected fragment failure".to_string(),
+            }),
+            &commands,
+        );
+        assert!(!terminal);
+        assert!(failure.is_ok());
+
+        let (accepted, terminal) = prepare_query_control_event(
+            Ok(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::LocalFailure,
+            }),
+            &commands,
+        );
+        assert!(!terminal);
+        assert_eq!(
+            accepted.expect("local first-wins termination remains observable"),
+            QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::LocalFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn grpc_query_lifecycle_client_rejects_unsolicited_local_failure_termination() {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(32);
+        let commands = Mutex::new(QueryControlCommandState::new(command_tx));
+
+        let (accepted, terminal) = prepare_query_control_event(
+            Ok(QueryControlEvent::TerminationAccepted {
+                reason: QueryTerminationReason::LocalFailure,
+            }),
+            &commands,
+        );
+        assert!(terminal);
+        let error = accepted.expect_err("unsolicited termination must be rejected");
+        assert_eq!(
+            error.kind(),
+            QueryLifecycleTransportErrorKind::InvalidResponse
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

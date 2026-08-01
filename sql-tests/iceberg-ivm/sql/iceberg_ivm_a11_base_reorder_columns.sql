@@ -83,7 +83,8 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 6
 -- @skip_result_check=true
-INSERT INTO ice_ivm_a11_reorder_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'US', 400);
+INSERT INTO ice_ivm_a11_reorder_${uuid0}.ns_${uuid0}.base_${uuid0} (id, region, amount)
+VALUES (4, 'US', 400);
 
 -- query 7
 -- Column reorder: field ids unchanged, refresh must succeed.

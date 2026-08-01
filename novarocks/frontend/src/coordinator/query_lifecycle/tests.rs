@@ -1550,7 +1550,16 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
     assert_eq!(snapshot.local_failures, 1);
     assert_eq!(snapshot.coordinator_lost, 0);
     assert_eq!(snapshot.heartbeat_timeouts, 0);
-    drop(lease);
+    let error = lease
+        .finalize()
+        .expect_err("local failure must interrupt terminal drain");
+    assert!(error.message().contains("backend 0 scan failed"), "{error}");
+    assert!(
+        !error
+            .message()
+            .contains("timed out waiting for all participants to drain"),
+        "{error}"
+    );
 }
 
 #[test]

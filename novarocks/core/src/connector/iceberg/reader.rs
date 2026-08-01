@@ -603,52 +603,68 @@ fn align_batch_to_schema(
     let mut fields = Vec::with_capacity(expected.fields().len());
     let mut columns = Vec::with_capacity(expected.fields().len());
     for target in expected.fields() {
-        let column: ArrayRef =
-            match source_index_for_target(source_schema.fields(), target.as_ref())? {
-                Some(index) => {
-                    let source = batch.column(index).clone();
-                    if source.data_type() == target.data_type() {
-                        source
-                    } else if matches!(target.data_type(), DataType::LargeBinary)
-                        && crate::formats::parquet::is_variant_struct_data_type(source.data_type())
-                    {
-                        crate::formats::parquet::collapse_variant_struct_to_largebinary(
+        let column: ArrayRef = match source_index_for_target(
+            source_schema.fields(),
+            target.as_ref(),
+        )? {
+            Some(index) => {
+                let source = batch.column(index).clone();
+                if source.data_type() == target.data_type() {
+                    source
+                } else if iceberg_types_differ_only_by_nested_field_metadata(
+                    source.data_type(),
+                    target.data_type(),
+                ) {
+                    crate::exec::chunk::type_compatibility::retag_column(
                             &source,
-                            target.name(),
-                        )?
-                    } else {
-                        cast(source.as_ref(), target.data_type()).map_err(|error| {
+                            target.data_type(),
+                        )
+                        .map_err(|error| {
                             format!(
-                                "Iceberg field {} cannot cast from {:?} to {:?}: {error}",
+                                "Iceberg field {} cannot align nested Arrow metadata ({error:?}) from {:?} to {:?}",
                                 target.name(),
                                 source.data_type(),
                                 target.data_type()
                             )
                         })?
-                    }
-                }
-                None if is_iceberg_virtual(target.name()) => {
-                    iceberg_virtual_column(target, batch.num_rows(), positions, &facts)?
-                }
-                None if target.metadata().contains_key(
-                    crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY,
-                ) =>
+                } else if matches!(target.data_type(), DataType::LargeBinary)
+                    && crate::formats::parquet::is_variant_struct_data_type(source.data_type())
                 {
-                    crate::formats::parquet::build_iceberg_default_array(
-                        target.as_ref(),
-                        batch.num_rows(),
+                    crate::formats::parquet::collapse_variant_struct_to_largebinary(
+                        &source,
+                        target.name(),
                     )?
+                } else {
+                    cast(source.as_ref(), target.data_type()).map_err(|error| {
+                        format!(
+                            "Iceberg field {} cannot cast from {:?} to {:?}: {error}",
+                            target.name(),
+                            source.data_type(),
+                            target.data_type()
+                        )
+                    })?
                 }
-                None if target.is_nullable() => {
-                    new_null_array(target.data_type(), batch.num_rows())
-                }
-                None => {
-                    return Err(format!(
-                        "Iceberg data file is missing required field {}",
-                        target.name()
-                    ));
-                }
-            };
+            }
+            None if is_iceberg_virtual(target.name()) => {
+                iceberg_virtual_column(target, batch.num_rows(), positions, &facts)?
+            }
+            None if target.metadata().contains_key(
+                crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY,
+            ) =>
+            {
+                crate::formats::parquet::build_iceberg_default_array(
+                    target.as_ref(),
+                    batch.num_rows(),
+                )?
+            }
+            None if target.is_nullable() => new_null_array(target.data_type(), batch.num_rows()),
+            None => {
+                return Err(format!(
+                    "Iceberg data file is missing required field {}",
+                    target.name()
+                ));
+            }
+        };
         let field = if column.null_count() > 0 && !target.is_nullable() {
             target.as_ref().clone().with_nullable(true)
         } else {
@@ -658,6 +674,48 @@ fn align_batch_to_schema(
         columns.push(column);
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| error.to_string())
+}
+
+fn iceberg_types_differ_only_by_nested_field_metadata(
+    source: &DataType,
+    target: &DataType,
+) -> bool {
+    match (source, target) {
+        (DataType::List(source), DataType::List(target))
+        | (DataType::LargeList(source), DataType::LargeList(target)) => {
+            iceberg_types_differ_only_by_nested_field_metadata(
+                source.data_type(),
+                target.data_type(),
+            )
+        }
+        (
+            DataType::FixedSizeList(source, source_size),
+            DataType::FixedSizeList(target, target_size),
+        ) => {
+            source_size == target_size
+                && iceberg_types_differ_only_by_nested_field_metadata(
+                    source.data_type(),
+                    target.data_type(),
+                )
+        }
+        (DataType::Map(source, source_sorted), DataType::Map(target, target_sorted)) => {
+            source_sorted == target_sorted
+                && iceberg_types_differ_only_by_nested_field_metadata(
+                    source.data_type(),
+                    target.data_type(),
+                )
+        }
+        (DataType::Struct(source), DataType::Struct(target)) => {
+            source.len() == target.len()
+                && source.iter().zip(target.iter()).all(|(source, target)| {
+                    iceberg_types_differ_only_by_nested_field_metadata(
+                        source.data_type(),
+                        target.data_type(),
+                    )
+                })
+        }
+        _ => source == target,
+    }
 }
 
 /// Retain a low-cardinality UTF-8 scan column as an Arrow dictionary carrier.
@@ -904,6 +962,75 @@ mod tests {
             20
         );
         assert_eq!(aligned.column(2).null_count(), 1);
+    }
+
+    #[test]
+    fn aligns_nested_iceberg_field_metadata_without_arrow_cast() {
+        let source_type = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new(
+                            "value",
+                            DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let target_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int32, true),
+                        Field::new(
+                            "value",
+                            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "map2",
+                source_type.clone(),
+                true,
+            )])),
+            vec![arrow::array::new_empty_array(&source_type)],
+        )
+        .expect("source batch");
+        let expected = Arc::new(Schema::new(vec![Field::new(
+            "map2",
+            target_type.clone(),
+            true,
+        )]));
+
+        let aligned = align_batch_to_schema(
+            &expected,
+            source,
+            None,
+            IcebergFileFacts {
+                path: "file:///test.parquet",
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+            },
+        )
+        .expect("nested metadata alignment");
+
+        assert_eq!(aligned.column(0).data_type(), &target_type);
     }
 
     #[test]

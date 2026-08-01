@@ -222,6 +222,11 @@ pub(super) fn lower_connector_read_scan(
             }),
         )
     };
+    let reader_schema = if batch_transform.is_none() {
+        output_schema.arrow_schema_ref()
+    } else {
+        Arc::clone(&expected_schema)
+    };
     let binding = ctx
         .execution_resolver()?
         .resolve(&binding_key)
@@ -241,7 +246,7 @@ pub(super) fn lower_connector_read_scan(
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     let request = ConnectorOpenReaderRequest {
-        expected_schema,
+        expected_schema: reader_schema,
         batch,
         context: request_context,
     };
@@ -426,7 +431,9 @@ fn output_schema_with_connector_fields(
         .slots()
         .iter()
         .zip(expected.fields())
-        .map(|(slot, field)| slot.with_field(field.as_ref().clone()))
+        .map(|(slot, field)| {
+            slot.with_field(reconcile_connector_field(slot.field(), field.as_ref()))
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
@@ -444,6 +451,68 @@ fn output_schema_with_connector_fields(
                 format!("build ConnectorReadSource output schema: {error}"),
             )
         })
+}
+
+fn reconcile_connector_field(
+    output: &arrow::datatypes::Field,
+    carrier: &arrow::datatypes::Field,
+) -> arrow::datatypes::Field {
+    let mut metadata = output.metadata().clone();
+    metadata.extend(carrier.metadata().clone());
+    arrow::datatypes::Field::new(
+        output.name(),
+        reconcile_connector_data_type(output.data_type(), carrier.data_type()),
+        output.is_nullable(),
+    )
+    .with_metadata(metadata)
+}
+
+fn reconcile_connector_data_type(
+    output: &arrow::datatypes::DataType,
+    carrier: &arrow::datatypes::DataType,
+) -> arrow::datatypes::DataType {
+    use arrow::datatypes::{DataType, Fields};
+
+    match (output, carrier) {
+        (DataType::Struct(output), DataType::Struct(carrier)) => DataType::Struct(Fields::from(
+            output
+                .iter()
+                .zip(carrier.iter())
+                .map(|(output, carrier)| {
+                    Arc::new(reconcile_connector_field(output.as_ref(), carrier.as_ref()))
+                })
+                .collect::<Vec<_>>(),
+        )),
+        (DataType::List(output), carrier) => list_element(carrier)
+            .map(|carrier| {
+                DataType::List(Arc::new(reconcile_connector_field(
+                    output.as_ref(),
+                    carrier,
+                )))
+            })
+            .unwrap_or_else(|| output.data_type().clone()),
+        (DataType::LargeList(output), carrier) => list_element(carrier)
+            .map(|carrier| {
+                DataType::LargeList(Arc::new(reconcile_connector_field(
+                    output.as_ref(),
+                    carrier,
+                )))
+            })
+            .unwrap_or_else(|| output.data_type().clone()),
+        (DataType::FixedSizeList(output, size), carrier) => list_element(carrier)
+            .map(|carrier| {
+                DataType::FixedSizeList(
+                    Arc::new(reconcile_connector_field(output.as_ref(), carrier)),
+                    *size,
+                )
+            })
+            .unwrap_or_else(|| output.data_type().clone()),
+        (DataType::Map(output, sorted), DataType::Map(carrier, _)) => DataType::Map(
+            Arc::new(reconcile_connector_field(output.as_ref(), carrier.as_ref())),
+            *sorted,
+        ),
+        _ => output.clone(),
+    }
 }
 
 fn schema_matches_connector_contract(
@@ -473,23 +542,44 @@ fn data_type_matches_connector_contract(
 ) -> bool {
     use arrow::datatypes::DataType;
 
+    if let (Some(carrier), Some(output)) = (list_element(carrier), list_element(output)) {
+        return data_type_matches_connector_contract(carrier.data_type(), output.data_type());
+    }
+
     match (carrier, output) {
         (DataType::Struct(carrier), DataType::Struct(output)) => {
             carrier.len() == output.len()
-                && carrier
-                    .iter()
-                    .zip(output.iter())
-                    .all(|(carrier, output)| field_matches_connector_contract(carrier, output))
+                && carrier.iter().zip(output.iter()).all(|(carrier, output)| {
+                    carrier.name() == output.name()
+                        && data_type_matches_connector_contract(
+                            carrier.data_type(),
+                            output.data_type(),
+                        )
+                })
         }
-        (DataType::List(carrier), DataType::List(output))
-        | (DataType::LargeList(carrier), DataType::LargeList(output))
-        | (DataType::FixedSizeList(carrier, _), DataType::FixedSizeList(output, _)) => {
-            field_matches_connector_contract(carrier, output)
-        }
-        (DataType::Map(carrier, carrier_sorted), DataType::Map(output, output_sorted)) => {
-            carrier_sorted == output_sorted && field_matches_connector_contract(carrier, output)
+        (DataType::Map(carrier, _), DataType::Map(output, _)) => {
+            let (DataType::Struct(carrier), DataType::Struct(output)) =
+                (carrier.data_type(), output.data_type())
+            else {
+                return false;
+            };
+            carrier.len() == output.len()
+                && carrier.iter().zip(output.iter()).all(|(carrier, output)| {
+                    data_type_matches_connector_contract(carrier.data_type(), output.data_type())
+                })
         }
         _ => carrier == output,
+    }
+}
+
+fn list_element(data_type: &arrow::datatypes::DataType) -> Option<&arrow::datatypes::Field> {
+    use arrow::datatypes::DataType;
+
+    match data_type {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            Some(field.as_ref())
+        }
+        _ => None,
     }
 }
 
@@ -514,4 +604,131 @@ fn required_usize(value: u64, field: &'static str) -> Result<usize, NativeFragme
             format!("ConnectorReadSource {field} does not fit usize"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+
+    use super::{reconcile_connector_field, schema_matches_connector_contract};
+
+    #[test]
+    fn connector_contract_accepts_domain_nested_field_details_absent_from_type_desc() {
+        let carrier = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("id", DataType::Int64, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+                    false,
+                )),
+            ])),
+            false,
+        )]);
+        let decoded = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![
+                Arc::new(Field::new("id", DataType::Int64, true)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true,
+                )),
+            ])),
+            false,
+        )]);
+
+        assert!(schema_matches_connector_contract(&carrier, &decoded));
+    }
+
+    #[test]
+    fn connector_contract_accepts_map_child_nullability_absent_from_type_desc() {
+        let map = |key_nullable, value_nullable| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Arc::new(Field::new("key", DataType::Utf8, key_nullable)),
+                        Arc::new(Field::new("value", DataType::Int64, value_nullable)),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let carrier = Schema::new(vec![Field::new("attributes", map(false, false), true)]);
+        let decoded = Schema::new(vec![Field::new("attributes", map(true, true), true)]);
+
+        assert!(schema_matches_connector_contract(&carrier, &decoded));
+    }
+
+    #[test]
+    fn connector_contract_keeps_top_level_and_struct_shape_strict() {
+        let carrier = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+                "id",
+                DataType::Int64,
+                false,
+            ))])),
+            false,
+        )]);
+        let nullable = Schema::new(vec![Field::new(
+            "payload",
+            carrier.field(0).data_type().clone(),
+            true,
+        )]);
+        let renamed = Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+                "other",
+                DataType::Int64,
+                true,
+            ))])),
+            false,
+        )]);
+
+        assert!(!schema_matches_connector_contract(&carrier, &nullable));
+        assert!(!schema_matches_connector_contract(&carrier, &renamed));
+    }
+
+    #[test]
+    fn connector_field_reconciliation_preserves_ids_and_runtime_nullability() {
+        let mut key_metadata = HashMap::new();
+        key_metadata.insert("PARQUET:field_id".to_string(), "7".to_string());
+        let map = |key_nullable, metadata| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Arc::new(
+                            Field::new("key", DataType::Utf8, key_nullable).with_metadata(metadata),
+                        ),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let output = Field::new("attributes", map(true, HashMap::new()), true);
+        let carrier = Field::new("attributes", map(false, key_metadata), true);
+
+        let reconciled = reconcile_connector_field(&output, &carrier);
+        let DataType::Map(entries, _) = reconciled.data_type() else {
+            panic!("expected reconciled MAP");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected reconciled MAP entries");
+        };
+        assert!(fields[0].is_nullable());
+        assert_eq!(
+            fields[0].metadata().get("PARQUET:field_id"),
+            Some(&"7".to_string())
+        );
+    }
 }

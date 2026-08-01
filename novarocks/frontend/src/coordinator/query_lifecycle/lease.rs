@@ -643,22 +643,33 @@ impl AttemptControl {
     }
 
     fn abort(&self, primary_error: String, force_unary: bool) -> String {
-        if self
-            .state
-            .compare_exchange(ACTIVE, ABORTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return self
-                .primary_error
-                .lock()
-                .expect("query lifecycle primary error")
-                .clone()
-                .unwrap_or(primary_error);
+        let mut observed = self.state.load(Ordering::Acquire);
+        loop {
+            match observed {
+                ACTIVE | FINALIZING => match self.state.compare_exchange(
+                    observed,
+                    ABORTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => observed = current,
+                },
+                _ => {
+                    return self
+                        .primary_error
+                        .lock()
+                        .expect("query lifecycle primary error")
+                        .clone()
+                        .unwrap_or(primary_error);
+                }
+            }
         }
         *self
             .primary_error
             .lock()
             .expect("query lifecycle primary error") = Some(primary_error.clone());
+        self.terminal.1.notify_all();
         self.stop_supervisor();
         self.metrics.attempt_terminated();
         tracing::warn!(
@@ -889,6 +900,15 @@ impl AttemptControl {
             .expect("attempted participant set")
             .len();
         self.wait_terminal_event(timeout, |terminal| {
+            if self.state.load(Ordering::Acquire) == ABORTED
+                && let Some(error) = self
+                    .primary_error
+                    .lock()
+                    .expect("query lifecycle primary error")
+                    .clone()
+            {
+                return Some(Err(error));
+            }
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
@@ -990,7 +1010,14 @@ impl AttemptControl {
             SupervisorFailureKind::LocalFailure => self.metrics.local_failure(),
         }
         if let Some(registry) = self.registry.upgrade() {
-            let _ = registry.latch_failure_and_cancel(self.execution_id.query_id(), reason);
+            let query_id = self.execution_id.query_id();
+            // A LocalFailure is delivered by the same control-stream reader
+            // that must receive TerminationAccepted. Dispatch cancellation on
+            // a separate thread so abort acknowledgement cannot deadlock
+            // behind its own event handler.
+            std::thread::spawn(move || {
+                let _ = registry.latch_failure_and_cancel(query_id, reason);
+            });
         } else {
             let _ = self.abort_preserving(reason);
         }
