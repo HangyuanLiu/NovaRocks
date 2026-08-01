@@ -33,6 +33,99 @@ pub(crate) struct JoinFirstRefreshLogicalPlan {
     pub(crate) change_stream: ImvChangeStreamDescriptor,
 }
 
+/// Canonical fresh-data plan for a join MV first refresh.
+///
+/// Unlike the legacy change-stream plan, this plan carries only payload and
+/// join apply-key columns. It is therefore suitable for a single append cohort
+/// into an empty staged target and cannot accidentally route through a delete
+/// or rewrite action consumer.
+pub(crate) struct JoinFirstRefreshAppendLogicalPlan {
+    pub(crate) plan: LogicalPlanNode,
+    pub(crate) factory: ColumnRefFactory,
+}
+
+pub(crate) fn build_join_first_refresh_append_logical_plan(
+    rewrite: &IcebergMvRewriteContext,
+    left_ref: &TableIdentity,
+    right_ref: &TableIdentity,
+    input: JoinFirstRefreshLogicalInput,
+) -> Result<JoinFirstRefreshAppendLogicalPlan, String> {
+    let JoinFirstRefreshLogicalInput { plan, mut factory } = input;
+    let input = build_join_full_refresh_apply_input(
+        plan,
+        rewrite.schema_contract.as_ref(),
+        left_ref,
+        right_ref,
+    )?;
+    reserve_factory_for_logical_plan(&mut factory, &input.plan)?;
+    let join_apply_key_column_id = factory.create(
+        None,
+        JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
+        DataType::Utf8,
+        false,
+    );
+    // The descriptor remains the single owner of the canonical key
+    // expression. Its action column is validation-only for this append path
+    // and is intentionally omitted by the projection builder below.
+    let action_column_id = factory.create(
+        None,
+        crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+        DataType::Int8,
+        false,
+    );
+    let join_apply_key_column = join_full_refresh_output_column(
+        join_apply_key_column_id,
+        JOIN_APPLY_KEY_COLUMN_NAME,
+        DataType::Utf8,
+        false,
+        true,
+    );
+    let action_column = join_full_refresh_output_column(
+        action_column_id,
+        crate::exec::change_op::CHANGE_OP_COLUMN,
+        DataType::Int8,
+        false,
+        true,
+    );
+    let descriptor = build_join_full_refresh_descriptor(
+        rewrite,
+        left_ref,
+        right_ref,
+        input.payload_columns,
+        input.left_row_id_column,
+        input.right_row_id_column,
+        action_column,
+        join_apply_key_column,
+        input.join_key_pairs,
+    )?;
+    descriptor.validate().map_err(|e| {
+        format!(
+            "iceberg join MV {} first-refresh append descriptor is invalid: {e}",
+            rewrite.target.fqn()
+        )
+    })?;
+    let left_uuid = rewrite
+        .pin
+        .uuid(left_ref)
+        .ok_or_else(|| format!("missing uuid for {}", left_ref.fqn()))?
+        .to_string();
+    let right_uuid = rewrite
+        .pin
+        .uuid(right_ref)
+        .ok_or_else(|| format!("missing uuid for {}", right_ref.fqn()))?
+        .to_string();
+    let plan = crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
+        input.plan,
+        &descriptor,
+        &left_uuid,
+        &right_uuid,
+        join_apply_key_column_id.0,
+    )
+    .map_err(|e| format!("build join first-refresh append logical plan: {e}"))?;
+    reserve_factory_for_logical_plan(&mut factory, &plan)?;
+    Ok(JoinFirstRefreshAppendLogicalPlan { plan, factory })
+}
+
 pub(crate) fn build_join_first_refresh_logical_plan(
     rewrite: &IcebergMvRewriteContext,
     left_ref: &TableIdentity,
