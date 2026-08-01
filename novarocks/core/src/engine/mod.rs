@@ -62,6 +62,7 @@ pub(crate) mod information_schema;
 pub mod insert_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
+pub(crate) mod mv_first_refresh_staging;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;

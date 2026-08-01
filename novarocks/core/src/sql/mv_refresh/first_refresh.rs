@@ -219,6 +219,10 @@ impl PreparedMvFirstRefreshWrite {
         self.physical_sql.root_hash_column()
     }
 
+    pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
+        self.request.connector_context()
+    }
+
     /// Consuming bind boundary: fragment preparation may only happen after
     /// admission and exact-lease activation.  The resulting artifact cannot
     /// be rebound to another operation/cohort.
