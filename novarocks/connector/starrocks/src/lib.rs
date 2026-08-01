@@ -24,12 +24,22 @@
 mod codec;
 mod domain;
 
+pub mod direct;
+
 pub mod control;
 pub mod execution;
 
 pub use control::{
     StarRocksControlGeneration, StarRocksDirectSplitPlanner, StarRocksMetadataSource,
     StarRocksRpcSplitPlanner,
+};
+pub use direct::{
+    StarRocksDirectColumnBinding, StarRocksDirectIoRuntime, StarRocksDirectLocation,
+    StarRocksDirectLocationSource, StarRocksDirectMetadataLayout, StarRocksDirectSplit,
+    StarRocksDirectStorageResolver, StarRocksDirectTabletDescriptor,
+    StarRocksDirectTabletPlanningSource, StarRocksSharedDataDirectPlanner,
+    StarRocksSharedDataDirectReaderFactory, StarRocksSharedDataStorageResolver,
+    StarRocksStarManagerRouting, StarRocksStarOsClient, StarRocksStorageBindingRef,
 };
 pub use domain::{
     StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksFreezeDigest,

@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
@@ -30,9 +29,10 @@ use novarocks_spi::connector::{
 use crate::STARROCKS_PROVIDER_ID;
 use crate::codec::{encode_schema_ipc, schema_digest};
 use crate::control::{
-    StrategyPayload, decode_declaration, decode_split, split_output_schema_digest, split_strategy,
-    validate_split_generation,
+    StrategyPayload, decode_declaration, decode_split, direct_outer_facts,
+    split_output_schema_digest, split_strategy, validate_split_generation,
 };
+use crate::direct::{StarRocksDirectSplit, decode_direct_split};
 use crate::domain::{
     StarRocksLocalBindingRef, StarRocksRpcOpaquePayload, StarRocksRpcTransport,
     StarRocksSelectedStrategy, unavailable,
@@ -50,7 +50,7 @@ pub trait StarRocksRpcReaderFactory: Send + Sync {
 pub trait StarRocksDirectReaderFactory: Send + Sync {
     fn open_direct_reader(
         &self,
-        payload: Bytes,
+        split: StarRocksDirectSplit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
 }
@@ -165,6 +165,7 @@ impl ConnectorReadExecution for CompositeReadExecution {
                 "StarRocks split output schema does not match the requested schema",
             ));
         }
+        let direct_outer = direct_outer_facts(&split)?;
         match (split_strategy(&split), split.strategy_payload) {
             (StarRocksSelectedStrategy::Rpc { transport }, StrategyPayload::Rpc { payload }) => {
                 self.rpc
@@ -179,13 +180,15 @@ impl ConnectorReadExecution for CompositeReadExecution {
             (
                 StarRocksSelectedStrategy::SharedDataDirect,
                 StrategyPayload::SharedDataDirect { payload },
-            ) => self
-                .direct
-                .as_ref()
-                .ok_or_else(|| {
-                    unavailable("StarRocks shared-data direct reader factory is unavailable")
-                })?
-                .open_direct_reader(payload.0, request),
+            ) => {
+                let direct = decode_direct_split(&payload.0, &direct_outer)?;
+                self.direct
+                    .as_ref()
+                    .ok_or_else(|| {
+                        unavailable("StarRocks shared-data direct reader factory is unavailable")
+                    })?
+                    .open_direct_reader(direct, request)
+            }
             _ => Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "StarRocks split tag does not match its frozen strategy",
@@ -219,6 +222,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorBatchBudget, ConnectorCancellation, ConnectorControlBinding, ConnectorInstanceId,
         ConnectorReadSelector, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
@@ -228,9 +232,13 @@ mod tests {
     use super::*;
     use crate::{
         StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksControlGeneration,
-        StarRocksDirectSplitPlanner, StarRocksMetadataSource, StarRocksReadPolicy,
-        StarRocksResolvedTable, StarRocksRpcSplitPlanner, StarRocksSplitPlanningInput,
-        StarRocksStrategySplit, StarRocksStrategySplitPayload, StarRocksTopology,
+        StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
+        StarRocksDirectMetadataLayout, StarRocksDirectSplitPlanner,
+        StarRocksDirectTabletDescriptor, StarRocksDirectTabletPlanningSource,
+        StarRocksMetadataSource, StarRocksReadPolicy, StarRocksResolvedTable,
+        StarRocksRpcSplitPlanner, StarRocksSharedDataDirectPlanner, StarRocksSplitPlanningInput,
+        StarRocksStorageBindingRef, StarRocksStrategySplit, StarRocksStrategySplitPayload,
+        StarRocksTopology,
     };
 
     struct NeverCancelled;
@@ -376,20 +384,39 @@ mod tests {
         }
     }
 
-    struct ReadyDirectPlanner;
-    impl StarRocksDirectSplitPlanner for ReadyDirectPlanner {
-        fn plan_direct_splits(
+    struct ReadyDirectTablets;
+    impl StarRocksDirectTabletPlanningSource for ReadyDirectTablets {
+        fn plan_tablets(
             &self,
             _: &StarRocksSplitPlanningInput,
             _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
-            Ok(vec![StarRocksStrategySplit {
-                split_id: Arc::from("direct-1"),
-                payload: StarRocksStrategySplitPayload::SharedDataDirect(Bytes::from_static(
-                    b"direct-fact",
-                )),
-                estimated_bytes: Some(11),
-            }])
+        ) -> Result<Vec<StarRocksDirectTabletDescriptor>, ConnectorError> {
+            Ok(vec![StarRocksDirectTabletDescriptor::try_new(
+                1,
+                2,
+                3,
+                StarRocksDirectMetadataLayout::Standalone,
+                "meta/0001.meta",
+                vec![StarRocksDirectColumnBinding::try_new(
+                    0, 1, "id", "BIGINT", false, None,
+                )?],
+                Some(11),
+            )?])
+        }
+    }
+    struct ReadyDirectLocations;
+    impl StarRocksDirectLocationSource for ReadyDirectLocations {
+        fn resolve_locations(
+            &self,
+            _: &[i64],
+            _: &ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<StarRocksDirectLocation>, ConnectorError> {
+            Ok(vec![StarRocksDirectLocation::try_new(
+                1,
+                "s3://bucket/tablet",
+                StarRocksStorageBindingRef::parse("volume-a")?,
+                "fs-key",
+            )?])
         }
     }
 
@@ -418,7 +445,10 @@ mod tests {
             ),
             Arc::new(ReadyDirectSource),
             Arc::new(RpcPlanner),
-            Arc::new(ReadyDirectPlanner),
+            Arc::new(StarRocksSharedDataDirectPlanner::new(
+                Arc::new(ReadyDirectTablets),
+                Arc::new(ReadyDirectLocations),
+            )),
         )
         .unwrap()
     }
@@ -514,7 +544,7 @@ mod tests {
     impl StarRocksDirectReaderFactory for DirectFactory {
         fn open_direct_reader(
             &self,
-            _: Bytes,
+            _: StarRocksDirectSplit,
             _: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -529,10 +559,10 @@ mod tests {
     impl StarRocksDirectReaderFactory for ReadyDirectFactory {
         fn open_direct_reader(
             &self,
-            payload: Bytes,
+            payload: StarRocksDirectSplit,
             request: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            assert_eq!(payload, Bytes::from_static(b"direct-fact"));
+            assert_eq!(payload.tablet_id(), 1);
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Reader {
                 batch: Some(
@@ -652,5 +682,48 @@ mod tests {
             .unwrap();
         assert_eq!(reader.next_batch().unwrap().unwrap().num_rows(), 1);
         assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn separate_backend_local_bindings_do_not_share_direct_clients() {
+        let binding = direct_control();
+        let (declaration, split, schema) = planned_read(&binding);
+        let be_one_calls = Arc::new(AtomicUsize::new(0));
+        let be_two_calls = Arc::new(AtomicUsize::new(0));
+        let installer = |calls: Arc<AtomicUsize>| {
+            let mut bindings = StarRocksExecutionBindings::new();
+            bindings.insert(
+                StarRocksLocalBindingRef::parse("test").unwrap(),
+                StarRocksLocalExecutionBinding {
+                    rpc: None,
+                    direct: Some(Arc::new(ReadyDirectFactory(calls))),
+                },
+            );
+            StarRocksExecutionInstaller::new(bindings)
+        };
+        let open = |installer: StarRocksExecutionInstaller, schema: arrow::datatypes::SchemaRef| {
+            let installed = installer.install(&declaration, &context()).unwrap();
+            installed
+                .read()
+                .unwrap()
+                .open_reader(
+                    &split,
+                    ConnectorOpenReaderRequest {
+                        expected_schema: schema,
+                        batch: ConnectorBatchBudget {
+                            max_rows: NonZeroUsize::new(32).unwrap(),
+                            max_bytes: NonZeroUsize::new(4096).unwrap(),
+                        },
+                        context: context(),
+                    },
+                )
+                .unwrap()
+        };
+        let _reader = open(installer(Arc::clone(&be_one_calls)), Arc::clone(&schema));
+        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(be_two_calls.load(Ordering::SeqCst), 0);
+        let _reader = open(installer(Arc::clone(&be_two_calls)), schema);
+        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(be_two_calls.load(Ordering::SeqCst), 1);
     }
 }
