@@ -3846,6 +3846,64 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn execution_session_binds_only_the_exact_installed_consumer_contract() {
+            use novarocks_execution::runtime_filter::{
+                ConsumerActivation as ExecutionConsumerActivation, RuntimeFilterBindOutcome,
+                RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,
+                RuntimeFilterSession, RuntimeFilterSubscriptionRequest,
+            };
+
+            let (_service, producer_context) = installed_membership_service();
+            let context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(producer_context.service()),
+                producer_context.query_id(),
+                producer_context.epoch(),
+                uid(30),
+            );
+            let schema =
+                ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
+                    .expect("installed membership schema");
+            let contract = RuntimeFilterExecutionContract::Membership {
+                canonical_schema: Arc::from(schema.canonical_bytes()),
+                schema_digest: schema.digest().bytes(),
+            };
+            let request =
+                RuntimeFilterSubscriptionRequest::new(RuntimeFilterConsumerContract::new(
+                    novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(30),
+                    novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(1),
+                    ExecutionConsumerActivation::BlockingSnapshot,
+                    contract.clone(),
+                ));
+            assert!(matches!(
+                RuntimeFilterSession::subscribe(&context, request),
+                Ok(RuntimeFilterBindOutcome::Bound(
+                    novarocks_execution::runtime_filter::RuntimeFilterSubscriptionHandle::Blocking(
+                        _
+                    )
+                ))
+            ));
+
+            let mismatched =
+                RuntimeFilterSubscriptionRequest::new(RuntimeFilterConsumerContract::new(
+                    novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(30),
+                    novarocks_execution::runtime_filter::RuntimeFilterChannelId::new(1),
+                    ExecutionConsumerActivation::BlockingSnapshot,
+                    RuntimeFilterExecutionContract::Membership {
+                        canonical_schema: Arc::from(schema.canonical_bytes()),
+                        schema_digest: [0; 32],
+                    },
+                ));
+            let error = match RuntimeFilterSession::subscribe(&context, mismatched) {
+                Err(error) => error,
+                Ok(_) => panic!("execution session must reject a mismatched consumer contract"),
+            };
+            assert_eq!(
+                error.kind(),
+                novarocks_execution::runtime_filter::RuntimeFilterContractViolationKind::ContractMismatch
+            );
+        }
+
+        #[test]
         fn native_binding_role_kind_and_contract_mismatch_fail_before_open() {
             let (service, context) = installed_membership_service();
 

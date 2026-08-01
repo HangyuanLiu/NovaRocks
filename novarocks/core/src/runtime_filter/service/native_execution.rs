@@ -17,26 +17,38 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
+use arrow::array::{ArrayRef, BooleanArray};
+use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 
 use crate::common::types::UniqueId;
 use crate::runtime_filter::codec::contribution::{
     ContributionCodecError, RuntimeFilterContribution as CoreContribution, decode_contribution,
+    encode_contribution,
+};
+use crate::runtime_filter::exec::membership_predicate::{
+    MembershipPredicateContract, NativeRuntimeFilterPredicate,
+};
+use crate::runtime_filter::exec::ordered_range_predicate::{
+    NativeOrderedRangePredicate, OrderedRangePredicateContract,
 };
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
     ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
 };
 use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerArtifactProfile};
-use crate::runtime_filter::port::identity::DeploymentEpoch;
+use crate::runtime_filter::port::identity::{DeploymentEpoch, LogicalVersion};
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::producer::{
     OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
     ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
-    NonBlockingLiveSubscription, SubscriptionHandle, SubscriptionKind,
+    ArtifactAcquireOutcome, ArtifactUnsupportedReason, BlockingSnapshotSubscription,
+    LivePollOutcome, LiveTerminal, NonBlockingLiveSubscription, SubscriptionHandle,
+    SubscriptionKind, UnavailableReason,
 };
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 
@@ -259,6 +271,7 @@ impl NativeRuntimeFilterExecutionContext {
                 channel.logical_domain(),
                 channel.reduction_requirement(),
             )?,
+            snapshot_compiler: snapshot_predicate_compiler(channel.logical_domain())?,
         })
     }
 
@@ -356,6 +369,48 @@ impl ResolvedNativeProducer {
         self.max_contribution_bytes
     }
 
+    pub(crate) fn execution_contract(&self) -> execution::RuntimeFilterExecutionContract {
+        to_execution_contract(&self.contract)
+    }
+
+    pub(crate) fn encode_execution_contribution(
+        &self,
+        partition: crate::runtime_filter::port::identity::PartitionId,
+        sequence: crate::runtime_filter::port::identity::ProducerSequence,
+        contribution: CoreContribution,
+    ) -> Result<execution::RuntimeFilterContribution, execution::RuntimeFilterContractViolation>
+    {
+        let kind = match &contribution {
+            CoreContribution::Membership(_) => execution::RuntimeFilterContributionKind::Membership,
+            CoreContribution::OrderedBound(_) => {
+                execution::RuntimeFilterContributionKind::OrderedBound
+            }
+            CoreContribution::TopKSummary(_) => {
+                execution::RuntimeFilterContributionKind::TopKSummary
+            }
+            CoreContribution::FinalDomain(_) => {
+                execution::RuntimeFilterContributionKind::FinalDomain
+            }
+        };
+        let stream = crate::runtime_filter::port::identity::ProducerStreamId::new(
+            self.binding_id,
+            self.fragment_instance_id,
+            partition,
+        );
+        let encoded = encode_contribution(
+            &contribution,
+            self.inbound_contract.codec_expectation(stream, sequence),
+            self.inbound_contract.limits().max_encoded_bytes(),
+        )
+        .map_err(codec_violation)?;
+        let (contract_digest, canonical_bytes) = encoded.into_parts();
+        Ok(execution::RuntimeFilterContribution::new(
+            kind,
+            contract_digest,
+            canonical_bytes,
+        ))
+    }
+
     pub(crate) fn open_membership(
         &self,
         local_partition_count: u32,
@@ -447,7 +502,7 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
                 execution_producer_port_kind(contract.kind()),
             )
             .map_err(execution_violation)?;
-        if execution_contract(resolved.contract()) != *contract.contract() {
+        if to_execution_contract(resolved.contract()) != *contract.contract() {
             return Err(execution::RuntimeFilterContractViolation::new(
                 execution::RuntimeFilterContractViolationKind::ContractMismatch,
                 "producer execution contract does not match the installed route",
@@ -468,15 +523,63 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
 
     fn subscribe(
         &self,
-        _request: execution::RuntimeFilterSubscriptionRequest,
+        request: execution::RuntimeFilterSubscriptionRequest,
     ) -> Result<
         execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
         execution::RuntimeFilterContractViolation,
     > {
-        Err(execution::RuntimeFilterContractViolation::new(
-            execution::RuntimeFilterContractViolationKind::RoleMismatch,
-            "native execution subscription adapter is not installed yet",
-        ))
+        let contract = request.contract();
+        let requested_kind = match contract.activation() {
+            execution::ConsumerActivation::BlockingSnapshot => SubscriptionKind::BlockingSnapshot,
+            execution::ConsumerActivation::NonBlockingLive => SubscriptionKind::NonBlockingLive,
+        };
+        let resolved = self
+            .resolve_consumer(
+                BindingId::new(contract.binding_id().get()),
+                ChannelId::new(contract.channel_id().get()),
+                requested_kind,
+            )
+            .map_err(execution_violation)?;
+        if to_execution_contract(resolved.contract()) != *contract.contract() {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "consumer execution contract does not match the installed route",
+            ));
+        }
+        let handle = match resolved.subscribe() {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                return Ok(execution::RuntimeFilterBindOutcome::Unavailable(
+                    execution::UnavailableReason::RouteUnavailable,
+                ));
+            }
+            Err(error) => return Err(execution_violation(error)),
+        };
+        let binding_id = execution::RuntimeFilterBindingId::new(contract.binding_id().get());
+        let contract_digest = execution_contract_digest(contract.contract());
+        let outcome = match handle {
+            SubscriptionHandle::Blocking(subscription) => {
+                execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::new(
+                    NativeExecutionBlockingSubscription {
+                        binding_id,
+                        contract_digest,
+                        compiler: resolved.snapshot_compiler.clone(),
+                        subscription,
+                    },
+                ))
+            }
+            SubscriptionHandle::Live(subscription) => {
+                execution::RuntimeFilterSubscriptionHandle::Live(Arc::new(
+                    NativeExecutionLiveSubscription {
+                        binding_id,
+                        contract_digest,
+                        compiler: resolved.snapshot_compiler.clone(),
+                        subscription,
+                    },
+                ))
+            }
+        };
+        Ok(execution::RuntimeFilterBindOutcome::Bound(outcome))
     }
 }
 
@@ -563,21 +666,23 @@ impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
 
     fn fail(
         &self,
+        reason: execution::RuntimeFilterProducerFailure,
     ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
     {
+        let reason = match reason {
+            execution::RuntimeFilterProducerFailure::Cancelled => ProducerFailureReason::Cancelled,
+            execution::RuntimeFilterProducerFailure::ExecutionFailed => {
+                ProducerFailureReason::ExecutionFailed
+            }
+            execution::RuntimeFilterProducerFailure::UpstreamUnavailable => {
+                ProducerFailureReason::UpstreamUnavailable
+            }
+        };
         match &self.handle {
-            ProducerHandle::Membership(adapter) => {
-                adapter.fail(ProducerFailureReason::ExecutionFailed)
-            }
-            ProducerHandle::OrderedBound(adapter) => {
-                adapter.fail(ProducerFailureReason::ExecutionFailed)
-            }
-            ProducerHandle::TopKSummary(adapter) => {
-                adapter.fail(ProducerFailureReason::ExecutionFailed)
-            }
-            ProducerHandle::FinalDomain(adapter) => {
-                adapter.fail(ProducerFailureReason::ExecutionFailed)
-            }
+            ProducerHandle::Membership(adapter) => adapter.fail(reason),
+            ProducerHandle::OrderedBound(adapter) => adapter.fail(reason),
+            ProducerHandle::TopKSummary(adapter) => adapter.fail(reason),
+            ProducerHandle::FinalDomain(adapter) => adapter.fail(reason),
         }
         .map(execution_submit_outcome)
         .map_err(execution_violation)
@@ -593,7 +698,7 @@ fn execution_producer_port_kind(kind: execution::RuntimeFilterProducerKind) -> P
     }
 }
 
-fn execution_contract(
+fn to_execution_contract(
     contract: &InstalledRuntimeFilterExecutionContract,
 ) -> execution::RuntimeFilterExecutionContract {
     match contract {
@@ -727,6 +832,7 @@ pub(crate) struct ResolvedNativeConsumer {
     lifecycle: RuntimeFilterLifecycle,
     reduction_requirement: ReductionRequirement,
     topk_contract_digest: Option<[u8; 32]>,
+    snapshot_compiler: SnapshotPredicateCompiler,
 }
 
 impl std::fmt::Debug for ResolvedNativeConsumer {
@@ -790,6 +896,267 @@ impl ResolvedNativeConsumer {
             ));
         }
         self.subscribe()?.into_live()
+    }
+}
+
+#[derive(Clone)]
+enum SnapshotPredicateCompiler {
+    Membership {
+        data_type: DataType,
+        null_semantics: crate::runtime_filter::model::contract::NullSemantics,
+    },
+    Ordered {
+        order_contract: Arc<RuntimeOrderContract>,
+    },
+}
+
+impl SnapshotPredicateCompiler {
+    fn compile(
+        &self,
+        bundle: &crate::runtime_filter::port::artifact::ArtifactBundle,
+        binding_id: execution::RuntimeFilterBindingId,
+        contract_digest: [u8; 32],
+    ) -> Result<Arc<execution::RuntimeFilterSnapshot>, execution::UnavailableReason> {
+        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = match self {
+            Self::Membership {
+                data_type,
+                null_semantics,
+            } => {
+                let expected = MembershipPredicateContract::join(
+                    bundle.channel_id(),
+                    data_type.clone(),
+                    *null_semantics,
+                    bundle.version(),
+                )
+                .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
+                Arc::new(NativeExecutionPredicate::Membership(
+                    NativeRuntimeFilterPredicate::compile(bundle, &expected)
+                        .map_err(|_| execution::UnavailableReason::MaterializationFailed)?,
+                ))
+            }
+            Self::Ordered { order_contract } => {
+                let expected = OrderedRangePredicateContract::new(
+                    bundle.channel_id(),
+                    Arc::clone(order_contract),
+                    bundle.version(),
+                )
+                .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
+                Arc::new(NativeExecutionPredicate::Ordered(
+                    NativeOrderedRangePredicate::compile(bundle, &expected)
+                        .map_err(|_| execution::UnavailableReason::MaterializationFailed)?,
+                ))
+            }
+        };
+        Ok(Arc::new(execution::RuntimeFilterSnapshot::new(
+            binding_id,
+            execution::LogicalVersion::new(bundle.version().get()),
+            contract_digest,
+            predicate,
+        )))
+    }
+}
+
+enum NativeExecutionPredicate {
+    Membership(NativeRuntimeFilterPredicate),
+    Ordered(NativeOrderedRangePredicate),
+}
+
+impl execution::RuntimeFilterPredicate for NativeExecutionPredicate {
+    fn evaluate(
+        &self,
+        input: &ArrayRef,
+    ) -> Result<BooleanArray, execution::RuntimeFilterContractViolation> {
+        match self {
+            Self::Membership(predicate) => predicate.evaluate(input).map_err(|error| {
+                execution::RuntimeFilterContractViolation::new(
+                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                    error.to_string(),
+                )
+            }),
+            Self::Ordered(predicate) => predicate.evaluate(input).map_err(|error| {
+                execution::RuntimeFilterContractViolation::new(
+                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                    error.to_string(),
+                )
+            }),
+        }
+    }
+}
+
+struct NativeExecutionBlockingSubscription {
+    binding_id: execution::RuntimeFilterBindingId,
+    contract_digest: [u8; 32],
+    compiler: SnapshotPredicateCompiler,
+    subscription: Arc<dyn BlockingSnapshotSubscription>,
+}
+
+impl execution::BlockingSnapshotSubscription for NativeExecutionBlockingSubscription {
+    fn acquire(&self, timeout: Duration) -> execution::SnapshotAcquireOutcome {
+        map_acquire_outcome(
+            self.subscription.acquire(timeout),
+            self.binding_id,
+            self.contract_digest,
+            &self.compiler,
+        )
+    }
+
+    fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+        self.subscription.snapshot().and_then(|bundle| {
+            self.compiler
+                .compile(&bundle, self.binding_id, self.contract_digest)
+                .ok()
+        })
+    }
+}
+
+struct NativeExecutionLiveSubscription {
+    binding_id: execution::RuntimeFilterBindingId,
+    contract_digest: [u8; 32],
+    compiler: SnapshotPredicateCompiler,
+    subscription: Arc<dyn NonBlockingLiveSubscription>,
+}
+
+impl execution::NonBlockingLiveSubscription for NativeExecutionLiveSubscription {
+    fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+        self.subscription.snapshot().and_then(|bundle| {
+            self.compiler
+                .compile(&bundle, self.binding_id, self.contract_digest)
+                .ok()
+        })
+    }
+
+    fn poll_after(
+        &self,
+        observed: Option<execution::LogicalVersion>,
+    ) -> execution::LivePollOutcome {
+        let observed = observed.map(|version| LogicalVersion::new(version.get()));
+        match self.subscription.poll_after(observed) {
+            LivePollOutcome::Updated { bundle, terminal } => {
+                match self
+                    .compiler
+                    .compile(&bundle, self.binding_id, self.contract_digest)
+                {
+                    Ok(snapshot) => execution::LivePollOutcome::Updated {
+                        snapshot,
+                        terminal: terminal.map(map_live_terminal),
+                    },
+                    Err(reason) => execution::LivePollOutcome::Idle {
+                        latest_version: Some(execution::LogicalVersion::new(
+                            bundle.version().get(),
+                        )),
+                        terminal: Some(execution::LiveTerminal::Unavailable(reason)),
+                    },
+                }
+            }
+            LivePollOutcome::Idle {
+                latest_version,
+                terminal,
+            } => execution::LivePollOutcome::Idle {
+                latest_version: latest_version
+                    .map(|version| execution::LogicalVersion::new(version.get())),
+                terminal: terminal.map(map_live_terminal),
+            },
+        }
+    }
+}
+
+fn map_acquire_outcome(
+    outcome: ArtifactAcquireOutcome,
+    binding_id: execution::RuntimeFilterBindingId,
+    contract_digest: [u8; 32],
+    compiler: &SnapshotPredicateCompiler,
+) -> execution::SnapshotAcquireOutcome {
+    match outcome {
+        ArtifactAcquireOutcome::Published(bundle) => {
+            match compiler.compile(&bundle, binding_id, contract_digest) {
+                Ok(snapshot) => execution::SnapshotAcquireOutcome::Published(snapshot),
+                Err(reason) => execution::SnapshotAcquireOutcome::Unavailable(reason),
+            }
+        }
+        ArtifactAcquireOutcome::Unsupported(reason) => {
+            execution::SnapshotAcquireOutcome::Unsupported(map_unsupported_reason(reason))
+        }
+        ArtifactAcquireOutcome::Unavailable(reason) => {
+            execution::SnapshotAcquireOutcome::Unavailable(map_unavailable_reason(reason))
+        }
+        ArtifactAcquireOutcome::Cancelled => execution::SnapshotAcquireOutcome::Cancelled,
+        ArtifactAcquireOutcome::TimedOut => execution::SnapshotAcquireOutcome::TimedOut,
+    }
+}
+
+fn map_unavailable_reason(reason: UnavailableReason) -> execution::UnavailableReason {
+    match reason {
+        UnavailableReason::ResourceLimit => execution::UnavailableReason::ResourceLimit,
+        UnavailableReason::IncompleteCoverage => execution::UnavailableReason::IncompleteCoverage,
+        UnavailableReason::ProducerFailed => execution::UnavailableReason::ProducerFailed,
+        UnavailableReason::MaterializationFailed => {
+            execution::UnavailableReason::MaterializationFailed
+        }
+        UnavailableReason::RouteUnavailable => execution::UnavailableReason::RouteUnavailable,
+    }
+}
+
+fn map_unsupported_reason(
+    reason: ArtifactUnsupportedReason,
+) -> execution::ArtifactUnsupportedReason {
+    match reason {
+        ArtifactUnsupportedReason::RangeDeferred => {
+            execution::ArtifactUnsupportedReason::RangeDeferred
+        }
+        ArtifactUnsupportedReason::NoAcceptedRepresentation => {
+            execution::ArtifactUnsupportedReason::NoAcceptedRepresentation
+        }
+    }
+}
+
+fn map_live_terminal(terminal: LiveTerminal) -> execution::LiveTerminal {
+    match terminal {
+        LiveTerminal::Completed => execution::LiveTerminal::Completed,
+        LiveTerminal::CompletedWithoutArtifact => execution::LiveTerminal::CompletedWithoutArtifact,
+        LiveTerminal::Cancelled => execution::LiveTerminal::Cancelled,
+        LiveTerminal::DegradedLogical(reason)
+        | LiveTerminal::DegradedArtifact(reason)
+        | LiveTerminal::DegradedDelivery(reason)
+        | LiveTerminal::Unavailable(reason) => {
+            execution::LiveTerminal::Unavailable(map_unavailable_reason(reason))
+        }
+    }
+}
+
+fn snapshot_predicate_compiler(
+    logical_domain: &RuntimeFilterLogicalDomain,
+) -> Result<SnapshotPredicateCompiler, RuntimeContractViolation> {
+    match logical_domain {
+        RuntimeFilterLogicalDomain::Membership {
+            value_type,
+            null_semantics,
+        } => Ok(SnapshotPredicateCompiler::Membership {
+            data_type: value_type.clone(),
+            null_semantics: *null_semantics,
+        }),
+        RuntimeFilterLogicalDomain::OrderedBound(contract) => {
+            let order_contract = RuntimeOrderContract::try_from_plan(contract).map_err(|_| {
+                resolution_violation(
+                    RuntimeContractViolationKind::OrderedContractMismatch,
+                    "installed ordered contract is invalid",
+                )
+            })?;
+            Ok(SnapshotPredicateCompiler::Ordered {
+                order_contract: Arc::new(order_contract),
+            })
+        }
+    }
+}
+
+fn execution_contract_digest(contract: &execution::RuntimeFilterExecutionContract) -> [u8; 32] {
+    match contract {
+        execution::RuntimeFilterExecutionContract::Membership { schema_digest, .. } => {
+            *schema_digest
+        }
+        execution::RuntimeFilterExecutionContract::Ordered {
+            order_contract_digest,
+            ..
+        } => *order_contract_digest,
     }
 }
 

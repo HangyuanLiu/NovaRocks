@@ -424,7 +424,10 @@ pub trait RuntimeFilterProducer: Send + Sync {
         partition: PartitionId,
         terminal: ProducerSequence,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
-    fn fail(&self) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
+    fn fail(
+        &self,
+        reason: RuntimeFilterProducerFailure,
+    ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
 }
 pub type RuntimeFilterProducerHandle = Arc<dyn RuntimeFilterProducer>;
 
@@ -445,6 +448,13 @@ pub enum RuntimeFilterSubmitOutcome {
     TerminalNoop,
     Completed,
     CompletedWithoutArtifact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterProducerFailure {
+    Cancelled,
+    ExecutionFailed,
+    UpstreamUnavailable,
 }
 
 pub trait RuntimeFilterSession: Send + Sync {
@@ -554,7 +564,10 @@ mod tests {
         ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
             Ok(RuntimeFilterSubmitOutcome::Applied)
         }
-        fn fail(&self) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
+        fn fail(
+            &self,
+            _: RuntimeFilterProducerFailure,
+        ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
             Ok(RuntimeFilterSubmitOutcome::Applied)
         }
     }

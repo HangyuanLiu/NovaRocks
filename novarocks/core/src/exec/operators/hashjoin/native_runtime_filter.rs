@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use novarocks_execution::runtime_filter as execution;
 
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
@@ -45,6 +46,7 @@ use crate::runtime_filter::port::producer::{
 };
 use crate::runtime_filter::service::{
     InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
+    ResolvedNativeProducer,
 };
 
 #[derive(Default)]
@@ -372,8 +374,17 @@ struct NativeMembershipProducerStream {
     partition_id: PartitionId,
     next_sequence: u64,
     terminal: bool,
-    adapter: Option<Arc<dyn ProducerAdapter>>,
+    endpoint: Option<NativeMembershipProducerEndpoint>,
     max_contribution_bytes: Option<usize>,
+}
+
+enum NativeMembershipProducerEndpoint {
+    Execution {
+        producer: execution::RuntimeFilterProducerHandle,
+        resolved: ResolvedNativeProducer,
+    },
+    #[cfg(test)]
+    Prebound(Arc<dyn ProducerAdapter>),
 }
 
 enum NativeMembershipSubmitOutcome {
@@ -384,27 +395,32 @@ enum NativeMembershipSubmitOutcome {
 impl NativeMembershipProducerStream {
     fn new(binding: NativeMembershipProducerBinding, local_index: u32) -> Self {
         #[cfg(test)]
-        let (adapter, max_contribution_bytes) = match &binding.source {
+        let (endpoint, max_contribution_bytes) = match &binding.source {
             NativeMembershipProducerSource::Installed(_) => (None, None),
             NativeMembershipProducerSource::Prebound {
                 adapter,
                 max_contribution_bytes,
-            } => (Some(Arc::clone(adapter)), Some(*max_contribution_bytes)),
+            } => (
+                Some(NativeMembershipProducerEndpoint::Prebound(Arc::clone(
+                    adapter,
+                ))),
+                Some(*max_contribution_bytes),
+            ),
         };
         #[cfg(not(test))]
-        let (adapter, max_contribution_bytes) = (None, None);
+        let (endpoint, max_contribution_bytes) = (None, None);
         Self {
             binding,
             partition_id: PartitionId::new(local_index),
             next_sequence: 0,
             terminal: false,
-            adapter,
+            endpoint,
             max_contribution_bytes,
         }
     }
 
     fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
-        if self.adapter.is_some() {
+        if self.endpoint.is_some() {
             return Ok(());
         }
         let NativeMembershipProducerSource::Installed(context) = &self.binding.source else {
@@ -432,20 +448,29 @@ impl NativeMembershipProducerStream {
         };
         validate_resolved_binding(&self.binding, &resolved)?;
         let max_contribution_bytes = resolved.max_contribution_bytes();
-        let adapter = match resolved.open_membership(local_partition_count) {
-            Ok(adapter) => adapter,
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+        let request = execution::RuntimeFilterProducerOpenRequest::new(
+            execution::RuntimeFilterProducerContract::new(
+                execution::RuntimeFilterBindingId::new(self.binding.binding_id),
+                execution::RuntimeFilterChannelId::new(self.binding.channel_id),
+                execution::RuntimeFilterProducerKind::Membership,
+                resolved.execution_contract(),
+            ),
+            local_partition_count,
+        );
+        let producer = match execution::RuntimeFilterSession::open_producer(context, request) {
+            Ok(execution::RuntimeFilterBindOutcome::Bound(producer)) => producer,
+            Ok(execution::RuntimeFilterBindOutcome::Unavailable(_)) => {
                 self.mark_service_unavailable();
                 return Ok(());
             }
             Err(error) => {
                 return Err(format!(
-                    "native runtime-filter binding_id={} open failed during operator bind: {error}",
+                    "native runtime-filter binding_id={} execution session open failed during operator bind: {error}",
                     self.binding.binding_id
                 ));
             }
         };
-        self.adapter = Some(adapter);
+        self.endpoint = Some(NativeMembershipProducerEndpoint::Execution { producer, resolved });
         self.max_contribution_bytes = Some(max_contribution_bytes);
         Ok(())
     }
@@ -454,7 +479,7 @@ impl NativeMembershipProducerStream {
         if self.terminal || self.binding.coordinator.failed.load(Ordering::Acquire) {
             return Ok(NativeMembershipSubmitOutcome::Applied);
         }
-        let adapter = self.adapter.as_ref().ok_or_else(|| {
+        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before build input",
                 self.binding.binding_id
@@ -492,24 +517,61 @@ impl NativeMembershipProducerStream {
             if delta.values().is_empty() && !delta.contains_null() {
                 continue;
             }
-            let outcome = match adapter.submit(
-                self.partition_id,
-                ProducerSequence::new(self.next_sequence),
-                delta,
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                    self.mark_service_unavailable();
-                    return Ok(NativeMembershipSubmitOutcome::Applied);
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "native runtime-filter binding_id={} contribution failed: {error}",
+            let outcome = match endpoint {
+                NativeMembershipProducerEndpoint::Execution { producer, resolved } => {
+                    let contribution = resolved.encode_execution_contribution(
+                        self.partition_id,
+                        ProducerSequence::new(self.next_sequence),
+                        crate::runtime_filter::codec::contribution::RuntimeFilterContribution::Membership(delta),
+                    ).map_err(|error| format!(
+                        "native runtime-filter binding_id={} contribution encoding failed: {error}",
                         self.binding.binding_id
-                    ));
+                    ))?;
+                    match producer.submit(
+                        execution::PartitionId::new(self.partition_id.get()),
+                        execution::ProducerSequence::new(self.next_sequence),
+                        contribution,
+                    ) {
+                        Ok(outcome) => {
+                            outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop
+                        }
+                        Err(error)
+                            if error.kind()
+                                == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                        {
+                            self.mark_service_unavailable();
+                            return Ok(NativeMembershipSubmitOutcome::Applied);
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "native runtime-filter binding_id={} contribution failed: {error}",
+                                self.binding.binding_id
+                            ));
+                        }
+                    }
                 }
+                #[cfg(test)]
+                NativeMembershipProducerEndpoint::Prebound(adapter) => match adapter.submit(
+                    self.partition_id,
+                    ProducerSequence::new(self.next_sequence),
+                    delta,
+                ) {
+                    Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                    Err(error)
+                        if error.kind() == RuntimeContractViolationKind::ServiceUnavailable =>
+                    {
+                        self.mark_service_unavailable();
+                        return Ok(NativeMembershipSubmitOutcome::Applied);
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "native runtime-filter binding_id={} contribution failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
+                },
             };
-            if outcome == SubmitOutcome::TerminalNoop {
+            if outcome {
                 self.binding
                     .coordinator
                     .failed
@@ -535,7 +597,7 @@ impl NativeMembershipProducerStream {
             self.terminal = true;
             return Ok(());
         }
-        let adapter = self.adapter.as_ref().ok_or_else(|| {
+        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} producer was not bound before finish",
                 self.binding.binding_id
@@ -550,22 +612,45 @@ impl NativeMembershipProducerStream {
                 Duration::from_secs(5),
             );
         }
-        let outcome = match adapter
-            .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                self.mark_service_unavailable();
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "native runtime-filter binding_id={} close failed: {error}",
-                    self.binding.binding_id
-                ));
-            }
+        let terminal_noop = match endpoint {
+            NativeMembershipProducerEndpoint::Execution { producer, .. } => match producer
+                .close_partition(
+                    execution::PartitionId::new(self.partition_id.get()),
+                    execution::ProducerSequence::new(self.next_sequence),
+                ) {
+                Ok(outcome) => outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop,
+                Err(error)
+                    if error.kind()
+                        == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                {
+                    self.mark_service_unavailable();
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "native runtime-filter binding_id={} close failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
+            },
+            #[cfg(test)]
+            NativeMembershipProducerEndpoint::Prebound(adapter) => match adapter
+                .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
+            {
+                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    self.mark_service_unavailable();
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "native runtime-filter binding_id={} close failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
+            },
         };
-        if outcome == SubmitOutcome::TerminalNoop {
+        if terminal_noop {
             self.binding
                 .coordinator
                 .failed
@@ -594,17 +679,42 @@ impl NativeMembershipProducerStream {
         {
             return Ok(());
         }
-        let Some(adapter) = self.adapter.as_ref() else {
+        let Some(endpoint) = self.endpoint.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = adapter.fail(reason) {
-            if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
-                return Ok(());
+        match endpoint {
+            NativeMembershipProducerEndpoint::Execution { producer, .. } => {
+                if let Err(error) = producer.fail(match reason {
+                    ProducerFailureReason::Cancelled => {
+                        execution::RuntimeFilterProducerFailure::Cancelled
+                    }
+                    ProducerFailureReason::ExecutionFailed => {
+                        execution::RuntimeFilterProducerFailure::ExecutionFailed
+                    }
+                    ProducerFailureReason::UpstreamUnavailable => {
+                        execution::RuntimeFilterProducerFailure::UpstreamUnavailable
+                    }
+                }) {
+                    if error.kind() != execution::RuntimeFilterContractViolationKind::SessionClosed
+                    {
+                        return Err(format!(
+                            "native runtime-filter binding_id={} fail-open failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
+                }
             }
-            return Err(format!(
-                "native runtime-filter binding_id={} fail-open failed: {error}",
-                self.binding.binding_id
-            ));
+            #[cfg(test)]
+            NativeMembershipProducerEndpoint::Prebound(adapter) => {
+                if let Err(error) = adapter.fail(reason) {
+                    if error.kind() != RuntimeContractViolationKind::ServiceUnavailable {
+                        return Err(format!(
+                            "native runtime-filter binding_id={} fail-open failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
