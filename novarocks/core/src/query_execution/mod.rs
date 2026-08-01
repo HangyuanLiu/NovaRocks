@@ -20,6 +20,7 @@ pub(crate) mod assembly;
 pub mod backend;
 pub mod cancellation;
 mod connector_binding;
+pub(crate) mod connector_write_transaction;
 pub mod contract;
 pub mod control;
 pub mod fragment_transport;
@@ -27,6 +28,7 @@ pub mod fragment_transport;
 pub(crate) mod in_process_test;
 pub mod lifecycle;
 pub(crate) mod outcome;
+pub use outcome::ConnectorWriteCompletion;
 pub(crate) mod preparation;
 pub(crate) mod profile;
 pub mod request_context;
@@ -35,6 +37,8 @@ pub(crate) mod schedule;
 pub mod service;
 pub mod session;
 pub mod write;
+pub mod write_operation;
+pub mod write_plan;
 
 #[cfg(test)]
 mod tests;

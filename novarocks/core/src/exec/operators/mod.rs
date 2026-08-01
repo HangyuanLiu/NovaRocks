@@ -30,12 +30,12 @@ mod analytic_sink;
 mod analytic_source;
 mod assert_num_rows_processor;
 mod change_event_expand_processor;
+mod connector_write_sink;
 mod data_stream_sink;
 mod exchange_source;
 mod fetch_processor;
 mod filter_processor;
 pub(crate) mod hashjoin;
-pub(crate) mod iceberg_change_stream_router_sink;
 mod limit_processor;
 mod local_exchange_sink;
 mod local_exchange_source;
@@ -57,7 +57,6 @@ mod table_function_processor;
 mod values_source;
 
 // Re-export all public types to maintain compatibility
-pub use crate::connector::iceberg::IcebergTableSinkFactory;
 pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
 pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
@@ -68,6 +67,7 @@ pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
 pub use change_event_expand_processor::ChangeEventExpandProcessorFactory;
+pub(crate) use connector_write_sink::ConnectorWriteSinkFactory;
 pub(crate) use data_stream_sink::DataStreamSinkFactory;
 #[cfg(test)]
 pub(crate) use data_stream_sink::take_eos_be_number_for_test;
@@ -79,11 +79,6 @@ pub use filter_processor::FilterProcessorFactory;
 pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
     PartitionedJoinProbeProcessorFactory,
-};
-pub(crate) use iceberg_change_stream_router_sink::IcebergChangeStreamRouterSinkFactory;
-#[allow(unused_imports)]
-pub use iceberg_change_stream_router_sink::{
-    IcebergChangeStreamRouterBranchFactoryInput, IcebergChangeStreamRouterSinkFactoryInput,
 };
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;

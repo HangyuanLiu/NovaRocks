@@ -22,6 +22,7 @@ use crate::types::{CompatBeEndpoint, RunnerConfig};
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::net::TcpListener;
@@ -495,7 +496,10 @@ pub(crate) fn create_isolated_fe_home(
     Ok(())
 }
 
-pub(crate) fn render_be_config(ports: &CompatBePorts) -> Result<String> {
+pub(crate) fn render_be_config(
+    ports: &CompatBePorts,
+    variables: &HashMap<String, String>,
+) -> Result<String> {
     let mut root = toml::map::Map::new();
     let mut server = toml::map::Map::new();
     server.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
@@ -514,6 +518,38 @@ pub(crate) fn render_be_config(ports: &CompatBePorts) -> Result<String> {
         server.insert(key.to_string(), Value::Integer(i64::from(port)));
     }
     root.insert("server".to_string(), Value::Table(server));
+    let object_store_values = ["oss_endpoint", "oss_ak", "oss_sk"]
+        .into_iter()
+        .map(|key| variables.get(key).filter(|value| !value.trim().is_empty()))
+        .collect::<Vec<_>>();
+    if object_store_values.iter().any(Option::is_some) {
+        if object_store_values.iter().any(Option::is_none) {
+            bail!(
+                "compat connector startup object-store binding requires oss_endpoint, oss_ak, and oss_sk"
+            );
+        }
+        let mut object_store = toml::map::Map::new();
+        object_store.insert(
+            "endpoint".to_string(),
+            Value::String(object_store_values[0].expect("checked endpoint").clone()),
+        );
+        object_store.insert(
+            "access_key_id".to_string(),
+            Value::String(object_store_values[1].expect("checked access key").clone()),
+        );
+        object_store.insert(
+            "access_key_secret".to_string(),
+            Value::String(object_store_values[2].expect("checked secret key").clone()),
+        );
+        object_store.insert(
+            "region".to_string(),
+            Value::String("us-east-1".to_string()),
+        );
+        object_store.insert("enable_path_style_access".to_string(), Value::Boolean(true));
+        let mut connector = toml::map::Map::new();
+        connector.insert("object_store".to_string(), Value::Table(object_store));
+        root.insert("connector".to_string(), Value::Table(connector));
+    }
     toml::to_string(&Value::Table(root)).context("serialize compatibility BE config")
 }
 
@@ -1003,7 +1039,7 @@ impl StarRocksCompatServerHandle {
             let workdir = runtime_dir.path().join(format!("be-{index}"));
             fs::create_dir_all(&workdir)?;
             let config = workdir.join("novarocks.toml");
-            fs::write(&config, render_be_config(ports)?)?;
+            fs::write(&config, render_be_config(ports, &runner_config.values)?)?;
             reserved.release_ports(&ports.all_ports())?;
             let process = start_be(
                 index,
@@ -1593,7 +1629,7 @@ aws_s3_secret_key = private-secret
             grpc: 19080,
             starlet: 19070,
         };
-        let rendered = render_be_config(&ports).expect("render BE config");
+        let rendered = render_be_config(&ports, &HashMap::new()).expect("render BE config");
         let value: toml::Value = rendered.parse().expect("parse BE TOML");
         let server = value.get("server").expect("server table");
         assert_eq!(
@@ -1619,6 +1655,39 @@ aws_s3_secret_key = private-secret
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn be_toml_installs_complete_connector_object_store_binding() {
+        let ports = CompatBePorts {
+            heartbeat: 19050,
+            be: 19060,
+            brpc: 18060,
+            http: 18040,
+            grpc: 19080,
+            starlet: 19070,
+        };
+        let variables = HashMap::from([
+            ("oss_endpoint".to_string(), "http://127.0.0.1:9000".to_string()),
+            ("oss_ak".to_string(), "access".to_string()),
+            ("oss_sk".to_string(), "secret".to_string()),
+        ]);
+        let rendered = render_be_config(&ports, &variables).expect("render BE config");
+        let value: toml::Value = rendered.parse().expect("parse BE TOML");
+        let object_store = value
+            .get("connector")
+            .and_then(|value| value.get("object_store"))
+            .expect("connector object store");
+        assert_eq!(
+            object_store.get("endpoint").and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(
+            object_store
+                .get("enable_path_style_access")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
     }
 
     fn topology_rows(ports: &[u16], alive: &str) -> Vec<Vec<String>> {

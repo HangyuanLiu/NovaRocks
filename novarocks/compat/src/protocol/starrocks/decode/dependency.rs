@@ -31,7 +31,7 @@ pub(crate) enum FragmentExprArenaOwner {
     MultiCastDataStream,
     SplitDataStream,
     IcebergTable,
-    IcebergChangeStreamRouter,
+    ChangeStreamRouter,
     StarRocksOutputProjection,
     StarRocksPartition,
     StarRocksIndexPredicate { index: usize },

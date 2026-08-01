@@ -20,9 +20,10 @@
 use std::sync::Arc;
 
 use crate::query_execution::contract::{
-    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
-    DistributedQueryRequest,
+    ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
+    DistributedQueryOutcome, DistributedQueryRequest,
 };
+use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 
 #[derive(Clone)]
 pub struct QueryExecutionService {
@@ -40,5 +41,14 @@ impl QueryExecutionService {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.coordinator.execute(request)
+    }
+
+    /// Acquire one exact frontend control generation and seal every cohort
+    /// before any distributed writer attempt is staged.
+    pub fn begin_write_operation(
+        &self,
+        registration: ConnectorWriteOperationRegistration,
+    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
+        self.coordinator.begin_write_operation(registration)
     }
 }

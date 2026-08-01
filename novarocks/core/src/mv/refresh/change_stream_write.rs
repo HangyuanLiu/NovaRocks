@@ -11,14 +11,21 @@ use iceberg::TableIdent;
 
 use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
-    route_change_stream_writer_reports,
 };
-use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergCommitCollector};
 use crate::query_execution::write::WriteCommitInput;
 
 pub(crate) struct ExecutedChangeStreamWrite {
-    pub(crate) write_commit: WriteCommitInput,
+    pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) commit_plan: ChangeStreamWriterCommitPlan,
+    /// Generic connector control has performed the external branch commit
+    /// after routing its opaque staged reports into this exact collector.
+    pub(crate) committed: Option<CommittedChangeStreamWrite>,
+}
+
+pub(crate) struct CommittedChangeStreamWrite {
+    pub(crate) collector: Arc<IcebergCommitCollector>,
+    pub(crate) outcome: CommitOutcome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +37,7 @@ pub(crate) enum ChangeStreamWriteEffect {
 pub(crate) struct PopulatedChangeStreamWrite {
     pub(crate) collector: Arc<IcebergCommitCollector>,
     pub(crate) effect: ChangeStreamWriteEffect,
+    pub(crate) committed_outcome: Option<CommitOutcome>,
 }
 
 #[derive(Debug)]
@@ -57,16 +65,16 @@ pub(crate) fn execute_and_collect_change_stream_write<F>(
 where
     F: FnOnce() -> Result<ExecutedChangeStreamWrite, String>,
 {
-    let collector = new_iceberg_mv_commit_collector(table, ident, target_ref, op_kind);
     let executed = execute().map_err(ChangeStreamWriteError::Execution)?;
-    let routed = route_change_stream_writer_reports(
-        &collector,
-        table.metadata(),
-        &executed.write_commit,
-        &executed.commit_plan,
-    )
-    .map_err(ChangeStreamWriteError::Routing)?;
-    routed.inject(&collector);
+    let (collector, committed_outcome) = match executed.committed {
+        Some(committed) => (committed.collector, Some(committed.outcome)),
+        None => {
+            return Err(ChangeStreamWriteError::Execution(
+                "MV change-stream execution completed without a connector control commit"
+                    .to_string(),
+            ));
+        }
+    };
 
     let added_rows = collector.injected_or_appended_data_record_count();
     let deleted_rows = collector.injected_delete_record_count();
@@ -79,10 +87,14 @@ where
         }
     };
 
-    Ok(PopulatedChangeStreamWrite { collector, effect })
+    Ok(PopulatedChangeStreamWrite {
+        collector,
+        effect,
+        committed_outcome,
+    })
 }
 
-fn new_iceberg_mv_commit_collector(
+pub(crate) fn new_iceberg_mv_commit_collector(
     table: &iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
@@ -142,7 +154,6 @@ mod tests {
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use crate::query_execution::write::{WriterCommitInput, WriterKey};
-    use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
     use crate::sql::common::ChangeStreamBranchKind;
 
     fn test_table() -> iceberg::table::Table {
@@ -190,70 +201,15 @@ mod tests {
         }
     }
 
-    fn writer_report(
-        table: &iceberg::table::Table,
-        path: &str,
-        content: IcebergFileContent,
-        record_count: i64,
-    ) -> crate::proto::novarocks::IcebergCommitInfo {
-        let is_delete = matches!(content, IcebergFileContent::PositionDeletes);
-        let report = IcebergWriterReport {
-            file: IcebergWrittenFileReport {
-                path: path.to_string(),
-                format: if is_delete { "puffin" } else { "parquet" }.to_string(),
-                content,
-                record_count,
-                file_size_in_bytes: 128,
-                partition: IcebergPartitionReport {
-                    partition_path: String::new(),
-                    null_fingerprint: String::new(),
-                    partition_spec_id: table.metadata().default_partition_spec_id(),
-                    partition_values: Struct::empty(),
-                },
-                split_offsets: if is_delete { None } else { Some(vec![4]) },
-                column_stats: None,
-                referenced_data_file: is_delete.then(|| "base.parquet".to_string()),
-                first_row_id: None,
-                equality_ids: None,
-                key_metadata: None,
-                content_offset: is_delete.then_some(4),
-                content_size_in_bytes: is_delete.then_some(12),
-                cardinality: is_delete.then_some(record_count),
-            },
-            is_overwrite: None,
-            is_rewrite: None,
-        };
-        writer_report_to_iceberg_commit_info(report, table.metadata()).expect("wire encode")
-    }
-
     fn executed_write(
-        table: &iceberg::table::Table,
-        writers: Vec<(i32, &str, IcebergFileContent, i64)>,
+        _table: &iceberg::table::Table,
+        _writers: Vec<(i32, &str, IcebergFileContent, i64)>,
         branches: BTreeMap<i32, ChangeStreamBranchKind>,
     ) -> ExecutedChangeStreamWrite {
-        let query_id = UniqueId { hi: 10, lo: 20 };
-        let writers = writers
-            .into_iter()
-            .enumerate()
-            .map(
-                |(index, (fragment_id, path, content, record_count))| WriterCommitInput {
-                    writer_id: index,
-                    fragment_id: fragment_id as u32,
-                    writer_key: writer_key(query_id, fragment_id, index as i32),
-                    iceberg_commits: vec![writer_report(table, path, content, record_count)],
-                    load_counters: BTreeMap::new(),
-                    loaded_rows: record_count,
-                    loaded_bytes: 128,
-                    filtered_rows: 0,
-                },
-            )
-            .collect();
         ExecutedChangeStreamWrite {
-            write_commit: WriteCommitInput {
-                write_id: query_id,
-                writers,
-            },
+            write_commit: None,
             commit_plan: ChangeStreamWriterCommitPlan::new(branches),
+            committed: None,
         }
     }
 
@@ -262,7 +218,7 @@ mod tests {
         let table = test_table();
         let calls = Cell::new(0);
 
-        let populated = execute_and_collect_change_stream_write(
+        let result = execute_and_collect_change_stream_write(
             &table,
             &test_ident(),
             "main",
@@ -271,23 +227,56 @@ mod tests {
                 calls.set(calls.get() + 1);
                 Ok(executed_write(&table, Vec::new(), BTreeMap::new()))
             },
-        )
-        .unwrap_or_else(|_| panic!("empty write should succeed"));
+        );
 
         assert_eq!(calls.get(), 1);
-        assert_eq!(populated.effect, ChangeStreamWriteEffect::Empty);
-        assert_eq!(populated.collector.table_ident, test_ident());
-        assert_eq!(
-            populated.collector.injected_or_appended_data_record_count(),
-            0
+        assert!(
+            matches!(result, Err(ChangeStreamWriteError::Execution(message)) if message.contains("connector control commit"))
         );
+    }
+
+    #[test]
+    fn generic_committed_write_preserves_its_control_outcome() {
+        let table = test_table();
+        let collector = new_iceberg_mv_commit_collector(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+        );
+        let outcome = CommitOutcome {
+            new_snapshot_id: 42,
+            written_manifest_paths: vec!["file:///warehouse/db/t/metadata/manifest.avro".into()],
+        };
+
+        let populated = execute_and_collect_change_stream_write(
+            &table,
+            &test_ident(),
+            "main",
+            CommitOpKind::FastAppend,
+            || {
+                Ok(ExecutedChangeStreamWrite {
+                    write_commit: None,
+                    commit_plan: ChangeStreamWriterCommitPlan::new(BTreeMap::new()),
+                    committed: Some(CommittedChangeStreamWrite {
+                        collector: Arc::clone(&collector),
+                        outcome: outcome.clone(),
+                    }),
+                })
+            },
+        )
+        .expect("generic committed write must not require a legacy report carrier");
+
+        assert_eq!(populated.collector.table_ident, test_ident());
+        assert_eq!(populated.effect, ChangeStreamWriteEffect::Empty);
+        assert_eq!(populated.committed_outcome, Some(outcome));
     }
 
     #[test]
     fn fast_append_returns_populated_collector_and_added_effect() {
         let table = test_table();
 
-        let populated = execute_and_collect_change_stream_write(
+        let result = execute_and_collect_change_stream_write(
             &table,
             &test_ident(),
             "main",
@@ -299,27 +288,9 @@ mod tests {
                     BTreeMap::from([(11, ChangeStreamBranchKind::FreshData)]),
                 ))
             },
-        )
-        .unwrap_or_else(|_| panic!("append write should succeed"));
-
-        assert_eq!(
-            populated.effect,
-            ChangeStreamWriteEffect::Changed {
-                added_rows: 2,
-                deleted_rows: 0,
-            }
         );
-        assert_eq!(
-            populated.collector.injected_or_appended_data_record_count(),
-            2
-        );
-        assert_eq!(
-            populated
-                .collector
-                .take_written_files()
-                .expect("written files")[0]
-                .path,
-            "fresh.parquet"
+        assert!(
+            matches!(result, Err(ChangeStreamWriteError::Execution(message)) if message.contains("connector control commit"))
         );
     }
 
@@ -327,7 +298,7 @@ mod tests {
     fn row_delta_returns_added_and_deleted_effect() {
         let table = test_table();
 
-        let populated = execute_and_collect_change_stream_write(
+        let result = execute_and_collect_change_stream_write(
             &table,
             &test_ident(),
             "main",
@@ -345,17 +316,10 @@ mod tests {
                     ]),
                 ))
             },
-        )
-        .unwrap_or_else(|_| panic!("row-delta write should succeed"));
-
-        assert_eq!(
-            populated.effect,
-            ChangeStreamWriteEffect::Changed {
-                added_rows: 2,
-                deleted_rows: 3,
-            }
         );
-        assert_eq!(populated.collector.injected_delete_record_count(), 3);
+        assert!(
+            matches!(result, Err(ChangeStreamWriteError::Execution(message)) if message.contains("connector control commit"))
+        );
     }
 
     #[test]
@@ -402,17 +366,8 @@ mod tests {
             },
         );
 
-        let Err(ChangeStreamWriteError::Routing(error)) = result else {
-            panic!("routing failure expected");
-        };
-        let (message, converted) = error.into_parts();
-        assert!(message.contains("writer fragment 12 is not declared"));
-        assert_eq!(
-            converted
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["known.parquet", "unknown.parquet"]
+        assert!(
+            matches!(result, Err(ChangeStreamWriteError::Execution(message)) if message.contains("connector control commit"))
         );
     }
 }

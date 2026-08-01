@@ -120,8 +120,24 @@ impl StarRocksReporter {
 
     pub(crate) fn stop(&self) {
         self.inner.stopped.store(true, Ordering::Release);
-        self.inner.normal.changed.notify_all();
-        self.inner.priority.changed.notify_all();
+        {
+            let _state = self
+                .inner
+                .normal
+                .state
+                .lock()
+                .expect("compat normal report queue lock");
+            self.inner.normal.changed.notify_all();
+        }
+        {
+            let _state = self
+                .inner
+                .priority
+                .state
+                .lock()
+                .expect("compat final report queue lock");
+            self.inner.priority.changed.notify_all();
+        }
         let workers = std::mem::take(&mut *self.workers.lock().expect("compat report worker lock"));
         for worker in workers {
             let _ = worker.join();
@@ -358,6 +374,8 @@ mod tests {
                 profile: None,
                 tracking_url: None,
                 load_datacache_metrics: None,
+                connector_staged_reports: Vec::new(),
+                connector_staged_report_error: None,
             }),
         }
     }

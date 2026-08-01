@@ -337,6 +337,10 @@ impl NativePlanDecodeContext {
         self.query_id
     }
 
+    pub(crate) fn fragment_instance_id(&self) -> FragmentInstanceId {
+        self.fragment_instance_id
+    }
+
     pub(crate) fn connectors(
         &self,
     ) -> Result<&crate::connector::ConnectorRegistry, super::error::NativeFragmentLeafDecodeError>

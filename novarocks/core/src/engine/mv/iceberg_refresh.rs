@@ -7332,6 +7332,7 @@ fn begin_staged_iceberg_mv_refresh_intent(
     base_snapshots: BTreeMap<String, i64>,
     staging_branch: &str,
 ) -> Result<i64, String> {
+    let connector_operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
     let provider = state
         .metadata_provider
         .as_ref()
@@ -7352,7 +7353,7 @@ fn begin_staged_iceberg_mv_refresh_intent(
                     table: target.table.clone(),
                     ref_name: Some(staging_branch.to_string()),
                 },
-                attempt_id: format!("mv-refresh-{mv_id}-{staging_branch}"),
+                attempt_id: connector_operation_id.to_string(),
                 base_snapshot_id: expected_main_snapshot_id,
                 base_snapshot_map: base_snapshots.clone(),
                 staged_artifacts: vec![format!("branch:{staging_branch}")],
@@ -7650,6 +7651,33 @@ fn load_iceberg_mv_refresh_operation_id(
         .map_err(|e| format!("load iceberg mv refresh operation id failed: {e}"))?
         .ok_or_else(|| format!("mv refresh {refresh_id} not found"))?;
     Ok(refresh.operation_id)
+}
+
+fn load_iceberg_mv_refresh_connector_operation_id(
+    state: &Arc<StandaloneState>,
+    refresh_id: i64,
+) -> Result<novarocks_spi::connector::ConnectorWriteOperationId, String> {
+    let operation_id =
+        load_iceberg_mv_refresh_operation_id(state, refresh_id)?.ok_or_else(|| {
+            format!("mv refresh {refresh_id} is missing its durable connector write operation")
+        })?;
+    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
+        "metadata provider required to load iceberg MV connector write operation".to_string()
+    })?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg MV connector write operation read failed: {e}"))?;
+    let operation = state
+        .iceberg_operation_repo
+        .load_operation(read.as_ref(), operation_id)
+        .map_err(|e| format!("load iceberg MV connector write operation failed: {e}"))?
+        .ok_or_else(|| format!("iceberg MV connector write operation {operation_id} not found"))?;
+    operation.attempt_id.parse().map_err(|e| {
+        format!(
+            "iceberg MV connector write operation {operation_id} has invalid attempt id {:?}: {e}",
+            operation.attempt_id
+        )
+    })
 }
 
 fn record_iceberg_mv_repartition_operation_intent(
@@ -11737,12 +11765,17 @@ fn repartition_iceberg_join_mv_overwrite(
                 state,
                 &target_backend,
                 &target_table,
+                &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
                     producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
                     mv_refresh_ctx: Some(ctx),
+                    snapshot_properties: marker.clone(),
+                    connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
+                        state, refresh_id,
+                    )?,
                 },
                 staging_branch,
             )
@@ -11988,12 +12021,17 @@ fn first_refresh_iceberg_join_mv(
                 state,
                 &target_backend,
                 &target_table,
+                &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
                     producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
                     mv_refresh_ctx: Some(ctx),
+                    snapshot_properties: marker.clone(),
+                    connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
+                        state, refresh_id,
+                    )?,
                 },
                 staging_branch,
             )
@@ -13430,6 +13468,7 @@ fn execute_join_delta_branches_logical(
                 state,
                 &target_backend,
                 &target_table,
+                &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
                     output_columns: planned_query.output_columns,
@@ -13438,6 +13477,10 @@ fn execute_join_delta_branches_logical(
                         .unwrap_or(planned_query.change_stream),
                     producer_branches,
                     mv_refresh_ctx: Some(ctx),
+                    snapshot_properties: marker.clone(),
+                    connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
+                        state, refresh_id,
+                    )?,
                 },
                 &staging_branch,
             )
@@ -13904,6 +13947,8 @@ struct ImvRefreshPlannedChangeStream<'a> {
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
     mv_refresh_ctx: Option<&'a IcebergMvRefreshContext>,
+    snapshot_properties: BTreeMap<String, String>,
+    connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 }
 
 #[cfg(test)]
@@ -13960,6 +14005,7 @@ fn imv_change_stream_writer_abort_result_for_test(
         query_result: crate::runtime::query_result::QueryResult::empty(),
         write_commit: None,
         write_abort: Some(abort),
+        connector_completion: None,
         fragment_profiles: Vec::new(),
     }
 }
@@ -13982,7 +14028,7 @@ fn execute_imv_change_stream_write(
         ident,
         target_ref,
         op_kind,
-        || execute_imv_change_stream_writer(state, target, &table, refresh_plan, target_ref),
+        || execute_imv_change_stream_writer(state, target, &table, ident, refresh_plan, target_ref),
     )
 }
 
@@ -13990,6 +14036,7 @@ fn execute_imv_change_stream_writer(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     table: &iceberg::table::Table,
+    ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
@@ -14046,14 +14093,89 @@ fn execute_imv_change_stream_writer(
     {
         return executed_change_stream_write_from_result(result, planned.commit_plan);
     }
+    let op_kind = if refresh_plan
+        .producer_branches
+        .iter()
+        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
+    {
+        CommitOpKind::RowDeltaDvFromFiles
+    } else {
+        CommitOpKind::FastAppend
+    };
+    let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
+        table, ident, target_ref, op_kind,
+    );
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector: Arc::clone(&collector),
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: refresh_plan.snapshot_properties.clone(),
+    });
+    let base_snapshot_id = table
+        .metadata()
+        .refs()
+        .get(target_ref)
+        .map(|reference| reference.snapshot_id)
+        .or_else(|| {
+            (target_ref == "main")
+                .then(|| {
+                    table
+                        .metadata()
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id())
+                })
+                .flatten()
+        });
+    let connector_write =
+        crate::engine::mutation_flow::build_change_stream_connector_write_template(
+            state,
+            target,
+            &planned.topology,
+            planned.commit_plan.clone(),
+            Arc::clone(&commit_executor),
+            &entry,
+            base_snapshot_id,
+            refresh_plan.connector_operation_id,
+            connector_context.clone(),
+        )?;
     let result = crate::engine::execute_planned_iceberg_change_stream_write(
         state,
         planned.prepared,
         planned.native_bundle,
         None,
         None,
+        Some(connector_write),
     )?;
-    executed_change_stream_write_from_result(result, planned.commit_plan)
+    if let Some(abort) = result.write_abort {
+        return Err(abort.reason);
+    }
+    let completion = result.connector_completion.as_ref().ok_or_else(|| {
+        "Iceberg MV change-stream write completed without generic connector completion".to_string()
+    })?;
+    let outcome =
+        crate::engine::iceberg_writer::commit_iceberg_connector_write(&commit_executor, completion)
+            .map_err(|error| format!("commit generic Iceberg MV staged reports: {error:?}"))?;
+    Ok(
+        crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite {
+            write_commit: None,
+            commit_plan: planned.commit_plan,
+            committed: Some(
+                crate::mv::refresh::change_stream_write::CommittedChangeStreamWrite {
+                    collector,
+                    outcome,
+                },
+            ),
+        },
+    )
 }
 
 fn executed_change_stream_write_from_result(
@@ -14063,13 +14185,11 @@ fn executed_change_stream_write_from_result(
     if let Some(abort) = result.write_abort {
         return Err(abort.reason);
     }
-    let write_commit = result
-        .write_commit
-        .ok_or_else(|| "IMV change-stream write completed without writer commit".to_string())?;
     Ok(
         crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite {
-            write_commit,
+            write_commit: result.write_commit,
             commit_plan,
+            committed: None,
         },
     )
 }
@@ -15049,6 +15169,10 @@ fn incremental_refresh_iceberg_mv_with_changes(
             change_stream: planned_query.change_stream,
             producer_branches,
             mv_refresh_ctx: Some(ctx),
+            snapshot_properties: marker.clone(),
+            connector_operation_id: load_iceberg_mv_refresh_connector_operation_id(
+                state, refresh_id,
+            )?,
         },
         &staging_branch,
     )
@@ -24673,6 +24797,7 @@ mod tests {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         };
 

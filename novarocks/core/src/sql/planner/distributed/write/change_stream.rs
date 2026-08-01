@@ -39,15 +39,15 @@ pub(crate) struct ChangeStreamWriteDagSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamRouterSink {
+pub(crate) struct ChangeStreamRouterSink {
     pub(crate) group_id: i32,
     pub(crate) change_op_output_ordinal: usize,
     pub(crate) data_route_output_ordinal: Option<usize>,
-    pub(crate) branches: Vec<IcebergChangeStreamBranchRoute>,
+    pub(crate) branches: Vec<ChangeStreamBranchRoute>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamBranchRoute {
+pub(crate) struct ChangeStreamBranchRoute {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
     pub(crate) target_fragment_id: FragmentId,

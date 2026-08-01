@@ -129,6 +129,12 @@ impl RunningPipelineExecution {
         self.submitted_driver_count
     }
 
+    pub(crate) fn take_connector_staged_report_frames(
+        &self,
+    ) -> Vec<novarocks_spi::connector::ConnectorStagedReportFrame> {
+        self.runtime_state.take_connector_staged_report_frames()
+    }
+
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
     pub(crate) fn cancel(&self, err: String) -> bool {
         let won = self.completion.fail(err.clone());

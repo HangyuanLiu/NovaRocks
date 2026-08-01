@@ -17,7 +17,7 @@
 
 //! Engine-owned mapping and persistence boundary for writer operation lifecycle records.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::connector::iceberg::commit::CommitOpKind;
@@ -109,19 +109,12 @@ pub(crate) fn operation_fact_update_from_write_abort(
 fn staged_artifacts_from_writer_outputs(
     writers: &[WriterCommitInput],
 ) -> Result<Vec<String>, String> {
-    let mut paths = BTreeSet::new();
-    for writer in writers {
-        for commit_info in &writer.iceberg_commits {
-            let Some(data_file) = commit_info.iceberg_data_file.as_ref() else {
-                continue;
-            };
-            let path = data_file.path.as_ref().ok_or_else(|| {
-                format!("writer {} Iceberg data file missing path", writer.writer_id)
-            })?;
-            paths.insert(path.clone());
-        }
-    }
-    Ok(paths.into_iter().collect())
+    // Connector reports are intentionally opaque outside their provider
+    // control binding.  Operation persistence therefore records lifecycle
+    // facts, not provider file paths; abort/cleanup is delegated to the same
+    // exact-generation control lease that staged the reports.
+    let _ = writers;
+    Ok(Vec::new())
 }
 
 fn format_unique_id(id: &crate::common::types::UniqueId) -> String {
@@ -194,7 +187,6 @@ pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
     use crate::common::types::UniqueId;
-    use crate::proto::novarocks;
     use crate::query_execution::write::{
         WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
     };
@@ -213,16 +205,9 @@ pub(crate) mod test_support {
             writer_id: 0,
             fragment_id: 0,
             writer_key,
-            iceberg_commits: vec![novarocks::IcebergCommitInfo {
-                iceberg_data_file: Some(novarocks::IcebergDataFile {
-                    path: Some("s3://warehouse/orders/_staging/a.parquet".to_string()),
-                    record_count: Some(11),
-                    file_size_in_bytes: Some(110),
-                    file_content: novarocks::IcebergFileContent::Data as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
+            connector_staged_report_frames: vec![
+                crate::proto::novarocks::ConnectorStagedReportFrame::default(),
+            ],
             load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
             loaded_rows: 11,
             loaded_bytes: 110,
@@ -264,7 +249,6 @@ mod tests {
         IcebergOperationState, IcebergOperationTarget,
     };
     use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
-    use crate::proto::novarocks;
     use crate::query_execution::write::{WriteAbortInput, WriterCommitInput, WriterKey};
 
     struct WriterOperationTestState {
@@ -291,21 +275,12 @@ mod tests {
         }
     }
 
-    fn writer_output(writer_id: usize, writer_key: WriterKey, path: &str) -> WriterCommitInput {
+    fn writer_output(writer_id: usize, writer_key: WriterKey, _path: &str) -> WriterCommitInput {
         WriterCommitInput {
             writer_id,
             fragment_id: 0,
             writer_key,
-            iceberg_commits: vec![novarocks::IcebergCommitInfo {
-                iceberg_data_file: Some(novarocks::IcebergDataFile {
-                    path: Some(path.to_string()),
-                    record_count: Some(11),
-                    file_size_in_bytes: Some(110),
-                    file_content: novarocks::IcebergFileContent::Data as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
+            connector_staged_report_frames: Vec::new(),
             load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
             loaded_rows: 11,
             loaded_bytes: 110,
@@ -355,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn write_commit_input_builds_operation_request_with_writer_artifacts() {
+    fn write_commit_input_does_not_expose_provider_artifacts() {
         let writer_a = writer_output(0, key(10, 20, 101, 201, 0), "s3://w/a.parquet");
         let writer_b = writer_output(1, key(10, 20, 102, 202, 1), "s3://w/b.parquet");
         let commit = WriteCommitInput {
@@ -371,13 +346,7 @@ mod tests {
         assert_eq!(request.attempt_id, "insert-10-20");
         assert_eq!(request.base_snapshot_id, Some(42));
         assert_eq!(request.created_at_ms, 1234);
-        assert_eq!(
-            request.staged_artifacts,
-            vec![
-                "s3://w/a.parquet".to_string(),
-                "s3://w/b.parquet".to_string()
-            ]
-        );
+        assert!(request.staged_artifacts.is_empty());
     }
 
     #[test]
@@ -401,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_abort_with_artifacts_maps_to_known_uncommitted_retry_abort() {
+    fn writer_abort_delegates_cleanup_to_connector_control() {
         let completed = writer_output(0, key(30, 40, 301, 401, 0), "s3://w/done.parquet");
         let abort = WriteAbortInput {
             write_id: id(30, 40),
@@ -418,12 +387,10 @@ mod tests {
         assert_eq!(fact.now_ms, 2000);
         assert_eq!(fact.commit_outcome, None);
         assert_eq!(fact.recovery_evidence, None);
-        let cleanup = fact.cleanup_outcome.expect("cleanup fact");
-        assert!(!cleanup.attempted);
-        assert_eq!(cleanup.error_count, 0);
+        assert_eq!(fact.cleanup_outcome, None);
         let failure = fact.failure.expect("failure fact");
         assert_eq!(failure.kind, IcebergOperationFailureKind::KnownUncommitted);
-        assert_eq!(failure.next_action, IcebergOperationNextAction::RetryAbort);
+        assert_eq!(failure.next_action, IcebergOperationNextAction::None);
         assert!(
             failure.message.contains("query timed out"),
             "{}",
@@ -440,7 +407,7 @@ mod tests {
             failure.message
         );
         assert!(
-            failure.message.contains("staged_artifacts=1"),
+            failure.message.contains("staged_artifacts=0"),
             "{}",
             failure.message
         );
@@ -476,39 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn staged_artifacts_ignore_non_iceberg_commit_infos_and_deduplicate_paths() {
-        let mut writer = writer_output(0, key(70, 80, 701, 801, 0), "s3://w/a.parquet");
-        writer.iceberg_commits.push(novarocks::IcebergCommitInfo {
-            iceberg_data_file: Some(novarocks::IcebergDataFile {
-                path: Some("s3://w/a.parquet".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        writer
-            .iceberg_commits
-            .push(novarocks::IcebergCommitInfo::default());
-
+    fn staged_artifacts_are_opaque_outside_connector_control() {
+        let writer = writer_output(0, key(70, 80, 701, 801, 0), "s3://w/a.parquet");
         let artifacts = staged_artifacts_from_writer_outputs(&[writer]).expect("artifacts");
-
-        assert_eq!(artifacts, vec!["s3://w/a.parquet".to_string()]);
-    }
-
-    #[test]
-    fn staged_artifacts_reject_missing_iceberg_path() {
-        let mut writer = writer_output(0, key(90, 100, 901, 1001, 0), "s3://w/a.parquet");
-        writer.iceberg_commits.push(novarocks::IcebergCommitInfo {
-            iceberg_data_file: Some(novarocks::IcebergDataFile {
-                path: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-
-        let err = staged_artifacts_from_writer_outputs(&[writer])
-            .expect_err("missing Iceberg file path must fail");
-
-        assert!(err.contains("missing path"), "{err}");
+        assert!(artifacts.is_empty());
     }
 
     fn test_state_with_metadata() -> WriterOperationTestState {

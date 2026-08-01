@@ -22,14 +22,12 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::scan::encode_column_def;
-use super::super::write::{
-    encode_iceberg_change_stream_router_sink, encode_iceberg_write_sink_spec,
-};
+use super::super::write::encode_change_stream_router_sink;
 use super::*;
 use crate::protocol::native::encode::plan;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::write::change_stream::{
-    IcebergChangeStreamBranchRoute, IcebergChangeStreamRouterSink,
+    ChangeStreamBranchRoute, ChangeStreamRouterSink,
 };
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
 
@@ -60,10 +58,10 @@ fn field_with_iceberg_id(id: i32, name: &str, data_type: DataType, nullable: boo
 fn change_stream_router_encoder_materializes_partition_exprs() {
     let plan = single_fragment_router_plan_for_test();
     let fragment = plan.fragments().first().expect("router fragment");
-    let DataSink::IcebergChangeStreamRouter(sink) = &fragment.sink else {
+    let DataSink::ChangeStreamRouter(sink) = &fragment.sink else {
         panic!("expected Iceberg change-stream router sink");
     };
-    let router = encode_iceberg_change_stream_router_sink(
+    let router = encode_change_stream_router_sink(
         sink,
         fragment.fragment_id,
         &NativePlanEncodeContext {
@@ -122,11 +120,11 @@ fn single_fragment_router_plan_for_test() -> DistributedPlan {
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::IcebergChangeStreamRouter(IcebergChangeStreamRouterSink {
+            sink: DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
                 group_id: 0,
                 change_op_output_ordinal: 0,
                 data_route_output_ordinal: Some(1),
-                branches: vec![IcebergChangeStreamBranchRoute {
+                branches: vec![ChangeStreamBranchRoute {
                     branch_id: 0,
                     branch_kind: ChangeStreamBranchKind::DeleteDv,
                     target_fragment_id: 1,
@@ -411,96 +409,6 @@ fn values_distributed_node(
 }
 
 #[test]
-fn iceberg_write_fragment_uses_sink_output_contract_for_duplicate_input_columns() {
-    let mut sink_spec =
-        crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-    sink_spec.target_columns = vec![
-        novarocks_catalog::schema::ColumnDef {
-            name: "c0".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-        novarocks_catalog::schema::ColumnDef {
-            name: "c1".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            write_default: None,
-            logical_type: None,
-        },
-    ];
-    sink_spec.target_table.columns = sink_spec.target_columns.clone();
-
-    let repeated_input = vec![
-        output_column(7, "g0", DataType::Int64),
-        output_column(7, "g1", DataType::Int64),
-    ];
-    let fragment = crate::sql::planner::distributed::PlanFragment {
-        fragment_id: 0,
-        root: values_distributed_node(0, 11, repeated_input.clone()),
-        data_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-        output_partition: crate::sql::planner::distributed::DataPartition::unpartitioned(),
-        sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
-            crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
-                descriptor_database: "db".to_string(),
-                spec: sink_spec,
-                input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
-            },
-        ),
-        output_exprs: None,
-        output_columns: repeated_input,
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-
-    // The write output/target-schema is finalized in the sealed plan
-    // (CGO-9C Task 3), so encode through a sealed distributed plan rather than
-    // the bare fragment helper: the encoder maps the finalized contract 1:1.
-    let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![fragment],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    };
-    let encoded_plan = plan::encode_distributed_plan(&plan, empty_scan_bindings())
-        .expect("encode distributed plan");
-    let encoded = encoded_plan
-        .fragments
-        .iter()
-        .find(|fragment| fragment.fragment_id == 0)
-        .expect("write fragment");
-
-    assert_eq!(encoded.output_exprs.len(), 2);
-    let encoded_ids = encoded
-        .output_exprs
-        .iter()
-        .map(|expr| {
-            let Some(crate::proto::expr::expr::Kind::ColumnRef(column)) = expr.kind.as_ref() else {
-                panic!("expected column ref");
-            };
-            column.column_id
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(encoded_ids, vec![7, 7]);
-
-    let output_ids = encoded
-        .output_columns
-        .iter()
-        .map(|column| column.column_id)
-        .collect::<Vec<_>>();
-    assert_eq!(output_ids, vec![1, 2]);
-    assert_eq!(
-        encoded
-            .output_columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["c0", "c1"]
-    );
-}
-
-#[test]
 fn native_scan_encoder_preserves_iceberg_write_defaults() {
     let schema = crate::connector::iceberg::scan_model::IcebergSchemaDef {
         fields: vec![
@@ -679,57 +587,4 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
     let table = scan.table.as_ref().expect("table");
 
     assert_eq!(table.columns[0].write_default_json.as_deref(), Some("[]"));
-}
-
-#[test]
-fn iceberg_write_sink_preserves_position_delete_descriptor_order_and_fields() {
-    use crate::connector::iceberg::position_delete_descriptor::{
-        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        PositionDeleteDescriptorInput, PositionDeleteOutputField,
-        PositionDeletePartitionSourceField,
-    };
-
-    let mut spec = crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-    spec.position_delete_output_descriptor = Some(PositionDeleteDescriptorInput {
-        file_path: PositionDeleteOutputField {
-            output_expr_index: 0,
-            name: "file_path".to_string(),
-            data_type: DataType::Utf8,
-            field_id: ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
-        },
-        pos: PositionDeleteOutputField {
-            output_expr_index: 1,
-            name: "pos".to_string(),
-            data_type: DataType::Int64,
-            field_id: ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        },
-        partition_source_fields: vec![PositionDeletePartitionSourceField {
-            output_expr_index: 2,
-            source_column_name: "event_date".to_string(),
-            partition_field_name: "event_day".to_string(),
-            transform_expr: "day(event_date)".to_string(),
-            source_field_id: 17,
-            data_type: DataType::Date32,
-        }],
-        target_partition_spec_id: 9,
-    });
-    let ctx = NativePlanEncodeContext {
-        scan_bindings: None,
-        node_outputs: None,
-        fragment_edge_outputs: None,
-        write_contracts: None,
-        runtime_filter_bindings: None,
-    };
-
-    let encoded = encode_iceberg_write_sink_spec(&spec, &ctx)
-        .expect("encode Iceberg position-delete sink descriptor");
-    let descriptor = encoded
-        .position_delete_output_descriptor
-        .expect("position-delete descriptor");
-    assert_eq!(descriptor.file_path.as_ref().unwrap().output_expr_index, 0);
-    assert_eq!(descriptor.pos.as_ref().unwrap().output_expr_index, 1);
-    assert_eq!(descriptor.partition_source_fields.len(), 1);
-    assert_eq!(descriptor.partition_source_fields[0].output_expr_index, 2);
-    assert_eq!(descriptor.partition_source_fields[0].source_field_id, 17);
-    assert_eq!(descriptor.target_partition_spec_id, 9);
 }

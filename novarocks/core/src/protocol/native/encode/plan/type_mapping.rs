@@ -18,7 +18,6 @@
 use super::super::expr::encode_expr;
 use crate::proto::{common, plan};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
-use crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode;
 use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
@@ -243,16 +242,6 @@ pub(super) fn encode_iceberg_metadata_table_type(
         crate::connector::iceberg::IcebergMetadataTableType::Partitions => {
             plan::IcebergMetadataTableType::Partitions as i32
         }
-    }
-}
-
-pub(super) fn encode_iceberg_write_sink_mode(src: IcebergWriteSinkMode) -> i32 {
-    match src {
-        IcebergWriteSinkMode::Data => plan::IcebergWriteSinkMode::Data as i32,
-        IcebergWriteSinkMode::RowLineageData => plan::IcebergWriteSinkMode::RowLineageData as i32,
-        IcebergWriteSinkMode::PositionDeletes => plan::IcebergWriteSinkMode::PositionDeletes as i32,
-        IcebergWriteSinkMode::DeletionVectors => plan::IcebergWriteSinkMode::DeletionVectors as i32,
-        IcebergWriteSinkMode::EqualityDeletes => plan::IcebergWriteSinkMode::EqualityDeletes as i32,
     }
 }
 

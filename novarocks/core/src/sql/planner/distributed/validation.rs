@@ -253,19 +253,27 @@ fn validate_structure(
         validate_node_fragment_ownership(fragment.fragment_id, &fragment.root)?;
 
         if fragment.fragment_id == root_fragment_id {
-            if !matches!(
-                fragment.sink,
+            let root_sink_supported = match fragment.sink {
                 DataSink::Result
-                    | DataSink::IcebergWrite(_)
-                    | DataSink::IcebergChangeStreamRouter(_)
-            ) {
+                | DataSink::ConnectorWrite(_)
+                | DataSink::ChangeStreamRouter(_) => true,
+                _ => false,
+            };
+            if !root_sink_supported {
                 return Err(format!(
                     "lower_distributed_plan root fragment id={} must use result, Iceberg write, or Iceberg change-stream router sink",
                     fragment.fragment_id
                 ));
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
-        } else if !matches!(fragment.sink, DataSink::Noop | DataSink::IcebergWrite(_)) {
+        } else {
+            let non_root_sink_supported = match fragment.sink {
+                DataSink::Noop | DataSink::ConnectorWrite(_) => true,
+                _ => false,
+            };
+            if non_root_sink_supported {
+                continue;
+            }
             return Err(format!(
                 "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
                 fragment.fragment_id
@@ -367,7 +375,7 @@ fn validate_source_edge_shape(edges: &[FragmentEdge]) -> Result<(), String> {
             // CTE multicast is an intentional one-producer-to-many-receivers
             // fan-out, so it is exempt from the plain-stream fan-out rule.
             FragmentEdgeKind::CteMulticast { .. } => {}
-            FragmentEdgeKind::IcebergChangeStreamRouter {
+            FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id,
                 branch_id,
                 branch_kind,
@@ -516,15 +524,15 @@ fn validate_finalized_edge(
             }
             Ok(())
         }
-        FragmentEdgeKind::IcebergChangeStreamRouter {
+        FragmentEdgeKind::ChangeStreamRouter {
             router_group_id,
             branch_id,
             branch_kind,
         } => {
-            let DataSink::IcebergChangeStreamRouter(router) = &source.sink else {
+            let DataSink::ChangeStreamRouter(router) = &source.sink else {
                 return Err(edge_error(
                     edge,
-                    "router source fragment does not use IcebergChangeStreamRouter sink",
+                    "router source fragment does not use ChangeStreamRouter sink",
                 ));
             };
             let route = router
@@ -862,7 +870,7 @@ fn target_exchange_for_edge<'a>(
                 ));
             }
         }
-        (FragmentEdgeKind::IcebergChangeStreamRouter { .. }, ExchangeFlavor::Distribution) => {}
+        (FragmentEdgeKind::ChangeStreamRouter { .. }, ExchangeFlavor::Distribution) => {}
         (FragmentEdgeKind::Stream, _) => {
             return Err(format!(
                 "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
@@ -875,7 +883,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, edge.target_fragment_id
             ));
         }
-        (FragmentEdgeKind::IcebergChangeStreamRouter { .. }, _) => {
+        (FragmentEdgeKind::ChangeStreamRouter { .. }, _) => {
             return Err(format!(
                 "lower_distributed_plan Iceberg change-stream router edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
                 edge.target_exchange_node_id, edge.target_fragment_id
@@ -889,7 +897,7 @@ fn fragment_edge_kind_label(edge_kind: &FragmentEdgeKind) -> &'static str {
     match edge_kind {
         FragmentEdgeKind::Stream => "stream",
         FragmentEdgeKind::CteMulticast { .. } => "CTE multicast",
-        FragmentEdgeKind::IcebergChangeStreamRouter { .. } => "Iceberg change-stream router",
+        FragmentEdgeKind::ChangeStreamRouter { .. } => "Iceberg change-stream router",
     }
 }
 
@@ -1297,13 +1305,13 @@ mod tests {
             .seal()
             .expect_err("router edge without router sink must fail");
         assert!(
-            err.contains("router source fragment does not use IcebergChangeStreamRouter sink"),
+            err.contains("router source fragment does not use ChangeStreamRouter sink"),
             "{err}"
         );
 
         let mut route_mismatch = draft_builder_from_plan(&planned, Default::default());
         {
-            let FragmentEdgeKind::IcebergChangeStreamRouter { branch_id, .. } =
+            let FragmentEdgeKind::ChangeStreamRouter { branch_id, .. } =
                 &mut route_mismatch.edges_mut()[0].edge_kind
             else {
                 panic!("expected router edge");
@@ -1390,7 +1398,7 @@ mod tests {
                 .iter_mut()
                 .find(|fragment| fragment.fragment_id == first_edge.source_fragment_id)
                 .expect("router source fragment");
-            let DataSink::IcebergChangeStreamRouter(router) = &mut source.sink else {
+            let DataSink::ChangeStreamRouter(router) = &mut source.sink else {
                 panic!("expected router sink");
             };
             let mut second_route = router.branches[0].clone();
@@ -1420,7 +1428,7 @@ mod tests {
                     }],
                 },
                 stream_kind: FragmentStreamKind::Partitioned,
-                edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+                edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                     router_group_id,
                     branch_id: second_route.branch_id,
                     branch_kind: second_route.branch_kind,
@@ -1604,7 +1612,7 @@ mod tests {
             target_exchange_node_id: node,
             output_partition: DataPartition::unpartitioned(),
             stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+            edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id: group,
                 branch_id: branch,
                 branch_kind: kind,

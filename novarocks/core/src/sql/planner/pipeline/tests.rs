@@ -230,17 +230,17 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
 
     let write = build_iceberg_write_distributed_plan(
         physical_values_node(vec![id.clone()]),
-        crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
             descriptor_database: "test_db".to_string(),
             spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
-            input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
         },
     )
     .expect("write entrypoint seals after sink decoration");
     assert_sealed_plan(&write);
     assert!(matches!(
         write.fragments()[0].sink,
-        crate::sql::planner::distributed::DataSink::IcebergWrite(_)
+        crate::sql::planner::distributed::DataSink::ConnectorWrite(_)
     ));
 
     let change = build_iceberg_change_stream_distributed_plan(
@@ -264,7 +264,7 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
         .expect("change-stream root");
     assert!(matches!(
         root.sink,
-        crate::sql::planner::distributed::DataSink::IcebergChangeStreamRouter(_)
+        crate::sql::planner::distributed::DataSink::ChangeStreamRouter(_)
     ));
 }
 

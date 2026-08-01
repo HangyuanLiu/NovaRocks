@@ -384,6 +384,12 @@ impl RunningFragmentHandle {
             .resources
             .handoff_sink_commit();
     }
+
+    pub fn take_connector_staged_report_frames(
+        &self,
+    ) -> Vec<novarocks_spi::connector::ConnectorStagedReportFrame> {
+        self.inner.pipeline.take_connector_staged_report_frames()
+    }
 }
 
 impl RunningFragmentInner {
@@ -485,6 +491,10 @@ pub fn prepare_fragment(
                 mem_tracker: context.mem_tracker.clone(),
                 native_runtime_filter_context: context.runtime_filter.clone(),
                 load_tracking_sink: context.load_tracking_sink.clone(),
+                connector_staged_report_collector: program
+                    .sink()
+                    .program()
+                    .connector_staged_report_collector(),
             },
             context.profiler.as_ref(),
         )

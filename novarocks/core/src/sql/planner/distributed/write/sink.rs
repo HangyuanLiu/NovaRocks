@@ -21,6 +21,7 @@ use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescrip
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::sql::planner::table::TableDef;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::ConnectorWriterHandle;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
@@ -56,17 +57,37 @@ pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
     -9_000_000_001
 }
 
+/// Provider planning input consumed before the distributed plan is sealed.
+/// It never crosses the native wire or reaches the backend runtime.
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergWriteFragmentSink {
+pub(crate) struct IcebergWritePlanInput {
     pub(crate) descriptor_database: String,
     pub(crate) spec: IcebergWriteSinkSpec,
-    pub(crate) input: IcebergWriteInputBinding,
+    pub(crate) input: ConnectorWriteInputBinding,
 }
 
+/// Generic Arrow input selection for a connector batch writer.  This lives
+/// beside the generic sink so native carrier code has no provider-specific
+/// input type.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergWriteInputBinding {
+pub(crate) enum ConnectorWriteInputBinding {
     RootOutputByOrdinal,
     OutputOrdinals(Vec<usize>),
+}
+
+/// Provider-neutral distributed writer sink. The opaque handle was planned by
+/// the FE control binding for one exact writer identity; generic planner code
+/// does not inspect its provider payload.
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectorWriteFragmentSink {
+    /// Absent only in a frontend-side template before exact placement freezes
+    /// the writer identity. A submitted native fragment always carries one.
+    pub(crate) handle: Option<ConnectorWriterHandle>,
+    pub(crate) input: ConnectorWriteInputBinding,
+    /// Sealed generic Arrow output contract. It contains only expression and
+    /// schema facts, never provider payload or credentials.
+    pub(crate) output_contract:
+        Option<crate::sql::planner::distributed::output::ConnectorWriteOutputContract>,
 }
 
 impl IcebergWriteSinkSpec {

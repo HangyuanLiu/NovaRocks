@@ -281,7 +281,6 @@ pub(crate) fn execute_dml_change_stream_write(
         prepared,
         native_bundle,
         commit_plan,
-        #[cfg(test)]
         topology,
     } = plan_dml_change_stream_write(state, target, &mut plan)?;
     #[cfg(test)]
@@ -293,6 +292,7 @@ pub(crate) fn execute_dml_change_stream_write(
         prepared,
         native_bundle,
         query_opts.cloned(),
+        None,
         None,
     )?;
     dml_change_stream_write_execution(result, commit_plan)

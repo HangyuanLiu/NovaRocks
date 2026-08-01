@@ -26,6 +26,7 @@ mod metadata;
 mod mutation;
 mod predicate;
 mod read;
+mod write;
 
 pub mod conformance;
 
@@ -80,4 +81,20 @@ pub use read::{
     ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
     ConnectorScan, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult,
+};
+pub use write::{
+    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorBatchWriter, ConnectorOpenWriterRequest,
+    ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
+    ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCohortCompletion,
+    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWriteExecution, ConnectorWriteExecutionId,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
+    ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteResolver,
+    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES, MAX_CONNECTOR_STAGED_REPORT_PARTS,
+    MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_COHORTS,
+    MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_OPERATION_WRITERS,
+    MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
 };

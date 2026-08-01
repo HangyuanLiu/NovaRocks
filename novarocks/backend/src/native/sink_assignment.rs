@@ -72,7 +72,7 @@ fn decode_fragment_sink_assignment(
                 sender_id: None,
             })
         }
-        plan::data_sink::Kind::IcebergChangeStreamRouter(router) => {
+        plan::data_sink::Kind::ChangeStreamRouter(router) => {
             let groups = router
                 .branches
                 .iter()
@@ -80,7 +80,7 @@ fn decode_fragment_sink_assignment(
                 .map(|(index, branch)| {
                     let group_path = path
                         .clone()
-                        .field("iceberg_change_stream_router")
+                        .field("change_stream_router")
                         .field("branches")
                         .index(index)
                         .field("destinations");
@@ -100,7 +100,7 @@ fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::Result(_)
         | plan::data_sink::Kind::Noop(_)
-        | plan::data_sink::Kind::IcebergWrite(_) => {
+        | plan::data_sink::Kind::ConnectorWrite(_) => {
             if instance.destinations.is_empty() {
                 Ok(FragmentSinkAssignment::None)
             } else {

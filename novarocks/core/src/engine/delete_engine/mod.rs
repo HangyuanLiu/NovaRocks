@@ -26,7 +26,6 @@ use std::sync::Arc;
 use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 
 /// DELETE statements recognized by the frontend command router.
@@ -107,7 +106,10 @@ pub enum DeleteWriteReport {
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
     fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
-    fn commit(&self, input: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError>;
+    fn commit(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<CommitOutcome, CommitServiceError>;
     fn finalize(&self) -> Result<(), String>;
 }
 
@@ -168,24 +170,17 @@ impl DeleteEngine for Arc<StandaloneState> {
             let has_staged_files = abort
                 .completed_writer_outputs
                 .iter()
-                .flat_map(|writer| &writer.iceberg_commits)
-                .next()
-                .is_some();
+                .any(|writer| !writer.connector_staged_report_frames.is_empty());
             return Ok(DeleteWriteReport::Aborted {
                 reason: abort.reason,
                 has_staged_files,
             });
         }
-        let Some(input) = result.write_commit else {
+        let Some(completion) = result.connector_completion else {
             return Ok(DeleteWriteReport::NoOp);
         };
-        if matches!(prepared.operation.commit_op_kind, CommitOpKind::FastAppend)
-            && !crate::engine::write_transaction::write_commit_has_files(&input)
-        {
-            return Ok(DeleteWriteReport::NoOp);
-        }
         Ok(DeleteWriteReport::CommitRequired(Arc::new(
-            CoreDeleteCommit { input },
+            CoreDeleteCommit { completion },
         )))
     }
 
@@ -209,7 +204,7 @@ impl DeleteEngine for Arc<StandaloneState> {
                     crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
                 )
             })?;
-        prepared.execution.commit(&commit.input)
+        prepared.execution.commit(&commit.completion)
     }
 
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
@@ -229,7 +224,7 @@ impl DeletePrepared for CorePreparedDelete {
 }
 
 struct CoreDeleteCommit {
-    input: WriteCommitInput,
+    completion: crate::query_execution::ConnectorWriteCompletion,
 }
 
 impl DeleteCommit for CoreDeleteCommit {

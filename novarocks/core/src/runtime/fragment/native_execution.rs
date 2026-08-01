@@ -236,6 +236,10 @@ pub(crate) fn execute_native_submission(
             mem_tracker: context.mem_tracker.clone(),
             native_runtime_filter_context: context.runtime_filter.clone(),
             load_tracking_sink: None,
+            connector_staged_report_collector: program
+                .sink()
+                .program()
+                .connector_staged_report_collector(),
         },
         context.profiler.as_ref(),
     )

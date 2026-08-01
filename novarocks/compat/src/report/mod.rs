@@ -217,6 +217,25 @@ fn build_starrocks_report_params(
         .unwrap_or(false);
     let profile = profile::build_profile_tree(registration, include_runtime_filters);
     let load_datacache_metrics = build_load_datacache_metrics(profile.as_ref());
+    let (connector_staged_reports, connector_staged_report_error) = if done {
+        let frames = terminal
+            .map(FragmentTerminalReport::connector_staged_report_frames)
+            .unwrap_or_default();
+        if frames.is_empty() {
+            (Vec::new(), None)
+        } else {
+            match novarocks_spi::connector::ConnectorStagedReport::try_from_frames(frames.to_vec())
+            {
+                Ok(report) => (vec![report], None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("reassemble connector staged report: {error}")),
+                ),
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
     build_report_params(ExecStatusReportInput {
         finst_id: registration.fragment_instance_id(),
         query_id: registration.query_id(),
@@ -226,6 +245,8 @@ fn build_starrocks_report_params(
         profile,
         tracking_url: build_tracking_url(tracking, registration.query_id()),
         load_datacache_metrics,
+        connector_staged_reports,
+        connector_staged_report_error,
     })
 }
 

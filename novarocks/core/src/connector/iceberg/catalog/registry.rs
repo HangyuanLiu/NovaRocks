@@ -48,6 +48,7 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;
+use crate::connector::iceberg::write_service::IcebergWriteServiceRegistry;
 use crate::sql::literal::{literal_to_i128_for_integer, parse_datetime_string_to_nanos};
 use crate::sql::{ColumnAggregation, Literal, TableColumnDef, TableKeyDesc, TableKeyKind};
 use novarocks_catalog::identifier::normalize_identifier;
@@ -57,6 +58,7 @@ use novarocks_catalog::schema::{ColumnDefault, SqlType};
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
     catalogs: HashMap<String, IcebergCatalogEntry>,
+    write_services: IcebergWriteServiceRegistry,
 }
 
 /// Selects which Iceberg catalog implementation an [`IcebergCatalogEntry`]
@@ -121,6 +123,10 @@ const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 const S3_NAMESPACE_MARKER_FILE: &str = ".novarocks_namespace";
 
 impl IcebergCatalogRegistry {
+    pub(crate) fn write_services(&self) -> IcebergWriteServiceRegistry {
+        self.write_services.clone()
+    }
+
     pub(crate) fn create_catalog(
         &mut self,
         catalog_name: &str,

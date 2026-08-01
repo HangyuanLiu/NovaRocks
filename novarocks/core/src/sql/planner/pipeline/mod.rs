@@ -43,7 +43,7 @@ pub(crate) fn build_distributed_plan_with_settings(
 
 pub(crate) fn build_iceberg_write_distributed_plan(
     physical: PhysicalPlanNode,
-    sink: crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink,
+    sink: crate::sql::planner::distributed::write::sink::IcebergWritePlanInput,
 ) -> Result<DistributedPlan, String> {
     build_iceberg_write_distributed_plan_with_settings(
         physical,
@@ -54,7 +54,7 @@ pub(crate) fn build_iceberg_write_distributed_plan(
 
 pub(crate) fn build_iceberg_write_distributed_plan_with_settings(
     mut physical: PhysicalPlanNode,
-    sink: crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink,
+    sink: crate::sql::planner::distributed::write::sink::IcebergWritePlanInput,
     settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(

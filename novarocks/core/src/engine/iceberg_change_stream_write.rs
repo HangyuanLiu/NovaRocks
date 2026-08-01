@@ -89,27 +89,8 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             native_bundle,
             build_input.query_opts.clone(),
             None,
+            None,
         )
-    }
-
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let guard = self
-            .commit_plan
-            .lock()
-            .expect("change-stream commit plan lock poisoned");
-        let plan = guard.as_ref().ok_or_else(|| {
-            CommitServiceError::known_uncommitted(
-                "change-stream commit plan is missing; coordinated write did not complete"
-                    .to_string(),
-                CleanupAttempt::not_attempted(),
-            )
-        })?;
-        self.commit_executor
-            .commit_change_stream_write_input(write_commit, plan)
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {

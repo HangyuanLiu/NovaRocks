@@ -18,10 +18,7 @@
 use super::type_mapping::{
     encode_change_stream_branch_kind, encode_data_partition, encode_edge_partition_type,
 };
-use super::write::{
-    encode_iceberg_change_stream_router_sink, encode_iceberg_write_input_binding,
-    encode_iceberg_write_sink_spec,
-};
+use super::write::{encode_change_stream_router_sink, encode_connector_write_fragment_sink};
 use super::*;
 
 pub(super) fn attach_stream_sinks(
@@ -171,14 +168,12 @@ fn encode_data_sink(
         kind: Some(match src {
             DataSink::Result => Kind::Result(true),
             DataSink::Noop => Kind::Noop(true),
-            DataSink::IcebergWrite(sink) => Kind::IcebergWrite(plan::IcebergWriteFragmentSink {
-                descriptor_database: sink.descriptor_database.clone(),
-                spec: Some(encode_iceberg_write_sink_spec(&sink.spec, ctx)?),
-                input: Some(encode_iceberg_write_input_binding(&sink.input)),
-            }),
-            DataSink::IcebergChangeStreamRouter(sink) => Kind::IcebergChangeStreamRouter(
-                encode_iceberg_change_stream_router_sink(sink, fragment_id, ctx)?,
-            ),
+            DataSink::ConnectorWrite(sink) => {
+                Kind::ConnectorWrite(encode_connector_write_fragment_sink(sink))
+            }
+            DataSink::ChangeStreamRouter(sink) => {
+                Kind::ChangeStreamRouter(encode_change_stream_router_sink(sink, fragment_id, ctx)?)
+            }
         }),
     })
 }
@@ -216,11 +211,11 @@ fn encode_fragment_edge_kind(src: &FragmentEdgeKind) -> plan::FragmentEdgeKind {
                     .map(|id| id.0)
                     .collect(),
             }),
-            FragmentEdgeKind::IcebergChangeStreamRouter {
+            FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id,
                 branch_id,
                 branch_kind,
-            } => Kind::IcebergChangeStreamRouter(plan::IcebergChangeStreamRouterEdge {
+            } => Kind::ChangeStreamRouter(plan::ChangeStreamRouterEdge {
                 router_group_id: *router_group_id,
                 branch_id: *branch_id,
                 branch_kind: encode_change_stream_branch_kind(*branch_kind),

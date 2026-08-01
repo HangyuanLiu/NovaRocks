@@ -20,15 +20,13 @@ use crate::connector::starrocks::sink::plan::{
 };
 use crate::exec::fragment::program::{FragmentProgram, FragmentSinkSpec};
 use crate::exec::fragment::sink::{
-    DataStreamSinkBranchProgram, FragmentSinkProgram, IcebergChangeStreamRouterProgram,
-    MultiCastDataStreamSinkProgram,
+    DataStreamSinkBranchProgram, FragmentSinkProgram, MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::OlapTableSinkFactory;
 use crate::exec::operators::{
-    DataStreamSinkFactory, DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
-    IcebergChangeStreamRouterSinkFactory, IcebergChangeStreamRouterSinkFactoryInput,
-    IcebergTableSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
-    ResultBufferSinkFactory, SplitDataStreamSinkFactory,
+    ConnectorWriteSinkFactory, DataStreamSinkFactory, DataStreamSinkFactoryInput,
+    MultiCastDataStreamSinkFactory, NoopSinkFactory, ResultBufferSinkFactory,
+    SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::FragmentDestination;
@@ -134,8 +132,8 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
             plan_node_id,
             std::sync::Arc::clone(&transmitter),
         ),
-        (FragmentSinkProgram::IcebergTable(table), FragmentSinkAssignment::None) => {
-            IcebergTableSinkFactory::try_new(table.factory_input())
+        (FragmentSinkProgram::ConnectorWrite(connector), FragmentSinkAssignment::None) => {
+            ConnectorWriteSinkFactory::try_new(connector)
                 .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>)
                 .map_err(materialization_error)
         }
@@ -143,17 +141,6 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
             FragmentSinkProgram::StarRocksTable(table),
             FragmentSinkAssignment::StarRocksTable(assignment),
         ) => materialize_starrocks_table(table, assignment),
-        (
-            FragmentSinkProgram::IcebergChangeStreamRouter(router),
-            FragmentSinkAssignment::DestinationGroups { groups, sender_id },
-        ) => materialize_router(
-            router,
-            groups,
-            fragment_instance_id,
-            *sender_id,
-            plan_node_id,
-            std::sync::Arc::clone(&transmitter),
-        ),
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
             "sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
@@ -265,47 +252,6 @@ fn materialize_split(
     )))
 }
 
-fn materialize_router(
-    program: &IcebergChangeStreamRouterProgram,
-    groups: &[Vec<FragmentDestination>],
-    fragment_instance_id: crate::common::types::UniqueId,
-    sender_id: Option<i32>,
-    plan_node_id: i32,
-    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
-) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    ensure_group_count(program.branches().len(), groups.len())?;
-    let branches = program
-        .branches()
-        .iter()
-        .zip(groups)
-        .map(|(branch, destinations)| {
-            Ok(IcebergChangeStreamRouterBranchFactoryInput {
-                branch_id: branch.branch_id(),
-                branch_kind: branch.branch_kind(),
-                stream_sink: branch_input(branch.stream_sink(), destinations.clone())?,
-            })
-        })
-        .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
-    let input = IcebergChangeStreamRouterSinkFactoryInput {
-        change_op_slot_id: slot_id_as_i32(program.change_op_slot_id())?,
-        data_route_slot_id: program
-            .data_route_slot_id()
-            .map(slot_id_as_i32)
-            .transpose()?,
-        branches,
-    };
-    IcebergChangeStreamRouterSinkFactory::try_new(
-        input,
-        fragment_instance_id,
-        sender_id,
-        program.partition_arena().clone(),
-        plan_node_id,
-        transmitter,
-    )
-    .map(|factory| Box::new(factory) as Box<dyn OperatorFactory>)
-    .map_err(materialization_error)
-}
-
 fn stream_input(
     program: &crate::exec::fragment::sink::DataStreamSinkProgram,
     destinations: Vec<FragmentDestination>,
@@ -345,15 +291,6 @@ fn ensure_group_count(expected: usize, actual: usize) -> Result<(), FragmentLaun
     Ok(())
 }
 
-fn slot_id_as_i32(slot_id: crate::common::ids::SlotId) -> Result<i32, FragmentLaunchError> {
-    i32::try_from(slot_id.as_u32()).map_err(|_| {
-        materialization_error(format!(
-            "router slot id {} exceeds operator representation",
-            slot_id.as_u32()
-        ))
-    })
-}
-
 fn materialization_error(detail: impl Into<String>) -> FragmentLaunchError {
     FragmentLaunchError::new(
         FragmentLaunchStage::Materialize,
@@ -370,8 +307,7 @@ fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
         FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
         FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
         FragmentSinkProgram::StarRocksTable(_) => "starrocks_table",
-        FragmentSinkProgram::IcebergTable(_) => "iceberg_table",
-        FragmentSinkProgram::IcebergChangeStreamRouter(_) => "iceberg_change_stream_router",
+        FragmentSinkProgram::ConnectorWrite(_) => "connector_write",
     }
 }
 
@@ -407,7 +343,6 @@ mod tests {
     };
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-        IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
         MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     };
     use crate::exec::node::values::ValuesNode;
@@ -423,7 +358,6 @@ mod tests {
     use crate::runtime::fragment::io::ExchangeFrameTransmitter;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::sql::common::ChangeStreamBranchKind;
 
     use super::starrocks_factory_input;
     use super::{materialize_fragment_sink, materialize_fragment_sink_components};
@@ -633,35 +567,6 @@ mod tests {
         assert_eq!(
             (frontend.hostname.as_str(), frontend.port),
             ("frontend", 9020)
-        );
-    }
-
-    #[test]
-    fn iceberg_router_materialization_uses_fragment_root_plan_node_id() {
-        let program = fragment_program(FragmentSinkProgram::IcebergChangeStreamRouter(
-            IcebergChangeStreamRouterProgram::try_new(
-                SlotId::new(1),
-                None,
-                vec![IcebergChangeStreamRouterBranchProgram::new(
-                    7,
-                    ChangeStreamBranchKind::DeleteDv,
-                    stream_branch(17),
-                )],
-                ExprArena::default(),
-            )
-            .expect("router program"),
-        ));
-        let instance = instance(FragmentSinkAssignment::DestinationGroups {
-            groups: vec![Vec::new()],
-            sender_id: None,
-        });
-
-        let factory = materialize_fragment_sink(&program, &instance, test_transmitter(), None)
-            .expect("router sink");
-
-        assert_factory_and_operator_name(
-            factory.as_ref(),
-            "ICEBERG_CHANGE_STREAM_ROUTER_SINK (id=99)",
         );
     }
 

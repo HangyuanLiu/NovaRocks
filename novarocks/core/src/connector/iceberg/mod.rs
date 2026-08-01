@@ -55,7 +55,11 @@ pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
 pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
+pub(crate) mod write_contract;
+pub(crate) mod write_control;
 pub(crate) mod write_descriptor;
+pub(crate) mod write_execution;
+pub(crate) mod write_service;
 
 pub use metadata::plan_compat_iceberg_metadata_read_source;
 pub(crate) use metadata::plan_native_iceberg_metadata_read_source;
@@ -74,5 +78,9 @@ pub use schema::{
 pub(crate) use schema::{
     build_projected_output_schema_from_descriptor, build_projected_output_schema_from_scan_model,
 };
-pub use sink::IcebergTableSinkFactory;
 pub use sink_plan::IcebergSinkMode;
+pub use write_contract::{
+    CompatIcebergColumnStats, CompatIcebergDataFile, CompatIcebergFileContent,
+    CompatIcebergPartitionValue, CompatIcebergSinkCommitInfo, plan_compat_connector_write,
+    project_compat_sink_commit_infos,
+};

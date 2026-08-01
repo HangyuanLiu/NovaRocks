@@ -32,20 +32,21 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec,
 };
+use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
-use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
+use crate::engine::write_transaction::IcebergWriteCommitExecutor;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::query_execution::write::WriteCommitInput;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use crate::sql::parser::ast::Literal;
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::{ConnectorWriteIntent, ConnectorWriteOperationId};
 
 pub(crate) fn prepare_equality_delete_statement(
     state: &Arc<StandaloneState>,
@@ -126,9 +127,10 @@ struct DistributedEqualityDeleteWriteExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
-    commit_executor: IcebergWriteCommitExecutor,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 }
 
 impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
@@ -143,23 +145,25 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
             None,
             Some(&self.execution),
             &self.connector_context,
+            Some(self.connector_write.clone()),
         )?;
-        if result.write_abort.is_none()
-            && result
-                .write_commit
-                .as_ref()
-                .is_none_or(|commit| !write_commit_has_files(commit))
-        {
+        if result.write_abort.is_none() && result.connector_completion.is_none() {
             return Err(
-                "ADD EQUALITY DELETE produced no equality-delete files for non-empty input"
+                "ADD EQUALITY DELETE completed without a sealed connector write completion for non-empty input"
                     .to_string(),
             );
         }
         Ok(result)
     }
 
-    fn commit(&self, write_commit: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
+    fn commit(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+            &self.commit_executor,
+            completion,
+        )
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -226,7 +230,7 @@ fn prepare_equality_delete_distributed_write(
     );
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -237,14 +241,28 @@ fn prepare_equality_delete_distributed_write(
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
-    let attempt_id = format!(
-        "{}.{}.{}:equality-delete:{}",
-        target.catalog,
-        target.namespace,
-        target.table,
-        uuid::Uuid::new_v4()
-    );
+    });
+    let connector_operation_id = ConnectorWriteOperationId::new();
+    let writer_handle_payload =
+        encode_equality_delete_sink_spec_handle_payload(&sink_spec, delete_columns)?;
+    let input_schema = Arc::new(ArrowSchema::new(
+        sink_spec
+            .target_columns
+            .iter()
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>(),
+    ));
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_connector_write(
+        state,
+        target,
+        "main",
+        ConnectorWriteIntent::RowDelta,
+        input_schema,
+        writer_handle_payload,
+        Arc::clone(&commit_executor),
+        connector_operation_id,
+        connector_context.clone(),
+    )?;
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -253,6 +271,7 @@ fn prepare_equality_delete_distributed_write(
         commit_executor,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
+        connector_write,
     };
     Ok(prepared_delete(
         DeleteOperation {
@@ -260,7 +279,7 @@ fn prepare_equality_delete_distributed_write(
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             target_ref: "main".to_string(),
-            attempt_id,
+            attempt_id: connector_operation_id.to_string(),
             commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id: current_snapshot_id,
         },

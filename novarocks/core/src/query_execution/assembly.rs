@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_spi::connector::ConnectorSplit;
+use novarocks_spi::connector::{ConnectorSplit, ConnectorWriterHandle};
 
 use crate::exec::chunk::Chunk;
 use crate::novarocks_logging::debug;
@@ -170,7 +170,7 @@ pub(crate) fn group_router_edges_by_source<'a>(
 ) -> BTreeMap<(FragmentId, i32), Vec<&'a FragmentEdge>> {
     let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
     for edge in edges {
-        let FragmentEdgeKind::IcebergChangeStreamRouter {
+        let FragmentEdgeKind::ChangeStreamRouter {
             router_group_id, ..
         } = edge.edge_kind
         else {
@@ -200,6 +200,139 @@ pub(crate) fn ensure_native_fragment_sink_supported(
         "native submission cannot encode {dynamic_sink} for fragment {fragment_id}; \
          the native sink contract must carry dynamic destinations before this fragment can be submitted"
     ))
+}
+
+/// Install one placement-local provider-neutral writer handle planned by the
+/// frontend control binding.
+///
+/// Native fragment templates are encoded before scheduling.  The writer
+/// identity therefore cannot be valid until the placement has been frozen.
+/// This is the only seam that installs the per-placement opaque handle; it
+/// neither decodes its provider payload nor permits a fallback to an
+/// unplanned handle.
+pub(crate) fn patch_native_connector_write_sink(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment_id: FragmentId,
+    fragment_instance_id: crate::common::types::UniqueId,
+    backend_num: i32,
+    handle: &ConnectorWriterHandle,
+) -> Result<(), String> {
+    let mut patched_fragment = fragment.clone();
+    patch_native_connector_write_sink_in_place(
+        &mut patched_fragment,
+        fragment_id,
+        fragment_instance_id,
+        backend_num,
+        handle,
+    )?;
+    *fragment = patched_fragment;
+    Ok(())
+}
+
+fn patch_native_connector_write_sink_in_place(
+    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment_id: FragmentId,
+    fragment_instance_id: crate::common::types::UniqueId,
+    backend_num: i32,
+    handle: &ConnectorWriterHandle,
+) -> Result<(), String> {
+    let writer = handle.writer();
+    if writer.fragment_id()
+        != i32::try_from(fragment_id)
+            .map_err(|_| format!("connector write fragment {fragment_id} exceeds i32 width"))?
+        || writer.backend_num() != backend_num
+        || writer.fragment_instance_id() != unique_id_bytes(fragment_instance_id)
+        || writer.sink_ordinal() != 0
+    {
+        return Err(format!(
+            "connector writer handle does not match scheduled placement: fragment={fragment_id} backend_num={backend_num} finst={fragment_instance_id:?}"
+        ));
+    }
+
+    let sink = fragment
+        .sink
+        .as_mut()
+        .ok_or_else(|| format!("terminal write fragment {fragment_id} has no native sink"))?;
+    let template = match sink.kind.take() {
+        Some(crate::proto::plan::data_sink::Kind::ConnectorWrite(template)) => template,
+        Some(other) => {
+            sink.kind = Some(other);
+            return Err(format!(
+                "terminal write fragment {fragment_id} requires CONNECTOR_WRITE template before connector write patch"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "terminal write fragment {fragment_id} has an empty native sink"
+            ));
+        }
+    };
+    if template.handle.is_some() {
+        return Err(format!(
+            "terminal connector write fragment {fragment_id} already has a writer handle"
+        ));
+    }
+    let input = template.input.ok_or_else(|| {
+        format!("terminal connector write fragment {fragment_id} is missing input binding")
+    })?;
+    let input = match input.kind {
+        Some(crate::proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+            value,
+        )) => crate::proto::plan::ConnectorWriteInputBinding {
+            kind: Some(
+                crate::proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(value),
+            ),
+        },
+        Some(crate::proto::plan::connector_write_input_binding::Kind::OutputOrdinals(values)) => {
+            crate::proto::plan::ConnectorWriteInputBinding {
+                kind: Some(
+                    crate::proto::plan::connector_write_input_binding::Kind::OutputOrdinals(values),
+                ),
+            }
+        }
+        None => {
+            return Err(format!(
+                "terminal connector write fragment {fragment_id} has an empty input binding"
+            ));
+        }
+    };
+    sink.kind = Some(crate::proto::plan::data_sink::Kind::ConnectorWrite(
+        crate::proto::plan::ConnectorWriteFragmentSink {
+            handle: Some(crate::proto::plan::ConnectorWriterHandleEnvelope {
+                contract_version: handle.version(),
+                writer: Some(crate::proto::plan::ConnectorWriterIdentity {
+                    operation_id: writer.operation_id().to_bytes().to_vec(),
+                    cohort_id: writer.cohort_id().to_bytes().to_vec(),
+                    execution_query_id: writer.execution_id().query_id().to_vec(),
+                    execution_attempt_id: writer.execution_id().attempt_id(),
+                    fragment_instance_id: Some(native_unique_id(writer.fragment_instance_id())),
+                    fragment_id: writer.fragment_id(),
+                    backend_num: writer.backend_num(),
+                    sink_ordinal: writer.sink_ordinal(),
+                    connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
+                    connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
+                }),
+                payload: handle.payload().to_vec(),
+                payload_sha256: handle.payload_digest().to_vec(),
+            }),
+            input: Some(input),
+        },
+    ));
+    Ok(())
+}
+
+fn unique_id_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes
+}
+
+fn native_unique_id(value: [u8; 16]) -> crate::proto::common::UniqueId {
+    crate::proto::common::UniqueId {
+        hi: i64::from_be_bytes(value[..8].try_into().expect("fixed writer identity prefix")),
+        lo: i64::from_be_bytes(value[8..].try_into().expect("fixed writer identity suffix")),
+    }
 }
 
 pub(crate) fn validate_fragment_output_kind(
@@ -396,7 +529,7 @@ fn patch_connector_splits_in_node(
     Ok(())
 }
 
-pub(crate) fn patch_native_iceberg_change_stream_router_sink(
+pub(crate) fn patch_native_change_stream_router_sink(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
@@ -404,7 +537,7 @@ pub(crate) fn patch_native_iceberg_change_stream_router_sink(
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
     let mut patched_fragment = fragment.clone();
-    patch_native_iceberg_change_stream_router_sink_in_place(
+    patch_native_change_stream_router_sink_in_place(
         &mut patched_fragment,
         fragment_id,
         router_group_id,
@@ -415,7 +548,7 @@ pub(crate) fn patch_native_iceberg_change_stream_router_sink(
     Ok(())
 }
 
-fn patch_native_iceberg_change_stream_router_sink_in_place(
+fn patch_native_change_stream_router_sink_in_place(
     fragment: &mut crate::proto::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
@@ -426,11 +559,11 @@ fn patch_native_iceberg_change_stream_router_sink_in_place(
         return Err("native Iceberg change-stream router sink has no branch edges".to_string());
     }
     let router = match fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut()) {
-        Some(crate::proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router)) => router,
+        Some(crate::proto::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
         _ => {
             return Err(format!(
                 "fragment {fragment_id} is router source for group {router_group_id} but native \
-                 fragment payload is missing ICEBERG_CHANGE_STREAM_ROUTER_SINK"
+                 fragment payload is missing CHANGE_STREAM_ROUTER_SINK"
             ));
         }
     };
@@ -445,7 +578,7 @@ fn patch_native_iceberg_change_stream_router_sink_in_place(
 
     let mut edge_route_keys = BTreeSet::new();
     for edge in branch_edges {
-        let FragmentEdgeKind::IcebergChangeStreamRouter {
+        let FragmentEdgeKind::ChangeStreamRouter {
             router_group_id: edge_group_id,
             branch_id,
             branch_kind,
@@ -496,7 +629,7 @@ fn patch_native_iceberg_change_stream_router_sink_in_place(
     }
 
     for edge in branch_edges {
-        let FragmentEdgeKind::IcebergChangeStreamRouter {
+        let FragmentEdgeKind::ChangeStreamRouter {
             router_group_id: edge_group_id,
             branch_id,
             branch_kind,
@@ -808,6 +941,12 @@ mod tests {
     use arrow::array::{Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
+        ConnectorWriterIdentity,
+    };
 
     use super::*;
     use crate::common::ids::SlotId;
@@ -842,7 +981,7 @@ mod tests {
             target_exchange_node_id: 77,
             output_partition: DataPartition::unpartitioned(),
             stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::IcebergChangeStreamRouter {
+            edge_kind: FragmentEdgeKind::ChangeStreamRouter {
                 router_group_id: 7,
                 branch_id: 0,
                 branch_kind: ChangeStreamBranchKind::DeleteDv,
@@ -855,12 +994,12 @@ mod tests {
         native_plan::PlanFragment {
             fragment_id: 1,
             sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::IcebergChangeStreamRouter(
-                    native_plan::IcebergChangeStreamRouterSink {
+                kind: Some(native_plan::data_sink::Kind::ChangeStreamRouter(
+                    native_plan::ChangeStreamRouterSink {
                         group_id: 7,
                         change_op_output_ordinal: 0,
                         data_route_output_ordinal: None,
-                        branches: vec![native_plan::IcebergChangeStreamBranchRoute {
+                        branches: vec![native_plan::ChangeStreamBranchRoute {
                             branch_id: 0,
                             branch_kind: native_plan::ChangeStreamBranchKind::DeleteDv as i32,
                             target_fragment_id: 0,
@@ -873,6 +1012,50 @@ mod tests {
                             }),
                             destinations: None,
                         }],
+                    },
+                )),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn connector_writer_handle(
+        fragment_id: FragmentId,
+        finst_id: UniqueId,
+    ) -> ConnectorWriterHandle {
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        let operation_id = ConnectorWriteOperationId::new();
+        let writer = ConnectorWriterIdentity::new(
+            operation_id,
+            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
+            ConnectorWriteExecutionId::new([3; 16], 1),
+            unique_id_bytes(finst_id),
+            i32::try_from(fragment_id).expect("test fragment fits i32"),
+            0,
+            0,
+            owner.clone(),
+        );
+        ConnectorWriterHandle::try_new(owner, writer, 1, Bytes::from_static(b"opaque"))
+            .expect("valid connector handle")
+    }
+
+    fn connector_writer_template_fragment(fragment_id: FragmentId) -> native_plan::PlanFragment {
+        native_plan::PlanFragment {
+            fragment_id,
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::ConnectorWrite(
+                    native_plan::ConnectorWriteFragmentSink {
+                        handle: None,
+                        input: Some(native_plan::ConnectorWriteInputBinding {
+                            kind: Some(
+                                native_plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+                                    true,
+                                ),
+                            ),
+                        }),
                     },
                 )),
             }),
@@ -910,6 +1093,50 @@ mod tests {
                 .expect_err("producer must be nonterminal")
                 .contains("producer fragment 2")
         );
+    }
+
+    #[test]
+    fn patches_only_the_exact_placement_to_a_generic_connector_writer() {
+        let finst_id = UniqueId { hi: 41, lo: 77 };
+        let handle = connector_writer_handle(9, finst_id);
+        let mut fragment = connector_writer_template_fragment(9);
+
+        patch_native_connector_write_sink(&mut fragment, 9, finst_id, 0, &handle)
+            .expect("exact writer placement patches");
+
+        let Some(native_plan::data_sink::Kind::ConnectorWrite(sink)) =
+            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+        else {
+            panic!("generic connector write sink");
+        };
+        let writer = sink
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.writer.as_ref())
+            .expect("writer");
+        assert_eq!(writer.fragment_id, 9);
+        assert_eq!(writer.backend_num, 0);
+        assert_eq!(sink.handle.as_ref().expect("handle").payload, b"opaque");
+        assert!(matches!(
+            sink.input.as_ref().and_then(|input| input.kind.as_ref()),
+            Some(native_plan::connector_write_input_binding::Kind::RootOutputByOrdinal(true))
+        ));
+
+        let mut wrong = connector_writer_template_fragment(9);
+        let before = wrong.clone();
+        let error = patch_native_connector_write_sink(
+            &mut wrong,
+            9,
+            UniqueId { hi: 41, lo: 78 },
+            0,
+            &handle,
+        )
+        .expect_err("wrong fragment instance must fail closed");
+        assert!(
+            error.contains("does not match scheduled placement"),
+            "{error}"
+        );
+        assert_eq!(wrong, before, "failed patch must preserve legacy template");
     }
 
     #[test]
@@ -1044,14 +1271,9 @@ mod tests {
         let mut fragment = router_fragment();
         let before = fragment.clone();
         let edge = router_edge(2);
-        let error = patch_native_iceberg_change_stream_router_sink(
-            &mut fragment,
-            1,
-            7,
-            &[&edge],
-            &BTreeMap::new(),
-        )
-        .expect_err("missing target placement must fail before patching");
+        let error =
+            patch_native_change_stream_router_sink(&mut fragment, 1, 7, &[&edge], &BTreeMap::new())
+                .expect_err("missing target placement must fail before patching");
         assert!(
             error.contains("target fragment 2 has no placements"),
             "{error}"

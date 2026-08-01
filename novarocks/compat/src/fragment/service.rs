@@ -53,6 +53,10 @@ use novarocks::runtime::starrocks_fragment_query::{
     StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
     StarRocksFragmentQueryRuntime,
 };
+use novarocks_spi::connector::{
+    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+    ConnectorWriterIdentity,
+};
 
 use crate::fragment::admission::{
     DescriptorPreparation, DescriptorTransportCache, PrelaunchCancellationToken, PrelaunchGuard,
@@ -60,7 +64,7 @@ use crate::fragment::admission::{
 };
 use crate::fragment::dependency::{lake_meta_storage_resolver, resolve_dependencies};
 use crate::load::CompatLoadRegistry;
-use crate::report::{self, CompatReportService};
+use crate::report::CompatReportService;
 
 pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
@@ -788,6 +792,7 @@ fn prepare_starrocks_draft(
         Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>,
     >,
     compat_iceberg_execution: Option<&Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
+    compat_connector_writer: Option<ConnectorWriterIdentity>,
 ) -> Result<StarRocksFragmentDraftEnvelope, String> {
     validate_internal_addresses(params, Some(fragment))?;
     let facts = snapshot_decode_facts(resolve_stream_load_paths(load_registry, params)?)?;
@@ -811,12 +816,91 @@ fn prepare_starrocks_draft(
         starlet_metadata_provider,
         storage_metadata_provider,
         compat_iceberg_execution,
+        compat_connector_writer,
     })
     .map_err(|error| error.to_string())?;
     Ok(StarRocksFragmentDraftEnvelope {
         draft,
         total_fragments: params.instances_number.map(|value| value.max(0) as usize),
     })
+}
+
+fn compat_connector_writer_for_fragment(
+    fragment: &planner::TPlanFragment,
+    params: &internal_service::TPlanFragmentExecParams,
+    backend_num: Option<i32>,
+    binding: Option<&Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
+) -> Result<Option<ConnectorWriterIdentity>, String> {
+    let Some(sink_type) = fragment.output_sink.as_ref().map(|sink| sink.type_) else {
+        return Ok(None);
+    };
+    if !matches!(
+        sink_type,
+        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DV_SINK
+            | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK
+    ) {
+        return Ok(None);
+    }
+    let binding = binding.ok_or_else(|| {
+        "compat Iceberg connector write requires the startup-composed execution binding".to_string()
+    })?;
+    if binding.write().is_none() {
+        return Err(
+            "compat Iceberg connector execution binding has no write capability".to_string(),
+        );
+    }
+    let backend_num = backend_num.ok_or_else(|| {
+        "compat Iceberg connector write requires FE backend_num for writer identity".to_string()
+    })?;
+    let fragment_id = fragment
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.nodes.first())
+        .map(|node| node.node_id)
+        .ok_or_else(|| "compat Iceberg connector write requires a root plan node id".to_string())?;
+    Ok(Some(freeze_compat_connector_writer(
+        &params.query_id,
+        &params.fragment_instance_id,
+        fragment_id,
+        backend_num,
+        binding.key().clone(),
+    )))
+}
+
+fn freeze_compat_connector_writer(
+    query_id: &types::TUniqueId,
+    fragment_instance_id: &types::TUniqueId,
+    fragment_id: i32,
+    backend_num: i32,
+    owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+) -> ConnectorWriterIdentity {
+    let query_id = unique_id_bytes(query_id);
+    let operation_id = ConnectorWriteOperationId::from_bytes(compat_operation_id_bytes(query_id));
+    ConnectorWriterIdentity::new(
+        operation_id,
+        ConnectorWriteCohortId::primary(operation_id),
+        ConnectorWriteExecutionId::new(query_id, 0),
+        unique_id_bytes(fragment_instance_id),
+        fragment_id,
+        backend_num,
+        0,
+        owner,
+    )
+}
+
+fn compat_operation_id_bytes(mut query_id: [u8; 16]) -> [u8; 16] {
+    query_id[6] = (query_id[6] & 0x0f) | 0x70;
+    query_id[8] = (query_id[8] & 0x3f) | 0x80;
+    query_id
+}
+
+fn unique_id_bytes(id: &types::TUniqueId) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&id.hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&id.lo.to_be_bytes());
+    bytes
 }
 
 fn resolve_stream_load_paths(
@@ -1874,6 +1958,12 @@ fn submit_exec_batch_plan_fragments_with(
     let token = guard.cancellation_token();
     let mut drafts = Vec::with_capacity(envelopes.len());
     for entry in envelopes {
+        let compat_connector_writer = compat_connector_writer_for_fragment(
+            entry.0,
+            &entry.1,
+            entry.6,
+            service.compat_iceberg_execution.get(),
+        )?;
         drafts.push(prepare_starrocks_draft(
             &service.load_registry,
             entry.0,
@@ -1894,6 +1984,7 @@ fn submit_exec_batch_plan_fragments_with(
             service.starlet_metadata_provider.clone(),
             service.storage_metadata_provider.clone(),
             service.compat_iceberg_execution.get(),
+            compat_connector_writer,
         )?);
     }
     token.check(0).map_err(|error| error.to_string())?;
@@ -1968,6 +2059,12 @@ fn submit_exec_plan_fragment_with(
             .transpose()?,
     );
     let token = guard.cancellation_token();
+    let compat_connector_writer = compat_connector_writer_for_fragment(
+        fragment,
+        &params,
+        one.backend_num,
+        service.compat_iceberg_execution.get(),
+    )?;
     let draft = prepare_starrocks_draft(
         &service.load_registry,
         fragment,
@@ -1988,6 +2085,7 @@ fn submit_exec_plan_fragment_with(
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
         service.compat_iceberg_execution.get(),
+        compat_connector_writer,
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
@@ -2035,6 +2133,12 @@ fn execute_plan_fragment_sync_with(
             .transpose()?,
     );
     let token = guard.cancellation_token();
+    let compat_connector_writer = compat_connector_writer_for_fragment(
+        fragment,
+        &params,
+        one.backend_num,
+        service.compat_iceberg_execution.get(),
+    )?;
     let draft = prepare_starrocks_draft(
         &service.load_registry,
         fragment,
@@ -2055,6 +2159,7 @@ fn execute_plan_fragment_sync_with(
         service.starlet_metadata_provider.clone(),
         service.storage_metadata_provider.clone(),
         service.compat_iceberg_execution.get(),
+        compat_connector_writer,
     )?;
     let resolved = resolve_starrocks_draft(&draft, &token, service.lake_meta_resolver.as_ref())?;
     let prepared = finish_starrocks_draft(draft, resolved)?;
