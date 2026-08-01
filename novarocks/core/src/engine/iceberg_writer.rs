@@ -392,6 +392,28 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
             "first-refresh write lease does not match the target connector instance".to_string(),
         );
     }
+    let expected_target = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    let observed_snapshot_id = if target_ref == "main" {
+        commit_executor
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+    } else {
+        commit_executor
+            .table
+            .metadata()
+            .refs()
+            .get(target_ref)
+            .map(|reference| reference.snapshot_id)
+    };
+    if payload.target != expected_target
+        || payload.target_ref != target_ref
+        || payload.expected_snapshot_id != observed_snapshot_id
+        || payload.staging_path != commit_executor.collector.staging_dir
+    {
+        return Err("first-refresh provider payload drifted from frozen target facts".to_string());
+    }
     let provider_payload = payload
         .encode()
         .map_err(|error| format!("encode Iceberg first-refresh plan payload: {error}"))?;
