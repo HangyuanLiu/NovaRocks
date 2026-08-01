@@ -139,6 +139,51 @@ pub struct RuntimeFilterContribution {
     canonical_bytes: Arc<[u8]>,
 }
 
+/// A frozen, fragment-local membership domain submitted through a final-domain
+/// completion fence.
+///
+/// The execution surface owns the lifecycle of this payload, while a
+/// role-local session adapter validates and converts the opaque value into its
+/// reducer representation. `canonical_bytes` gives callers a stable size
+/// bound without exposing a transport envelope or a service-issued authority.
+#[derive(Clone)]
+pub struct RuntimeFilterFinalDomain {
+    canonical_bytes: Arc<[u8]>,
+    value: Arc<dyn Any + Send + Sync>,
+}
+
+impl RuntimeFilterFinalDomain {
+    pub fn new<T>(canonical_bytes: impl Into<Arc<[u8]>>, value: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            canonical_bytes: canonical_bytes.into(),
+            value: Arc::new(value),
+        }
+    }
+
+    pub const fn canonical_bytes(&self) -> &Arc<[u8]> {
+        &self.canonical_bytes
+    }
+
+    /// This is for a role-local session adapter only. Execution callers pass
+    /// the opaque payload to a typed completion capability; they never mint
+    /// completion authority or address a delivery route.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.value.downcast_ref()
+    }
+}
+
+impl fmt::Debug for RuntimeFilterFinalDomain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeFilterFinalDomain")
+            .field("canonical_bytes_len", &self.canonical_bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RuntimeFilterContribution {
     pub fn new(
         kind: RuntimeFilterContributionKind,
@@ -286,6 +331,33 @@ impl RuntimeFilterConsumerContract {
 pub struct RuntimeFilterProducerOpenRequest {
     contract: RuntimeFilterProducerContract,
     local_partition_count: u32,
+}
+
+/// Opens the aggregate-only completion fence associated with a FinalDomain
+/// producer binding. It is deliberately separate from the regular producer
+/// handle: the adapter retains issuance authority until every claimed local
+/// partition has frozen and closed exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterFinalDomainOpenRequest {
+    contract: RuntimeFilterProducerContract,
+    local_partition_count: u32,
+}
+
+impl RuntimeFilterFinalDomainOpenRequest {
+    pub const fn new(contract: RuntimeFilterProducerContract, local_partition_count: u32) -> Self {
+        Self {
+            contract,
+            local_partition_count,
+        }
+    }
+
+    pub const fn contract(&self) -> &RuntimeFilterProducerContract {
+        &self.contract
+    }
+
+    pub const fn local_partition_count(&self) -> u32 {
+        self.local_partition_count
+    }
 }
 impl RuntimeFilterProducerOpenRequest {
     pub const fn new(contract: RuntimeFilterProducerContract, local_partition_count: u32) -> Self {
@@ -443,6 +515,35 @@ pub trait RuntimeFilterProducer: Send + Sync {
 }
 pub type RuntimeFilterProducerHandle = Arc<dyn RuntimeFilterProducer>;
 
+/// One-shot ownership of a FinalDomain partition. A caller must freeze a
+/// domain then close it; dropping an unclosed handle is terminal failure for
+/// the whole completion fence.
+pub trait RuntimeFilterFinalDomainPartition: Send {
+    fn seal(
+        &mut self,
+        domain: RuntimeFilterFinalDomain,
+    ) -> Result<(), RuntimeFilterContractViolation>;
+    fn close(&mut self) -> Result<(), RuntimeFilterContractViolation>;
+}
+pub type RuntimeFilterFinalDomainPartitionHandle = Box<dyn RuntimeFilterFinalDomainPartition>;
+
+/// Fragment-local FinalDomain fence capability. It exposes only local
+/// partition ownership, the frozen-domain budget, and typed terminal failure;
+/// registry membership and service issuance proofs stay adapter-private.
+pub trait RuntimeFilterFinalDomainCompletion: Send + Sync {
+    fn membership_key_type(&self) -> DataType;
+    fn max_domain_canonical_bytes(&self) -> usize;
+    fn claim_partition(
+        &self,
+        partition: PartitionId,
+    ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation>;
+    fn fail(
+        &self,
+        reason: RuntimeFilterProducerFailure,
+    ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
+}
+pub type RuntimeFilterFinalDomainCompletionHandle = Arc<dyn RuntimeFilterFinalDomainCompletion>;
+
 /// A producer operation is admitted exactly once by the installed route. The
 /// result preserves terminal and replay semantics without exposing the
 /// role-local reducer's implementation types.
@@ -479,6 +580,13 @@ pub trait RuntimeFilterSession: Send + Sync {
         request: RuntimeFilterSubscriptionRequest,
     ) -> Result<
         RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
+        RuntimeFilterContractViolation,
+    >;
+    fn open_final_domain_completion(
+        &self,
+        request: RuntimeFilterFinalDomainOpenRequest,
+    ) -> Result<
+        RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
         RuntimeFilterContractViolation,
     >;
 }
@@ -547,6 +655,9 @@ impl RuntimeFilterLiveCursor {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
     use super::*;
     use arrow::array::Int64Array;
 
@@ -591,6 +702,108 @@ mod tests {
             Ok(RuntimeFilterSubmitOutcome::Applied)
         }
     }
+
+    struct FinalDomainFenceState {
+        partition_count: u32,
+        claimed: Mutex<BTreeSet<u32>>,
+        closed: Mutex<BTreeSet<u32>>,
+    }
+
+    struct FinalDomainFence(Arc<FinalDomainFenceState>);
+
+    impl FinalDomainFence {
+        fn new(partition_count: u32) -> Self {
+            Self(Arc::new(FinalDomainFenceState {
+                partition_count,
+                claimed: Mutex::new(BTreeSet::new()),
+                closed: Mutex::new(BTreeSet::new()),
+            }))
+        }
+
+        fn completed(&self) -> bool {
+            self.0.closed.lock().expect("closed partitions").len()
+                == self.0.partition_count as usize
+        }
+    }
+
+    struct FinalDomainPartition {
+        fence: Arc<FinalDomainFenceState>,
+        partition: u32,
+        sealed: bool,
+    }
+
+    impl RuntimeFilterFinalDomainPartition for FinalDomainPartition {
+        fn seal(
+            &mut self,
+            _domain: RuntimeFilterFinalDomain,
+        ) -> Result<(), RuntimeFilterContractViolation> {
+            if self.sealed {
+                return Err(RuntimeFilterContractViolation::new(
+                    RuntimeFilterContractViolationKind::ContractMismatch,
+                    "fake final-domain partition was sealed twice",
+                ));
+            }
+            self.sealed = true;
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), RuntimeFilterContractViolation> {
+            if !self.sealed {
+                return Err(RuntimeFilterContractViolation::new(
+                    RuntimeFilterContractViolationKind::ContractMismatch,
+                    "fake final-domain partition closed before seal",
+                ));
+            }
+            self.fence
+                .closed
+                .lock()
+                .expect("closed partitions")
+                .insert(self.partition);
+            Ok(())
+        }
+    }
+
+    impl RuntimeFilterFinalDomainCompletion for FinalDomainFence {
+        fn membership_key_type(&self) -> DataType {
+            DataType::Int64
+        }
+
+        fn max_domain_canonical_bytes(&self) -> usize {
+            1024
+        }
+
+        fn claim_partition(
+            self: &Self,
+            partition: PartitionId,
+        ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation>
+        {
+            if partition.get() >= self.0.partition_count {
+                return Err(RuntimeFilterContractViolation::new(
+                    RuntimeFilterContractViolationKind::ContractMismatch,
+                    "fake final-domain partition is outside declared DOP",
+                ));
+            }
+            let mut claimed = self.0.claimed.lock().expect("claimed partitions");
+            if !claimed.insert(partition.get()) {
+                return Err(RuntimeFilterContractViolation::new(
+                    RuntimeFilterContractViolationKind::ContractMismatch,
+                    "fake final-domain partition was claimed twice",
+                ));
+            }
+            Ok(Box::new(FinalDomainPartition {
+                fence: Arc::clone(&self.0),
+                partition: partition.get(),
+                sealed: false,
+            }))
+        }
+
+        fn fail(
+            &self,
+            _reason: RuntimeFilterProducerFailure,
+        ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
+            Ok(RuntimeFilterSubmitOutcome::TerminalNoop)
+        }
+    }
     struct FakeSession;
     impl RuntimeFilterSession for FakeSession {
         fn open_producer(
@@ -625,6 +838,25 @@ mod tests {
                     "fake session has no subscription",
                 ))
             }
+        }
+
+        fn open_final_domain_completion(
+            &self,
+            request: RuntimeFilterFinalDomainOpenRequest,
+        ) -> Result<
+            RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
+            RuntimeFilterContractViolation,
+        > {
+            if request.contract().kind() != RuntimeFilterProducerKind::FinalDomain {
+                return Err(RuntimeFilterContractViolation::new(
+                    RuntimeFilterContractViolationKind::RoleMismatch,
+                    "fake session only exposes a final-domain completion fence",
+                ));
+            }
+            Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "fake session has no final-domain completion fence",
+            ))
         }
     }
     fn membership() -> RuntimeFilterExecutionContract {
@@ -692,5 +924,29 @@ mod tests {
             .output_rows(),
             1
         );
+    }
+
+    #[test]
+    fn final_domain_fence_requires_every_partition_to_seal_and_close() {
+        let completion = Arc::new(FinalDomainFence::new(2));
+        let mut first = completion
+            .claim_partition(PartitionId::new(0))
+            .expect("first partition is claimable");
+        assert!(first.close().is_err());
+        first
+            .seal(RuntimeFilterFinalDomain::new([1_u8], 7_i64))
+            .expect("first partition seals");
+        first.close().expect("first partition closes");
+        assert!(!completion.completed());
+
+        let mut second = completion
+            .claim_partition(PartitionId::new(1))
+            .expect("second partition is claimable");
+        second
+            .seal(RuntimeFilterFinalDomain::new([2_u8], 8_i64))
+            .expect("second partition seals");
+        second.close().expect("second partition closes");
+        assert!(completion.completed());
+        assert!(completion.claim_partition(PartitionId::new(1)).is_err());
     }
 }

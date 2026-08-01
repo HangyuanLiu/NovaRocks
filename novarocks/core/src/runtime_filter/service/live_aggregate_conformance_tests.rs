@@ -23,6 +23,8 @@ use std::time::Instant;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_execution::runtime_filter as execution;
+use novarocks_execution::runtime_filter::RuntimeFilterSession;
 
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
@@ -70,6 +72,7 @@ use crate::sql::planner::distributed::{
 
 use super::RuntimeFilterService;
 use super::memory::MemTrackerMemoryAccount;
+use super::native_execution::NativeRuntimeFilterExecutionContext;
 
 const CHANNEL: ChannelId = ChannelId::new(401);
 const PRODUCER_A: BindingId = BindingId::new(410);
@@ -120,11 +123,36 @@ struct WitnessProcessors {
 }
 
 impl WitnessProcessors {
-    fn open(service: &RuntimeFilterService, binding: BindingId, instance: UniqueId) -> Self {
-        let session = service
-            .open_final_aggregate_producer(binding, instance, AGGREGATE_DOP as u32)
-            .expect("compiler-installed aggregate producer session opens");
-        let session = AggregateFinalDomainSessionBuilder::new(session, AGGREGATE_DOP, 4096)
+    fn open(service: &Arc<RuntimeFilterService>, binding: BindingId, instance: UniqueId) -> Self {
+        let context = NativeRuntimeFilterExecutionContext::new(
+            Arc::clone(service),
+            UniqueId::new(406, 0),
+            DeploymentEpoch::new(1),
+            instance,
+        );
+        let resolved = context
+            .resolve_producer(
+                binding,
+                CHANNEL,
+                crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
+            )
+            .expect("compiler-installed final-domain producer resolves");
+        let request = execution::RuntimeFilterFinalDomainOpenRequest::new(
+            execution::RuntimeFilterProducerContract::new(
+                execution::RuntimeFilterBindingId::new(binding.get()),
+                execution::RuntimeFilterChannelId::new(CHANNEL.get()),
+                execution::RuntimeFilterProducerKind::FinalDomain,
+                resolved.execution_contract(),
+            ),
+            AGGREGATE_DOP as u32,
+        );
+        let execution::RuntimeFilterBindOutcome::Bound(completion) = context
+            .open_final_domain_completion(request)
+            .expect("compiler-installed aggregate completion capability opens")
+        else {
+            panic!("compiler-installed aggregate completion capability is available")
+        };
+        let session = AggregateFinalDomainSessionBuilder::new(completion, AGGREGATE_DOP, 4096)
             .expect("aggregate processor accepts the installed completion session");
         let factory = aggregate_factory(session);
         let drivers = (0..AGGREGATE_DOP)

@@ -590,6 +590,158 @@ impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
         };
         Ok(execution::RuntimeFilterBindOutcome::Bound(outcome))
     }
+
+    fn open_final_domain_completion(
+        &self,
+        request: execution::RuntimeFilterFinalDomainOpenRequest,
+    ) -> Result<
+        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterFinalDomainCompletionHandle>,
+        execution::RuntimeFilterContractViolation,
+    > {
+        let contract = request.contract();
+        if contract.kind() != execution::RuntimeFilterProducerKind::FinalDomain {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::RoleMismatch,
+                "final-domain completion requires a FinalDomain producer contract",
+            ));
+        }
+        let resolved = self
+            .resolve_producer(
+                BindingId::new(contract.binding_id().get()),
+                ChannelId::new(contract.channel_id().get()),
+                ProducerPortKind::FinalDomain,
+            )
+            .map_err(execution_violation)?;
+        if to_execution_contract(resolved.contract()) != *contract.contract() {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "final-domain execution contract does not match the installed route",
+            ));
+        }
+        let max_domain_canonical_bytes = resolved.max_contribution_bytes();
+        let session = match self.service.open_final_aggregate_producer(
+            resolved.binding_id,
+            self.fragment_instance_id,
+            request.local_partition_count(),
+        ) {
+            Ok(session) => session,
+            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                return Ok(execution::RuntimeFilterBindOutcome::Unavailable(
+                    execution::UnavailableReason::RouteUnavailable,
+                ));
+            }
+            Err(error) => return Err(execution_violation(error)),
+        };
+        Ok(execution::RuntimeFilterBindOutcome::Bound(Arc::new(
+            NativeExecutionFinalDomainCompletion {
+                session: Arc::new(session),
+                max_domain_canonical_bytes,
+            },
+        )))
+    }
+}
+
+struct NativeExecutionFinalDomainCompletion {
+    session: Arc<super::final_domain_completion::FinalDomainCompletionSession>,
+    max_domain_canonical_bytes: usize,
+}
+
+impl execution::RuntimeFilterFinalDomainCompletion for NativeExecutionFinalDomainCompletion {
+    fn membership_key_type(&self) -> DataType {
+        self.session.membership_key_type().clone()
+    }
+
+    fn max_domain_canonical_bytes(&self) -> usize {
+        self.max_domain_canonical_bytes
+    }
+
+    fn claim_partition(
+        &self,
+        partition: execution::PartitionId,
+    ) -> Result<
+        execution::RuntimeFilterFinalDomainPartitionHandle,
+        execution::RuntimeFilterContractViolation,
+    > {
+        self.session
+            .partition(crate::runtime_filter::port::identity::PartitionId::new(
+                partition.get(),
+            ))
+            .map(|committer| {
+                Box::new(NativeExecutionFinalDomainPartition {
+                    committer,
+                    expected_key_type: self.session.membership_key_type().clone(),
+                    max_domain_canonical_bytes: self.max_domain_canonical_bytes,
+                }) as execution::RuntimeFilterFinalDomainPartitionHandle
+            })
+            .map_err(execution_violation)
+    }
+
+    fn fail(
+        &self,
+        reason: execution::RuntimeFilterProducerFailure,
+    ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+    {
+        self.session
+            .fail(core_failure_reason(reason))
+            .map(execution_submit_outcome)
+            .map_err(execution_violation)
+    }
+}
+
+struct NativeExecutionFinalDomainPartition {
+    committer: super::final_domain_completion::FinalDomainPartitionCommitter,
+    expected_key_type: DataType,
+    max_domain_canonical_bytes: usize,
+}
+
+impl execution::RuntimeFilterFinalDomainPartition for NativeExecutionFinalDomainPartition {
+    fn seal(
+        &mut self,
+        payload: execution::RuntimeFilterFinalDomain,
+    ) -> Result<(), execution::RuntimeFilterContractViolation> {
+        if payload.canonical_bytes().len() > self.max_domain_canonical_bytes {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "final-domain payload exceeds the opened producer budget",
+            ));
+        }
+        let Some(domain) =
+            payload.downcast_ref::<crate::runtime_filter::port::value_domain::ValueDomainDelta>()
+        else {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::RoleMismatch,
+                "final-domain payload was not created by the native execution adapter",
+            ));
+        };
+        if !domain.matches_data_type(&self.expected_key_type) {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "final-domain payload type does not match the opened producer contract",
+            ));
+        }
+        let mut canonical = Vec::new();
+        domain
+            .encode_canonical_into(&mut canonical)
+            .map_err(|error| {
+                execution::RuntimeFilterContractViolation::new(
+                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                    error.to_string(),
+                )
+            })?;
+        if canonical.as_slice() != payload.canonical_bytes().as_ref() {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "final-domain canonical payload does not match its native value domain",
+            ));
+        }
+        self.committer
+            .seal(domain.clone())
+            .map_err(execution_violation)
+    }
+
+    fn close(&mut self) -> Result<(), execution::RuntimeFilterContractViolation> {
+        self.committer.close().map_err(execution_violation)
+    }
 }
 
 struct NativeExecutionProducerAdapter {
@@ -683,15 +835,7 @@ impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
         reason: execution::RuntimeFilterProducerFailure,
     ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
     {
-        let reason = match reason {
-            execution::RuntimeFilterProducerFailure::Cancelled => ProducerFailureReason::Cancelled,
-            execution::RuntimeFilterProducerFailure::ExecutionFailed => {
-                ProducerFailureReason::ExecutionFailed
-            }
-            execution::RuntimeFilterProducerFailure::UpstreamUnavailable => {
-                ProducerFailureReason::UpstreamUnavailable
-            }
-        };
+        let reason = core_failure_reason(reason);
         match &self.handle {
             ProducerHandle::Membership(adapter) => adapter.fail(reason),
             ProducerHandle::OrderedBound(adapter) => adapter.fail(reason),
@@ -700,6 +844,18 @@ impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
         }
         .map(execution_submit_outcome)
         .map_err(execution_violation)
+    }
+}
+
+fn core_failure_reason(reason: execution::RuntimeFilterProducerFailure) -> ProducerFailureReason {
+    match reason {
+        execution::RuntimeFilterProducerFailure::Cancelled => ProducerFailureReason::Cancelled,
+        execution::RuntimeFilterProducerFailure::ExecutionFailed => {
+            ProducerFailureReason::ExecutionFailed
+        }
+        execution::RuntimeFilterProducerFailure::UpstreamUnavailable => {
+            ProducerFailureReason::UpstreamUnavailable
+        }
     }
 }
 
