@@ -77,9 +77,11 @@ fn open_writer(
         "resolved connector execution binding has no write capability during sink materialization"
             .to_string()
     })?;
-    execution
+    let writer = execution
         .open_writer(request)
-        .map_err(|error| format!("open connector batch writer: {error}"))
+        .map_err(|error| format!("open connector batch writer: {error}"))?;
+    eprintln!("NOVAROCKS_CONNECTOR_WRITER_OPENED");
+    Ok(writer)
 }
 
 impl OperatorFactory for ConnectorWriteSinkFactory {

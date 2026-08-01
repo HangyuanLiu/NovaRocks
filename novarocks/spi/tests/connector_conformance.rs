@@ -25,18 +25,21 @@ use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::conformance::assert_batch_reader_contract;
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
-    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
-    ConnectorStatistics, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, StatisticsEvidence, StatisticsReadRequest,
+    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
+    ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType, ConnectorStaticPredicateId,
+    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral, ConnectorStatistics,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
 
@@ -271,6 +274,75 @@ fn control_binding_rejects_statistics_owned_by_another_generation() {
         )
         .err()
         .expect("a host must not attach foreign statistics")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+}
+
+struct OwnerDataMutation {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorDataMutation for OwnerDataMutation {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_mutation(
+        &self,
+        _: ConnectorDataMutationPlanningRequest,
+    ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
+        unreachable!("binding construction must not plan a mutation")
+    }
+
+    fn execute(
+        &self,
+        _: ConnectorDataMutationExecuteRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        unreachable!("binding construction must not execute a mutation")
+    }
+
+    fn reconcile(
+        &self,
+        _: ConnectorDataMutationReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+        unreachable!("binding construction must not reconcile a mutation")
+    }
+}
+
+#[test]
+fn control_binding_rejects_data_mutation_owned_by_another_generation() {
+    let descriptor = descriptor("file");
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let foreign = Arc::new(OwnerDataMutation {
+        descriptor: descriptor.clone(),
+        key: ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+        },
+    });
+    assert_eq!(
+        ConnectorControlBinding::try_new_with_data_mutation(
+            descriptor.clone(),
+            incarnation,
+            Arc::new(OwnerMetadata::new("file")),
+            Arc::new(OwnerPlanning {
+                instance_id: descriptor.instance_id.clone(),
+            }),
+            Arc::new(OwnerDistribution {
+                descriptor,
+                incarnation,
+            }),
+            None,
+            Some(foreign),
+        )
+        .err()
+        .expect("a host must not attach foreign data mutation")
         .kind(),
         ConnectorErrorKind::InvalidRequest
     );

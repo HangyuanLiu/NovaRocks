@@ -1295,17 +1295,6 @@ pub(crate) fn execute_truncate_table_statement(
             target.namespace, target.table
         ));
     }
-    let resolved_table = {
-        crate::connector::metadata_load_table(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?
-        .0
-    };
     crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
         state,
         &target,
@@ -1314,8 +1303,8 @@ pub(crate) fn execute_truncate_table_statement(
     crate::engine::iceberg_truncate::execute_iceberg_truncate_table(
         state,
         &target,
-        &resolved_table,
         target_ref,
+        connector_context,
     )
 }
 

@@ -469,6 +469,93 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorControlRegistry {
+    fn acquire_current_data_mutation(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active data mutation binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        test_data_mutation_lease(binding)
+    }
+
+    fn acquire_exact_data_mutation(
+        &self,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(&key.instance_id)
+            .filter(|binding| binding.incarnation() == key.incarnation)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector data mutation generation is unavailable",
+                )
+            })?;
+        test_data_mutation_lease(binding)
+    }
+}
+
+#[cfg(test)]
+fn test_data_mutation_lease(
+    binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
+) -> Result<
+    novarocks_spi::connector::ConnectorDataMutationLease,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let mutation = binding.data_mutation().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no data mutation capability",
+        )
+    })?;
+    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    novarocks_spi::connector::ConnectorDataMutationLease::new(
+        binding.descriptor().clone(),
+        key,
+        Arc::clone(binding.metadata()),
+        mutation,
+        || {},
+    )
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRegistry {
     fn acquire_current_write(
         &self,
@@ -1794,7 +1881,12 @@ impl StandaloneSession {
 
         // ALTER TABLE ... ADD FILES FROM '...'
         if looks_like_add_files(&normalized) {
-            return self.handle_add_files(&normalized, current_catalog, current_database);
+            return self.handle_add_files(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // Standard SQL: let sqlparser parse the full statement
@@ -2061,8 +2153,15 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
+        crate::engine::query_prep::add_files(
+            &self.inner,
+            sql,
+            current_catalog,
+            current_database,
+            connector_context,
+        )
     }
 
     fn handle_show_create_table(

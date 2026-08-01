@@ -1,5 +1,5 @@
 ---
-id: ADR-0018
+id: ADR-0023
 title: "Connector distributed writer contract"
 domain: [provider-spi, distributed-execution]
 status: active

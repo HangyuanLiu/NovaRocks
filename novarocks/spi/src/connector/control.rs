@@ -19,11 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteResolver,
+    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl,
+    ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -63,6 +64,7 @@ pub struct ConnectorControlBinding {
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
     mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+    data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
 }
@@ -132,6 +134,29 @@ impl ConnectorControlBinding {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_data_mutation(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_all_capabilities(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
@@ -139,6 +164,31 @@ impl ConnectorControlBinding {
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
         mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_all_capabilities(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            None,
+            write,
+            statistics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_capabilities(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
         write: Option<Arc<dyn ConnectorWriteControl>>,
         statistics: Option<Arc<dyn ConnectorStatistics>>,
     ) -> Result<Self, ConnectorError> {
@@ -161,6 +211,13 @@ impl ConnectorControlBinding {
                 ConnectorErrorKind::InvalidRequest,
                 "connector mutation capability owner does not match its control binding generation",
             ));
+        }
+        if let Some(data_mutation) = &data_mutation {
+            super::data_mutation::validate_data_mutation_owner(
+                &descriptor,
+                incarnation,
+                data_mutation.as_ref(),
+            )?;
         }
         if write.as_ref().is_some_and(|write| {
             write.binding_key().instance_id != descriptor.instance_id
@@ -185,6 +242,7 @@ impl ConnectorControlBinding {
             planning,
             distribution,
             mutation,
+            data_mutation,
             write,
             statistics,
         })
@@ -208,6 +266,10 @@ impl ConnectorControlBinding {
 
     pub fn mutation(&self) -> Option<&Arc<dyn ConnectorCatalogMutation>> {
         self.mutation.as_ref()
+    }
+
+    pub fn data_mutation(&self) -> Option<&Arc<dyn ConnectorDataMutation>> {
+        self.data_mutation.as_ref()
     }
 
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
@@ -254,6 +316,7 @@ pub trait ConnectorControlResolver: Send + Sync {
 pub trait ConnectorControlRegistry:
     ConnectorControlResolver
     + ConnectorCatalogMutationResolver
+    + ConnectorDataMutationResolver
     + ConnectorWriteResolver
     + ConnectorStatisticsResolver
 {

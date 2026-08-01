@@ -58,6 +58,7 @@ use super::scan_model::{
 pub(crate) struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
     expected_schema: SchemaRef,
+    name_mapping: Option<Arc<iceberg::spec::NameMapping>>,
     data_file_path: String,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
@@ -83,6 +84,39 @@ impl IcebergBatchReader {
         Self::try_new_with_equality_mode(
             file,
             physical_predicates,
+            None,
+            access,
+            request,
+            file_context,
+            false,
+            true,
+        )
+    }
+
+    pub(crate) fn try_new_with_name_mapping(
+        file: &IcebergDataFileInfo,
+        physical_predicates: &[IcebergPhysicalPredicate],
+        name_mapping: Option<&str>,
+        access: FsAccessHandle,
+        request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
+    ) -> Result<Self, ConnectorError> {
+        let name_mapping = name_mapping
+            .map(|mapping| {
+                serde_json::from_str(mapping)
+                    .map(Arc::new)
+                    .map_err(|error| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            format!("decode Iceberg split name mapping: {error}"),
+                        )
+                    })
+            })
+            .transpose()?;
+        Self::try_new_with_equality_mode(
+            file,
+            physical_predicates,
+            name_mapping,
             access,
             request,
             file_context,
@@ -100,7 +134,7 @@ impl IcebergBatchReader {
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_equality_mode(file, &[], access, request, file_context, true, true)
+        Self::try_new_with_equality_mode(file, &[], None, access, request, file_context, true, true)
     }
 
     /// Build one child of a multi-file delta reader.  The parent owns the
@@ -116,6 +150,7 @@ impl IcebergBatchReader {
         Self::try_new_with_equality_mode(
             file,
             &[],
+            None,
             access,
             request,
             file_context,
@@ -127,6 +162,7 @@ impl IcebergBatchReader {
     fn try_new_with_equality_mode(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
+        name_mapping: Option<Arc<iceberg::spec::NameMapping>>,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
@@ -181,6 +217,7 @@ impl IcebergBatchReader {
         Ok(Self {
             reader,
             expected_schema: request.expected_schema,
+            name_mapping,
             data_file_path: file.path.clone(),
             first_row_id: file.first_row_id,
             data_sequence_number: file.data_sequence_number,
@@ -265,8 +302,13 @@ impl ConnectorBatchReader for IcebergBatchReader {
         self.validate_context()?;
         match next {
             Some(file_batch) => {
+                let batch =
+                    apply_name_mapping_to_batch(file_batch.batch, self.name_mapping.as_deref())
+                        .map_err(|error| {
+                            ConnectorError::new(ConnectorErrorKind::CorruptData, error)
+                        })?;
                 let (batch, positions) = apply_delete_filters(
-                    file_batch.batch,
+                    batch,
                     file_batch.physical_row_positions,
                     &self.position_deletes,
                     &self.equality_deletes,
@@ -553,6 +595,165 @@ fn connector_metrics(metrics: FileMetricsSnapshot) -> ConnectorReaderMetricsSnap
         row_groups_pruned: metrics.row_groups_pruned,
         delayed_materialization_ranges: metrics.delayed_materialization_ranges,
     }
+}
+
+fn apply_name_mapping_to_batch(
+    batch: RecordBatch,
+    name_mapping: Option<&iceberg::spec::NameMapping>,
+) -> Result<RecordBatch, String> {
+    let (identified, total) = schema_field_id_coverage(&batch.schema())?;
+    if identified == total {
+        return Ok(batch);
+    }
+    if identified != 0 {
+        return Err("Iceberg data file mixes fields with and without field IDs".to_string());
+    }
+    let Some(name_mapping) = name_mapping else {
+        return Ok(batch);
+    };
+    let schema = apply_name_mapping_to_schema(&batch.schema(), name_mapping)?;
+    RecordBatch::try_new(schema, batch.columns().to_vec())
+        .map_err(|error| format!("apply Iceberg name mapping to batch schema: {error}"))
+}
+
+pub(super) fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usize), String> {
+    schema
+        .fields()
+        .iter()
+        .try_fold((0usize, 0usize), |(identified, total), field| {
+            let (field_identified, field_total) = field_id_coverage(field.as_ref())?;
+            Ok::<_, String>((identified + field_identified, total + field_total))
+        })
+}
+
+pub(super) fn apply_name_mapping_to_schema(
+    schema: &SchemaRef,
+    name_mapping: &iceberg::spec::NameMapping,
+) -> Result<SchemaRef, String> {
+    let mappings = name_mapping
+        .fields()
+        .iter()
+        .cloned()
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| map_field_id_recursive(field.as_ref(), &mappings))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+fn map_field_id_recursive(
+    field: &Field,
+    mappings: &[Arc<iceberg::spec::MappedField>],
+) -> Result<Field, String> {
+    let mapped = mapped_field_for_name(mappings, field.name())?;
+    let field_id = mapped.field_id().ok_or_else(|| {
+        format!(
+            "Iceberg name mapping entry for {} does not contain a field ID",
+            field.name()
+        )
+    })?;
+    let mut metadata = field.metadata().clone();
+    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|child| map_field_id_recursive(child.as_ref(), mapped.fields()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        ),
+        DataType::List(child) => DataType::List(Arc::new(map_field_id_recursive(
+            child.as_ref(),
+            mapped.fields(),
+        )?)),
+        DataType::LargeList(child) => DataType::LargeList(Arc::new(map_field_id_recursive(
+            child.as_ref(),
+            mapped.fields(),
+        )?)),
+        DataType::FixedSizeList(child, size) => DataType::FixedSizeList(
+            Arc::new(map_field_id_recursive(child.as_ref(), mapped.fields())?),
+            *size,
+        ),
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(entry_fields) = entries.data_type() else {
+                return Err(format!(
+                    "Iceberg mapped map field {} has non-struct entries",
+                    field.name()
+                ));
+            };
+            if entry_fields.len() != 2 {
+                return Err(format!(
+                    "Iceberg mapped map field {} must have key and value entries",
+                    field.name()
+                ));
+            }
+            let key = map_field_id_recursive(entry_fields[0].as_ref(), mapped.fields())?;
+            let value = map_field_id_recursive(entry_fields[1].as_ref(), mapped.fields())?;
+            let entries = Field::new(
+                entries.name(),
+                DataType::Struct(vec![key, value].into()),
+                entries.is_nullable(),
+            )
+            .with_metadata(entries.metadata().clone());
+            DataType::Map(Arc::new(entries), *sorted)
+        }
+        data_type => data_type.clone(),
+    };
+    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata))
+}
+
+fn mapped_field_for_name<'a>(
+    mappings: &'a [Arc<iceberg::spec::MappedField>],
+    name: &str,
+) -> Result<&'a iceberg::spec::MappedField, String> {
+    let mut matches = mappings
+        .iter()
+        .filter(|mapped| mapped.names().iter().any(|candidate| candidate == name));
+    let mapped = matches
+        .next()
+        .ok_or_else(|| format!("Iceberg name mapping does not contain physical field {name}"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "Iceberg name mapping contains duplicate aliases for physical field {name}"
+        ));
+    }
+    Ok(mapped)
+}
+
+fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
+    let identified = usize::from(parse_field_id(field)?.is_some());
+    let (children_identified, children_total) = match field.data_type() {
+        DataType::Struct(children) => {
+            children
+                .iter()
+                .try_fold((0usize, 0usize), |(identified, total), child| {
+                    let (child_identified, child_total) = field_id_coverage(child.as_ref())?;
+                    Ok::<_, String>((identified + child_identified, total + child_total))
+                })?
+        }
+        DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
+            field_id_coverage(child.as_ref())?
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(children) = entries.data_type() else {
+                return Err(format!("map field {} has non-struct entries", field.name()));
+            };
+            children
+                .iter()
+                .try_fold((0usize, 0usize), |(identified, total), child| {
+                    let (child_identified, child_total) = field_id_coverage(child.as_ref())?;
+                    Ok::<_, String>((identified + child_identified, total + child_total))
+                })?
+        }
+        _ => (0, 0),
+    };
+    Ok((identified + children_identified, 1 + children_total))
 }
 
 fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
@@ -908,6 +1109,81 @@ mod tests {
             PARQUET_FIELD_ID_META_KEY.to_string(),
             field_id.to_string(),
         )]))
+    }
+
+    #[test]
+    fn applies_name_mapping_recursively_to_reordered_nested_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "old_map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("old_key", DataType::Utf8, false),
+                                Field::new("old_value", DataType::Int32, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
+                "old_values",
+                DataType::List(Arc::new(Field::new("element_old", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "old_record",
+                DataType::Struct(vec![Field::new("old_nested", DataType::Int32, false)].into()),
+                false,
+            ),
+        ]));
+        let mapping: iceberg::spec::NameMapping = serde_json::from_str(
+            r#"[
+                {"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["old_nested"]}]},
+                {"field-id":3,"names":["old_values"],"fields":[{"field-id":4,"names":["element_old"]}]},
+                {"field-id":5,"names":["old_map"],"fields":[
+                    {"field-id":6,"names":["old_key"]},
+                    {"field-id":7,"names":["old_value"]}
+                ]}
+            ]"#,
+        )
+        .expect("mapping");
+
+        let mapped = apply_name_mapping_to_schema(&schema, &mapping).expect("recursive mapping");
+        assert_eq!(schema_field_id_coverage(&mapped).expect("coverage"), (7, 7));
+        assert_eq!(parse_field_id(mapped.field(0)).expect("map ID"), Some(5));
+        assert_eq!(parse_field_id(mapped.field(1)).expect("list ID"), Some(3));
+        assert_eq!(parse_field_id(mapped.field(2)).expect("struct ID"), Some(1));
+    }
+
+    #[test]
+    fn name_mapping_rejects_missing_nested_alias_and_mixed_ids_are_detected() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "old_record",
+            DataType::Struct(vec![Field::new("missing", DataType::Int32, false)].into()),
+            false,
+        )]));
+        let mapping: iceberg::spec::NameMapping = serde_json::from_str(
+            r#"[{"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["other"]}]}]"#,
+        )
+        .expect("mapping");
+        assert!(
+            apply_name_mapping_to_schema(&schema, &mapping)
+                .expect_err("nested mapping must be complete")
+                .contains("does not contain physical field missing")
+        );
+
+        let mixed = Arc::new(Schema::new(vec![
+            field_with_id("identified", 1, false),
+            Field::new("unidentified", DataType::Int32, false),
+        ]));
+        assert_eq!(schema_field_id_coverage(&mixed).expect("coverage"), (1, 2));
     }
 
     #[test]

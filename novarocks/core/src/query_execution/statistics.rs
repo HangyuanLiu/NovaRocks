@@ -269,7 +269,7 @@ pub(crate) fn prepare_statistics_connector_read(
             },
         )
         .map_err(connector_planning_error)?;
-    let splits = lease
+    let split_result = lease
         .binding()
         .planning()
         .plan_splits(
@@ -281,7 +281,7 @@ pub(crate) fn prepare_statistics_connector_read(
             },
         )
         .map_err(connector_planning_error)?;
-    if splits
+    if split_result
         .splits
         .iter()
         .any(|split| split.owner() != &lease.binding().descriptor().instance_id)
@@ -298,8 +298,8 @@ pub(crate) fn prepare_statistics_connector_read(
     Ok(PlannedConnectorRead {
         declaration,
         scan,
-        splits: splits.splits,
-        planning_metrics: splits.metrics,
+        splits: split_result.splits,
+        planning_metrics: split_result.metrics,
         static_predicates: Vec::new(),
         predicate_dispositions: Vec::new(),
         residual_predicates: Vec::new(),

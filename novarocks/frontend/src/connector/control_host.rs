@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, Weak};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver, ConnectorControlBinding,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorWriteLease,
-    ConnectorWriteResolver,
+    ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -49,8 +49,19 @@ struct ControlGeneration {
     state: ControlGenerationState,
     planning_leases: usize,
     mutation_leases: usize,
+    data_mutation_leases: usize,
     write_leases: usize,
     statistics_leases: usize,
+}
+
+impl ControlGeneration {
+    fn all_leases_released(&self) -> bool {
+        self.planning_leases == 0
+            && self.mutation_leases == 0
+            && self.data_mutation_leases == 0
+            && self.write_leases == 0
+            && self.statistics_leases == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +145,7 @@ impl ConnectorControlHost {
                 state: ControlGenerationState::Active,
                 planning_leases: 0,
                 mutation_leases: 0,
+                data_mutation_leases: 0,
                 write_leases: 0,
                 statistics_leases: 0,
             },
@@ -162,10 +174,8 @@ impl ConnectorControlHost {
             )
         })?;
         generation.state = ControlGenerationState::Retiring;
-        let retirement = (generation.planning_leases == 0
-            && generation.mutation_leases == 0
-            && generation.write_leases == 0
-            && generation.statistics_leases == 0)
+        let retirement = generation
+            .all_leases_released()
             .then(|| queue_retirement(&mut state, key))
             .flatten();
         drop(state);
@@ -234,7 +244,7 @@ impl ConnectorControlHost {
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         Ok(ConnectorControlPlanningLease::new(binding, move || {
-            release_planning_lease(&state, &retirement_sink, key);
+            release_lease(&state, &retirement_sink, key, LeaseKind::Planning);
         }))
     }
 
@@ -282,7 +292,73 @@ impl ConnectorControlHost {
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            release_mutation_lease(&state, &retirement_sink, key);
+            release_lease(&state, &retirement_sink, key, LeaseKind::Mutation);
+        })
+    }
+
+    fn acquire_current_data_mutation(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        let key = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
+        };
+        self.acquire_data_mutation(&key, true)
+    }
+
+    fn acquire_exact_data_mutation(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        self.acquire_data_mutation(key, false)
+    }
+
+    fn acquire_data_mutation(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+        require_active: bool,
+    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        let (descriptor, metadata, mutation) = {
+            let mut state = self.lock_state()?;
+            let generation = state.generations.get_mut(key).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "connector control generation is not registered",
+                )
+            })?;
+            if require_active && generation.state != ControlGenerationState::Active {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
+            }
+            let mutation = generation.binding.data_mutation().cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no data mutation capability",
+                )
+            })?;
+            generation.data_mutation_leases = generation.data_mutation_leases.saturating_add(1);
+            (
+                generation.binding.descriptor().clone(),
+                Arc::clone(generation.binding.metadata()),
+                mutation,
+            )
+        };
+        let state = Arc::downgrade(&self.state);
+        let retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let lease_key = key.clone();
+        ConnectorDataMutationLease::new(descriptor, key.clone(), metadata, mutation, move || {
+            release_lease(&state, &retirement_sink, lease_key, LeaseKind::DataMutation);
         })
     }
 
@@ -329,7 +405,7 @@ impl ConnectorControlHost {
             key.clone(),
             write,
             distribution,
-            move || release_write_lease(&state, &retirement_sink, key),
+            move || release_lease(&state, &retirement_sink, key, LeaseKind::Write),
         )
     }
 
@@ -377,7 +453,7 @@ impl ConnectorControlHost {
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
-            release_statistics_lease(&state, &retirement_sink, key);
+            release_lease(&state, &retirement_sink, key, LeaseKind::Statistics);
         })
     }
 
@@ -425,6 +501,22 @@ impl ConnectorCatalogMutationResolver for ConnectorControlHost {
     }
 }
 
+impl ConnectorDataMutationResolver for ConnectorControlHost {
+    fn acquire_current_data_mutation(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        Self::acquire_current_data_mutation(self, instance_id)
+    }
+
+    fn acquire_exact_data_mutation(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        Self::acquire_exact_data_mutation(self, key)
+    }
+}
+
 impl ConnectorWriteResolver for ConnectorControlHost {
     fn acquire_current_write(
         &self,
@@ -453,10 +545,20 @@ impl ConnectorControlRegistry for ConnectorControlHost {
     }
 }
 
-fn release_planning_lease(
+#[derive(Clone, Copy)]
+enum LeaseKind {
+    Planning,
+    Mutation,
+    DataMutation,
+    Write,
+    Statistics,
+}
+
+fn release_lease(
     state: &Weak<Mutex<ControlHostState>>,
     retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     key: ConnectorExecutionBindingKey,
+    kind: LeaseKind,
 ) {
     let Some(host_state) = state.upgrade() else {
         return;
@@ -467,16 +569,31 @@ fn release_planning_lease(
     let Some(generation) = state.generations.get_mut(&key) else {
         return;
     };
-    generation.planning_leases = generation.planning_leases.saturating_sub(1);
+    match kind {
+        LeaseKind::Planning => {
+            generation.planning_leases = generation.planning_leases.saturating_sub(1);
+        }
+        LeaseKind::Mutation => {
+            generation.mutation_leases = generation.mutation_leases.saturating_sub(1);
+        }
+        LeaseKind::DataMutation => {
+            generation.data_mutation_leases = generation.data_mutation_leases.saturating_sub(1);
+        }
+        LeaseKind::Write => {
+            generation.write_leases = generation.write_leases.saturating_sub(1);
+        }
+        LeaseKind::Statistics => {
+            generation.statistics_leases = generation.statistics_leases.saturating_sub(1);
+        }
+    }
     let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.planning_leases == 0
-        && generation.mutation_leases == 0
-        && generation.write_leases == 0
-        && generation.statistics_leases == 0)
-        .then(|| queue_retirement(&mut state, key))
-        .flatten();
+        && generation.all_leases_released())
+    .then(|| queue_retirement(&mut state, key))
+    .flatten();
     drop(state);
-    let Some(retirement) = retirement else { return };
+    let Some(retirement) = retirement else {
+        return;
+    };
     let Some(slot) = retirement_sink.upgrade() else {
         return;
     };
@@ -490,129 +607,6 @@ fn release_planning_lease(
     } else if let Ok(mut state) = host_state.lock() {
         // See ConnectorControlHost::dispatch_retirement: keep the sink lock
         // while publishing the fallback queue entry.
-        state.ready_retires.push(retirement);
-    }
-}
-
-fn release_write_lease(
-    state: &Weak<Mutex<ControlHostState>>,
-    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
-    key: ConnectorExecutionBindingKey,
-) {
-    let Some(host_state) = state.upgrade() else {
-        return;
-    };
-    let Ok(mut state) = host_state.lock() else {
-        return;
-    };
-    let Some(generation) = state.generations.get_mut(&key) else {
-        return;
-    };
-    generation.write_leases = generation.write_leases.saturating_sub(1);
-    let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.planning_leases == 0
-        && generation.mutation_leases == 0
-        && generation.write_leases == 0
-        && generation.statistics_leases == 0)
-        .then(|| queue_retirement(&mut state, key))
-        .flatten();
-    drop(state);
-    let Some(retirement) = retirement else {
-        return;
-    };
-    let Some(slot) = retirement_sink.upgrade() else {
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        return;
-    };
-    let sink = slot.clone();
-    if let Some(sink) = sink {
-        drop(slot);
-        sink.retire(retirement);
-    } else if let Ok(mut state) = host_state.lock() {
-        state.ready_retires.push(retirement);
-    }
-}
-
-fn release_mutation_lease(
-    state: &Weak<Mutex<ControlHostState>>,
-    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
-    key: ConnectorExecutionBindingKey,
-) {
-    let Some(host_state) = state.upgrade() else {
-        return;
-    };
-    let Ok(mut state) = host_state.lock() else {
-        return;
-    };
-    let Some(generation) = state.generations.get_mut(&key) else {
-        return;
-    };
-    generation.mutation_leases = generation.mutation_leases.saturating_sub(1);
-    let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.planning_leases == 0
-        && generation.mutation_leases == 0
-        && generation.write_leases == 0
-        && generation.statistics_leases == 0)
-        .then(|| queue_retirement(&mut state, key))
-        .flatten();
-    drop(state);
-    let Some(retirement) = retirement else {
-        return;
-    };
-    let Some(slot) = retirement_sink.upgrade() else {
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        return;
-    };
-    let sink = slot.clone();
-    if let Some(sink) = sink {
-        drop(slot);
-        sink.retire(retirement);
-    } else if let Ok(mut state) = host_state.lock() {
-        state.ready_retires.push(retirement);
-    }
-}
-
-fn release_statistics_lease(
-    state: &Weak<Mutex<ControlHostState>>,
-    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
-    key: ConnectorExecutionBindingKey,
-) {
-    let Some(host_state) = state.upgrade() else {
-        return;
-    };
-    let Ok(mut state) = host_state.lock() else {
-        return;
-    };
-    let Some(generation) = state.generations.get_mut(&key) else {
-        return;
-    };
-    generation.statistics_leases = generation.statistics_leases.saturating_sub(1);
-    let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.planning_leases == 0
-        && generation.mutation_leases == 0
-        && generation.write_leases == 0
-        && generation.statistics_leases == 0)
-        .then(|| queue_retirement(&mut state, key))
-        .flatten();
-    drop(state);
-    let Some(retirement) = retirement else {
-        return;
-    };
-    let Some(slot) = retirement_sink.upgrade() else {
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        return;
-    };
-    let sink = slot.clone();
-    if let Some(sink) = sink {
-        drop(slot);
-        sink.retire(retirement);
-    } else if let Ok(mut state) = host_state.lock() {
         state.ready_retires.push(retirement);
     }
 }

@@ -339,6 +339,18 @@ pub(crate) fn execute(
             let (commit, abort) = report.into_payloads();
             parts.completion.write(result, commit, abort)
         }
+        DistributedQueryIntent::Statistics => {
+            let program = parts
+                .statistics_program
+                .as_ref()
+                .ok_or_else(|| failed("statistics execution lost its typed collection program"))?;
+            let result = program.finish_fragment_payloads(
+                terminal_facts
+                    .iter()
+                    .map(|fragment| fragment.statistics_payload()),
+            )?;
+            parts.completion.statistics(program, result)
+        }
     };
     running.clear();
     outcome
