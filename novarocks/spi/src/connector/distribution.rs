@@ -163,8 +163,7 @@ mod tests {
                 MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES + 1
             ]),
         )
-        .err()
-        .expect("oversized declaration must fail");
+        .expect_err("oversized declaration must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
     }
 

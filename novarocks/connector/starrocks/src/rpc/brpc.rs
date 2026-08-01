@@ -314,10 +314,12 @@ fn decode_values(
     let count = if binding.is_const { 1 } else { rows };
     let mut values = raw_values(cursor, &binding.data_type, count)?;
     if binding.is_const {
-        values = std::iter::repeat(values.into_iter().next().ok_or_else(|| {
-            ConnectorError::new(ConnectorErrorKind::CorruptData, "empty constant column")
-        })?)
-        .take(rows)
+        values = std::iter::repeat_n(
+            values.into_iter().next().ok_or_else(|| {
+                ConnectorError::new(ConnectorErrorKind::CorruptData, "empty constant column")
+            })?,
+            rows,
+        )
         .collect();
     }
     for (value, null) in values.iter_mut().zip(nulls) {
@@ -427,7 +429,7 @@ fn fixed_width<F: Fn(&[u8]) -> Value>(
         return corrupt();
     }
     let data = cursor.split_to(size);
-    Ok(data.chunks_exact(width).map(|v| map(v)).collect())
+    Ok(data.chunks_exact(width).map(map).collect())
 }
 fn array(
     binding: &StarRocksRpcOutputBinding,

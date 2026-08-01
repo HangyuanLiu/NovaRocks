@@ -13,8 +13,8 @@ pub use codec::{StarRocksRpcOutputBinding, StarRocksRpcSplit};
 pub(crate) use codec::{decode_rpc_split, encode_rpc_split};
 pub use flight::{StarRocksArrowFlightClient, StarRocksArrowFlightStream, StarRocksFlightReader};
 pub use http::{
-    StarRocksHttpTransport, StarRocksRemoteControlClient, StarRocksRemoteControlConfig,
-    StarRocksRemoteMetadataSource, StarRocksRemoteScanPlanner,
+    StarRocksHttpRequest, StarRocksHttpTransport, StarRocksRemoteControlClient,
+    StarRocksRemoteControlConfig, StarRocksRemoteMetadataSource, StarRocksRemoteScanPlanner,
 };
 
 use std::fmt;

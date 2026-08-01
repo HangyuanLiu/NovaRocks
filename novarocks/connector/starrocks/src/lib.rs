@@ -55,10 +55,10 @@ pub use execution::{
 };
 pub use rpc::{
     StarRocksArrowFlightClient, StarRocksArrowFlightStream, StarRocksBrpcTransport,
-    StarRocksFlightReader, StarRocksHttpTransport, StarRocksRemoteControlClient,
-    StarRocksRemoteControlConfig, StarRocksRemoteEndpoint, StarRocksRemoteMetadataSource,
-    StarRocksRemoteRpcReaderFactory, StarRocksRemoteScanPlanner, StarRocksRpcOutputBinding,
-    StarRocksRpcSplit,
+    StarRocksFlightReader, StarRocksHttpRequest, StarRocksHttpTransport,
+    StarRocksRemoteControlClient, StarRocksRemoteControlConfig, StarRocksRemoteEndpoint,
+    StarRocksRemoteMetadataSource, StarRocksRemoteRpcReaderFactory, StarRocksRemoteScanPlanner,
+    StarRocksRpcOutputBinding, StarRocksRpcSplit,
 };
 
 pub const STARROCKS_PROVIDER_ID: &str = "starrocks";

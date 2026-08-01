@@ -89,17 +89,18 @@ impl fmt::Debug for StarRocksRemoteControlConfig {
     }
 }
 
+pub struct StarRocksHttpRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a Url,
+    pub body: Option<&'a [u8]>,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub timeout: Duration,
+    pub context: &'a ConnectorRequestContext,
+}
+
 pub trait StarRocksHttpTransport: Send + Sync {
-    fn request(
-        &self,
-        method: &str,
-        url: &Url,
-        body: Option<&[u8]>,
-        username: &str,
-        password: &str,
-        timeout: Duration,
-        context: &ConnectorRequestContext,
-    ) -> Result<Bytes, ConnectorError>;
+    fn request(&self, request: StarRocksHttpRequest<'_>) -> Result<Bytes, ConnectorError>;
 }
 
 pub struct StarRocksReqwestHttpTransport {
@@ -118,34 +119,29 @@ impl StarRocksReqwestHttpTransport {
     }
 }
 impl StarRocksHttpTransport for StarRocksReqwestHttpTransport {
-    fn request(
-        &self,
-        method: &str,
-        url: &Url,
-        body: Option<&[u8]>,
-        username: &str,
-        password: &str,
-        timeout: Duration,
-        context: &ConnectorRequestContext,
-    ) -> Result<Bytes, ConnectorError> {
-        active(context)?;
-        let method = reqwest::Method::from_bytes(method.as_bytes())
+    fn request(&self, request: StarRocksHttpRequest<'_>) -> Result<Bytes, ConnectorError> {
+        active(request.context)?;
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| invalid("invalid HTTP method"))?;
-        let mut request = self
+        let mut builder = self
             .client
-            .request(method, url.clone())
-            .timeout(timeout)
+            .request(method, request.url.clone())
+            .timeout(request.timeout)
             .basic_auth(
-                username.split('@').next().unwrap_or(username),
-                Some(password),
+                request
+                    .username
+                    .split('@')
+                    .next()
+                    .unwrap_or(request.username),
+                Some(request.password),
             )
             .header(reqwest::header::ACCEPT, "application/json");
-        if let Some(body) = body {
-            request = request
+        if let Some(body) = request.body {
+            builder = builder
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body.to_vec());
         }
-        let response = request.send().map_err(|_| {
+        let response = builder.send().map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::Unavailable,
                 "StarRocks remote control request failed",
@@ -157,7 +153,7 @@ impl StarRocksHttpTransport for StarRocksReqwestHttpTransport {
                 "read StarRocks remote control response",
             )
         })?;
-        if bytes.len() > context.max_total_payload_bytes() {
+        if bytes.len() > request.context.max_total_payload_bytes() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "StarRocks remote control response exceeds payload budget",
@@ -220,15 +216,15 @@ impl StarRocksRemoteControlClient {
                     .min(context.deadline().saturating_duration_since(Instant::now()));
                 match self
                     .transport
-                    .request(
+                    .request(StarRocksHttpRequest {
                         method,
-                        &url,
-                        body.as_deref(),
-                        &self.config.username,
-                        &self.config.password,
+                        url: &url,
+                        body: body.as_deref(),
+                        username: &self.config.username,
+                        password: &self.config.password,
                         timeout,
                         context,
-                    )
+                    })
                     .and_then(|bytes| {
                         serde_json::from_slice(&bytes).map_err(|_| {
                             ConnectorError::new(
@@ -642,18 +638,12 @@ mod tests {
     }
 
     impl StarRocksHttpTransport for Transport {
-        fn request(
-            &self,
-            _: &str,
-            url: &Url,
-            _: Option<&[u8]>,
-            _: &str,
-            _: &str,
-            _: Duration,
-            _: &ConnectorRequestContext,
-        ) -> Result<Bytes, ConnectorError> {
-            self.paths.lock().expect("paths").push(url.to_string());
-            let response = if url.path().ends_with("/tables") {
+        fn request(&self, request: StarRocksHttpRequest<'_>) -> Result<Bytes, ConnectorError> {
+            self.paths
+                .lock()
+                .expect("paths")
+                .push(request.url.to_string());
+            let response = if request.url.path().ends_with("/tables") {
                 r#"{"status":200,"values":["t"]}"#
             } else {
                 r#"{"status":200}"#
@@ -689,19 +679,11 @@ mod tests {
 
     struct PlanningTransport;
     impl StarRocksHttpTransport for PlanningTransport {
-        fn request(
-            &self,
-            _: &str,
-            url: &Url,
-            body: Option<&[u8]>,
-            _: &str,
-            _: &str,
-            _: Duration,
-            _: &ConnectorRequestContext,
-        ) -> Result<Bytes, ConnectorError> {
-            let response = if url.path().ends_with("/prepare_scan") {
+        fn request(&self, request: StarRocksHttpRequest<'_>) -> Result<Bytes, ConnectorError> {
+            let response = if request.url.path().ends_with("/prepare_scan") {
                 let body: serde_json::Value =
-                    serde_json::from_slice(body.expect("prepare body")).expect("valid JSON");
+                    serde_json::from_slice(request.body.expect("prepare body"))
+                        .expect("valid JSON");
                 let session_id = body["session_id"].as_str().expect("session ID");
                 format!(
                     r#"{{"status":200,"session_id":"{session_id}","streams":[{{"scan_token":"query-token","remote_be":{{"host":"be.example","port":8040}},"transport":"brpc_chunk"}}],"outputs":[{{"output_index":0,"remote_slot_id":1,"name":"value","actual_wire_type":"BIGINT","nullable":false,"is_const":false,"wire_shape":"DATA"}}]}}"#
