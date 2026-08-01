@@ -374,14 +374,30 @@ impl SqlCompiler {
             })
             .unwrap_or_default();
         request.check_control()?;
-        let optimized_tree = crate::sql::optimizer::optimize(
-            optimizer_expr,
-            scalar_arena,
-            &statistics.snapshot,
-            factory,
-            mv_candidates,
-            &settings,
-        )
+        let root_distribution = match &request.intent {
+            SqlCompileIntent::IcebergWrite { root_distribution } => {
+                resolve_root_distribution_requirement(&logical_plan, root_distribution)?
+            }
+            _ => None,
+        };
+        let optimized_tree = match root_distribution {
+            Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
+                optimizer_expr,
+                scalar_arena,
+                &statistics.snapshot,
+                factory,
+                root_distribution,
+                &settings,
+            ),
+            None => crate::sql::optimizer::optimize(
+                optimizer_expr,
+                scalar_arena,
+                &statistics.snapshot,
+                factory,
+                mv_candidates,
+                &settings,
+            ),
+        }
         .map_err(SqlCompileError::Compilation)?;
         request.check_control()?;
 
@@ -445,6 +461,48 @@ fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, S
             "SQL compiler requires a query statement after application preprocessing".to_string(),
         )),
     }
+}
+
+fn resolve_root_distribution_requirement(
+    logical_plan: &crate::sql::planner::logical::LogicalPlanNode,
+    requirement: &RootDistributionRequirement,
+) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, SqlCompileError> {
+    let output_columns = crate::sql::planner::plan_output_columns(logical_plan)
+        .map_err(SqlCompileError::Compilation)?;
+    let column = match requirement {
+        RootDistributionRequirement::Any => return Ok(None),
+        RootDistributionRequirement::ShuffleOutputOrdinal(index) => {
+            output_columns.get(*index).ok_or_else(|| {
+                SqlCompileError::InvalidRequest(format!(
+                    "cannot derive Iceberg write root shuffle: output column index {index} out of range ({} columns)",
+                    output_columns.len()
+                ))
+            })?
+        }
+        RootDistributionRequirement::ShuffleOutputName(name) => {
+            let mut matches = output_columns.iter().filter(|column| column.name == *name);
+            let column = matches.next().ok_or_else(|| {
+                SqlCompileError::InvalidRequest(format!(
+                    "cannot derive Iceberg write root shuffle: output column '{name}' not found"
+                ))
+            })?;
+            if matches.next().is_some() {
+                return Err(SqlCompileError::InvalidRequest(format!(
+                    "cannot derive Iceberg write root shuffle: output column '{name}' is ambiguous"
+                )));
+            }
+            column
+        }
+    };
+    if column.column_id == crate::sql::column_id::ColumnId::UNSET {
+        return Err(SqlCompileError::InvalidRequest(format!(
+            "cannot derive Iceberg write root shuffle: output column '{}' has no ColumnId",
+            column.name
+        )));
+    }
+    Ok(Some(
+        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([column.column_id]),
+    ))
 }
 
 fn collect_statistics(
@@ -626,6 +684,38 @@ mod tests {
         assert!(matches!(
             SqlCompiler::compile(request),
             Ok(SqlCompileOutput::Distributed(_))
+        ));
+    }
+
+    #[test]
+    fn sqlx1_kernel_write_root_requirement_is_validated_in_sql() {
+        let catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = QueryCancellationSource::new();
+        let request = SqlCompileRequest::new(
+            SqlStatementInput::Sql("select 1 as payload".to_string()),
+            SqlCompileIntent::IcebergWrite {
+                root_distribution: RootDistributionRequirement::ShuffleOutputName(
+                    "missing".to_string(),
+                ),
+            },
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
+            },
+            &catalog_snapshot,
+            &STATISTICS,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            None,
+            SqlCompileControl::new(None, cancellation.view()),
+        );
+        assert!(matches!(
+            SqlCompiler::compile(request),
+            Err(SqlCompileError::InvalidRequest(error)) if error.contains("output column 'missing' not found")
         ));
     }
 }

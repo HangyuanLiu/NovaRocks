@@ -4042,64 +4042,16 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
     )
 }
 
-pub(crate) type IcebergWriteRootDistributionResolver = Box<
-    dyn FnOnce(
-        &crate::sql::planner::logical::LogicalPlanNode,
-    ) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String>,
->;
-
-#[allow(dead_code)]
 pub(crate) fn iceberg_write_shuffle_by_output_name(
     output_name: impl Into<String>,
-) -> IcebergWriteRootDistributionResolver {
-    let output_name = output_name.into();
-    Box::new(move |logical| {
-        let output_columns = crate::sql::planner::plan_output_columns(logical)?;
-        let mut matches = output_columns
-            .iter()
-            .filter(|column| column.name == output_name);
-        let column = matches.next().ok_or_else(|| {
-            format!(
-                "cannot derive Iceberg write root shuffle: output column '{output_name}' not found"
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "cannot derive Iceberg write root shuffle: output column '{output_name}' is ambiguous"
-            ));
-        }
-        iceberg_write_shuffle_for_output_column(column)
-    })
+) -> crate::sql::compiler::RootDistributionRequirement {
+    crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
 }
 
-#[allow(dead_code)]
 pub(crate) fn iceberg_write_shuffle_by_output_index(
     output_index: usize,
-) -> IcebergWriteRootDistributionResolver {
-    Box::new(move |logical| {
-        let output_columns = crate::sql::planner::plan_output_columns(logical)?;
-        let column = output_columns.get(output_index).ok_or_else(|| {
-            format!(
-                "cannot derive Iceberg write root shuffle: output column index {output_index} out of range ({} columns)",
-                output_columns.len()
-            )
-        })?;
-        iceberg_write_shuffle_for_output_column(column)
-    })
-}
-
-fn iceberg_write_shuffle_for_output_column(
-    column: &crate::sql::analysis::OutputColumn,
-) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String> {
-    if column.column_id == crate::sql::column_id::ColumnId::UNSET {
-        return Err(format!(
-            "cannot derive Iceberg write root shuffle: output column '{}' has no ColumnId",
-            column.name
-        ));
-    }
-    Ok(Some(
-        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([column.column_id]),
-    ))
+) -> crate::sql::compiler::RootDistributionRequirement {
+    crate::sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4110,7 +4062,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
-    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     // This public write helper is also used by non-session transaction executors,
@@ -4126,7 +4078,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         query,
         sink_spec,
         query_opts,
-        root_distribution_resolver,
+        root_distribution,
         execution,
         &connector_context,
         None,
@@ -4141,7 +4093,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
-    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
@@ -4153,7 +4105,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         query,
         sink_spec,
         query_opts,
-        root_distribution_resolver,
+        root_distribution,
         execution,
         connector_context,
         connector_write.map(DistributedConnectorWrite::Begin),
@@ -4168,7 +4120,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
-    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
@@ -4180,7 +4132,7 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
         query,
         sink_spec,
         query_opts,
-        root_distribution_resolver,
+        root_distribution,
         execution,
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
@@ -4200,12 +4152,20 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     query: &sqlparser::ast::Query,
     sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
     query_opts: Option<QueryOptions>,
-    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let optimizer_settings = optimizer_settings_for_execution(execution);
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -4226,11 +4186,6 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     }
 
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
@@ -4239,41 +4194,41 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         TableLookupMode::SchemaOnly,
     );
 
-    let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(&prepared, &analyzer_provider, current_database)?;
-    let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let root_distribution = match root_distribution_resolver {
-        Some(resolve_root_distribution) => resolve_root_distribution(&logical_plan)?,
-        None => None,
-    };
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical_plan,
-        &mut scalar_arena,
-    )?;
-    let providers = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+    let table_bindings = analyzer_provider.query_table_bindings();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
         state,
-        analyzer_provider.statistics_pins(),
+        table_bindings.clone(),
     );
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    let optimized_tree = match root_distribution {
-        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
-            optimizer_expr,
-            scalar_arena,
-            &query_stats.snapshot,
-            factory,
-            root_distribution,
-            &optimizer_settings,
-        )?,
-        None => crate::sql::optimizer::optimize(
-            optimizer_expr,
-            scalar_arena,
-            &query_stats.snapshot,
-            factory,
-            Vec::new(),
-            &optimizer_settings,
-        )?,
+    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "Iceberg write requires a non-empty admitted backend topology".to_string()
+        })?;
+    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(prepared.to_string()),
+        crate::sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        &catalog_snapshot,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        None,
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            execution.cancellation().clone(),
+        ),
+    );
+    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(compiler_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
     };
+    let optimized_tree = compiled.optimized_tree;
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
     let writer_input = if connector_write.is_some()
         && matches!(
@@ -4301,7 +4256,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &distributed_plan,
         state.connector_control.as_ref(),
         &connector_context,
-        Some(analyzer_provider.query_table_bindings().as_ref()),
+        Some(table_bindings.as_ref()),
         None,
         scan_preparation_options(&optimizer_settings),
     )?;
@@ -4309,14 +4264,6 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &distributed_plan,
         &prepared,
     )?;
-    let maintenance_execution;
-    let execution = match execution {
-        Some(execution) => execution,
-        None => {
-            maintenance_execution = capture_maintenance_execution(state)?;
-            &maintenance_execution
-        }
-    };
     execute_distributed_write_with_execution(
         &state.query_execution,
         prepared,
@@ -10163,7 +10110,14 @@ path = "meta/operations.sqlite"
         );
 
         let result = super::execute_query_as_iceberg_write(
-            &state, None, "default", &query, sink_spec, None, None, None,
+            &state,
+            None,
+            "default",
+            &query,
+            sink_spec,
+            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
+            None,
         );
 
         let err = result.expect_err("default state should fail before executing the sink");
@@ -10174,55 +10128,17 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
-    fn iceberg_write_root_shuffle_by_output_name_uses_logical_output_column_id() {
-        use crate::sql::catalog::PlannerTableProvider;
-        use crate::sql::column_id::ColumnId;
-        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
-
-        struct EmptyCatalog;
-        impl PlannerTableProvider for EmptyCatalog {
-            fn resolve_table_for_analysis(
-                &self,
-                _catalog: Option<&str>,
-                _database: &str,
-                table: &str,
-            ) -> Result<crate::sql::catalog::ResolvedAnalyzerTable, String> {
-                Err(format!("table not found: {table}"))
-            }
-        }
-
-        let stmt = crate::sql::parser::parse_sql_raw("SELECT 1 AS payload, 'file-a' AS _file")
-            .expect("parse query");
-        let sqlparser::ast::Statement::Query(query) = stmt else {
-            panic!("expected query statement");
-        };
-        let (resolved, cte_registry, mut factory) =
-            crate::sql::analyzer::analyze(&query, &EmptyCatalog, "default").expect("analyze query");
-        let logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
-            .expect("plan query");
-        let planned_file_col = crate::sql::planner::plan_output_columns(&logical_plan)
-            .expect("planned output columns")
-            .into_iter()
-            .find(|column| column.name == "_file")
-            .expect("planned _file output")
-            .column_id;
-        assert_ne!(planned_file_col, ColumnId::UNSET);
-
-        let distribution = super::iceberg_write_shuffle_by_output_name("_file")(&logical_plan)
-            .expect("resolve root distribution")
-            .expect("root distribution");
-
-        match distribution {
-            DistributionSpec::HashPartitioned { cols, source } => {
-                assert_eq!(cols, vec![planned_file_col]);
-                assert_eq!(source, HashSource::ShuffleAgg);
-            }
-            other => panic!("expected shuffle distribution, got {other:?}"),
-        }
+    fn iceberg_write_root_shuffle_by_output_name_is_a_typed_sql_requirement() {
+        assert_eq!(
+            super::iceberg_write_shuffle_by_output_name("_file"),
+            crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(
+                "_file".to_string()
+            )
+        );
     }
 
     #[test]
-    fn execute_query_as_iceberg_write_invokes_root_distribution_resolver_after_planning() {
+    fn execute_query_as_iceberg_write_requires_admitted_topology() {
         let query = parse_query_for_engine_test("SELECT 1 AS payload, 'file-a' AS _file");
         let mut state = StandaloneState::default();
         state.exchange_port = 1;
@@ -10240,28 +10156,19 @@ path = "meta/operations.sqlite"
             &query,
             sink_spec,
             None,
-            Some(Box::new(|logical| {
-                let saw_file_output = crate::sql::planner::plan_output_columns(logical)?
-                    .into_iter()
-                    .any(|column| {
-                        column.name == "_file"
-                            && column.column_id != crate::sql::column_id::ColumnId::UNSET
-                    });
-                if !saw_file_output {
-                    return Err("resolver did not see planned _file output".to_string());
-                }
-                Err("resolver saw planned _file output".to_string())
-            })),
+            crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(
+                "missing".to_string(),
+            ),
             None,
         );
 
         let err = match result {
-            Ok(_) => panic!("resolver error should stop write planning before execution"),
+            Ok(_) => panic!("write without admission topology should not execute"),
             Err(err) => err,
         };
         assert!(
-            err.contains("resolver saw planned _file output"),
-            "expected resolver error, got: {err}"
+            err.contains("non-empty admitted backend topology"),
+            "expected admission error, got: {err}"
         );
     }
 
