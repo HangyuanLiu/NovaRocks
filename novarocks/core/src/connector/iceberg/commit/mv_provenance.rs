@@ -368,7 +368,7 @@ mod spike_tests {
     use uuid::Uuid;
 
     use crate::connector::iceberg::commit::test_helpers::{
-        IcebergTestFixture, v3_table_with_n_data_files,
+        IcebergTestFixture, empty_v3_iceberg_table, v3_table_with_n_data_files,
     };
 
     const SPIKE_PROP: &str = "novarocks.spike";
@@ -494,6 +494,67 @@ mod spike_tests {
         assert_eq!(
             data_after, data_before,
             "data-free append must preserve existing data files"
+        );
+    }
+
+    /// A newly-created MV target has no current snapshot, so a staging branch
+    /// cannot yet be created. This establishes the narrow storage primitive
+    /// needed by a future provider-owned CREATE-MV bootstrap: a data-free
+    /// append with a non-empty summary can create the first snapshot without
+    /// adding user rows or data files.
+    #[tokio::test]
+    async fn candidate_a_empty_fast_append_bootstraps_empty_table() {
+        let fixture = empty_v3_iceberg_table().await;
+        let catalog = fixture.catalog.clone();
+        assert!(
+            fixture.table.metadata().current_snapshot().is_none(),
+            "fixture must model a newly created MV target"
+        );
+
+        let table = catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload empty target before bootstrap");
+        let mut props = HashMap::new();
+        props.insert("novarocks.mv.bootstrap.v1".to_string(), "1".to_string());
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .set_snapshot_properties(props)
+            .set_commit_uuid(Uuid::new_v4());
+        let tx = action
+            .apply(tx)
+            .expect("apply empty-target bootstrap append");
+        tx.commit(catalog.as_ref())
+            .await
+            .expect("empty-target bootstrap append must commit");
+
+        let reloaded = catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload empty target after bootstrap");
+        let snapshot = reloaded
+            .metadata()
+            .current_snapshot()
+            .expect("bootstrap must create a current snapshot");
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get("novarocks.mv.bootstrap.v1")
+                .map(String::as_str),
+            Some("1"),
+            "bootstrap marker must survive catalog reload"
+        );
+        assert_eq!(
+            snapshot.summary().operation,
+            Operation::Append,
+            "bootstrap must be a data-free append snapshot"
+        );
+        assert_eq!(
+            live_data_file_count(&reloaded).await,
+            0,
+            "bootstrap must not create user data files"
         );
     }
 
