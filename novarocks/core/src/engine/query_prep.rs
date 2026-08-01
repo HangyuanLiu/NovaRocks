@@ -68,6 +68,7 @@ pub(crate) fn add_files(
     sql: &str,
     current_catalog: Option<&str>,
     current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let (table_parts, s3_path) = parse_add_files_sql(sql)?;
 
@@ -97,12 +98,6 @@ pub(crate) fn add_files(
         _ => return Err("invalid table name in ADD FILES".to_string()),
     };
 
-    let guard = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalog read lock");
-    let entry = guard.get(&catalog_name)?;
-    drop(guard);
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: catalog_name.clone(),
@@ -114,16 +109,22 @@ pub(crate) fn add_files(
         &target,
         crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
     )?;
-    let count = crate::connector::iceberg::catalog::add_files::add_files(
-        &entry,
-        &namespace,
-        &table_name,
-        &s3_path,
+    let completed = crate::connector::data_mutation::execute_data_mutation(
+        state.connector_control.as_ref(),
+        state.as_ref(),
+        &novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
+            .map_err(|error| error.to_string())?,
+        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
+                .map_err(|error| error.to_string())?,
+            namespace: namespace.clone().into(),
+            table: table_name.clone().into(),
+        },
+        crate::connector::data_mutation::DataMutationIntent::register_existing_files(s3_path),
+        connector_context.clone(),
     )?;
-    entry.invalidate_table_cache(&namespace, &table_name);
-    state
-        .catalog_service
-        .invalidate_table(&catalog_name, &namespace, &table_name)?;
+    let count = completed.receipt.summary().file_count();
     let msg = format!("Added {count} file(s)");
     build_string_query_result("status", vec![msg]).map(StatementResult::Query)
 }

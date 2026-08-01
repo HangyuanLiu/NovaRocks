@@ -869,6 +869,23 @@ fn evaluate_log_evidence(
         }
     }
 
+    for pattern in &step.meta.be_log_not_contains {
+        let mut total = 0usize;
+        for index in 0..endpoint_count {
+            total = total
+                .checked_add(log_delta(snapshot, server_handle, index, pattern)?)
+                .context("BE log occurrence count overflow")?;
+        }
+        if total != 0 {
+            bail!(
+                "BE log unexpectedly contains forbidden step-scoped pattern {pattern:?} {total} time(s)"
+            );
+        }
+        successes.push(format!(
+            "    @be_log_not_contains PASS pattern={pattern:?}"
+        ));
+    }
+
     for (pattern, required) in &step.meta.be_log_count_at_least {
         let mut total = 0usize;
         for index in 0..endpoint_count {

@@ -366,6 +366,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "be_log_contains" => {
                 meta.be_log_contains.push(raw_value);
             }
+            "be_log_not_contains" => {
+                if raw_value.is_empty() {
+                    bail!("@be_log_not_contains pattern must not be empty");
+                }
+                meta.be_log_not_contains.push(raw_value);
+            }
             "be_log_count_at_least" => {
                 let (pattern, count) = raw_value.rsplit_once(',').ok_or_else(|| {
                     anyhow::anyhow!("@be_log_count_at_least requires <pattern>,<positive-count>")
@@ -560,6 +566,11 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             base.be_log_contains.clone()
         } else {
             override_meta.be_log_contains.clone()
+        },
+        be_log_not_contains: if override_meta.be_log_not_contains.is_empty() {
+            base.be_log_not_contains.clone()
+        } else {
+            override_meta.be_log_not_contains.clone()
         },
         be_log_count_at_least: if override_meta.be_log_count_at_least.is_empty() {
             base.be_log_count_at_least.clone()

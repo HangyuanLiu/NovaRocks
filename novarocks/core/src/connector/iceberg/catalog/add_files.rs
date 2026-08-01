@@ -24,14 +24,11 @@ use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use bytes::Bytes;
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct, Type};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use sha2::{Digest, Sha256};
 
-use crate::connector::iceberg::catalog::registry::{
-    IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog, load_table,
-};
+use crate::connector::iceberg::catalog::registry::block_on_iceberg;
 use crate::connector::iceberg::fs_io;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_spi::connector::{
@@ -89,41 +86,6 @@ impl AddFilesManifest {
             })
             .collect()
     }
-}
-
-/// Transitional concrete caller retained only until the C2 caller cutover.
-/// Validation and catalog dispatch already use the final provider primitives.
-pub(crate) fn add_files(
-    entry: &IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    source_directory: &str,
-) -> Result<usize, String> {
-    let loaded = load_table(entry, namespace, table_name)?;
-    let object_store_config = fs_io::object_store_config_from_catalog_properties(&entry.properties)
-        .map_err(|error| format!("parse ADD FILES object-store properties: {error}"))?;
-    let manifest = plan_manifest_for_table(
-        &loaded.table,
-        source_directory,
-        object_store_config.as_ref(),
-    )?;
-    let count = manifest.records.len();
-    let data_files = manifest.to_data_files()?;
-    let catalog = build_iceberg_catalog(entry)?;
-    block_on_iceberg(async {
-        let transaction = Transaction::new(&loaded.table);
-        let transaction = transaction
-            .fast_append()
-            .add_data_files(data_files)
-            .apply(transaction)
-            .map_err(|error| format!("append ADD FILES manifest: {error}"))?;
-        transaction
-            .commit(catalog.as_ref())
-            .await
-            .map_err(|error| format!("commit ADD FILES manifest: {error}"))
-    })
-    .map_err(|error| format!("ADD FILES runtime: {error}"))??;
-    Ok(count)
 }
 
 pub(crate) fn plan_manifest_for_table(

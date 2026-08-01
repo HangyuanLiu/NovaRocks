@@ -1889,7 +1889,12 @@ impl StandaloneSession {
 
         // ALTER TABLE ... ADD FILES FROM '...'
         if looks_like_add_files(&normalized) {
-            return self.handle_add_files(&normalized, current_catalog, current_database);
+            return self.handle_add_files(
+                &normalized,
+                current_catalog,
+                current_database,
+                &connector_context,
+            );
         }
 
         // Standard SQL: let sqlparser parse the full statement
@@ -2156,8 +2161,15 @@ impl StandaloneSession {
         sql: &str,
         current_catalog: Option<&str>,
         current_database: &str,
+        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
-        crate::engine::query_prep::add_files(&self.inner, sql, current_catalog, current_database)
+        crate::engine::query_prep::add_files(
+            &self.inner,
+            sql,
+            current_catalog,
+            current_database,
+            connector_context,
+        )
     }
 
     fn handle_show_create_table(
