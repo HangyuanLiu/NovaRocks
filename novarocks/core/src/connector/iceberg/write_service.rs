@@ -45,8 +45,8 @@ use super::write_contract::{
     decode_sink_plan_handle_payload, decode_writer_reports, encode_sink_plan_handle_payload,
 };
 use super::write_control::{
-    IcebergWriteControlBackend, IcebergWriteControlPlan, IcebergWritePlanPayloadV1,
-    IcebergWriteReconcileEvidenceV1,
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlBackend, IcebergWriteControlPlan,
+    IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
 };
 use crate::engine::IcebergWriteCommitExecutor;
 
@@ -56,7 +56,18 @@ use crate::engine::IcebergWriteCommitExecutor;
 /// or a provider payload fallback.
 #[derive(Clone, Default)]
 pub(crate) struct IcebergWriteServiceRegistry {
-    services: Arc<Mutex<HashMap<ConnectorWriteOperationId, Arc<dyn IcebergWriteControlBackend>>>>,
+    services: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteServiceEntry>>>,
+}
+
+#[derive(Clone)]
+enum IcebergWriteServiceEntry {
+    Ready(Arc<dyn IcebergWriteControlBackend>),
+    Lazy {
+        activation_digest: [u8; 32],
+        factory: Arc<
+            dyn Fn() -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError> + Send + Sync,
+        >,
+    },
 }
 
 impl IcebergWriteServiceRegistry {
@@ -72,7 +83,13 @@ impl IcebergWriteServiceRegistry {
             .services
             .lock()
             .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
-        if services.insert(operation_id, Arc::new(service)).is_some() {
+        if services
+            .insert(
+                operation_id,
+                IcebergWriteServiceEntry::Ready(Arc::new(service)),
+            )
+            .is_some()
+        {
             return Err(invalid(
                 "Iceberg write service already exists for connector operation ID",
             ));
@@ -80,21 +97,75 @@ impl IcebergWriteServiceRegistry {
         Ok(())
     }
 
+    /// Reserves an operation after exact-lease admission.  It intentionally
+    /// does not construct the provider service: the first SPI `plan` request
+    /// creates and caches it under this operation ID.
+    pub(crate) fn register_lazy<F>(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        activation_digest: [u8; 32],
+        factory: F,
+    ) -> Result<(), ConnectorError>
+    where
+        F: Fn() -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut services = self
+            .services
+            .lock()
+            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
+        match services.get(&operation_id) {
+            Some(IcebergWriteServiceEntry::Lazy {
+                activation_digest: existing,
+                ..
+            }) if existing == &activation_digest => return Ok(()),
+            Some(_) => {
+                return Err(invalid(
+                    "Iceberg write operation already has a conflicting service activation",
+                ));
+            }
+            None => {}
+        }
+        services.insert(
+            operation_id,
+            IcebergWriteServiceEntry::Lazy {
+                activation_digest,
+                factory: Arc::new(factory),
+            },
+        );
+        Ok(())
+    }
+
     fn resolve(
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError> {
-        self.services
+        let mut services = self
+            .services
             .lock()
-            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?
-            .get(&operation_id)
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "Iceberg connector write operation has no FE control service",
-                )
-            })
+            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
+        let entry = services.get(&operation_id).cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "Iceberg connector write operation has no FE control service",
+            )
+        })?;
+        match entry {
+            IcebergWriteServiceEntry::Ready(service) => Ok(service),
+            IcebergWriteServiceEntry::Lazy {
+                activation_digest: _,
+                factory,
+            } => {
+                let service = factory()?;
+                services.insert(
+                    operation_id,
+                    IcebergWriteServiceEntry::Ready(Arc::clone(&service)),
+                );
+                Ok(service)
+            }
+        }
     }
 }
 
@@ -212,6 +283,103 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     ) -> Result<CleanupAttempt, String>;
 
     fn recovery_evidence(&self) -> RecoveryEvidence;
+}
+
+/// First-refresh committer. It is the only place where the opaque provider
+/// payload becomes Iceberg snapshot provenance, and it derives row count from
+/// the complete accepted report set rather than any frontend result carrier.
+pub(crate) struct IcebergFirstRefreshWriteReportCommitter {
+    executor: Arc<IcebergWriteCommitExecutor>,
+    provenance_properties: BTreeMap<String, String>,
+}
+
+impl IcebergFirstRefreshWriteReportCommitter {
+    pub(crate) fn new(
+        executor: Arc<IcebergWriteCommitExecutor>,
+        provenance_properties: BTreeMap<String, String>,
+    ) -> Result<Self, ConnectorError> {
+        if provenance_properties.contains_key("novarocks.mv.refresh.row_count") {
+            return Err(invalid(
+                "first-refresh provenance template must not predeclare row count",
+            ));
+        }
+        Ok(Self {
+            executor,
+            provenance_properties,
+        })
+    }
+
+    fn decode_primary_reports(
+        &self,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<Vec<IcebergWriterReport>, CommitServiceError> {
+        if cohorts.len() != 1 || cohorts[0].role != IcebergWriteCohortRole::Primary {
+            return Err(CommitServiceError::invalid_input(
+                "first-refresh write must contain exactly one primary append cohort".to_string(),
+            ));
+        }
+        let mut reports = Vec::new();
+        for staged in &cohorts[0].reports {
+            staged.validate().map_err(|error| {
+                CommitServiceError::invalid_input(format!(
+                    "validate first-refresh connector staged report: {error}"
+                ))
+            })?;
+            reports.extend(
+                decode_writer_reports(staged.payload(), self.executor.table.metadata())
+                    .map_err(CommitServiceError::invalid_input)?,
+            );
+        }
+        Ok(reports)
+    }
+}
+
+impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
+    fn table_metadata(&self) -> &TableMetadata {
+        self.executor.table.metadata()
+    }
+
+    fn commit_connector_operation(
+        &self,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let reports = self.decode_primary_reports(cohorts)?;
+        let row_count = reports.iter().try_fold(0_i64, |total, report| {
+            if report.file.record_count < 0 {
+                return Err(CommitServiceError::invalid_input(
+                    "first-refresh report has a negative row count".to_string(),
+                ));
+            }
+            total.checked_add(report.file.record_count).ok_or_else(|| {
+                CommitServiceError::invalid_input("first-refresh row count overflow".to_string())
+            })
+        })?;
+        let mut provenance = self.provenance_properties.clone();
+        provenance.insert(
+            "novarocks.mv.refresh.row_count".to_string(),
+            row_count.to_string(),
+        );
+        self.executor
+            .commit_iceberg_writer_reports_with_snapshot_properties(reports, provenance)
+    }
+
+    fn commit_iceberg_writer_reports(
+        &self,
+        reports: Vec<IcebergWriterReport>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.executor.commit_iceberg_writer_reports(reports)
+    }
+
+    fn abort_iceberg_writer_reports(
+        &self,
+        reports: Vec<IcebergWriterReport>,
+    ) -> Result<CleanupAttempt, String> {
+        self.executor.abort_iceberg_writer_reports(reports)
+    }
+
+    fn recovery_evidence(&self) -> RecoveryEvidence {
+        RecoveryEvidence::from_collector(&self.executor.collector)
+    }
 }
 
 #[derive(Clone)]
@@ -593,6 +761,18 @@ impl IcebergWriteCohortContext {
         })
     }
 
+    fn first_refresh_primary(
+        writer_handle_payloads: IcebergWriterHandlePayloads,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+    ) -> Result<Self, ConnectorError> {
+        validate_writer_handle_payloads(&writer_handle_payloads)?;
+        Ok(Self {
+            writer_handle_payloads,
+            control_payload: plan_payload.encode()?,
+            role: IcebergWriteCohortRole::Primary,
+        })
+    }
+
     pub(crate) fn cow_rewrite(
         writer_handle_payload: bytes::Bytes,
         plan_payload: &IcebergWritePlanPayloadV1,
@@ -716,6 +896,22 @@ impl IcebergWriteControlServiceContext {
         Ok(Self {
             cohorts: IcebergWriteCohortContexts::PrimaryTemplate(
                 IcebergWriteCohortContext::primary(
+                    IcebergWriterHandlePayloads::Uniform(writer_handle_payload),
+                    plan_payload,
+                )?,
+            ),
+            commit_executor,
+        })
+    }
+
+    pub(crate) fn new_with_first_refresh_handle_payload(
+        writer_handle_payload: bytes::Bytes,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            cohorts: IcebergWriteCohortContexts::PrimaryTemplate(
+                IcebergWriteCohortContext::first_refresh_primary(
                     IcebergWriterHandlePayloads::Uniform(writer_handle_payload),
                     plan_payload,
                 )?,

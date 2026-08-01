@@ -24,6 +24,13 @@ use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::projection_first_refresh::{
     prepare_projection_full_read_sql, prepare_union_projection_full_read_sql,
 };
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+use arrow::datatypes::SchemaRef;
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorWriteCohortId, ConnectorWriteOperationId,
+};
+use std::collections::BTreeSet;
 
 /// Immutable SQL artifact for a distributed first-refresh write.
 ///
@@ -42,6 +49,231 @@ impl MvFirstRefreshPhysicalSql {
 
     pub(crate) fn root_hash_column(&self) -> &str {
         &self.root_hash_column
+    }
+}
+
+/// Validated logical shape of a first-refresh append.  All variants have one
+/// empty target and therefore one sealed primary append cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvFirstRefreshShape {
+    Projection,
+    UnionProjection,
+    Aggregate,
+    BranchUnionAggregate,
+    Join,
+    Composed,
+}
+
+/// Target facts frozen before a first-refresh writer is admitted.  It carries
+/// Arrow schema and field identities, never an Iceberg table/client or a
+/// provider decoder.
+#[derive(Clone)]
+pub(crate) struct MvFirstRefreshTargetContract {
+    schema: SchemaRef,
+    field_ids: Vec<i32>,
+    partition_spec_id: i32,
+    hidden_hash_key: String,
+}
+
+impl MvFirstRefreshTargetContract {
+    pub(crate) fn try_new(
+        schema: SchemaRef,
+        field_ids: Vec<i32>,
+        partition_spec_id: i32,
+        hidden_hash_key: String,
+    ) -> Result<Self, String> {
+        if schema.fields().len() != field_ids.len()
+            || field_ids.iter().any(|field_id| *field_id <= 0)
+            || field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len()
+            || partition_spec_id < 0
+            || hidden_hash_key.is_empty()
+        {
+            return Err("invalid MV first-refresh target physical contract".to_string());
+        }
+        Ok(Self {
+            schema,
+            field_ids,
+            partition_spec_id,
+            hidden_hash_key,
+        })
+    }
+
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub(crate) fn field_ids(&self) -> &[i32] {
+        &self.field_ids
+    }
+
+    pub(crate) const fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+
+    pub(crate) fn hidden_hash_key(&self) -> &str {
+        &self.hidden_hash_key
+    }
+}
+
+/// SQL/application handoff before fragment preparation.  The source SQL and
+/// target contract are frozen, but topology, writer handles, provider service
+/// construction and native fragment preparation are intentionally deferred.
+#[derive(Clone)]
+pub(crate) struct MvFirstRefreshWriteRequest {
+    canonical_select_sql: String,
+    shape: MvFirstRefreshShape,
+    target_table: ConnectorTableHandle,
+    target_contract: MvFirstRefreshTargetContract,
+    observed_binding: ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    connector_context: ConnectorRequestContext,
+}
+
+impl MvFirstRefreshWriteRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        canonical_select_sql: String,
+        shape: MvFirstRefreshShape,
+        target_table: ConnectorTableHandle,
+        target_contract: MvFirstRefreshTargetContract,
+        observed_binding: ConnectorExecutionBindingKey,
+        operation_id: ConnectorWriteOperationId,
+        connector_context: ConnectorRequestContext,
+    ) -> Result<Self, String> {
+        if canonical_select_sql.trim().is_empty()
+            || target_table.owner() != &observed_binding.instance_id
+        {
+            return Err("invalid MV first-refresh write request identity".to_string());
+        }
+        Ok(Self {
+            canonical_select_sql,
+            shape,
+            target_table,
+            target_contract,
+            observed_binding,
+            operation_id,
+            connector_context,
+        })
+    }
+
+    pub(crate) fn canonical_select_sql(&self) -> &str {
+        &self.canonical_select_sql
+    }
+
+    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
+        self.shape
+    }
+
+    pub(crate) fn target_table(&self) -> &ConnectorTableHandle {
+        &self.target_table
+    }
+
+    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
+        &self.target_contract
+    }
+
+    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
+        &self.observed_binding
+    }
+
+    pub(crate) const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
+        &self.connector_context
+    }
+}
+
+/// Side-effect-free SQL preparation for a first-refresh write.  Its fields
+/// remain private so an application owner can inspect facts but cannot obtain
+/// a local program, catalog object, record batch or provider payload.
+pub(crate) struct PreparedMvFirstRefreshWrite {
+    request: MvFirstRefreshWriteRequest,
+    physical_sql: MvFirstRefreshPhysicalSql,
+    primary_cohort: ConnectorWriteCohortId,
+}
+
+impl PreparedMvFirstRefreshWrite {
+    pub(crate) fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.request.operation_id()
+    }
+
+    pub(crate) const fn primary_cohort(&self) -> ConnectorWriteCohortId {
+        self.primary_cohort
+    }
+
+    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
+        self.request.observed_binding()
+    }
+
+    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
+        self.request.target_contract()
+    }
+
+    pub(crate) fn physical_sql(&self) -> &str {
+        self.physical_sql.sql()
+    }
+
+    pub(crate) fn root_hash_column(&self) -> &str {
+        self.physical_sql.root_hash_column()
+    }
+
+    /// Consuming bind boundary: fragment preparation may only happen after
+    /// admission and exact-lease activation.  The resulting artifact cannot
+    /// be rebound to another operation/cohort.
+    pub(crate) fn bind_distributed(
+        self,
+        distributed: PreparedDistributedWriteRequest,
+    ) -> Result<BoundMvFirstRefreshWrite, String> {
+        if distributed.write_operation_id() != self.operation_id()
+            || distributed.write_cohort_id() != self.primary_cohort
+        {
+            return Err("MV first-refresh distributed artifact identity mismatch".to_string());
+        }
+        Ok(BoundMvFirstRefreshWrite { distributed })
+    }
+}
+
+/// Opaque post-admission artifact. It is intentionally consumable only by the
+/// application route that owns the exact write session.
+pub(crate) struct BoundMvFirstRefreshWrite {
+    distributed: PreparedDistributedWriteRequest,
+}
+
+impl BoundMvFirstRefreshWrite {
+    pub(crate) fn into_distributed(self) -> PreparedDistributedWriteRequest {
+        self.distributed
+    }
+}
+
+pub(crate) struct MvFirstRefreshWritePreparer;
+
+impl MvFirstRefreshWritePreparer {
+    pub(crate) fn prepare(
+        request: MvFirstRefreshWriteRequest,
+        physical_sql: MvFirstRefreshPhysicalSql,
+    ) -> Result<PreparedMvFirstRefreshWrite, String> {
+        if physical_sql.root_hash_column() != request.target_contract().hidden_hash_key() {
+            return Err(
+                "MV first-refresh root distribution does not match the target hidden hash key"
+                    .to_string(),
+            );
+        }
+        if physical_sql.sql().contains("QueryResult")
+            || physical_sql.sql().contains("RecordBatch")
+            || physical_sql.sql().contains("Chunk")
+        {
+            return Err(
+                "MV first-refresh SQL artifact contains a frontend row carrier".to_string(),
+            );
+        }
+        let operation_id = request.operation_id();
+        Ok(PreparedMvFirstRefreshWrite {
+            request,
+            physical_sql,
+            primary_cohort: ConnectorWriteCohortId::primary(operation_id),
+        })
     }
 }
 

@@ -49,6 +49,8 @@ use super::write_contract::connector_write_receipt;
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
 const ICEBERG_WRITE_OPERATION_KIND: &str = "iceberg.connector_write.v2";
 const ICEBERG_WRITE_PLAN_PAYLOAD_VERSION: u16 = 1;
+const ICEBERG_FIRST_REFRESH_WRITE_PLAN_PAYLOAD_VERSION: u16 = 2;
+const MAX_FIRST_REFRESH_STAGING_PATH_BYTES: usize = 4 * 1024;
 
 /// Canonical, secret-free FE control payload.  The planner may use `target`
 /// to describe a catalog table/ref, but must never put a catalog client or
@@ -88,6 +90,61 @@ impl IcebergWritePlanPayloadV1 {
             ));
         }
         Ok(decoded)
+    }
+}
+
+/// Provider-private facts for a first-refresh append. The application layer
+/// retains this only as an opaque payload; validation and provenance handling
+/// remain inside the Iceberg control binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IcebergFirstRefreshWritePlanPayloadV2 {
+    pub version: u16,
+    pub target: String,
+    pub target_ref: String,
+    pub expected_snapshot_id: Option<i64>,
+    pub staging_path: String,
+    pub provenance_properties: BTreeMap<String, String>,
+}
+
+impl IcebergFirstRefreshWritePlanPayloadV2 {
+    pub(crate) fn encode(&self) -> Result<Bytes, ConnectorError> {
+        self.validate()?;
+        canonical_json(self, "Iceberg first-refresh write plan payload")
+    }
+
+    pub(crate) fn decode(payload: &[u8]) -> Result<Self, ConnectorError> {
+        let decoded: Self =
+            decode_canonical_json(payload, "Iceberg first-refresh write plan payload")?;
+        decoded.validate()?;
+        if canonical_json(&decoded, "Iceberg first-refresh write plan payload")?.as_ref() != payload
+        {
+            return Err(invalid(
+                "Iceberg first-refresh write plan payload is not canonical JSON v2",
+            ));
+        }
+        Ok(decoded)
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if self.version != ICEBERG_FIRST_REFRESH_WRITE_PLAN_PAYLOAD_VERSION
+            || self.target.is_empty()
+            || self.target_ref.is_empty()
+            || self.staging_path.is_empty()
+            || self.staging_path.len() > MAX_FIRST_REFRESH_STAGING_PATH_BYTES
+            || self
+                .expected_snapshot_id
+                .is_some_and(|snapshot_id| snapshot_id < 0)
+            || self
+                .provenance_properties
+                .iter()
+                .any(|(key, value)| key.is_empty() || value.is_empty())
+        {
+            return Err(invalid(
+                "unsupported or incomplete Iceberg first-refresh write plan payload",
+            ));
+        }
+        Ok(())
     }
 }
 

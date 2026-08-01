@@ -136,10 +136,25 @@ impl IcebergWriteCommitExecutor {
         &self,
         reports: impl IntoIterator<Item = IcebergWriterReport>,
     ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_iceberg_writer_reports_with_snapshot_properties(
+            reports,
+            self.snapshot_properties.clone(),
+        )
+    }
+
+    /// Provider-private callers may add facts derived from the complete
+    /// accepted writer report set before the one catalog commit.  The generic
+    /// query/application layers never decode those reports or mutate this
+    /// snapshot property map.
+    pub(crate) fn commit_iceberg_writer_reports_with_snapshot_properties(
+        &self,
+        reports: impl IntoIterator<Item = IcebergWriterReport>,
+        snapshot_properties: BTreeMap<String, String>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
         let mut writer_files = Vec::new();
         self.convert_iceberg_writer_reports(reports, &mut writer_files)?;
         self.collector.inject_written_files(writer_files);
-        self.run_commit_after_collector_injection()
+        self.run_commit_after_collector_injection_with_properties(snapshot_properties)
     }
 
     /// Best-effort cleanup for reports that are known not to have reached the
@@ -202,6 +217,13 @@ impl IcebergWriteCommitExecutor {
     }
 
     fn run_commit_after_collector_injection(&self) -> Result<CommitOutcome, CommitServiceError> {
+        self.run_commit_after_collector_injection_with_properties(self.snapshot_properties.clone())
+    }
+
+    fn run_commit_after_collector_injection_with_properties(
+        &self,
+        snapshot_properties: BTreeMap<String, String>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
         let file_io = self.table.file_io().clone();
         let input = RunInput {
             collector: Arc::clone(&self.collector),
@@ -212,7 +234,7 @@ impl IcebergWriteCommitExecutor {
             cleanup_path_mapper: self.cleanup_path_mapper.clone(),
             cow_update_rewrite: self.cow_update_rewrite.clone(),
             target_ref: self.target_ref.clone(),
-            snapshot_properties: self.snapshot_properties.clone(),
+            snapshot_properties,
         };
 
         match block_on_iceberg(async { run_iceberg_commit(input).await }) {
