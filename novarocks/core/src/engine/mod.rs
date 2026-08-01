@@ -4872,9 +4872,15 @@ fn prepare_query_with_sql_compiler_kernel(
         table_bindings.clone(),
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let mv_definitions = allow_mv_rewrite_candidates
-        .then(|| crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state))
-        .transpose()?;
+    // MV rewrite is an optional SQL optimization. An application composition
+    // without an MV repository supplies no snapshot; a repository that is
+    // available but fails to freeze remains a planning error.
+    let mv_definitions =
+        if allow_mv_rewrite_candidates && state.mv_repository.availability().is_available() {
+            Some(crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?)
+        } else {
+            None
+        };
     let distributed_intent = match &intent {
         crate::sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
             crate::query_execution::contract::DistributedQueryIntent::Profile
