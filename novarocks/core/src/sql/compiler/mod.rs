@@ -20,6 +20,7 @@
 //! This module deliberately owns only neutral compiler inputs and outputs.
 //! Application admission, connector execution preparation, native encoding,
 //! and query lifecycle orchestration remain outside this boundary.
+// Design: ADR-0025 (docs/adr/ADR-0025-sql-compiler-explicit-input-boundary.md)
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
