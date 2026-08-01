@@ -281,8 +281,6 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
     pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
-    pub(crate) unified_statistics:
-        Arc<crate::connector::unified_statistics::UnifiedStatisticsResolver>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -345,9 +343,6 @@ impl Default for StandaloneState {
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
             statistics_application: Arc::new(
                 statistics_application::UnavailableStatisticsApplicationPort,
-            ),
-            unified_statistics: Arc::new(
-                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
             unified_statistics: Arc::new(
@@ -1057,9 +1052,6 @@ impl StandaloneNovaRocks {
             view_service,
             statistics_service,
             statistics_application,
-            unified_statistics: Arc::new(
-                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-            ),
             connector_control,
             unified_statistics: Arc::new(
                 crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),

@@ -412,6 +412,7 @@ mod tests {
     };
     use crate::connector::iceberg::commit::types::CommitOpKind;
     use iceberg::spec::{DataFileBuilder, DataFileFormat, Operation, Struct};
+    use std::collections::BTreeMap;
 
     #[test]
     fn truncate_commit_is_send_sync() {

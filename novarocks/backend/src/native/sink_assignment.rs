@@ -87,6 +87,7 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::Result(_)
         | plan::data_sink::Kind::Noop(_)
+        | plan::data_sink::Kind::Statistics(_)
         | plan::data_sink::Kind::ConnectorWrite(_) => {
             if instance.destinations.is_empty() {
                 Ok(FragmentSinkAssignment::None)

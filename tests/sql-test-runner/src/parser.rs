@@ -1355,6 +1355,7 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @be_log_contains=compat_ingress method=exec_batch_plan_fragments".to_string(),
+            "-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
             "-- @be_log_be_count_at_least=compat_exchange_receive eos=true,2".to_string(),
             "-- @be_log_exact_fragment_cancellation=3".to_string(),
@@ -1366,6 +1367,10 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.be_log_contains,
             vec!["compat_ingress method=exec_batch_plan_fragments".to_string()]
+        );
+        assert_eq!(
+            meta.be_log_not_contains,
+            vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()]
         );
         assert_eq!(
             meta.be_log_count_at_least,

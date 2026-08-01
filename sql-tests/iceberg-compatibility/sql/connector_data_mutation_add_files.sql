@@ -39,13 +39,13 @@ TBLPROPERTIES (
   'schema.name-mapping.default' = '[{"field-id":1,"names":["new_id","old_id"]},{"field-id":2,"names":["new_note","old_note"]}]'
 );
 
-DROP TABLE IF EXISTS c2_plain_${uuid0};
-CREATE TABLE c2_plain_${uuid0} (
-  old_note STRING,
-  old_id BIGINT
-) USING parquet
-LOCATION 's3a://warehouse/c2-add-files-${uuid0}';
-INSERT INTO c2_plain_${uuid0} VALUES ('alpha', 11), ('beta', 22);
+INSERT OVERWRITE DIRECTORY 's3a://warehouse/c2-add-files-${uuid0}'
+USING parquet
+SELECT old_note, old_id
+FROM VALUES
+  ('alpha', CAST(11 AS BIGINT)),
+  ('beta', CAST(22 AS BIGINT))
+AS source(old_note, old_id);
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'

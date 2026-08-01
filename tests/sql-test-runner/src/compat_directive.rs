@@ -139,6 +139,7 @@ pub(crate) fn snapshot_with_deadline(
     let patterns = meta
         .be_log_contains
         .iter()
+        .chain(meta.be_log_not_contains.iter())
         .chain(
             meta.be_log_count_at_least
                 .iter()
@@ -1240,6 +1241,43 @@ mod tests {
         assert!(log.contains(
             "@be_log_be_count_at_least PASS pattern=\"runtime_filter_receive\" actual=2 required=2"
         ));
+    }
+
+    #[test]
+    fn negative_log_directive_is_scoped_to_post_step_delta() {
+        let handle = FakeCompatHandle::new(vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED old\n", "", ""]);
+        let step = step(QueryMeta {
+            be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
+            ..QueryMeta::default()
+        });
+        let mut log = String::new();
+        let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
+
+        run(&step, &handle, &before, &mut log)
+            .expect("pre-step markers must not fail a step-scoped assertion");
+
+        assert!(log.contains(
+            "@be_log_not_contains PASS pattern=\"NOVAROCKS_CONNECTOR_WRITER_OPENED\""
+        ));
+    }
+
+    #[test]
+    fn negative_log_directive_rejects_post_step_marker() {
+        let handle = FakeCompatHandle::new(vec!["", "", ""]);
+        let step = step(QueryMeta {
+            be_log_not_contains: vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()],
+            ..QueryMeta::default()
+        });
+        let mut log = String::new();
+        let before = snapshot(&step.meta, &handle).expect("pre-step snapshot");
+        handle.append_log(1, "NOVAROCKS_CONNECTOR_WRITER_OPENED new\n");
+
+        let error = run(&step, &handle, &before, &mut log)
+            .expect_err("post-step marker must fail the negative assertion");
+
+        assert!(error
+            .to_string()
+            .contains("unexpectedly contains forbidden step-scoped pattern"));
     }
 
     #[test]

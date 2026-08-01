@@ -99,6 +99,7 @@ impl DataMutationCacheFinalizer for crate::engine::StandaloneState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CompletedDataMutation {
+    #[allow(dead_code)]
     pub(crate) effect: ExternalMutationEffect,
     pub(crate) receipt: ConnectorDataMutationReceipt,
     pub(crate) finalization: ExternalMutationFinalization,
@@ -137,10 +138,12 @@ pub(crate) enum ResolvedDataMutation {
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
+        #[allow(dead_code)]
         evidence: ExternalMutationEvidence,
     },
     ContractFailure {
         error: ConnectorError,
+        #[allow(dead_code)]
         dispatch: DataMutationDispatchState,
     },
 }
@@ -224,6 +227,7 @@ pub(crate) struct DataMutationSession {
 }
 
 impl DataMutationSession {
+    #[allow(clippy::result_large_err)]
     pub(crate) fn plan(
         resolver: &dyn ConnectorDataMutationResolver,
         instance_id: &ConnectorInstanceId,
@@ -293,6 +297,7 @@ impl DataMutationSession {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
         &self.plan
     }

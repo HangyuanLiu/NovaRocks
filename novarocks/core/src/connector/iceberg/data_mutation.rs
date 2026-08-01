@@ -152,7 +152,7 @@ struct TerminalRecord {
     outcome: ExternalMutationOutcome<ConnectorDataMutationReceipt>,
 }
 
-pub(crate) trait IcebergDataMutationBackend: Send + Sync {
+trait IcebergDataMutationBackend: Send + Sync {
     fn plan(
         &self,
         request: &ConnectorDataMutationPlanningRequest,
@@ -165,6 +165,7 @@ pub(crate) trait IcebergDataMutationBackend: Send + Sync {
         ConnectorError,
     >;
 
+    #[allow(clippy::result_large_err)]
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,
@@ -188,13 +189,13 @@ enum MarkerLookup {
     Missing,
 }
 
-pub(crate) struct RegisteredIcebergDataMutationBackend {
+struct RegisteredIcebergDataMutationBackend {
     instance_id: novarocks_spi::connector::ConnectorInstanceId,
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
 }
 
 impl RegisteredIcebergDataMutationBackend {
-    pub(crate) fn new(
+    fn new(
         instance_id: novarocks_spi::connector::ConnectorInstanceId,
         registry: Arc<RwLock<IcebergCatalogRegistry>>,
     ) -> Self {
@@ -399,7 +400,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
                 staging_dir,
-                UniqueId { hi: 0, lo: 0 },
+                UniqueId::new(0, 0),
             )
             .with_table_metadata(metadata.clone()),
         );
@@ -534,7 +535,21 @@ pub(crate) struct IcebergDataMutationAdapter {
 }
 
 impl IcebergDataMutationAdapter {
-    pub(crate) fn new(
+    pub(crate) fn new_registered(
+        key: ConnectorExecutionBindingKey,
+        instance_id: novarocks_spi::connector::ConnectorInstanceId,
+        registry: Arc<RwLock<IcebergCatalogRegistry>>,
+    ) -> Result<Self, ConnectorError> {
+        Self::new(
+            key,
+            Arc::new(RegisteredIcebergDataMutationBackend::new(
+                instance_id,
+                registry,
+            )),
+        )
+    }
+
+    fn new(
         key: ConnectorExecutionBindingKey,
         backend: Arc<dyn IcebergDataMutationBackend>,
     ) -> Result<Self, ConnectorError> {
