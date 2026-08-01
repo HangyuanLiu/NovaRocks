@@ -7422,6 +7422,7 @@ fn begin_staged_iceberg_mv_repartition_intent(
     previous_default_spec_id: i32,
     previous_partition_contract: Option<&mv_schema::MvPartitionContract>,
 ) -> Result<i64, String> {
+    let connector_operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
     let provider = state
         .metadata_provider
         .as_ref()
@@ -7454,7 +7455,7 @@ fn begin_staged_iceberg_mv_repartition_intent(
                     table: target.table.clone(),
                     ref_name: Some(staging_branch.to_string()),
                 },
-                attempt_id: format!("mv-repartition-{mv_id}-{staging_branch}"),
+                attempt_id: connector_operation_id.to_string(),
                 base_snapshot_id: expected_main_snapshot_id,
                 base_snapshot_map: base_snapshots.clone(),
                 staged_artifacts,
@@ -11778,6 +11779,7 @@ fn repartition_iceberg_join_mv_overwrite(
                     )?,
                 },
                 staging_branch,
+                Some(CommitOpKind::Overwrite),
             )
         },
     )
@@ -11803,44 +11805,55 @@ fn repartition_iceberg_join_mv_overwrite(
             ..
         } => added_rows,
     };
+    // The generic connector control commits its staged reports before it
+    // returns `PopulatedChangeStreamWrite`.  Replaying that collector here
+    // would issue a second overwrite from the pre-commit table snapshot.  On
+    // v3 targets its stale row-lineage range is rejected; on recovery paths it
+    // can also mask the replay as a successful append.  Publish the exact
+    // connector commit instead.
+    let committed_outcome = populated.committed_outcome;
     let collector = populated.collector;
-    let commit_outcome = match data_block_on(commit_iceberg_mv_with_populated_collector(
-        &target_table,
-        iceberg_catalog,
-        target_entry,
-        &ident,
-        Arc::clone(&collector),
-        staging_branch,
-        marker,
-    )) {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(err)) => {
-            return Err(
-                handle_iceberg_mv_commit_service_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                    connector_context,
-                ),
-            );
-        }
-        Err(err) => {
-            return Err(
-                handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
-                    state,
-                    target,
-                    target_entry,
-                    staging_branch,
-                    refresh_id,
-                    err,
-                    Some(repartition_restore),
-                    connector_context,
-                ),
-            );
+    let commit_outcome = if let Some(outcome) = committed_outcome {
+        outcome
+    } else {
+        match data_block_on(commit_iceberg_mv_with_populated_collector(
+            &target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            Arc::clone(&collector),
+            staging_branch,
+            marker,
+        )) {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(err)) => {
+                return Err(
+                    handle_iceberg_mv_commit_service_error_with_repartition_restore(
+                        state,
+                        target,
+                        target_entry,
+                        staging_branch,
+                        refresh_id,
+                        err,
+                        Some(repartition_restore),
+                        connector_context,
+                    ),
+                );
+            }
+            Err(err) => {
+                return Err(
+                    handle_iceberg_mv_definite_pre_publish_error_with_repartition_restore(
+                        state,
+                        target,
+                        target_entry,
+                        staging_branch,
+                        refresh_id,
+                        err,
+                        Some(repartition_restore),
+                        connector_context,
+                    ),
+                );
+            }
         }
     };
     let snapshots = ctx.rewrite.pin.to_snapshot_map();
@@ -12034,6 +12047,7 @@ fn first_refresh_iceberg_join_mv(
                     )?,
                 },
                 staging_branch,
+                None,
             )
         },
     )
@@ -12070,38 +12084,43 @@ fn first_refresh_iceberg_join_mv(
         abort_iceberg_mv_refresh(state, refresh_id)?;
         return Ok(StatementResult::Ok);
     }
+    let committed_outcome = populated.committed_outcome;
     let collector = populated.collector;
-    let new_snapshot_id = match data_block_on(commit_iceberg_mv_with_populated_collector(
-        &target_table,
-        iceberg_catalog,
-        target_entry,
-        &ident,
-        Arc::clone(&collector),
-        staging_branch,
-        marker,
-    )) {
-        Ok(Ok(outcome)) => outcome.new_snapshot_id,
-        Ok(Err(err)) => {
-            return Err(handle_iceberg_mv_commit_service_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                connector_context,
-            ));
-        }
-        Err(err) => {
-            return Err(handle_iceberg_mv_definite_pre_publish_error(
-                state,
-                target,
-                target_entry,
-                staging_branch,
-                refresh_id,
-                err,
-                connector_context,
-            ));
+    let new_snapshot_id = if let Some(outcome) = committed_outcome {
+        outcome.new_snapshot_id
+    } else {
+        match data_block_on(commit_iceberg_mv_with_populated_collector(
+            &target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            Arc::clone(&collector),
+            staging_branch,
+            marker,
+        )) {
+            Ok(Ok(outcome)) => outcome.new_snapshot_id,
+            Ok(Err(err)) => {
+                return Err(handle_iceberg_mv_commit_service_error(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    connector_context,
+                ));
+            }
+            Err(err) => {
+                return Err(handle_iceberg_mv_definite_pre_publish_error(
+                    state,
+                    target,
+                    target_entry,
+                    staging_branch,
+                    refresh_id,
+                    err,
+                    connector_context,
+                ));
+            }
         }
     };
 
@@ -13483,6 +13502,7 @@ fn execute_join_delta_branches_logical(
                     )?,
                 },
                 &staging_branch,
+                None,
             )
         },
     )
@@ -14028,7 +14048,17 @@ fn execute_imv_change_stream_write(
         ident,
         target_ref,
         op_kind,
-        || execute_imv_change_stream_writer(state, target, &table, ident, refresh_plan, target_ref),
+        || {
+            execute_imv_change_stream_writer(
+                state,
+                target,
+                &table,
+                ident,
+                refresh_plan,
+                target_ref,
+                Some(op_kind),
+            )
+        },
     )
 }
 
@@ -14039,6 +14069,7 @@ fn execute_imv_change_stream_writer(
     ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
+    commit_op_kind: Option<CommitOpKind>,
 ) -> Result<crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite, String> {
     let (refresh_plan, data_route_output_ordinal) =
         ensure_imv_change_stream_data_route(refresh_plan)?;
@@ -14093,15 +14124,17 @@ fn execute_imv_change_stream_writer(
     {
         return executed_change_stream_write_from_result(result, planned.commit_plan);
     }
-    let op_kind = if refresh_plan
-        .producer_branches
-        .iter()
-        .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
-    {
-        CommitOpKind::RowDeltaDvFromFiles
-    } else {
-        CommitOpKind::FastAppend
-    };
+    let op_kind = commit_op_kind.unwrap_or_else(|| {
+        if refresh_plan
+            .producer_branches
+            .iter()
+            .any(|branch| matches!(branch, ImvChangeStreamProducerBranch::DeleteDv))
+        {
+            CommitOpKind::RowDeltaDvFromFiles
+        } else {
+            CommitOpKind::FastAppend
+        }
+    });
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
         table, ident, target_ref, op_kind,
     );
@@ -14109,7 +14142,7 @@ fn execute_imv_change_stream_writer(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table: table.clone(),
@@ -20445,6 +20478,10 @@ mod tests {
             Some("MV_REPARTITION")
         );
         assert_eq!(operation.state, IcebergOperationState::Finalized);
+        operation
+            .attempt_id
+            .parse::<novarocks_spi::connector::ConnectorWriteOperationId>()
+            .expect("repartition connector operation id");
         assert!(
             operation
                 .staged_artifacts

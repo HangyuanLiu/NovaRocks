@@ -106,6 +106,10 @@ pub enum DeleteWriteReport {
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
     fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
+    fn has_staged_output(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<bool, String>;
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -179,6 +183,9 @@ impl DeleteEngine for Arc<StandaloneState> {
         let Some(completion) = result.connector_completion else {
             return Ok(DeleteWriteReport::NoOp);
         };
+        if !prepared.execution.has_staged_output(&completion)? {
+            return Ok(DeleteWriteReport::NoOp);
+        }
         Ok(DeleteWriteReport::CommitRequired(Arc::new(
             CoreDeleteCommit { completion },
         )))
@@ -210,6 +217,23 @@ impl DeleteEngine for Arc<StandaloneState> {
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {
         downcast_prepared(prepared)?.execution.finalize()
     }
+}
+
+pub(crate) fn has_iceberg_staged_output(
+    completion: &crate::query_execution::ConnectorWriteCompletion,
+    commit_executor: &crate::engine::write_transaction::IcebergWriteCommitExecutor,
+) -> Result<bool, String> {
+    completion
+        .input()
+        .reports()
+        .iter()
+        .try_fold(false, |has_staged_output, staged| {
+            let reports = crate::connector::iceberg::write_contract::decode_writer_reports(
+                staged.payload(),
+                commit_executor.table.metadata(),
+            )?;
+            Ok(has_staged_output || !reports.is_empty())
+        })
 }
 
 struct CorePreparedDelete {

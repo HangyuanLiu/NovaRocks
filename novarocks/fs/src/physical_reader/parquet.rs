@@ -339,12 +339,17 @@ fn projection_roots(
                 .enumerate()
                 .map(|(index, field)| (field.name().as_str(), index))
                 .collect::<HashMap<_, _>>();
+            let available_names = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>();
             names
                 .iter()
                 .map(|name| {
                     by_name.get(name.as_str()).copied().ok_or_else(|| {
                         FileError::invalid(format!(
-                            "Parquet projection column does not exist: {name}"
+                            "Parquet projection column does not exist: {name}; available root columns: {available_names:?}"
                         ))
                     })
                 })

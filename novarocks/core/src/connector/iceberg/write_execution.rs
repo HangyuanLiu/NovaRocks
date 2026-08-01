@@ -44,6 +44,7 @@ use super::data_writer::{
     staged_data_file_to_writer_report, write_record_batches,
 };
 use super::delete_file::IcebergFileContent;
+use super::position_delete_descriptor::canonical_output_schema;
 use super::provider::IcebergReadBinding;
 use super::report::{
     IcebergPartitionReport, IcebergWriterReport, partition_path_from_struct,
@@ -618,6 +619,16 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                         format!("take Iceberg position-delete batch failed: {arrow_error}"),
                     )
                 })?;
+            let delete_batch = RecordBatch::try_new(
+                canonical_output_schema(),
+                part_batch.columns()[..2].to_vec(),
+            )
+            .map_err(|arrow_error| {
+                error(
+                    ConnectorErrorKind::Internal,
+                    format!("project Iceberg position-delete columns failed: {arrow_error}"),
+                )
+            })?;
             let partition = self
                 .handle
                 .partitions
@@ -639,7 +650,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                 self.handle.compression,
             )
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-            let record_count = i64::try_from(part_batch.num_rows()).map_err(|_| {
+            let record_count = i64::try_from(delete_batch.num_rows()).map_err(|_| {
                 error(
                     ConnectorErrorKind::Internal,
                     "Iceberg position-delete record count overflows i64",
@@ -651,7 +662,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
                     "Iceberg position-delete file size overflows i64",
                 )
             })?;
-            let reported_reference = unique_file_path(&part_batch)
+            let reported_reference = unique_file_path(&delete_batch)
                 .map_err(|message| error(ConnectorErrorKind::CorruptData, message))?
                 .ok_or_else(|| {
                     error(

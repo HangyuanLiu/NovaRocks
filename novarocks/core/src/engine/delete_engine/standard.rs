@@ -69,7 +69,8 @@ use crate::connector::iceberg::write_contract::{
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
+    DeleteOperation, PreparedDelete, PreparedDeleteExecution, has_iceberg_staged_output,
+    prepared_delete,
 };
 use crate::engine::write_transaction::IcebergWriteCommitExecutor;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -265,6 +266,13 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
         Ok(result)
     }
 
+    fn has_staged_output(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<bool, String> {
+        has_iceberg_staged_output(completion, &self.commit_executor)
+    }
+
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -306,6 +314,13 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
             Some(self.connector_write.clone()),
         )?;
         Ok(result)
+    }
+
+    fn has_staged_output(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<bool, String> {
+        has_iceberg_staged_output(completion, &self.commit_executor)
     }
 
     fn commit(
@@ -395,7 +410,7 @@ fn prepare_delete_dv_write(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table: table.clone(),
@@ -483,7 +498,7 @@ fn prepare_delete_write(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table: table.clone(),

@@ -230,7 +230,7 @@ fn prepare_iceberg_distributed_write(
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table,

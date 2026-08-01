@@ -457,14 +457,13 @@ pub(crate) fn transform_variant_columns_for_write(
         out_columns.push(out_arr);
     }
 
-    // Build the output schema by keeping the input batch's fields for all
-    // non-variant columns and swapping in the annotated field only for
-    // variant positions. This is necessary because this function runs before
-    // annotate_batch: non-variant columns may still carry widened engine
-    // types (e.g. INSERT SELECT id + 1 produces Int64 for an Int32 column).
-    // Rebuilding against the full annotated_schema would make
-    // RecordBatch::try_new reject such batches. annotate_batch reconciles
-    // non-variant types afterward.
+    // Preserve the input field identities for every output column, including
+    // VARIANT. This function runs before annotate_batch, which owns the
+    // all-or-nothing Iceberg field-id binding. Injecting the annotated
+    // VARIANT field here would make a mixed schema look identity-addressable
+    // and cause the ordinary input columns to be replaced with NULLs. The
+    // final annotate_batch call restores the complete annotated schema after
+    // the physical struct conversion is complete.
     let out_fields: Vec<arrow::datatypes::FieldRef> = batch
         .schema()
         .fields()
@@ -472,16 +471,11 @@ pub(crate) fn transform_variant_columns_for_write(
         .enumerate()
         .map(|(idx, input_field)| {
             if variant_set.contains(&idx) {
-                // Use the annotated field which carries the extension metadata
-                // required by the parquet writer (ARROW:extension:name etc.).
-                let field = annotated_schema.field(idx).as_ref().clone();
-                if shredding_config.spec_for_index(idx).is_some() {
-                    field
-                        .with_data_type(out_columns[idx].data_type().clone())
-                        .into()
-                } else {
-                    field.into()
-                }
+                input_field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(out_columns[idx].data_type().clone())
+                    .into()
             } else {
                 input_field.clone()
             }
@@ -786,16 +780,17 @@ mod tests {
             .expect("column 1 must be StructArray");
         assert_eq!(v.fields().len(), 2);
 
-        // (d) Output schema: id field equals the INPUT batch field (Int64),
-        //     v field carries the extension metadata from annotated_schema.
+        // (d) Output schema fields retain the input batch identities.  The
+        //     final writer annotation pass installs Iceberg field ids for all
+        //     columns together; adding the variant id here would make that
+        //     pass select identity alignment for only one column.
         assert_eq!(out.schema().field(0), &input_id_field);
         let out_schema = out.schema();
         let v_schema_field = out_schema.field(1);
-        // The annotated variant field carries the extension metadata.
+        let expected_variant_field = Field::new("v", v_schema_field.data_type().clone(), true);
         assert_eq!(
-            v_schema_field,
-            annotated.field(1),
-            "variant schema field must come from annotated_schema"
+            v_schema_field, &expected_variant_field,
+            "variant transform must preserve the input field identity"
         );
     }
 
@@ -959,10 +954,9 @@ mod tests {
             s.column_by_name("value").unwrap().data_type(),
             &DataType::BinaryView
         );
-        assert_eq!(
-            out.schema().field(0).metadata(),
-            annotated.field(0).metadata(),
-            "variant field-id and extension metadata must stay on the top-level field"
+        assert!(
+            out.schema().field(0).metadata().is_empty(),
+            "final writer annotation, not this transform, binds Iceberg metadata"
         );
     }
 }

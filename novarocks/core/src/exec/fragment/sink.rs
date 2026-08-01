@@ -231,7 +231,8 @@ impl ConnectorWriteInputProjection {
                     field.data_type(),
                     DataType::FixedSizeBinary(width)
                         if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
-                ) {
+                    )
+                {
                     cast_with_special_rules(&array, field.data_type())
                 } else {
                     cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())

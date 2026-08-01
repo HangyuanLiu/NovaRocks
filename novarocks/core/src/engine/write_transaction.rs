@@ -13,7 +13,7 @@
 //! outcome, and finalization) to an [`IcebergWriteTransactionExecutor`].
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use opendal::Operator;
@@ -115,7 +115,7 @@ pub(crate) trait IcebergWriteTransactionExecutor {
 /// SQL routing is intentionally kept outside this type; callers supply a
 /// collected [`WriteCommitInput`] after the coordinated write has completed.
 pub(crate) struct IcebergWriteCommitExecutor {
-    pub(crate) state: Arc<StandaloneState>,
+    pub(crate) state: Weak<StandaloneState>,
     pub(crate) target: TargetBackend,
     pub(crate) catalog: Arc<dyn iceberg::Catalog>,
     pub(crate) table: iceberg::table::Table,
@@ -265,7 +265,10 @@ impl IcebergWriteCommitExecutor {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
+        let state = self.state.upgrade().ok_or_else(|| {
+            "Iceberg write finalization requires a live standalone engine state".to_string()
+        })?;
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&state, &self.target)
     }
 }
 

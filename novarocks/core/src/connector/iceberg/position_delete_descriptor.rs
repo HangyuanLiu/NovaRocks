@@ -149,6 +149,14 @@ pub(crate) fn output_schema_from_descriptor(
     desc: &PositionDeleteDescriptorInput,
 ) -> Result<SchemaRef, crate::common::engine_error::EngineError> {
     validate_required_fields(desc)?;
+    Ok(canonical_output_schema())
+}
+
+/// The on-file schema for an Iceberg position-delete Parquet file.  The
+/// distributed sink receives the internal row-identity columns (`_file`,
+/// `_pos`), but its staged artifact must use Iceberg's canonical physical
+/// field names and IDs.
+pub(crate) fn canonical_output_schema() -> SchemaRef {
     let file_path = Field::new(
         ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
         DataType::Utf8,
@@ -164,7 +172,7 @@ pub(crate) fn output_schema_from_descriptor(
             ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string(),
         )]),
     );
-    Ok(Arc::new(Schema::new(vec![file_path, pos])))
+    Arc::new(Schema::new(vec![file_path, pos]))
 }
 
 #[allow(dead_code)]

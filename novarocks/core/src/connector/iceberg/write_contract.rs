@@ -805,7 +805,7 @@ pub(crate) fn position_delete_handle_from_payload(
                 .to_string(),
         );
     }
-    if input_schema.fields().len() != 2
+    if input_schema.fields().len() < 2
         || input_schema.fields()[0].name()
             != crate::connector::iceberg::catalog::backend::ICEBERG_ROW_IDENTITY_FILE_COLUMN
         || input_schema.fields()[0].data_type() != &arrow::datatypes::DataType::Utf8
@@ -814,7 +814,7 @@ pub(crate) fn position_delete_handle_from_payload(
         || input_schema.fields()[1].data_type() != &arrow::datatypes::DataType::Int64
     {
         return Err(
-            "Iceberg position-delete writer requires an exact (_file UTF8, _pos INT64) input schema"
+            "Iceberg position-delete writer requires (_file UTF8, _pos INT64) as its first two input columns"
                 .to_string(),
         );
     }
@@ -2233,6 +2233,14 @@ mod tests {
             metadata.default_partition_spec_id()
         );
         assert!(decoded.partitions[&data_file].descriptor.values.is_empty());
+
+        let schema_with_route_column = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("_file", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("_pos", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        position_delete_handle_from_payload(&payload, &schema_with_route_column)
+            .expect("accept route-only columns after position-delete fields");
 
         let invalid_schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("path", arrow::datatypes::DataType::Utf8, false),
