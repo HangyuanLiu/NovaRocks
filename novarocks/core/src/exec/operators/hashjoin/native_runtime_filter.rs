@@ -33,8 +33,8 @@ use crate::exec::node::runtime_filter::{
     RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
 use crate::runtime_filter::codec::contribution::{
-    ContributionCodecExpectation, RuntimeFilterContribution as CoreContribution,
-    encode_contribution,
+    ContributionCodecError, ContributionCodecExpectation,
+    RuntimeFilterContribution as CoreContribution, encode_contribution,
 };
 use crate::runtime_filter::exec::membership_delta::{
     MembershipDeltaEncoder, MembershipEncodingOutcome,
@@ -391,6 +391,32 @@ enum NativeMembershipSubmitOutcome {
     Unavailable,
 }
 
+fn encode_execution_membership_contribution(
+    delta: CoreContribution,
+    membership_schema: &ArtifactMembershipSchema,
+    max_contribution_bytes: usize,
+) -> Result<Option<execution::RuntimeFilterContribution>, ContributionCodecError> {
+    let encoded = match encode_contribution(
+        &delta,
+        ContributionCodecExpectation::Membership(membership_schema),
+        max_contribution_bytes,
+    ) {
+        Ok(encoded) => encoded,
+        Err(
+            ContributionCodecError::EncodedSizeExceeded | ContributionCodecError::ResourceLimit,
+        ) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let (contract_digest, canonical_bytes) = encoded.into_parts();
+    Ok(Some(execution::RuntimeFilterContribution::new(
+        execution::RuntimeFilterContributionKind::Membership,
+        contract_digest,
+        canonical_bytes,
+    )))
+}
+
 impl NativeMembershipProducerStream {
     fn new(binding: NativeMembershipProducerBinding, local_index: u32) -> Self {
         #[cfg(test)]
@@ -494,21 +520,17 @@ impl NativeMembershipProducerStream {
             }
             let outcome = match endpoint {
                 NativeMembershipProducerEndpoint::Execution(producer) => {
-                    let encoded = encode_contribution(
-                        &CoreContribution::Membership(delta),
-                        ContributionCodecExpectation::Membership(&self.binding.membership_schema),
+                    let Some(contribution) = encode_execution_membership_contribution(
+                        CoreContribution::Membership(delta),
+                        &self.binding.membership_schema,
                         max_contribution_bytes,
                     )
                     .map_err(|error| format!(
                         "native runtime-filter binding_id={} contribution encoding failed: {error}",
                         self.binding.binding_id
-                    ))?;
-                    let (contract_digest, canonical_bytes) = encoded.into_parts();
-                    let contribution = execution::RuntimeFilterContribution::new(
-                        execution::RuntimeFilterContributionKind::Membership,
-                        contract_digest,
-                        canonical_bytes,
-                    );
+                    ))? else {
+                        return Ok(NativeMembershipSubmitOutcome::Unavailable);
+                    };
                     match producer.submit(
                         execution::PartitionId::new(self.partition_id.get()),
                         execution::ProducerSequence::new(self.next_sequence),
@@ -891,9 +913,13 @@ mod tests {
 
     use super::{
         NativeMembershipProducerBinding, NativeRuntimeFilterProducerFactory,
-        install_native_producer_close_gate_for_test, native_producer_close_gates,
+        encode_execution_membership_contribution, install_native_producer_close_gate_for_test,
+        native_producer_close_gates,
     };
-    use crate::runtime_filter::model::contract::BindingId;
+    use crate::runtime_filter::codec::contribution::RuntimeFilterContribution as CoreContribution;
+    use crate::runtime_filter::exec::membership_delta::MembershipDeltaEncoder;
+    use crate::runtime_filter::model::contract::{BindingId, NullSemantics};
+    use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
     use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
     use crate::runtime_filter::port::producer::{
         ProducerAdapter, ProducerFailureReason, RuntimeContractViolation,
@@ -1270,6 +1296,33 @@ mod tests {
             assert_eq!(*sequence, expected_sequence as u64);
             assert!(delta.canonical_encoded_len().unwrap() <= exact_one);
         }
+    }
+
+    #[test]
+    fn native_membership_wire_budget_is_unavailable_not_a_fragment_error() {
+        let schema = ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches)
+            .expect("membership schema");
+        let delta = MembershipDeltaEncoder::encode(
+            &Int64Array::from(vec![1]),
+            &DataType::Int64,
+            usize::MAX,
+        )
+        .expect("membership delta")
+        .into_deltas()
+        .expect("membership deltas")
+        .into_iter()
+        .next()
+        .expect("one membership delta");
+        let semantic_budget = delta.canonical_encoded_len().expect("semantic size");
+
+        assert!(matches!(
+            encode_execution_membership_contribution(
+                CoreContribution::Membership(delta),
+                &schema,
+                semantic_budget,
+            ),
+            Ok(None)
+        ));
     }
 
     #[test]
