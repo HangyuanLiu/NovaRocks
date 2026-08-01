@@ -135,6 +135,7 @@ pub(crate) fn execute_update_statement(
                 &target,
                 stmt,
                 current_catalog,
+                execution,
                 connector_context,
             )?;
             if matched.row_ids.is_empty() {
@@ -177,6 +178,7 @@ fn materialize_update_matches(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -209,6 +211,7 @@ fn materialize_update_matches(
         Some(&target.catalog),
         &match_sql,
         &target.namespace,
+        execution,
         connector_context,
     )
 }
@@ -2197,18 +2200,20 @@ fn execute_update_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal UPDATE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
+    let result = crate::engine::execute_query_with_catalog_service_with_execution(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        execution,
         connector_context,
     )?;
     matched_update_batch_from_query_result(result)
@@ -2646,6 +2651,7 @@ pub(crate) fn execute_merge_statement(
         current_catalog,
         &target_columns,
         insert_columns_resolved.as_deref(),
+        execution,
         connector_context,
     )?;
 
@@ -3183,6 +3189,7 @@ fn materialize_merge_match(
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let target_alias = stmt
@@ -3299,6 +3306,7 @@ fn materialize_merge_match(
         Some(&target.catalog),
         &sql,
         &target.namespace,
+        execution,
         connector_context,
     )?;
     Ok(result)
@@ -3486,18 +3494,20 @@ fn execute_merge_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal MERGE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
+    let result = crate::engine::execute_query_with_catalog_service_with_execution(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        execution,
         connector_context,
     )?;
     let Some(first_chunk) = result.chunks.first() else {
