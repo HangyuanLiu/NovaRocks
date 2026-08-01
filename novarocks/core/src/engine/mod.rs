@@ -4917,7 +4917,10 @@ fn prepare_query_with_sql_compiler_kernel(
     };
     ensure_mainline_distributed_execution(
         false,
-        state.iceberg_catalogs.read().is_ok(),
+        // SQLX-1 has already lowered a connector-neutral distributed read.
+        // A populated Iceberg registry is catalog metadata, not a request for
+        // the removed local direct-write execution path.
+        false,
         state.exchange_port,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
