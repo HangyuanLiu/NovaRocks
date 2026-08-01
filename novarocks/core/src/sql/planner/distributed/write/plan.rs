@@ -20,8 +20,8 @@ use super::change_stream::{
     IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch,
 };
 use super::sink::{
-    ConnectorWriteFragmentSink, ConnectorWriteInputBinding, IcebergWritePlanInput,
-    IcebergWriteSinkMode, synthetic_iceberg_write_table_id,
+    ConnectorWriteFragmentSink, ConnectorWriteInputBinding, ConnectorWritePlanInput,
+    IcebergWritePlanInput, IcebergWriteSinkMode, synthetic_iceberg_write_table_id,
 };
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
@@ -52,6 +52,19 @@ pub(crate) fn build_iceberg_write_distributed_plan(
     crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
+/// Build a distributed plan whose terminal is a provider-neutral connector
+/// writer. The supplied Arrow/output contract is the complete SQL-owned
+/// boundary; provider payload is attached only after placement has frozen a
+/// writer identity.
+pub(crate) fn build_connector_write_distributed_plan(
+    physical: &crate::sql::planner::physical::PhysicalPlanNode,
+    sink: ConnectorWritePlanInput,
+) -> Result<DistributedPlan, String> {
+    let draft = crate::sql::planner::distributed::build::build_distributed_plan_draft(physical)?;
+    let draft = with_connector_write_sink(draft, sink)?;
+    crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
+}
+
 pub(crate) fn build_iceberg_change_stream_distributed_plan(
     physical: &crate::sql::planner::physical::PhysicalPlanNode,
     descriptor_database: &str,
@@ -72,6 +85,9 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_write_sink(
     mut plan: DistributedPlanDraft,
     sink: IcebergWritePlanInput,
 ) -> Result<DistributedPlanDraft, String> {
+    if let Some(generic) = sink.as_connector_write_input() {
+        return with_connector_write_sink(plan, generic);
+    }
     let root_fragment_id = plan
         .root_fragment_id
         .ok_or_else(|| "Iceberg write sink requires a draft root fragment id".to_string())?;
@@ -101,6 +117,37 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_write_sink(
             input: sink.input.into(),
             output_contract: Some(output_contract),
         });
+    Ok(plan)
+}
+
+pub(in crate::sql::planner::distributed) fn with_connector_write_sink(
+    mut plan: DistributedPlanDraft,
+    sink: ConnectorWritePlanInput,
+) -> Result<DistributedPlanDraft, String> {
+    let root_fragment_id = plan
+        .root_fragment_id
+        .ok_or_else(|| "connector write sink requires a draft root fragment id".to_string())?;
+    let root = plan
+        .fragments
+        .iter_mut()
+        .find(|fragment| fragment.fragment_id == root_fragment_id)
+        .ok_or_else(|| {
+            format!("connector write sink cannot find root fragment id={root_fragment_id}")
+        })?;
+    if !matches!(root.sink, DataSink::Result) {
+        return Err(format!(
+            "connector write sink expected root fragment id={} to use result sink",
+            root.fragment_id
+        ));
+    }
+    let output_contract =
+        crate::sql::planner::distributed::output::finalize_connector_write_output(root, &sink)
+            .map_err(|error| error.to_string())?;
+    root.sink = DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
+        handle: None,
+        input: sink.input,
+        output_contract: Some(output_contract),
+    });
     Ok(plan)
 }
 
@@ -506,7 +553,8 @@ mod tests {
 
     use super::super::change_stream::{ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec};
     use super::super::sink::{
-        ConnectorWriteInputBinding, IcebergWritePlanInput, synthetic_iceberg_write_table_id,
+        ConnectorWriteInputBinding, ConnectorWritePlanInput, IcebergWritePlanInput,
+        synthetic_iceberg_write_table_id,
     };
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
@@ -517,7 +565,9 @@ mod tests {
     };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    use super::{with_iceberg_change_stream_write, with_iceberg_write_sink};
+    use super::{
+        with_connector_write_sink, with_iceberg_change_stream_write, with_iceberg_write_sink,
+    };
 
     #[test]
     fn with_iceberg_write_sink_replaces_root_result_sink() {
@@ -554,9 +604,7 @@ mod tests {
 
         let err = with_iceberg_write_sink(plan.into_draft(), sink).expect_err("arity mismatch");
 
-        assert!(err.contains(
-            "Iceberg write sink input column count 2 does not match target column count 1"
-        ));
+        assert!(err.contains("sink input column count 2 does not match target column count 1"));
     }
 
     #[test]
@@ -572,6 +620,28 @@ mod tests {
             with_iceberg_write_sink(plan.into_draft(), sink).expect_err("out-of-range ordinal");
 
         assert!(err.contains("Iceberg write sink output ordinal 7 is out of range"));
+    }
+
+    #[test]
+    fn generic_connector_sink_replaces_result_without_provider_input() {
+        let plan = single_fragment_plan_for_test();
+        let spec = super::super::sink::test_support::simple_sink_spec();
+        let sink = ConnectorWritePlanInput::from_target_columns(
+            &spec.target_columns,
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+            None,
+        );
+
+        let planned =
+            with_connector_write_sink(plan.into_draft(), sink).expect("generic write sink");
+        let planned = crate::sql::planner::distributed::seal::seal_draft(planned)
+            .expect("generic write draft seals");
+        let root = planned
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.fragment_id == planned.root_fragment_id())
+            .expect("root fragment");
+        assert!(matches!(root.sink, DataSink::ConnectorWrite(_)));
     }
 
     #[test]

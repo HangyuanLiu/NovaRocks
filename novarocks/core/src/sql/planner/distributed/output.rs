@@ -91,7 +91,9 @@ use super::boundary::{
     BoundaryCatalog, BoundaryContract, ExecutionColumnId, ExecutionColumnIdAllocator,
 };
 use super::write::change_stream::ChangeStreamBranchRoute;
-use super::write::sink::{ConnectorWriteInputBinding, IcebergWritePlanInput};
+use super::write::sink::{
+    ConnectorWriteInputBinding, ConnectorWritePlanInput, IcebergWritePlanInput,
+};
 use super::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeReceiver, FragmentEdge,
     FragmentEdgeKind, FragmentId, PlanFragment,
@@ -2011,6 +2013,72 @@ pub(crate) fn finalize_iceberg_write_output(
     })
 }
 
+/// Finalize a provider-neutral connector write output. The output schema and
+/// optional root projection are supplied by SQL; no provider planning type is
+/// visible to this boundary.
+pub(crate) fn finalize_connector_write_output(
+    fragment: &PlanFragment,
+    sink: &ConnectorWritePlanInput,
+) -> Result<ConnectorWriteOutputContract, WriteContractError> {
+    let input_columns =
+        connector_write_input_columns(fragment.fragment_id, &fragment.output_columns, &sink.input)?;
+    let target_columns = sink.target_schema.fields();
+    let output_exprs = match &sink.root_output_exprs {
+        Some(exprs) if exprs.len() == target_columns.len() => exprs.clone(),
+        Some(exprs) => {
+            return Err(WriteContractError::WriteOutputExprArity {
+                fragment_id: fragment.fragment_id,
+                output_exprs: exprs.len(),
+                target_columns: target_columns.len(),
+            });
+        }
+        None => match fragment.output_exprs.as_ref() {
+            Some(exprs) if exprs.len() == target_columns.len() => exprs.clone(),
+            Some(exprs) => {
+                return Err(WriteContractError::WriteOutputExprArity {
+                    fragment_id: fragment.fragment_id,
+                    output_exprs: exprs.len(),
+                    target_columns: target_columns.len(),
+                });
+            }
+            None => {
+                if input_columns.len() != target_columns.len() {
+                    return Err(WriteContractError::WriteInputArity {
+                        fragment_id: fragment.fragment_id,
+                        input_columns: input_columns.len(),
+                        target_columns: target_columns.len(),
+                    });
+                }
+                input_columns.into_iter().map(column_ref_expr).collect()
+            }
+        },
+    };
+    let target_schema = target_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let column_id = idx
+                .checked_add(1)
+                .and_then(|ordinal| u32::try_from(ordinal).ok())
+                .ok_or(WriteContractError::WriteTargetColumnIdOverflow {
+                    fragment_id: fragment.fragment_id,
+                    ordinal: idx,
+                })?;
+            Ok(FinalizedWriteTargetColumn {
+                column_id,
+                name: field.name().to_string(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                is_internal: false,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConnectorWriteOutputContract {
+        output_exprs,
+        target_schema,
+    })
+}
+
 /// Finalize the schema of a narrowed position/DV input stream.  The wire IDs
 /// remain positional, while names and types follow the concrete physical
 /// stream columns selected by the fragment binding.
@@ -2043,7 +2111,7 @@ fn finalize_write_input_schema(
 /// Select the fragment output columns that feed the write sink, per its input
 /// binding. Planner-side twin of the encoder's removed
 /// `iceberg_write_sink_columns_for_input`.
-fn iceberg_write_input_columns<'a>(
+fn connector_write_input_columns<'a>(
     fragment_id: FragmentId,
     output_columns: &'a [OutputColumn],
     input: &ConnectorWriteInputBinding,
@@ -2064,6 +2132,14 @@ fn iceberg_write_input_columns<'a>(
             })
             .collect(),
     }
+}
+
+fn iceberg_write_input_columns<'a>(
+    fragment_id: FragmentId,
+    output_columns: &'a [OutputColumn],
+    input: &ConnectorWriteInputBinding,
+) -> Result<Vec<&'a OutputColumn>, WriteContractError> {
+    connector_write_input_columns(fragment_id, output_columns, input)
 }
 
 /// Finalize the write sink's target output schema. Positional target-field ids

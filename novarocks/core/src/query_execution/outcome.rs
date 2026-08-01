@@ -106,6 +106,59 @@ impl WriteExecutionOutcome {
             self.connector_completion,
         )
     }
+
+    /// Consume a native connector-write terminal without exposing a client row
+    /// transport. A connector staging request has exactly one completion
+    /// carrier: its complete accepted SPI report set.
+    pub fn into_connector_staging(self) -> Result<ConnectorWriteCompletion, DistributedQueryError> {
+        if !self.result.columns.is_empty() || !self.result.chunks.is_empty() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging terminal returned a result payload",
+            ));
+        }
+        if self.abort.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging terminal returned an abort payload",
+            ));
+        }
+        self.connector_completion.ok_or_else(|| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging terminal has no accepted connector completion",
+            )
+        })
+    }
+}
+
+/// Bounded, provider-neutral aggregate of an accepted staged-report set.
+/// Frontend/application code may observe these counters but cannot inspect the
+/// provider-owned report payloads that produced them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorWriteStagingSummary {
+    input_rows: u64,
+    staged_bytes: u64,
+    artifact_count: u64,
+    writer_count: u32,
+}
+
+impl ConnectorWriteStagingSummary {
+    pub const fn input_rows(self) -> u64 {
+        self.input_rows
+    }
+
+    pub const fn staged_bytes(self) -> u64 {
+        self.staged_bytes
+    }
+
+    pub const fn artifact_count(self) -> u64 {
+        self.artifact_count
+    }
+
+    pub const fn writer_count(self) -> u32 {
+        self.writer_count
+    }
 }
 
 /// Successful provider-neutral terminal write facts.  The attachment owns the
@@ -183,6 +236,54 @@ impl ConnectorWriteCompletion {
     pub fn session(&self) -> &ConnectorWriteOperationSession {
         &self.session
     }
+
+    pub fn staging_summary(&self) -> Result<ConnectorWriteStagingSummary, DistributedQueryError> {
+        let writer_count = u32::try_from(self.input.reports().len()).map_err(|_| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging report count exceeds bounded summary range",
+            )
+        })?;
+        self.input.reports().iter().try_fold(
+            ConnectorWriteStagingSummary {
+                writer_count,
+                ..ConnectorWriteStagingSummary::default()
+            },
+            |summary, report| {
+                let report_summary = report.summary();
+                Ok(ConnectorWriteStagingSummary {
+                    input_rows: summary
+                        .input_rows
+                        .checked_add(report_summary.input_rows)
+                        .ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "connector staging input row summary overflow",
+                            )
+                        })?,
+                    staged_bytes: summary
+                        .staged_bytes
+                        .checked_add(report_summary.staged_bytes)
+                        .ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "connector staging byte summary overflow",
+                            )
+                        })?,
+                    artifact_count: summary
+                        .artifact_count
+                        .checked_add(report_summary.artifact_count)
+                        .ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "connector staging artifact summary overflow",
+                            )
+                        })?,
+                    writer_count: summary.writer_count,
+                })
+            },
+        )
+    }
 }
 
 pub struct FragmentProfileSet {
@@ -233,7 +334,7 @@ impl DistributedQueryOutcome {
         }
     }
 
-    pub(crate) fn into_write(self) -> Result<WriteExecutionOutcome, DistributedQueryError> {
+    pub fn into_write(self) -> Result<WriteExecutionOutcome, DistributedQueryError> {
         match self {
             Self::Write(outcome) => Ok(outcome),
             other => Err(outcome_variant_mismatch(

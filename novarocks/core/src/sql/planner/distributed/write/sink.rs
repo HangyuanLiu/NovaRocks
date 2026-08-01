@@ -16,12 +16,16 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::connector::iceberg::position_delete_descriptor::PositionDeleteDescriptorInput;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::sql::planner::table::TableDef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::ConnectorWriterHandle;
+
+use crate::sql::analysis::TypedExpr;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
@@ -64,6 +68,61 @@ pub(crate) struct IcebergWritePlanInput {
     pub(crate) descriptor_database: String,
     pub(crate) spec: IcebergWriteSinkSpec,
     pub(crate) input: ConnectorWriteInputBinding,
+}
+
+/// Provider-neutral input for a distributed connector writer.  It contains
+/// only the Arrow contract between the terminal fragment and the BE-local
+/// writer; concrete providers keep target metadata in their opaque handle.
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectorWritePlanInput {
+    pub(crate) target_schema: SchemaRef,
+    pub(crate) input: ConnectorWriteInputBinding,
+    /// A root-only projection supplied by SQL when the physical stream needs
+    /// to materialize hidden or state columns immediately before the sink.
+    /// The expression contract is generic planner data, never provider data.
+    pub(crate) root_output_exprs: Option<Vec<TypedExpr>>,
+}
+
+impl ConnectorWritePlanInput {
+    pub(crate) fn from_target_columns(
+        target_columns: &[ColumnDef],
+        input: ConnectorWriteInputBinding,
+        root_output_exprs: Option<Vec<TypedExpr>>,
+    ) -> Self {
+        let fields = target_columns
+            .iter()
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>();
+        Self {
+            target_schema: Arc::new(Schema::new(fields)),
+            input,
+            root_output_exprs,
+        }
+    }
+
+    pub(crate) fn target_column_count(&self) -> usize {
+        self.target_schema.fields().len()
+    }
+}
+
+impl IcebergWritePlanInput {
+    /// The ordinary Iceberg data-writer path is an adapter onto the generic
+    /// connector sink. Position-delete/DV writes retain their narrowed legacy
+    /// input adapter because their input schema is intentionally derived from
+    /// the physical row-identity stream rather than the table schema.
+    pub(crate) fn as_connector_write_input(&self) -> Option<ConnectorWritePlanInput> {
+        if matches!(
+            self.spec.mode,
+            IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors
+        ) {
+            return None;
+        }
+        Some(ConnectorWritePlanInput::from_target_columns(
+            &self.spec.target_columns,
+            self.input.clone(),
+            None,
+        ))
+    }
 }
 
 /// Generic Arrow input selection for a connector batch writer.  This lives

@@ -241,6 +241,7 @@ impl ConnectorWritePlanningTemplate {
 /// The complete provider-neutral cohort registration supplied before any
 /// writer attempt may be planned.  Frontend consumes this value exactly once
 /// to acquire one exact-generation lease and seal the immutable cohort set.
+#[derive(Clone)]
 pub struct ConnectorWriteOperationRegistration {
     operation_id: ConnectorWriteOperationId,
     connector_instance_id: novarocks_spi::connector::ConnectorInstanceId,
