@@ -18,7 +18,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use novarocks_execution::runtime_filter as execution;
+
 use crate::common::types::UniqueId;
+use crate::runtime_filter::codec::contribution::{
+    ContributionCodecError, RuntimeFilterContribution as CoreContribution, decode_contribution,
+};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
     ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
@@ -27,8 +32,8 @@ use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ConsumerAr
 use crate::runtime_filter::port::identity::DeploymentEpoch;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::producer::{
-    OrderedBoundProducerAdapter, ProducerAdapter, ProducerHandle, ProducerPortKind,
-    RuntimeContractViolation, RuntimeContractViolationKind,
+    OrderedBoundProducerAdapter, ProducerAdapter, ProducerFailureReason, ProducerHandle,
+    ProducerPortKind, RuntimeContractViolation, RuntimeContractViolationKind,
 };
 use crate::runtime_filter::port::subscription::{
     NonBlockingLiveSubscription, SubscriptionHandle, SubscriptionKind,
@@ -192,6 +197,7 @@ impl NativeRuntimeFilterExecutionContext {
             completion_requirement: channel.completion_requirement(),
             topk_contract_digest,
             max_contribution_bytes: route.inbound_contract().limits().max_contribution_bytes(),
+            inbound_contract: route.inbound_contract().clone(),
         })
     }
 
@@ -306,6 +312,7 @@ pub(crate) struct ResolvedNativeProducer {
     completion_requirement: CompletionRequirement,
     topk_contract_digest: Option<[u8; 32]>,
     max_contribution_bytes: usize,
+    inbound_contract: super::registry::InboundProducerContract,
 }
 
 impl std::fmt::Debug for ResolvedNativeProducer {
@@ -392,6 +399,317 @@ impl ResolvedNativeProducer {
                 RuntimeContractViolationKind::ProducerPortMismatch,
                 "resolved ordered-bound producer opened a different typed port",
             )),
+        }
+    }
+
+    fn open_handle(
+        &self,
+        local_partition_count: u32,
+    ) -> Result<ProducerHandle, RuntimeContractViolation> {
+        self.service.open_producer(
+            self.binding_id,
+            self.fragment_instance_id,
+            local_partition_count,
+            self.kind,
+        )
+    }
+
+    fn execution_producer(
+        &self,
+        local_partition_count: u32,
+    ) -> Result<execution::RuntimeFilterProducerHandle, execution::RuntimeFilterContractViolation>
+    {
+        let handle = self
+            .open_handle(local_partition_count)
+            .map_err(execution_violation)?;
+        Ok(Arc::new(NativeExecutionProducerAdapter {
+            handle,
+            binding_id: self.binding_id,
+            fragment_instance_id: self.fragment_instance_id,
+            inbound_contract: self.inbound_contract.clone(),
+        }))
+    }
+}
+
+impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
+    fn open_producer(
+        &self,
+        request: execution::RuntimeFilterProducerOpenRequest,
+    ) -> Result<
+        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+        execution::RuntimeFilterContractViolation,
+    > {
+        let contract = request.contract();
+        let resolved = self
+            .resolve_producer(
+                BindingId::new(contract.binding_id().get()),
+                ChannelId::new(contract.channel_id().get()),
+                execution_producer_port_kind(contract.kind()),
+            )
+            .map_err(execution_violation)?;
+        if execution_contract(resolved.contract()) != *contract.contract() {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "producer execution contract does not match the installed route",
+            ));
+        }
+        match resolved.execution_producer(request.local_partition_count()) {
+            Ok(handle) => Ok(execution::RuntimeFilterBindOutcome::Bound(handle)),
+            Err(error)
+                if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+            {
+                Ok(execution::RuntimeFilterBindOutcome::Unavailable(
+                    execution::UnavailableReason::RouteUnavailable,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        _request: execution::RuntimeFilterSubscriptionRequest,
+    ) -> Result<
+        execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+        execution::RuntimeFilterContractViolation,
+    > {
+        Err(execution::RuntimeFilterContractViolation::new(
+            execution::RuntimeFilterContractViolationKind::RoleMismatch,
+            "native execution subscription adapter is not installed yet",
+        ))
+    }
+}
+
+struct NativeExecutionProducerAdapter {
+    handle: ProducerHandle,
+    binding_id: BindingId,
+    fragment_instance_id: UniqueId,
+    inbound_contract: super::registry::InboundProducerContract,
+}
+
+impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
+    fn submit(
+        &self,
+        partition: execution::PartitionId,
+        sequence: execution::ProducerSequence,
+        contribution: execution::RuntimeFilterContribution,
+    ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+    {
+        let partition = crate::runtime_filter::port::identity::PartitionId::new(partition.get());
+        let sequence = crate::runtime_filter::port::identity::ProducerSequence::new(sequence.get());
+        if contribution.contract_digest() != self.inbound_contract.schema_digest() {
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "contribution contract digest does not match the installed producer route",
+            ));
+        }
+        let stream = crate::runtime_filter::port::identity::ProducerStreamId::new(
+            self.binding_id,
+            self.fragment_instance_id,
+            partition,
+        );
+        let decoded = decode_contribution(
+            contribution.canonical_bytes(),
+            &contribution.contract_digest(),
+            self.inbound_contract.codec_expectation(stream, sequence),
+            self.inbound_contract.limits().max_encoded_bytes(),
+        )
+        .map_err(codec_violation)?;
+        match (&self.handle, decoded) {
+            (ProducerHandle::Membership(adapter), CoreContribution::Membership(delta)) => adapter
+                .submit(partition, sequence, delta)
+                .map(execution_submit_outcome)
+                .map_err(execution_violation),
+            (ProducerHandle::OrderedBound(adapter), CoreContribution::OrderedBound(update)) => {
+                adapter
+                    .submit_bound(partition, sequence, update)
+                    .map(execution_submit_outcome)
+                    .map_err(execution_violation)
+            }
+            (ProducerHandle::TopKSummary(adapter), CoreContribution::TopKSummary(summary)) => {
+                adapter
+                    .submit_summary(partition, sequence, summary)
+                    .map(execution_submit_outcome)
+                    .map_err(execution_violation)
+            }
+            (ProducerHandle::FinalDomain(adapter), CoreContribution::FinalDomain(shard)) => adapter
+                .complete(partition, sequence, shard)
+                .map(execution_submit_outcome)
+                .map_err(execution_violation),
+            _ => Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::RoleMismatch,
+                "contribution kind does not match the opened producer port",
+            )),
+        }
+    }
+
+    fn close_partition(
+        &self,
+        partition: execution::PartitionId,
+        terminal: execution::ProducerSequence,
+    ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+    {
+        let partition = crate::runtime_filter::port::identity::PartitionId::new(partition.get());
+        let terminal = crate::runtime_filter::port::identity::ProducerSequence::new(terminal.get());
+        match &self.handle {
+            ProducerHandle::Membership(adapter) => adapter.close_partition(partition, terminal),
+            ProducerHandle::OrderedBound(adapter) => adapter.close_partition(partition, terminal),
+            ProducerHandle::TopKSummary(adapter) => adapter.close_partition(partition, terminal),
+            ProducerHandle::FinalDomain(adapter) => adapter.close_partition(partition, terminal),
+        }
+        .map(execution_submit_outcome)
+        .map_err(execution_violation)
+    }
+
+    fn fail(
+        &self,
+    ) -> Result<execution::RuntimeFilterSubmitOutcome, execution::RuntimeFilterContractViolation>
+    {
+        match &self.handle {
+            ProducerHandle::Membership(adapter) => {
+                adapter.fail(ProducerFailureReason::ExecutionFailed)
+            }
+            ProducerHandle::OrderedBound(adapter) => {
+                adapter.fail(ProducerFailureReason::ExecutionFailed)
+            }
+            ProducerHandle::TopKSummary(adapter) => {
+                adapter.fail(ProducerFailureReason::ExecutionFailed)
+            }
+            ProducerHandle::FinalDomain(adapter) => {
+                adapter.fail(ProducerFailureReason::ExecutionFailed)
+            }
+        }
+        .map(execution_submit_outcome)
+        .map_err(execution_violation)
+    }
+}
+
+fn execution_producer_port_kind(kind: execution::RuntimeFilterProducerKind) -> ProducerPortKind {
+    match kind {
+        execution::RuntimeFilterProducerKind::Membership => ProducerPortKind::Membership,
+        execution::RuntimeFilterProducerKind::OrderedBound => ProducerPortKind::OrderedBound,
+        execution::RuntimeFilterProducerKind::TopKSummary => ProducerPortKind::TopKSummary,
+        execution::RuntimeFilterProducerKind::FinalDomain => ProducerPortKind::FinalDomain,
+    }
+}
+
+fn execution_contract(
+    contract: &InstalledRuntimeFilterExecutionContract,
+) -> execution::RuntimeFilterExecutionContract {
+    match contract {
+        InstalledRuntimeFilterExecutionContract::Membership {
+            canonical_schema,
+            schema_digest,
+        } => execution::RuntimeFilterExecutionContract::Membership {
+            canonical_schema: Arc::clone(canonical_schema),
+            schema_digest: *schema_digest,
+        },
+        InstalledRuntimeFilterExecutionContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } => execution::RuntimeFilterExecutionContract::Ordered {
+            keys: keys
+                .iter()
+                .map(|key| {
+                    execution::RuntimeOrderKey::new(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
+                                execution::RuntimeOrderSortDirection::Ascending
+                            }
+                            crate::runtime_filter::model::contract::SortDirection::Descending => {
+                                execution::RuntimeOrderSortDirection::Descending
+                            }
+                        },
+                        match key.null_order() {
+                            crate::runtime_filter::model::contract::NullOrder::First => {
+                                execution::RuntimeOrderNullOrder::First
+                            }
+                            crate::runtime_filter::model::contract::NullOrder::Last => {
+                                execution::RuntimeOrderNullOrder::Last
+                            }
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            comparator_digest: *comparator_digest,
+            order_contract_digest: *order_contract_digest,
+        },
+    }
+}
+
+fn execution_violation(
+    error: RuntimeContractViolation,
+) -> execution::RuntimeFilterContractViolation {
+    let kind = match error.kind() {
+        RuntimeContractViolationKind::ServiceUnavailable => {
+            execution::RuntimeFilterContractViolationKind::SessionClosed
+        }
+        RuntimeContractViolationKind::UnauthorizedBinding
+        | RuntimeContractViolationKind::UnauthorizedFragmentInstance => {
+            execution::RuntimeFilterContractViolationKind::UnauthorizedBinding
+        }
+        RuntimeContractViolationKind::ProducerPortMismatch
+        | RuntimeContractViolationKind::ConsumerPortMismatch
+        | RuntimeContractViolationKind::SubscriptionActivationMismatch => {
+            execution::RuntimeFilterContractViolationKind::RoleMismatch
+        }
+        RuntimeContractViolationKind::InvalidPartitionCount => {
+            execution::RuntimeFilterContractViolationKind::InvalidPartitionCount
+        }
+        _ => execution::RuntimeFilterContractViolationKind::ContractMismatch,
+    };
+    execution::RuntimeFilterContractViolation::new(kind, error.to_string())
+}
+
+fn codec_violation(error: ContributionCodecError) -> execution::RuntimeFilterContractViolation {
+    execution::RuntimeFilterContractViolation::new(
+        execution::RuntimeFilterContractViolationKind::ContractMismatch,
+        error.to_string(),
+    )
+}
+
+fn execution_submit_outcome(
+    outcome: crate::runtime_filter::port::producer::SubmitOutcome,
+) -> execution::RuntimeFilterSubmitOutcome {
+    match outcome {
+        crate::runtime_filter::port::producer::SubmitOutcome::Applied => {
+            execution::RuntimeFilterSubmitOutcome::Applied
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::Duplicate => {
+            execution::RuntimeFilterSubmitOutcome::Duplicate
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::Stale => {
+            execution::RuntimeFilterSubmitOutcome::Stale
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::SequenceAdvancedEqual => {
+            execution::RuntimeFilterSubmitOutcome::SequenceAdvancedEqual
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::StreamAcceptedNoGlobalChange => {
+            execution::RuntimeFilterSubmitOutcome::StreamAcceptedNoGlobalChange
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::Published => {
+            execution::RuntimeFilterSubmitOutcome::Published
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::PendingGap => {
+            execution::RuntimeFilterSubmitOutcome::PendingGap
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::PendingFinalSnapshot => {
+            execution::RuntimeFilterSubmitOutcome::PendingFinalSnapshot
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::CoverageStillPossible => {
+            execution::RuntimeFilterSubmitOutcome::CoverageStillPossible
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::TerminalNoop => {
+            execution::RuntimeFilterSubmitOutcome::TerminalNoop
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::Completed => {
+            execution::RuntimeFilterSubmitOutcome::Completed
+        }
+        crate::runtime_filter::port::producer::SubmitOutcome::CompletedWithoutArtifact => {
+            execution::RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
         }
     }
 }

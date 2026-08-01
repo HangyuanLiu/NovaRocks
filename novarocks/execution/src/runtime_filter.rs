@@ -418,15 +418,34 @@ pub trait RuntimeFilterProducer: Send + Sync {
         partition: PartitionId,
         sequence: ProducerSequence,
         contribution: RuntimeFilterContribution,
-    ) -> Result<(), RuntimeFilterContractViolation>;
+    ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
     fn close_partition(
         &self,
         partition: PartitionId,
         terminal: ProducerSequence,
-    ) -> Result<(), RuntimeFilterContractViolation>;
-    fn fail(&self) -> Result<(), RuntimeFilterContractViolation>;
+    ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
+    fn fail(&self) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
 }
 pub type RuntimeFilterProducerHandle = Arc<dyn RuntimeFilterProducer>;
+
+/// A producer operation is admitted exactly once by the installed route. The
+/// result preserves terminal and replay semantics without exposing the
+/// role-local reducer's implementation types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterSubmitOutcome {
+    Applied,
+    Duplicate,
+    Stale,
+    SequenceAdvancedEqual,
+    StreamAcceptedNoGlobalChange,
+    Published,
+    PendingGap,
+    PendingFinalSnapshot,
+    CoverageStillPossible,
+    TerminalNoop,
+    Completed,
+    CompletedWithoutArtifact,
+}
 
 pub trait RuntimeFilterSession: Send + Sync {
     fn open_producer(
@@ -525,18 +544,18 @@ mod tests {
             _: PartitionId,
             _: ProducerSequence,
             _: RuntimeFilterContribution,
-        ) -> Result<(), RuntimeFilterContractViolation> {
-            Ok(())
+        ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
+            Ok(RuntimeFilterSubmitOutcome::Applied)
         }
         fn close_partition(
             &self,
             _: PartitionId,
             _: ProducerSequence,
-        ) -> Result<(), RuntimeFilterContractViolation> {
-            Ok(())
+        ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
+            Ok(RuntimeFilterSubmitOutcome::Applied)
         }
-        fn fail(&self) -> Result<(), RuntimeFilterContractViolation> {
-            Ok(())
+        fn fail(&self) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
+            Ok(RuntimeFilterSubmitOutcome::Applied)
         }
     }
     struct FakeSession;
