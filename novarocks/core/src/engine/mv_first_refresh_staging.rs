@@ -25,7 +25,9 @@ use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
 use crate::sql::mv_refresh::first_refresh::{
-    MvFirstRefreshExecutionArtifact, PreparedMvFirstRefreshWrite,
+    MvFirstRefreshExecutionArtifact, MvFirstRefreshPhysicalSql, MvFirstRefreshShape,
+    MvFirstRefreshTargetContract, MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest,
+    PreparedMvFirstRefreshWrite,
 };
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
@@ -59,6 +61,132 @@ pub(crate) fn build_mv_first_refresh_sink_spec(
         target_table,
         ctx.target_bindings.runtime().target_entry(),
         &columns,
+    )
+}
+
+/// Freeze an SQL-shaped first refresh against the already-validated target
+/// context. This is pure preparation: it allocates no catalog branch, control
+/// lease, writer service, fragment or backend work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_mv_first_refresh_sql_write(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: MvFirstRefreshShape,
+    physical_sql: MvFirstRefreshPhysicalSql,
+    staging_branch: &str,
+    operation_id: ConnectorWriteOperationId,
+    observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedMvFirstRefreshWrite, String> {
+    if matches!(
+        shape,
+        MvFirstRefreshShape::Join | MvFirstRefreshShape::JoinAggregate
+    ) {
+        return Err("join first-refresh must use the typed append logical artifact".to_string());
+    }
+    let request = mv_first_refresh_request(
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+        connector_context,
+    )?;
+    MvFirstRefreshWritePreparer::prepare(request, physical_sql)
+}
+
+/// Freeze a canonical join append projection behind the same request facts as
+/// SQL-shaped first refreshes. The typed logical plan is still not prepared
+/// into native fragments until the exact write lease is active.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_mv_first_refresh_join_write(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: MvFirstRefreshShape,
+    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    staging_branch: &str,
+    operation_id: ConnectorWriteOperationId,
+    observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedMvFirstRefreshWrite, String> {
+    if !matches!(
+        shape,
+        MvFirstRefreshShape::Join | MvFirstRefreshShape::JoinAggregate
+    ) {
+        return Err("typed first-refresh append artifact requires a join shape".to_string());
+    }
+    let request = mv_first_refresh_request(
+        ctx,
+        shape,
+        staging_branch,
+        operation_id,
+        observed_binding,
+        connector_context,
+    )?;
+    MvFirstRefreshWritePreparer::prepare_join_logical(request, append)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mv_first_refresh_request(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: MvFirstRefreshShape,
+    staging_branch: &str,
+    operation_id: ConnectorWriteOperationId,
+    observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<MvFirstRefreshWriteRequest, String> {
+    if staging_branch.is_empty() {
+        return Err("MV first-refresh staging branch is empty".to_string());
+    }
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: ctx.rewrite.target.catalog.clone(),
+        namespace: ctx.rewrite.target.namespace.clone(),
+        table: ctx.rewrite.target.table.clone(),
+    };
+    let runtime = ctx.target_bindings.runtime();
+    let persisted_partition_spec_id = ctx
+        .rewrite
+        .schema_contract
+        .target
+        .partition
+        .as_ref()
+        .map(|partition| partition.target_spec_id)
+        .unwrap_or_else(|| {
+            runtime
+                .target_table()
+                .metadata()
+                .default_partition_spec_id()
+        });
+    if runtime
+        .target_table()
+        .metadata()
+        .default_partition_spec_id()
+        != persisted_partition_spec_id
+    {
+        return Err(
+            "MV first-refresh target partition spec drifted from its persisted contract"
+                .to_string(),
+        );
+    }
+    let target_contract = MvFirstRefreshTargetContract::from_iceberg_schema(
+        ctx.rewrite.target_schema.as_ref(),
+        persisted_partition_spec_id,
+        ctx.rewrite
+            .schema_contract
+            .target
+            .hidden_apply_key
+            .column_name
+            .clone(),
+    )?;
+    let table =
+        crate::engine::iceberg_writer::iceberg_connector_table_handle(&target, staging_branch)?;
+    MvFirstRefreshWriteRequest::try_new(
+        ctx.rewrite.canonical_select_query.to_string(),
+        shape,
+        table,
+        target_contract,
+        observed_binding,
+        operation_id,
+        connector_context,
     )
 }
 

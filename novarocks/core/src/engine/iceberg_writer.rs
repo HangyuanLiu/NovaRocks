@@ -541,20 +541,7 @@ fn build_iceberg_connector_write_templates(
         novarocks_spi::connector::ConnectorRequestContext,
     )>,
 ) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
-    let instance_id = ConnectorInstanceId::parse(&target.catalog)
-        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    let table_payload = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "catalog": target.catalog,
-            "namespace": target.namespace,
-            "table": target.table,
-            "ref": target_ref,
-        }))
-        .map_err(|error| format!("encode connector table identity: {error}"))?,
-    );
-    let table = ConnectorTableHandle::try_new(instance_id, table_payload)
-        .map_err(|error| format!("build connector table handle: {error}"))?;
+    let table = iceberg_connector_table_handle(target, target_ref)?;
     cohorts
         .into_iter()
         .map(
@@ -573,6 +560,29 @@ fn build_iceberg_connector_write_templates(
             },
         )
         .collect()
+}
+
+/// Construct the provider-neutral SPI table identity used by an Iceberg
+/// writer. Callers may freeze it during SQL/application preparation, but the
+/// payload contains no catalog client or provider receipt decoder.
+pub(crate) fn iceberg_connector_table_handle(
+    target: &TargetBackend,
+    target_ref: &str,
+) -> Result<ConnectorTableHandle, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    let table_payload = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "catalog": target.catalog,
+            "namespace": target.namespace,
+            "table": target.table,
+            "ref": target_ref,
+        }))
+        .map_err(|error| format!("encode connector table identity: {error}"))?,
+    );
+    ConnectorTableHandle::try_new(instance_id, table_payload)
+        .map_err(|error| format!("build connector table handle: {error}"))
 }
 
 pub(crate) fn commit_iceberg_connector_write(
