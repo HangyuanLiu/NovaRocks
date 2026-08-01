@@ -263,15 +263,69 @@ impl<'a> CatalogServiceProvider<'a> {
     ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
+                let planner = self
+                    .service
+                    .local()
+                    .read()
+                    .expect("catalog service local read lock")
+                    .get(database, table)?;
+                // COW DML registers a query-local file input under the
+                // internal catalog. The SQL surface name is synthetic, but
+                // native scan preparation identifies the real Iceberg table.
+                // Materialize the one connector lease under that physical
+                // identity while preserving the synthetic TableDef used by
+                // analysis; preparation can then consume the exact lease
+                // without a current-generation reacquire.
+                if let crate::sql::planner::table::ScanSource::IcebergDataFiles {
+                    table: iceberg,
+                    binding,
+                    ..
+                } = &planner.source
+                {
+                    let catalog = iceberg.catalog.clone();
+                    let namespace = iceberg.namespace.clone();
+                    let table_name = iceberg.table.clone();
+                    if catalog != "default_catalog" {
+                        let key = match binding {
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+                                TableBindingKey::strict_base(&catalog, &namespace, &table_name)
+                            }
+                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+                                let snapshot_id = iceberg.current_snapshot_id.ok_or_else(|| {
+                                    format!(
+                                        "explicit Iceberg input '{}.{}.{}' has no frozen snapshot identity",
+                                        catalog, namespace, table_name
+                                    )
+                                })?;
+                                TableBindingKey::time_travel(
+                                    &catalog,
+                                    &namespace,
+                                    &table_name,
+                                    snapshot_id,
+                                )
+                            }
+                        };
+                        return self
+                            .bindings
+                            .resolve_or_insert(key, || {
+                                let mut binding = self.loader.load_strict_base_table(
+                                    &catalog,
+                                    &namespace,
+                                    &table_name,
+                                )?;
+                                binding.resolved = ResolvedAnalyzerTable::from_planner(
+                                    Some("default_catalog"),
+                                    database,
+                                    planner,
+                                );
+                                Ok(binding)
+                            })
+                            .map(|binding| binding.resolved.clone());
+                    }
+                }
                 let key = TableBindingKey::analysis_lookup("default_catalog", database, table);
                 self.bindings
                     .resolve_or_insert(key, || {
-                        let planner = self
-                            .service
-                            .local()
-                            .read()
-                            .expect("catalog service local read lock")
-                            .get(database, table)?;
                         Ok(QueryTableBinding::local(
                             ResolvedAnalyzerTable::from_planner(
                                 Some("default_catalog"),

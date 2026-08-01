@@ -305,6 +305,7 @@ fn build_update_mor_change_stream_write_plan(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -347,6 +348,7 @@ fn build_update_mor_change_stream_write_plan(
         &analyzer_provider,
         &target.namespace,
         None,
+        execution,
     )?;
     let producer = build_update_mor_change_event_expand_plan(
         planned.optimized_tree,
@@ -357,6 +359,10 @@ fn build_update_mor_change_stream_write_plan(
         state,
         target,
         producer,
+        planned.table_bindings.ok_or_else(|| {
+            "MOR UPDATE change-stream compilation did not retain query table bindings".to_string()
+        })?,
+        execution.clone(),
         crate::engine::dml_change_stream::DmlChangeStreamBranchSet::UpdateMor,
         target_ref,
     )?;
@@ -1054,6 +1060,7 @@ fn execute_mor_update(
         target_columns,
         target_ref,
         metadata.last_sequence_number() + 1,
+        &execution,
         connector_context,
     )?;
     run_mor_update_change_stream_transaction(
@@ -2626,6 +2633,7 @@ pub(crate) fn execute_merge_statement(
             insert_columns_resolved.as_deref(),
             target_ref,
             metadata.last_sequence_number() + 1,
+            execution,
             connector_context,
         )?;
         run_mor_merge_change_stream_transaction(
@@ -3322,6 +3330,7 @@ fn build_merge_mor_change_stream_write_plan(
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
@@ -3455,6 +3464,7 @@ fn build_merge_mor_change_stream_write_plan(
         &analyzer_provider,
         &target.namespace,
         None,
+        execution,
     )?;
     let producer = build_merge_mor_change_event_expand_plan(
         planned.optimized_tree,
@@ -3468,6 +3478,10 @@ fn build_merge_mor_change_stream_write_plan(
         state,
         target,
         producer,
+        planned.table_bindings.ok_or_else(|| {
+            "MOR MERGE change-stream compilation did not retain query table bindings".to_string()
+        })?,
+        execution.clone(),
         crate::engine::dml_change_stream::DmlChangeStreamBranchSet::Merge {
             matched_update: has_matched_update,
             matched_delete: has_matched_delete,

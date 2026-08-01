@@ -3505,7 +3505,7 @@ fn connector_static_planning_metrics(
     Ok(metrics)
 }
 
-fn capture_maintenance_execution(
+pub(crate) fn capture_maintenance_execution(
     state: &StandaloneState,
 ) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
     let topology = state
@@ -4383,6 +4383,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     _current_catalog: Option<&str>,
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    query_table_bindings: Option<&crate::sql::catalog::provider::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
@@ -4398,6 +4399,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
         _current_catalog,
         current_database,
         optimized_tree,
+        query_table_bindings,
         dag,
         mv_refresh_ctx,
         pre_expand_keyed_assert,
@@ -4411,6 +4413,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     _current_catalog: Option<&str>,
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
+    query_table_bindings: Option<&crate::sql::catalog::provider::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
@@ -4439,7 +4442,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         &distributed_plan,
         state.connector_control.as_ref(),
         connector_context,
-        None,
+        query_table_bindings,
         scan_binding_resolver,
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )?;
@@ -4499,6 +4502,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         current_catalog,
         current_database,
         optimized_tree,
+        None,
         dag,
         mv_refresh_ctx,
         None,
@@ -4717,6 +4721,7 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
     pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+    pub(crate) table_bindings: Option<Arc<crate::sql::catalog::provider::QueryTableBindingStore>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4725,8 +4730,15 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     current_database: &str,
     imv_rewrite: Option<&dyn crate::sql::compiler::SqlImvRewriteInput>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "distributed SQL compilation requires a frozen non-zero backend count".to_string()
+        })?;
+    let table_bindings = analyzer_catalog
+        .query_table_bindings()
+        .ok_or_else(|| "change-stream SQL compilation requires query table bindings".to_string())?;
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let statistics = query_stats::QueryStatisticsContext::unavailable();
     let request = crate::sql::compiler::SqlCompileRequest::new(
@@ -4737,12 +4749,15 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
             current_database: current_database.to_string(),
             optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         },
-        crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog,
         &statistics,
         crate::sql::functions::builtin_sql_function_catalog(),
         None,
-        crate::sql::compiler::SqlCompileControl::new(None, cancellation.view()),
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            execution.cancellation().clone(),
+        ),
     );
     let request = match imv_rewrite {
         Some(input) => request.with_imv_rewrite(input),
@@ -4757,6 +4772,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         output_columns: compiled.optimized_tree.output_columns.clone(),
         optimized_tree: compiled.optimized_tree,
         change_stream: compiled.change_stream,
+        table_bindings: Some(table_bindings),
     })
 }
 
@@ -4788,6 +4804,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         optimized_tree,
         output_columns,
         change_stream,
+        table_bindings: None,
     })
 }
 

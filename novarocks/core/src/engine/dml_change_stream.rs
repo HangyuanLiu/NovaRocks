@@ -35,6 +35,9 @@ pub(crate) struct DmlChangeStreamWritePlan {
     pub(crate) producer: OptimizedOperatorNode,
     pub(crate) dag: ChangeStreamWriteDagSpec,
     pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    pub(crate) table_bindings:
+        std::sync::Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    pub(crate) execution: crate::query_execution::request_context::QueryExecutionContext,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +104,8 @@ pub(crate) fn build_dml_change_stream_write_plan(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     producer: OptimizedOperatorNode,
+    table_bindings: std::sync::Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    execution: crate::query_execution::request_context::QueryExecutionContext,
     branch_set: DmlChangeStreamBranchSet,
     target_ref: &str,
 ) -> Result<DmlChangeStreamWritePlan, String> {
@@ -177,6 +182,8 @@ pub(crate) fn build_dml_change_stream_write_plan(
         producer,
         dag,
         pre_expand_keyed_assert: None,
+        table_bindings,
+        execution,
     })
 }
 
@@ -292,7 +299,7 @@ pub(crate) fn execute_dml_change_stream_write(
         prepared,
         native_bundle,
         query_opts.cloned(),
-        None,
+        Some(&plan.execution),
         None,
     )?;
     dml_change_stream_write_execution(result, commit_plan)
@@ -315,6 +322,7 @@ pub(crate) fn plan_dml_change_stream_write(
         Some(&target.catalog),
         &target.namespace,
         &plan.producer,
+        Some(plan.table_bindings.as_ref()),
         &mut plan.dag,
         None,
         keyed_assert,

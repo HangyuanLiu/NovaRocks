@@ -11763,6 +11763,7 @@ fn repartition_iceberg_join_mv_overwrite(
                 &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
+                    table_bindings: None,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
                     producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -12025,6 +12026,7 @@ fn first_refresh_iceberg_join_mv(
                 &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
+                    table_bindings: None,
                     output_columns: planned_query.output_columns,
                     change_stream: logical.change_stream,
                     producer_branches: vec![ImvChangeStreamProducerBranch::FreshData],
@@ -13525,6 +13527,7 @@ fn execute_join_delta_branches_logical(
                 &ident,
                 ImvRefreshPlannedChangeStream {
                     optimized_tree: planned_query.optimized_tree,
+                    table_bindings: None,
                     output_columns: planned_query.output_columns,
                     change_stream: logical
                         .change_stream_override
@@ -13998,6 +14001,7 @@ const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
+    table_bindings: Option<std::sync::Arc<crate::sql::catalog::provider::QueryTableBindingStore>>,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,
@@ -14144,6 +14148,7 @@ fn execute_imv_change_stream_writer(
             Some(&target.catalog),
             &target.namespace,
             &refresh_plan.optimized_tree,
+            refresh_plan.table_bindings.as_deref(),
             &mut dag,
             refresh_plan.mv_refresh_ctx,
             None,
@@ -15180,11 +15185,13 @@ fn incremental_refresh_iceberg_mv_with_changes(
         CommitOpKind::FastAppend
     };
     let imv_rewrite_input = IcebergImvRewriteInput::new(&ctx, rewrite_evidence);
+    let execution = crate::engine::capture_maintenance_execution(state)?;
     let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
         &catalog,
         current_database,
         Some(&imv_rewrite_input),
+        &execution,
     )
     .map_err(|err| {
         handle_iceberg_mv_commit_error(
@@ -15214,6 +15221,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
         op_kind,
         ImvRefreshPlannedChangeStream {
             optimized_tree: planned_query.optimized_tree,
+            table_bindings: planned_query.table_bindings,
             output_columns: planned_query.output_columns,
             change_stream: planned_query.change_stream,
             producer_branches,
