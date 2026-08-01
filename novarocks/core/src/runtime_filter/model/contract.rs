@@ -43,20 +43,20 @@ model_id!(PlanFragmentId, u32);
 model_id!(PlanNodeId, i32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ComparatorDigest([u8; 32]);
+pub struct ComparatorDigest([u8; 32]);
 
 impl ComparatorDigest {
-    pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+    pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) const fn get(self) -> [u8; 32] {
+    pub const fn get(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RuntimeFilterLogicalDomain {
+pub enum RuntimeFilterLogicalDomain {
     Membership {
         value_type: DataType,
         null_semantics: NullSemantics,
@@ -65,39 +65,39 @@ pub(crate) enum RuntimeFilterLogicalDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum NullSemantics {
+pub enum NullSemantics {
     NeverMatches,
     NullSafeEqual,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum SortDirection {
+pub enum SortDirection {
     Ascending,
     Descending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum NullOrder {
+pub enum NullOrder {
     First,
     Last,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OrderKeyContract {
+pub struct OrderKeyContract {
     pub data_type: DataType,
     pub direction: SortDirection,
     pub null_order: NullOrder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OrderContract {
+pub struct OrderContract {
     pub keys: Vec<OrderKeyContract>,
     pub inclusive: bool,
     pub comparator_digest: ComparatorDigest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ContributionKind {
+pub enum ContributionKind {
     ValueDomainDelta,
     FinalDomainShard,
     OrderedBoundUpdate,
@@ -112,45 +112,45 @@ pub(crate) enum RuntimeFilterLifecycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TopKSummaryRequirement(NonZeroU32);
+pub struct TopKSummaryRequirement(NonZeroU32);
 
 impl TopKSummaryRequirement {
-    pub(crate) fn try_new(k: u32) -> Option<Self> {
+    pub fn try_new(k: u32) -> Option<Self> {
         NonZeroU32::new(k).map(Self)
     }
 
-    pub(crate) const fn k(self) -> NonZeroU32 {
+    pub const fn k(self) -> NonZeroU32 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ReductionRequirement {
+pub enum ReductionRequirement {
     SetUnion,
     TightenOrderedBound,
     MergeTopKSummary(TopKSummaryRequirement),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum CompletionFenceKind {
+pub enum CompletionFenceKind {
     CommittedDomainFrozen,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum CompletionRequirement {
+pub enum CompletionRequirement {
     ProducerClosed,
     FencedFinalDomain(CompletionFenceKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ArtifactCapability {
+pub enum ArtifactCapability {
     Membership,
     OrderedRange,
     EmptyDomain,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum LateApplyGranularity {
+pub enum LateApplyGranularity {
     Row,
     Batch,
     RowGroup,
@@ -159,13 +159,13 @@ pub(crate) enum LateApplyGranularity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsumerActivation {
+pub enum ConsumerActivation {
     BlockingSnapshot,
     NonBlockingLive { late_apply: LateApplyGranularity },
 }
 
 impl ConsumerActivation {
-    pub(crate) fn is_blocking_or_batch_live(self) -> bool {
+    pub fn is_blocking_or_batch_live(self) -> bool {
         matches!(
             self,
             Self::BlockingSnapshot

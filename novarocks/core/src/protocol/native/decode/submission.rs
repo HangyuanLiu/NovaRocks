@@ -29,11 +29,11 @@ use crate::exec::fragment::program::{
 use crate::exec::node::ExecPlan;
 use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
-use crate::protocol::native_fragment_assembly_port::{
+use crate::protocol::native::test_assembly::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
     NativeFragmentInstanceInput, NativeFragmentSinkAssignmentDecoder,
-    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder,
-    NativeRuntimeFilterContractDecoder, NativeScanSourceContractDecoder,
+    NativeFragmentSubmissionValidator, NativeOutputLayoutDecoder, NativeScanSourceContractDecoder,
+    RuntimeFilterExecutionContractDecoder,
 };
 use crate::query_execution::contract::QueryId as ExecutionQueryId;
 use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
@@ -136,7 +136,7 @@ pub(crate) fn assemble_fragment_submission_with_connectors_and_execution_resolve
     output_layout_decoder: Arc<dyn NativeOutputLayoutDecoder>,
     scan_source_contract_decoder: &dyn NativeScanSourceContractDecoder,
     exchange_contract_decoder: &dyn NativeExchangeContractDecoder,
-    runtime_filter_contract_decoder: &dyn NativeRuntimeFilterContractDecoder,
+    runtime_filter_contract_decoder: &dyn RuntimeFilterExecutionContractDecoder,
     connectors: Arc<crate::connector::ConnectorRegistry>,
     execution_resolver: Arc<dyn novarocks_spi::connector::ConnectorExecutionResolver>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {

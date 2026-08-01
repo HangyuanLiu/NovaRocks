@@ -37,31 +37,27 @@ const REPLAY_DIGEST_DOMAIN: &[u8] = b"novarocks.runtime-filter.ordered-bound-rep
 const REPLAY_DIGEST_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct OrderContractDigest([u8; 32]);
+pub struct OrderContractDigest([u8; 32]);
 
 impl OrderContractDigest {
-    pub(crate) const fn from_bytes_for_codec(bytes: [u8; 32]) -> Self {
+    pub const fn from_bytes_for_codec(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) const fn bytes(self) -> [u8; 32] {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeOrderKey {
+pub struct RuntimeOrderKey {
     data_type: DataType,
     direction: SortDirection,
     null_order: NullOrder,
 }
 
 impl RuntimeOrderKey {
-    pub(crate) const fn from_codec(
-        data_type: DataType,
-        direction: SortDirection,
-        null_order: NullOrder,
-    ) -> Self {
+    pub const fn new(data_type: DataType, direction: SortDirection, null_order: NullOrder) -> Self {
         Self {
             data_type,
             direction,
@@ -69,21 +65,21 @@ impl RuntimeOrderKey {
         }
     }
 
-    pub(crate) const fn data_type(&self) -> &DataType {
+    pub const fn data_type(&self) -> &DataType {
         &self.data_type
     }
 
-    pub(crate) const fn direction(&self) -> SortDirection {
+    pub const fn direction(&self) -> SortDirection {
         self.direction
     }
 
-    pub(crate) const fn null_order(&self) -> NullOrder {
+    pub const fn null_order(&self) -> NullOrder {
         self.null_order
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeOrderContract {
+pub struct RuntimeOrderContract {
     keys: Arc<[RuntimeOrderKey]>,
     plan_comparator_digest: ComparatorDigest,
     order_contract_digest: OrderContractDigest,
@@ -277,7 +273,7 @@ impl OrderedBoundUpdate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OrderContractError {
+pub enum OrderContractError {
     EmptyKeys,
     ExclusiveBound,
     UnsupportedSchema,
@@ -306,7 +302,7 @@ impl ComparatorDigestV1 {
     }
 }
 
-pub(crate) fn comparator_digest_for_plan(
+pub fn comparator_digest_for_plan(
     keys: &[OrderKeyContract],
 ) -> Result<ComparatorDigest, OrderContractError> {
     ComparatorDigestV1::for_contract(keys, COMPARATOR_ALGORITHM_VERSION)
@@ -352,7 +348,7 @@ impl RuntimeOrderContract {
         Ok(OrderContractDigest(order.finalize().into()))
     }
 
-    pub(crate) fn try_from_plan(plan: &OrderContract) -> Result<Self, OrderContractError> {
+    pub fn try_from_plan(plan: &OrderContract) -> Result<Self, OrderContractError> {
         if plan.keys.is_empty() {
             return Err(OrderContractError::EmptyKeys);
         }
@@ -416,7 +412,7 @@ impl RuntimeOrderContract {
         Ok(Ordering::Equal)
     }
 
-    pub(crate) const fn digest(&self) -> OrderContractDigest {
+    pub const fn digest(&self) -> OrderContractDigest {
         self.order_contract_digest
     }
 
