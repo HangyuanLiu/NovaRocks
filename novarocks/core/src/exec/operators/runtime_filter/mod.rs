@@ -865,6 +865,36 @@ impl RuntimeFilterConsumerSet {
     }
 
     #[cfg(test)]
+    fn from_execution_live_bound_for_test(
+        specs: Vec<RuntimeFilterConsumerBinding>,
+        arena: Arc<ExprArena>,
+        subscriptions: Vec<Arc<dyn execution::NonBlockingLiveSubscription>>,
+    ) -> Self {
+        validate_plan_specs(&specs, &arena).unwrap();
+        assert_eq!(specs.len(), subscriptions.len());
+        let bindings = specs
+            .into_iter()
+            .zip(subscriptions)
+            .map(|(spec, subscription)| NativeConsumerBinding {
+                spec,
+                state: NativeConsumerBindingState::BoundLive {
+                    subscription,
+                    observed: None,
+                },
+            })
+            .collect();
+        Self {
+            inner: Arc::new(NativeConsumerInner {
+                arena,
+                bindings: Mutex::new(bindings),
+                acquire_phase: Mutex::new(NativeConsumerAcquirePhase::Pending),
+                acquire_ready: Condvar::new(),
+                wait_timeout: Mutex::new(Duration::from_secs(1)),
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn from_mixed_bound_for_test(
         specs: Vec<RuntimeFilterConsumerBinding>,
         arena: Arc<ExprArena>,
@@ -2032,12 +2062,14 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Array, BooleanArray, Int32Array};
     use arrow::datatypes::DataType;
+    use novarocks_execution::runtime_filter as execution;
 
     use super::{
-        NativeConsumerBindingState, NativeConsumerTestSubscription, RuntimeFilterConsumerSet,
-        subscription_kind_for_activation, validate_resolved_consumer_activation,
+        NativeConsumerBindingState, NativeConsumerTestSubscription, NativeExecutionPredicate,
+        RuntimeFilterConsumerSet, membership_predicate_contract, subscription_kind_for_activation,
+        validate_resolved_consumer_activation,
     };
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -2050,6 +2082,7 @@ mod tests {
     };
     use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
     use crate::runtime::profile::{RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS};
+    use crate::runtime_filter::exec::membership_predicate::NativeRuntimeFilterPredicate;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, ConsumerActivation, LateApplyGranularity, NullSemantics,
     };
@@ -2224,6 +2257,42 @@ mod tests {
         }
     }
 
+    struct ScriptedExecutionLiveSubscription {
+        outcomes: Mutex<VecDeque<execution::LivePollOutcome>>,
+        observed: Mutex<Vec<Option<execution::LogicalVersion>>>,
+    }
+
+    impl ScriptedExecutionLiveSubscription {
+        fn new(outcomes: impl IntoIterator<Item = execution::LivePollOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed(&self) -> Vec<Option<execution::LogicalVersion>> {
+            self.observed.lock().unwrap().clone()
+        }
+    }
+
+    impl execution::NonBlockingLiveSubscription for ScriptedExecutionLiveSubscription {
+        fn snapshot(&self) -> Option<Arc<execution::RuntimeFilterSnapshot>> {
+            None
+        }
+
+        fn poll_after(
+            &self,
+            observed: Option<execution::LogicalVersion>,
+        ) -> execution::LivePollOutcome {
+            self.observed.lock().unwrap().push(observed);
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test supplies every live poll outcome")
+        }
+    }
+
     fn live_spec(arena: &mut ExprArena) -> RuntimeFilterConsumerBinding {
         let mut spec = consumer_spec(arena);
         spec.activation = ConsumerActivation::NonBlockingLive {
@@ -2234,13 +2303,19 @@ mod tests {
 
     fn live_fixture(
         outcomes: impl IntoIterator<Item = LivePollOutcome>,
-    ) -> (RuntimeFilterConsumerSet, Arc<ScriptedLiveSubscription>) {
+    ) -> (
+        RuntimeFilterConsumerSet,
+        Arc<ScriptedExecutionLiveSubscription>,
+    ) {
         let mut arena = ExprArena::default();
         let spec = live_spec(&mut arena);
-        let subscription = Arc::new(ScriptedLiveSubscription::new(outcomes));
-        let typed: Arc<dyn NonBlockingLiveSubscription> = subscription.clone();
+        let execution_outcomes = outcomes
+            .into_iter()
+            .map(|outcome| execution_live_outcome(&spec, outcome));
+        let subscription = Arc::new(ScriptedExecutionLiveSubscription::new(execution_outcomes));
+        let typed: Arc<dyn execution::NonBlockingLiveSubscription> = subscription.clone();
         (
-            RuntimeFilterConsumerSet::from_live_bound_for_test(
+            RuntimeFilterConsumerSet::from_execution_live_bound_for_test(
                 vec![spec],
                 Arc::new(arena),
                 vec![typed],
@@ -2255,11 +2330,82 @@ mod tests {
             .bindings
             .lock()
             .expect("native RF consumer lock");
-        let NativeConsumerBindingState::TestBoundLive { observed, .. } = &mut bindings[0].state
-        else {
+        let NativeConsumerBindingState::BoundLive { observed, .. } = &mut bindings[0].state else {
             panic!("fixture binding is live");
         };
-        *observed = next;
+        *observed = next.map(|version| execution::LogicalVersion::new(version.get()));
+    }
+
+    fn execution_live_outcome(
+        spec: &RuntimeFilterConsumerBinding,
+        outcome: LivePollOutcome,
+    ) -> execution::LivePollOutcome {
+        match outcome {
+            LivePollOutcome::Updated { bundle, terminal } => execution::LivePollOutcome::Updated {
+                snapshot: execution_membership_snapshot(spec, bundle),
+                terminal: terminal.map(execution_live_terminal),
+            },
+            LivePollOutcome::Idle {
+                latest_version,
+                terminal,
+            } => execution::LivePollOutcome::Idle {
+                latest_version: latest_version
+                    .map(|version| execution::LogicalVersion::new(version.get())),
+                terminal: terminal.map(execution_live_terminal),
+            },
+        }
+    }
+
+    fn execution_membership_snapshot(
+        spec: &RuntimeFilterConsumerBinding,
+        bundle: Arc<ArtifactBundle>,
+    ) -> Arc<execution::RuntimeFilterSnapshot> {
+        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = if bundle.version()
+            == LogicalVersion::FIRST
+        {
+            Arc::new(NativeExecutionPredicate::Membership(
+                NativeRuntimeFilterPredicate::compile(
+                    &bundle,
+                    &membership_predicate_contract(spec).expect("valid membership test contract"),
+                )
+                .expect("valid membership test artifact"),
+            ))
+        } else {
+            Arc::new(AlwaysPassesTestPredicate)
+        };
+        Arc::new(execution::RuntimeFilterSnapshot::new(
+            execution::RuntimeFilterBindingId::new(spec.binding_id),
+            execution::LogicalVersion::new(bundle.version().get()),
+            [0; 32],
+            predicate,
+        ))
+    }
+
+    struct AlwaysPassesTestPredicate;
+
+    impl execution::RuntimeFilterPredicate for AlwaysPassesTestPredicate {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn evaluate(
+            &self,
+            input: &arrow::array::ArrayRef,
+        ) -> Result<BooleanArray, execution::RuntimeFilterContractViolation> {
+            Ok(BooleanArray::from(vec![true; input.len()]))
+        }
+    }
+
+    fn execution_live_terminal(terminal: LiveTerminal) -> execution::LiveTerminal {
+        match terminal {
+            LiveTerminal::Completed => execution::LiveTerminal::Completed,
+            LiveTerminal::CompletedWithoutArtifact
+            | LiveTerminal::DegradedLogical(_)
+            | LiveTerminal::DegradedArtifact(_)
+            | LiveTerminal::DegradedDelivery(_)
+            | LiveTerminal::Unavailable(_) => execution::LiveTerminal::CompletedWithoutArtifact,
+            LiveTerminal::Cancelled => execution::LiveTerminal::Cancelled,
+        }
     }
 
     fn assert_values(output: Option<crate::exec::chunk::Chunk>, expected: &[i32]) {
