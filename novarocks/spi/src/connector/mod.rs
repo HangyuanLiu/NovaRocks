@@ -17,6 +17,7 @@
 
 mod context;
 mod control;
+mod data_mutation;
 mod distribution;
 mod error;
 mod execution;
@@ -35,6 +36,18 @@ pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
     ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
     ConnectorControlResolver, ConnectorExecutionDistribution, ConnectorScanPlanning,
+};
+pub use data_mutation::{
+    CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, ConnectorDataMutation,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
+    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
+    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
+    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
 };
 pub use distribution::{
     ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,
