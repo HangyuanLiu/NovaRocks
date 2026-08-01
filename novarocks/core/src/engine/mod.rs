@@ -4736,9 +4736,12 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         .ok_or_else(|| {
             "distributed SQL compilation requires a frozen non-zero backend count".to_string()
         })?;
-    let table_bindings = analyzer_catalog
-        .query_table_bindings()
-        .ok_or_else(|| "change-stream SQL compilation requires query table bindings".to_string())?;
+    // Incremental MV refresh supplies its immutable, generation-fenced scan
+    // bindings through `IcebergMvRefreshContext`. Its one-shot in-memory
+    // analysis catalog therefore has no ordinary query binding store; retain
+    // that absence in the compiler output so physical preparation delegates
+    // only to the typed refresh resolver rather than reacquiring metadata.
+    let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let statistics = query_stats::QueryStatisticsContext::unavailable();
     let request = crate::sql::compiler::SqlCompileRequest::new(
@@ -4772,7 +4775,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         output_columns: compiled.optimized_tree.output_columns.clone(),
         optimized_tree: compiled.optimized_tree,
         change_stream: compiled.change_stream,
-        table_bindings: Some(table_bindings),
+        table_bindings,
     })
 }
 
