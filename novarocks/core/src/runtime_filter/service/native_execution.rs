@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 
@@ -28,6 +27,7 @@ use crate::runtime_filter::codec::contribution::{
     ContributionCodecError, RuntimeFilterContribution as CoreContribution, decode_contribution,
     encode_contribution,
 };
+use crate::runtime_filter::exec::execution_predicate::NativeExecutionPredicate;
 use crate::runtime_filter::exec::membership_predicate::{
     MembershipPredicateContract, NativeRuntimeFilterPredicate,
 };
@@ -955,10 +955,10 @@ impl SnapshotPredicateCompiler {
                     bundle.version(),
                 )
                 .map_err(|_| execution::UnavailableReason::MaterializationFailed)?;
-                Arc::new(NativeExecutionPredicate::Ordered(
+                Arc::new(NativeExecutionPredicate::Ordered(Arc::new(
                     NativeOrderedRangePredicate::compile(bundle, &expected)
                         .map_err(|_| execution::UnavailableReason::MaterializationFailed)?,
-                ))
+                )))
             }
         };
         Ok(Arc::new(execution::RuntimeFilterSnapshot::new(
@@ -967,46 +967,6 @@ impl SnapshotPredicateCompiler {
             contract_digest,
             predicate,
         )))
-    }
-}
-
-pub(crate) enum NativeExecutionPredicate {
-    Membership(NativeRuntimeFilterPredicate),
-    Ordered(NativeOrderedRangePredicate),
-}
-
-impl NativeExecutionPredicate {
-    pub(crate) fn ordered_range(&self) -> Option<&NativeOrderedRangePredicate> {
-        match self {
-            Self::Membership(_) => None,
-            Self::Ordered(predicate) => Some(predicate),
-        }
-    }
-}
-
-impl execution::RuntimeFilterPredicate for NativeExecutionPredicate {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn evaluate(
-        &self,
-        input: &ArrayRef,
-    ) -> Result<BooleanArray, execution::RuntimeFilterContractViolation> {
-        match self {
-            Self::Membership(predicate) => predicate.evaluate(input).map_err(|error| {
-                execution::RuntimeFilterContractViolation::new(
-                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
-                    error.to_string(),
-                )
-            }),
-            Self::Ordered(predicate) => predicate.evaluate(input).map_err(|error| {
-                execution::RuntimeFilterContractViolation::new(
-                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
-                    error.to_string(),
-                )
-            }),
-        }
     }
 }
 

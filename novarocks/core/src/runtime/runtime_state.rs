@@ -189,6 +189,15 @@ impl RuntimeState {
         self.native_runtime_filter_context.as_ref()
     }
 
+    pub(crate) fn runtime_filter_session(
+        &self,
+    ) -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> {
+        self.native_runtime_filter_context.as_ref().map(|context| {
+            std::sync::Arc::new(context.clone())
+                as novarocks_execution::runtime_filter::RuntimeFilterSessionRef
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
