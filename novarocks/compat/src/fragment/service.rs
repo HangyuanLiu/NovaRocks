@@ -34,29 +34,28 @@ use crate::protocol::starrocks::decode::{
 };
 use crate::thrift::{data_sinks, descriptors, internal_service, planner, types};
 use novarocks::cache::CacheOptions;
-use novarocks::common::types::UniqueId;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::exchange;
-use novarocks::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentReportRegistration,
-    FragmentResultWriter, FragmentTerminalReport, LoadTrackingLogSink, SyncFragmentExecutor,
-};
 use novarocks::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, RunningFragmentHandle,
     prepare_fragment,
 };
+use novarocks::runtime::fragment::{
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+};
 use novarocks::runtime::mem_tracker::MemTracker;
 use novarocks::runtime::profile::{ProfileUnit, Profiler};
-use novarocks::runtime::query_context::{LookupFetcherLifecycle, QueryId};
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks::runtime::starrocks_fragment_query::{
-    StarRocksFragmentExecution, StarRocksFragmentHandoff, StarRocksFragmentPreStartHandoff,
-    StarRocksFragmentQueryRuntime,
+    LookupFetcherLifecycle, StarRocksFragmentExecution, StarRocksFragmentHandoff,
+    StarRocksFragmentPreStartHandoff, StarRocksFragmentQueryRuntime,
 };
 use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
     ConnectorWriterIdentity,
 };
+use novarocks_types::QueryId;
+use novarocks_types::UniqueId;
 
 use crate::fragment::admission::{
     DescriptorPreparation, DescriptorTransportCache, PrelaunchCancellationToken, PrelaunchGuard,
@@ -64,7 +63,9 @@ use crate::fragment::admission::{
 };
 use crate::fragment::dependency::{lake_meta_storage_resolver, resolve_dependencies};
 use crate::load::CompatLoadRegistry;
-use crate::report::CompatReportService;
+use crate::report::{CompatReportService, FragmentReportRegistration, FragmentTerminalReport};
+
+use super::sync::SyncFragmentExecutor;
 
 pub struct CompatFragmentService {
     queries: StarRocksFragmentQueryRuntime,
@@ -77,7 +78,6 @@ pub struct CompatFragmentService {
     event_sink: Arc<dyn FragmentEventSink>,
     report_service: Arc<CompatReportService>,
     load_registry: Arc<CompatLoadRegistry>,
-    load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
     table_schema_provider:
         Option<Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>>,
@@ -125,7 +125,6 @@ impl CompatFragmentService {
             result_writer,
             report_service,
             load_registry,
-            Arc::new(crate::load::LoadTrackingStore::default()),
         )
     }
 
@@ -136,7 +135,6 @@ impl CompatFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         report_service: Arc<CompatReportService>,
         load_registry: Arc<CompatLoadRegistry>,
-        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
     ) -> Self {
         let starlet_metadata_provider = crate::starlet_metadata::starlet_metadata_provider();
         let storage_metadata_provider = crate::storage_wire::storage_metadata_provider();
@@ -147,7 +145,6 @@ impl CompatFragmentService {
             result_writer,
             report_service,
             load_registry,
-            load_tracking_sink,
             lake_meta_storage_resolver(
                 starlet_metadata_provider.clone(),
                 storage_metadata_provider.clone(),
@@ -167,7 +164,6 @@ impl CompatFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         report_service: Arc<CompatReportService>,
         load_registry: Arc<CompatLoadRegistry>,
-        load_tracking_sink: Arc<dyn LoadTrackingLogSink>,
         lake_meta_resolver: Arc<dyn LakeMetaStorageResolver>,
         table_schema_provider: Option<
             Arc<dyn novarocks::connector::starrocks::ports::TableSchemaProvider>,
@@ -194,7 +190,6 @@ impl CompatFragmentService {
             event_sink: crate::fragment::compat_fragment_event_sink(Arc::clone(&report_service)),
             report_service,
             load_registry,
-            load_tracking_sink,
             lake_meta_resolver,
             table_schema_provider,
             schema_load_provider,
@@ -521,10 +516,10 @@ fn append_incremental_scan_ranges(
     exec_params: &mut internal_service::TPlanFragmentExecParams,
 ) -> Result<(), String> {
     backfill_per_node_scan_ranges(exec_params);
-    let finst_id = UniqueId {
-        hi: exec_params.fragment_instance_id.hi,
-        lo: exec_params.fragment_instance_id.lo,
-    };
+    let finst_id = UniqueId::new(
+        exec_params.fragment_instance_id.hi,
+        exec_params.fragment_instance_id.lo,
+    );
     let mut decoded_updates = Vec::new();
     for (node_id, scan_ranges) in &exec_params.per_node_scan_ranges {
         if scan_ranges.is_empty() {
@@ -929,13 +924,7 @@ fn resolve_stream_load_paths(
                             load_id.hi, load_id.lo
                         )
                     })?;
-                paths.insert(
-                    UniqueId {
-                        hi: load_id.hi,
-                        lo: load_id.lo,
-                    },
-                    path,
-                );
+                paths.insert(UniqueId::new(load_id.hi, load_id.lo), path);
             }
         }
     }
@@ -1163,18 +1152,15 @@ fn launch_prepared_fragments(
         if prepared.submission.uses_split_data_stream_sink() {
             eprintln!("compat_fragment_sink sink=SPLIT_DATA_STREAM_SINK stage=materialized");
         }
-        let prepare_context = prepared
-            .metadata
-            .into_prepare_context(
-                profiler.clone(),
-                Some(Arc::clone(&fragment_mem_tracker)),
-                Arc::clone(&service.exchange_transmitter),
-                Arc::clone(&service.lookup_client),
-                Arc::clone(&service.result_writer),
-                Arc::clone(&service.event_sink),
-                finst_id,
-            )
-            .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
+        let prepare_context = prepared.metadata.into_prepare_context(
+            profiler.clone(),
+            Some(Arc::clone(&fragment_mem_tracker)),
+            Arc::clone(&service.exchange_transmitter),
+            Arc::clone(&service.lookup_client),
+            Arc::clone(&service.result_writer),
+            Arc::clone(&service.event_sink),
+            finst_id,
+        );
         let dormant = match prepare_fragment(prepared.submission, prepare_context) {
             Ok(dormant) => dormant,
             Err(error) => {
@@ -1688,7 +1674,8 @@ fn spawn_dormant_workers(
         let join = match std::thread::Builder::new()
             .name(format!(
                 "compat-fragment-{:x}-{:x}",
-                finst_id.hi, finst_id.lo
+                finst_id.high(),
+                finst_id.low()
             ))
             .spawn(move || {
                 if worker_start_gate.wait() == BatchStartState::Aborted {
@@ -1752,7 +1739,7 @@ fn spawn_dormant_workers(
                     |error| {
                         controls.cancel_query(query_id, error);
                         for id in queries.cancel_query(execution, error.to_string()) {
-                            exchange::cancel_fragment(id.hi, id.lo);
+                            exchange::cancel_fragment(id.high(), id.low());
                         }
                     },
                     || queries.finish_fragment_for_report(execution),
@@ -1768,7 +1755,7 @@ fn spawn_dormant_workers(
                             None => {}
                         }
                     },
-                    || exchange::remove_fragment(finst_id.hi, finst_id.lo),
+                    || exchange::remove_fragment(finst_id.high(), finst_id.low()),
                     || queries.unregister_fragment(finst_id, execution),
                     |decision| queries.cleanup_after_fragment_report(query_id, decision),
                 );
@@ -1912,10 +1899,10 @@ fn submit_exec_batch_plan_fragments_with(
             query_id_for_batch = Some(query_id);
         }
 
-        let finst_id = UniqueId {
-            hi: exec_params.fragment_instance_id.hi,
-            lo: exec_params.fragment_instance_id.lo,
-        };
+        let finst_id = UniqueId::new(
+            exec_params.fragment_instance_id.hi,
+            exec_params.fragment_instance_id.lo,
+        );
         let mut exec_params = exec_params.clone();
         backfill_per_node_scan_ranges(&mut exec_params);
         finst_ids.push(finst_id);
@@ -2031,10 +2018,10 @@ fn submit_exec_plan_fragment_with(
         return Ok(());
     }
     let fragment = one.fragment.as_ref().expect("checked above");
-    let finst_id = UniqueId {
-        hi: params.fragment_instance_id.hi,
-        lo: params.fragment_instance_id.lo,
-    };
+    let finst_id = UniqueId::new(
+        params.fragment_instance_id.hi,
+        params.fragment_instance_id.lo,
+    );
     let query_id = QueryId::new(params.query_id.hi, params.query_id.lo);
     let mut params = params.clone();
     backfill_per_node_scan_ranges(&mut params);
@@ -2104,10 +2091,10 @@ fn execute_plan_fragment_sync_with(
         return Err("missing fragment in TExecPlanFragmentParams".to_string());
     };
 
-    let finst_id = UniqueId {
-        hi: params.fragment_instance_id.hi,
-        lo: params.fragment_instance_id.lo,
-    };
+    let finst_id = UniqueId::new(
+        params.fragment_instance_id.hi,
+        params.fragment_instance_id.lo,
+    );
     let query_id = QueryId::new(params.query_id.hi, params.query_id.lo);
 
     let mut params = params.clone();
@@ -2188,18 +2175,15 @@ fn execute_plan_fragment_sync_with(
         handoff.cache_options(),
     )?;
     let fragment_mem_tracker = admission.fragment_mem_tracker(finst_id);
-    let prepare_context = prepared
-        .metadata
-        .into_prepare_context(
-            None,
-            Some(Arc::clone(&fragment_mem_tracker)),
-            Arc::clone(&service.exchange_transmitter),
-            Arc::clone(&service.lookup_client),
-            Arc::clone(&service.result_writer),
-            Arc::clone(&service.event_sink),
-            finst_id,
-        )
-        .with_load_tracking_sink(Arc::clone(&service.load_tracking_sink));
+    let prepare_context = prepared.metadata.into_prepare_context(
+        None,
+        Some(Arc::clone(&fragment_mem_tracker)),
+        Arc::clone(&service.exchange_transmitter),
+        Arc::clone(&service.lookup_client),
+        Arc::clone(&service.result_writer),
+        Arc::clone(&service.event_sink),
+        finst_id,
+    );
     let dormant = prepare_fragment(prepared.submission, prepare_context)
         .map_err(|error| error.to_string())?;
     let start_gate = Arc::new(BatchStartGate::default());
@@ -2261,7 +2245,7 @@ fn execute_plan_fragment_sync_with(
         drop(running);
         result
     };
-    exchange::remove_fragment(finst_id.hi, finst_id.lo);
+    exchange::remove_fragment(finst_id.high(), finst_id.low());
     queries.unregister_fragment(finst_id, execution);
     queries.finish_fragment(execution);
     drop(admission);
@@ -2284,15 +2268,15 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
+    use crate::fragment::SyncFragmentExecutor;
     use crate::protocol::starrocks::thrift_codec::{
         thrift_binary_deserialize, thrift_binary_serialize,
     };
     use crate::thrift::{
         data_sinks, descriptors, internal_service, partitions, plan_nodes, planner, types,
     };
-    use novarocks::common::types::UniqueId;
-    use novarocks::runtime::fragment::io::SyncFragmentExecutor;
-    use novarocks::runtime::query_context::QueryId;
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
 
     use super::{
         AdapterFailurePlan, AdapterFailureStage, AdapterPausePlan, CompatFragmentService,
@@ -2324,7 +2308,7 @@ mod tests {
     }
 
     fn runtime_query_id(query: UniqueId) -> QueryId {
-        QueryId::new(query.hi, query.lo)
+        QueryId::new(query.high(), query.low())
     }
 
     fn fragment_service() -> CompatFragmentService {
@@ -2438,8 +2422,14 @@ mod tests {
 
     fn params(query: UniqueId, finst: UniqueId) -> internal_service::TPlanFragmentExecParams {
         internal_service::TPlanFragmentExecParams::new(
-            types::TUniqueId::new(query.hi, query.lo),
-            types::TUniqueId::new(finst.hi, finst.lo),
+            types::TUniqueId {
+                hi: query.high(),
+                lo: query.low(),
+            },
+            types::TUniqueId {
+                hi: finst.high(),
+                lo: finst.low(),
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             None,
@@ -2601,14 +2591,8 @@ mod tests {
         let _failure_lock = FAILURE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let query = UniqueId {
-            hi: 85_031,
-            lo: 85_032,
-        };
-        let finst = UniqueId {
-            hi: 85_033,
-            lo: 85_034,
-        };
+        let query = UniqueId::new(85_031, 85_032);
+        let finst = UniqueId::new(85_033, 85_034);
         let bytes = thrift_binary_serialize(&valid_batch(query, &[finst], false))
             .expect("serialize cancellation batch");
         let service = Arc::new(CompatFragmentService::new(
@@ -2653,14 +2637,8 @@ mod tests {
 
     #[test]
     fn cancel_fragment_reaches_a_running_sync_fragment() {
-        let query = UniqueId {
-            hi: 85_041,
-            lo: 85_042,
-        };
-        let finst = UniqueId {
-            hi: 85_043,
-            lo: 85_044,
-        };
+        let query = UniqueId::new(85_041, 85_042);
+        let finst = UniqueId::new(85_043, 85_044);
         let service = Arc::new(CompatFragmentService::new(
             novarocks::runtime::starrocks_fragment_query::StarRocksFragmentQueryRuntime::new(),
             crate::fragment::brpc_exchange_transmitter(),
@@ -2708,14 +2686,8 @@ mod tests {
 
     #[test]
     fn malformed_fragment_fails_before_registration() {
-        let query = UniqueId {
-            hi: 85_001,
-            lo: 85_002,
-        };
-        let finst = UniqueId {
-            hi: 85_003,
-            lo: 85_004,
-        };
+        let query = UniqueId::new(85_001, 85_002);
+        let finst = UniqueId::new(85_003, 85_004);
         let request = request(query, finst, fragment(None));
         let before = TEST_FRAGMENT_LAUNCH_COUNT.load(Ordering::SeqCst);
         let service = fragment_service();
@@ -2734,18 +2706,9 @@ mod tests {
 
     #[test]
     fn batch_second_unique_malformed_launches_nothing() {
-        let query = UniqueId {
-            hi: 85_101,
-            lo: 85_102,
-        };
-        let first_finst = UniqueId {
-            hi: 85_103,
-            lo: 85_104,
-        };
-        let second_finst = UniqueId {
-            hi: 85_105,
-            lo: 85_106,
-        };
+        let query = UniqueId::new(85_101, 85_102);
+        let first_finst = UniqueId::new(85_103, 85_104);
+        let second_finst = UniqueId::new(85_105, 85_106);
         let valid = request(
             query,
             first_finst,
@@ -2776,18 +2739,9 @@ mod tests {
 
     #[test]
     fn batch_second_fragment_cache_options_conflict_leaves_handoff_unpublished() {
-        let query = UniqueId {
-            hi: 85_111,
-            lo: 85_112,
-        };
-        let first_finst = UniqueId {
-            hi: 85_113,
-            lo: 85_114,
-        };
-        let second_finst = UniqueId {
-            hi: 85_115,
-            lo: 85_116,
-        };
+        let query = UniqueId::new(85_111, 85_112);
+        let first_finst = UniqueId::new(85_113, 85_114);
+        let second_finst = UniqueId::new(85_115, 85_116);
         let plan = || fragment(Some(plan_nodes::TPlan::new(vec![empty_set_node()])));
         let mut first = request(query, first_finst, plan());
         first.query_options = Some(query_options_with_cache_probability(10));
@@ -2820,20 +2774,8 @@ mod tests {
         let _failure_lock = FAILURE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let query = UniqueId {
-            hi: 85_201,
-            lo: 85_202,
-        };
-        let finst_ids = [
-            UniqueId {
-                hi: 85_203,
-                lo: 85_204,
-            },
-            UniqueId {
-                hi: 85_205,
-                lo: 85_206,
-            },
-        ];
+        let query = UniqueId::new(85_201, 85_202);
+        let finst_ids = [UniqueId::new(85_203, 85_204), UniqueId::new(85_205, 85_206)];
         let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, false))
             .expect("serialize prepare failure batch");
         let reset = inject_failure(query, AdapterFailureStage::Prepare, 2);
@@ -2867,20 +2809,8 @@ mod tests {
         let _failure_lock = FAILURE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let query = UniqueId {
-            hi: 85_211,
-            lo: 85_212,
-        };
-        let finst_ids = [
-            UniqueId {
-                hi: 85_213,
-                lo: 85_214,
-            },
-            UniqueId {
-                hi: 85_215,
-                lo: 85_216,
-            },
-        ];
+        let query = UniqueId::new(85_211, 85_212);
+        let finst_ids = [UniqueId::new(85_213, 85_214), UniqueId::new(85_215, 85_216)];
         let bytes = thrift_binary_serialize(&valid_batch(query, &finst_ids, true))
             .expect("serialize report registration failure batch");
         let reset = inject_failure(query, AdapterFailureStage::ReportRegistration, 2);

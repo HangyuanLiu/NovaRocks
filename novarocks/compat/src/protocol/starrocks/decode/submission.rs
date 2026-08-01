@@ -25,7 +25,7 @@ use crate::thrift::{descriptors, internal_service, planner, types};
 use novarocks::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::{
-    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
+    ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgramBuilder,
     FragmentProgramOptions, RuntimeFilterContract,
 };
 use novarocks::exec::node::scan::BoundScanRanges;
@@ -33,20 +33,18 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use novarocks::exec::row_position::RowPositionDescriptor;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::descriptor_snapshot::DescriptorSnapshot;
-use novarocks::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
-    FragmentRuntimeOptions, ScanAssignments,
+use novarocks::runtime::fragment::FragmentSubmission;
+use novarocks::runtime::fragment::{
+    ExchangeFrameTransmitter, ExchangeInputAssignment, ExchangeInputAssignments, FragmentEventSink,
+    FragmentInstanceSpec, FragmentResultWriter, FragmentRuntimeOptions, ResultPresentation,
+    ResultProjection, ResultWriteSpec, ScanAssignments,
 };
-use novarocks::runtime::fragment::io::{
-    FragmentEventSink, FragmentResultWriter, ResultPresentation, ResultProjection, ResultWriteSpec,
-};
-use novarocks::runtime::fragment::submission::FragmentSubmission;
-use novarocks::runtime::query_context::LookupFetcherLifecycle;
-use novarocks::runtime::query_context::{QueryId as RuntimeQueryId, query_context_manager};
 use novarocks::runtime::query_options::query_expire_durations;
+use novarocks::runtime::starrocks_fragment_query::{
+    LookupFetcherLifecycle, StarRocksFragmentQueryRuntime,
+};
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use super::dependency::{
@@ -97,16 +95,6 @@ pub(crate) struct StarRocksDecodeInput<'a> {
     pub(crate) compat_connector_writer: Option<novarocks_spi::connector::ConnectorWriterIdentity>,
 }
 
-struct CompatConnectorWriteCancellation {
-    query_id: RuntimeQueryId,
-}
-
-impl ConnectorCancellation for CompatConnectorWriteCancellation {
-    fn is_cancelled(&self) -> bool {
-        query_context_manager().is_query_canceled(self.query_id)
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct StarRocksFragmentDraft {
     parts: DecodedDraftParts,
@@ -118,11 +106,6 @@ pub(crate) struct StarRocksFragmentDraft {
 impl StarRocksFragmentDraft {
     pub(crate) fn external_dependencies(&self) -> &[StarRocksExternalDependency] {
         &self.external_dependencies
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepared_program_for_test(&self) -> &FragmentProgram {
-        &self.parts.program
     }
 }
 
@@ -194,7 +177,7 @@ impl StarRocksSubmissionMetadata {
 
     fn result_write_spec(
         &self,
-        fragment_instance_id: novarocks::common::types::UniqueId,
+        fragment_instance_id: novarocks_types::UniqueId,
     ) -> Option<ResultWriteSpec> {
         self.result_override
             .as_ref()
@@ -233,12 +216,12 @@ impl StarRocksSubmissionMetadata {
         profiler: Option<novarocks::runtime::profile::Profiler>,
         mem_tracker: Option<std::sync::Arc<novarocks::runtime::mem_tracker::MemTracker>>,
         exchange_transmitter: std::sync::Arc<
-            dyn novarocks::runtime::fragment::io::ExchangeFrameTransmitter,
+            dyn novarocks::runtime::fragment::ExchangeFrameTransmitter,
         >,
-        lookup_client: std::sync::Arc<dyn novarocks::runtime::fragment::io::FragmentLookupClient>,
+        lookup_client: std::sync::Arc<dyn novarocks::runtime::fragment::FragmentLookupClient>,
         result_writer: std::sync::Arc<dyn FragmentResultWriter>,
         event_sink: std::sync::Arc<dyn FragmentEventSink>,
-        fragment_instance_id: novarocks::common::types::UniqueId,
+        fragment_instance_id: novarocks_types::UniqueId,
     ) -> novarocks::runtime::fragment::FragmentPrepareContext {
         novarocks::runtime::fragment::FragmentPrepareContext::new_with_execution_overrides(
             profiler,
@@ -256,7 +239,7 @@ impl StarRocksSubmissionMetadata {
 
 #[derive(Debug)]
 struct DecodedDraftParts {
-    program: FragmentProgram,
+    program: FragmentProgramBuilder,
     instance: FragmentInstanceSpec,
     metadata: StarRocksSubmissionMetadata,
 }
@@ -322,7 +305,7 @@ pub(crate) fn finish_fragment_submission(
             )
         })?;
         if !replace_values_chunk(
-            &mut draft.parts.program.plan_mut().root,
+            draft.parts.program.plan_mut().root_mut(),
             patch.node_id(),
             chunk,
         ) {
@@ -335,9 +318,13 @@ pub(crate) fn finish_fragment_submission(
             ));
         }
     }
-    let submission =
-        FragmentSubmission::try_new(Arc::new(draft.parts.program), draft.parts.instance)
-            .map_err(StarRocksFragmentDecodeError::Binding)?;
+    let program = draft
+        .parts
+        .program
+        .finish()
+        .map_err(StarRocksFragmentDecodeError::from)?;
+    let submission = FragmentSubmission::try_new(Arc::new(program), draft.parts.instance)
+        .map_err(StarRocksFragmentDecodeError::Binding)?;
     Ok(DecodedStarRocksFragment {
         submission,
         metadata: draft.parts.metadata,
@@ -345,13 +332,13 @@ pub(crate) fn finish_fragment_submission(
 }
 
 fn query_profile_arena_mut(
-    program: &mut FragmentProgram,
+    program: &mut FragmentProgramBuilder,
     owner: FragmentExprArenaOwner,
 ) -> Result<&mut ExprArena, StarRocksFragmentDecodeError> {
     if owner == FragmentExprArenaOwner::Plan {
-        return Ok(&mut program.plan_mut().arena);
+        return Ok(program.plan_mut().arena_mut());
     }
-    let sink = program.sink_mut().program_mut();
+    let sink = program.sink_program_mut();
     let arena = match (owner, sink) {
         (
             FragmentExprArenaOwner::DataStream,
@@ -375,47 +362,6 @@ fn query_profile_arena_mut(
             FragmentExprArenaOwner::ChangeStreamRouter,
             novarocks::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(program),
         ) => program.arena_mut(),
-        (
-            FragmentExprArenaOwner::StarRocksOutputProjection,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let projection = program.output_projection.as_mut().ok_or_else(|| {
-                query_profile_patch_target_error(owner, "output projection is missing")
-            })?;
-            Arc::make_mut(&mut projection.arena)
-        }
-        (
-            FragmentExprArenaOwner::StarRocksPartition,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let partition = program
-                .descriptor
-                .partition
-                .partition_exprs
-                .as_mut()
-                .ok_or_else(|| {
-                    query_profile_patch_target_error(owner, "partition expressions are missing")
-                })?;
-            &mut Arc::make_mut(partition).arena
-        }
-        (
-            FragmentExprArenaOwner::StarRocksIndexPredicate { index },
-            novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
-        ) => {
-            let predicate = program
-                .descriptor
-                .schema
-                .indexes
-                .get_mut(index)
-                .and_then(|index| index.where_clause.as_mut())
-                .ok_or_else(|| {
-                    query_profile_patch_target_error(
-                        owner,
-                        format!("index predicate {index} is missing"),
-                    )
-                })?;
-            Arc::make_mut(&mut predicate.arena)
-        }
         _ => {
             return Err(query_profile_patch_target_error(
                 owner,
@@ -642,9 +588,7 @@ fn decode_draft_parts(
             let (_, query_expire) = query_expire_durations(Some(&instance.query_options));
             ConnectorRequestContext::try_new(
                 Instant::now() + query_expire,
-                Arc::new(CompatConnectorWriteCancellation {
-                    query_id: instance.query_id,
-                }),
+                StarRocksFragmentQueryRuntime::new().connector_cancellation(instance.query_id),
                 MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -681,33 +625,31 @@ fn decode_draft_parts(
         FieldPath::root("exec_plan_fragment").field("fragment"),
     )?;
     let runtime_filters = RuntimeFilterContract::default();
-    let plan = ExecPlan {
-        arena,
-        root: lowered.node,
-    };
-    let exchange_contracts = collect_exchange_contracts(&plan.root)?;
+    let plan = novarocks::exec::node::ExecPlanBuilder::new(arena, lowered.node)
+        .finish()
+        .map_err(StarRocksFragmentDecodeError::from)?;
+    let exchange_contracts = collect_exchange_contracts(plan.root())?;
     let exchange_assignments = decode_exchange_assignments(
         &exchange_contracts,
         &instance.per_exchange_sender_counts,
         &instance.batch_exchange_sender_counts,
     )?;
-    let program = FragmentProgram::new(
+    let mut program = novarocks::exec::fragment::program::FragmentProgramBuilder::new(
         plan,
         spec,
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-        scan_contracts,
-        exchange_contracts,
-        runtime_filters,
-    );
+    )
+    .scan_sources(scan_contracts)
+    .exchange_inputs(exchange_contracts)
+    .runtime_filters(runtime_filters);
     let mut row_position_descriptors = HashMap::new();
-    collect_row_position_descriptors(&program.plan().root, &mut row_position_descriptors).map_err(
-        |detail| {
+    collect_row_position_descriptors(program.plan_mut().root(), &mut row_position_descriptors)
+        .map_err(|detail| {
             StarRocksFragmentDecodeError::invalid_value(
                 FieldPath::root("exec_plan_fragment").field("fragment"),
                 detail,
             )
-        },
-    )?;
+        })?;
     let descriptor_snapshot = input
         .descriptors
         .map(super::descriptor::descriptor_snapshot_from_thrift)
@@ -738,11 +680,7 @@ fn decode_draft_parts(
         scan_assignments,
         exchange_assignments,
         assignment,
-        FragmentRuntimeOptions::new(
-            instance.query_options,
-            instance.report_endpoint,
-            instance.typed_result_sink,
-        ),
+        FragmentRuntimeOptions::new(instance.query_options, instance.typed_result_sink),
         instance.pipeline_dop,
         instance.backend_num,
     );
@@ -1107,30 +1045,19 @@ mod tests {
     use super::*;
     use crate::thrift::exprs::{TExpr, TExprNode, TExprNodeType, TStringLiteral};
     use crate::thrift::{data_sinks, partitions, plan_nodes};
-    use novarocks::common::types::UniqueId;
     use novarocks::exec::expr::{ExprNode, LiteralValue};
-    use novarocks::exec::fragment::program::{FragmentSinkKind, FragmentSinkSpec};
+    use novarocks::exec::fragment::program::FragmentSinkKind;
     use novarocks::exec::fragment::sink::FragmentSinkProgram;
     use novarocks::exec::node::ExecNodeKind;
     use novarocks::runtime::endpoint::FragmentDestination;
     use novarocks::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
-    use novarocks::runtime::query_context::{QueryId, query_context_manager};
     use novarocks::runtime::result_buffer::{self, TryFetchResult};
     use novarocks::runtime::runtime_filter_observability::{
         QueryKey, RuntimeFilterLifecycleRegistry,
     };
+    use novarocks_types::QueryId;
+    use novarocks_types::UniqueId;
     use std::sync::LazyLock;
-
-    use novarocks::connector::starrocks::lake::context::PartialUpdateWriteMode;
-    use novarocks::connector::starrocks::schema::{
-        StarRocksColumnSchema, StarRocksKeysType, StarRocksTabletSchema,
-    };
-    use novarocks::connector::starrocks::sink::partition_key::PartitionExprPlan;
-    use novarocks::connector::starrocks::sink::plan::{
-        SinkIndexDescriptor, SinkLocationDescriptor, SinkNodesDescriptor, SinkOutputProjectionPlan,
-        SinkPartitionDescriptor, SinkPredicatePlan, SinkSchemaDescriptor,
-        StarRocksTableSinkDescriptor, StarRocksTableSinkProgram,
-    };
 
     static EMPTY_BATCH_SENDERS: LazyLock<HashMap<i32, usize>> = LazyLock::new(HashMap::new);
     static EMPTY_DECODE_FACTS: LazyLock<StarRocksDecodeFacts> =
@@ -1361,117 +1288,16 @@ mod tests {
         ));
     }
 
-    fn starrocks_program_with_owned_arenas() -> (FragmentProgram, [novarocks::exec::expr::ExprId; 3])
-    {
-        let mut output_arena = ExprArena::default();
-        let output_id = output_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let mut partition_arena = ExprArena::default();
-        let partition_id = partition_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let mut index_arena = ExprArena::default();
-        let index_id = index_arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8(String::new())),
-            arrow::datatypes::DataType::Utf8,
-        );
-        let tablet_schema = StarRocksTabletSchema::try_new(
-            Some(10),
-            Some(StarRocksKeysType::Primary),
-            vec![StarRocksColumnSchema {
-                unique_id: 1,
-                name: Some("k".to_string()),
-                r#type: "BIGINT".to_string(),
-                is_key: Some(true),
-                is_nullable: Some(false),
-                ..StarRocksColumnSchema::default()
-            }],
-        )
-        .expect("tablet schema");
-        let table = StarRocksTableSinkProgram {
-            name: "OLAP_TABLE_SINK".to_string(),
-            descriptor: StarRocksTableSinkDescriptor {
-                db_id: 1,
-                table_id: 2,
-                db_name: Some("db".to_string()),
-                table_name: Some("tbl".to_string()),
-                keys_type: StarRocksKeysType::Primary,
-                is_lake_table: true,
-                dynamic_overwrite: false,
-                partial_update_mode: PartialUpdateWriteMode::Row,
-                merge_condition: None,
-                null_expr_in_auto_increment: false,
-                miss_auto_increment_column: false,
-                schema: SinkSchemaDescriptor {
-                    slot_descs: Vec::new(),
-                    indexes: vec![SinkIndexDescriptor {
-                        index_id: 10,
-                        schema_id: 10,
-                        column_names: vec!["k".to_string()],
-                        tablet_schema,
-                        column_to_expr_value: HashMap::new(),
-                        is_shadow: false,
-                        where_clause: Some(SinkPredicatePlan {
-                            arena: Arc::new(index_arena),
-                            expr_id: index_id,
-                        }),
-                    }],
-                },
-                partition: SinkPartitionDescriptor {
-                    enable_automatic_partition: false,
-                    partition_columns: Vec::new(),
-                    distributed_columns: Vec::new(),
-                    partition_exprs: Some(Arc::new(PartitionExprPlan {
-                        arena: partition_arena,
-                        expr_ids: vec![partition_id],
-                    })),
-                    partitions: Vec::new(),
-                },
-                location: SinkLocationDescriptor {
-                    tablets: Vec::new(),
-                },
-                nodes: SinkNodesDescriptor { nodes: Vec::new() },
-                frontend_provider: None,
-                starlet_metadata_provider: None,
-                storage_metadata_provider: None,
-            },
-            output_projection: Some(SinkOutputProjectionPlan {
-                arena: Arc::new(output_arena),
-                expr_ids: vec![output_id],
-                output_slot_ids: Vec::new(),
-                output_field_names: Vec::new(),
-            }),
-            output_expr_slot_name_map: HashMap::new(),
-            output_expr_slot_ids: Vec::new(),
-            literal_partition_values: None,
-        };
-        let program = FragmentProgram::new(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Values(novarocks::exec::node::values::ValuesNode {
-                        chunk: novarocks::exec::chunk::Chunk::default(),
-                        node_id: 99,
-                    }),
-                },
-            },
-            FragmentSinkSpec::try_new(FragmentSinkProgram::StarRocksTable(table))
-                .expect("StarRocks sink program"),
-            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            RuntimeFilterContract::default(),
-        );
-        (program, [output_id, partition_id, index_id])
-    }
-
     fn params(query: UniqueId, finst: UniqueId) -> internal_service::TPlanFragmentExecParams {
         internal_service::TPlanFragmentExecParams::new(
-            types::TUniqueId::new(query.hi, query.lo),
-            types::TUniqueId::new(finst.hi, finst.lo),
+            types::TUniqueId {
+                hi: query.high(),
+                lo: query.low(),
+            },
+            types::TUniqueId {
+                hi: finst.high(),
+                lo: finst.low(),
+            },
             BTreeMap::new(),
             BTreeMap::new(),
             None,
@@ -1521,16 +1347,12 @@ mod tests {
 
     #[test]
     fn values_noop_decodes_to_validated_starrocks_submission() {
-        let query = UniqueId { hi: 11, lo: 12 };
-        let finst = UniqueId { hi: 21, lo: 22 };
+        let query = UniqueId::new(11, 12);
+        let finst = UniqueId::new(21, 22);
         let fragment = values_noop_fragment();
         let params = params(query, finst);
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare values/noop fragment");
-        assert!(matches!(
-            draft.prepared_program_for_test().plan().root.kind,
-            ExecNodeKind::Values(_)
-        ));
         assert!(draft.external_dependencies().is_empty());
         let decoded = finish_fragment_submission(draft, StarRocksResolvedDependencies::default())
             .expect("finish values/noop fragment");
@@ -1539,7 +1361,7 @@ mod tests {
         assert_eq!(submission.instance().fragment_instance_id().get(), finst);
         assert_eq!(submission.program().sink().kind(), FragmentSinkKind::Noop);
         assert!(matches!(
-            submission.program().plan().root.kind,
+            submission.program().plan().root().kind,
             ExecNodeKind::Values(_)
         ));
         assert!(metadata.descriptor_snapshot().is_none());
@@ -1570,7 +1392,7 @@ mod tests {
 
         let mut fragment = values_noop_fragment();
         fragment.plan.as_mut().expect("plan").nodes = vec![lookup, fetch];
-        let mut params = params(UniqueId { hi: 43, lo: 44 }, UniqueId { hi: 45, lo: 46 });
+        let mut params = params(UniqueId::new(43, 44), UniqueId::new(45, 46));
         params.per_look_up_num_fetchers = Some(BTreeMap::from([(41, 3)]));
         let input = decode_input(&fragment, &params);
 
@@ -1594,7 +1416,7 @@ mod tests {
         sink.type_ = data_sinks::TDataSinkType::DATA_STREAM_SINK;
         sink.stream_sink = Some(profile_partitioned_stream_sink("query-7"));
         let fragment = fragment_with_sink(sink);
-        let params = params(UniqueId { hi: 81, lo: 82 }, UniqueId { hi: 83, lo: 84 });
+        let params = params(UniqueId::new(81, 82), UniqueId::new(83, 84));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare profile-partitioned data stream");
@@ -1619,7 +1441,7 @@ mod tests {
         sink.type_ = data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK;
         sink.multi_cast_stream_sink = Some(multi_cast);
         let fragment = fragment_with_sink(sink);
-        let params = params(UniqueId { hi: 85, lo: 86 }, UniqueId { hi: 87, lo: 88 });
+        let params = params(UniqueId::new(85, 86), UniqueId::new(87, 88));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare profile-partitioned multicast");
@@ -1641,7 +1463,7 @@ mod tests {
         let mut fragment = values_noop_fragment();
         let root = &mut fragment.plan.as_mut().expect("plan").nodes[0];
         root.conjuncts = Some(vec![get_query_profile_expr("query-7")]);
-        let params = params(UniqueId { hi: 89, lo: 90 }, UniqueId { hi: 91, lo: 92 });
+        let params = params(UniqueId::new(89, 90), UniqueId::new(91, 92));
 
         let draft = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect("prepare plan-owned profile expression");
@@ -1649,82 +1471,19 @@ mod tests {
         let decoded = finish_fragment_submission(draft, resolved)
             .expect("finish plan-owned profile expression");
         let (submission, _) = decoded.into_parts();
-        let ExecNodeKind::Filter(filter) = &submission.program().plan().root.kind else {
+        let ExecNodeKind::Filter(filter) = &submission.program().plan().root().kind else {
             panic!("root conjunct must lower to a filter");
         };
-        assert_resolved_profile(&submission.program().plan().arena, filter.predicate);
-    }
-
-    #[test]
-    fn starrocks_query_profile_owner_routing_targets_exact_retained_arena() {
-        let (mut program, [output_id, partition_id, index_id]) =
-            starrocks_program_with_owned_arenas();
-        for (owner, expr_id, value) in [
-            (
-                FragmentExprArenaOwner::StarRocksOutputProjection,
-                output_id,
-                "output-profile",
-            ),
-            (
-                FragmentExprArenaOwner::StarRocksPartition,
-                partition_id,
-                "partition-profile",
-            ),
-            (
-                FragmentExprArenaOwner::StarRocksIndexPredicate { index: 0 },
-                index_id,
-                "index-profile",
-            ),
-        ] {
-            query_profile_arena_mut(&mut program, owner)
-                .expect("owner must resolve its exact retained arena")
-                .replace_literal(expr_id, LiteralValue::Utf8(value.to_string()))
-                .expect("owned literal patch");
-        }
-        assert!(
-            query_profile_arena_mut(
-                &mut program,
-                FragmentExprArenaOwner::StarRocksIndexPredicate { index: 1 },
-            )
-            .is_err()
-        );
-        assert!(query_profile_arena_mut(&mut program, FragmentExprArenaOwner::DataStream).is_err());
-
-        let FragmentSinkProgram::StarRocksTable(table) = program.sink().program() else {
-            panic!("fixture must retain a StarRocks table sink");
-        };
-        let output = table.output_projection.as_ref().expect("output projection");
-        assert!(matches!(
-            output.arena.node(output_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "output-profile"
-        ));
-        let partition = table
-            .descriptor
-            .partition
-            .partition_exprs
-            .as_ref()
-            .expect("partition expressions");
-        assert!(matches!(
-            partition.arena.node(partition_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "partition-profile"
-        ));
-        let predicate = table.descriptor.schema.indexes[0]
-            .where_clause
-            .as_ref()
-            .expect("index predicate");
-        assert!(matches!(
-            predicate.arena.node(index_id),
-            Some(ExprNode::Literal(LiteralValue::Utf8(value))) if value == "index-profile"
-        ));
+        assert_resolved_profile(submission.program().plan().arena(), filter.predicate);
     }
 
     #[test]
     fn instance_first_decode_owns_domain_destinations() {
-        let query = UniqueId { hi: 13, lo: 14 };
-        let finst = UniqueId { hi: 23, lo: 24 };
+        let query = UniqueId::new(13, 14);
+        let finst = UniqueId::new(23, 24);
         let mut params = params(query, finst);
         params.destinations = Some(vec![data_sinks::TPlanFragmentDestination::new(
-            types::TUniqueId::new(33, 34),
+            types::TUniqueId { hi: 33, lo: 34 },
             types::TNetworkAddress::new("127.0.0.1".to_string(), 8060),
             None,
             None,
@@ -1748,105 +1507,93 @@ mod tests {
     }
 
     #[test]
-    fn instance_first_decode_builds_non_empty_scan_contract_and_assignment() {
+    fn broker_file_scan_is_rejected_as_unsupported() {
         let mut scan_node = empty_set_node();
         scan_node.node_id = 17;
         scan_node.node_type = plan_nodes::TPlanNodeType::FILE_SCAN_NODE;
-        let broker_params = plan_nodes::TBrokerScanRangeParams::new(
-            b',' as i8,
-            b'\n' as i8,
-            1,
-            vec![1],
-            2,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let broker_range = plan_nodes::TBrokerScanRange::new(
-            vec![plan_nodes::TBrokerRangeDesc::new(
-                types::TFileType::FILE_LOCAL,
-                plan_nodes::TFileFormatType::FORMAT_CSV_PLAIN,
-                true,
-                "/tmp/pbf3.csv".to_string(),
-                0,
-                128,
-                None,
-                Some(128),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )],
-            broker_params,
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-        );
-        let raw_ranges = BTreeMap::from([(
-            17,
-            vec![internal_service::TScanRangeParams::new(
-                plan_nodes::TScanRange::new(None, None, Some(broker_range), None, None, None, None),
-                None,
-                Some(false),
-                Some(false),
-            )],
-        )]);
-        let facts = super::super::instance::StarRocksDecodeFacts::default();
-        let (contracts, assignments) =
-            super::super::instance::decode_scan_contracts_and_raw_ranges(
-                &[scan_node],
-                &raw_ranges,
-                None,
-                &facts,
-                FieldPath::root("exec_plan_fragment")
-                    .field("params")
-                    .field("per_node_scan_ranges"),
-            )
-            .expect("decode normalized scan inventory");
-        let node_id = FragmentNodeId::new(17);
+        let mut fragment = values_noop_fragment();
+        fragment.plan.as_mut().expect("plan").nodes = vec![scan_node];
+        let params = params(UniqueId::new(71, 72), UniqueId::new(81, 82));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("broker FILE_SCAN_NODE must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
-            contracts
-                .get(&node_id)
-                .expect("scan contract")
-                .assignment_kind(),
-            novarocks::exec::fragment::program::ScanAssignmentKind::BrokerFile
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
         );
-        // `decode_scan_contracts_and_raw_ranges` now returns the transient
-        // enrichment carrier (kind, raw ScanRangeParams) per node.
-        let (_, assignment_ranges) = assignments.get(&node_id).expect("scan assignment");
-        assert_eq!(assignment_ranges.len(), 1);
-        assert!(matches!(
-            assignment_ranges[0].range,
-            novarocks::runtime::scan_range::ScanRange::BrokerFile(_)
-        ));
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.plan.nodes[0].node_type"
+        );
+    }
+
+    #[test]
+    fn olap_table_sink_is_rejected_as_unsupported() {
+        let mut fragment = values_noop_fragment();
+        fragment.output_sink.as_mut().expect("output sink").type_ =
+            data_sinks::TDataSinkType::OLAP_TABLE_SINK;
+        let params = params(UniqueId::new(73, 74), UniqueId::new(83, 84));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("OLAP_TABLE_SINK must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
+        );
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.output_sink.type"
+        );
+    }
+
+    #[test]
+    fn lake_late_materialization_is_rejected_as_unsupported() {
+        let mut scan_node = empty_set_node();
+        scan_node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
+        let lake = plan_nodes::TLakeScanNode::new(
+            0,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        );
+        scan_node.lake_scan_node = Some(lake);
+        let mut fragment = values_noop_fragment();
+        fragment.plan.as_mut().expect("plan").nodes = vec![scan_node];
+        let params = params(UniqueId::new(75, 76), UniqueId::new(85, 86));
+        let error = prepare_fragment_submission(decode_input(&fragment, &params))
+            .expect_err("lake late materialization must be retired");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.kind(),
+            novarocks::protocol::ProtocolErrorKind::Unsupported
+        );
+        assert_eq!(
+            protocol.path().to_string(),
+            "exec_plan_fragment.fragment.plan.nodes[0].lake_scan_node.enable_global_late_materialization"
+        );
     }
 
     #[test]
@@ -2135,7 +1882,7 @@ mod tests {
     fn negative_child_count_reports_exact_node_field_path() {
         let mut fragment = values_noop_fragment();
         fragment.plan.as_mut().expect("plan").nodes[0].num_children = -1;
-        let params = params(UniqueId { hi: 35, lo: 36 }, UniqueId { hi: 45, lo: 46 });
+        let params = params(UniqueId::new(35, 36), UniqueId::new(45, 46));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("negative child count must fail");
         assert_eq!(
@@ -2157,7 +1904,7 @@ mod tests {
         child.node_id += 1;
         child.num_children = -1;
         plan.nodes.push(child);
-        let params = params(UniqueId { hi: 37, lo: 38 }, UniqueId { hi: 47, lo: 48 });
+        let params = params(UniqueId::new(37, 38), UniqueId::new(47, 48));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("negative child count must fail");
         assert_eq!(
@@ -2177,7 +1924,7 @@ mod tests {
         let mut trailing = plan.nodes[0].clone();
         trailing.node_id += 1;
         plan.nodes.push(trailing);
-        let params = params(UniqueId { hi: 39, lo: 40 }, UniqueId { hi: 49, lo: 50 });
+        let params = params(UniqueId::new(39, 40), UniqueId::new(49, 50));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("trailing flat node must fail");
         assert_eq!(
@@ -2195,7 +1942,7 @@ mod tests {
         let mut fragment = values_noop_fragment();
         fragment.plan = None;
         fragment.output_sink = None;
-        let params = params(UniqueId { hi: 31, lo: 32 }, UniqueId { hi: 41, lo: 42 });
+        let params = params(UniqueId::new(31, 32), UniqueId::new(41, 42));
         let error = prepare_fragment_submission(decode_input(&fragment, &params))
             .expect_err("missing plan must fail");
         let protocol = error.protocol().expect("missing plan is a protocol error");
@@ -2212,27 +1959,18 @@ mod tests {
     #[test]
     fn malformed_starrocks_fragment_has_zero_runtime_side_effects() {
         let query = QueryId::new(51, 52);
-        let finst = UniqueId { hi: 61, lo: 62 };
+        let finst = UniqueId::new(61, 62);
         let mut fragment = values_noop_fragment();
         fragment.plan = None;
-        let params = params(
-            UniqueId {
-                hi: query.hi(),
-                lo: query.lo(),
-            },
-            finst,
-        );
+        let params = params(UniqueId::new(query.high(), query.low()), finst);
         let exchange_key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 11,
         };
-        let rf_key = QueryKey::from_hi_lo(query.hi(), query.lo());
+        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
 
-        assert!(query_context_manager().query_mem_tracker(query).is_none());
         assert!(prepare_fragment_submission(decode_input(&fragment, &params)).is_err());
-        assert!(query_context_manager().query_mem_tracker(query).is_none());
-        assert!(query_context_manager().query_id_by_finst(finst).is_none());
         assert!(matches!(
             result_buffer::try_fetch(finst),
             TryFetchResult::Error(_)

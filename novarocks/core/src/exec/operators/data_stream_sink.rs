@@ -32,6 +32,7 @@ use crate::common::ids::SlotId;
 use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange::{ExchangeFrame, ExchangeFrameTransmitter};
@@ -1015,109 +1016,6 @@ mod data_stream_sink_hash_partition {
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash;
 pub(crate) use data_stream_sink_hash_partition::partition_chunk_by_hash_arrays;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataStreamPartitionType {
-    Unpartitioned,
-    Random,
-    HashPartitioned,
-    BucketShuffleHashPartitioned,
-}
-
-impl DataStreamPartitionType {
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::Unpartitioned => "UNPARTITIONED",
-            Self::Random => "RANDOM",
-            Self::HashPartitioned => "HASH_PARTITIONED",
-            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
-        }
-    }
-
-    pub fn requires_exprs(self) -> bool {
-        matches!(
-            self,
-            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
-        )
-    }
-}
-
-#[derive(Clone)]
-pub struct DataStreamSinkFactoryInput {
-    pub dest_node_id: i32,
-    pub output_exprs: Vec<ExprId>,
-    pub output_partition_type: DataStreamPartitionType,
-    pub output_partition_exprs: Vec<ExprId>,
-    pub output_columns: Vec<SlotId>,
-    pub destinations: Vec<FragmentDestination>,
-}
-
-impl DataStreamSinkFactoryInput {
-    pub fn try_from_static_program(
-        dest_node_id: i32,
-        output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        mut output_partition_exprs: Vec<ExprId>,
-        output_columns: Vec<SlotId>,
-        destinations: Vec<FragmentDestination>,
-    ) -> Result<Self, String> {
-        if !output_exprs.is_empty() {
-            return Err("DATA_STREAM_SINK output_exprs are not supported".to_string());
-        }
-        let mut seen = std::collections::HashSet::new();
-        if let Some(slot_id) = output_columns
-            .iter()
-            .find(|slot_id| !seen.insert(**slot_id))
-        {
-            return Err(format!(
-                "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
-            ));
-        }
-        if !output_partition_type.requires_exprs() {
-            output_partition_exprs.clear();
-        }
-        Ok(Self {
-            dest_node_id,
-            output_exprs,
-            output_partition_type,
-            output_partition_exprs,
-            output_columns,
-            destinations,
-        })
-    }
-
-    pub fn try_new(
-        dest_node_id: i32,
-        output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        output_partition_exprs: Vec<ExprId>,
-        output_columns: Vec<i32>,
-        destinations: Vec<FragmentDestination>,
-    ) -> Result<Self, String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut parsed_output_columns = Vec::with_capacity(output_columns.len());
-        for raw in output_columns {
-            let slot_id = SlotId::try_from(raw).map_err(|err| {
-                format!("DATA_STREAM_SINK: invalid output_columns slot id: {err}")
-            })?;
-            if !seen.insert(slot_id) {
-                return Err(format!(
-                    "DATA_STREAM_SINK: duplicate output_columns slot id: {slot_id}"
-                ));
-            }
-            parsed_output_columns.push(slot_id);
-        }
-
-        Self::try_from_static_program(
-            dest_node_id,
-            output_partition_type,
-            output_exprs,
-            output_partition_exprs,
-            parsed_output_columns,
-            destinations,
-        )
-    }
-}
-
 /// Factory for distributed stream sinks that serialize and transmit chunks to remote fragment instances.
 pub(crate) struct DataStreamSinkFactory {
     name: String,
@@ -1176,7 +1074,7 @@ impl OperatorFactory for DataStreamSinkFactory {
 
         let sender_id = self
             .sender_id
-            .unwrap_or((self.fragment_instance_id.lo as i32) & 0x7fffffff);
+            .unwrap_or((self.fragment_instance_id.low() as i32) & 0x7fffffff);
         // Initial value only; overwritten by bind_runtime_state /
         // sync_be_number from RuntimeState.backend_num (the FE-assigned instance
         // index) before the sink sends. At instance 0 this stays 0.
@@ -1190,12 +1088,15 @@ impl OperatorFactory for DataStreamSinkFactory {
                 .destinations
                 .iter()
                 .take(3)
-                .map(|d| format_uuid(d.finst_id().hi, d.finst_id().lo))
+                .map(|d| format_uuid(d.finst_id().high(), d.finst_id().low()))
                 .collect::<Vec<_>>()
                 .join(",");
             debug!(
                 "DataStreamSink created: finst={} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
-                format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
+                format_uuid(
+                    self.fragment_instance_id.high(),
+                    self.fragment_instance_id.low()
+                ),
                 self.plan_node_id,
                 self.input.dest_node_id,
                 part_type,
@@ -1355,7 +1256,10 @@ impl Operator for DataStreamSinkOperator {
         self.finish_state.register_driver();
         crate::novarocks_logging::debug!(
             "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
-            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -1473,7 +1377,10 @@ impl DataStreamSinkOperator {
         debug!(
             "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_chunks={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
             reason,
-            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
             self.driver_id,
             self.sender_id,
             self.pending_chunk_bytes_total(),
@@ -1550,7 +1457,7 @@ impl DataStreamSinkOperator {
     /// StarRocks BE applies the same `lo == -1` check in DataStreamSender::send_chunk(),
     /// ExchangeSinkOperator::push_chunk(), and Channel::close().
     fn is_pseudo_destination(dest: &FragmentDestination) -> bool {
-        dest.finst_id().lo == -1
+        dest.finst_id().low() == -1
     }
 
     fn partition_chunk(&mut self, chunk: &Chunk) -> Result<Vec<Vec<Chunk>>, String> {
@@ -1652,10 +1559,7 @@ impl DataStreamSinkOperator {
         let reserve_bytes = pending.payload_bytes.max(1);
 
         let addr = dest.endpoint();
-        let dest_finst_id = UniqueId {
-            hi: dest.finst_id().hi,
-            lo: dest.finst_id().lo,
-        };
+        let dest_finst_id = UniqueId::new(dest.finst_id().high(), dest.finst_id().low());
         let error_state = self
             .error_state
             .as_ref()
@@ -1741,10 +1645,7 @@ impl DataStreamSinkOperator {
 
         self.init_profile_if_needed();
 
-        let dest_finst_id = UniqueId {
-            hi: dest.finst_id().hi,
-            lo: dest.finst_id().lo,
-        };
+        let dest_finst_id = UniqueId::new(dest.finst_id().high(), dest.finst_id().low());
 
         let row_count: usize = chunks.iter().map(|c| c.len()).sum();
         let sequence = self.shared_sequence.fetch_add(1, Ordering::SeqCst);
@@ -2059,7 +1960,10 @@ impl ProcessorOperator for DataStreamSinkOperator {
 
         debug!(
             "DataStreamSink set_finishing: finst={} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
-            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -2074,7 +1978,10 @@ impl ProcessorOperator for DataStreamSinkOperator {
         let is_last_driver = self.finish_state.driver_finished();
         debug!(
             "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
-            format_uuid(self.fragment_instance_id.hi, self.fragment_instance_id.lo),
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -2249,7 +2156,7 @@ mod tests {
             )
             .expect("test sink input"),
             transmitter: crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            fragment_instance_id: UniqueId { hi: 1, lo: 2 },
+            fragment_instance_id: UniqueId::new(1, 2),
             arena: ExprArena::default(),
             expr_ids: Vec::new(),
             init_error: None,
@@ -2278,17 +2185,17 @@ mod tests {
 
     fn make_test_destination() -> FragmentDestination {
         FragmentDestination::new(
-            UniqueId { hi: 9, lo: 9 },
+            UniqueId::new(9, 9),
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         )
     }
 
     fn make_test_exchange_send_task() -> ExchangeSendTask {
         let mut op = make_test_operator();
-        op.fragment_instance_id = UniqueId { hi: 81, lo: 82 };
+        op.fragment_instance_id = UniqueId::new(81, 82);
         op.build_exchange_send_task(
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
-            UniqueId { hi: 91, lo: 92 },
+            UniqueId::new(91, 92),
             PendingPayload {
                 be_number: 7,
                 payload: vec![1, 2, 3],
@@ -2402,11 +2309,11 @@ mod tests {
 
         assert_eq!(
             task.frame.destination_fragment_instance_id,
-            UniqueId { hi: 91, lo: 92 }
+            UniqueId::new(91, 92)
         );
         assert_eq!(
             task.frame.sender_fragment_instance_id,
-            UniqueId { hi: 81, lo: 82 }
+            UniqueId::new(81, 82)
         );
     }
 

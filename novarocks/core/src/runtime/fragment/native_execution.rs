@@ -235,7 +235,6 @@ pub(crate) fn execute_native_submission(
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),
             native_runtime_filter_context: context.runtime_filter.clone(),
-            load_tracking_sink: None,
             connector_staged_report_collector: program
                 .sink()
                 .program()
@@ -295,7 +294,7 @@ pub(crate) fn execute_native_submission(
         sink,
         exchange_bindings,
         scan_bindings,
-        Some((fragment_instance_id.hi, fragment_instance_id.lo)),
+        Some((fragment_instance_id.high(), fragment_instance_id.low())),
         context.profiler,
         pipeline_dop,
         runtime_state,
@@ -357,12 +356,12 @@ mod tests {
         ));
         let instance = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 81, lo: 82 },
-            FragmentInstanceId::new(UniqueId { hi: 83, lo: 84 }),
+            QueryId::new(81, 82),
+            FragmentInstanceId::new(UniqueId::new(83, 84)),
             ScanAssignments::default(),
             ExchangeInputAssignments::default(),
             FragmentSinkAssignment::None,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("non-zero DOP"),
             BackendNum::try_new(1).expect("backend number"),
         );

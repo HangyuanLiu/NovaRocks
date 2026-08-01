@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::protocol::starrocks::decode::error::StarRocksFragmentDecodeError;
 use crate::protocol::starrocks::decode::expr::parse_min_max_conjuncts;
 use crate::protocol::starrocks::decode::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
@@ -35,7 +36,6 @@ use novarocks::connector::starrocks::plan_compat_starrocks_read_source;
 use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::fragment::program::ScanAssignmentKind;
 use novarocks::exec::node::project::ProjectNode;
-use novarocks::exec::node::scan::LakeGlmScanInfo;
 use novarocks::exec::node::scan::ScanNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::exec::row_position::{
@@ -45,9 +45,61 @@ use novarocks::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange,
 };
 use novarocks::novarocks_logging::debug;
-use novarocks::runtime::query_context::QueryId;
+use novarocks::protocol::FieldPath;
 use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::ScanRange;
+use novarocks_types::QueryId;
+
+/// Reject the retired Lake late-materialization request before lowerers build
+/// provider-specific state. The row-position virtual columns are the request's
+/// existing wire representation, so retain their plan-node field path.
+pub(crate) fn reject_lake_late_materialization(
+    node: &plan_nodes::TPlanNode,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
+    tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    layout_hints: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
+    node_path: FieldPath,
+) -> Result<(), StarRocksFragmentDecodeError> {
+    let Some(lake) = node.lake_scan_node.as_ref() else {
+        return Ok(());
+    };
+    if lake.enable_global_late_materialization == Some(true) {
+        return Err(StarRocksFragmentDecodeError::unsupported(
+            node_path
+                .field("lake_scan_node")
+                .field("enable_global_late_materialization"),
+            "LAKE_SCAN_NODE late materialization is retired; it is not part of the fragment kernel",
+        ));
+    }
+    let slots = layout_hints
+        .get(&lake.tuple_id)
+        .filter(|slots| !slots.is_empty())
+        .or_else(|| tuple_slots.get(&lake.tuple_id));
+    let Some(slots) = slots else {
+        return Ok(());
+    };
+    let descriptors = desc_tbl
+        .and_then(|table| table.slot_descriptors.as_deref())
+        .unwrap_or(&[]);
+    if slots.iter().any(|slot_id| {
+        descriptors
+            .iter()
+            .find(|slot| slot.parent == Some(lake.tuple_id) && slot.id == Some(*slot_id))
+            .map(slot_display_name_from_desc)
+            .is_some_and(|name| {
+                is_lake_source_id(&name)
+                    || is_lake_tablet_id(&name)
+                    || is_lake_rss_id(&name)
+                    || is_lake_row_id(&name)
+            })
+    }) {
+        return Err(StarRocksFragmentDecodeError::unsupported(
+            node_path.field("row_tuples"),
+            "LAKE_SCAN_NODE late materialization is retired; row-position virtual columns are not part of the fragment kernel",
+        ));
+    }
+    Ok(())
+}
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -230,6 +282,13 @@ pub(crate) fn lower_lake_scan_node(
             ));
         }
     };
+
+    if lake_row_position_spec.is_some() {
+        return Err(format!(
+            "LAKE_SCAN_NODE node_id={} late materialization is retired",
+            node.node_id
+        ));
+    }
 
     if lake_row_position_spec.is_some() {
         // Rebuild scan_layout with virtual cols removed
@@ -491,10 +550,10 @@ pub(crate) fn lower_lake_scan_node(
             table_id,
             schema_id,
             fe_addr: external_dependencies.and_then(|draft| draft.frontend_endpoint().cloned()),
-            query_id: Some(novarocks::common::types::UniqueId {
-                hi: query_id.hi(),
-                lo: query_id.lo(),
-            }),
+            query_id: Some(novarocks_types::UniqueId::new(
+                query_id.high(),
+                query_id.low(),
+            )),
             native_tablet_schema: None,
             native_column_hints: None,
             table_schema_provider: external_dependencies
@@ -505,14 +564,6 @@ pub(crate) fn lower_lake_scan_node(
         deferred_lake_resolution: None,
         topn_filter_column_map,
     };
-
-    let lake_row_position_spec_active = lake_row_position_spec.is_some();
-
-    let lake_glm_info = lake_row_position_spec.as_ref().map(|_| LakeGlmScanInfo {
-        ranges: cfg.ranges.clone(),
-        properties: cfg.properties.clone(),
-        lake_schema_meta: cfg.lake_schema_meta.clone(),
-    });
 
     let source = plan_compat_starrocks_read_source(query_id, node.node_id, cfg, query_opts)
         .map_err(|error| error.to_string())?;
@@ -526,8 +577,7 @@ pub(crate) fn lower_lake_scan_node(
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_accept_empty_scan_ranges(true)
-        .with_lake_row_position(lake_row_position_spec)
-        .with_lake_glm_info(lake_glm_info);
+        .with_lake_row_position(lake_row_position_spec);
     let scan_lowered = Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),
@@ -537,7 +587,7 @@ pub(crate) fn lower_lake_scan_node(
 
     // Skip the dict-expansion projection if there's nothing to remap,
     // or if lake GLM virtual cols were removed (that difference is not dict-related).
-    if dict_int_to_string.is_empty() || lake_row_position_spec_active {
+    if dict_int_to_string.is_empty() {
         return Ok(scan_lowered);
     }
 

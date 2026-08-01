@@ -9,15 +9,128 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::thrift::{data_cache, status as thrift_status, status_code, types};
-use novarocks::common::types::UniqueId;
 use novarocks::novarocks_logging::{debug, warn};
-use novarocks::runtime::fragment::io::{FragmentReportRegistration, FragmentTerminalReport};
+use novarocks::runtime::mem_tracker::MemTracker;
+use novarocks::runtime::profile::Profiler;
 use novarocks::runtime::sink_commit;
+use novarocks_types::{QueryId, UniqueId};
 
 use reporter::{ExecStateReportTask, StarRocksReporter};
 use status::{ExecStatusReportInput, build_report_params};
 
 use crate::load::LoadTrackingStore;
+
+/// StarRocks report inputs captured when a Compat fragment becomes reportable.
+///
+/// This is intentionally Compat-local: the fragment kernel does not own an
+/// execution-status transport or a StarRocks report lifecycle.
+#[derive(Clone)]
+pub(crate) struct FragmentReportRegistration {
+    fragment_instance_id: UniqueId,
+    query_id: QueryId,
+    backend_num: i32,
+    enable_profile: bool,
+    profiler: Option<Profiler>,
+    fragment_mem_tracker: Option<Arc<MemTracker>>,
+    query_mem_tracker: Option<Arc<MemTracker>>,
+    report_interval_ns: Option<i64>,
+}
+
+impl FragmentReportRegistration {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        fragment_instance_id: UniqueId,
+        query_id: QueryId,
+        backend_num: i32,
+        enable_profile: bool,
+        profiler: Option<Profiler>,
+        fragment_mem_tracker: Option<Arc<MemTracker>>,
+        query_mem_tracker: Option<Arc<MemTracker>>,
+        report_interval_ns: Option<i64>,
+    ) -> Self {
+        Self {
+            fragment_instance_id,
+            query_id,
+            backend_num,
+            enable_profile,
+            profiler,
+            fragment_mem_tracker,
+            query_mem_tracker,
+            report_interval_ns,
+        }
+    }
+
+    pub(crate) const fn fragment_instance_id(&self) -> UniqueId {
+        self.fragment_instance_id
+    }
+
+    pub(crate) const fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    pub(crate) const fn backend_num(&self) -> i32 {
+        self.backend_num
+    }
+
+    pub(crate) const fn enable_profile(&self) -> bool {
+        self.enable_profile
+    }
+
+    pub(crate) fn profiler(&self) -> Option<&Profiler> {
+        self.profiler.as_ref()
+    }
+
+    pub(crate) fn fragment_mem_tracker(&self) -> Option<&Arc<MemTracker>> {
+        self.fragment_mem_tracker.as_ref()
+    }
+
+    pub(crate) fn query_mem_tracker(&self) -> Option<&Arc<MemTracker>> {
+        self.query_mem_tracker.as_ref()
+    }
+
+    pub(crate) const fn report_interval_ns(&self) -> Option<i64> {
+        self.report_interval_ns
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FragmentTerminalReport {
+    error: Option<String>,
+    include_runtime_filter_profile: bool,
+    connector_staged_report_frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
+}
+
+impl FragmentTerminalReport {
+    pub(crate) fn new(error: Option<String>, include_runtime_filter_profile: bool) -> Self {
+        Self {
+            error,
+            include_runtime_filter_profile,
+            connector_staged_report_frames: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_connector_staged_report_frames(
+        mut self,
+        frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
+    ) -> Self {
+        self.connector_staged_report_frames = frames;
+        self
+    }
+
+    pub(crate) fn connector_staged_report_frames(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorStagedReportFrame] {
+        &self.connector_staged_report_frames
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(crate) const fn include_runtime_filter_profile(&self) -> bool {
+        self.include_runtime_filter_profile
+    }
+}
 
 /// Compat-owned StarRocks execution-status registry and worker lifecycle.
 pub(crate) struct CompatReportService {
@@ -262,7 +375,7 @@ fn thrift_status_from_error(error: Option<String>) -> thrift_status::TStatus {
 
 fn build_tracking_url(
     tracking: &LoadTrackingStore,
-    query_id: novarocks::runtime::query_context::QueryId,
+    query_id: novarocks_types::QueryId,
 ) -> Option<String> {
     if !tracking.has_tracking_log(query_id) {
         return None;
@@ -273,8 +386,8 @@ fn build_tracking_url(
     Some(format!(
         "http://{host}:{}/api/_load_tracking/{}/{}",
         config.server.http_port,
-        query_id.hi(),
-        query_id.lo()
+        query_id.high(),
+        query_id.low()
     ))
 }
 

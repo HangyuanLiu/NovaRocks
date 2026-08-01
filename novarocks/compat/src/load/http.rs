@@ -26,7 +26,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use serde_json::json;
 
-use novarocks::runtime::query_context::QueryId;
+use novarocks_types::QueryId;
 
 use super::service::{
     CompatLoadService, HttpHeaders, handle_stream_load, handle_transaction_load,
@@ -127,8 +127,8 @@ async fn handle_load_tracking_log(
             StatusCode::NOT_FOUND,
             format!(
                 "tracking log is not available for query_id={:016x}:{:016x}",
-                query_id.hi(),
-                query_id.lo()
+                query_id.high(),
+                query_id.low()
             ),
         )
             .into_response(),
@@ -142,11 +142,8 @@ mod tests {
     #[derive(Debug)]
     struct UnusedSyncExecutor;
 
-    impl novarocks::runtime::fragment::io::SyncFragmentExecutor for UnusedSyncExecutor {
-        fn execute_encoded(
-            &self,
-            _payload: &[u8],
-        ) -> Result<novarocks::common::types::UniqueId, String> {
+    impl crate::fragment::SyncFragmentExecutor for UnusedSyncExecutor {
+        fn execute_encoded(&self, _payload: &[u8]) -> Result<novarocks_types::UniqueId, String> {
             Err("unexpected fragment execution".to_string())
         }
     }

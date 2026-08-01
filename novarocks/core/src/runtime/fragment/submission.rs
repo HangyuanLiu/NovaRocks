@@ -499,7 +499,7 @@ fn validate_sink_assignment(
     program: &FragmentProgram,
     instance: &FragmentInstanceSpec,
 ) -> Result<(), FragmentBindingError> {
-    use FragmentSinkAssignmentKind::{DestinationGroups, StarRocksTable, StreamDestinations};
+    use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
     use FragmentSinkAssignmentRequirement as Requirement;
     let requirement = program.sink().assignment_requirement();
     let assignment = instance.sink_assignment();
@@ -525,9 +525,6 @@ fn validate_sink_assignment(
                 groups.len()
             ),
         )),
-        (Requirement::Required(StarRocksTable), FragmentSinkAssignment::StarRocksTable(_)) => {
-            Ok(())
-        }
         (Requirement::Required(_), FragmentSinkAssignment::None) => Err(FragmentBindingError::new(
             FragmentBindingTarget::Sink,
             FragmentBindingErrorKind::MissingAssignment,
@@ -549,13 +546,12 @@ fn validate_sink_assignment(
 }
 
 fn sink_requirement_summary(requirement: FragmentSinkAssignmentRequirement) -> String {
-    use FragmentSinkAssignmentKind::{DestinationGroups, StarRocksTable, StreamDestinations};
+    use FragmentSinkAssignmentKind::{DestinationGroups, StreamDestinations};
     use FragmentSinkAssignmentRequirement::{None, Required};
     match requirement {
         None => "none".to_string(),
         Required(StreamDestinations) => "stream_destinations".to_string(),
         Required(DestinationGroups(count)) => format!("destination_groups(count={})", count.get()),
-        Required(StarRocksTable) => "starrocks_table".to_string(),
     }
 }
 
@@ -566,7 +562,6 @@ fn sink_assignment_summary(assignment: &FragmentSinkAssignment) -> String {
         FragmentSinkAssignment::DestinationGroups { groups, .. } => {
             format!("destination_groups(count={})", groups.len())
         }
-        FragmentSinkAssignment::StarRocksTable(_) => "starrocks_table".to_string(),
     }
 }
 
@@ -591,6 +586,7 @@ mod tests {
         FragmentProgramOptions, FragmentSinkSpec, RuntimeFilterContract, RuntimeFilterId,
         ScanAssignmentKind, ScanSourceContract,
     };
+    use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
@@ -610,28 +606,26 @@ mod tests {
     use crate::exec::node::union_all::UnionAllNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::exec::operators::DataStreamPartitionType;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::exchange::ExchangeKey;
     use crate::runtime::fragment::instance::{
         BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
         FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
-        StarRocksTableSinkAssignment,
     };
     use crate::runtime::profile::RuntimeProfile;
-    use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use novarocks_types::QueryId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     use super::*;
 
     fn uid(hi: i64, lo: i64) -> UniqueId {
-        UniqueId { hi, lo }
+        UniqueId::new(hi, lo)
     }
 
     fn query_id(hi: i64, lo: i64) -> QueryId {
-        QueryId { hi, lo }
+        QueryId::new(hi, lo)
     }
 
     fn values_plan(node_id: i32) -> ExecPlan {
@@ -859,7 +853,7 @@ mod tests {
             scans,
             exchanges,
             sink,
-            FragmentRuntimeOptions::new(QueryOptions::default(), None, false),
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
             NonZeroUsize::new(1).expect("pipeline DOP"),
             BackendNum::try_new(0).expect("backend number"),
         )
@@ -1810,22 +1804,6 @@ mod tests {
     }
 
     #[test]
-    fn starrocks_table_sink_requires_explicit_assignment_kind() {
-        assert_eq!(
-            FragmentSinkAssignmentRequirement::Required(FragmentSinkAssignmentKind::StarRocksTable),
-            FragmentSinkAssignmentRequirement::Required(FragmentSinkAssignmentKind::StarRocksTable)
-        );
-        let assignment = FragmentSinkAssignment::StarRocksTable(StarRocksTableSinkAssignment::new(
-            41,
-            uid(5, 6),
-            Some(RuntimeEndpoint::new("fe", 9020).expect("frontend endpoint")),
-        ));
-        assert!(matches!(
-            assignment,
-            FragmentSinkAssignment::StarRocksTable(_)
-        ));
-    }
-
     #[test]
     fn static_exchange_validation_precedes_dynamic_scan_validation() {
         let scan_id = FragmentNodeId::new(10);
@@ -2101,11 +2079,11 @@ mod tests {
         let finst = uid(unique, unique + 2);
         let exchange_id = FragmentNodeId::new(41);
         let exchange_key = ExchangeKey {
-            finst_id_hi: finst.hi,
-            finst_id_lo: finst.lo,
+            finst_id_hi: finst.high(),
+            finst_id_lo: finst.low(),
             node_id: 41,
         };
-        let rf_key = QueryKey::from_hi_lo(query.hi, query.lo);
+        let rf_key = QueryKey::from_hi_lo(query.high(), query.low());
         let expected = schema(1, true);
         let program = program_with(
             ExecPlan {

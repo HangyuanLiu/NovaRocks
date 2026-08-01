@@ -24,15 +24,15 @@ use arrow::datatypes::{Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks::common::ids::SlotId;
 use novarocks::exec::expr::ExprArena;
+use novarocks::exec::fragment::sink::DataStreamPartitionType;
 use novarocks::exec::fragment::sink::{
     ConnectorWriteSinkProgram, DataStreamSinkBranchProgram, FragmentSinkProgram,
     MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
     build_change_stream_split_predicate,
 };
-use novarocks::exec::operators::DataStreamPartitionType;
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use novarocks::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
+use novarocks::runtime::fragment::FragmentSinkAssignment;
 use novarocks::runtime::query_options::query_expire_durations;
 use novarocks_protocol::novarocks as native_proto;
 use novarocks_protocol::{common, expr, plan};
@@ -190,7 +190,7 @@ fn decode_connector_write_sink_program(
     })?;
     let fragment_instance_id = unique_id_bytes(wire_finst.hi, wire_finst.lo);
     let context_finst = context.fragment_instance_id().get();
-    if fragment_instance_id != unique_id_bytes(context_finst.hi, context_finst.lo) {
+    if fragment_instance_id != unique_id_bytes(context_finst.high(), context_finst.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -215,7 +215,7 @@ fn decode_connector_write_sink_program(
             "connector writer handle requires native query identity",
         )
     })?;
-    if execution_id.query_id() != unique_id_bytes(query_id.hi(), query_id.lo()) {
+    if execution_id.query_id() != unique_id_bytes(query_id.high(), query_id.low()) {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "handle",
@@ -874,18 +874,18 @@ fn decode_router_output_slots(
 
 fn decode_change_stream_branch_kind(
     value: i32,
-) -> Result<novarocks::sql::common::ChangeStreamBranchKind, String> {
+) -> Result<novarocks::exec::change_op::ChangeStreamBranchKind, String> {
     match plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
         plan::ChangeStreamBranchKind::DeleteDv => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::DeleteDv)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::DeleteDv)
         }
         plan::ChangeStreamBranchKind::ReuseData => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::ReuseData)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::ReuseData)
         }
         plan::ChangeStreamBranchKind::FreshData => {
-            Ok(novarocks::sql::common::ChangeStreamBranchKind::FreshData)
+            Ok(novarocks::exec::change_op::ChangeStreamBranchKind::FreshData)
         }
         plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())
@@ -910,10 +910,7 @@ fn decode_stream_destination_list(
                 )
             })?;
             Ok(FragmentDestination::new(
-                novarocks::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
                     NativeFragmentDecodeError::invalid_value(
                         destination_path.field("endpoint"),
@@ -942,10 +939,7 @@ fn decode_instance_destinations(
                 )
             })?;
             Ok(FragmentDestination::new(
-                novarocks::common::types::UniqueId {
-                    hi: finst_id.hi,
-                    lo: finst_id.lo,
-                },
+                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
                     NativeFragmentDecodeError::invalid_value(
                         destination_path.field("endpoint"),
@@ -973,7 +967,7 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 #[cfg(test)]
 mod tests {
     use super::decode_fragment_sink_assignment;
-    use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
+    use novarocks::runtime::fragment::FragmentSinkAssignment;
     use novarocks_protocol::{novarocks as proto, plan};
 
     #[test]

@@ -158,7 +158,6 @@ pub enum FragmentSinkKind {
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
-    StarRocksTable,
     ConnectorWrite,
 }
 
@@ -166,7 +165,6 @@ pub enum FragmentSinkKind {
 pub enum FragmentSinkAssignmentKind {
     StreamDestinations,
     DestinationGroups(NonZeroUsize),
-    StarRocksTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,10 +211,6 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
-            FragmentSinkProgram::StarRocksTable(_) => (
-                FragmentSinkKind::StarRocksTable,
-                Required(FragmentSinkAssignmentKind::StarRocksTable),
-            ),
             FragmentSinkProgram::ConnectorWrite(_) => (FragmentSinkKind::ConnectorWrite, None),
         };
         Ok(Self {
@@ -230,7 +224,7 @@ impl FragmentSinkSpec {
         &self.program
     }
 
-    pub fn program_mut(&mut self) -> &mut FragmentSinkProgram {
+    pub(crate) fn program_mut(&mut self) -> &mut FragmentSinkProgram {
         &mut self.program
     }
 
@@ -276,7 +270,7 @@ pub struct FragmentProgram {
 }
 
 impl FragmentProgram {
-    pub fn new(
+    pub(crate) fn new(
         plan: ExecPlan,
         sink: FragmentSinkSpec,
         program_options: FragmentProgramOptions,
@@ -304,7 +298,7 @@ impl FragmentProgram {
         &self.plan
     }
 
-    pub fn plan_mut(&mut self) -> &mut ExecPlan {
+    pub(crate) fn plan_mut(&mut self) -> &mut ExecPlan {
         &mut self.plan
     }
 
@@ -312,7 +306,7 @@ impl FragmentProgram {
         &self.sink
     }
 
-    pub fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
+    pub(crate) fn sink_mut(&mut self) -> &mut FragmentSinkSpec {
         &mut self.sink
     }
 
@@ -330,6 +324,87 @@ impl FragmentProgram {
 
     pub const fn runtime_filters(&self) -> &RuntimeFilterContract {
         &self.runtime_filters
+    }
+}
+
+/// Builder for a sealed fragment program. Decoders may resolve and patch their
+/// transient dependencies before `finish`; runtime entry points receive only
+/// the immutable result.
+#[derive(Debug)]
+pub struct FragmentProgramBuilder {
+    plan: ExecPlan,
+    sink: FragmentSinkSpec,
+    program_options: FragmentProgramOptions,
+    scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
+    exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
+    runtime_filters: RuntimeFilterContract,
+}
+
+impl FragmentProgramBuilder {
+    pub fn new(
+        plan: ExecPlan,
+        sink: FragmentSinkSpec,
+        program_options: FragmentProgramOptions,
+    ) -> Self {
+        Self {
+            plan,
+            sink,
+            program_options,
+            scan_sources: BTreeMap::new(),
+            exchange_inputs: BTreeMap::new(),
+            runtime_filters: RuntimeFilterContract::default(),
+        }
+    }
+
+    pub fn scan_sources(
+        mut self,
+        scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
+    ) -> Self {
+        self.scan_sources = scan_sources;
+        self
+    }
+
+    pub fn exchange_inputs(
+        mut self,
+        exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
+    ) -> Self {
+        self.exchange_inputs = exchange_inputs;
+        self
+    }
+
+    pub fn runtime_filters(mut self, runtime_filters: RuntimeFilterContract) -> Self {
+        self.runtime_filters = runtime_filters;
+        self
+    }
+
+    /// Decoder-only patch point before `finish` seals the program.
+    pub fn plan_mut(&mut self) -> &mut ExecPlan {
+        &mut self.plan
+    }
+
+    /// Decoder-only patch point for sink-owned expression arenas before
+    /// `finish` seals the program.
+    pub fn sink_program_mut(&mut self) -> &mut FragmentSinkProgram {
+        self.sink.program_mut()
+    }
+
+    pub fn finish(self) -> Result<FragmentProgram, ExecPlanBuildError> {
+        let root_plan_node_id = root_plan_node_id(&self.plan);
+        if root_plan_node_id < 0 {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Node,
+                "fragment root requires a non-negative node id",
+            ));
+        }
+        Ok(FragmentProgram {
+            root_plan_node_id: FragmentNodeId::new(root_plan_node_id),
+            plan: self.plan,
+            sink: self.sink,
+            program_options: self.program_options,
+            scan_sources: self.scan_sources,
+            exchange_inputs: self.exchange_inputs,
+            runtime_filters: self.runtime_filters,
+        })
     }
 }
 
@@ -366,6 +441,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprId};
+    use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
         DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
         MultiCastDataStreamSinkProgram,
@@ -373,7 +449,6 @@ mod tests {
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::values::ValuesNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::exec::operators::DataStreamPartitionType;
 
     use super::*;
 

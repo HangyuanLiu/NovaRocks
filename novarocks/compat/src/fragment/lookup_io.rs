@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use novarocks::runtime::fragment::io::{
+use novarocks::runtime::fragment::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentLookupClient, LookupBatch,
     LookupColumn, LookupKind, LookupRequest,
 };
@@ -65,15 +65,12 @@ fn local_lookup(request: LookupRequest) -> Result<LookupBatch, FragmentIoError> 
                 .map(|column| (column.slot_id(), column.values().clone()))
                 .collect(),
         ),
-        LookupKind::Lake => novarocks::runtime::lookup::execute_lake_lookup_request(
-            request.query_id(),
-            request.tuple_id(),
-            request
-                .columns()
-                .iter()
-                .map(|column| (column.slot_id(), column.values().clone()))
-                .collect(),
-        ),
+        LookupKind::Lake => {
+            return Err(lookup_error(
+                FragmentIoErrorKind::Internal,
+                "lake late-materialization lookup is retired",
+            ));
+        }
     }
     .map_err(|error| lookup_error(FragmentIoErrorKind::Internal, error))?;
     Ok(LookupBatch::new(
@@ -89,8 +86,8 @@ fn remote_request(
 ) -> Result<novarocks::proto::filter::LookupRequest, FragmentIoError> {
     let mut output = novarocks::proto::filter::LookupRequest {
         query_id: Some(novarocks::proto::common::UniqueId {
-            hi: request.query_id().hi(),
-            lo: request.query_id().lo(),
+            hi: request.query_id().high(),
+            lo: request.query_id().low(),
         }),
         lookup_node_id: request.lookup_node_id(),
         request_tuple_id: request.tuple_id(),

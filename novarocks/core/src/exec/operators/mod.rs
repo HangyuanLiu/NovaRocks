@@ -57,8 +57,6 @@ mod statistics_sink;
 mod table_function_processor;
 mod values_source;
 
-// Re-export all public types to maintain compatibility
-pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
 pub(crate) use aggregate::AggregateFinalDomainSessionBuilder;
 pub use aggregate::AggregateProcessorFactory;
 pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
@@ -72,7 +70,6 @@ pub(crate) use connector_write_sink::ConnectorWriteSinkFactory;
 pub(crate) use data_stream_sink::DataStreamSinkFactory;
 #[cfg(test)]
 pub(crate) use data_stream_sink::take_eos_be_number_for_test;
-pub use data_stream_sink::{DataStreamPartitionType, DataStreamSinkFactoryInput};
 pub use exchange_source::ExchangeSourceFactory;
 pub use fetch_processor::FetchProcessorFactory;
 pub(crate) use filter_processor::FilterEncodingPolicy;

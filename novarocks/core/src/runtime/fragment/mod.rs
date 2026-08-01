@@ -19,14 +19,14 @@ pub(crate) mod error;
 pub(crate) mod exchange;
 pub(crate) mod fact;
 pub(crate) mod handle;
-pub mod instance;
-pub mod io;
+pub(crate) mod instance;
+pub(crate) mod io;
 pub(crate) mod native_execution;
 pub(crate) mod resources;
 pub(crate) mod runtime_state;
 pub(crate) mod scan;
 pub(crate) mod sink;
-pub mod submission;
+pub(crate) mod submission;
 
 #[cfg(test)]
 mod io_contract_tests;
@@ -38,5 +38,14 @@ pub use error::{
 pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 pub use handle::{
     DormantFragmentHandle, FragmentPrepareContext, RunningFragmentHandle, prepare_fragment,
+};
+pub use instance::*;
+pub use io::result_format::{build_result_batch, build_statistic_result_batch, empty_result_batch};
+pub use io::{
+    ExchangeFrame, ExchangeFrameTransmitter, FragmentEvent, FragmentEventSink, FragmentIoError,
+    FragmentIoErrorKind, FragmentIoOperation, FragmentLookupClient, FragmentProfileSnapshot,
+    FragmentProgress, FragmentResultSession, FragmentResultWriter, LookupBatch, LookupColumn,
+    LookupKind, LookupRequest, LookupTarget, NoopFragmentEventSink, ResultAbort,
+    ResultPresentation, ResultProjection, ResultWriteSpec, UnavailableFragmentLookupClient,
 };
 pub use submission::FragmentSubmission;

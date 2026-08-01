@@ -24,7 +24,7 @@ use crate::exec::fragment::error::{
 };
 use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId};
 use crate::exec::node::scan::BoundScanRanges;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 
@@ -173,64 +173,24 @@ pub enum FragmentSinkAssignment {
         groups: Vec<Vec<FragmentDestination>>,
         sender_id: Option<i32>,
     },
-    StarRocksTable(StarRocksTableSinkAssignment),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StarRocksTableSinkAssignment {
-    txn_id: i64,
-    load_id: UniqueId,
-    frontend: Option<RuntimeEndpoint>,
-}
-
-impl StarRocksTableSinkAssignment {
-    pub const fn new(txn_id: i64, load_id: UniqueId, frontend: Option<RuntimeEndpoint>) -> Self {
-        Self {
-            txn_id,
-            load_id,
-            frontend,
-        }
-    }
-
-    pub const fn txn_id(&self) -> i64 {
-        self.txn_id
-    }
-
-    pub const fn load_id(&self) -> UniqueId {
-        self.load_id
-    }
-
-    pub const fn frontend(&self) -> Option<&RuntimeEndpoint> {
-        self.frontend.as_ref()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FragmentRuntimeOptions {
     query_options: QueryOptions,
-    report_endpoint: Option<RuntimeEndpoint>,
     typed_result_sink: bool,
 }
 
 impl FragmentRuntimeOptions {
-    pub fn new(
-        query_options: QueryOptions,
-        report_endpoint: Option<RuntimeEndpoint>,
-        typed_result_sink: bool,
-    ) -> Self {
+    pub fn new(query_options: QueryOptions, typed_result_sink: bool) -> Self {
         Self {
             query_options,
-            report_endpoint,
             typed_result_sink,
         }
     }
 
     pub fn query_options(&self) -> &QueryOptions {
         &self.query_options
-    }
-
-    pub fn report_endpoint(&self) -> Option<&RuntimeEndpoint> {
-        self.report_endpoint.as_ref()
     }
 
     pub const fn typed_result_sink(&self) -> bool {
@@ -325,18 +285,14 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime::query_context::QueryId;
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRange, ScanRangeParams};
+    use crate::runtime::scan_range::{FileFormat, ScanRange, ScanRangeParams};
 
     use super::*;
 
-    /// A simple, connector-agnostic `BoundScanRanges` for exercising the
-    /// instance-assignment carrier (variant content is irrelevant here — the
-    /// carrier no longer validates it; `ScanSource::bind` does, at materialize).
+    /// A simple connector-neutral assignment carrier for exercising instance
+    /// binding without exposing provider file range values.
     fn bound_ranges() -> BoundScanRanges {
-        BoundScanRanges::File {
-            ranges: Vec::new(),
-            has_more: false,
-        }
+        BoundScanRanges::None
     }
 
     #[test]
@@ -351,7 +307,7 @@ mod tests {
 
     #[test]
     fn fragment_instance_id_round_trips_unique_id() {
-        let raw = UniqueId { hi: 7, lo: 11 };
+        let raw = UniqueId::new(7, 11);
         assert_eq!(FragmentInstanceId::new(raw).get(), raw);
     }
 
@@ -368,15 +324,12 @@ mod tests {
         let assignment = assignments.get(&node_id).expect("assignment at map key");
         assert!(matches!(assignment.ranges(), BoundScanRanges::None));
 
-        let file_node = FragmentNodeId::new(23);
-        let assignments = ScanAssignments::try_new(BTreeMap::from([(file_node, bound_ranges())]))
+        let second_node = FragmentNodeId::new(23);
+        let assignments = ScanAssignments::try_new(BTreeMap::from([(second_node, bound_ranges())]))
             .expect("carrier");
         assert!(matches!(
-            assignments.get(&file_node).expect("assignment").ranges(),
-            BoundScanRanges::File {
-                has_more: false,
-                ..
-            }
+            assignments.get(&second_node).expect("assignment").ranges(),
+            BoundScanRanges::None
         ));
     }
 
@@ -469,16 +422,11 @@ mod tests {
             exchange_node,
             ExchangeInputAssignment::new(NonZeroUsize::new(2).expect("sender count")),
         )]));
-        let report_endpoint = RuntimeEndpoint::new("127.0.0.1", 8060).expect("endpoint");
-        let runtime_options = FragmentRuntimeOptions::new(
-            QueryOptions::default(),
-            Some(report_endpoint.clone()),
-            true,
-        );
+        let runtime_options = FragmentRuntimeOptions::new(QueryOptions::default(), true);
         let spec = FragmentInstanceSpec::new_native(
             FragmentContractVersion::CURRENT,
-            QueryId { hi: 13, lo: 17 },
-            FragmentInstanceId::new(UniqueId { hi: 19, lo: 23 }),
+            QueryId::new(13, 17),
+            FragmentInstanceId::new(UniqueId::new(19, 23)),
             scans,
             exchanges,
             FragmentSinkAssignment::StreamDestinations {
@@ -491,11 +439,8 @@ mod tests {
         );
 
         assert_eq!(spec.contract_version(), FragmentContractVersion::CURRENT);
-        assert_eq!(spec.query_id(), QueryId { hi: 13, lo: 17 });
-        assert_eq!(
-            spec.fragment_instance_id().get(),
-            UniqueId { hi: 19, lo: 23 }
-        );
+        assert_eq!(spec.query_id(), QueryId::new(13, 17));
+        assert_eq!(spec.fragment_instance_id().get(), UniqueId::new(19, 23));
         assert!(spec.scan_assignments().get(&scan_node).is_some());
         assert_eq!(
             spec.exchange_inputs()
@@ -516,10 +461,6 @@ mod tests {
             spec.runtime_options()
                 .query_options()
                 .eq(&QueryOptions::default())
-        );
-        assert_eq!(
-            spec.runtime_options().report_endpoint(),
-            Some(&report_endpoint)
         );
         assert!(spec.runtime_options().typed_result_sink());
         assert_eq!(spec.pipeline_dop().get(), 4);
