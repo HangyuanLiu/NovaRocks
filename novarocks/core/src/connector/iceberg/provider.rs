@@ -69,6 +69,7 @@ use super::catalog::registry::{
     extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
 };
 use super::catalog::views;
+use super::data_mutation::{IcebergDataMutationAdapter, RegisteredIcebergDataMutationBackend};
 use super::reader::IcebergBatchReader;
 use super::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -784,10 +785,17 @@ impl IcebergControlProvider {
             .map_err(|error| internal(format!("Iceberg catalog registry read lock: {error}")))?
             .write_services();
         let write = Arc::new(IcebergWriteControlAdapter::new(
-            write_key,
+            write_key.clone(),
             Arc::new(RegisteredIcebergWriteControlBackend::new(services)),
         )?);
-        ConnectorControlBinding::try_new_with_capabilities(
+        let data_mutation = Arc::new(IcebergDataMutationAdapter::new(
+            write_key,
+            Arc::new(RegisteredIcebergDataMutationBackend::new(
+                descriptor.instance_id.clone(),
+                registry,
+            )),
+        )?);
+        ConnectorControlBinding::try_new_with_all_capabilities(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -797,6 +805,7 @@ impl IcebergControlProvider {
                 incarnation,
             }),
             Some(provider.clone()),
+            Some(data_mutation),
             Some(write),
             Some(provider),
         )
@@ -3946,6 +3955,19 @@ struct TablePayload {
     logical_type_columns: BTreeMap<String, String>,
     #[serde(default)]
     hidden_columns: Vec<String>,
+}
+
+pub(crate) fn decode_data_mutation_table_target(
+    handle: &novarocks_spi::connector::ConnectorTableHandle,
+) -> Result<(String, String), ConnectorError> {
+    let payload: TablePayload = decode_payload(handle.payload(), "data mutation table handle")?;
+    if payload.metadata_table_type.is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg data mutation requires a base table handle",
+        ));
+    }
+    Ok((payload.namespace, payload.table))
 }
 
 #[derive(Clone, Deserialize, Serialize)]

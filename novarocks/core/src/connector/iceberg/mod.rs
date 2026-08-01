@@ -21,6 +21,7 @@ pub mod changes;
 pub mod commit;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod compact;
+pub(crate) mod data_mutation;
 pub(crate) mod data_writer;
 pub(crate) mod default_value;
 pub mod delete_file;

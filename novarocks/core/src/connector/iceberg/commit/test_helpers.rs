@@ -127,6 +127,19 @@ pub(crate) async fn run_commit_with<A>(
 where
     A: IcebergCommitAction + 'static,
 {
+    run_commit_with_properties(action, op_kind, fixture, target_ref, BTreeMap::new()).await
+}
+
+pub(crate) async fn run_commit_with_properties<A>(
+    action: A,
+    op_kind: CommitOpKind,
+    fixture: &IcebergTestFixture,
+    target_ref: &str,
+    snapshot_properties: BTreeMap<String, String>,
+) -> Result<CommitOutcome, String>
+where
+    A: IcebergCommitAction + 'static,
+{
     let metadata = fixture.table.metadata();
     let staging_dir = format!("{}/staging", metadata.location());
     let collector = Arc::new(
@@ -145,7 +158,6 @@ where
 
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
-    let snapshot_properties = BTreeMap::new();
     let ctx = CommitCtx {
         collector: &collector,
         table: &fixture.table,

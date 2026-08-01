@@ -99,7 +99,8 @@ impl IcebergCommitAction for FastAppendCommit {
         let action = tx
             .fast_append()
             .add_data_files(data_files)
-            .set_commit_uuid(ctx.commit_uuid);
+            .set_commit_uuid(ctx.commit_uuid)
+            .set_snapshot_properties(ctx.snapshot_properties.clone().into_iter().collect());
         let tx = action
             .apply(tx)
             .map_err(|e| format!("fast_append apply failed: {e}"))?;
@@ -418,6 +419,7 @@ impl TransactionAction for FastAppendV3TxnAction {
             },
         ];
         let requirements = vec![
+            TableRequirement::UuidMatch { uuid: m.uuid() },
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: m.current_schema_id(),
             },

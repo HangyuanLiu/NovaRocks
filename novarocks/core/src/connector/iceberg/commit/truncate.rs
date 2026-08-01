@@ -53,7 +53,7 @@ use iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
@@ -76,6 +76,7 @@ impl IcebergCommitAction for TruncateCommit {
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -110,6 +111,7 @@ struct TruncateTxnAction {
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     target_ref: String,
+    snapshot_properties: std::collections::BTreeMap<String, String>,
 }
 
 impl TruncateTxnAction {
@@ -242,13 +244,18 @@ impl TransactionAction for TruncateTxnAction {
         //    (see iceberg-0.9.0/src/spec/table_metadata_builder.rs:419).
         //    Setting `(next_row_id, 0)` is the spec-faithful way to record
         //    "no new row ids consumed" while still satisfying the validator.
-        let summary = Summary {
-            operation: Operation::Delete,
-            additional_properties: finalize_snapshot_summary(
+        let additional_properties = merge_snapshot_summary_properties(
+            finalize_snapshot_summary(
                 truncate_summary(&data_entries, &delete_entries),
                 m.current_snapshot().map(|s| s.summary()),
                 true,
             ),
+            &self.snapshot_properties,
+        )
+        .map_err(to_iceberg_unexpected)?;
+        let summary = Summary {
+            operation: Operation::Delete,
+            additional_properties,
         };
         let snapshot_builder = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
@@ -279,6 +286,7 @@ impl TransactionAction for TruncateTxnAction {
             },
         ];
         let requirements = vec![
+            TableRequirement::UuidMatch { uuid: m.uuid() },
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: m.current_schema_id(),
             },
@@ -399,7 +407,8 @@ mod tests {
     //! stronger coverage than what an inline mock fixture would provide.
     use super::*;
     use crate::connector::iceberg::commit::test_helpers::{
-        empty_v3_iceberg_table, run_commit_with, v3_table_with_n_data_files,
+        empty_v3_iceberg_table, run_commit_with, run_commit_with_properties,
+        v3_table_with_n_data_files,
     };
     use crate::connector::iceberg::commit::types::CommitOpKind;
     use iceberg::spec::{DataFileBuilder, DataFileFormat, Operation, Struct};
@@ -506,6 +515,39 @@ mod tests {
         let p = &snap.summary().additional_properties;
         assert_eq!(p.get("deleted-data-files").map(String::as_str), Some("0"));
         assert_eq!(p.get("added-data-files").map(String::as_str), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn truncate_snapshot_carries_data_mutation_marker() {
+        let fixture = empty_v3_iceberg_table().await;
+        let marker = r#"{"version":1}"#.to_string();
+        run_commit_with_properties(
+            TruncateCommit,
+            CommitOpKind::Truncate,
+            &fixture,
+            "main",
+            BTreeMap::from([(
+                "novarocks.connector.data-mutation.v1".to_string(),
+                marker.clone(),
+            )]),
+        )
+        .await
+        .expect("truncate with marker");
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload");
+        assert_eq!(
+            reloaded
+                .metadata()
+                .current_snapshot()
+                .expect("snapshot")
+                .summary()
+                .additional_properties
+                .get("novarocks.connector.data-mutation.v1"),
+            Some(&marker)
+        );
     }
 
     /// `write_truncate_deletes_manifest` should produce a `Deletes`-typed

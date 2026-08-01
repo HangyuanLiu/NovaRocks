@@ -1255,7 +1255,10 @@ async fn commit_v3_insert_rows_with_fast_append(
     FastAppendCommit.commit(ctx).await.map(|_| ())
 }
 
-fn data_file_to_written_file(df: &DataFile, partition_spec_id: i32) -> Result<WrittenFile, String> {
+pub(crate) fn data_file_to_written_file(
+    df: &DataFile,
+    partition_spec_id: i32,
+) -> Result<WrittenFile, String> {
     Ok(WrittenFile {
         path: df.file_path().to_string(),
         format: df.file_format(),
