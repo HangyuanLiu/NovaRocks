@@ -134,13 +134,19 @@ pub enum RuntimeFilterContributionKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterContribution {
     kind: RuntimeFilterContributionKind,
+    contract_digest: [u8; 32],
     canonical_bytes: Arc<[u8]>,
 }
 
 impl RuntimeFilterContribution {
-    pub fn new(kind: RuntimeFilterContributionKind, canonical_bytes: impl Into<Arc<[u8]>>) -> Self {
+    pub fn new(
+        kind: RuntimeFilterContributionKind,
+        contract_digest: [u8; 32],
+        canonical_bytes: impl Into<Arc<[u8]>>,
+    ) -> Self {
         Self {
             kind,
+            contract_digest,
             canonical_bytes: canonical_bytes.into(),
         }
     }
@@ -151,6 +157,10 @@ impl RuntimeFilterContribution {
 
     pub const fn canonical_bytes(&self) -> &Arc<[u8]> {
         &self.canonical_bytes
+    }
+
+    pub const fn contract_digest(&self) -> [u8; 32] {
+        self.contract_digest
     }
 }
 
@@ -588,6 +598,7 @@ mod tests {
                     ProducerSequence::new(1),
                     RuntimeFilterContribution::new(
                         RuntimeFilterContributionKind::Membership,
+                        [2; 32],
                         Arc::<[u8]>::from([1_u8, 2]),
                     ),
                 ).is_ok()
