@@ -11752,15 +11752,9 @@ fn repartition_iceberg_join_mv_overwrite(
         right_ref,
         crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory },
         |logical| {
-            let connectors_snapshot = state
-                .connectors
-                .read()
-                .expect("standalone connector registry read lock")
-                .clone();
             let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
                 logical.plan,
                 logical.factory,
-                &connectors_snapshot,
             )?;
             execute_imv_change_stream_writer(
                 state,
@@ -12020,15 +12014,9 @@ fn first_refresh_iceberg_join_mv(
         right_ref,
         logical_input,
         |logical| {
-            let connectors_snapshot = state
-                .connectors
-                .read()
-                .expect("standalone connector registry read lock")
-                .clone();
             let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
                 logical.plan,
                 logical.factory,
-                &connectors_snapshot,
             )?;
             execute_imv_change_stream_writer(
                 state,
@@ -13516,15 +13504,9 @@ fn execute_join_delta_branches_logical(
         mode,
         logical_plan,
         |logical| {
-            let connectors_snapshot = state
-                .connectors
-                .read()
-                .expect("standalone connector registry read lock")
-                .clone();
             let planned_query = crate::engine::plan_logical_for_iceberg_change_stream_refresh(
                 logical.plan,
                 logical.factory,
-                &connectors_snapshot,
             )?;
             let producer_branches = match mode {
                 JoinIncrementalRefreshMode::AppendOnly => {

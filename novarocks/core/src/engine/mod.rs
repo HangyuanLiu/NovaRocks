@@ -4778,7 +4778,6 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
 pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
-    connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let change_stream =
         crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(
