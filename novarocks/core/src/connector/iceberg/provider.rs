@@ -77,7 +77,7 @@ use super::scan_model::{
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::RegisteredIcebergWriteControlBackend;
-use crate::connector::stats::TableStatsProvider;
+use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2928,27 +2928,19 @@ impl StatisticsReader for IcebergControlProvider {
                 "Iceberg table has no current snapshot for statistics",
             )
         })?;
-        let legacy = super::stats::IcebergTableStatsProvider::new(Arc::clone(&self.registry));
-        let base = legacy
-            .estimate_table_statistics(&crate::connector::stats::TableStatsRequest {
-                catalog: Some(self.instance_id.as_str().to_string()),
-                database: table.namespace.clone(),
-                table: table.table.clone(),
-                source: crate::connector::stats::ScanSourceIdentity::IcebergTable {
-                    catalog: self.instance_id.as_str().to_string(),
-                    namespace: table.namespace.clone(),
-                    table: table.table.clone(),
-                },
-                snapshot: Some(crate::connector::stats::TableSnapshotRef::SnapshotId(
-                    snapshot_id,
-                )),
-            })
-            .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    format!("read Iceberg statistics: {error:?}"),
-                )
-            })?;
+        let base = super::stats::read_pinned_table_statistics(
+            &self.registry,
+            self.instance_id.as_str(),
+            &table.namespace,
+            &table.table,
+            Some(snapshot_id),
+        )
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("read Iceberg statistics: {error:?}"),
+            )
+        })?;
         // A metadata-only `update_statistics` leaves the Iceberg snapshot (and
         // therefore the data-version) unchanged.  Its registered Puffin path
         // is nevertheless a new immutable evidence revision, so derive the
@@ -4009,7 +4001,14 @@ pub(crate) fn load_schema_table_def(
     catalog: &str,
     namespace: &str,
     table: &str,
-) -> Result<(crate::sql::planner::table::TableDef, Option<i32>), String> {
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<i32>,
+        Option<ResolvedTableStatisticsPin>,
+    ),
+    String,
+> {
     load_table_def_at(controls, context, catalog, namespace, table, None, true)
 }
 
@@ -4021,7 +4020,14 @@ pub(crate) fn load_table_def_at(
     table: &str,
     snapshot_id: Option<i64>,
     schema_only: bool,
-) -> Result<(crate::sql::planner::table::TableDef, Option<i32>), String> {
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<i32>,
+        Option<ResolvedTableStatisticsPin>,
+    ),
+    String,
+> {
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
@@ -4091,7 +4097,14 @@ pub(crate) fn load_table_def_at(
             binding,
         },
     };
-    Ok((table_def, schema_id))
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(|data_version| ResolvedTableStatisticsPin {
+            table: metadata.table.clone(),
+            data_version,
+        });
+    Ok((table_def, schema_id, statistics_pin))
 }
 
 pub(crate) fn load_metadata_table_def(
