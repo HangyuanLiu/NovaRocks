@@ -30,7 +30,7 @@ pub(crate) mod views;
 // imported symbol.
 pub(crate) use backend::{
     build_iceberg_table_def_for_delta_scan, build_iceberg_table_def_with_files,
-    hidden_internal_column_names_from_metadata, iceberg_table_stats_provider, row_lineage_enabled,
+    hidden_internal_column_names_from_metadata, row_lineage_enabled,
 };
 pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace,

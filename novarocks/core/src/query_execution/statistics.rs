@@ -261,6 +261,7 @@ pub(crate) fn prepare_statistics_connector_read(
             program.plan.table(),
             ConnectorBeginScanRequest {
                 projection: program.plan.scan_projection(),
+                static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
                 limit: None,
                 batch,
@@ -281,6 +282,7 @@ pub(crate) fn prepare_statistics_connector_read(
         )
         .map_err(connector_planning_error)?;
     if splits
+        .splits
         .iter()
         .any(|split| split.owner() != &lease.binding().descriptor().instance_id)
     {
@@ -296,7 +298,11 @@ pub(crate) fn prepare_statistics_connector_read(
     Ok(PlannedConnectorRead {
         declaration,
         scan,
-        splits,
+        splits: splits.splits,
+        planning_metrics: splits.metrics,
+        static_predicates: Vec::new(),
+        predicate_dispositions: Vec::new(),
+        residual_predicates: Vec::new(),
         batch,
         planning_lease: Some(lease),
     })
@@ -338,6 +344,7 @@ pub(crate) fn build_statistics_collection_request(
         controls,
         &context,
         Some(&resolver),
+        crate::query_execution::preparation::ScanPreparationOptions::default(),
     )
     .map_err(contract_violation)?;
     let native_bundle =

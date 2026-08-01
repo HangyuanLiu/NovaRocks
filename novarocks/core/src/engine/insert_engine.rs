@@ -410,6 +410,7 @@ fn resolved_table(target: &ResolvedInsertTarget) -> ResolvedTable {
         namespace: target.namespace.clone(),
         table: target.table.clone(),
         columns: target.columns.clone(),
+        statistics_pin: None,
     }
 }
 

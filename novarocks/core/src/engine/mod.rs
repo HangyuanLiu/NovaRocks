@@ -284,6 +284,11 @@ pub(crate) struct StandaloneState {
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    /// Process-local cache of immutable evidence returned by connector
+    /// statistics readers. Query compilation still consumes only the pin
+    /// captured during table resolution.
+    pub(crate) unified_statistics:
+        Arc<crate::connector::unified_statistics::UnifiedStatisticsResolver>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) mv_refresh_pruning_limits: MvRefreshPruningLimits,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
@@ -340,6 +345,9 @@ impl Default for StandaloneState {
                 statistics_application::UnavailableStatisticsApplicationPort,
             ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
+            unified_statistics: Arc::new(
+                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
+            ),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
             metadata_provider: None,
@@ -958,6 +966,9 @@ impl StandaloneNovaRocks {
             statistics_service,
             statistics_application,
             connector_control,
+            unified_statistics: Arc::new(
+                crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
+            ),
             table_maintenance_service,
             self_weak: self_weak.clone(),
             query_execution,

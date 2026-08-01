@@ -644,7 +644,15 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use bytes::Bytes;
+    use novarocks_connector_starrocks::{
+        StarRocksConnectorConfig, StarRocksControlGeneration, StarRocksDirectSplitPlanner,
+        StarRocksMetadataSource, StarRocksReadPolicy, StarRocksResolvedTable,
+        StarRocksRpcSplitPlanner, StarRocksRpcTransport, StarRocksSplitPlanningInput,
+        StarRocksStrategySplit,
+    };
     use novarocks_spi::connector::{
         ConnectorBeginScanRequest, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
         ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
@@ -654,6 +662,98 @@ mod tests {
     };
 
     use super::*;
+
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct StarRocksFixtureSource;
+
+    impl StarRocksMetadataSource for StarRocksFixtureSource {
+        fn namespace_exists(
+            &self,
+            _: &str,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<bool, ConnectorError> {
+            Ok(true)
+        }
+        fn table_exists(
+            &self,
+            _: &str,
+            _: &str,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<bool, ConnectorError> {
+            Ok(true)
+        }
+        fn list_tables(
+            &self,
+            _: &str,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<Vec<String>, ConnectorError> {
+            Ok(vec![])
+        }
+        fn load_table(
+            &self,
+            _: &str,
+            _: &str,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<StarRocksResolvedTable, ConnectorError> {
+            Err(unsupported())
+        }
+    }
+
+    struct StarRocksFixturePlanner;
+
+    impl StarRocksRpcSplitPlanner for StarRocksFixturePlanner {
+        fn plan_rpc_splits(
+            &self,
+            _: &StarRocksSplitPlanningInput,
+            _: &ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
+            Err(unsupported())
+        }
+    }
+
+    impl StarRocksDirectSplitPlanner for StarRocksFixturePlanner {
+        fn plan_direct_splits(
+            &self,
+            _: &StarRocksSplitPlanningInput,
+            _: &ConnectorSplitPlanningRequest,
+        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
+            Err(unsupported())
+        }
+    }
+
+    fn starrocks_binding() -> ConnectorControlBinding {
+        let config = StarRocksConnectorConfig::new(
+            ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
+            StarRocksReadPolicy::Auto,
+            StarRocksRpcTransport::BrpcChunk,
+            novarocks_connector_starrocks::StarRocksLocalBindingRef::parse("test")
+                .expect("binding"),
+        );
+        StarRocksControlGeneration::try_new(
+            config,
+            Arc::new(StarRocksFixtureSource),
+            Arc::new(StarRocksFixturePlanner),
+            Arc::new(StarRocksFixturePlanner),
+        )
+        .expect("StarRocks control binding")
+    }
+
+    fn starrocks_context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context")
+    }
 
     struct TestControl {
         instance_id: ConnectorInstanceId,
@@ -821,6 +921,39 @@ mod tests {
             vec![String::from("127.0.0.1:18080")]
         );
         assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    }
+
+    #[test]
+    fn starrocks_control_host_keeps_the_retiring_generation_leased_and_accepts_its_replacement() {
+        let host = ConnectorControlHost::new();
+        let first = starrocks_binding();
+        let instance = first.descriptor().instance_id.clone();
+        let first_incarnation = first.incarnation();
+        host.register(first)
+            .expect("register first StarRocks generation");
+        let lease = host
+            .acquire_current(&instance)
+            .expect("acquire first lease");
+        let declaration = lease
+            .binding()
+            .execution_declaration(&starrocks_context())
+            .expect("declaration");
+        assert_eq!(declaration.binding_key().incarnation, first_incarnation);
+
+        host.retire_current(&instance)
+            .expect("retire first generation");
+        host.register(starrocks_binding())
+            .expect("register replacement generation");
+        assert_eq!(lease.binding().incarnation(), first_incarnation);
+        drop(lease);
+
+        assert_ne!(
+            host.acquire_current(&instance)
+                .expect("acquire replacement")
+                .binding()
+                .incarnation(),
+            first_incarnation
+        );
     }
 
     fn unsupported() -> ConnectorError {

@@ -30,6 +30,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 novarocks = { path = "../core", features = ["query-execution-contract-test-support"] }
+novarocks-connector-starrocks = { path = "../connector/starrocks" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tonic = { version = "0.12", features = ["transport"] }

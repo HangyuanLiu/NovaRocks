@@ -362,13 +362,11 @@ fn collect_statistics_through_engine(
 ) -> Result<Vec<CollectedColumnStatistics>, String> {
     let name = object_name_from_parts(&target.name_parts)?;
     let (database, table) = resolve_database_and_table(&name, &target.current_database)?;
-    let ndv_by_name = crate::connector::iceberg::analyze::analyze_iceberg_puffin_stats(
-        state,
-        target.current_catalog.as_deref(),
-        &target.current_database,
-        &name,
-        columns,
-    )?;
+    // Persistent connector statistics are collected through the pinned
+    // frontend-owned statistics application path. This legacy in-engine
+    // aggregation helper deliberately does not create or publish a second
+    // Iceberg statistics artifact.
+    let ndv_by_name = std::collections::HashMap::<String, f64>::new();
     let mut output = Vec::with_capacity(columns.len());
     for column in columns {
         let sql = format!(

@@ -13,6 +13,7 @@ use novarocks::query_execution::lifecycle::{
     QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminalIngress, QueryTerminationAck,
 };
 use novarocks::service::MetricsHttpServer;
+use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
@@ -245,6 +246,16 @@ fn compose_backend_application_services(
                 )
             })?;
     }
+    execution_host
+        .register_installer(Arc::new(StarRocksExecutionInstaller::new(
+            StarRocksExecutionBindings::new(),
+        )))
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("register StarRocks connector execution installer: {error}"),
+            )
+        })?;
     let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
         grpc_exchange_transmitter(),
         grpc_fragment_lookup_client(),
@@ -549,11 +560,13 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
     };
+    use bytes::Bytes;
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks::query_execution::lifecycle::contract::{
@@ -573,10 +586,23 @@ mod tests {
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,
     };
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorErrorKind, ConnectorExecutionDeclaration,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorProviderId, ConnectorRequestContext,
+    };
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     fn unused_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -641,6 +667,42 @@ mod tests {
             Arc::strong_count(&services.query_lifecycle_registry),
             3,
             "application, Stage ingress, and fragment service must share exactly one registry"
+        );
+    }
+
+    #[test]
+    fn starrocks_execution_host_composition_recognizes_the_provider_but_requires_a_local_binding() {
+        let services = compose_backend_application_services(&NovaRocksConfig::default())
+            .expect("compose backend application services");
+        let query = QueryExecutionId::new(
+            QueryId::new(0x5352_4331, 1),
+            AttemptId::new(1).expect("attempt"),
+        )
+        .expect("query");
+        let declaration = ConnectorExecutionDeclaration::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("starrocks").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
+            },
+            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            Bytes::from_static(br#"{"version":1,"contract_version":1,"local_binding":"missing"}"#),
+        )
+        .expect("declaration");
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            4096,
+        )
+        .expect("context");
+
+        assert_eq!(
+            services
+                .execution_host
+                .ensure(query, &declaration, &context)
+                .expect_err("empty startup binding map must reject execution")
+                .kind(),
+            ConnectorErrorKind::Unavailable
         );
     }
 

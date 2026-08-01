@@ -3269,6 +3269,7 @@ dependencies = [
  "bytes",
  "iceberg",
  "novarocks",
+ "novarocks-connector-starrocks",
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
@@ -3326,6 +3327,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-starrocks"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "bytes",
+ "novarocks-spi",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
@@ -3338,6 +3353,7 @@ dependencies = [
  "hex",
  "novarocks",
  "novarocks-catalog",
+ "novarocks-connector-starrocks",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store",
