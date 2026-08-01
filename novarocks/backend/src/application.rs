@@ -456,7 +456,25 @@ where
 async fn run_backend_server_until_signal(
     config: BackendServerConfig,
 ) -> Result<(), BackendApplicationError> {
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| {
+        BackendApplicationError::new(
+            BackendApplicationErrorKind::Signal,
+            format!("install SIGINT listener failed: {error}"),
+        )
+    })?;
+
     run_backend_server_until(config, async {
+        #[cfg(unix)]
+        {
+            // Register the OS handler before the host emits its ready marker.
+            // A supervisor can otherwise deliver SIGINT in the narrow window
+            // between readiness and the first poll of `tokio::signal::ctrl_c`.
+            interrupt.recv().await;
+            Ok(())
+        }
+        #[cfg(not(unix))]
         tokio::signal::ctrl_c().await.map_err(|error| {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Signal,

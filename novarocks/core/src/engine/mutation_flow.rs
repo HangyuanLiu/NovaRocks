@@ -1336,7 +1336,7 @@ fn run_mor_update_change_stream_transaction(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table,
@@ -1414,7 +1414,7 @@ fn run_mor_merge_change_stream_transaction(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table,
@@ -2046,7 +2046,7 @@ fn run_cow_update_distributed_transaction(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table,
@@ -2776,7 +2776,7 @@ pub(crate) fn execute_merge_statement(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table,

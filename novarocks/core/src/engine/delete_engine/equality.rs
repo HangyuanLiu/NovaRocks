@@ -36,7 +36,8 @@ use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::delete_engine::{
-    DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
+    DeleteOperation, PreparedDelete, PreparedDeleteExecution, has_iceberg_staged_output,
+    prepared_delete,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::write_transaction::IcebergWriteCommitExecutor;
@@ -156,6 +157,13 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         Ok(result)
     }
 
+    fn has_staged_output(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<bool, String> {
+        has_iceberg_staged_output(completion, &self.commit_executor)
+    }
+
     fn commit(
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
@@ -231,7 +239,7 @@ fn prepare_equality_delete_distributed_write(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::clone(state),
+        state: Arc::downgrade(state),
         target: target.clone(),
         catalog,
         table: table.clone(),
