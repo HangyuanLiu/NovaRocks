@@ -1422,6 +1422,7 @@ impl StandaloneSession {
                     query_opts,
                     request_context.execution(),
                     crate::sql::compiler::SqlCompileIntent::Query,
+                    true,
                 )?;
                 Ok(PreparedQueryOperation::Distributed(
                     PreparedDistributedQuery {
@@ -1475,6 +1476,7 @@ impl StandaloneSession {
                     level: crate::sql::explain::ExplainLevel::Analyze,
                     analyze: true,
                 },
+                true,
             )?;
         Ok(PreparedQueryOperation::Distributed(
             PreparedDistributedQuery {
@@ -3919,15 +3921,6 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let catalog_snapshot = catalog_service_snapshot
-        .local()
-        .read()
-        .expect("catalog service snapshot local read lock");
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
@@ -3936,19 +3929,24 @@ pub(crate) fn execute_query_with_catalog_service_with_connector_context(
         TableLookupMode::SchemaOnly,
     );
     let execution = capture_maintenance_execution(state)?;
-    execute_query_with_catalog_provider_with_execution(
+    let (request, _, _) = prepare_query_with_sql_compiler_kernel(
         query,
         &analyzer_provider,
-        &catalog_snapshot,
-        &connectors_snapshot,
+        current_catalog,
         current_database,
-        state.exchange_port,
-        query_opts,
-        &state.query_execution,
+        state,
         connector_context,
-        Some(state),
+        query_opts,
         &execution,
-    )
+        crate::sql::compiler::SqlCompileIntent::Query,
+        true,
+    )?;
+    state
+        .query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn execute_query_with_catalog_service_with_execution(
@@ -3961,15 +3959,6 @@ pub(crate) fn execute_query_with_catalog_service_with_execution(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let catalog_snapshot = catalog_service_snapshot
-        .local()
-        .read()
-        .expect("catalog service snapshot local read lock");
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
@@ -3977,19 +3966,24 @@ pub(crate) fn execute_query_with_catalog_service_with_execution(
         connector_context.clone(),
         TableLookupMode::SchemaOnly,
     );
-    execute_query_with_catalog_provider_with_execution(
+    let (request, _, _) = prepare_query_with_sql_compiler_kernel(
         query,
         &analyzer_provider,
-        &catalog_snapshot,
-        &connectors_snapshot,
+        current_catalog,
         current_database,
-        state.exchange_port,
-        query_opts,
-        &state.query_execution,
+        state,
         connector_context,
-        Some(state),
+        query_opts,
         execution,
-    )
+        crate::sql::compiler::SqlCompileIntent::Query,
+        true,
+    )?;
+    state
+        .query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
 }
 
 /// Execute a refresh query whose SQL has already been expanded by the MV
@@ -4004,15 +3998,6 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryResult, String> {
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let catalog_snapshot = catalog_service_snapshot
-        .local()
-        .read()
-        .expect("catalog service snapshot local read lock");
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = build_catalog_service_provider(
         current_catalog,
         &catalog_service_snapshot,
@@ -4021,24 +4006,24 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         TableLookupMode::SchemaOnly,
     );
     let maintenance_execution = capture_maintenance_execution(state)?;
-    execute_query_with_options_and_imv_validator_with_catalog_provider(
+    let (request, _, _) = prepare_query_with_sql_compiler_kernel(
         query,
         &analyzer_provider,
-        &catalog_snapshot,
-        &connectors_snapshot,
+        current_catalog,
         current_database,
-        state.exchange_port,
-        query_opts,
-        &state.query_execution,
+        state,
         connector_context,
-        None,
-        None,
-        None,
-        None,
-        Some(state),
+        query_opts,
+        &maintenance_execution,
+        crate::sql::compiler::SqlCompileIntent::Query,
         false,
-        Some(&maintenance_execution),
-    )
+    )?;
+    state
+        .query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn iceberg_write_shuffle_by_output_name(
@@ -4866,6 +4851,7 @@ fn prepare_query_with_sql_compiler_kernel(
     query_opts: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     intent: crate::sql::compiler::SqlCompileIntent,
+    allow_mv_rewrite_candidates: bool,
 ) -> Result<
     (
         crate::query_execution::contract::DistributedQueryRequest,
@@ -4886,7 +4872,9 @@ fn prepare_query_with_sql_compiler_kernel(
         table_bindings.clone(),
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let mv_definitions = crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?;
+    let mv_definitions = allow_mv_rewrite_candidates
+        .then(|| crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state))
+        .transpose()?;
     let distributed_intent = match &intent {
         crate::sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
             crate::query_execution::contract::DistributedQueryIntent::Profile
@@ -4905,7 +4893,9 @@ fn prepare_query_with_sql_compiler_kernel(
         &catalog_snapshot,
         &statistics,
         crate::sql::functions::builtin_sql_function_catalog(),
-        Some(&mv_definitions),
+        mv_definitions
+            .as_ref()
+            .map(|snapshot| snapshot as &dyn crate::sql::compiler::SqlMvRewriteSnapshot),
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             execution.cancellation().clone(),
