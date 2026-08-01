@@ -3353,6 +3353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-execution"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-frontend"
 version = "0.1.0"
 dependencies = [
