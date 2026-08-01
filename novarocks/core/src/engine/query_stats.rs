@@ -233,7 +233,7 @@ pub(super) fn collect_table_stats(
     table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
-    let ScanSource::IcebergDataFiles { table, .. } = &table_def.source else {
+    let ScanSource::IcebergDataFiles { table, binding, .. } = &table_def.source else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
@@ -257,9 +257,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(binding) =
-        bindings.strict_base_binding(&table.catalog, &table.namespace, &table.table)
-    else {
+    let Some(query_binding) = bindings.iceberg_data_file_binding(table, *binding) else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
@@ -267,7 +265,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(pin) = binding.statistics_pin.as_ref() else {
+    let Some(pin) = query_binding.statistics_pin.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
@@ -275,7 +273,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(planning_lease) = binding.planning_lease.as_ref() else {
+    let Some(planning_lease) = query_binding.planning_lease.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(

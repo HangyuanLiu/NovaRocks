@@ -47,6 +47,7 @@ struct TableBindingKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TableBindingSelector {
     StrictBaseTable,
+    TimeTravelSnapshot(i64),
 }
 
 impl TableBindingKey {
@@ -58,6 +59,36 @@ impl TableBindingKey {
             selector: TableBindingSelector::StrictBaseTable,
         }
     }
+
+    fn analysis_lookup(catalog: &str, namespace: &str, table: &str) -> Self {
+        if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
+            return Self {
+                catalog: catalog.to_ascii_lowercase(),
+                namespace: namespace.to_ascii_lowercase(),
+                table: base_table.to_ascii_lowercase(),
+                selector: TableBindingSelector::TimeTravelSnapshot(snapshot_id),
+            };
+        }
+        Self::strict_base(catalog, namespace, table)
+    }
+
+    fn time_travel(catalog: &str, namespace: &str, table: &str, snapshot_id: i64) -> Self {
+        Self {
+            catalog: catalog.to_ascii_lowercase(),
+            namespace: namespace.to_ascii_lowercase(),
+            table: table.to_ascii_lowercase(),
+            selector: TableBindingSelector::TimeTravelSnapshot(snapshot_id),
+        }
+    }
+}
+
+fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
+    let encoded = table.strip_prefix("__sqlx1_tt_")?;
+    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
+    (!base_table.is_empty())
+        .then(|| snapshot_id.parse::<i64>().ok())
+        .flatten()
+        .map(|snapshot_id| (base_table, snapshot_id))
 }
 
 /// One external metadata result, pinned to the same connector control
@@ -135,6 +166,35 @@ impl QueryTableBindingStore {
             .and_then(|entry| entry.clone().ok())
     }
 
+    pub(crate) fn iceberg_data_file_binding(
+        &self,
+        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    ) -> Option<Arc<QueryTableBinding>> {
+        let key = match binding {
+            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+                table.current_snapshot_id.map(|snapshot_id| {
+                    TableBindingKey::time_travel(
+                        &table.catalog,
+                        &table.namespace,
+                        &table.table,
+                        snapshot_id,
+                    )
+                })
+            }
+            _ => Some(TableBindingKey::strict_base(
+                &table.catalog,
+                &table.namespace,
+                &table.table,
+            )),
+        }?;
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(&key)
+            .and_then(|entry| entry.clone().ok())
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_strict_base_binding_for_test(
         &self,
@@ -203,7 +263,7 @@ impl<'a> CatalogServiceProvider<'a> {
     ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                let key = TableBindingKey::strict_base("default_catalog", database, table);
+                let key = TableBindingKey::analysis_lookup("default_catalog", database, table);
                 self.bindings
                     .resolve_or_insert(key, || {
                         let planner = self
@@ -223,7 +283,7 @@ impl<'a> CatalogServiceProvider<'a> {
                     .map(|binding| binding.resolved.clone())
             }
             Some(catalog) => {
-                let key = TableBindingKey::strict_base(catalog, database, table);
+                let key = TableBindingKey::analysis_lookup(catalog, database, table);
                 self.bindings
                     .resolve_or_insert(key, || {
                         self.loader.load_strict_base_table(catalog, database, table)
@@ -349,6 +409,16 @@ mod tests {
         assert!(matches!(first, Err(error) if error == "missing table"));
         assert!(matches!(second, Err(error) if error == "missing table"));
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sqlx1_resolution_time_travel_identity_uses_base_table_and_snapshot_selector() {
+        let first = TableBindingKey::analysis_lookup("ice", "db", "__sqlx1_tt_orders_42");
+        let same = TableBindingKey::time_travel("ICE", "DB", "orders", 42);
+        let other_snapshot = TableBindingKey::analysis_lookup("ice", "db", "__sqlx1_tt_orders_43");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other_snapshot);
     }
 
     #[test]

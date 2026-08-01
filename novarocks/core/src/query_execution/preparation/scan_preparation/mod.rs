@@ -220,7 +220,7 @@ fn prepare_scan_node(
                 })
                 .unwrap_or_default();
             let exact_lease = query_table_bindings
-                .map(|bindings| exact_query_binding_lease(bindings, &files.table))
+                .map(|bindings| exact_query_binding_lease(bindings, &files.table, files.binding))
                 .transpose()?;
             let planned = plan_iceberg_connector_read(
                 controls,
@@ -243,7 +243,13 @@ fn prepare_scan_node(
                 ));
             };
             let exact_lease = query_table_bindings
-                .map(|bindings| exact_query_binding_lease(bindings, table))
+                .map(|bindings| {
+                    exact_query_binding_lease(
+                        bindings,
+                        table,
+                        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    )
+                })
                 .transpose()?;
             let planned = plan_iceberg_delta_connector_read(
                 controls,
@@ -275,9 +281,10 @@ fn prepare_scan_node(
 fn exact_query_binding_lease(
     bindings: &QueryTableBindingStore,
     table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
     let binding = bindings
-        .strict_base_binding(&table.catalog, &table.namespace, &table.table)
+        .iceberg_data_file_binding(table, binding)
         .ok_or_else(|| {
             format!(
                 "scan preparation has no exact query binding for '{}.{}.{}'",
