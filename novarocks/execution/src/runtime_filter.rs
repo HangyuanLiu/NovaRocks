@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, BooleanArray};
+use arrow::datatypes::DataType;
 
 macro_rules! id {
     ($name:ident, $raw:ty) => {
@@ -60,9 +61,55 @@ pub enum RuntimeFilterExecutionContract {
         schema_digest: [u8; 32],
     },
     Ordered {
+        keys: Arc<[RuntimeOrderKey]>,
         comparator_digest: [u8; 32],
         order_contract_digest: [u8; 32],
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeOrderSortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeOrderNullOrder {
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeOrderKey {
+    data_type: DataType,
+    direction: RuntimeOrderSortDirection,
+    null_order: RuntimeOrderNullOrder,
+}
+
+impl RuntimeOrderKey {
+    pub const fn new(
+        data_type: DataType,
+        direction: RuntimeOrderSortDirection,
+        null_order: RuntimeOrderNullOrder,
+    ) -> Self {
+        Self {
+            data_type,
+            direction,
+            null_order,
+        }
+    }
+
+    pub const fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    pub const fn direction(&self) -> RuntimeOrderSortDirection {
+        self.direction
+    }
+
+    pub const fn null_order(&self) -> RuntimeOrderNullOrder {
+        self.null_order
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +118,40 @@ pub enum RuntimeFilterProducerKind {
     OrderedBound,
     TopKSummary,
     FinalDomain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterContributionKind {
+    Membership,
+    OrderedBound,
+    TopKSummary,
+    FinalDomain,
+}
+
+/// Immutable canonical contribution bytes. The execution surface owns the
+/// producer vocabulary; a role-local adapter owns codec validation and reducer
+/// delivery for the installed contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterContribution {
+    kind: RuntimeFilterContributionKind,
+    canonical_bytes: Arc<[u8]>,
+}
+
+impl RuntimeFilterContribution {
+    pub fn new(kind: RuntimeFilterContributionKind, canonical_bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            kind,
+            canonical_bytes: canonical_bytes.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> RuntimeFilterContributionKind {
+        self.kind
+    }
+
+    pub const fn canonical_bytes(&self) -> &Arc<[u8]> {
+        &self.canonical_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +403,12 @@ pub enum RuntimeFilterSubscriptionHandle {
 }
 
 pub trait RuntimeFilterProducer: Send + Sync {
+    fn submit(
+        &self,
+        partition: PartitionId,
+        sequence: ProducerSequence,
+        contribution: RuntimeFilterContribution,
+    ) -> Result<(), RuntimeFilterContractViolation>;
     fn close_partition(
         &self,
         partition: PartitionId,
@@ -423,6 +510,14 @@ mod tests {
     }
     struct Producer;
     impl RuntimeFilterProducer for Producer {
+        fn submit(
+            &self,
+            _: PartitionId,
+            _: ProducerSequence,
+            _: RuntimeFilterContribution,
+        ) -> Result<(), RuntimeFilterContractViolation> {
+            Ok(())
+        }
         fn close_partition(
             &self,
             _: PartitionId,
@@ -487,7 +582,15 @@ mod tests {
         );
         assert!(matches!(
             session.open_producer(RuntimeFilterProducerOpenRequest::new(producer, 1)),
-            Ok(RuntimeFilterBindOutcome::Bound(_))
+            Ok(RuntimeFilterBindOutcome::Bound(handle))
+                if handle.submit(
+                    PartitionId::new(0),
+                    ProducerSequence::new(1),
+                    RuntimeFilterContribution::new(
+                        RuntimeFilterContributionKind::Membership,
+                        Arc::<[u8]>::from([1_u8, 2]),
+                    ),
+                ).is_ok()
         ));
         let consumer = RuntimeFilterConsumerContract::new(
             RuntimeFilterBindingId::new(99),
