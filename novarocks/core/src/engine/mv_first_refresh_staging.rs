@@ -12,13 +12,16 @@ use std::sync::Arc;
 
 use crate::engine::{
     IcebergWriteRootDistributionResolver, StandaloneState,
+    execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context,
     execute_query_as_iceberg_staging_in_operation_with_connector_context,
     iceberg_write_shuffle_by_output_name,
 };
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
-use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+use crate::sql::mv_refresh::first_refresh::{
+    MvFirstRefreshExecutionArtifact, PreparedMvFirstRefreshWrite,
+};
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
 pub(crate) fn execute_prepared_mv_first_refresh_staging(
@@ -29,6 +32,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     sink_spec: IcebergWriteSinkSpec,
     execution: &QueryExecutionContext,
     registration: ConnectorWriteExecutionRegistration,
+    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<(ConnectorWriteCompletion, ConnectorWriteStagingSummary), String> {
     if registration.session().operation_id() != prepared.operation_id()
         || registration.cohort_id() != prepared.primary_cohort()
@@ -40,21 +44,44 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
             "MV first-refresh staging sink schema does not match target contract".to_string(),
         );
     }
-    let query = parse_query_from_sql(prepared.physical_sql())?;
-    let root_distribution: IcebergWriteRootDistributionResolver =
-        iceberg_write_shuffle_by_output_name(prepared.root_hash_column().to_string());
-    execute_query_as_iceberg_staging_in_operation_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        &query,
-        sink_spec,
-        None,
-        Some(root_distribution),
-        Some(execution),
-        prepared.connector_context(),
-        registration,
-    )
+    let connector_context = prepared.connector_context().clone();
+    let root_hash_column = prepared.root_hash_column().to_string();
+    match prepared.into_execution_artifact() {
+        MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
+            let query = parse_query_from_sql(physical_sql.sql())?;
+            let root_distribution: IcebergWriteRootDistributionResolver =
+                iceberg_write_shuffle_by_output_name(root_hash_column);
+            execute_query_as_iceberg_staging_in_operation_with_connector_context(
+                state,
+                current_catalog,
+                current_database,
+                &query,
+                sink_spec,
+                None,
+                Some(root_distribution),
+                Some(execution),
+                &connector_context,
+                registration,
+            )
+        }
+        MvFirstRefreshExecutionArtifact::Logical(logical) => {
+            let mv_refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                "MV first-refresh logical staging requires its frozen refresh context".to_string()
+            })?;
+            let (logical_plan, factory) = logical.into_parts();
+            execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
+                state,
+                logical_plan,
+                factory,
+                sink_spec,
+                iceberg_write_shuffle_by_output_name(root_hash_column),
+                execution,
+                &connector_context,
+                mv_refresh_ctx,
+                registration,
+            )
+        }
+    }
 }
 
 fn parse_query_from_sql(sql: &str) -> Result<sqlparser::ast::Query, String> {

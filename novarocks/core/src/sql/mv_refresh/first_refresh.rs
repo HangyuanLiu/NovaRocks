@@ -25,6 +25,8 @@ use crate::mv::refresh::projection_first_refresh::{
     prepare_projection_full_read_sql, prepare_union_projection_full_read_sql,
 };
 use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
+use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::planner::logical::LogicalPlanNode;
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
@@ -40,6 +42,47 @@ use std::collections::BTreeSet;
 pub(crate) struct MvFirstRefreshPhysicalSql {
     sql: String,
     root_hash_column: String,
+}
+
+/// Canonical typed append projection for a join first refresh.  It is a
+/// planning value, not a backend-local executable: code generation, fragment
+/// preparation and connector handle attachment remain deferred until the
+/// admitted native execution boundary.
+pub(crate) struct MvFirstRefreshLogicalArtifact {
+    plan: LogicalPlanNode,
+    factory: ColumnRefFactory,
+    root_hash_column: String,
+}
+
+impl MvFirstRefreshLogicalArtifact {
+    pub(crate) fn from_join_append(
+        append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    ) -> Self {
+        Self {
+            plan: append.plan,
+            factory: append.factory,
+            root_hash_column: crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
+                .to_string(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (LogicalPlanNode, ColumnRefFactory) {
+        (self.plan, self.factory)
+    }
+}
+
+pub(crate) enum MvFirstRefreshExecutionArtifact {
+    Sql(MvFirstRefreshPhysicalSql),
+    Logical(MvFirstRefreshLogicalArtifact),
+}
+
+impl MvFirstRefreshExecutionArtifact {
+    fn root_hash_column(&self) -> &str {
+        match self {
+            Self::Sql(sql) => sql.root_hash_column(),
+            Self::Logical(logical) => &logical.root_hash_column,
+        }
+    }
 }
 
 impl MvFirstRefreshPhysicalSql {
@@ -219,7 +262,7 @@ impl MvFirstRefreshWriteRequest {
 /// a local program, catalog object, record batch or provider payload.
 pub(crate) struct PreparedMvFirstRefreshWrite {
     request: MvFirstRefreshWriteRequest,
-    physical_sql: MvFirstRefreshPhysicalSql,
+    artifact: MvFirstRefreshExecutionArtifact,
     primary_cohort: ConnectorWriteCohortId,
 }
 
@@ -240,16 +283,16 @@ impl PreparedMvFirstRefreshWrite {
         self.request.target_contract()
     }
 
-    pub(crate) fn physical_sql(&self) -> &str {
-        self.physical_sql.sql()
-    }
-
     pub(crate) fn root_hash_column(&self) -> &str {
-        self.physical_sql.root_hash_column()
+        self.artifact.root_hash_column()
     }
 
     pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
         self.request.connector_context()
+    }
+
+    pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
+        self.artifact
     }
 
     /// Consuming bind boundary: fragment preparation may only happen after
@@ -287,15 +330,37 @@ impl MvFirstRefreshWritePreparer {
         request: MvFirstRefreshWriteRequest,
         physical_sql: MvFirstRefreshPhysicalSql,
     ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        if physical_sql.root_hash_column() != request.target_contract().hidden_hash_key() {
+        Self::prepare_artifact(request, MvFirstRefreshExecutionArtifact::Sql(physical_sql))
+    }
+
+    /// Freeze a typed join append projection behind the same prepared artifact
+    /// boundary used by SQL-shaped first refreshes.
+    pub(crate) fn prepare_join_logical(
+        request: MvFirstRefreshWriteRequest,
+        append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    ) -> Result<PreparedMvFirstRefreshWrite, String> {
+        Self::prepare_artifact(
+            request,
+            MvFirstRefreshExecutionArtifact::Logical(
+                MvFirstRefreshLogicalArtifact::from_join_append(append),
+            ),
+        )
+    }
+
+    fn prepare_artifact(
+        request: MvFirstRefreshWriteRequest,
+        artifact: MvFirstRefreshExecutionArtifact,
+    ) -> Result<PreparedMvFirstRefreshWrite, String> {
+        if artifact.root_hash_column() != request.target_contract().hidden_hash_key() {
             return Err(
                 "MV first-refresh root distribution does not match the target hidden hash key"
                     .to_string(),
             );
         }
-        if physical_sql.sql().contains("QueryResult")
-            || physical_sql.sql().contains("RecordBatch")
-            || physical_sql.sql().contains("Chunk")
+        if matches!(&artifact, MvFirstRefreshExecutionArtifact::Sql(physical_sql)
+            if physical_sql.sql().contains("QueryResult")
+                || physical_sql.sql().contains("RecordBatch")
+                || physical_sql.sql().contains("Chunk"))
         {
             return Err(
                 "MV first-refresh SQL artifact contains a frontend row carrier".to_string(),
@@ -304,7 +369,7 @@ impl MvFirstRefreshWritePreparer {
         let operation_id = request.operation_id();
         Ok(PreparedMvFirstRefreshWrite {
             request,
-            physical_sql,
+            artifact,
             primary_cohort: ConnectorWriteCohortId::primary(operation_id),
         })
     }

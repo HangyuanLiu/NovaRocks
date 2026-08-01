@@ -4250,6 +4250,99 @@ pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_conte
         connector_context,
         connector_write,
     )?;
+    connector_staging_completion_from_result(result)
+}
+
+/// Execute an already-analyzed MV logical plan into the same result-free
+/// connector staging terminal as a parsed query.  Join first-refresh plans
+/// use this path because their append projection is represented by canonical
+/// typed expressions rather than a SQL string.  It deliberately receives an
+/// admitted request and sealed write registration, never a frontend row sink.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
+    state: &Arc<StandaloneState>,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    root_distribution_resolver: IcebergWriteRootDistributionResolver,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    crate::connector::validate_request_context(connector_context)?;
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let root_distribution = root_distribution_resolver(&logical_plan)?.ok_or_else(|| {
+        "MV first-refresh logical writer requires a root hash distribution".to_string()
+    })?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatisticsContext::unavailable();
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimized_tree = crate::sql::optimizer::optimize_with_root_distribution(
+        optimizer_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        root_distribution,
+        &optimizer_settings,
+    )?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        &connectors_snapshot,
+        state.connector_control.as_ref(),
+        connector_context,
+        Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let result = execute_distributed_write_with_execution(
+        &state.query_execution,
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+    )?;
+    connector_staging_completion_from_result(result)
+}
+
+fn connector_staging_completion_from_result(
+    result: crate::query_execution::outcome::QueryExecutionResult,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
     if !result.query_result.columns.is_empty() || !result.query_result.chunks.is_empty() {
         return Err("connector staging terminal returned a result payload".to_string());
     }

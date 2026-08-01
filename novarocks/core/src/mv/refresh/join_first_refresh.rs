@@ -949,6 +949,30 @@ mod tests {
     }
 
     #[test]
+    fn builds_append_only_join_plan_without_change_stream_action() {
+        let rewrite = join_projection_rewrite_context();
+        let logical = build_join_first_refresh_append_logical_plan(
+            &rewrite,
+            &rewrite.base_refs[0],
+            &rewrite.base_refs[1],
+            valid_input(),
+        )
+        .expect("join first-refresh append logical plan");
+        let outputs = crate::sql::planner::plan_output_columns(&logical.plan)
+            .expect("join first-refresh append outputs");
+        assert!(
+            outputs
+                .iter()
+                .any(|column| column.name == JOIN_APPLY_KEY_COLUMN_NAME)
+        );
+        assert!(
+            outputs
+                .iter()
+                .all(|column| column.name != crate::exec::change_op::CHANGE_OP_COLUMN)
+        );
+    }
+
+    #[test]
     fn execution_adapter_builds_plan_and_invokes_callback_once() {
         let rewrite = join_projection_rewrite_context();
         let calls = Cell::new(0);
