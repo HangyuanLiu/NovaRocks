@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use self::common::*;
+use novarocks_execution::runtime_filter as execution;
 
 use crate::native::plan_decode::context::NativePlanDecodeContext;
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
@@ -59,8 +60,8 @@ use novarocks::exec::node::aggregate::{
 use novarocks::exec::node::join::{JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding};
 use novarocks::exec::node::limit::LimitNode;
 use novarocks::exec::node::runtime_filter::{
-    RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode, RuntimeFilterExecutionContract,
-    RuntimeFilterExecutionReduction,
+    NullOrder, RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
+    RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction, SortDirection,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
 use novarocks::proto::plan;
@@ -1018,7 +1019,27 @@ fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExec
             comparator_digest,
             order_contract_digest,
         } => RuntimeFilterExecutionContract::Ordered {
-            keys: Arc::clone(keys),
+            keys: keys
+                .iter()
+                .map(|key| {
+                    execution::RuntimeOrderKey::new(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            SortDirection::Ascending => {
+                                execution::RuntimeOrderSortDirection::Ascending
+                            }
+                            SortDirection::Descending => {
+                                execution::RuntimeOrderSortDirection::Descending
+                            }
+                        },
+                        match key.null_order() {
+                            NullOrder::First => execution::RuntimeOrderNullOrder::First,
+                            NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
             comparator_digest: *comparator_digest,
             order_contract_digest: *order_contract_digest,
         },
@@ -1587,5 +1608,52 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::DataType;
+    use novarocks::exec::node::runtime_filter::{
+        NullOrder, RuntimeFilterExecutionContract, RuntimeOrderKey, SortDirection,
+    };
+    use novarocks_execution::runtime_filter as execution;
+
+    use super::{DecodedRuntimeFilterContract, native_contract};
+
+    #[test]
+    fn native_contract_canonicalizes_ordered_keys_for_execution() {
+        let contract = native_contract(&DecodedRuntimeFilterContract::Ordered {
+            keys: Arc::from([RuntimeOrderKey::new(
+                DataType::Int64,
+                SortDirection::Descending,
+                NullOrder::First,
+            )]),
+            comparator_digest: [3; 32],
+            order_contract_digest: [4; 32],
+        });
+
+        let RuntimeFilterExecutionContract::Ordered {
+            keys,
+            comparator_digest,
+            order_contract_digest,
+        } = contract
+        else {
+            panic!("ordered decoded contract must remain ordered")
+        };
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].data_type(), &DataType::Int64);
+        assert_eq!(
+            keys[0].direction(),
+            execution::RuntimeOrderSortDirection::Descending
+        );
+        assert_eq!(
+            keys[0].null_order(),
+            execution::RuntimeOrderNullOrder::First
+        );
+        assert_eq!(comparator_digest, [3; 32]);
+        assert_eq!(order_contract_digest, [4; 32]);
     }
 }

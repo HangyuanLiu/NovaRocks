@@ -1179,7 +1179,7 @@ mod tests {
             },
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: order.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },
@@ -1270,7 +1270,7 @@ mod tests {
             },
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: order.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },
@@ -1334,7 +1334,7 @@ mod tests {
                 activation: ConsumerActivation::NonBlockingLive { late_apply },
                 capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
                 contract: RuntimeFilterExecutionContract::Ordered {
-                    keys: order.keys().to_vec().into(),
+                    keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
                     comparator_digest: order.plan_comparator_digest().get(),
                     order_contract_digest: order.digest().bytes(),
                 },
@@ -1380,7 +1380,7 @@ mod tests {
             },
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: order.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },

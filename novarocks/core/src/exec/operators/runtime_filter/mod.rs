@@ -1529,35 +1529,7 @@ fn execution_ordered_live_consumer_contract(
         execution::RuntimeFilterBindingId::new(spec.binding_id),
         execution::RuntimeFilterChannelId::new(spec.channel_id),
         execution::ConsumerActivation::NonBlockingLive,
-        execution::RuntimeFilterExecutionContract::Ordered {
-            keys: keys
-                .iter()
-                .map(|key| {
-                    execution::RuntimeOrderKey::new(
-                        key.data_type().clone(),
-                        match key.direction() {
-                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
-                                execution::RuntimeOrderSortDirection::Ascending
-                            }
-                            crate::runtime_filter::model::contract::SortDirection::Descending => {
-                                execution::RuntimeOrderSortDirection::Descending
-                            }
-                        },
-                        match key.null_order() {
-                            crate::runtime_filter::model::contract::NullOrder::First => {
-                                execution::RuntimeOrderNullOrder::First
-                            }
-                            crate::runtime_filter::model::contract::NullOrder::Last => {
-                                execution::RuntimeOrderNullOrder::Last
-                            }
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into(),
-            comparator_digest: *comparator_digest,
-            order_contract_digest: *order_contract_digest,
-        },
+        spec.contract.clone(),
     ))
 }
 
@@ -1669,7 +1641,7 @@ fn ordered_runtime_contract(
         ));
     }
     let plan = OrderContract {
-        keys: keys
+        keys: crate::exec::node::runtime_filter::core_order_keys(keys)
             .iter()
             .map(|key| OrderKeyContract {
                 data_type: key.data_type().clone(),
@@ -1688,7 +1660,7 @@ fn ordered_runtime_contract(
             )
         })?,
     );
-    if rebuilt.keys() != keys.as_ref()
+    if rebuilt.keys() != crate::exec::node::runtime_filter::core_order_keys(keys).as_ref()
         || rebuilt.plan_comparator_digest().get() != *comparator_digest
         || rebuilt.digest().bytes() != *order_contract_digest
     {
@@ -1937,7 +1909,8 @@ fn validate_resolved_ordered_live_consumer(
                 comparator_digest: installed_comparator,
                 order_contract_digest: installed_order,
             },
-        ) if keys == installed_keys
+        ) if crate::exec::node::runtime_filter::core_order_keys(keys).as_ref()
+            == installed_keys.as_ref()
             && comparator_digest == installed_comparator
             && order_contract_digest == installed_order =>
         {
@@ -3278,7 +3251,7 @@ mod native_ordered_live_consumer_tests {
             activation,
             capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: order.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(order.keys()),
                 comparator_digest: order.plan_comparator_digest().get(),
                 order_contract_digest: order.digest().bytes(),
             },

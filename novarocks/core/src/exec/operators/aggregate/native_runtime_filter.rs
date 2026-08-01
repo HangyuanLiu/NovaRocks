@@ -141,7 +141,7 @@ fn frozen_binding_contract(
         ));
     };
     let contract = RuntimeOrderContract::from_codec(
-        keys.to_vec(),
+        crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
         crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
         OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
     )
@@ -173,35 +173,7 @@ fn frozen_execution_contract(
         execution::RuntimeFilterBindingId::new(spec.binding_id),
         execution::RuntimeFilterChannelId::new(spec.channel_id),
         execution::RuntimeFilterProducerKind::OrderedBound,
-        execution::RuntimeFilterExecutionContract::Ordered {
-            keys: keys
-                .iter()
-                .map(|key| {
-                    execution::RuntimeOrderKey::new(
-                        key.data_type().clone(),
-                        match key.direction() {
-                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
-                                execution::RuntimeOrderSortDirection::Ascending
-                            }
-                            crate::runtime_filter::model::contract::SortDirection::Descending => {
-                                execution::RuntimeOrderSortDirection::Descending
-                            }
-                        },
-                        match key.null_order() {
-                            crate::runtime_filter::model::contract::NullOrder::First => {
-                                execution::RuntimeOrderNullOrder::First
-                            }
-                            crate::runtime_filter::model::contract::NullOrder::Last => {
-                                execution::RuntimeOrderNullOrder::Last
-                            }
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into(),
-            comparator_digest: *comparator_digest,
-            order_contract_digest: *order_contract_digest,
-        },
+        spec.contract.clone(),
     ))
 }
 
@@ -266,7 +238,7 @@ fn validate_binding_contract(
             spec.binding_id
         ));
     };
-    if keys != installed_keys
+    if crate::exec::node::runtime_filter::core_order_keys(keys).as_ref() != installed_keys.as_ref()
         || comparator_digest != installed_comparator_digest
         || order_contract_digest != installed_order_contract_digest
     {
@@ -276,7 +248,7 @@ fn validate_binding_contract(
         ));
     }
     RuntimeOrderContract::from_codec(
-        keys.to_vec(),
+        crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
         crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
         OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
     )
@@ -999,7 +971,7 @@ mod tests {
             group_key_ordinal: 0,
             limit: NonZeroU32::new(limit).expect("nonzero limit"),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: contract.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
             },

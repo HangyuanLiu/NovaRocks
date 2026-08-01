@@ -47,6 +47,7 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
+    execution_order_keys,
 };
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::sort::SortNode;
@@ -1960,7 +1961,7 @@ mod tests {
         build_native_pipeline_graph_for_exec_plan_with_dop,
         build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
         build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context,
-        resolve_aggregate_topn_producer_site,
+        execution_order_keys, resolve_aggregate_topn_producer_site,
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -2348,7 +2349,7 @@ mod tests {
             group_key_ordinal: 0,
             limit: std::num::NonZeroU32::new(5).expect("nonzero limit"),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: Arc::from(runtime.keys()),
+                keys: execution_order_keys(runtime.keys()),
                 comparator_digest: runtime.plan_comparator_digest().get(),
                 order_contract_digest: runtime.digest().bytes(),
             },

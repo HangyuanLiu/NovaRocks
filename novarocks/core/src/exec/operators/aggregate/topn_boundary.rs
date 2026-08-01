@@ -309,7 +309,7 @@ impl AggregateTopNBoundaryBinding {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
         let contract = Arc::new(RuntimeOrderContract::from_codec(
-            keys.to_vec(),
+            crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
             ComparatorDigest::new(*comparator_digest),
             OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
         )?);
@@ -347,7 +347,7 @@ pub(crate) fn validate_topn_boundary_specs(
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
         let contract = RuntimeOrderContract::from_codec(
-            keys.to_vec(),
+            crate::exec::node::runtime_filter::core_order_keys(keys).to_vec(),
             ComparatorDigest::new(*comparator_digest),
             OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
         )?;
@@ -1185,7 +1185,7 @@ mod tests {
             group_key_ordinal: 2,
             limit: NonZeroU32::new(4).unwrap(),
             contract: RuntimeFilterExecutionContract::Ordered {
-                keys: contract.keys().to_vec().into(),
+                keys: crate::exec::node::runtime_filter::execution_order_keys(contract.keys()),
                 comparator_digest: contract.plan_comparator_digest().get(),
                 order_contract_digest: contract.digest().bytes(),
             },

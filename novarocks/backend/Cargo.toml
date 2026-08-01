@@ -9,6 +9,7 @@ doctest = false
 
 [dependencies]
 novarocks = { path = "../core" }
+novarocks-execution = { path = "../execution" }
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
 novarocks-fs = { path = "../fs" }
 novarocks-protocol = { path = "../protocol" }
