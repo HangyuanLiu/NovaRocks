@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -342,6 +343,11 @@ pub enum LiveTerminal {
 }
 
 pub trait RuntimeFilterPredicate: Send + Sync {
+    /// Allows a role-local execution adapter to expose an optional, typed
+    /// evaluator extension without exposing delivery artifacts or Service
+    /// state through the session/snapshot surface.
+    fn as_any(&self) -> &dyn Any;
+
     fn evaluate(&self, input: &ArrayRef) -> Result<BooleanArray, RuntimeFilterContractViolation>;
 }
 
@@ -546,6 +552,10 @@ mod tests {
 
     struct Predicate;
     impl RuntimeFilterPredicate for Predicate {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn evaluate(
             &self,
             input: &ArrayRef,

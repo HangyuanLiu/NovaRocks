@@ -970,12 +970,25 @@ impl SnapshotPredicateCompiler {
     }
 }
 
-enum NativeExecutionPredicate {
+pub(crate) enum NativeExecutionPredicate {
     Membership(NativeRuntimeFilterPredicate),
     Ordered(NativeOrderedRangePredicate),
 }
 
+impl NativeExecutionPredicate {
+    pub(crate) fn ordered_range(&self) -> Option<&NativeOrderedRangePredicate> {
+        match self {
+            Self::Membership(_) => None,
+            Self::Ordered(predicate) => Some(predicate),
+        }
+    }
+}
+
 impl execution::RuntimeFilterPredicate for NativeExecutionPredicate {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn evaluate(
         &self,
         input: &ArrayRef,
