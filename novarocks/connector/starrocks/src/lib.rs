@@ -25,6 +25,7 @@ mod codec;
 mod domain;
 
 pub mod direct;
+pub mod rpc;
 
 pub mod control;
 pub mod execution;
@@ -51,6 +52,13 @@ pub use domain::{
 pub use execution::{
     StarRocksDirectReaderFactory, StarRocksExecutionBindings, StarRocksExecutionInstaller,
     StarRocksLocalExecutionBinding, StarRocksRpcReaderFactory,
+};
+pub use rpc::{
+    StarRocksArrowFlightClient, StarRocksArrowFlightStream, StarRocksBrpcTransport,
+    StarRocksFlightReader, StarRocksHttpTransport, StarRocksRemoteControlClient,
+    StarRocksRemoteControlConfig, StarRocksRemoteEndpoint, StarRocksRemoteMetadataSource,
+    StarRocksRemoteRpcReaderFactory, StarRocksRemoteScanPlanner, StarRocksRpcOutputBinding,
+    StarRocksRpcSplit,
 };
 
 pub const STARROCKS_PROVIDER_ID: &str = "starrocks";

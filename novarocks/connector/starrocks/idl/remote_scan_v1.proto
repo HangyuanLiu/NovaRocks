@@ -1,0 +1,37 @@
+syntax = "proto2";
+
+package novarocks.starrocks.remote.v1;
+
+// Provider-private snapshot of the read-reachable remote-scan messages.
+message StatusPB {
+  optional int32 status_code = 1;
+  optional string error_msgs = 2;
+}
+
+enum CompressionTypePB {
+  LZ4_FRAME = 0;
+  LZ4_BLOCK = 1;
+  NO_COMPRESSION = 2;
+}
+
+message ChunkPB {
+  optional bytes data = 1;
+  optional CompressionTypePB compress_type = 2;
+  repeated int32 slot_id_map = 4;
+  repeated bool is_nulls = 5;
+  repeated bool is_consts = 6;
+  optional int64 serialized_size = 9;
+  repeated int32 encode_level = 10;
+}
+
+message PFetchRemoteScanChunkRequest {
+  optional string scan_token = 1;
+  optional int64 packet_seq = 2;
+}
+
+message PFetchRemoteScanChunkResult {
+  optional StatusPB status = 1;
+  optional bool eos = 2;
+  optional int64 packet_seq = 3;
+  optional ChunkPB chunk = 4;
+}

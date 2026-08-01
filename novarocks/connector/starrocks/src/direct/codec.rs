@@ -254,6 +254,7 @@ mod tests {
             output_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
             projection: vec![0],
             limit: None,
+            has_residual_predicates: false,
         };
         let tablet = StarRocksDirectTabletDescriptor::try_new(
             1,
