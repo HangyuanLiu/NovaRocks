@@ -691,7 +691,7 @@ fn native_runtime_filter_context(
     }
 }
 
-fn native_aggregate_topn_context(
+fn native_aggregate_topn_session(
     specs: &[AggregateTopNRuntimeFilterProducerBinding],
     runtime_filter_execution: &PipelineRuntimeFilterExecution,
 ) -> Result<Option<execution::RuntimeFilterSessionRef>, String> {
@@ -1417,7 +1417,7 @@ fn build_pipeline_for_node(
                         AggregateTopNProducerSite::PartialAggregateProcessor,
                         native_topn_producers,
                     );
-                    let runtime_filter_context = native_aggregate_topn_context(
+                    let runtime_filter_session = native_aggregate_topn_session(
                         &topn_producers,
                         &ctx.runtime_filter_execution,
                     )?;
@@ -1430,7 +1430,7 @@ fn build_pipeline_for_node(
                         false,
                         output_chunk_schema.clone(),
                         topn_producers,
-                        runtime_filter_context,
+                        runtime_filter_session,
                         dop,
                         None,
                     )?)
@@ -1464,7 +1464,7 @@ fn build_pipeline_for_node(
                     AggregateTopNProducerSite::FinalAggregateProcessor,
                     native_topn_producers,
                 );
-                let final_runtime_filter_context = native_aggregate_topn_context(
+                let final_runtime_filter_session = native_aggregate_topn_session(
                     &final_topn_producers,
                     &ctx.runtime_filter_execution,
                 )?;
@@ -1480,7 +1480,7 @@ fn build_pipeline_for_node(
                         true,
                         output_chunk_schema.clone(),
                         final_topn_producers,
-                        final_runtime_filter_context,
+                        final_runtime_filter_session,
                         build.pipeline.dop,
                         None,
                     )?));
@@ -1592,7 +1592,7 @@ fn build_pipeline_for_node(
                         AggregateTopNProducerSite::StreamingAggregateSink,
                         native_topn_producers,
                     );
-                    let runtime_filter_context = native_aggregate_topn_context(
+                    let runtime_filter_session = native_aggregate_topn_session(
                         &topn_producers,
                         &ctx.runtime_filter_execution,
                     )?;
@@ -1605,7 +1605,7 @@ fn build_pipeline_for_node(
                         output_chunk_schema.clone(),
                         streaming_state.clone(),
                         topn_producers,
-                        runtime_filter_context,
+                        runtime_filter_session,
                         dop,
                     )?)
                 };
@@ -1642,8 +1642,8 @@ fn build_pipeline_for_node(
                     AggregateTopNProducerSite::AggregateProcessor,
                     native_topn_producers,
                 );
-                let runtime_filter_context =
-                    native_aggregate_topn_context(&topn_producers, &ctx.runtime_filter_execution)?;
+                let runtime_filter_session =
+                    native_aggregate_topn_session(&topn_producers, &ctx.runtime_filter_execution)?;
                 Box::new(AggregateProcessorFactory::new_native(
                     *node_id,
                     Arc::clone(&ctx.arena),
@@ -1653,7 +1653,7 @@ fn build_pipeline_for_node(
                     false,
                     output_chunk_schema.clone(),
                     topn_producers,
-                    runtime_filter_context,
+                    runtime_filter_session,
                     dop,
                     None,
                 )?)
