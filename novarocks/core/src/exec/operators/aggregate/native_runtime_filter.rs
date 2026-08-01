@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use novarocks_execution::runtime_filter as execution;
+
 use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
 use crate::exec::node::runtime_filter::{
     RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
@@ -446,7 +448,16 @@ struct AggregateTopNProducerStream {
     local_partition_count: u32,
     next_sequence: u64,
     terminal: bool,
-    adapter: Option<Arc<dyn OrderedBoundProducerAdapter>>,
+    endpoint: Option<AggregateTopNProducerEndpoint>,
+}
+
+enum AggregateTopNProducerEndpoint {
+    Execution {
+        producer: execution::RuntimeFilterProducerHandle,
+        resolved: Arc<ResolvedNativeProducer>,
+    },
+    #[cfg(test)]
+    Prebound(Arc<dyn OrderedBoundProducerAdapter>),
 }
 
 impl AggregateTopNProducerStream {
@@ -456,24 +467,26 @@ impl AggregateTopNProducerStream {
         local_partition_count: u32,
     ) -> Self {
         #[cfg(test)]
-        let adapter = match &binding.source {
+        let endpoint = match &binding.source {
             AggregateTopNProducerSource::Installed(_) => None,
-            AggregateTopNProducerSource::Prebound(adapter) => Some(Arc::clone(adapter)),
+            AggregateTopNProducerSource::Prebound(adapter) => {
+                Some(AggregateTopNProducerEndpoint::Prebound(Arc::clone(adapter)))
+            }
         };
         #[cfg(not(test))]
-        let adapter = None;
+        let endpoint = None;
         Self {
             binding,
             partition_id,
             local_partition_count,
             next_sequence: 0,
             terminal: false,
-            adapter,
+            endpoint,
         }
     }
 
     fn bind(&mut self) -> Result<(), String> {
-        if self.adapter.is_some() || self.terminal {
+        if self.endpoint.is_some() || self.terminal {
             return Ok(());
         }
         let AggregateTopNProducerSource::Installed(resolved) = &self.binding.source else {
@@ -482,12 +495,17 @@ impl AggregateTopNProducerStream {
                 self.binding.binding_id
             ));
         };
-        match resolved.open_ordered_bound(self.local_partition_count) {
-            Ok(adapter) => {
-                self.adapter = Some(adapter);
+        match resolved.open_execution_producer(self.local_partition_count) {
+            Ok(producer) => {
+                self.endpoint = Some(AggregateTopNProducerEndpoint::Execution {
+                    producer,
+                    resolved: Arc::clone(resolved),
+                });
                 Ok(())
             }
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+            Err(error)
+                if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+            {
                 self.binding
                     .coordinator
                     .failed
@@ -507,7 +525,7 @@ impl AggregateTopNProducerStream {
             self.terminal = true;
             return Ok(());
         }
-        let adapter = self.adapter.as_ref().ok_or_else(|| {
+        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} was not bound before input",
                 self.binding.binding_id
@@ -520,28 +538,67 @@ impl AggregateTopNProducerStream {
                     self.binding.binding_id
                 )
             })?;
-        let outcome = match adapter.submit_bound(
-            self.partition_id,
-            ProducerSequence::new(self.next_sequence),
-            update,
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                self.binding
-                    .coordinator
-                    .failed
-                    .store(true, Ordering::Release);
-                self.terminal = true;
-                return Ok(());
+        let terminal_noop = match endpoint {
+            AggregateTopNProducerEndpoint::Execution { producer, resolved } => {
+                let contribution = resolved
+                    .encode_execution_contribution(
+                        self.partition_id,
+                        ProducerSequence::new(self.next_sequence),
+                        crate::runtime_filter::codec::contribution::RuntimeFilterContribution::OrderedBound(update),
+                    )
+                    .map_err(|error| format!(
+                        "native aggregate TopN producer binding_id={} contribution encoding failed: {error}",
+                        self.binding.binding_id
+                    ))?;
+                match producer.submit(
+                    execution::PartitionId::new(self.partition_id.get()),
+                    execution::ProducerSequence::new(self.next_sequence),
+                    contribution,
+                ) {
+                    Ok(outcome) => outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop,
+                    Err(error)
+                        if error.kind()
+                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                    {
+                        self.binding
+                            .coordinator
+                            .failed
+                            .store(true, Ordering::Release);
+                        self.terminal = true;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "native aggregate TopN producer binding_id={} contribution failed: {error}",
+                            self.binding.binding_id
+                        ));
+                    }
+                }
             }
-            Err(error) => {
-                return Err(format!(
-                    "native aggregate TopN producer binding_id={} contribution failed: {error}",
-                    self.binding.binding_id
-                ));
-            }
+            #[cfg(test)]
+            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter.submit_bound(
+                self.partition_id,
+                ProducerSequence::new(self.next_sequence),
+                update,
+            ) {
+                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    self.binding
+                        .coordinator
+                        .failed
+                        .store(true, Ordering::Release);
+                    self.terminal = true;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "native aggregate TopN producer binding_id={} contribution failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
+            },
         };
-        if outcome == SubmitOutcome::TerminalNoop {
+        if terminal_noop {
             self.fail(ProducerFailureReason::ExecutionFailed)?;
             return Ok(());
         }
@@ -559,32 +616,59 @@ impl AggregateTopNProducerStream {
             self.terminal = true;
             return Ok(());
         }
-        let adapter = self.adapter.as_ref().ok_or_else(|| {
+        let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             format!(
                 "native aggregate TopN producer binding_id={} was not bound before finish",
                 self.binding.binding_id
             )
         })?;
-        let outcome = match adapter
-            .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                self.binding
-                    .coordinator
-                    .failed
-                    .store(true, Ordering::Release);
-                self.terminal = true;
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "native aggregate TopN producer binding_id={} close failed: {error}",
-                    self.binding.binding_id
-                ));
-            }
+        let terminal_noop = match endpoint {
+            AggregateTopNProducerEndpoint::Execution { producer, .. } => match producer
+                .close_partition(
+                    execution::PartitionId::new(self.partition_id.get()),
+                    execution::ProducerSequence::new(self.next_sequence),
+                ) {
+                Ok(outcome) => outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop,
+                Err(error)
+                    if error.kind()
+                        == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                {
+                    self.binding
+                        .coordinator
+                        .failed
+                        .store(true, Ordering::Release);
+                    self.terminal = true;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "native aggregate TopN producer binding_id={} close failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
+            },
+            #[cfg(test)]
+            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter
+                .close_partition(self.partition_id, ProducerSequence::new(self.next_sequence))
+            {
+                Ok(outcome) => outcome == SubmitOutcome::TerminalNoop,
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    self.binding
+                        .coordinator
+                        .failed
+                        .store(true, Ordering::Release);
+                    self.terminal = true;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "native aggregate TopN producer binding_id={} close failed: {error}",
+                        self.binding.binding_id
+                    ));
+                }
+            },
         };
-        if outcome == SubmitOutcome::TerminalNoop {
+        if terminal_noop {
             self.binding
                 .coordinator
                 .failed
@@ -599,7 +683,7 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         self.terminal = true;
-        let Some(adapter) = self.adapter.as_ref() else {
+        let Some(endpoint) = self.endpoint.as_ref() else {
             return Ok(());
         };
         if self
@@ -611,15 +695,43 @@ impl AggregateTopNProducerStream {
         {
             return Ok(());
         }
-        match adapter.fail(reason) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
-                Ok(())
+        match endpoint {
+            AggregateTopNProducerEndpoint::Execution { producer, .. } => {
+                match producer.fail(match reason {
+                    ProducerFailureReason::Cancelled => {
+                        execution::RuntimeFilterProducerFailure::Cancelled
+                    }
+                    ProducerFailureReason::ExecutionFailed => {
+                        execution::RuntimeFilterProducerFailure::ExecutionFailed
+                    }
+                    ProducerFailureReason::UpstreamUnavailable => {
+                        execution::RuntimeFilterProducerFailure::UpstreamUnavailable
+                    }
+                }) {
+                    Ok(_) => Ok(()),
+                    Err(error)
+                        if error.kind()
+                            == execution::RuntimeFilterContractViolationKind::SessionClosed =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "native aggregate TopN producer binding_id={} fail-open failed: {error}",
+                        self.binding.binding_id
+                    )),
+                }
             }
-            Err(error) => Err(format!(
-                "native aggregate TopN producer binding_id={} fail-open failed: {error}",
-                self.binding.binding_id
-            )),
+            #[cfg(test)]
+            AggregateTopNProducerEndpoint::Prebound(adapter) => match adapter.fail(reason) {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == RuntimeContractViolationKind::ServiceUnavailable => {
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "native aggregate TopN producer binding_id={} fail-open failed: {error}",
+                    self.binding.binding_id
+                )),
+            },
         }
     }
 }
@@ -1227,7 +1339,7 @@ mod tests {
         let mut unbound = factory.create(0).expect("unbound partition session");
         let mut bound = factory.create(1).expect("bound partition session");
         bound.bind().expect("bind sibling partition");
-        unbound.streams[0].adapter = None;
+        unbound.streams[0].endpoint = None;
 
         unbound
             .fail(ProducerFailureReason::ExecutionFailed)

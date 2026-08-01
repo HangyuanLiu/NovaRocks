@@ -484,6 +484,14 @@ impl ResolvedNativeProducer {
             inbound_contract: self.inbound_contract.clone(),
         }))
     }
+
+    pub(crate) fn open_execution_producer(
+        &self,
+        local_partition_count: u32,
+    ) -> Result<execution::RuntimeFilterProducerHandle, execution::RuntimeFilterContractViolation>
+    {
+        self.execution_producer(local_partition_count)
+    }
 }
 
 impl execution::RuntimeFilterSession for NativeRuntimeFilterExecutionContext {
