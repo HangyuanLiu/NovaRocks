@@ -332,11 +332,6 @@ fn build_update_mor_change_stream_write_plan(
     }
 
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
@@ -347,11 +342,8 @@ fn build_update_mor_change_stream_write_plan(
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
         &analyzer_provider,
-        &connectors_snapshot,
         &target.namespace,
         None,
-        None,
-        false,
     )?;
     let producer = build_update_mor_change_event_expand_plan(
         planned.optimized_tree,
@@ -3443,11 +3435,6 @@ fn build_merge_mor_change_stream_write_plan(
     }
 
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
@@ -3458,11 +3445,8 @@ fn build_merge_mor_change_stream_write_plan(
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
         &analyzer_provider,
-        &connectors_snapshot,
         &target.namespace,
         None,
-        None,
-        false,
     )?;
     let producer = build_merge_mor_change_event_expand_plan(
         planned.optimized_tree,

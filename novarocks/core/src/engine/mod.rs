@@ -4037,7 +4037,6 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_catalog_service_with_con
         None,
         Some(state),
         false,
-        false,
         Some(&maintenance_execution),
     )
 }
@@ -4562,7 +4561,6 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         mv_rewrite_state,
         true,
-        false,
         None,
     )
 }
@@ -4597,7 +4595,6 @@ fn execute_query_with_catalog_provider_with_execution(
         None,
         mv_rewrite_state,
         true,
-        false,
         Some(execution),
     )
 }
@@ -4609,12 +4606,6 @@ fn execute_query_with_catalog_provider_with_execution(
 /// `DistributedPlan` has native sink and write support.
 ///
 /// `execute_query_with_options(..., mv_refresh_ctx = Some(ctx))` runs the
-/// IMV rewrite pipeline before optimization and also passes the refresh
-/// context into codegen. Pre-expanded MV refresh SQL that only needs the
-/// codegen context must use `execute_preexpanded_mv_refresh_query_with_options`.
-pub(crate) type ImvRewriteValidator<'a> = dyn Fn(&crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome) -> Result<(), String>
-    + 'a;
-
 pub(crate) fn execute_query_with_options(
     query: &sqlparser::ast::Query,
     catalog: &PlannerMemoryCatalog,
@@ -4661,9 +4652,24 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    imv_rewrite: Option<&dyn crate::sql::compiler::SqlImvRewriteInput>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
+    let default_imv_rewrite;
+    let imv_rewrite = match (mv_refresh_ctx, imv_rewrite) {
+        (Some(_), Some(input)) => Some(input),
+        (Some(refresh), None) => {
+            default_imv_rewrite = crate::engine::mv::iceberg_refresh::IcebergImvRewriteInput::new(
+                refresh,
+                crate::engine::mv::iceberg_refresh::RewriteMergeRefreshEvidence::None,
+            );
+            Some(&default_imv_rewrite as &dyn crate::sql::compiler::SqlImvRewriteInput)
+        }
+        (None, Some(_)) => {
+            return Err("IMV rewrite input requires MV refresh context".to_string());
+        }
+        (None, None) => None,
+    };
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
         catalog,
@@ -4677,10 +4683,9 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
-        imv_rewrite_validator,
+        imv_rewrite,
         mv_rewrite_state,
         true,
-        mv_refresh_ctx.is_some(),
         None,
     )
 }
@@ -4718,7 +4723,6 @@ pub(crate) fn execute_preexpanded_mv_refresh_query_with_options(
         None,
         None,
         false,
-        false,
         None,
     )
 }
@@ -4734,66 +4738,40 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
-    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
-    run_imv_rewrite: bool,
+    imv_rewrite: Option<&dyn crate::sql::compiler::SqlImvRewriteInput>,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let mut change_stream =
-        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
-    if run_imv_rewrite {
-        let mv_ctx =
-            mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
-        logical_plan =
-            crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical_plan);
-        let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
-        let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-            crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-                plan: logical_plan,
-                disabled_rules: crate::sql::optimizer::options::SessionOptimizerSettings::default()
-                    .disabled_rules,
-                mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
-                deadline: None,
-                column_ref_factory: std::rc::Rc::clone(&factory_cell),
-            },
-        )
-        .map_err(|e| format!("imv rewrite: {e}"))?;
-        if let Some(validator) = imv_rewrite_validator {
-            validator(&outcome)?;
-        }
-        factory = std::rc::Rc::try_unwrap(factory_cell)
-            .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
-            .into_inner();
-        change_stream = outcome.annotation.change_stream.clone();
-        logical_plan = outcome.plan;
-    } else if imv_rewrite_validator.is_some() {
-        return Err("IMV rewrite validator requires MV refresh context".to_string());
-    }
-
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical_plan,
-        &mut scalar_arena,
-    )?;
-    let providers = query_stats::QueryStatisticsContext::unavailable();
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    let optimized_tree = crate::sql::optimizer::optimize(
-        optimizer_expr,
-        scalar_arena,
-        &query_stats.snapshot,
-        factory,
-        Vec::new(),
-        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
-    )?;
-    let output_columns = optimized_tree.output_columns.clone();
+    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let statistics = query_stats::QueryStatisticsContext::unavailable();
+    let request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
+        crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: None,
+            current_database: current_database.to_string(),
+            optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
+        &catalog,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        None,
+        crate::sql::compiler::SqlCompileControl::new(None, cancellation.view()),
+    );
+    let request = match imv_rewrite {
+        Some(input) => request.with_imv_rewrite(input),
+        None => request,
+    };
+    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err("change-stream intent did not produce an optimized SQL plan".to_string());
+    };
     Ok(PlannedIcebergChangeStreamRefreshQuery {
-        optimized_tree,
-        output_columns,
-        change_stream,
+        output_columns: compiled.optimized_tree.output_columns.clone(),
+        optimized_tree: compiled.optimized_tree,
+        change_stream: compiled.change_stream,
     })
 }
 
@@ -4843,10 +4821,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
-    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    imv_rewrite: Option<&dyn crate::sql::compiler::SqlImvRewriteInput>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     allow_mv_rewrite_candidates: bool,
-    run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<QueryResult, String> {
     let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
@@ -4861,10 +4838,9 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         terminal_sink,
         iceberg_catalogs,
         mv_refresh_ctx,
-        imv_rewrite_validator,
+        imv_rewrite,
         mv_rewrite_state,
         allow_mv_rewrite_candidates,
-        run_imv_rewrite,
         execution,
     )?;
     query_execution
@@ -5057,41 +5033,19 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
-    imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    imv_rewrite: Option<&dyn crate::sql::compiler::SqlImvRewriteInput>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
     allow_mv_rewrite_candidates: bool,
-    run_imv_rewrite: bool,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
 ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let optimizer_settings = optimizer_settings_for_execution(execution);
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let mut logical_plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    if run_imv_rewrite {
-        let mv_ctx =
-            mv_refresh_ctx.ok_or_else(|| "IMV rewrite requires MV refresh context".to_string())?;
-        logical_plan =
-            crate::engine::mv::iceberg_refresh::normalize_imv_rewrite_root_project(logical_plan);
-        let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
-        let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-            crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-                plan: logical_plan,
-                disabled_rules: optimizer_settings.disabled_rules.clone(),
-                mv_ctx: std::sync::Arc::clone(&mv_ctx.rewrite),
-                deadline: None,
-                column_ref_factory: std::rc::Rc::clone(&factory_cell),
-            },
-        )
-        .map_err(|e| format!("imv rewrite: {e}"))?;
-        if let Some(validator) = imv_rewrite_validator {
-            validator(&outcome)?;
-        }
-        factory = std::rc::Rc::try_unwrap(factory_cell)
-            .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
-            .into_inner();
-        logical_plan = outcome.plan;
-    } else if imv_rewrite_validator.is_some() {
-        return Err("IMV rewrite validator requires MV refresh context".to_string());
+    if let Some(input) = imv_rewrite {
+        let rewritten = input.rewrite(logical_plan, factory, &optimizer_settings)?;
+        logical_plan = rewritten.logical_plan;
+        factory = rewritten.factory;
     }
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
     let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(

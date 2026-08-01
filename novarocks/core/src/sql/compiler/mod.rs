@@ -116,6 +116,26 @@ pub(crate) trait SqlMvRewriteSnapshot {
     ) -> Vec<crate::sql::optimizer::cascades_rules::mv_rewrite::MvRewriteCandidate>;
 }
 
+/// Application-frozen input for incremental-MV rewrite.  SQL invokes this at
+/// the logical boundary, but does not receive an application request context
+/// or an untyped callback.  The implementation owns any refresh-specific
+/// validation and returns only SQL facts.
+pub(crate) trait SqlImvRewriteInput {
+    fn rewrite(
+        &self,
+        logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+        factory: crate::sql::column_id::ColumnRefFactory,
+        optimizer_settings: &SessionOptimizerSettings,
+    ) -> Result<SqlImvRewriteOutput, String>;
+}
+
+pub(crate) struct SqlImvRewriteOutput {
+    pub(crate) logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+    pub(crate) factory: crate::sql::column_id::ColumnRefFactory,
+    pub(crate) change_stream:
+        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+}
+
 /// Immutable SQL function semantics used by analysis and optimization.
 ///
 /// The function implementation and its execution kernels are explicitly out
@@ -215,6 +235,7 @@ pub(crate) struct SqlCompileRequest<'a> {
     pub(crate) statistics: &'a dyn SqlStatisticsSnapshot,
     pub(crate) functions: &'a dyn SqlFunctionCatalog,
     pub(crate) mv_rewrite: Option<&'a dyn SqlMvRewriteSnapshot>,
+    pub(crate) imv_rewrite: Option<&'a dyn SqlImvRewriteInput>,
     pub(crate) control: SqlCompileControl,
 }
 
@@ -240,12 +261,18 @@ impl<'a> SqlCompileRequest<'a> {
             statistics,
             functions,
             mv_rewrite,
+            imv_rewrite: None,
             control,
         }
     }
 
     pub(crate) fn check_control(&self) -> Result<(), SqlCompileError> {
         self.control.check()
+    }
+
+    pub(crate) fn with_imv_rewrite(mut self, input: &'a dyn SqlImvRewriteInput) -> Self {
+        self.imv_rewrite = Some(input);
+        self
     }
 }
 
@@ -274,6 +301,8 @@ pub(crate) struct SqlAnalysisOutput {
 pub(crate) struct SqlOptimizedOutput {
     pub(crate) optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     pub(crate) statistics: SqlStatisticsPlan,
+    pub(crate) change_stream:
+        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
 }
 
 pub(crate) struct SqlDistributedOutput {
@@ -331,7 +360,7 @@ impl SqlCompiler {
         )
         .map_err(SqlCompileError::Compilation)?;
         request.check_control()?;
-        let logical_plan = crate::sql::planner::plan_query(resolved, ctes, &mut factory)
+        let mut logical_plan = crate::sql::planner::plan_query(resolved, ctes, &mut factory)
             .map_err(SqlCompileError::Compilation)?;
         request.check_control()?;
 
@@ -347,6 +376,24 @@ impl SqlCompiler {
                 factory,
             }));
         }
+        let mut settings = request.session.optimizer_settings.clone();
+        apply_planning_environment(&mut settings, request.environment)?;
+        let mut change_stream =
+            crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
+        if let Some(input) = request.imv_rewrite {
+            if !matches!(request.intent, SqlCompileIntent::ChangeStreamWrite) {
+                return Err(SqlCompileError::InvalidRequest(
+                    "incremental MV rewrite requires ChangeStreamWrite intent".to_string(),
+                ));
+            }
+            let rewritten = input
+                .rewrite(logical_plan, factory, &settings)
+                .map_err(SqlCompileError::Compilation)?;
+            logical_plan = rewritten.logical_plan;
+            factory = rewritten.factory;
+            change_stream = rewritten.change_stream;
+            request.check_control()?;
+        }
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
         let mut optimizer_expr =
             crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
@@ -356,8 +403,6 @@ impl SqlCompiler {
             .map_err(SqlCompileError::Compilation)?;
         let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr);
         request.check_control()?;
-        let mut settings = request.session.optimizer_settings.clone();
-        apply_planning_environment(&mut settings, request.environment)?;
         let mv_candidates = request
             .mv_rewrite
             .map(|snapshot| {
@@ -430,6 +475,7 @@ impl SqlCompiler {
             return Ok(SqlCompileOutput::Optimized(SqlOptimizedOutput {
                 optimized_tree,
                 statistics,
+                change_stream,
             }));
         }
 
