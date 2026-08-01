@@ -101,6 +101,7 @@ pub(super) fn plan_iceberg_connector_read(
         residual_predicates,
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
+        read_session: None,
     })
 }
 
@@ -138,6 +139,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         residual_predicates: scan.predicates.clone(),
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
+        read_session: None,
     })
 }
 

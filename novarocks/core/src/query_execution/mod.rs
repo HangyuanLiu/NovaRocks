@@ -31,6 +31,7 @@ pub(crate) mod outcome;
 pub use outcome::ConnectorWriteCompletion;
 pub(crate) mod preparation;
 pub(crate) mod profile;
+pub mod read_session;
 pub mod request_context;
 mod runtime_filter;
 pub(crate) mod schedule;

@@ -305,6 +305,7 @@ pub(crate) fn prepare_statistics_connector_read(
         residual_predicates: Vec::new(),
         batch,
         planning_lease: Some(lease),
+        read_session: split_result.session,
     })
 }
 

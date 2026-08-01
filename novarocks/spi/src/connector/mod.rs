@@ -27,6 +27,7 @@ mod metadata;
 mod mutation;
 mod predicate;
 mod read;
+mod read_session;
 mod statistics;
 mod write;
 
@@ -95,6 +96,10 @@ pub use read::{
     ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
     ConnectorScan, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult,
+};
+pub use read_session::{
+    ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
+    ConnectorReadSessionOutcome,
 };
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
