@@ -1218,7 +1218,8 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
@@ -1250,10 +1251,78 @@ mod tests {
         }
     }
 
+    struct LazyBackend;
+
+    impl IcebergWriteControlBackend for LazyBackend {
+        fn plan(
+            &self,
+            _: &ConnectorWritePlanningRequest,
+        ) -> Result<IcebergWriteControlPlan, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test lazy backend does not plan writes",
+            ))
+        }
+
+        fn commit(
+            &self,
+            _: &ConnectorWriteCommitRequest,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            Err(CommitServiceError::invalid_input(
+                "test lazy backend does not commit writes".to_string(),
+            ))
+        }
+
+        fn abort(
+            &self,
+            _: &ConnectorWriteAbortRequest,
+        ) -> Result<ExternalMutationFinalization, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test lazy backend does not abort writes",
+            ))
+        }
+
+        fn reconcile(
+            &self,
+            _: &IcebergWriteReconcileEvidenceV1,
+        ) -> Result<Option<CommitOutcome>, CommitServiceError> {
+            Err(CommitServiceError::invalid_input(
+                "test lazy backend does not reconcile writes".to_string(),
+            ))
+        }
+    }
+
     struct FakeCommitter {
         metadata: TableMetadata,
         committed: Mutex<Vec<Vec<IcebergWriterReport>>>,
         aborted: Mutex<Vec<Vec<IcebergWriterReport>>>,
+    }
+
+    #[test]
+    fn lazy_service_activation_is_idempotent_and_constructed_once() {
+        let registry = IcebergWriteServiceRegistry::default();
+        let operation_id = ConnectorWriteOperationId::from_bytes([91; 16]);
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&constructions);
+        registry
+            .register_lazy(operation_id, [7; 32], move || {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(LazyBackend))
+            })
+            .expect("reserve lazy operation");
+        registry
+            .register_lazy(operation_id, [7; 32], || Ok(Arc::new(LazyBackend)))
+            .expect("same activation is idempotent");
+        assert!(
+            registry
+                .register_lazy(operation_id, [8; 32], || Ok(Arc::new(LazyBackend)))
+                .is_err(),
+            "different activation facts must fail closed"
+        );
+        let _first = registry.resolve(operation_id).expect("first resolve");
+        let _second = registry.resolve(operation_id).expect("cached resolve");
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
     }
 
     impl IcebergWriteReportCommitter for FakeCommitter {
