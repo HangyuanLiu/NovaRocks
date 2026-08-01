@@ -26,21 +26,24 @@ use crate::exec::node::runtime_filter::{
     RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction,
 };
 use crate::exec::operators::aggregate::topn_boundary::AggregateTopNBoundaryBinding;
-use crate::runtime_filter::model::contract::{
-    BindingId, ChannelId, CompletionRequirement, ContributionKind, ReductionRequirement,
+use crate::runtime_filter::codec::contribution::{
+    ContributionCodecExpectation, RuntimeFilterContribution as CoreContribution,
+    encode_contribution,
 };
+#[cfg(test)]
+use crate::runtime_filter::model::contract::ReductionRequirement;
+use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use crate::runtime_filter::port::identity::{PartitionId, ProducerSequence};
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, OrderedBoundUpdate, OrderedTuple, RuntimeOrderContract,
 };
+#[cfg(test)]
+use crate::runtime_filter::port::producer::ProducerPortKind;
 use crate::runtime_filter::port::producer::{
-    OrderedBoundProducerAdapter, ProducerFailureReason, ProducerPortKind,
-    RuntimeContractViolationKind, SubmitOutcome,
+    OrderedBoundProducerAdapter, ProducerFailureReason, RuntimeContractViolationKind, SubmitOutcome,
 };
-use crate::runtime_filter::service::{
-    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
-    ResolvedNativeProducer,
-};
+#[cfg(test)]
+use crate::runtime_filter::service::InstalledRuntimeFilterExecutionContract;
 
 #[derive(Default)]
 struct AggregateTopNProducerInstanceCoordinator {
@@ -49,7 +52,7 @@ struct AggregateTopNProducerInstanceCoordinator {
 
 #[derive(Clone)]
 enum AggregateTopNProducerSource {
-    Installed(Arc<ResolvedNativeProducer>),
+    Session(execution::RuntimeFilterSessionRef),
     #[cfg(test)]
     Prebound(Arc<dyn OrderedBoundProducerAdapter>),
 }
@@ -57,7 +60,9 @@ enum AggregateTopNProducerSource {
 #[derive(Clone)]
 struct AggregateTopNProducerBinding {
     binding_id: u32,
+    channel_id: u32,
     contract: Arc<RuntimeOrderContract>,
+    execution_contract: execution::RuntimeFilterProducerContract,
     source: AggregateTopNProducerSource,
     coordinator: Arc<AggregateTopNProducerInstanceCoordinator>,
 }
@@ -65,32 +70,15 @@ struct AggregateTopNProducerBinding {
 impl AggregateTopNProducerBinding {
     fn from_plan(
         spec: &AggregateTopNRuntimeFilterProducerBinding,
-        context: &NativeRuntimeFilterExecutionContext,
+        session: execution::RuntimeFilterSessionRef,
     ) -> Result<Self, String> {
-        let resolved = context
-            .resolve_producer(
-                BindingId::new(spec.binding_id),
-                ChannelId::new(spec.channel_id),
-                ProducerPortKind::OrderedBound,
-            )
-            .map_err(|error| {
-                format!(
-                    "native aggregate TopN producer binding_id={} resolution failed: {error}",
-                    spec.binding_id
-                )
-            })?;
-        let contract = validate_binding_contract(
-            spec,
-            resolved.kind(),
-            resolved.contract(),
-            resolved.reduction_requirement(),
-            resolved.allowed_contribution_kinds(),
-            resolved.completion_requirement(),
-        )?;
+        let (contract, execution_contract) = frozen_binding_contract(spec)?;
         Ok(Self {
             binding_id: spec.binding_id,
+            channel_id: spec.channel_id,
             contract,
-            source: AggregateTopNProducerSource::Installed(Arc::new(resolved)),
+            execution_contract,
+            source: AggregateTopNProducerSource::Session(session),
             coordinator: Arc::new(AggregateTopNProducerInstanceCoordinator::default()),
         })
     }
@@ -110,13 +98,114 @@ impl AggregateTopNProducerBinding {
         )?;
         Ok(Self {
             binding_id: spec.binding_id,
+            channel_id: spec.channel_id,
             contract,
+            execution_contract: frozen_execution_contract(spec)?,
             source: AggregateTopNProducerSource::Prebound(resolved.adapter),
             coordinator: Arc::new(AggregateTopNProducerInstanceCoordinator::default()),
         })
     }
 }
 
+fn frozen_binding_contract(
+    spec: &AggregateTopNRuntimeFilterProducerBinding,
+) -> Result<
+    (
+        Arc<RuntimeOrderContract>,
+        execution::RuntimeFilterProducerContract,
+    ),
+    String,
+> {
+    if spec.reduction != RuntimeFilterExecutionReduction::TightenOrderedBound
+        || spec.contribution_kinds
+            != BTreeSet::from([
+                ContributionKind::OrderedBoundUpdate,
+                ContributionKind::ProducerClosed,
+            ])
+        || spec.completion_requirement != CompletionRequirement::ProducerClosed
+    {
+        return Err(format!(
+            "native aggregate TopN producer binding_id={} has an invalid frozen contract",
+            spec.binding_id
+        ));
+    }
+    let RuntimeFilterExecutionContract::Ordered {
+        keys,
+        comparator_digest,
+        order_contract_digest,
+    } = &spec.contract
+    else {
+        return Err(format!(
+            "native aggregate TopN producer binding_id={} requires an ordered contract",
+            spec.binding_id
+        ));
+    };
+    let contract = RuntimeOrderContract::from_codec(
+        keys.to_vec(),
+        crate::runtime_filter::model::contract::ComparatorDigest::new(*comparator_digest),
+        OrderContractDigest::from_bytes_for_codec(*order_contract_digest),
+    )
+    .map(Arc::new)
+    .map_err(|error| {
+        format!(
+            "native aggregate TopN producer binding_id={} ordered contract is invalid: {error:?}",
+            spec.binding_id
+        )
+    })?;
+    Ok((contract, frozen_execution_contract(spec)?))
+}
+
+fn frozen_execution_contract(
+    spec: &AggregateTopNRuntimeFilterProducerBinding,
+) -> Result<execution::RuntimeFilterProducerContract, String> {
+    let RuntimeFilterExecutionContract::Ordered {
+        keys,
+        comparator_digest,
+        order_contract_digest,
+    } = &spec.contract
+    else {
+        return Err(format!(
+            "native aggregate TopN producer binding_id={} requires an ordered contract",
+            spec.binding_id
+        ));
+    };
+    Ok(execution::RuntimeFilterProducerContract::new(
+        execution::RuntimeFilterBindingId::new(spec.binding_id),
+        execution::RuntimeFilterChannelId::new(spec.channel_id),
+        execution::RuntimeFilterProducerKind::OrderedBound,
+        execution::RuntimeFilterExecutionContract::Ordered {
+            keys: keys
+                .iter()
+                .map(|key| {
+                    execution::RuntimeOrderKey::new(
+                        key.data_type().clone(),
+                        match key.direction() {
+                            crate::runtime_filter::model::contract::SortDirection::Ascending => {
+                                execution::RuntimeOrderSortDirection::Ascending
+                            }
+                            crate::runtime_filter::model::contract::SortDirection::Descending => {
+                                execution::RuntimeOrderSortDirection::Descending
+                            }
+                        },
+                        match key.null_order() {
+                            crate::runtime_filter::model::contract::NullOrder::First => {
+                                execution::RuntimeOrderNullOrder::First
+                            }
+                            crate::runtime_filter::model::contract::NullOrder::Last => {
+                                execution::RuntimeOrderNullOrder::Last
+                            }
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            comparator_digest: *comparator_digest,
+            order_contract_digest: *order_contract_digest,
+        },
+    ))
+}
+
+#[cfg(test)]
 fn validate_binding_contract(
     spec: &AggregateTopNRuntimeFilterProducerBinding,
     port: ProducerPortKind,
@@ -218,13 +307,13 @@ impl std::fmt::Debug for AggregateTopNProducerSessionFactory {
 impl AggregateTopNProducerSessionFactory {
     pub(crate) fn from_plan(
         specs: &[AggregateTopNRuntimeFilterProducerBinding],
-        context: &NativeRuntimeFilterExecutionContext,
+        session: execution::RuntimeFilterSessionRef,
         local_partition_count: i32,
     ) -> Result<Self, String> {
         let local_partition_count = validate_partition_count(local_partition_count)?;
         let bindings = specs
             .iter()
-            .map(|spec| AggregateTopNProducerBinding::from_plan(spec, context))
+            .map(|spec| AggregateTopNProducerBinding::from_plan(spec, Arc::clone(&session)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             bindings,
@@ -452,10 +541,7 @@ struct AggregateTopNProducerStream {
 }
 
 enum AggregateTopNProducerEndpoint {
-    Execution {
-        producer: execution::RuntimeFilterProducerHandle,
-        resolved: Arc<ResolvedNativeProducer>,
-    },
+    Execution(execution::RuntimeFilterProducerHandle),
     #[cfg(test)]
     Prebound(Arc<dyn OrderedBoundProducerAdapter>),
 }
@@ -468,7 +554,7 @@ impl AggregateTopNProducerStream {
     ) -> Self {
         #[cfg(test)]
         let endpoint = match &binding.source {
-            AggregateTopNProducerSource::Installed(_) => None,
+            AggregateTopNProducerSource::Session(_) => None,
             AggregateTopNProducerSource::Prebound(adapter) => {
                 Some(AggregateTopNProducerEndpoint::Prebound(Arc::clone(adapter)))
             }
@@ -489,18 +575,27 @@ impl AggregateTopNProducerStream {
         if self.endpoint.is_some() || self.terminal {
             return Ok(());
         }
-        let AggregateTopNProducerSource::Installed(resolved) = &self.binding.source else {
+        let AggregateTopNProducerSource::Session(session) = &self.binding.source else {
             return Err(format!(
-                "native aggregate TopN producer binding_id={} has no installed producer source",
+                "native aggregate TopN producer binding_id={} has no execution producer session",
                 self.binding.binding_id
             ));
         };
-        match resolved.open_execution_producer(self.local_partition_count) {
-            Ok(producer) => {
-                self.endpoint = Some(AggregateTopNProducerEndpoint::Execution {
-                    producer,
-                    resolved: Arc::clone(resolved),
-                });
+        let request = execution::RuntimeFilterProducerOpenRequest::new(
+            self.binding.execution_contract.clone(),
+            self.local_partition_count,
+        );
+        match session.open_producer(request) {
+            Ok(execution::RuntimeFilterBindOutcome::Bound(producer)) => {
+                self.endpoint = Some(AggregateTopNProducerEndpoint::Execution(producer));
+                Ok(())
+            }
+            Ok(execution::RuntimeFilterBindOutcome::Unavailable(_)) => {
+                self.binding
+                    .coordinator
+                    .failed
+                    .store(true, Ordering::Release);
+                self.terminal = true;
                 Ok(())
             }
             Err(error)
@@ -539,17 +634,22 @@ impl AggregateTopNProducerStream {
                 )
             })?;
         let terminal_noop = match endpoint {
-            AggregateTopNProducerEndpoint::Execution { producer, resolved } => {
-                let contribution = resolved
-                    .encode_execution_contribution(
-                        self.partition_id,
-                        ProducerSequence::new(self.next_sequence),
-                        crate::runtime_filter::codec::contribution::RuntimeFilterContribution::OrderedBound(update),
-                    )
-                    .map_err(|error| format!(
+            AggregateTopNProducerEndpoint::Execution(producer) => {
+                let encoded = encode_contribution(
+                    &CoreContribution::OrderedBound(update),
+                    ContributionCodecExpectation::OrderedBound(&self.binding.contract),
+                    producer.max_contribution_bytes(),
+                )
+                .map_err(|error| format!(
                         "native aggregate TopN producer binding_id={} contribution encoding failed: {error}",
                         self.binding.binding_id
                     ))?;
+                let (contract_digest, canonical_bytes) = encoded.into_parts();
+                let contribution = execution::RuntimeFilterContribution::new(
+                    execution::RuntimeFilterContributionKind::OrderedBound,
+                    contract_digest,
+                    canonical_bytes,
+                );
                 match producer.submit(
                     execution::PartitionId::new(self.partition_id.get()),
                     execution::ProducerSequence::new(self.next_sequence),
@@ -623,11 +723,10 @@ impl AggregateTopNProducerStream {
             )
         })?;
         let terminal_noop = match endpoint {
-            AggregateTopNProducerEndpoint::Execution { producer, .. } => match producer
-                .close_partition(
-                    execution::PartitionId::new(self.partition_id.get()),
-                    execution::ProducerSequence::new(self.next_sequence),
-                ) {
+            AggregateTopNProducerEndpoint::Execution(producer) => match producer.close_partition(
+                execution::PartitionId::new(self.partition_id.get()),
+                execution::ProducerSequence::new(self.next_sequence),
+            ) {
                 Ok(outcome) => outcome == execution::RuntimeFilterSubmitOutcome::TerminalNoop,
                 Err(error)
                     if error.kind()
@@ -696,7 +795,7 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         match endpoint {
-            AggregateTopNProducerEndpoint::Execution { producer, .. } => {
+            AggregateTopNProducerEndpoint::Execution(producer) => {
                 match producer.fail(match reason {
                     ProducerFailureReason::Cancelled => {
                         execution::RuntimeFilterProducerFailure::Cancelled

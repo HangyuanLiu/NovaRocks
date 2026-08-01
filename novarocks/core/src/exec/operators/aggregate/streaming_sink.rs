@@ -113,7 +113,7 @@ impl AggregateStreamingSinkFactory {
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
                 &topn_producers,
-                &context,
+                Arc::new(context),
                 local_partition_count,
             )?))
         };
