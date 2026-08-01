@@ -83,6 +83,7 @@ code-anchors:
 - ADR-0017 — Connector catalog mutation 为何使用 FE-only lease 与三态 external outcome（active）
 - ADR-0018 — 静态 Connector predicate 为何以 Exact/PruningOnly/Unsupported 协商、而不扩展 native wire（active）
 - ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（active）
+- ADR-0023 — distributed writer 为何以 operation/cohort/execution/writer 分层，并由 FE 聚合外部提交（active）
 
 ### distributed-query-lifecycle
 
