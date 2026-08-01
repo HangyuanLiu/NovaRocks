@@ -459,6 +459,7 @@ mod tests {
             );
             let assert_expr = arena.intern(
                 ScalarNode::FunctionCall {
+                    volatility: crate::sql::functions::FunctionVolatility::Immutable,
                     name: "assert_true".to_string(),
                     args: vec![true_lit],
                     distinct: false,

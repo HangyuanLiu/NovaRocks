@@ -859,6 +859,7 @@ pub(crate) fn substitute_scalar(
             name,
             args,
             distinct,
+            volatility,
         } => ScalarNode::FunctionCall {
             name,
             args: args
@@ -866,6 +867,7 @@ pub(crate) fn substitute_scalar(
                 .map(|arg| substitute_scalar(arena, arg, defs))
                 .collect(),
             distinct,
+            volatility,
         },
         ScalarNode::AggregateCall {
             name,

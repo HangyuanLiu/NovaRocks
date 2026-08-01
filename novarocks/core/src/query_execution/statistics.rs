@@ -340,9 +340,9 @@ pub(crate) fn build_statistics_collection_request(
     let resolver = PinnedStatisticsReadResolver::new(read);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
-        connectors,
         controls,
         &context,
+        None,
         Some(&resolver),
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )

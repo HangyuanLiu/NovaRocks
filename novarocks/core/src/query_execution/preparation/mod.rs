@@ -26,7 +26,7 @@ mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::connector::ConnectorRegistry;
+use crate::sql::catalog::provider::QueryTableBindingStore;
 use crate::sql::planner::table::ScanSource;
 
 use boundary::validate_and_group_boundary_contracts;
@@ -46,9 +46,9 @@ use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_role
 
 pub(crate) fn prepare_fragments(
     plan: &crate::sql::planner::distributed::DistributedPlan,
-    connectors: &ConnectorRegistry,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
+    query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn scan::ScanBindingResolver>,
     scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
@@ -114,8 +114,14 @@ pub(crate) fn prepare_fragments(
             plan.runtime_filter_graph(),
             plan.fragments(),
         )?;
-    let scan_bindings =
-        prepare_scan_bindings(plan, connectors, controls, context, resolver, scan_options)?;
+    let scan_bindings = prepare_scan_bindings(
+        plan,
+        controls,
+        context,
+        query_table_bindings,
+        resolver,
+        scan_options,
+    )?;
 
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
@@ -581,9 +587,9 @@ mod tests {
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &registry,
             &controls,
             &crate::connector::test_request_context(),
+            None,
             None,
             ScanPreparationOptions::default(),
         )
@@ -608,9 +614,9 @@ mod tests {
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let error = match prepare_fragments(
             &plan,
-            &registry,
             &controls,
             &crate::connector::test_request_context(),
+            None,
             None,
             ScanPreparationOptions::default(),
         ) {
@@ -639,9 +645,9 @@ mod tests {
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = prepare_fragments(
             &plan,
-            &registry,
             &controls,
             &crate::connector::test_request_context(),
+            None,
             None,
             ScanPreparationOptions::default(),
         )

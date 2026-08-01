@@ -434,6 +434,7 @@ fn prune_raw_join_row_id_output_from_branch(
 fn join_row_key_expr(evidence: &JoinDeltaBranchEvidence) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
             args: vec![
                 string_literal(&evidence.left_base.table_uuid),

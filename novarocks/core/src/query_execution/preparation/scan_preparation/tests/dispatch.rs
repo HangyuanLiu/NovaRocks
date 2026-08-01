@@ -17,6 +17,7 @@
 
 use super::super::{collect_scan_bindings, store_planned_starrocks_scan};
 use super::*;
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -65,9 +66,9 @@ fn scan_preparation_propagates_caller_cancellation() {
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let err = match super::super::prepare_scan_bindings(
         &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
-        &registry,
         &controls,
         &context,
+        None,
         None,
         super::super::ScanPreparationOptions::default(),
     ) {
@@ -79,6 +80,79 @@ fn scan_preparation_propagates_caller_cancellation() {
         err.contains("Cancelled: connector request was cancelled"),
         "{err}"
     );
+}
+
+#[test]
+fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() {
+    let root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+    let DistributedNodeKind::Scan(scan) = &root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source else {
+        panic!("fixture scan must use IcebergDataFiles");
+    };
+    let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
+    let lease = controls
+        .acquire_current(
+            &ConnectorInstanceId::parse(&table.catalog).expect("fixture catalog instance"),
+        )
+        .expect("fixture planning lease");
+    let bindings = crate::sql::catalog::provider::QueryTableBindingStore::default();
+    bindings.insert_strict_base_binding_for_test(
+        &table.catalog,
+        &table.namespace,
+        &table.table,
+        crate::sql::catalog::provider::QueryTableBinding {
+            resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                Some(&table.catalog),
+                "default",
+                scan.table.clone(),
+            ),
+            statistics_pin: None,
+            planning_lease: Some(lease.clone()),
+        },
+    );
+
+    let prepared = super::super::prepare_scan_bindings(
+        &plan(root),
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&bindings),
+        None,
+        super::super::ScanPreparationOptions::default(),
+    )
+    .expect("exact query binding must plan the scan");
+    let retained = prepared
+        .connector_read(0, 10)
+        .expect("prepared connector read")
+        .planning_lease
+        .as_ref()
+        .expect("prepared read must retain planning lease");
+    assert_eq!(
+        retained.binding().incarnation(),
+        lease.binding().incarnation(),
+        "preparation must retain the query binding generation"
+    );
+}
+
+#[test]
+fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
+    let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(registry);
+    let bindings = crate::sql::catalog::provider::QueryTableBindingStore::default();
+    let error = match super::super::prepare_scan_bindings(
+        &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&bindings),
+        None,
+        super::super::ScanPreparationOptions::default(),
+    ) {
+        Ok(_) => panic!("missing binding must fail before a current-generation acquire"),
+        Err(error) => error,
+    };
+    assert!(error.contains("has no exact query binding"), "{error}");
 }
 
 #[test]
@@ -117,9 +191,9 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     collect_scan_bindings(
         0,
         &root,
-        &registry,
         &controls,
         &context,
+        None,
         None,
         super::super::ScanPreparationOptions::default(),
         &mut seen_scan_node_ids,
@@ -129,9 +203,9 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let err = collect_scan_bindings(
         0,
         &root,
-        &registry,
         &controls,
         &context,
+        None,
         None,
         super::super::ScanPreparationOptions::default(),
         &mut seen_scan_node_ids,

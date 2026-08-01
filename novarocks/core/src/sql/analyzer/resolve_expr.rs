@@ -660,9 +660,14 @@ impl<'a> super::AnalyzerContext<'a> {
                 if let Some(for_expr) = substring_for {
                     args.push(self.analyze_expr(for_expr, scope)?);
                 }
-                let bound = bind_scalar_function_call("substring", args)?;
+                let bound = bind_scalar_function_call_with_catalog(
+                    self.function_catalog,
+                    "substring",
+                    args,
+                )?;
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility("substring"),
                         name: "substring".to_string(),
                         args: bound.args,
                         distinct: false,
@@ -696,6 +701,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility(func_name),
                         name: func_name.to_string(),
                         args,
                         distinct: false,
@@ -719,6 +725,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 };
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility(func_name),
                         name: func_name.to_string(),
                         args: vec![expr_typed],
                         distinct: false,
@@ -803,6 +810,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 };
                 Ok(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility(function_name),
                         name: function_name.to_string(),
                         args: vec![base, index_typed],
                         distinct: false,
@@ -976,6 +984,7 @@ impl<'a> super::AnalyzerContext<'a> {
         };
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
                 args: vec![base, field_name_expr],
                 distinct: false,
@@ -1012,11 +1021,16 @@ impl<'a> super::AnalyzerContext<'a> {
         let arg_types = vec![arg.data_type.clone()];
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility(name),
                 name: name.to_string(),
                 args: vec![arg],
                 distinct: false,
             },
-            data_type: infer_scalar_return_type(name, &arg_types),
+            data_type: infer_scalar_return_type_with_catalog(
+                self.function_catalog,
+                name,
+                &arg_types,
+            ),
             nullable: true,
         })
     }
@@ -1119,6 +1133,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility("__array_literal"),
                 name: "__array_literal".to_string(),
                 args,
                 distinct: false,
@@ -1148,6 +1163,7 @@ impl<'a> super::AnalyzerContext<'a> {
         // (mapped to Utf8 at the analyzer level for downstream operators).
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility(fn_name),
                 name: fn_name.to_string(),
                 args: vec![left_typed, right_typed],
                 distinct: false,
@@ -1897,7 +1913,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     infer_agg_return_type(&name, &arg_types)
                 }
             } else {
-                infer_scalar_return_type(&name, &arg_types)
+                infer_scalar_return_type_with_catalog(self.function_catalog, &name, &arg_types)
             };
             let (partition_by, order_by, window_frame) =
                 self.analyze_window_spec(window_type, scope)?;
@@ -2030,7 +2046,8 @@ impl<'a> super::AnalyzerContext<'a> {
         if is_aggregate_function(&name) {
             validate_aggregate_function_call(&name, &arg_types)?;
         } else {
-            let bound = bind_scalar_function_call(&name, args_typed)?;
+            let bound =
+                bind_scalar_function_call_with_catalog(self.function_catalog, &name, args_typed)?;
             arg_types = bound.args.iter().map(|arg| arg.data_type.clone()).collect();
             args_typed = bound.args.clone();
             bound_scalar = Some(bound);
@@ -2040,6 +2057,9 @@ impl<'a> super::AnalyzerContext<'a> {
             "ds_hll_accumulate" => {
                 let state_expr = TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self
+                            .function_catalog
+                            .volatility("ds_hll_count_distinct_state"),
                         name: "ds_hll_count_distinct_state".to_string(),
                         args: args_typed,
                         distinct: false,
@@ -2109,7 +2129,9 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut return_type = bound_scalar
                 .as_ref()
                 .map(|bound| bound.return_type.clone())
-                .unwrap_or_else(|| infer_scalar_return_type(&name, &arg_types));
+                .unwrap_or_else(|| {
+                    infer_scalar_return_type_with_catalog(self.function_catalog, &name, &arg_types)
+                });
             // `named_struct(name0, val0, name1, val1, …)` needs to carry the
             // user-supplied field *names* in its returned STRUCT schema.
             // `infer_scalar_return_type` only sees arg types and falls back
@@ -2187,6 +2209,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    volatility: self.function_catalog.volatility(&name),
                     name,
                     args: args_typed,
                     distinct: is_distinct,
@@ -2261,6 +2284,7 @@ impl<'a> super::AnalyzerContext<'a> {
         };
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility("__array_struct_subfield"),
                 name: "__array_struct_subfield".to_string(),
                 args: vec![base, field_name_expr],
                 distinct: false,
@@ -2331,7 +2355,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             let body = self.analyze_expr(&lambda_body, &lambda_scope)?;
             if typed_expr_contains_column_ref(&body)
-                || typed_expr_contains_nondeterministic_call(&body)
+                || typed_expr_contains_nondeterministic_call(self.function_catalog, &body)
                 || !typed_expr_references_all_lambda_params(&body, &lambda_params)
             {
                 return Err(
@@ -2349,6 +2373,7 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             return Ok(Some(TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    volatility: self.function_catalog.volatility("array_sort_lambda"),
                     name: "array_sort_lambda".to_string(),
                     args: vec![source.clone(), lambda],
                     distinct: false,
@@ -2415,6 +2440,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 args.extend(array_args);
                 Ok(Some(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility("array_map"),
                         name: "array_map".to_string(),
                         args,
                         distinct: false,
@@ -2434,6 +2460,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 map_args.extend(array_args);
                 let mapped = TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility("array_map"),
                         name: "array_map".to_string(),
                         args: map_args,
                         distinct: false,
@@ -2443,6 +2470,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 };
                 Ok(Some(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility(name),
                         name: name.to_string(),
                         args: vec![mapped],
                         distinct: false,
@@ -2466,6 +2494,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 map_args.extend(array_args);
                 let filter = TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility("array_map"),
                         name: "array_map".to_string(),
                         args: map_args,
                         distinct: false,
@@ -2475,6 +2504,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 };
                 Ok(Some(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: self.function_catalog.volatility("array_filter"),
                         name: "array_filter".to_string(),
                         args: vec![source.clone(), filter],
                         distinct: false,
@@ -2694,6 +2724,7 @@ impl<'a> super::AnalyzerContext<'a> {
         ));
         let body_typed = TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: self.function_catalog.volatility("map"),
                 name: "map".to_string(),
                 args: vec![new_key, new_value],
                 distinct: false,
@@ -3448,6 +3479,7 @@ fn date_day_shift_expr(
     let offset_expr = cast_null_preserving_target_type(offset_expr, &DataType::Int64);
     Some(TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::builtin_function_volatility(function_name),
             name: function_name.to_string(),
             args: vec![date_expr, offset_expr],
             distinct: false,
@@ -3620,7 +3652,16 @@ fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) 
     )
 }
 
-fn bind_scalar_function_call(
+fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundScalarCall, String> {
+    bind_scalar_function_call_with_catalog(
+        crate::sql::functions::builtin_sql_function_catalog(),
+        name,
+        args,
+    )
+}
+
+fn bind_scalar_function_call_with_catalog(
+    function_catalog: &dyn crate::sql::compiler::SqlFunctionCatalog,
     name: &str,
     mut args: Vec<TypedExpr>,
 ) -> Result<BoundScalarCall, String> {
@@ -3630,7 +3671,7 @@ fn bind_scalar_function_call(
         .map(|arg| arg.data_type.clone())
         .collect::<Vec<_>>();
 
-    match crate::sql::functions::resolve_scalar_function_signature(name, &arg_types) {
+    match function_catalog.resolve_scalar_signature(name, &arg_types) {
         Ok(
             resolved @ crate::sql::functions::ResolvedScalarFunction {
                 enforce_argument_binding: true,
@@ -3663,7 +3704,11 @@ fn bind_scalar_function_call(
         Err(crate::sql::functions::ResolveError::UnknownFunction) => {
             validate_scalar_function_call_typed(name, &args)?;
             Ok(BoundScalarCall {
-                return_type: infer_scalar_return_type(name, &arg_types),
+                return_type: infer_scalar_return_type_with_catalog(
+                    function_catalog,
+                    name,
+                    &arg_types,
+                ),
                 args,
             })
         }
@@ -3673,7 +3718,11 @@ fn bind_scalar_function_call(
         }) => {
             validate_scalar_function_call_typed(name, &args)?;
             Ok(BoundScalarCall {
-                return_type: infer_scalar_return_type(name, &arg_types),
+                return_type: infer_scalar_return_type_with_catalog(
+                    function_catalog,
+                    name,
+                    &arg_types,
+                ),
                 args,
             })
         }
@@ -4708,6 +4757,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
             name,
             args,
             distinct,
+            volatility,
         } => {
             let args: Vec<TypedExpr> = args
                 .into_iter()
@@ -4820,6 +4870,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                     name,
                     args,
                     distinct,
+                    volatility,
                 },
             }
         }
@@ -5044,59 +5095,64 @@ fn typed_expr_contains_column_ref(expr: &TypedExpr) -> bool {
     }
 }
 
-fn typed_expr_contains_nondeterministic_call(expr: &TypedExpr) -> bool {
+fn typed_expr_contains_nondeterministic_call(
+    function_catalog: &dyn crate::sql::compiler::SqlFunctionCatalog,
+    expr: &TypedExpr,
+) -> bool {
     match &expr.kind {
         ExprKind::FunctionCall { name, args, .. } => {
-            matches!(
-                name.as_str(),
-                "rand" | "random" | "uuid" | "now" | "current_timestamp" | "current_time"
-            ) || args.iter().any(typed_expr_contains_nondeterministic_call)
+            function_catalog.volatility(name).is_volatile()
+                || args
+                    .iter()
+                    .any(|arg| typed_expr_contains_nondeterministic_call(function_catalog, arg))
         }
         ExprKind::BinaryOp { left, right, .. } => {
-            typed_expr_contains_nondeterministic_call(left)
-                || typed_expr_contains_nondeterministic_call(right)
+            typed_expr_contains_nondeterministic_call(function_catalog, left)
+                || typed_expr_contains_nondeterministic_call(function_catalog, right)
         }
         ExprKind::UnaryOp { expr, .. }
         | ExprKind::Cast { expr, .. }
         | ExprKind::Nested(expr)
         | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. } => typed_expr_contains_nondeterministic_call(expr),
-        ExprKind::AggregateCall { args, .. } | ExprKind::WindowCall { args, .. } => {
-            args.iter().any(typed_expr_contains_nondeterministic_call)
+        | ExprKind::IsTruthValue { expr, .. } => {
+            typed_expr_contains_nondeterministic_call(function_catalog, expr)
         }
+        ExprKind::AggregateCall { args, .. } | ExprKind::WindowCall { args, .. } => args
+            .iter()
+            .any(|arg| typed_expr_contains_nondeterministic_call(function_catalog, arg)),
         ExprKind::Case {
             operand,
             when_then,
             else_expr,
         } => {
-            operand
-                .as_ref()
-                .is_some_and(|expr| typed_expr_contains_nondeterministic_call(expr))
-                || when_then.iter().any(|(when, then)| {
-                    typed_expr_contains_nondeterministic_call(when)
-                        || typed_expr_contains_nondeterministic_call(then)
-                })
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|expr| typed_expr_contains_nondeterministic_call(expr))
+            operand.as_ref().is_some_and(|expr| {
+                typed_expr_contains_nondeterministic_call(function_catalog, expr)
+            }) || when_then.iter().any(|(when, then)| {
+                typed_expr_contains_nondeterministic_call(function_catalog, when)
+                    || typed_expr_contains_nondeterministic_call(function_catalog, then)
+            }) || else_expr.as_ref().is_some_and(|expr| {
+                typed_expr_contains_nondeterministic_call(function_catalog, expr)
+            })
         }
         ExprKind::Between {
             expr, low, high, ..
         } => {
-            typed_expr_contains_nondeterministic_call(expr)
-                || typed_expr_contains_nondeterministic_call(low)
-                || typed_expr_contains_nondeterministic_call(high)
+            typed_expr_contains_nondeterministic_call(function_catalog, expr)
+                || typed_expr_contains_nondeterministic_call(function_catalog, low)
+                || typed_expr_contains_nondeterministic_call(function_catalog, high)
         }
         ExprKind::Like { expr, pattern, .. } => {
-            typed_expr_contains_nondeterministic_call(expr)
-                || typed_expr_contains_nondeterministic_call(pattern)
+            typed_expr_contains_nondeterministic_call(function_catalog, expr)
+                || typed_expr_contains_nondeterministic_call(function_catalog, pattern)
         }
         ExprKind::InList { expr, list, .. } => {
-            typed_expr_contains_nondeterministic_call(expr)
-                || list.iter().any(typed_expr_contains_nondeterministic_call)
+            typed_expr_contains_nondeterministic_call(function_catalog, expr)
+                || list
+                    .iter()
+                    .any(|item| typed_expr_contains_nondeterministic_call(function_catalog, item))
         }
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            typed_expr_contains_nondeterministic_call(body)
+            typed_expr_contains_nondeterministic_call(function_catalog, body)
         }
         _ => false,
     }
@@ -5354,6 +5410,40 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn sqlx1_function_array_sort_lambda_rejects_extended_clock_functions() {
+        // array_sort validates its lambda body through this same helper.  The
+        // seven entries below were missing from the old analyzer-local list
+        // but were already unsafe for optimizer rewrites.
+        for name in [
+            "current_date",
+            "curdate",
+            "curtime",
+            "localtime",
+            "localtimestamp",
+            "utc_timestamp",
+            "utc_time",
+        ] {
+            let body = crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::FunctionCall {
+                    volatility: crate::sql::functions::builtin_function_volatility(name),
+                    name: name.to_string(),
+                    args: vec![],
+                    distinct: false,
+                },
+                data_type: DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                nullable: false,
+            };
+            assert!(
+                super::typed_expr_contains_nondeterministic_call(
+                    crate::sql::functions::builtin_sql_function_catalog(),
+                    &body,
+                ),
+                "{name} must be rejected in array_sort lambda bodies"
+            );
+        }
     }
 
     fn analyze_manually_constructed_scalar_function(

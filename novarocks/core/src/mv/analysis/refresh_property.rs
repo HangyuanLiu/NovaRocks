@@ -1068,6 +1068,7 @@ fn count_aggregate_projection_outputs(select: &ResolvedSelect) -> Result<usize, 
                 name,
                 args,
                 distinct,
+                ..
             } if is_legacy_unresolved_aggregate_function_name(name) => {
                 validate_supported_aggregate_call(name, args.len(), *distinct, &[])?;
                 validate_aggregate_argument_exprs(args)?;
@@ -1123,6 +1124,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             name,
             args,
             distinct,
+            ..
         } => {
             if is_legacy_unresolved_aggregate_function_name(name) {
                 return Err(format!(
@@ -1325,11 +1327,13 @@ fn expr_kind_eq(left: &ExprKind, right: &ExprKind) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                ..
             },
             ExprKind::FunctionCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                ..
             },
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
@@ -1491,6 +1495,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             name,
             args,
             distinct,
+            ..
         } => {
             if is_legacy_unresolved_aggregate_function_name(name) {
                 return Err(format!(

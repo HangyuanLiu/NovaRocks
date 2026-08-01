@@ -631,6 +631,7 @@ fn coalesce_zero(arena: &mut ScalarArena, value: ScalarId, output: &OutputColumn
     );
     arena.intern(
         ScalarNode::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
             args: vec![value, zero],
             distinct: false,

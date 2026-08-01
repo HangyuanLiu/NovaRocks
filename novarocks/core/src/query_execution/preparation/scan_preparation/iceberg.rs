@@ -59,6 +59,7 @@ pub(crate) fn build_iceberg_metadata_scan_range_params()
 /// hints; it must not lower these splits back into `FileScanRange`.
 pub(super) fn plan_iceberg_connector_read(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    exact_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
@@ -78,15 +79,30 @@ pub(super) fn plan_iceberg_connector_read(
                 .position(|field| field.name.eq_ignore_ascii_case(name))
         })
         .collect::<Vec<_>>();
-    let planned = crate::connector::iceberg::provider::plan_native_iceberg_read(
-        controls,
-        context,
-        &files.table,
-        files.binding,
-        &files.files,
-        &projection,
-        static_predicates.clone(),
-    )?;
+    let planned = match exact_lease {
+        Some(lease) => crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
+            lease,
+            context,
+            &files.table,
+            files.binding,
+            &files.files,
+            &projection,
+            static_predicates.clone(),
+        )?,
+        // Callers that construct plans outside SQL compilation (test-only
+        // native encoding fixtures and legacy internal statistics plans) do
+        // not own a query catalog binding. Production SQL preparation passes
+        // an exact lease above and never reaches this fallback.
+        None => crate::connector::iceberg::provider::plan_native_iceberg_read(
+            controls,
+            context,
+            &files.table,
+            files.binding,
+            &files.files,
+            &projection,
+            static_predicates.clone(),
+        )?,
+    };
     let predicate_dispositions =
         normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
             .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;
@@ -109,6 +125,7 @@ pub(super) fn plan_iceberg_connector_read(
 /// but it does not retain a delta physical reader or a delete-side decoder.
 pub(super) fn plan_iceberg_delta_connector_read(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    exact_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
@@ -121,13 +138,24 @@ pub(super) fn plan_iceberg_delta_connector_read(
             "Iceberg delta connector planning requires IcebergDeltaTable source".to_string(),
         );
     };
-    let planned = crate::connector::iceberg::provider::plan_native_iceberg_delta_read(
-        controls,
-        context,
-        table,
-        &delta.runtime_plan.change_files,
-        delta.runtime_plan.delete_side.as_ref(),
-    )?;
+    let planned = match exact_lease {
+        Some(lease) => {
+            crate::connector::iceberg::provider::plan_native_iceberg_delta_read_with_lease(
+                lease,
+                context,
+                table,
+                &delta.runtime_plan.change_files,
+                delta.runtime_plan.delete_side.as_ref(),
+            )?
+        }
+        None => crate::connector::iceberg::provider::plan_native_iceberg_delta_read(
+            controls,
+            context,
+            table,
+            &delta.runtime_plan.change_files,
+            delta.runtime_plan.delete_side.as_ref(),
+        )?,
+    };
     Ok(PlannedConnectorRead {
         declaration: planned.declaration,
         scan: planned.scan,

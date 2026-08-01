@@ -132,6 +132,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             name,
             args,
             distinct,
+            ..
         } => format!(
             "FunctionCall({name},{distinct},{})",
             canonical_expr_list_key(arena, args)
@@ -346,6 +347,7 @@ mod tests {
     fn func(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -488,6 +490,7 @@ mod tests {
     fn non_deterministic_function_is_detected() {
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Volatile,
                 name: "rand".to_string(),
                 args: vec![],
                 distinct: false,

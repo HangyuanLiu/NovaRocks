@@ -513,6 +513,7 @@ fn native_iceberg_scan_unsupported_predicate_does_not_guess_pruning() {
                 name: "abs".to_string(),
                 args: vec![id_eq_literal(12)],
                 distinct: false,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             data_type: DataType::Boolean,
             nullable: false,

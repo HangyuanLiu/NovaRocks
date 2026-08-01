@@ -432,6 +432,7 @@ mod tests {
     fn typed_expr_display_name_formats_struct_subfield_like_starrocks() {
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
                 args: vec![col("c13"), string_lit("a")],
                 distinct: false,
@@ -446,6 +447,9 @@ mod tests {
     fn typed_expr_display_name_formats_collection_access_like_starrocks() {
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility(
+                    "__array_element_at",
+                ),
                 name: "__array_element_at".to_string(),
                 args: vec![col("c11"), int_lit(0)],
                 distinct: false,
@@ -481,6 +485,7 @@ mod tests {
     fn agg_call_display_name_preserves_struct_field_paths() {
         let arg = TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
                 args: vec![col("c13"), string_lit("a")],
                 distinct: false,

@@ -176,6 +176,7 @@ mod tests {
     fn variant_get(name: &str, source_column: &OutputColumn, path: &str, ty: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
                 args: vec![
                     column_ref(source_column),
@@ -192,6 +193,7 @@ mod tests {
     fn variant_get_with_args(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -618,6 +620,7 @@ mod tests {
         );
         let call_id = scalars.intern(
             ScalarNode::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: "variant_get".to_string(),
                 args: vec![unset_col_id, path_id, ty_id],
                 distinct: false,

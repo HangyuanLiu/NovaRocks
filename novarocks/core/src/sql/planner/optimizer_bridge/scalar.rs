@@ -661,12 +661,14 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             name,
             args,
             distinct,
+            volatility,
         } => {
             let arg_ids: Vec<ScalarId> = args.iter().map(|a| intern_typed(arena, a)).collect();
             ScalarNode::FunctionCall {
                 name: name.clone(),
                 args: arg_ids,
                 distinct: *distinct,
+                volatility: *volatility,
             }
         }
         ExprKind::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
@@ -811,10 +813,12 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             name,
             args,
             distinct,
+            volatility,
         } => ExprKind::FunctionCall {
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
             distinct: *distinct,
+            volatility: *volatility,
         },
         ScalarNode::LambdaFunction { params, body } => ExprKind::LambdaFunction {
             params: params.clone(),

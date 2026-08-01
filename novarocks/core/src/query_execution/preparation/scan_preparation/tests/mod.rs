@@ -50,9 +50,9 @@ fn prepare_scan_bindings(
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     super::prepare_scan_bindings(
         plan,
-        connectors,
         &controls,
         &crate::connector::test_request_context(),
+        None,
         resolver,
         super::ScanPreparationOptions::default(),
     )

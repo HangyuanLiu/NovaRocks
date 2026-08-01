@@ -33,6 +33,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, LambdaParam, LiteralValue, UnOp, WindowFrame};
+use crate::sql::functions::FunctionVolatility;
 
 /// `LiteralValue` is only `PartialEq` (it holds `Float(f64)` / `Decimal(String)`),
 /// so it cannot be a `HashMap` key directly. This newtype provides `Eq`/`Hash`
@@ -103,6 +104,7 @@ pub(crate) enum ScalarNode {
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
+        volatility: FunctionVolatility,
     },
     LambdaFunction {
         params: Vec<LambdaParam>,
@@ -205,6 +207,10 @@ pub(crate) struct ScalarArena {
     nodes: Vec<ScalarNode>,
     types: Vec<DataType>,
     nullable: Vec<bool>,
+    /// Function semantics resolved at scalar interning time.  It is kept
+    /// alongside the compact node representation so optimizer passes never
+    /// have to carry their own name-based volatility policy.
+    function_volatility: Vec<Option<FunctionVolatility>>,
     intern: HashMap<ScalarKey, ScalarId>,
     column_displays: HashMap<ColumnId, StoredColumnDisplay>,
 }
@@ -215,6 +221,7 @@ impl ScalarArena {
             nodes: Vec::new(),
             types: Vec::new(),
             nullable: Vec::new(),
+            function_volatility: Vec::new(),
             intern: HashMap::new(),
             column_displays: HashMap::new(),
         }
@@ -233,9 +240,14 @@ impl ScalarArena {
             return id;
         }
         let id = ScalarId(self.nodes.len() as u32);
+        let function_volatility = match &node {
+            ScalarNode::FunctionCall { volatility, .. } => Some(*volatility),
+            _ => None,
+        };
         self.nodes.push(node);
         self.types.push(ty);
         self.nullable.push(nullable);
+        self.function_volatility.push(function_volatility);
         self.intern.insert(key, id);
         id
     }
@@ -268,6 +280,15 @@ impl ScalarArena {
 
     pub(crate) fn nullable(&self, id: ScalarId) -> bool {
         self.nullable[id.0 as usize]
+    }
+
+    /// Returns the resolved volatility for a scalar function node.
+    ///
+    /// Non-function nodes intentionally return `None`; callers that recurse
+    /// through an expression can distinguish node-local semantics from a
+    /// volatile descendant.
+    pub(crate) fn function_volatility(&self, id: ScalarId) -> Option<FunctionVolatility> {
+        self.function_volatility[id.0 as usize]
     }
 
     fn remember_column_display(
@@ -468,6 +489,40 @@ mod tests {
         );
         assert_eq!(a.data_type(add1), &int());
         assert!(!a.nullable(add1));
+    }
+
+    #[test]
+    fn sqlx1_function_scalar_arena_carries_catalog_volatility() {
+        let mut arena = ScalarArena::new();
+        let volatile = arena.intern(
+            ScalarNode::FunctionCall {
+                volatility: FunctionVolatility::Volatile,
+                name: "curdate".to_string(),
+                args: vec![],
+                distinct: false,
+            },
+            DataType::Date32,
+            false,
+        );
+        let immutable = arena.intern(
+            ScalarNode::FunctionCall {
+                volatility: FunctionVolatility::Immutable,
+                name: "lower".to_string(),
+                args: vec![],
+                distinct: false,
+            },
+            DataType::Utf8,
+            false,
+        );
+
+        assert_eq!(
+            arena.function_volatility(volatile),
+            Some(FunctionVolatility::Volatile)
+        );
+        assert_eq!(
+            arena.function_volatility(immutable),
+            Some(FunctionVolatility::Immutable)
+        );
     }
 
     #[test]
@@ -1006,6 +1061,7 @@ mod bridge_tests {
                     ),
                 ],
                 distinct: true,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             DataType::Utf8,
             true,

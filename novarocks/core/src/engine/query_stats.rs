@@ -19,12 +19,15 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorControlRegistry, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
+    ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsProvenance,
 };
 
 use crate::connector::unified_statistics::{ResolvedStatisticsTable, UnifiedStatisticsResolver};
-use crate::sql::catalog::provider::QueryStatisticsPins;
+use crate::sql::catalog::ResolvedAnalyzerTable;
+use crate::sql::catalog::provider::{
+    QueryStatisticsPins, QueryTableBinding, QueryTableBindingLoader,
+};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::Confidence;
@@ -39,9 +42,8 @@ use crate::sql::planner::table::ScanSource;
 /// a provider registry: absent pins intentionally produce missing statistics
 /// rather than a second latest-resolution path.
 pub(crate) struct QueryStatisticsContext {
-    connector_control: Option<Arc<dyn ConnectorControlRegistry>>,
     resolver: Option<Arc<UnifiedStatisticsResolver>>,
-    pins: Option<QueryStatisticsPins>,
+    bindings: Option<QueryStatisticsPins>,
 }
 
 impl QueryStatisticsContext {
@@ -58,9 +60,8 @@ impl QueryStatisticsContext {
         pins: QueryStatisticsPins,
     ) -> Self {
         Self {
-            connector_control: Some(Arc::clone(&state.connector_control)),
             resolver: Some(Arc::clone(&state.unified_statistics)),
-            pins: Some(pins),
+            bindings: Some(pins),
         }
     }
 
@@ -78,30 +79,78 @@ impl QueryStatisticsContext {
     }
 }
 
-pub(crate) struct QueryStatsPlan {
-    pub snapshot: QueryStatsSnapshot,
-    next_stats_ref: u32,
-}
-
-impl QueryStatsPlan {
-    fn new(snapshot: QueryStatsSnapshot, next_stats_ref: u32) -> Self {
-        Self {
-            snapshot,
-            next_stats_ref,
-        }
-    }
-
-    pub(crate) fn add_stats(
-        &mut self,
-        label: impl Into<String>,
-        stats: BaseTableStatistics,
-    ) -> StatsRef {
-        let stats_ref = StatsRef::new(self.next_stats_ref);
-        self.next_stats_ref += 1;
-        self.snapshot.insert(stats_ref, label, stats);
-        stats_ref
+impl crate::sql::compiler::SqlStatisticsSnapshot for QueryStatisticsContext {
+    fn collect_table_statistics(
+        &self,
+        database: &str,
+        table: &crate::sql::planner::table::TableDef,
+    ) -> (
+        String,
+        crate::sql::optimizer::stats_input::BaseTableStatistics,
+    ) {
+        collect_table_stats(self, database, table)
     }
 }
+
+/// Application adapter for the SQL catalog's provider-neutral materialization
+/// seam.  The resulting binding carries the exact planning lease acquired for
+/// metadata; SQL itself never names the Iceberg provider.
+pub(crate) fn iceberg_table_binding_loader<'a>(
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Box<dyn QueryTableBindingLoader + 'a> {
+    Box::new(IcebergTableBindingLoader {
+        controls,
+        connector_context,
+    })
+}
+
+struct IcebergTableBindingLoader<'a> {
+    controls: &'a dyn ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
+    fn load_strict_base_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<QueryTableBinding, String> {
+        let (planner, _schema_id, statistics_pin, planning_lease) =
+            crate::connector::iceberg::provider::load_schema_table_def_with_lease(
+                self.controls,
+                self.connector_context.clone(),
+                catalog,
+                namespace,
+                table,
+            )?;
+        Ok(QueryTableBinding {
+            resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+            statistics_pin,
+            planning_lease: Some(planning_lease),
+        })
+    }
+
+    fn load_metadata_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<crate::sql::planner::table::TableDef, String> {
+        crate::connector::iceberg::provider::load_metadata_table_def(
+            self.controls,
+            self.connector_context.clone(),
+            catalog,
+            namespace,
+            table,
+            metadata_table_type,
+        )
+    }
+}
+
+pub(crate) type QueryStatsPlan = crate::sql::compiler::SqlStatisticsPlan;
 
 pub(crate) struct QueryStatsCollector {
     context: QueryStatisticsContext,
@@ -120,7 +169,10 @@ impl QueryStatsCollector {
 
     pub(crate) fn collect(mut self, opt_expr: &mut OptExpr) -> QueryStatsPlan {
         self.walk(opt_expr);
-        QueryStatsPlan::new(self.snapshot, self.next_stats_ref)
+        let mut plan = QueryStatsPlan::empty();
+        plan.snapshot = self.snapshot;
+        plan.set_next_stats_ref(self.next_stats_ref);
+        plan
     }
 
     fn walk(&mut self, expr: &mut OptExpr) {
@@ -160,14 +212,6 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(control) = context.connector_control.as_deref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "connector statistics resolver is not available".to_string(),
-            )),
-        );
-    };
     let Some(resolver) = context.resolver.as_deref() else {
         return (
             label,
@@ -176,28 +220,45 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(pins) = context.pins.as_ref() else {
+    let Some(bindings) = context.bindings.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "query statistics pins are not available".to_string(),
+                "query table bindings are not available".to_string(),
             )),
         );
     };
-    let pin = pins
-        .lock()
-        .expect("query statistics pin lock")
-        .get(&(
-            table.catalog.to_ascii_lowercase(),
-            table.namespace.to_ascii_lowercase(),
-            table.table.to_ascii_lowercase(),
-        ))
-        .cloned();
-    let Some(pin) = pin else {
+    let Some(binding) =
+        bindings.strict_base_binding(&table.catalog, &table.namespace, &table.table)
+    else {
+        return (
+            label,
+            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                "table resolution did not retain an exact query binding".to_string(),
+            )),
+        );
+    };
+    let Some(pin) = binding.statistics_pin.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
                 "table resolution did not retain a statistics data-version pin".to_string(),
+            )),
+        );
+    };
+    let Some(planning_lease) = binding.planning_lease.as_ref() else {
+        return (
+            label,
+            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                "table resolution did not retain its connector planning lease".to_string(),
+            )),
+        );
+    };
+    let Some(statistics) = planning_lease.binding().statistics() else {
+        return (
+            label,
+            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
+                "resolved connector generation does not expose statistics".to_string(),
             )),
         );
     };
@@ -211,11 +272,12 @@ pub(super) fn collect_table_stats(
             context.and_then(|context| {
                 resolver
                     .resolve(
-                        control,
                         &ResolvedStatisticsTable {
                             table: pin.table.clone(),
                             data_version: pin.data_version.clone(),
+                            incarnation: planning_lease.binding().incarnation(),
                         },
+                        statistics.as_ref(),
                         metrics,
                         context,
                     )

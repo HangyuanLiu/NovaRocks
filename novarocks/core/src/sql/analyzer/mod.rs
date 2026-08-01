@@ -75,11 +75,37 @@ pub(crate) fn analyze(
     ),
     String,
 > {
-    analyze_with_factory(
+    analyze_with_function_catalog(
+        query,
+        catalog,
+        current_database,
+        crate::sql::functions::builtin_sql_function_catalog(),
+    )
+}
+
+/// Analyze using the immutable function semantics captured by the compiler
+/// request.  The legacy [`analyze`] surface deliberately uses the builtin
+/// snapshot, so existing application callers retain their behaviour while
+/// SQLX-1 can inject a request-scoped catalog.
+pub(crate) fn analyze_with_function_catalog(
+    query: &sqlast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::sql::compiler::SqlFunctionCatalog,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::sql::analysis::cte::CTERegistry,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    String,
+> {
+    analyze_with_factory_and_function_catalog(
         query,
         catalog,
         current_database,
         crate::sql::column_id::ColumnRefFactory::new(),
+        function_catalog,
     )
 }
 
@@ -100,10 +126,36 @@ pub(crate) fn analyze_with_factory(
     ),
     String,
 > {
+    analyze_with_factory_and_function_catalog(
+        query,
+        catalog,
+        current_database,
+        factory,
+        crate::sql::functions::builtin_sql_function_catalog(),
+    )
+}
+
+/// Like [`analyze_with_factory`], but uses the immutable function catalog
+/// supplied by one compiler request.
+pub(crate) fn analyze_with_factory_and_function_catalog(
+    query: &sqlast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    function_catalog: &dyn crate::sql::compiler::SqlFunctionCatalog,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::sql::analysis::cte::CTERegistry,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    String,
+> {
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
+        function_catalog,
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
@@ -127,6 +179,7 @@ pub(crate) fn analyze_with_factory(
 pub(super) struct AnalyzerContext<'a> {
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
+    pub(super) function_catalog: &'a dyn crate::sql::compiler::SqlFunctionCatalog,
     /// Shared factory for allocating globally unique ColumnIds.
     pub(super) factory: std::rc::Rc<std::cell::RefCell<crate::sql::column_id::ColumnRefFactory>>,
     /// Currently visible CTE definitions from outer scopes or earlier entries
@@ -194,6 +247,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut child_ctx = AnalyzerContext {
             catalog: self.catalog,
             current_database: self.current_database,
+            function_catalog: self.function_catalog,
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),
@@ -695,6 +749,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                volatility,
             } => {
                 let is_agg = crate::sql::analyzer::functions::is_aggregate_function(&name);
                 TypedExpr {
@@ -714,6 +769,7 @@ impl<'a> AnalyzerContext<'a> {
                             })
                             .collect(),
                         distinct,
+                        volatility,
                     },
                 }
             }
@@ -890,6 +946,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                volatility,
             } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
@@ -902,6 +959,7 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     distinct,
+                    volatility,
                 },
             },
             ExprKind::LambdaFunction { params, body } => TypedExpr {
@@ -2222,6 +2280,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                volatility,
             } => ExprKind::FunctionCall {
                 name,
                 args: args
@@ -2229,6 +2288,7 @@ impl<'a> AnalyzerContext<'a> {
                     .map(|arg| self.rebind_order_by_agg_args(arg, from_scope, inside_agg))
                     .collect(),
                 distinct,
+                volatility,
             },
             ExprKind::Cast {
                 expr: inner,
@@ -3556,6 +3616,7 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            volatility,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -3573,6 +3634,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                volatility: *volatility,
             },
         },
         ExprKind::LambdaFunction { params, body } => TypedExpr {

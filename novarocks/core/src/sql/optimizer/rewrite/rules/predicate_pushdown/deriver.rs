@@ -840,6 +840,7 @@ mod tests {
             arena,
             TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    volatility: crate::sql::functions::FunctionVolatility::Volatile,
                     name: "rand".to_string(),
                     args: vec![],
                     distinct: false,

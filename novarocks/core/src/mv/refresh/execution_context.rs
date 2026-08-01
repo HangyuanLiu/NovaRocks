@@ -1450,9 +1450,9 @@ mod tests {
                         .expect("build DistributedPlan");
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
-                    &connectors,
                     &controls,
                     &crate::connector::test_request_context(),
+                    None,
                     Some(&refresh_ctx),
                     crate::query_execution::preparation::ScanPreparationOptions::default(),
                 )

@@ -694,10 +694,12 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            volatility,
         } => ExprKind::FunctionCall {
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            volatility: *volatility,
         },
         ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
             params: params.clone(),
@@ -900,15 +902,18 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                volatility: left_volatility,
             },
             ExprKind::FunctionCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                volatility: right_volatility,
             },
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_volatility == right_volatility
                 && typed_expr_slices_semantically_eq(left_args, right_args)
         }
         (

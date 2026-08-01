@@ -28,21 +28,23 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorStatisticsResolver,
-    ConnectorTableHandle, StatisticsAccuracy, StatisticsCoverage, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
-    StatisticsReadRequest,
+    ConnectorError, ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
+    ConnectorStatistics, ConnectorTableHandle, StatisticsAccuracy, StatisticsCoverage,
+    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest, StatisticsReadRequest,
 };
 
 #[derive(Clone)]
 pub(crate) struct ResolvedStatisticsTable {
     pub table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
+    pub incarnation: ConnectorInstanceIncarnation,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ResolvedCacheKey {
     instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
     table_payload: Bytes,
     data_version: StatisticsDataVersion,
     metrics: Vec<StatisticsMetric>,
@@ -51,6 +53,7 @@ struct ResolvedCacheKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ArtifactCacheKey {
     instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
     table_payload: Bytes,
     data_version: StatisticsDataVersion,
     evidence_revision: StatisticsEvidenceRevision,
@@ -70,13 +73,22 @@ pub(crate) struct UnifiedStatisticsResolver {
 impl UnifiedStatisticsResolver {
     pub(crate) fn resolve(
         &self,
-        resolver: &dyn ConnectorStatisticsResolver,
         table: &ResolvedStatisticsTable,
+        statistics: &dyn ConnectorStatistics,
         metrics: StatisticsMetricRequest,
         context: ConnectorRequestContext,
     ) -> Result<Arc<StatisticsEvidence>, ConnectorError> {
+        if statistics.descriptor().instance_id != *table.table.owner()
+            || statistics.incarnation() != table.incarnation
+        {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "resolved connector statistics capability does not match the query binding generation",
+            ));
+        }
         let key = ResolvedCacheKey {
             instance_id: table.table.owner().clone(),
+            incarnation: table.incarnation,
             table_payload: table.table.payload().clone(),
             data_version: table.data_version.clone(),
             metrics: metrics.metrics().to_vec(),
@@ -91,8 +103,7 @@ impl UnifiedStatisticsResolver {
             return Ok(evidence);
         }
 
-        let lease = resolver.acquire_current_statistics(table.table.owner())?;
-        let evidence = lease.read(StatisticsReadRequest {
+        let evidence = statistics.read_statistics(StatisticsReadRequest {
             table: table.table.clone(),
             data_version: table.data_version.clone(),
             metrics,
@@ -106,6 +117,7 @@ impl UnifiedStatisticsResolver {
         }
         let artifact_key = ArtifactCacheKey {
             instance_id: key.instance_id.clone(),
+            incarnation: key.incarnation,
             table_payload: key.table_payload.clone(),
             data_version: key.data_version.clone(),
             evidence_revision: evidence.evidence_revision.clone(),

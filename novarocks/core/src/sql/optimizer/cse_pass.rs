@@ -454,6 +454,7 @@ fn substitute(
             name,
             args,
             distinct,
+            volatility,
         } => ScalarNode::FunctionCall {
             name,
             args: args
@@ -461,6 +462,7 @@ fn substitute(
                 .map(|arg| substitute(scalars, arg, subst))
                 .collect(),
             distinct,
+            volatility,
         },
         ScalarNode::AggregateCall {
             name,
@@ -1463,12 +1465,18 @@ mod tests {
         )
     }
 
-    fn call(arena: &mut ScalarArena, name: &str, args: Vec<ScalarId>) -> ScalarId {
+    fn call(
+        arena: &mut ScalarArena,
+        name: &str,
+        args: Vec<ScalarId>,
+        volatility: crate::sql::functions::FunctionVolatility,
+    ) -> ScalarId {
         arena.intern(
             ScalarNode::FunctionCall {
                 name: name.to_string(),
                 args,
                 distinct: false,
+                volatility,
             },
             DataType::Int64,
             true,
@@ -1562,6 +1570,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let rand = arena.intern(
             ScalarNode::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Volatile,
                 name: "rand".to_string(),
                 args: vec![],
                 distinct: false,
@@ -1576,7 +1585,12 @@ mod tests {
     #[test]
     fn repeated_current_timestamp_is_not_common_candidate() {
         let mut arena = ScalarArena::new();
-        let current_timestamp = call(&mut arena, "current_timestamp", vec![]);
+        let current_timestamp = call(
+            &mut arena,
+            "current_timestamp",
+            vec![],
+            crate::sql::functions::FunctionVolatility::Volatile,
+        );
 
         assert_eq!(
             pick_commons(&arena, &[current_timestamp, current_timestamp]),
@@ -1588,8 +1602,18 @@ mod tests {
     fn sec_to_time_source_for_time_to_sec_is_not_common_candidate() {
         let mut arena = ScalarArena::new();
         let minus_one = int_lit(&mut arena, -1);
-        let sec_to_time = call(&mut arena, "sec_to_time", vec![minus_one]);
-        let time_to_sec = call(&mut arena, "time_to_sec", vec![sec_to_time]);
+        let sec_to_time = call(
+            &mut arena,
+            "sec_to_time",
+            vec![minus_one],
+            crate::sql::functions::FunctionVolatility::Immutable,
+        );
+        let time_to_sec = call(
+            &mut arena,
+            "time_to_sec",
+            vec![sec_to_time],
+            crate::sql::functions::FunctionVolatility::Immutable,
+        );
 
         assert_eq!(
             pick_commons(&arena, &[sec_to_time, time_to_sec]),
@@ -1608,6 +1632,7 @@ mod tests {
         let null_array_type = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
         let null_array = arena.intern(
             ScalarNode::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: "__array_literal".to_string(),
                 args: vec![null],
                 distinct: false,
@@ -1669,7 +1694,12 @@ mod tests {
     fn nested_non_deterministic_expression_is_not_common_candidate() {
         let mut arena = ScalarArena::new();
         let a = col(&mut arena, 1);
-        let rand = call(&mut arena, "rand", vec![]);
+        let rand = call(
+            &mut arena,
+            "rand",
+            vec![],
+            crate::sql::functions::FunctionVolatility::Volatile,
+        );
         let rand_plus_a = add(&mut arena, rand, a);
 
         assert_eq!(
@@ -3488,6 +3518,7 @@ mod tests {
         );
         let captures_right = arena.intern(
             ScalarNode::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
                 name: "test_lambda_wrapper".to_string(),
                 args: vec![left_a, lambda],
                 distinct: false,

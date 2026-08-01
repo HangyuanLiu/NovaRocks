@@ -738,6 +738,22 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> DataType {
+    infer_scalar_return_type_with_catalog(
+        crate::sql::functions::builtin_sql_function_catalog(),
+        name,
+        arg_types,
+    )
+}
+
+/// Infer an unregistered scalar return type using the function snapshot that
+/// belongs to the current compiler request. Registered signatures always take
+/// precedence; the match below remains the deliberately narrow legacy
+/// fallback for complex functions not yet representable in the registry.
+pub(super) fn infer_scalar_return_type_with_catalog(
+    function_catalog: &dyn crate::sql::compiler::SqlFunctionCatalog,
+    name: &str,
+    arg_types: &[DataType],
+) -> DataType {
     // Step B: the central signature registry is the single source of
     // truth for nearly all scalar built-ins (~250 names) including the
     // `coalesce`/`if`/`ifnull` cast-match family. If the registry knows
@@ -747,8 +763,8 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
     // extractors (`__array_element_at`, `map_keys`), and functions
     // whose permissive type fallbacks haven't been formalised as
     // signatures yet.
-    if let Ok(t) = crate::sql::functions::resolve_scalar_function(name, arg_types) {
-        return t;
+    if let Ok(resolved) = function_catalog.resolve_scalar_signature(name, arg_types) {
+        return resolved.return_type;
     }
     match name {
         // String functions
@@ -1577,6 +1593,7 @@ mod tests {
                     nullable: false,
                 }],
                 distinct: false,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             data_type: array_type(DataType::Utf8),
             nullable: false,
@@ -1593,6 +1610,7 @@ mod tests {
                     nullable: false,
                 }],
                 distinct: false,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             data_type: array_type(DataType::Int64),
             nullable: false,

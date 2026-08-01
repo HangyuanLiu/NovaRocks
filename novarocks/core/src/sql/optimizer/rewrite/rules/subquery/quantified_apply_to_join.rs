@@ -466,6 +466,7 @@ mod tests {
             name,
             args,
             distinct,
+            ..
         } = &condition.kind
         else {
             panic!("expected coalesce predicate, got: {condition:?}");

@@ -15,6 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Query-scoped catalog materialization.
+//!
+//! The SQL layer owns the lookup identity and memoization boundary.  The
+//! application supplies a provider-neutral loader which materializes external
+//! tables and retains the exact connector planning lease that supplied their
+//! metadata.  SQL catalog code never depends on a concrete connector
+//! provider.
+
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::catalog::{
     CatalogRuntimeMetadata, IcebergMetadataTableProvider, PlannerTableProvider,
@@ -28,60 +36,159 @@ use novarocks_catalog::table::CatalogTable;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub(crate) struct CatalogServiceProvider<'a> {
-    current_catalog: Option<&'a str>,
-    service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
-    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    lookup_mode: TableLookupMode,
-    statistics_pins: QueryStatisticsPins,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TableBindingKey {
+    catalog: String,
+    namespace: String,
+    table: String,
+    selector: TableBindingSelector,
 }
 
-pub(crate) type QueryStatisticsPins =
-    Arc<Mutex<HashMap<(String, String, String), ResolvedTableStatisticsPin>>>;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TableBindingSelector {
+    StrictBaseTable,
+}
 
-impl<'a> CatalogServiceProvider<'a> {
-    pub(crate) fn new(
-        current_catalog: Option<&'a str>,
-        service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
-        controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-        lookup_mode: TableLookupMode,
-    ) -> Self {
+impl TableBindingKey {
+    fn strict_base(catalog: &str, namespace: &str, table: &str) -> Self {
         Self {
-            current_catalog,
-            service,
-            controls,
-            connector_context,
-            lookup_mode,
-            statistics_pins: Arc::new(Mutex::new(HashMap::new())),
+            catalog: catalog.to_ascii_lowercase(),
+            namespace: namespace.to_ascii_lowercase(),
+            table: table.to_ascii_lowercase(),
+            selector: TableBindingSelector::StrictBaseTable,
         }
     }
+}
 
-    pub(crate) fn statistics_pins(&self) -> QueryStatisticsPins {
-        Arc::clone(&self.statistics_pins)
+/// One external metadata result, pinned to the same connector control
+/// generation used by later statistics and split preparation.
+#[derive(Clone)]
+pub(crate) struct QueryTableBinding {
+    pub(crate) resolved: ResolvedAnalyzerTable,
+    pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+}
+
+impl QueryTableBinding {
+    fn local(resolved: ResolvedAnalyzerTable) -> Self {
+        Self {
+            resolved,
+            statistics_pin: None,
+            planning_lease: None,
+        }
     }
+}
 
-    fn record_statistics_pin(
+/// Application-owned external materializer.  It is intentionally small: SQL
+/// can request a normalized table binding, but cannot name or downcast a
+/// concrete connector provider.
+pub(crate) trait QueryTableBindingLoader: Send + Sync {
+    fn load_strict_base_table(
         &self,
         catalog: &str,
         namespace: &str,
         table: &str,
-        pin: Option<ResolvedTableStatisticsPin>,
-    ) {
-        if let Some(pin) = pin {
-            self.statistics_pins
-                .lock()
-                .expect("query statistics pin lock")
-                .insert(
-                    (
-                        catalog.to_ascii_lowercase(),
-                        namespace.to_ascii_lowercase(),
-                        table.to_ascii_lowercase(),
-                    ),
-                    pin,
-                );
+    ) -> Result<QueryTableBinding, String>;
+
+    fn load_metadata_table(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    ) -> Result<TableDef, String>;
+}
+
+/// Query-local memo of both successful and failed materializations.  Keeping
+/// the lease in the value makes all subsequent consumers use the exact
+/// metadata generation rather than acquiring `latest` again.
+#[derive(Default)]
+pub(crate) struct QueryTableBindingStore {
+    entries: Mutex<HashMap<TableBindingKey, Result<Arc<QueryTableBinding>, String>>>,
+}
+
+impl QueryTableBindingStore {
+    fn resolve_or_insert(
+        &self,
+        key: TableBindingKey,
+        load: impl FnOnce() -> Result<QueryTableBinding, String>,
+    ) -> Result<Arc<QueryTableBinding>, String> {
+        let mut entries = self.entries.lock().expect("query table binding lock");
+        if let Some(entry) = entries.get(&key) {
+            return entry.clone();
         }
+        let entry = load().map(Arc::new);
+        entries.insert(key, entry.clone());
+        entry
+    }
+
+    pub(crate) fn strict_base_binding(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Option<Arc<QueryTableBinding>> {
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(&TableBindingKey::strict_base(catalog, namespace, table))
+            .and_then(|entry| entry.clone().ok())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_strict_base_binding_for_test(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        binding: QueryTableBinding,
+    ) {
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .insert(
+                TableBindingKey::strict_base(catalog, namespace, table),
+                Ok(Arc::new(binding)),
+            );
+    }
+}
+
+/// Transitional type name retained while application callers move from the
+/// old mutable statistics-pin side channel to `QueryTableBindingStore`.
+/// Unlike the old map, this is the immutable query binding authority.
+pub(crate) type QueryStatisticsPins = Arc<QueryTableBindingStore>;
+
+pub(crate) struct CatalogServiceProvider<'a> {
+    current_catalog: Option<&'a str>,
+    service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
+    bindings: QueryStatisticsPins,
+    loader: Box<dyn QueryTableBindingLoader + 'a>,
+}
+
+impl<'a> CatalogServiceProvider<'a> {
+    pub(crate) fn with_query_table_bindings(
+        current_catalog: Option<&'a str>,
+        service: &'a CatalogService<TableDef, CatalogRuntimeMetadata>,
+        _lookup_mode: TableLookupMode,
+        bindings: QueryStatisticsPins,
+        loader: Box<dyn QueryTableBindingLoader + 'a>,
+    ) -> Self {
+        Self {
+            current_catalog,
+            service,
+            bindings,
+            loader,
+        }
+    }
+
+    pub(crate) fn query_table_bindings(&self) -> QueryStatisticsPins {
+        Arc::clone(&self.bindings)
+    }
+
+    /// Compatibility accessor for callers not yet moved to the explicit
+    /// binding-store name.  It no longer exposes a mutable pin map.
+    pub(crate) fn statistics_pins(&self) -> QueryStatisticsPins {
+        self.query_table_bindings()
     }
 
     fn effective_catalog<'b>(&'b self, override_catalog: Option<&'b str>) -> Option<&'b str> {
@@ -96,56 +203,37 @@ impl<'a> CatalogServiceProvider<'a> {
     ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
-                let planner = self
-                    .service
-                    .local()
-                    .read()
-                    .expect("catalog service local read lock")
-                    .get(database, table)?;
-                Ok(ResolvedAnalyzerTable::from_planner(
-                    Some("default_catalog"),
-                    database,
-                    planner,
-                ))
+                let key = TableBindingKey::strict_base("default_catalog", database, table);
+                self.bindings
+                    .resolve_or_insert(key, || {
+                        let planner = self
+                            .service
+                            .local()
+                            .read()
+                            .expect("catalog service local read lock")
+                            .get(database, table)?;
+                        Ok(QueryTableBinding::local(
+                            ResolvedAnalyzerTable::from_planner(
+                                Some("default_catalog"),
+                                database,
+                                planner,
+                            ),
+                        ))
+                    })
+                    .map(|binding| binding.resolved.clone())
             }
-            Some(catalog) => match self.lookup_mode {
-                TableLookupMode::SchemaOnly => {
-                    let (planner, _, pin) =
-                        crate::connector::iceberg::provider::load_schema_table_def(
-                            self.controls,
-                            self.connector_context.clone(),
-                            catalog,
-                            database,
-                            table,
-                        )?;
-                    self.record_statistics_pin(catalog, database, table, pin);
-                    Ok(ResolvedAnalyzerTable::from_planner(
-                        Some(catalog),
-                        database,
-                        planner,
-                    ))
-                }
-                TableLookupMode::ExplainStats => {
-                    let (planner, _, pin) =
-                        crate::connector::iceberg::provider::load_schema_table_def(
-                            self.controls,
-                            self.connector_context.clone(),
-                            catalog,
-                            database,
-                            table,
-                        )?;
-                    self.record_statistics_pin(catalog, database, table, pin);
-                    Ok(ResolvedAnalyzerTable::from_planner(
-                        Some(catalog),
-                        database,
-                        planner,
-                    ))
-                }
-            },
+            Some(catalog) => {
+                let key = TableBindingKey::strict_base(catalog, database, table);
+                self.bindings
+                    .resolve_or_insert(key, || {
+                        self.loader.load_strict_base_table(catalog, database, table)
+                    })
+                    .map(|binding| binding.resolved.clone())
+            }
         }
     }
 
-    fn iceberg_metadata_table_def(
+    fn metadata_table_def(
         &self,
         catalog: Option<&str>,
         database: &str,
@@ -159,14 +247,10 @@ impl<'a> CatalogServiceProvider<'a> {
                 .read()
                 .expect("catalog service local read lock")
                 .get(database, table),
-            Some(catalog) => crate::connector::iceberg::provider::load_metadata_table_def(
-                self.controls,
-                self.connector_context.clone(),
-                catalog,
-                database,
-                table,
-                metadata_table_type,
-            ),
+            Some(catalog) => {
+                self.loader
+                    .load_metadata_table(catalog, database, table, metadata_table_type)
+            }
         }
     }
 }
@@ -215,8 +299,12 @@ impl PlannerTableProvider for CatalogServiceProvider<'_> {
         Some(self)
     }
 
+    fn query_table_bindings(&self) -> Option<QueryStatisticsPins> {
+        Some(CatalogServiceProvider::query_table_bindings(self))
+    }
+
     fn statistics_pins(&self) -> Option<QueryStatisticsPins> {
-        Some(self.statistics_pins())
+        Some(CatalogServiceProvider::statistics_pins(self))
     }
 }
 
@@ -228,6 +316,46 @@ impl IcebergMetadataTableProvider for CatalogServiceProvider<'_> {
         table: &str,
         metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
     ) -> Result<TableDef, String> {
-        self.iceberg_metadata_table_def(catalog, database, table, metadata_table_type)
+        self.metadata_table_def(catalog, database, table, metadata_table_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn sqlx1_resolution_error_is_memoized_by_canonical_identity() {
+        let bindings = QueryTableBindingStore::default();
+        let attempts = AtomicUsize::new(0);
+
+        let first = bindings.resolve_or_insert(
+            TableBindingKey::strict_base("ICEBERG", "DB", "TABLE"),
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err("missing table".to_string())
+            },
+        );
+        let second = bindings.resolve_or_insert(
+            TableBindingKey::strict_base("iceberg", "db", "table"),
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err("must not run".to_string())
+            },
+        );
+
+        assert!(matches!(first, Err(error) if error == "missing table"));
+        assert!(matches!(second, Err(error) if error == "missing table"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sqlx1_resolution_source_has_no_concrete_provider_dependency() {
+        let source = include_str!("provider.rs");
+        assert!(source.contains("trait QueryTableBindingLoader"));
+        let concrete_provider_path = ["connector::iceberg", "::provider::"].concat();
+        assert!(!source.contains(&concrete_provider_path));
     }
 }

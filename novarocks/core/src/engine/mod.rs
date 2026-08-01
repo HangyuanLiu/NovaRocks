@@ -112,12 +112,14 @@ pub(crate) fn build_catalog_service_provider<'a>(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     lookup_mode: TableLookupMode,
 ) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
-    crate::sql::catalog::provider::CatalogServiceProvider::new(
+    let bindings = Arc::new(crate::sql::catalog::provider::QueryTableBindingStore::default());
+    let loader = query_stats::iceberg_table_binding_loader(controls, connector_context);
+    crate::sql::catalog::provider::CatalogServiceProvider::with_query_table_bindings(
         current_catalog,
         catalog_service,
-        controls,
-        connector_context,
         lookup_mode,
+        bindings,
+        loader,
     )
 }
 
@@ -1332,16 +1334,6 @@ impl StandaloneSession {
                     crate::sql::explain::ExplainLevel::Normal
                 });
                 let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
-                let catalog_snapshot = catalog_service_snapshot
-                    .local()
-                    .read()
-                    .expect("catalog service snapshot local read lock");
-                let connectors_snapshot = self
-                    .inner
-                    .connectors
-                    .read()
-                    .expect("standalone connector registry read lock")
-                    .clone();
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
@@ -1349,20 +1341,20 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
-                let result = if force_logical_explain {
-                    explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
-                } else {
-                    explain_query(
-                        &prepared,
-                        &analyzer_provider,
-                        &catalog_snapshot,
-                        &connectors_snapshot,
-                        current_database,
-                        level,
-                        Some(&self.inner),
-                        &optimizer_settings_for_execution(Some(request_context.execution())),
-                    )?
-                };
+                let result = explain_query_with_sql_compiler_kernel(
+                    &prepared,
+                    &analyzer_provider,
+                    current_catalog,
+                    current_database,
+                    &self.inner,
+                    &connector_context,
+                    request_context.execution(),
+                    if force_logical_explain {
+                        crate::sql::explain::ExplainLevel::Normal
+                    } else {
+                        level
+                    },
+                )?;
                 Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
                     result: StatementResult::Query(result),
                 }))
@@ -1413,16 +1405,6 @@ impl StandaloneSession {
                     )?;
                 }
                 let catalog_service_snapshot = catalog_service_snapshot(&self.inner);
-                let catalog_snapshot = catalog_service_snapshot
-                    .local()
-                    .read()
-                    .expect("catalog service snapshot local read lock");
-                let connectors_snapshot = self
-                    .inner
-                    .connectors
-                    .read()
-                    .expect("standalone connector registry read lock")
-                    .clone();
                 let analyzer_provider = build_catalog_service_provider(
                     current_catalog,
                     &catalog_service_snapshot,
@@ -1430,23 +1412,15 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
-                let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
+                let request = prepare_query_with_sql_compiler_kernel(
                     &prepared,
                     &analyzer_provider,
-                    &catalog_snapshot,
-                    &connectors_snapshot,
+                    current_catalog,
                     current_database,
-                    self.inner.exchange_port,
-                    query_opts,
+                    &self.inner,
                     &connector_context,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&self.inner),
-                    true,
-                    false,
-                    Some(request_context.execution()),
+                    query_opts,
+                    request_context.execution(),
                 )?;
                 Ok(PreparedQueryOperation::Distributed(
                     PreparedDistributedQuery {
@@ -1505,20 +1479,24 @@ impl StandaloneSession {
                 &logical_plan,
                 &mut scalar_arena,
             )?;
-        let mut query_stats = query_stats::QueryStatsCollector::new(
+        let statistics_context =
             query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
                 &self.inner,
                 analyzer_provider.statistics_pins(),
-            ),
-        )
-        .collect(&mut optimizer_expr);
+            );
+        let mut query_stats = query_stats::QueryStatsCollector::new(statistics_context.clone())
+            .collect(&mut optimizer_expr);
         let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+        let mv_definitions =
+            crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(&self.inner)?;
         let mv_candidates = crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            &self.inner,
+            &mv_definitions,
             &analyzer_provider,
             current_database,
             &logical_plan,
             &mut factory,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            &statistics_context,
             &mut query_stats,
             &optimizer_settings,
         );
@@ -1536,11 +1514,12 @@ impl StandaloneSession {
             physical_plan,
             &optimizer_settings,
         )?;
+        let query_table_bindings = analyzer_provider.query_table_bindings();
         let prepared = crate::query_execution::preparation::prepare_fragments(
             &distributed_plan,
-            &connectors_snapshot,
             self.inner.connector_control.as_ref(),
             connector_context,
+            Some(query_table_bindings.as_ref()),
             None,
             scan_preparation_options(&optimizer_settings),
         )?;
@@ -1934,20 +1913,21 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::ExplainStats,
                 );
-                let result = if force_logical_explain {
-                    explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
+                let level = if force_logical_explain {
+                    crate::sql::explain::ExplainLevel::Normal
                 } else {
-                    explain_query(
-                        &prepared,
-                        &analyzer_provider,
-                        &catalog_snapshot,
-                        &connectors_snapshot,
-                        current_database,
-                        level,
-                        Some(&self.inner),
-                        &optimizer_settings_for_execution(Some(request_context.execution())),
-                    )?
+                    level
                 };
+                let result = explain_query_with_sql_compiler_kernel(
+                    &prepared,
+                    &analyzer_provider,
+                    current_catalog,
+                    current_database,
+                    &self.inner,
+                    &connector_context,
+                    request_context.execution(),
+                    level,
+                )?;
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Explain {
@@ -3665,7 +3645,7 @@ fn explain_analyze_query(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = mv_rewrite_state
+    let statistics_context = mv_rewrite_state
         .map(|state| {
             query_stats::QueryStatisticsContext::from_optional_state_with_pins(
                 Some(state),
@@ -3673,16 +3653,18 @@ fn explain_analyze_query(
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
-    let mut query_stats =
-        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let mut query_stats = query_stats::QueryStatsCollector::new(statistics_context.clone())
+        .collect(&mut optimizer_expr);
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mv_candidates = match mv_rewrite_state {
         Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            state,
+            &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
             analyzer_catalog,
             current_database,
             &logical_plan,
             &mut factory,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            &statistics_context,
             &mut query_stats,
             &optimizer_settings,
         ),
@@ -3707,11 +3689,14 @@ fn explain_analyze_query(
         .ok_or_else(|| {
             "distributed explain requires a frontend connector control host".to_string()
         })?;
+    let query_table_bindings = analyzer_catalog
+        .query_table_bindings()
+        .ok_or_else(|| "distributed explain requires query table bindings".to_string())?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        connectors,
         connector_controls,
         connector_context,
+        Some(query_table_bindings.as_ref()),
         None,
         scan_preparation_options(&optimizer_settings),
     )?;
@@ -3889,7 +3874,7 @@ fn explain_query(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = mv_rewrite_state
+    let statistics_context = mv_rewrite_state
         .map(|state| {
             query_stats::QueryStatisticsContext::from_optional_state_with_pins(
                 Some(state),
@@ -3897,17 +3882,19 @@ fn explain_query(
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
-    let mut query_stats =
-        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let mut query_stats = query_stats::QueryStatsCollector::new(statistics_context.clone())
+        .collect(&mut optimizer_expr);
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
     // context, so the gate is only `mv_rewrite_state.is_some()`).
     let mv_candidates = match mv_rewrite_state {
         Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            state,
+            &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
             analyzer_catalog,
             current_database,
             &logical_plan,
             &mut factory,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            &statistics_context,
             &mut query_stats,
             optimizer_settings,
         ),
@@ -4373,9 +4360,9 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        &connectors_snapshot,
         state.connector_control.as_ref(),
         &connector_context,
+        Some(analyzer_provider.query_table_bindings().as_ref()),
         None,
         scan_preparation_options(&optimizer_settings),
     )?;
@@ -4580,9 +4567,9 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        &connectors_snapshot,
         state.connector_control.as_ref(),
         connector_context,
+        None,
         scan_binding_resolver,
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )?;
@@ -5001,6 +4988,156 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         .map_err(|error| error.to_string())
 }
 
+/// Application-owned post-compile assembly for the canonical SQL kernel.
+///
+/// View/virtual rewrites and topology admission happened before this point.
+/// The compiler receives only their immutable SQL projection; preparation and
+/// native encoding receive the exact binding store returned by that same
+/// compilation request.
+#[allow(clippy::too_many_arguments)]
+fn prepare_query_with_sql_compiler_kernel(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    query_opts: Option<QueryOptions>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "SQL compilation requires a non-empty admitted backend topology".to_string()
+        })?;
+    let table_bindings = analyzer_catalog
+        .query_table_bindings()
+        .ok_or_else(|| "SQL compilation requires query table bindings".to_string())?;
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        table_bindings.clone(),
+    );
+    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let mv_definitions = crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?;
+    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
+        crate::sql::compiler::SqlCompileIntent::Query,
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        &catalog_snapshot,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        Some(&mv_definitions),
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            execution.cancellation().clone(),
+        ),
+    );
+    let planning_inputs = crate::sql::compiler::QueryPlanningInputs {
+        compile_request: compiler_request,
+        post_compile: crate::sql::compiler::PostCompilePlanningContext {
+            table_bindings,
+            connector_controls: state.connector_control.as_ref(),
+            connector_context,
+        },
+    };
+    let crate::sql::compiler::SqlCompileOutput::Distributed(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("query intent did not produce a distributed SQL plan".to_string());
+    };
+    ensure_mainline_distributed_execution(
+        false,
+        state.iceberg_catalogs.read().is_ok(),
+        state.exchange_port,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &compiled.distributed_plan,
+        planning_inputs.post_compile.connector_controls,
+        planning_inputs.post_compile.connector_context,
+        Some(planning_inputs.post_compile.table_bindings.as_ref()),
+        None,
+        scan_preparation_options(execution.optimizer_settings()),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &compiled.distributed_plan,
+        &prepared,
+    )?;
+    crate::query_execution::contract::build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        query_opts,
+        crate::query_execution::contract::DistributedQueryIntent::Result,
+        execution,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explain_query_with_sql_compiler_kernel(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    state: &Arc<StandaloneState>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    level: crate::sql::explain::ExplainLevel,
+) -> Result<QueryResult, String> {
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "SQL compilation requires a non-empty admitted backend topology".to_string()
+        })?;
+    let table_bindings = analyzer_catalog
+        .query_table_bindings()
+        .ok_or_else(|| "SQL compilation requires query table bindings".to_string())?;
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        table_bindings.clone(),
+    );
+    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let mv_definitions = crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?;
+    let planning_inputs = crate::sql::compiler::QueryPlanningInputs {
+        compile_request: crate::sql::compiler::SqlCompileRequest::new(
+            crate::sql::compiler::SqlStatementInput::RewriteCompleteSql(query.to_string()),
+            crate::sql::compiler::SqlCompileIntent::Explain {
+                level,
+                analyze: false,
+            },
+            crate::sql::compiler::SqlSessionContext {
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+            &catalog_snapshot,
+            &statistics,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            Some(&mv_definitions),
+            crate::sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                execution.cancellation().clone(),
+            ),
+        ),
+        post_compile: crate::sql::compiler::PostCompilePlanningContext {
+            table_bindings,
+            connector_controls: state.connector_control.as_ref(),
+            connector_context,
+        },
+    };
+    let crate::sql::compiler::SqlCompileOutput::ImmediateExplain(lines) =
+        crate::sql::compiler::SqlCompiler::compile(planning_inputs.compile_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("EXPLAIN intent did not produce immediate SQL facts".to_string());
+    };
+    build_string_query_result("Explain String", lines)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     query: &sqlparser::ast::Query,
@@ -5055,7 +5192,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = mv_rewrite_state
+    let statistics_context = mv_rewrite_state
         .map(|state| {
             query_stats::QueryStatisticsContext::from_optional_state_with_pins(
                 Some(state),
@@ -5063,8 +5200,8 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
-    let mut query_stats =
-        query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let mut query_stats = query_stats::QueryStatsCollector::new(statistics_context.clone())
+        .collect(&mut optimizer_expr);
     // MV query rewrite: discover fresh Iceberg MV candidates and inject their
     // target-table stats. Gated on a standalone-rewrite path (`Some(state)`)
     // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
@@ -5072,11 +5209,13 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     let mv_candidates = match mv_rewrite_state {
         Some(state) if allow_mv_rewrite_candidates && mv_refresh_ctx.is_none() => {
             crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-                state,
+                &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
                 analyzer_catalog,
                 current_database,
                 &logical_plan,
                 &mut factory,
+                crate::sql::functions::builtin_sql_function_catalog(),
+                &statistics_context,
                 &mut query_stats,
                 &optimizer_settings,
             )
@@ -5122,9 +5261,9 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         })?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        connectors,
         connector_controls,
         connector_context,
+        analyzer_catalog.query_table_bindings().as_deref(),
         scan_binding_resolver,
         scan_preparation_options(&optimizer_settings),
     )?;
@@ -5234,9 +5373,9 @@ pub(crate) fn execute_logical_plan_with_options(
         })?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
-        connectors,
         connector_controls,
         &connector_context,
+        None,
         scan_binding_resolver,
         scan_preparation_options(&optimizer_settings),
     )?;
