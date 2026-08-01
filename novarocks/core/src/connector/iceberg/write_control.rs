@@ -1323,4 +1323,38 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn first_refresh_payload_is_canonical_and_rejects_unsafe_facts() {
+        let payload = IcebergFirstRefreshWritePlanPayloadV2 {
+            version: 2,
+            target: "db.mv_target".to_string(),
+            target_ref: "refresh-staging".to_string(),
+            expected_snapshot_id: Some(7),
+            staging_path: "s3://warehouse/db/mv_target/data/_staging/attempt".to_string(),
+            provenance_properties: BTreeMap::from([(
+                "novarocks.mv.refresh.id".to_string(),
+                "42".to_string(),
+            )]),
+        }
+        .encode()
+        .expect("encode first-refresh payload");
+        assert_eq!(
+            IcebergFirstRefreshWritePlanPayloadV2::decode(&payload)
+                .expect("decode first-refresh payload")
+                .expected_snapshot_id,
+            Some(7)
+        );
+        let error = IcebergFirstRefreshWritePlanPayloadV2 {
+            version: 2,
+            target: "db.mv_target".to_string(),
+            target_ref: "refresh-staging".to_string(),
+            expected_snapshot_id: Some(-1),
+            staging_path: "s3://warehouse/db/mv_target/data/_staging/attempt".to_string(),
+            provenance_properties: BTreeMap::new(),
+        }
+        .encode()
+        .expect_err("negative snapshot must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
 }
