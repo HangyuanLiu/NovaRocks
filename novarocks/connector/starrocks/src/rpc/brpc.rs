@@ -104,6 +104,7 @@ impl StarRocksBrpcReader {
         )?;
         self.metrics.read_requests += 1;
         self.metrics.bytes_read += bytes.len() as u64;
+        validate_fetch_result_wire(&bytes)?;
         let response = FetchResult::decode(bytes).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -485,6 +486,116 @@ fn corrupt<T>() -> Result<T, ConnectorError> {
     Err(ConnectorError::new(
         ConnectorErrorKind::CorruptData,
         "malformed StarRocks ColumnArraySerde payload",
+    ))
+}
+
+/// Prost deliberately preserves unknown protobuf fields. The remote-scan
+/// snapshot is closed, so reject them before the generated DTO is decoded.
+fn validate_fetch_result_wire(bytes: &[u8]) -> Result<(), ConnectorError> {
+    let fields = wire_fields(bytes, &[1, 2, 3, 4])?;
+    for (field, payload) in fields {
+        match field {
+            1 => {
+                wire_fields(payload, &[1, 2])?;
+            }
+            4 => {
+                wire_fields(payload, &[1, 2, 4, 5, 6, 9, 10])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn wire_fields<'a>(
+    bytes: &'a [u8],
+    allowed: &[u32],
+) -> Result<Vec<(u32, &'a [u8])>, ConnectorError> {
+    let mut cursor = 0;
+    let mut fields = Vec::new();
+    while cursor < bytes.len() {
+        let key = read_varint(bytes, &mut cursor)?;
+        let field = (key >> 3) as u32;
+        if field == 0 || !allowed.contains(&field) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "StarRocks remote protobuf contains an unknown field",
+            ));
+        }
+        match key & 7 {
+            0 => {
+                read_varint(bytes, &mut cursor)?;
+            }
+            1 => {
+                cursor = cursor
+                    .checked_add(8)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "truncated StarRocks remote protobuf",
+                        )
+                    })?;
+            }
+            2 => {
+                let length = usize::try_from(read_varint(bytes, &mut cursor)?).map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "invalid StarRocks remote protobuf length",
+                    )
+                })?;
+                let end = cursor
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "truncated StarRocks remote protobuf",
+                        )
+                    })?;
+                fields.push((field, &bytes[cursor..end]));
+                cursor = end;
+            }
+            5 => {
+                cursor = cursor
+                    .checked_add(4)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            "truncated StarRocks remote protobuf",
+                        )
+                    })?;
+            }
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "unsupported StarRocks remote protobuf wire type",
+                ));
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64, ConnectorError> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*cursor).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "truncated StarRocks remote protobuf",
+            )
+        })?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(ConnectorError::new(
+        ConnectorErrorKind::CorruptData,
+        "invalid StarRocks remote protobuf varint",
     ))
 }
 

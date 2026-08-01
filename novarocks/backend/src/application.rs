@@ -930,6 +930,13 @@ mod tests {
     }
 
     #[test]
+    fn starrocks_execution_host_rpc_read_production_binding_is_unavailable() {
+        // The production installer is transport-neutral and deliberately owns
+        // an empty startup-local binding map until a catalog supplies one.
+        starrocks_execution_host_direct_read_production_binding_is_unavailable();
+    }
+
+    #[test]
     fn starrocks_execution_host_direct_read_leases_and_retires_configured_binding() {
         let host = ConnectorExecutionHost::new();
         let mut bindings = StarRocksExecutionBindings::new();

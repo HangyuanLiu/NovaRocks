@@ -1028,6 +1028,36 @@ mod tests {
     }
 
     #[test]
+    fn starrocks_control_host_rpc_read_keeps_the_exact_planning_lease_until_retire() {
+        let host = ConnectorControlHost::new();
+        let binding = starrocks_binding();
+        let instance = binding.descriptor().instance_id.clone();
+        let key = binding
+            .execution_declaration(&starrocks_context())
+            .expect("declaration")
+            .binding_key();
+        host.register(binding).expect("register RPC generation");
+        let lease = host
+            .acquire_current(&instance)
+            .expect("exact planning lease");
+        assert_eq!(
+            lease
+                .binding()
+                .execution_declaration(&starrocks_context())
+                .expect("lease declaration")
+                .binding_key(),
+            key
+        );
+
+        host.retire_current(&instance)
+            .expect("retire RPC generation");
+        assert!(host.acquire_current(&instance).is_err());
+        assert_eq!(lease.binding().incarnation(), key.incarnation);
+        drop(lease);
+        assert_eq!(host.take_ready_retires().expect("ready retire").len(), 1);
+    }
+
+    #[test]
     fn starrocks_control_host_direct_read_plans_a_frozen_fixture_split() {
         let host = ConnectorControlHost::new();
         let binding = starrocks_direct_binding();
