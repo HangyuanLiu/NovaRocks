@@ -30,6 +30,15 @@ use crate::query_execution::preparation::PreparedFragmentSet;
 pub use crate::query_execution::profile::ProfileTerminalBuilder;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
+use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteIntent,
+    ConnectorWriteOperationId, ConnectorWritePlanningRequest,
+};
+
+use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 
 /// Coordinator-neutral query identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -148,6 +157,195 @@ pub enum DistributedQueryIntent {
     Profile,
 }
 
+/// DML-owned facts required to plan one provider-neutral writer manifest
+/// after frontend placement.  The request deliberately excludes execution ID
+/// and expected writers: both are derived from the immutable placement and
+/// cannot be supplied by a pre-scheduling caller.
+#[derive(Clone)]
+pub struct ConnectorWritePlanningTemplate {
+    operation_id: ConnectorWriteOperationId,
+    cohort_id: ConnectorWriteCohortId,
+    table: ConnectorTableHandle,
+    intent: ConnectorWriteIntent,
+    input_schema: SchemaRef,
+    provider_payload: Bytes,
+    context: ConnectorRequestContext,
+}
+
+impl ConnectorWritePlanningTemplate {
+    pub fn new(
+        operation_id: ConnectorWriteOperationId,
+        table: ConnectorTableHandle,
+        intent: ConnectorWriteIntent,
+        input_schema: SchemaRef,
+        provider_payload: Bytes,
+        context: ConnectorRequestContext,
+    ) -> Self {
+        Self::new_in_cohort(
+            operation_id,
+            ConnectorWriteCohortId::primary(operation_id),
+            table,
+            intent,
+            input_schema,
+            provider_payload,
+            context,
+        )
+    }
+
+    pub fn new_in_cohort(
+        operation_id: ConnectorWriteOperationId,
+        cohort_id: ConnectorWriteCohortId,
+        table: ConnectorTableHandle,
+        intent: ConnectorWriteIntent,
+        input_schema: SchemaRef,
+        provider_payload: Bytes,
+        context: ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            operation_id,
+            cohort_id,
+            table,
+            intent,
+            input_schema,
+            provider_payload,
+            context,
+        }
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
+        self.cohort_id
+    }
+
+    pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
+        self.table.owner()
+    }
+
+    pub const fn intent(&self) -> ConnectorWriteIntent {
+        self.intent
+    }
+
+    pub fn context(&self) -> &ConnectorRequestContext {
+        &self.context
+    }
+
+    pub fn stable_digest(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+    ) -> Result<[u8; 32], ConnectorError> {
+        self.clone()
+            .into_request(ConnectorWriteExecutionId::new([0; 16], 0))
+            .stable_digest(owner)
+    }
+
+    pub fn into_request(
+        self,
+        execution_id: ConnectorWriteExecutionId,
+    ) -> ConnectorWritePlanningRequest {
+        ConnectorWritePlanningRequest {
+            operation_id: self.operation_id,
+            cohort_id: self.cohort_id,
+            execution_id,
+            table: self.table,
+            intent: self.intent,
+            input_schema: self.input_schema,
+            expected_writers: Vec::new(),
+            provider_payload: self.provider_payload,
+            context: self.context,
+        }
+    }
+}
+
+/// The complete provider-neutral cohort registration supplied before any
+/// writer attempt may be planned.  Frontend consumes this value exactly once
+/// to acquire one exact-generation lease and seal the immutable cohort set.
+pub struct ConnectorWriteOperationRegistration {
+    operation_id: ConnectorWriteOperationId,
+    connector_instance_id: novarocks_spi::connector::ConnectorInstanceId,
+    cohorts: Vec<ConnectorWritePlanningTemplate>,
+}
+
+impl ConnectorWriteOperationRegistration {
+    pub fn try_new(
+        cohorts: Vec<ConnectorWritePlanningTemplate>,
+    ) -> Result<Self, DistributedQueryError> {
+        let first = cohorts.first().ok_or_else(|| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write operation registration has no cohorts",
+            )
+        })?;
+        let operation_id = first.operation_id();
+        let connector_instance_id = first.connector_instance_id().clone();
+        let mut cohort_ids = std::collections::BTreeSet::new();
+        for cohort in &cohorts {
+            if cohort.operation_id() != operation_id
+                || cohort.connector_instance_id() != &connector_instance_id
+                || !cohort_ids.insert(cohort.cohort_id())
+            {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    "connector write operation registration contains a foreign or duplicate cohort",
+                ));
+            }
+        }
+        Ok(Self {
+            operation_id,
+            connector_instance_id,
+            cohorts,
+        })
+    }
+
+    pub fn single(cohort: ConnectorWritePlanningTemplate) -> Self {
+        Self::try_new(vec![cohort]).expect("one connector write cohort is a valid registration")
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
+        &self.connector_instance_id
+    }
+
+    pub fn into_cohorts(self) -> Vec<ConnectorWritePlanningTemplate> {
+        self.cohorts
+    }
+}
+
+/// One sealed cohort selected for a concrete distributed execution attempt.
+#[derive(Clone)]
+pub struct ConnectorWriteExecutionRegistration {
+    session: ConnectorWriteOperationSession,
+    cohort_id: ConnectorWriteCohortId,
+}
+
+impl ConnectorWriteExecutionRegistration {
+    pub fn try_new(
+        session: ConnectorWriteOperationSession,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<Self, DistributedQueryError> {
+        if !session.contains_cohort(cohort_id) {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write execution references a cohort outside the sealed operation",
+            ));
+        }
+        Ok(Self { session, cohort_id })
+    }
+
+    pub fn session(&self) -> &ConnectorWriteOperationSession {
+        &self.session
+    }
+
+    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
+        self.cohort_id
+    }
+}
+
 /// An owned request passed from core to the injected execution coordinator.
 ///
 /// Every field is private so role crates cannot assemble a request from
@@ -160,6 +358,7 @@ pub struct DistributedQueryRequest {
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
+    connector_write: Option<ConnectorWriteExecutionRegistration>,
 }
 
 impl DistributedQueryRequest {
@@ -187,6 +386,10 @@ impl DistributedQueryRequest {
         self.deadline
     }
 
+    pub fn connector_write(&self) -> Option<&ConnectorWriteExecutionRegistration> {
+        self.connector_write.as_ref()
+    }
+
     pub fn into_parts(self) -> DistributedQueryRequestParts {
         DistributedQueryRequestParts {
             artifacts: self.artifacts,
@@ -195,6 +398,7 @@ impl DistributedQueryRequest {
             deadline: self.deadline,
             cancellation: self.cancellation,
             completion: self.completion,
+            connector_write: self.connector_write,
         }
     }
 }
@@ -208,6 +412,7 @@ pub struct DistributedQueryRequestParts {
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
+    pub connector_write: Option<ConnectorWriteExecutionRegistration>,
 }
 
 /// Request construction accepts only the execution projection captured at
@@ -227,7 +432,31 @@ pub(crate) fn build_distributed_query_request_with_execution(
         deadline: execution.deadline(),
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
+        connector_write: None,
     })
+}
+
+/// Attach a placement-deferred connector writer request to an otherwise
+/// sealed distributed execution request.  Only the core request builder can
+/// invoke this: callers cannot recombine prepared/native artifacts.
+pub(crate) fn with_connector_write_operation(
+    mut request: DistributedQueryRequest,
+    registration: ConnectorWriteExecutionRegistration,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    if request.intent() != DistributedQueryIntent::Write {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "connector write planning is only valid for distributed write requests",
+        ));
+    }
+    if request.connector_write.is_some() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "distributed query already has a connector write planning template",
+        ));
+    }
+    request.connector_write = Some(registration);
+    Ok(request)
 }
 
 /// Stable error categories exposed by the coordinator boundary.
@@ -273,6 +502,16 @@ impl std::error::Error for DistributedQueryError {}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {
+    fn begin_write_operation(
+        &self,
+        _registration: ConnectorWriteOperationRegistration,
+    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator has no connector write operation service",
+        ))
+    }
+
     fn execute(
         &self,
         request: DistributedQueryRequest,

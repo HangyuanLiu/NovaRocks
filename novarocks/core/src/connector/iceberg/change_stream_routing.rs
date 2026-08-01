@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use iceberg::spec::TableMetadata;
 
 use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
-use crate::query_execution::write::WriteCommitInput;
+use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology;
@@ -118,6 +118,15 @@ pub(crate) struct ChangeStreamRoutedWriterFiles {
     pub(crate) fresh: Vec<WrittenFile>,
 }
 
+/// One logical generic writer's provider-private staged reports.  The
+/// fragment ID comes from the immutable writer identity, rather than from a
+/// legacy query-level commit carrier.
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeStreamWriterReports {
+    pub(crate) fragment_id: i32,
+    pub(crate) reports: Vec<IcebergWriterReport>,
+}
+
 impl ChangeStreamRoutedWriterFiles {
     fn converted_files(&self) -> Vec<WrittenFile> {
         self.reuse_or_dv
@@ -171,24 +180,20 @@ impl ChangeStreamWriterRoutingError {
     }
 }
 
-pub(crate) fn route_change_stream_writer_reports(
+/// Route generic provider-private reports according to the writer identity
+/// frozen in the change-stream manifest.  This is the carrier-neutral path
+/// used by the connector control adapter; no native Iceberg commit DTO is
+/// decoded here.
+pub(crate) fn route_change_stream_staged_reports(
     collector: &IcebergCommitCollector,
-    table_metadata: &TableMetadata,
-    write_commit: &WriteCommitInput,
+    reports: impl IntoIterator<Item = ChangeStreamWriterReports>,
     plan: &ChangeStreamWriterCommitPlan,
 ) -> Result<ChangeStreamRoutedWriterFiles, ChangeStreamWriterRoutingError> {
     let mut routed = ChangeStreamRoutedWriterFiles::default();
 
-    for writer in &write_commit.writers {
-        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
-            writer.iceberg_commits.clone(),
-            table_metadata,
-        )
-        .map_err(|message| {
-            ChangeStreamWriterRoutingError::new(message, routed.converted_files())
-        })?;
-        let mut writer_files = Vec::with_capacity(reports.len());
-        for report in reports {
+    for writer in reports {
+        let mut writer_files = Vec::with_capacity(writer.reports.len());
+        for report in writer.reports {
             let file = collector.convert_writer_report(report).map_err(|message| {
                 ChangeStreamWriterRoutingError::new(
                     message,
@@ -198,7 +203,15 @@ pub(crate) fn route_change_stream_writer_reports(
             writer_files.push(file);
         }
         let branch = plan
-            .branch_for_fragment_id(writer.fragment_id)
+            .branch_for_fragment_id(u32::try_from(writer.fragment_id).map_err(|_| {
+                ChangeStreamWriterRoutingError::new(
+                    format!(
+                        "generic change-stream writer fragment {} is negative",
+                        writer.fragment_id
+                    ),
+                    routed.converted_files_with(&writer_files),
+                )
+            })?)
             .map_err(|message| {
                 ChangeStreamWriterRoutingError::new(
                     message,
@@ -235,9 +248,6 @@ mod tests {
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
-    use crate::proto::novarocks;
-    use crate::query_execution::write::{WriteCommitInput, WriterCommitInput, WriterKey};
-    use crate::runtime::sink_commit::writer_report_to_iceberg_commit_info;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()
@@ -277,11 +287,8 @@ mod tests {
         .with_table_metadata(metadata.clone())
     }
 
-    fn sink_commit_info_for_data_file(
-        metadata: &TableMetadata,
-        path: &str,
-    ) -> novarocks::IcebergCommitInfo {
-        let report = IcebergWriterReport {
+    fn writer_report_for_data_file(metadata: &TableMetadata, path: &str) -> IcebergWriterReport {
+        IcebergWriterReport {
             file: IcebergWrittenFileReport {
                 path: path.to_string(),
                 format: "parquet".to_string(),
@@ -306,130 +313,50 @@ mod tests {
             },
             is_overwrite: None,
             is_rewrite: None,
-        };
-        writer_report_to_iceberg_commit_info(report, metadata).expect("wire encode")
-    }
-
-    fn writer_key(query_id: UniqueId, backend_num: i32) -> WriterKey {
-        WriterKey {
-            query_id,
-            fragment_instance_id: UniqueId {
-                hi: -7_553_829_481_223_774_409,
-                lo: -2_319_882_701_944_413_767 + i64::from(backend_num),
-            },
-            backend_num,
-        }
-    }
-
-    fn write_commit_for_fragments(
-        metadata: &TableMetadata,
-        fragments: Vec<(i32, &str)>,
-    ) -> WriteCommitInput {
-        let query_id = UniqueId { hi: 10, lo: 20 };
-        let writers = fragments
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (writer_fragment_id, path))| {
-                let backend_num = idx as i32;
-                WriterCommitInput {
-                    writer_id: idx,
-                    fragment_id: writer_fragment_id as u32,
-                    writer_key: writer_key(query_id, backend_num),
-                    iceberg_commits: vec![sink_commit_info_for_data_file(metadata, path)],
-                    load_counters: BTreeMap::new(),
-                    loaded_rows: 2,
-                    loaded_bytes: 128,
-                    filtered_rows: 0,
-                }
-            })
-            .collect();
-        WriteCommitInput {
-            write_id: query_id,
-            writers,
         }
     }
 
     #[test]
-    fn change_stream_commit_routes_attempt_bound_finst_by_explicit_fragment() {
+    fn change_stream_commit_routes_provider_reports_without_legacy_carrier() {
         let metadata = test_unpartitioned_metadata();
         let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
-        let write_commit = write_commit_for_fragments(
-            &metadata,
-            vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
-        );
         let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
             (10, ChangeStreamBranchKind::ReuseData),
             (11, ChangeStreamBranchKind::FreshData),
         ]));
+        route_change_stream_staged_reports(
+            &collector,
+            vec![
+                ChangeStreamWriterReports {
+                    fragment_id: 10,
+                    reports: vec![writer_report_for_data_file(&metadata, "reuse.parquet")],
+                },
+                ChangeStreamWriterReports {
+                    fragment_id: 11,
+                    reports: vec![writer_report_for_data_file(&metadata, "fresh.parquet")],
+                },
+            ],
+            &plan,
+        )
+        .expect("route provider reports")
+        .inject(&collector);
 
-        route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
-            .expect("route writer reports")
-            .inject(&collector);
-
-        let written = collector.take_written_files().expect("written channel");
         assert_eq!(
-            written.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            collector
+                .take_written_files()
+                .expect("written channel")
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
             vec!["reuse.parquet"]
         );
-        let appended = collector.take_appended_files();
         assert_eq!(
-            appended.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
-            vec!["fresh.parquet"]
-        );
-        assert!(
-            written
+            collector
+                .take_appended_files()
                 .iter()
-                .chain(appended.iter())
-                .all(|f| f.content == DataContentType::Data)
-        );
-    }
-
-    #[test]
-    fn change_stream_commit_routes_overwrite_fresh_files_to_written_channel() {
-        let metadata = test_unpartitioned_metadata();
-        let collector = test_collector(&metadata, CommitOpKind::Overwrite);
-        let write_commit = write_commit_for_fragments(
-            &metadata,
-            vec![(10, "reuse.parquet"), (11, "fresh.parquet")],
-        );
-        let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([
-            (10, ChangeStreamBranchKind::ReuseData),
-            (11, ChangeStreamBranchKind::FreshData),
-        ]));
-
-        route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
-            .expect("route writer reports")
-            .inject(&collector);
-
-        let written = collector.take_written_files().expect("written channel");
-        assert_eq!(
-            written.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
-            vec!["reuse.parquet", "fresh.parquet"]
-        );
-        assert!(collector.take_appended_files().is_empty());
-    }
-
-    #[test]
-    fn change_stream_commit_rejects_unknown_writer_fragment() {
-        let metadata = test_unpartitioned_metadata();
-        let collector = test_collector(&metadata, CommitOpKind::RowDeltaDvFromFiles);
-        let write_commit = write_commit_for_fragments(&metadata, vec![(12, "unknown.parquet")]);
-        let plan = ChangeStreamWriterCommitPlan::new(BTreeMap::from([(
-            10,
-            ChangeStreamBranchKind::ReuseData,
-        )]));
-
-        let err = route_change_stream_writer_reports(&collector, &metadata, &write_commit, &plan)
-            .expect_err("unknown writer fragment");
-        let (message, converted) = err.into_parts();
-
-        assert!(message.contains("writer fragment 12 is not declared"));
-        assert_eq!(
-            converted
-                .iter()
-                .map(|f| f.path.as_str())
+                .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["unknown.parquet"]
+            vec!["fresh.parquet"]
         );
     }
 

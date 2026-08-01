@@ -29,14 +29,11 @@ use novarocks::exec::expr::ExprArena;
 use novarocks::exec::fragment::program::FragmentSinkSpec;
 use novarocks::exec::fragment::sink::{
     DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-    IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
-    IcebergTableSinkProgram, MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
+    MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
+    build_change_stream_split_predicate,
 };
 use novarocks::exec::node::ExecPlan;
-use novarocks::exec::operators::{
-    DataStreamSinkFactoryInput, IcebergChangeStreamRouterBranchFactoryInput,
-    IcebergChangeStreamRouterSinkFactoryInput,
-};
+use novarocks::exec::operators::DataStreamSinkFactoryInput;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::endpoint::FragmentDestination;
 use novarocks::runtime::fragment::instance::FragmentSinkAssignment;
@@ -238,7 +235,18 @@ fn split_inputs_from_compat(
         .collect()
 }
 
-pub(crate) fn iceberg_router_input_from_compat(
+struct CompatChangeStreamRouterBranchInput {
+    branch_kind: novarocks::sql::common::ChangeStreamBranchKind,
+    stream_sink: DataStreamSinkFactoryInput,
+}
+
+struct CompatChangeStreamRouterInput {
+    change_op_slot_id: i32,
+    data_route_slot_id: Option<i32>,
+    branches: Vec<CompatChangeStreamRouterBranchInput>,
+}
+
+fn change_stream_router_input_from_compat(
     router: &data_sinks::TIcebergChangeStreamRouterSink,
     router_path: FieldPath,
     arena: &mut ExprArena,
@@ -247,7 +255,7 @@ pub(crate) fn iceberg_router_input_from_compat(
     external_dependencies: Option<
         &crate::protocol::starrocks::decode::StarRocksExternalDependencyDraft,
     >,
-) -> Result<IcebergChangeStreamRouterSinkFactoryInput, StarRocksFragmentDecodeError> {
+) -> Result<CompatChangeStreamRouterInput, StarRocksFragmentDecodeError> {
     let branches = router
         .branches
         .iter()
@@ -260,8 +268,7 @@ pub(crate) fn iceberg_router_input_from_compat(
                     detail,
                 )
             })?;
-            Ok(IcebergChangeStreamRouterBranchFactoryInput {
-                branch_id: branch.branch_id,
+            Ok(CompatChangeStreamRouterBranchInput {
                 branch_kind,
                 stream_sink: data_stream_input_from_compat(
                     &branch.stream_sink,
@@ -276,7 +283,7 @@ pub(crate) fn iceberg_router_input_from_compat(
             })
         })
         .collect::<Result<Vec<_>, StarRocksFragmentDecodeError>>()?;
-    Ok(IcebergChangeStreamRouterSinkFactoryInput {
+    Ok(CompatChangeStreamRouterInput {
         change_op_slot_id: router.change_op_slot_id,
         data_route_slot_id: router.data_route_slot_id,
         branches,
@@ -352,6 +359,11 @@ pub(crate) fn decode_fragment_sink(
     last_query_id: Option<&str>,
     session_time_zone: Option<&str>,
     external_dependencies: &StarRocksExternalDependencyDraft,
+    compat_iceberg_execution: Option<
+        &std::sync::Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+    >,
+    compat_connector_writer: Option<&novarocks_spi::connector::ConnectorWriterIdentity>,
+    compat_connector_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
     sink_path: FieldPath,
     fragment_path: FieldPath,
 ) -> Result<DecodedStarRocksFragmentSink, StarRocksFragmentDecodeError> {
@@ -525,21 +537,21 @@ pub(crate) fn decode_fragment_sink(
             )
         }
         data_sinks::TDataSinkType::ICEBERG_CHANGE_STREAM_ROUTER_SINK => {
-            let router_path = sink_path.clone().field("iceberg_change_stream_router_sink");
+            let router_path = sink_path.clone().field("change_stream_router_sink");
             let router = sink
                 .iceberg_change_stream_router_sink
                 .as_ref()
                 .ok_or_else(|| {
                     StarRocksFragmentDecodeError::missing(
                         router_path.clone(),
-                        "ICEBERG_CHANGE_STREAM_ROUTER_SINK missing iceberg_change_stream_router_sink",
+                        "CHANGE_STREAM_ROUTER_SINK missing change_stream_router_sink",
                     )
                 })?;
             let mut sink_arena = arena.clone();
             let input = external_dependencies.with_expr_arena_owner(
-                FragmentExprArenaOwner::IcebergChangeStreamRouter,
+                FragmentExprArenaOwner::ChangeStreamRouter,
                 || {
-                    iceberg_router_input_from_compat(
+                    change_stream_router_input_from_compat(
                         router,
                         router_path.clone(),
                         &mut sink_arena,
@@ -566,41 +578,42 @@ pub(crate) fn decode_fragment_sink(
                         detail,
                     )
                 })?;
-            let (branches, groups): (Vec<_>, Vec<_>) = input
-                .branches
-                .into_iter()
-                .enumerate()
-                .map(|(index, branch)| {
-                    let (stream, destinations) = static_branch_from_factory_input(
-                        branch.stream_sink,
-                        None,
-                        router_path
-                            .clone()
-                            .field("branches")
-                            .index(index)
-                            .field("stream_sink"),
-                    )?;
-                    Ok((
-                        IcebergChangeStreamRouterBranchProgram::new(
-                            branch.branch_id,
-                            branch.branch_kind,
-                            stream,
-                        ),
-                        destinations,
-                    ))
-                })
-                .collect::<Result<Vec<_>, StarRocksFragmentDecodeError>>()?
-                .into_iter()
-                .unzip();
-            let program = IcebergChangeStreamRouterProgram::try_new(
-                change_op_slot_id,
-                data_route_slot_id,
-                branches,
-                sink_arena,
-            )
-            .map_err(|detail| StarRocksFragmentDecodeError::invalid_value(router_path, detail))?;
+            let mut streams = Vec::with_capacity(input.branches.len());
+            let mut split_exprs = Vec::with_capacity(input.branches.len());
+            let mut groups = Vec::with_capacity(input.branches.len());
+            for (index, branch) in input.branches.into_iter().enumerate() {
+                let (stream, destinations) = static_branch_from_factory_input(
+                    branch.stream_sink,
+                    None,
+                    router_path
+                        .clone()
+                        .field("branches")
+                        .index(index)
+                        .field("stream_sink"),
+                )?;
+                split_exprs.push(
+                    build_change_stream_split_predicate(
+                        &mut sink_arena,
+                        change_op_slot_id,
+                        data_route_slot_id,
+                        branch.branch_kind,
+                    )
+                    .map_err(|detail| {
+                        StarRocksFragmentDecodeError::invalid_value(
+                            router_path.clone().field("branches").index(index),
+                            detail,
+                        )
+                    })?,
+                );
+                streams.push(stream);
+                groups.push(destinations);
+            }
+            let program = SplitDataStreamSinkProgram::try_new(streams, split_exprs, sink_arena)
+                .map_err(|detail| {
+                    StarRocksFragmentDecodeError::invalid_value(router_path, detail)
+                })?;
             decoded_compat_sink(
-                FragmentSinkProgram::IcebergChangeStreamRouter(program),
+                FragmentSinkProgram::SplitDataStream(program),
                 FragmentSinkAssignment::DestinationGroups { groups, sender_id },
                 sink_path,
             )
@@ -638,6 +651,30 @@ pub(crate) fn decode_fragment_sink(
         | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
         | data_sinks::TDataSinkType::ICEBERG_DV_SINK
         | data_sinks::TDataSinkType::ICEBERG_EQUALITY_DELETE_SINK => {
+            let compat_iceberg_execution = compat_iceberg_execution.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    sink_path.clone(),
+                    "Iceberg sink requires the startup-composed compat execution binding",
+                )
+            })?;
+            let compat_connector_writer = compat_connector_writer.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    sink_path.clone(),
+                    "Iceberg sink requires a batch-frozen connector writer identity",
+                )
+            })?;
+            if compat_connector_writer.binding_key() != compat_iceberg_execution.key() {
+                return Err(StarRocksFragmentDecodeError::invalid_value(
+                    sink_path.clone(),
+                    "compat connector writer owner does not match the exact execution binding",
+                ));
+            }
+            let compat_connector_context = compat_connector_context.ok_or_else(|| {
+                StarRocksFragmentDecodeError::missing(
+                    sink_path.clone(),
+                    "Iceberg sink requires a bounded connector writer request context",
+                )
+            })?;
             let sink_type_name = iceberg_sink_type_name(sink.type_);
             let iceberg_sink_path = sink_path.clone().field("iceberg_table_sink");
             let iceberg_sink = sink.iceberg_table_sink.as_ref().ok_or_else(|| {
@@ -677,12 +714,21 @@ pub(crate) fn decode_fragment_sink(
                 ),
             )
             .map_err(|error| error.into_fragment(iceberg_sink_path.clone()))?;
-            let program =
-                IcebergTableSinkProgram::try_from_factory_input(input).map_err(|detail| {
-                    StarRocksFragmentDecodeError::invalid_value(iceberg_sink_path, detail)
-                })?;
+            let program = novarocks::connector::iceberg::plan_compat_connector_write(
+                std::sync::Arc::clone(compat_iceberg_execution),
+                compat_connector_writer.clone(),
+                input,
+                lowered.layout.order.len(),
+                compat_connector_context.clone(),
+            )
+            .map_err(|detail| {
+                StarRocksFragmentDecodeError::invalid_value(iceberg_sink_path, detail)
+            })?;
+            eprintln!(
+                "compat_connector_write carrier=common collector=fragment_owned projector=provider_owned"
+            );
             let mut decoded = decoded_compat_sink(
-                FragmentSinkProgram::IcebergTable(program),
+                FragmentSinkProgram::ConnectorWrite(program),
                 FragmentSinkAssignment::None,
                 sink_path,
             )?;
@@ -725,7 +771,7 @@ pub(crate) fn decode_fragment_sink(
         other => Err(StarRocksFragmentDecodeError::unsupported(
             sink_path.field("type"),
             format!(
-                "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, ICEBERG_CHANGE_STREAM_ROUTER_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
+                "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, CHANGE_STREAM_ROUTER_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, ICEBERG_EQUALITY_DELETE_SINK, and OLAP_TABLE_SINK are supported",
                 other
             ),
         )),

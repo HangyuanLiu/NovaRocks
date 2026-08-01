@@ -257,7 +257,10 @@ pub(in crate::sql::planner::distributed) fn build_topology_contract(
 /// planner never imports codegen: an Iceberg write is a terminal write; result,
 /// noop, and change-stream router sinks are not.
 fn is_terminal_write(sink: &DataSink) -> bool {
-    matches!(sink, DataSink::IcebergWrite(_))
+    match sink {
+        DataSink::ConnectorWrite(_) => true,
+        _ => false,
+    }
 }
 
 /// Return the fragment ids in topological order (leaves first, root last).
@@ -390,7 +393,7 @@ mod tests {
         simple_sink_spec, unpartitioned_metadata_json,
     };
     use crate::sql::planner::distributed::write::sink::{
-        IcebergWriteFragmentSink, IcebergWriteInputBinding,
+        ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
     };
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
@@ -447,10 +450,10 @@ mod tests {
     }
 
     fn iceberg_write_sink() -> DataSink {
-        DataSink::IcebergWrite(IcebergWriteFragmentSink {
-            descriptor_database: "test_db".to_string(),
-            spec: simple_sink_spec(),
-            input: IcebergWriteInputBinding::RootOutputByOrdinal,
+        DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
+            handle: None,
+            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
+            output_contract: None,
         })
     }
 

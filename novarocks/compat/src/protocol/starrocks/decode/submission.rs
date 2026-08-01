@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::thrift::{descriptors, internal_service, planner, types};
 use novarocks::connector::starrocks::lake_meta::{LakeMetaStorageFacts, LakeMetaStorageRequest};
@@ -32,7 +33,6 @@ use novarocks::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use novarocks::exec::row_position::RowPositionDescriptor;
 use novarocks::protocol::FieldPath;
 use novarocks::runtime::descriptor_snapshot::DescriptorSnapshot;
-use novarocks::runtime::endpoint::RuntimeEndpoint;
 use novarocks::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceSpec,
     FragmentRuntimeOptions, ScanAssignments,
@@ -42,6 +42,12 @@ use novarocks::runtime::fragment::io::{
 };
 use novarocks::runtime::fragment::submission::FragmentSubmission;
 use novarocks::runtime::query_context::LookupFetcherLifecycle;
+use novarocks::runtime::query_context::{QueryId as RuntimeQueryId, query_context_manager};
+use novarocks::runtime::query_options::query_expire_durations;
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
 
 use super::dependency::{
     FragmentExprArenaOwner, QueryProfilePatch, StarRocksExternalDependency,
@@ -88,6 +94,17 @@ pub(crate) struct StarRocksDecodeInput<'a> {
         Option<Arc<dyn novarocks::connector::starrocks::ports::StorageMetadataProvider>>,
     pub compat_iceberg_execution:
         Option<&'a std::sync::Arc<novarocks_spi::connector::ConnectorExecutionBinding>>,
+    pub(crate) compat_connector_writer: Option<novarocks_spi::connector::ConnectorWriterIdentity>,
+}
+
+struct CompatConnectorWriteCancellation {
+    query_id: RuntimeQueryId,
+}
+
+impl ConnectorCancellation for CompatConnectorWriteCancellation {
+    fn is_cancelled(&self) -> bool {
+        query_context_manager().is_query_canceled(self.query_id)
+    }
 }
 
 #[derive(Debug)]
@@ -136,7 +153,7 @@ pub(crate) struct StarRocksSubmissionMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StarRocksReportDestination {
-    Coordinator(RuntimeEndpoint),
+    Coordinator(novarocks::runtime::endpoint::RuntimeEndpoint),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -350,14 +367,14 @@ fn query_profile_arena_mut(
         ) => program.arena_mut(),
         (
             FragmentExprArenaOwner::IcebergTable,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::IcebergTable(program),
-        ) => program.arena_mut(),
+            novarocks::exec::fragment::sink::FragmentSinkProgram::ConnectorWrite(program),
+        ) => program.expression_projection_arena_mut().ok_or_else(|| {
+            query_profile_patch_target_error(owner, "connector write projection is missing")
+        })?,
         (
-            FragmentExprArenaOwner::IcebergChangeStreamRouter,
-            novarocks::exec::fragment::sink::FragmentSinkProgram::IcebergChangeStreamRouter(
-                program,
-            ),
-        ) => program.partition_arena_mut(),
+            FragmentExprArenaOwner::ChangeStreamRouter,
+            novarocks::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(program),
+        ) => program.arena_mut(),
         (
             FragmentExprArenaOwner::StarRocksOutputProjection,
             novarocks::exec::fragment::sink::FragmentSinkProgram::StarRocksTable(program),
@@ -618,6 +635,27 @@ fn decode_draft_parts(
             .field("query_global_dict_exprs"),
         plan_path,
     )?;
+    let compat_connector_context = input
+        .compat_connector_writer
+        .as_ref()
+        .map(|_| {
+            let (_, query_expire) = query_expire_durations(Some(&instance.query_options));
+            ConnectorRequestContext::try_new(
+                Instant::now() + query_expire,
+                Arc::new(CompatConnectorWriteCancellation {
+                    query_id: instance.query_id,
+                }),
+                MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .map_err(|error| {
+                StarRocksFragmentDecodeError::invalid_value(
+                    sink_path.clone(),
+                    format!("build compat connector writer context: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     let DecodedStarRocksFragmentSink {
         spec,
         assignment,
@@ -636,6 +674,9 @@ fn decode_draft_parts(
             .query_globals
             .and_then(|globals| globals.time_zone.as_deref()),
         dependencies,
+        input.compat_iceberg_execution,
+        input.compat_connector_writer.as_ref(),
+        compat_connector_context.as_ref(),
         sink_path,
         FieldPath::root("exec_plan_fragment").field("fragment"),
     )?;
@@ -1474,6 +1515,7 @@ mod tests {
             starlet_metadata_provider: None,
             storage_metadata_provider: None,
             compat_iceberg_execution: None,
+            compat_connector_writer: None,
         }
     }
 

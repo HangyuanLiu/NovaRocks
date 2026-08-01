@@ -48,10 +48,7 @@ pub(super) fn validate_and_group_boundary_contracts(
             Some(edge.target_exchange_node_id),
             BoundaryKind::ExchangeReceive,
         ));
-        if matches!(
-            edge.edge_kind,
-            FragmentEdgeKind::IcebergChangeStreamRouter { .. }
-        ) {
+        if matches!(edge.edge_kind, FragmentEdgeKind::ChangeStreamRouter { .. }) {
             expected.insert((
                 edge.source_fragment_id,
                 None,

@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU16, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
     DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
@@ -31,9 +32,9 @@ use novarocks::query_execution::artifact::{
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
-    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
-    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
-    ProfileTerminalBuilder, QueryId,
+    ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
+    DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
+    DistributedQueryRequest, ProfileTerminalBuilder, QueryId,
 };
 use novarocks::query_execution::fragment_transport::{
     FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
@@ -42,7 +43,9 @@ use novarocks::query_execution::lifecycle::{
     AttemptId, QueryExecutionId, QueryInitOptions, QueryLifecycleTransport,
 };
 use novarocks::query_execution::write::WriteTerminalBuilder;
+use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
+use novarocks_spi::connector::ConnectorWriteResolver;
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig};
@@ -700,6 +703,10 @@ impl FrontendDistributedQueryCoordinator {
             )
         })?;
         let parts = request.into_parts();
+        let connector_write_session = parts
+            .connector_write
+            .as_ref()
+            .map(|registration| registration.session().clone());
         let intent = parts.completion.intent();
         self.backend_topology
             .validate_snapshot(&parts.topology)
@@ -730,6 +737,22 @@ impl FrontendDistributedQueryCoordinator {
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
         let scheduled = parts.artifacts.bind_schedule(schedule)?;
+        let scheduled = match parts.connector_write {
+            Some(registration) => {
+                let session = registration.session();
+                let manifest = scheduled.freeze_connector_write_manifest(
+                    &scheduled.terminal_write_fragment_ids(),
+                    session.operation_id(),
+                    registration.cohort_id(),
+                    session.owner().clone(),
+                )?;
+                let attachment = session
+                    .plan_manifest(&manifest)
+                    .map_err(|error| failed(format!("plan connector writer manifest: {error}")))?;
+                scheduled.attach_connector_write_plan(attachment)?
+            }
+            None => scheduled,
+        };
         let timeout_ms = parts.options.timeout_ms().max(0);
         let query_deadline_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -798,6 +821,7 @@ impl FrontendDistributedQueryCoordinator {
             expected_output,
             query_lifecycle_lease,
             connector_binding_lease: _connector_binding_lease,
+            connector_write_plan,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
         if let Some(message) = self.registry.first_failure(query_id)
@@ -905,7 +929,36 @@ impl FrontendDistributedQueryCoordinator {
                     }
                     let report_outcome = builder.finish()?;
                     let (commit, abort) = report_outcome.into_payloads();
-                    parts.completion.write(result, commit, abort)
+                    let connector_completion = match (
+                        connector_write_session,
+                        connector_write_plan,
+                        commit.as_ref(),
+                    ) {
+                        (Some(session), Some(attachment), Some(commit)) => {
+                            Some(ConnectorWriteCompletion::from_write_commit(
+                                session, attachment, commit,
+                            )?)
+                        }
+                        (Some(_), Some(_), None) => {
+                            return Err(DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "connector write execution ended without a complete staged-report commit",
+                            ));
+                        }
+                        (None, None, _) => None,
+                        _ => {
+                            return Err(DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "connector write operation session and planned attachment disagree",
+                            ));
+                        }
+                    };
+                    parts.completion.write_with_connector(
+                        result,
+                        commit,
+                        abort,
+                        connector_completion,
+                    )
                 }
                 DistributedQueryIntent::Profile => {
                     let mut builder = ProfileTerminalBuilder::new();
@@ -952,6 +1005,18 @@ impl FrontendDistributedQueryCoordinator {
 }
 
 impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
+    fn begin_write_operation(
+        &self,
+        registration: ConnectorWriteOperationRegistration,
+    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
+        let lease = self
+            .connector_control
+            .acquire_current_write(registration.connector_instance_id())
+            .map_err(|error| failed(format!("acquire connector write operation lease: {error}")))?;
+        ConnectorWriteOperationSession::try_begin(registration, lease)
+            .map_err(|error| failed(format!("seal connector write operation cohorts: {error}")))
+    }
+
     fn execute(
         &self,
         request: DistributedQueryRequest,

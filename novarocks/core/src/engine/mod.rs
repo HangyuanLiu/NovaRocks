@@ -76,6 +76,7 @@ pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
+pub(crate) use write_transaction::IcebergWriteCommitExecutor;
 
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
@@ -448,6 +449,54 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
             binding.descriptor().clone(),
             binding.incarnation(),
             mutation,
+            || {},
+        )
+    }
+}
+
+#[cfg(test)]
+impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRegistry {
+    fn acquire_current_write(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorWriteLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active write binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        let write = binding.write().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no distributed write capability",
+            )
+        })?;
+        let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: binding.descriptor().instance_id.clone(),
+            incarnation: binding.incarnation(),
+        };
+        novarocks_spi::connector::ConnectorWriteLease::new_with_execution_distribution(
+            key,
+            write,
+            binding.execution_distribution().clone(),
             || {},
         )
     }
@@ -3746,6 +3795,7 @@ pub(crate) fn execute_query_as_iceberg_write(
         root_distribution_resolver,
         execution,
         &connector_context,
+        None,
     )
 }
 
@@ -3760,6 +3810,66 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    execute_query_as_iceberg_write_with_connector_binding(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution_resolver,
+        execution,
+        connector_context,
+        connector_write.map(DistributedConnectorWrite::Begin),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    execute_query_as_iceberg_write_with_connector_binding(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution_resolver,
+        execution,
+        connector_context,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+    )
+}
+
+enum DistributedConnectorWrite {
+    Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
+    Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_as_iceberg_write_with_connector_binding(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let optimizer_settings = optimizer_settings_for_execution(execution);
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
@@ -3828,15 +3938,28 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         )?,
     };
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
-        physical_plan,
-        crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
-            descriptor_database: current_database.to_string(),
-            spec: sink_spec,
-            input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
-        },
-        &optimizer_settings,
-    )?;
+    let writer_input = if connector_write.is_some()
+        && matches!(
+            sink_spec.mode,
+            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
+                | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors
+        ) {
+        crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::OutputOrdinals(
+            vec![0, 1],
+        )
+    } else {
+        crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal
+    };
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+            physical_plan,
+            crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+                descriptor_database: current_database.to_string(),
+                spec: sink_spec,
+                input: writer_input,
+            },
+            &optimizer_settings,
+        )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         &connectors_snapshot,
@@ -3863,6 +3986,7 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         native_bundle,
         query_opts,
         execution,
+        connector_write,
     )
 }
 
@@ -3968,6 +4092,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: None,
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         })
     } else {
@@ -3980,7 +4105,6 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     pub(crate) commit_plan:
         crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
-    #[cfg(test)]
     pub(crate) topology:
         crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
 }
@@ -4062,7 +4186,6 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         prepared,
         native_bundle,
         commit_plan,
-        #[cfg(test)]
         topology,
     })
 }
@@ -4073,6 +4196,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_opts: Option<QueryOptions>,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let maintenance_execution;
     let execution = match execution {
@@ -4088,6 +4212,7 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
         native_bundle,
         query_opts,
         execution,
+        connector_write.map(DistributedConnectorWrite::Begin),
     )
 }
 
@@ -4119,6 +4244,7 @@ pub(crate) fn execute_physical_plan_as_iceberg_change_stream_write(
         planned.prepared,
         planned.native_bundle,
         query_opts,
+        None,
         None,
     )
 }
@@ -4739,6 +4865,7 @@ fn execute_distributed_write_with_execution(
     native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     query_options: Option<QueryOptions>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
@@ -4748,15 +4875,40 @@ fn execute_distributed_write_with_execution(
         execution,
     )
     .map_err(|error| error.to_string())?;
-    let (query_result, write_commit, write_abort) = query_execution
+    let request = match connector_write {
+        Some(DistributedConnectorWrite::Begin(template)) => {
+            let cohort_id = template.cohort_id();
+            let session = query_execution
+                .begin_write_operation(
+                    crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+                        template,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+            let registration =
+                crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                    session, cohort_id,
+                )
+                .map_err(|error| error.to_string())?;
+            crate::query_execution::contract::with_connector_write_operation(request, registration)
+                .map_err(|error| error.to_string())?
+        }
+        Some(DistributedConnectorWrite::Sealed(registration)) => {
+            crate::query_execution::contract::with_connector_write_operation(request, registration)
+                .map_err(|error| error.to_string())?
+        }
+        None => request,
+    };
+    let (query_result, write_commit, write_abort, connector_completion) = query_execution
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
-        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts)
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
         .map_err(|error| error.to_string())?;
     Ok(crate::query_execution::outcome::QueryExecutionResult {
         query_result,
         write_commit,
         write_abort,
+        connector_completion,
         fragment_profiles: Vec::new(),
     })
 }
@@ -4785,6 +4937,7 @@ fn execute_distributed_profile_with_execution(
         query_result,
         write_commit: None,
         write_abort: None,
+        connector_completion: None,
         fragment_profiles: fragment_profiles.into_profiles(),
     })
 }

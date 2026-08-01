@@ -194,6 +194,10 @@ impl StagedWriteContext {
         self.partition_spec_id
     }
 
+    pub(crate) fn metadata(&self) -> &TableMetadata {
+        self.metadata.as_ref()
+    }
+
     pub(crate) fn file_io(&self) -> &iceberg::io::FileIO {
         &self.file_io
     }

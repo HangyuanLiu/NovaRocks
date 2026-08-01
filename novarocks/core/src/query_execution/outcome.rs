@@ -20,18 +20,39 @@
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
-use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
+use crate::query_execution::write::{ConnectorWriteCommitInput, WriteAbortInput, WriteCommitInput};
+use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_result::QueryResult;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
-#[derive(Debug)]
 pub(crate) struct QueryExecutionResult {
     pub(crate) query_result: QueryResult,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
+    /// Present only when a native distributed writer completed through the
+    /// provider-neutral carrier.  It owns the exact control lease until the
+    /// engine transaction layer makes the terminal decision.
+    pub(crate) connector_completion: Option<ConnectorWriteCompletion>,
     pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
+}
+
+impl std::fmt::Debug for QueryExecutionResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryExecutionResult")
+            .field("query_result", &self.query_result)
+            .field("write_commit", &self.write_commit)
+            .field("write_abort", &self.write_abort)
+            .field(
+                "has_connector_completion",
+                &self.connector_completion.is_some(),
+            )
+            .field("fragment_profiles", &self.fragment_profiles)
+            .finish()
+    }
 }
 
 pub enum DistributedQueryOutcome {
@@ -54,6 +75,7 @@ pub struct WriteExecutionOutcome {
     result: QueryResult,
     commit: Option<WriteCommitInput>,
     abort: Option<WriteAbortInput>,
+    connector_completion: Option<ConnectorWriteCompletion>,
 }
 
 impl WriteExecutionOutcome {
@@ -65,6 +87,99 @@ impl WriteExecutionOutcome {
         Option<WriteAbortInput>,
     ) {
         (self.result, self.commit, self.abort)
+    }
+
+    pub(crate) fn into_parts_with_connector(
+        self,
+    ) -> (
+        QueryResult,
+        Option<WriteCommitInput>,
+        Option<WriteAbortInput>,
+        Option<ConnectorWriteCompletion>,
+    ) {
+        (
+            self.result,
+            self.commit,
+            self.abort,
+            self.connector_completion,
+        )
+    }
+}
+
+/// Successful provider-neutral terminal write facts.  The attachment owns the
+/// exact FE generation lease that issued the handles; carrying it through the
+/// outcome prevents a newer control generation from committing an older BE
+/// report set.
+pub struct ConnectorWriteCompletion {
+    session: ConnectorWriteOperationSession,
+    attachment: ConnectorWritePlanAttachment,
+    input: ConnectorWriteCommitInput,
+}
+
+impl ConnectorWriteCompletion {
+    pub fn from_write_commit(
+        session: ConnectorWriteOperationSession,
+        attachment: ConnectorWritePlanAttachment,
+        commit: &WriteCommitInput,
+    ) -> Result<Self, DistributedQueryError> {
+        let input = ConnectorWriteCommitInput::try_extract(commit)?.ok_or_else(|| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write attachment completed without generic staged reports",
+            )
+        })?;
+        let manifest = attachment.manifest();
+        if input.owner() != manifest.owner()
+            || input.operation_id() != manifest.operation_id()
+            || input.cohort_id() != manifest.cohort_id()
+            || input.execution_id() != manifest.execution_id()
+        {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "generic staged reports do not match the frozen connector write attachment",
+            ));
+        }
+        let expected = manifest
+            .writers()
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = input
+            .reports()
+            .iter()
+            .map(|report| report.writer().clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if expected != actual || input.reports().len() != actual.len() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "generic staged reports do not exactly cover the frozen connector writer manifest",
+            ));
+        }
+        session
+            .accept_attempt(&attachment, &input)
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!("register accepted connector write attempt: {error}"),
+                )
+            })?;
+        Ok(Self {
+            session,
+            attachment,
+            input,
+        })
+    }
+
+    pub(crate) fn attachment(&self) -> &ConnectorWritePlanAttachment {
+        &self.attachment
+    }
+
+    pub(crate) fn input(&self) -> &ConnectorWriteCommitInput {
+        &self.input
+    }
+
+    pub fn session(&self) -> &ConnectorWriteOperationSession {
+        &self.session
     }
 }
 
@@ -152,6 +267,16 @@ impl QueryOutcomeFactory {
         commit: Option<WriteCommitInput>,
         abort: Option<WriteAbortInput>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.write_with_connector(result, commit, abort, None)
+    }
+
+    pub fn write_with_connector(
+        self,
+        result: QueryResult,
+        commit: Option<WriteCommitInput>,
+        abort: Option<WriteAbortInput>,
+        connector_completion: Option<ConnectorWriteCompletion>,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.require_intent(DistributedQueryIntent::Write)?;
         if commit.is_some() && abort.is_some() {
             return Err(DistributedQueryError::new(
@@ -159,10 +284,17 @@ impl QueryOutcomeFactory {
                 "Write outcome cannot contain both commit and abort payloads",
             ));
         }
+        if connector_completion.is_some() && commit.is_none() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write completion requires a write commit payload",
+            ));
+        }
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
             result,
             commit,
             abort,
+            connector_completion,
         }))
     }
 
@@ -174,6 +306,7 @@ impl QueryOutcomeFactory {
             query_result,
             write_commit,
             write_abort,
+            connector_completion,
             fragment_profiles,
         } = result;
         match self.intent {
@@ -184,10 +317,16 @@ impl QueryOutcomeFactory {
                         "Write outcome cannot contain fragment profiles",
                     ));
                 }
-                self.write(query_result, write_commit, write_abort)
+                self.write_with_connector(
+                    query_result,
+                    write_commit,
+                    write_abort,
+                    connector_completion,
+                )
             }
             DistributedQueryIntent::Profile => {
-                if write_commit.is_some() || write_abort.is_some() {
+                if write_commit.is_some() || write_abort.is_some() || connector_completion.is_some()
+                {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "Profile outcome cannot contain write commit or abort payloads",
@@ -196,7 +335,10 @@ impl QueryOutcomeFactory {
                 self.profile(query_result, FragmentProfileSet::new(fragment_profiles))
             }
             DistributedQueryIntent::Result => {
-                if write_commit.is_some() || write_abort.is_some() || !fragment_profiles.is_empty()
+                if write_commit.is_some()
+                    || write_abort.is_some()
+                    || connector_completion.is_some()
+                    || !fragment_profiles.is_empty()
                 {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,

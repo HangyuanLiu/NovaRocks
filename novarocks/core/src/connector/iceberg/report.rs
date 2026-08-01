@@ -127,6 +127,51 @@ pub(crate) fn writer_report_from_written_file(
     })
 }
 
+/// Build the report for the currently supported unpartitioned equality-delete
+/// writer without requiring table metadata on the BE.  Control-side decoding
+/// still validates the empty partition descriptor against the frozen table
+/// metadata before catalog commit.
+pub(crate) fn writer_report_from_unpartitioned_equality_delete_file(
+    file: &crate::connector::iceberg::commit::WrittenFile,
+) -> Result<IcebergWriterReport, String> {
+    if file.content != iceberg::spec::DataContentType::EqualityDeletes {
+        return Err(
+            "unpartitioned equality-delete report requires an equality-delete file".to_string(),
+        );
+    }
+    if !file.partition_values.fields().is_empty() {
+        return Err(
+            "unpartitioned equality-delete report received non-empty partition values".to_string(),
+        );
+    }
+    Ok(IcebergWriterReport {
+        file: IcebergWrittenFileReport {
+            path: file.path.clone(),
+            format: file.format.to_string(),
+            content: IcebergFileContent::EqualityDeletes,
+            record_count: u64_to_i64(file.record_count, "record_count")?,
+            file_size_in_bytes: u64_to_i64(file.file_size_in_bytes, "file_size_in_bytes")?,
+            partition: IcebergPartitionReport {
+                partition_path: String::new(),
+                null_fingerprint: String::new(),
+                partition_spec_id: file.partition_spec_id,
+                partition_values: Struct::empty(),
+            },
+            split_offsets: None,
+            column_stats: column_stats_from_written_file(file)?,
+            referenced_data_file: None,
+            first_row_id: None,
+            equality_ids: file.equality_ids.clone(),
+            key_metadata: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        },
+        is_overwrite: None,
+        is_rewrite: None,
+    })
+}
+
 fn column_stats_from_written_file(
     file: &crate::connector::iceberg::commit::WrittenFile,
 ) -> Result<Option<IcebergColumnStats>, String> {

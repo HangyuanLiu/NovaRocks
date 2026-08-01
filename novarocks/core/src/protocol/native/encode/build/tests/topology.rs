@@ -284,11 +284,10 @@ fn fragment_build_preserves_finalized_router_edge() {
         .and_then(|sink| sink.kind.as_ref())
         .expect("router sink")
     {
-        crate::proto::plan::data_sink::Kind::IcebergChangeStreamRouter(router) => router.branches
-            [0]
-        .output_partition
-        .as_ref()
-        .expect("router route partition"),
+        crate::proto::plan::data_sink::Kind::ChangeStreamRouter(router) => router.branches[0]
+            .output_partition
+            .as_ref()
+            .expect("router route partition"),
         other => panic!("expected router sink, got {other:?}"),
     };
     assert_eq!(
@@ -333,75 +332,6 @@ fn lower_distributed_plan_owns_native_fragments_matching_schedules_and_root() {
 
     assert_eq!(fragment_ids, prepared_ids);
     assert!(fragment_ids.contains(&dp.root_fragment_id()));
-}
-
-#[test]
-fn lower_distributed_plan_owns_native_write_sink_shape() {
-    let columns = vec![output_col(1, "id")];
-    let mut sink_spec =
-        crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-    sink_spec.target_table.columns[0].data_type = DataType::Int64;
-    sink_spec.target_columns[0].data_type = DataType::Int64;
-    let fragment = PlanFragment {
-        fragment_id: 0,
-        root: physical_values_node(0, 10, columns.clone()),
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: crate::sql::planner::distributed::DataSink::IcebergWrite(
-            crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
-                descriptor_database: "default".to_string(),
-                spec: sink_spec,
-                input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
-            },
-        ),
-        output_exprs: None,
-        output_columns: columns,
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    };
-    let plan = crate::sql::planner::distributed::test_support::distributed_plan_for_test! {
-        fragments: vec![fragment],
-        root_fragment_id: 0,
-        runtime_filter_graph: Default::default(),
-        edges: Vec::new(),
-    };
-
-    let result = build_for_test(TestBuildRequest::result(
-        &plan,
-        &EmptyCatalog,
-        &ConnectorRegistry::new(),
-        None,
-    ))
-    .expect("native write fragment build");
-    assert_eq!(
-        result
-            .0
-            .fragment(0)
-            .expect("prepared write fragment")
-            .execution_role(),
-        crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite
-    );
-    assert!(
-        result
-            .0
-            .fragment(0)
-            .expect("prepared write fragment")
-            .boundary_projection()
-            .output_columns()
-            .is_empty(),
-        "Iceberg target schema belongs to WriteContractCatalog, not prepared query output"
-    );
-    let sink = result
-        .1
-        .get(0)
-        .expect("native fragment")
-        .sink
-        .as_ref()
-        .expect("native sink");
-    assert!(matches!(
-        sink.kind,
-        Some(crate::proto::plan::data_sink::Kind::IcebergWrite(_))
-    ));
 }
 
 #[test]

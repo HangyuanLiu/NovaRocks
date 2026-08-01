@@ -72,6 +72,7 @@ impl FragmentReportRegistration {
 pub struct FragmentTerminalReport {
     error: Option<String>,
     include_runtime_filter_profile: bool,
+    connector_staged_report_frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
 }
 
 impl FragmentTerminalReport {
@@ -79,7 +80,22 @@ impl FragmentTerminalReport {
         Self {
             error,
             include_runtime_filter_profile,
+            connector_staged_report_frames: Vec::new(),
         }
+    }
+
+    pub fn with_connector_staged_report_frames(
+        mut self,
+        frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
+    ) -> Self {
+        self.connector_staged_report_frames = frames;
+        self
+    }
+
+    pub fn connector_staged_report_frames(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorStagedReportFrame] {
+        &self.connector_staged_report_frames
     }
 
     pub fn error(&self) -> Option<&str> {

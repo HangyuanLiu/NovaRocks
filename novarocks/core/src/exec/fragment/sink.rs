@@ -16,14 +16,21 @@
 // under the License.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, SchemaRef};
+use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::iceberg::sink_plan::{IcebergSinkFactoryInput, IcebergSinkPlan};
 use crate::connector::starrocks::sink::plan::StarRocksTableSinkProgram;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::chunk::Chunk;
+use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::operators::DataStreamPartitionType;
+use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
 use crate::sql::common::ChangeStreamBranchKind;
+use novarocks_spi::connector::{ConnectorExecutionBinding, ConnectorOpenWriterRequest};
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
@@ -33,8 +40,7 @@ pub enum FragmentSinkProgram {
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
     StarRocksTable(StarRocksTableSinkProgram),
-    IcebergTable(IcebergTableSinkProgram),
-    IcebergChangeStreamRouter(IcebergChangeStreamRouterProgram),
+    ConnectorWrite(ConnectorWriteSinkProgram),
 }
 
 impl FragmentSinkProgram {
@@ -47,9 +53,227 @@ impl FragmentSinkProgram {
             Self::StarRocksTable(program) => program
                 .validate()
                 .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Sink, error)),
-            Self::IcebergTable(program) => program.validate(),
-            Self::IcebergChangeStreamRouter(program) => program.validate(),
+            Self::ConnectorWrite(program) => program.validate(),
         }
+    }
+
+    pub(crate) fn connector_staged_report_collector(
+        &self,
+    ) -> Option<ConnectorStagedReportCollector> {
+        match self {
+            Self::ConnectorWrite(program) => Some(program.report_collector()),
+            _ => None,
+        }
+    }
+}
+
+/// Provider-neutral terminal writer.  The program carries an already-resolved
+/// BE execution binding and a FE-issued opaque handle; it has no provider
+/// control capability and cannot commit external table state.
+#[derive(Clone)]
+pub struct ConnectorWriteSinkProgram {
+    name: String,
+    binding: Arc<ConnectorExecutionBinding>,
+    request: ConnectorOpenWriterRequest,
+    root_input_width: usize,
+    input_ordinals: Option<Vec<usize>>,
+    input_projection: Option<ConnectorWriteInputProjection>,
+    report_collector: ConnectorStagedReportCollector,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectorWriteInputProjection {
+    arena: ExprArena,
+    exprs: Vec<ExprId>,
+    schema: SchemaRef,
+}
+
+impl ConnectorWriteInputProjection {
+    fn try_new(
+        arena: ExprArena,
+        exprs: Vec<ExprId>,
+        schema: SchemaRef,
+    ) -> Result<Self, ExecPlanBuildError> {
+        if exprs.is_empty() || exprs.len() != schema.fields().len() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                "connector writer expression projection does not match its output schema",
+            ));
+        }
+        validate_expr_ids(&arena, &exprs, "connector writer input")?;
+        Ok(Self {
+            arena,
+            exprs,
+            schema,
+        })
+    }
+
+    pub(crate) fn project(&self, chunk: &Chunk) -> Result<RecordBatch, String> {
+        let arrays = self
+            .exprs
+            .iter()
+            .map(|expr| self.arena.eval(*expr, chunk))
+            .collect::<Result<Vec<_>, _>>()?;
+        let arrays = arrays
+            .into_iter()
+            .zip(self.schema.fields())
+            .enumerate()
+            .map(|(index, (array, field))| {
+                if array.data_type() == field.data_type() {
+                    return Ok(array);
+                }
+                let casted = if matches!(
+                    field.data_type(),
+                    DataType::FixedSizeBinary(width)
+                        if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+                ) {
+                    cast_with_special_rules(&array, field.data_type())
+                } else {
+                    cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())
+                };
+                casted.map_err(|error| {
+                    format!(
+                        "connector writer projection cast failed at column {index} from {:?} to {:?}: {error}",
+                        array.data_type(),
+                        field.data_type()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|error| format!("build connector writer projected batch: {error}"))
+    }
+}
+
+impl std::fmt::Debug for ConnectorWriteSinkProgram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorWriteSinkProgram")
+            .field("owner", self.request.handle.owner())
+            .field("writer", self.request.handle.writer())
+            .field("input_ordinals", &self.input_ordinals)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConnectorWriteSinkProgram {
+    pub fn try_new(
+        binding: Arc<ConnectorExecutionBinding>,
+        request: ConnectorOpenWriterRequest,
+        root_input_width: usize,
+        input_ordinals: Option<Vec<usize>>,
+    ) -> Result<Self, ExecPlanBuildError> {
+        let program = Self {
+            name: "CONNECTOR_WRITE_SINK".to_string(),
+            binding,
+            request,
+            root_input_width,
+            input_ordinals,
+            input_projection: None,
+            report_collector: ConnectorStagedReportCollector::default(),
+        };
+        program.validate()?;
+        Ok(program)
+    }
+
+    pub fn try_new_with_expression_projection(
+        binding: Arc<ConnectorExecutionBinding>,
+        request: ConnectorOpenWriterRequest,
+        root_input_width: usize,
+        arena: ExprArena,
+        exprs: Vec<ExprId>,
+        schema: SchemaRef,
+    ) -> Result<Self, ExecPlanBuildError> {
+        if request.expected_schema.as_ref() != schema.as_ref() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                "connector writer request schema does not match its expression projection",
+            ));
+        }
+        let program = Self {
+            name: "CONNECTOR_WRITE_SINK".to_string(),
+            binding,
+            request,
+            root_input_width,
+            input_ordinals: None,
+            input_projection: Some(ConnectorWriteInputProjection::try_new(
+                arena, exprs, schema,
+            )?),
+            report_collector: ConnectorStagedReportCollector::default(),
+        };
+        program.validate()?;
+        Ok(program)
+    }
+
+    fn validate(&self) -> Result<(), ExecPlanBuildError> {
+        self.request.handle.validate().map_err(|error| {
+            ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                format!("connector writer handle: {error}"),
+            )
+        })?;
+        if self.binding.key() != self.request.handle.owner() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                "connector writer handle owner does not match resolved execution binding",
+            ));
+        }
+        if self.binding.write().is_none() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Sink,
+                "resolved connector execution binding has no write capability",
+            ));
+        }
+        if let Some(ordinals) = &self.input_ordinals {
+            if ordinals.is_empty()
+                || ordinals
+                    .iter()
+                    .any(|ordinal| *ordinal >= self.root_input_width)
+            {
+                return Err(ExecPlanBuildError::new(
+                    ExecPlanInvariant::Sink,
+                    "connector writer input ordinals are empty or outside the root output schema",
+                ));
+            }
+            let mut unique = HashSet::new();
+            if ordinals.iter().any(|ordinal| !unique.insert(*ordinal)) {
+                return Err(ExecPlanBuildError::new(
+                    ExecPlanInvariant::Sink,
+                    "connector writer input ordinals contain duplicates",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn binding(&self) -> &Arc<ConnectorExecutionBinding> {
+        &self.binding
+    }
+
+    pub(crate) fn request(&self) -> &ConnectorOpenWriterRequest {
+        &self.request
+    }
+
+    pub(crate) fn input_ordinals(&self) -> Option<&[usize]> {
+        self.input_ordinals.as_deref()
+    }
+
+    pub(crate) fn input_projection(&self) -> Option<ConnectorWriteInputProjection> {
+        self.input_projection.clone()
+    }
+
+    pub fn expression_projection_arena_mut(&mut self) -> Option<&mut ExprArena> {
+        self.input_projection
+            .as_mut()
+            .map(|projection| &mut projection.arena)
+    }
+
+    pub(crate) fn report_collector(&self) -> ConnectorStagedReportCollector {
+        self.report_collector.clone()
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -331,145 +555,64 @@ impl SplitDataStreamSinkProgram {
     }
 }
 
-#[derive(Clone)]
-pub struct IcebergTableSinkProgram {
-    name: String,
-    arena: ExprArena,
-    plan: IcebergSinkPlan,
-}
-
-impl std::fmt::Debug for IcebergTableSinkProgram {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("IcebergTableSinkProgram")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl IcebergTableSinkProgram {
-    pub fn try_from_factory_input(
-        input: IcebergSinkFactoryInput,
-    ) -> Result<Self, ExecPlanBuildError> {
-        let program = Self {
-            name: input.name,
-            arena: input.arena,
-            plan: input.plan,
-        };
-        program.validate()?;
-        Ok(program)
-    }
-
-    fn validate(&self) -> Result<(), ExecPlanBuildError> {
-        validate_expr_ids(&self.arena, &self.plan.output_exprs, "Iceberg output")?;
-        validate_expr_ids(&self.arena, &self.plan.partition_exprs, "Iceberg partition")
-    }
-
-    pub(crate) fn factory_input(&self) -> IcebergSinkFactoryInput {
-        IcebergSinkFactoryInput {
-            name: self.name.clone(),
-            arena: self.arena.clone(),
-            plan: self.plan.clone(),
-        }
-    }
-
-    pub fn arena_mut(&mut self) -> &mut ExprArena {
-        &mut self.arena
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct IcebergChangeStreamRouterBranchProgram {
-    branch_id: i32,
-    branch_kind: ChangeStreamBranchKind,
-    stream_sink: DataStreamSinkBranchProgram,
-}
-
-impl IcebergChangeStreamRouterBranchProgram {
-    pub fn new(
-        branch_id: i32,
-        branch_kind: ChangeStreamBranchKind,
-        stream_sink: DataStreamSinkBranchProgram,
-    ) -> Self {
-        Self {
-            branch_id,
-            branch_kind,
-            stream_sink,
-        }
-    }
-
-    pub const fn branch_id(&self) -> i32 {
-        self.branch_id
-    }
-
-    pub const fn branch_kind(&self) -> ChangeStreamBranchKind {
-        self.branch_kind
-    }
-
-    pub const fn stream_sink(&self) -> &DataStreamSinkBranchProgram {
-        &self.stream_sink
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct IcebergChangeStreamRouterProgram {
+pub fn build_change_stream_split_predicate(
+    arena: &mut ExprArena,
     change_op_slot_id: SlotId,
     data_route_slot_id: Option<SlotId>,
-    branches: Vec<IcebergChangeStreamRouterBranchProgram>,
-    partition_arena: ExprArena,
-}
+    branch_kind: ChangeStreamBranchKind,
+) -> Result<ExprId, ExecPlanBuildError> {
+    use crate::exec::expr::{ExprNode, LiteralValue};
+    use crate::sql::common::{
+        CHANGE_OP_DELETE, CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    };
 
-impl IcebergChangeStreamRouterProgram {
-    pub fn try_new(
-        change_op_slot_id: SlotId,
-        data_route_slot_id: Option<SlotId>,
-        branches: Vec<IcebergChangeStreamRouterBranchProgram>,
-        partition_arena: ExprArena,
-    ) -> Result<Self, ExecPlanBuildError> {
-        let program = Self {
-            change_op_slot_id,
-            data_route_slot_id,
-            branches,
-            partition_arena,
-        };
-        program.validate()?;
-        Ok(program)
-    }
+    let operation = arena.push_typed(ExprNode::SlotId(change_op_slot_id), DataType::Int8);
+    let expected_operation = match branch_kind {
+        ChangeStreamBranchKind::DeleteDv => CHANGE_OP_DELETE,
+        ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData => CHANGE_OP_INSERT,
+    };
+    let operation_literal = arena.push_typed(
+        ExprNode::Literal(LiteralValue::Int8(expected_operation as i8)),
+        DataType::Int8,
+    );
+    let operation_matches = arena.push_typed(
+        ExprNode::Eq(operation, operation_literal),
+        DataType::Boolean,
+    );
 
-    fn validate(&self) -> Result<(), ExecPlanBuildError> {
-        validate_non_empty_group("ICEBERG_CHANGE_STREAM_ROUTER_SINK", self.branches.len())?;
-        for (index, branch) in self.branches.iter().enumerate() {
-            branch.stream_sink.validate_shape(&format!(
-                "ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}]"
-            ))?;
-            validate_expr_ids(
-                &self.partition_arena,
-                branch.stream_sink.output_partition_exprs(),
-                &format!("ICEBERG_CHANGE_STREAM_ROUTER_SINK branch[{index}] partition"),
-            )?;
+    let route_matches = match branch_kind {
+        ChangeStreamBranchKind::DeleteDv => data_route_slot_id.map(|route_slot| {
+            let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
+            arena.push_typed(ExprNode::IsNull(route), DataType::Boolean)
+        }),
+        ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData => {
+            let route_slot = data_route_slot_id.ok_or_else(|| {
+                ExecPlanBuildError::new(
+                    ExecPlanInvariant::Sink,
+                    "change-stream data branch requires a data route slot",
+                )
+            })?;
+            let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
+            let expected_route = match branch_kind {
+                ChangeStreamBranchKind::ReuseData => DATA_ROUTE_REUSE,
+                ChangeStreamBranchKind::FreshData => DATA_ROUTE_FRESH,
+                ChangeStreamBranchKind::DeleteDv => unreachable!(),
+            };
+            let route_literal = arena.push_typed(
+                ExprNode::Literal(LiteralValue::Int32(expected_route)),
+                DataType::Int32,
+            );
+            Some(arena.push_typed(ExprNode::Eq(route, route_literal), DataType::Boolean))
         }
-        Ok(())
-    }
+    };
 
-    pub const fn change_op_slot_id(&self) -> SlotId {
-        self.change_op_slot_id
-    }
-
-    pub const fn data_route_slot_id(&self) -> Option<SlotId> {
-        self.data_route_slot_id
-    }
-
-    pub fn branches(&self) -> &[IcebergChangeStreamRouterBranchProgram] {
-        &self.branches
-    }
-
-    pub const fn partition_arena(&self) -> &ExprArena {
-        &self.partition_arena
-    }
-
-    pub fn partition_arena_mut(&mut self) -> &mut ExprArena {
-        &mut self.partition_arena
-    }
+    Ok(match route_matches {
+        Some(route_matches) => arena.push_typed(
+            ExprNode::And(operation_matches, route_matches),
+            DataType::Boolean,
+        ),
+        None => operation_matches,
+    })
 }
 
 fn validate_stream_shape(
@@ -533,66 +676,19 @@ fn validate_non_empty_group(context: &str, count: usize) -> Result<(), ExecPlanB
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
+    use arrow::datatypes::DataType;
 
-    use arrow::datatypes::{DataType, Schema};
-    use parquet::basic::Compression;
-
-    use crate::common::ids::SlotId;
-    use crate::connector::iceberg::delete_file::IcebergFileFormat;
-    use crate::connector::iceberg::sink_plan::{
-        IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkPlan,
+    use super::{
+        DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
+        MultiCastDataStreamSinkProgram,
     };
+    use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprArena, ExprId, ExprNode};
     use crate::exec::fragment::error::ExecPlanInvariant;
     use crate::exec::fragment::program::{
         FragmentSinkAssignmentKind, FragmentSinkAssignmentRequirement, FragmentSinkSpec,
     };
     use crate::exec::operators::DataStreamPartitionType;
-    use crate::sql::common::ChangeStreamBranchKind;
-
-    use super::{
-        DataStreamSinkBranchProgram, DataStreamSinkProgram, FragmentSinkProgram,
-        IcebergChangeStreamRouterBranchProgram, IcebergChangeStreamRouterProgram,
-        IcebergTableSinkProgram, MultiCastDataStreamSinkProgram,
-    };
-
-    fn iceberg_input(
-        arena: ExprArena,
-        output_exprs: Vec<ExprId>,
-        partition_exprs: Vec<ExprId>,
-    ) -> IcebergSinkFactoryInput {
-        let schema = Arc::new(Schema::empty());
-        IcebergSinkFactoryInput {
-            name: "ICEBERG_TABLE_SINK".to_string(),
-            arena,
-            plan: IcebergSinkPlan {
-                mode: IcebergSinkMode::Data,
-                table_location: "file:///tmp/table".to_string(),
-                data_location: "file:///tmp/table/data".to_string(),
-                target_partition_spec_id: 0,
-                target_table_metadata: None,
-                target_snapshot_id: None,
-                position_delete_data_file_partitions: HashMap::new(),
-                position_delete_data_file_partition_index_input: None,
-                object_store_s3: None,
-                file_format: IcebergFileFormat::Parquet,
-                report_file_format: "parquet".to_string(),
-                compression: Compression::SNAPPY,
-                output_schema: Arc::clone(&schema),
-                target_schema: schema,
-                equality_delete_columns: Vec::new(),
-                row_lineage_data: false,
-                output_exprs,
-                partition_exprs,
-                partition_source_column_names: Vec::new(),
-                partition_column_names: Vec::new(),
-                transform_exprs: Vec::new(),
-                position_delete_binding: None,
-            },
-        }
-    }
 
     #[test]
     fn static_data_stream_program_contains_no_destinations() {
@@ -726,45 +822,5 @@ mod tests {
             MultiCastDataStreamSinkProgram::try_new(vec![branch()], ExprArena::default())
                 .expect_err("multicast partition expression must belong to group arena");
         assert_eq!(multicast_error.invariant(), ExecPlanInvariant::Expression);
-
-        let router_error = IcebergChangeStreamRouterProgram::try_new(
-            SlotId::new(1),
-            None,
-            vec![IcebergChangeStreamRouterBranchProgram::new(
-                7,
-                ChangeStreamBranchKind::FreshData,
-                branch(),
-            )],
-            ExprArena::default(),
-        )
-        .expect_err("router partition expression must belong to group arena");
-        assert_eq!(router_error.invariant(), ExecPlanInvariant::Expression);
-    }
-
-    #[test]
-    fn iceberg_program_validates_output_and_partition_expr_arena_membership() {
-        for (output_exprs, partition_exprs, label) in [
-            (vec![ExprId(99)], Vec::new(), "output"),
-            (Vec::new(), vec![ExprId(99)], "partition"),
-        ] {
-            let error = IcebergTableSinkProgram::try_from_factory_input(iceberg_input(
-                ExprArena::default(),
-                output_exprs,
-                partition_exprs,
-            ))
-            .expect_err("Iceberg expression ids must belong to the sink arena");
-
-            assert_eq!(error.invariant(), ExecPlanInvariant::Expression);
-            assert!(error.detail().contains(label));
-        }
-
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-        IcebergTableSinkProgram::try_from_factory_input(iceberg_input(
-            arena,
-            vec![expr],
-            vec![expr],
-        ))
-        .expect("valid Iceberg expression ids");
     }
 }

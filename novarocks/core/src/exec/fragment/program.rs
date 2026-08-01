@@ -158,8 +158,7 @@ pub enum FragmentSinkKind {
     MultiCastDataStream,
     SplitDataStream,
     StarRocksTable,
-    IcebergChangeStreamRouter,
-    IcebergTable,
+    ConnectorWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,17 +215,7 @@ impl FragmentSinkSpec {
                 FragmentSinkKind::StarRocksTable,
                 Required(FragmentSinkAssignmentKind::StarRocksTable),
             ),
-            FragmentSinkProgram::IcebergTable(_) => (FragmentSinkKind::IcebergTable, None),
-            FragmentSinkProgram::IcebergChangeStreamRouter(router) => {
-                let count = non_empty_group_count(
-                    FragmentSinkKind::IcebergChangeStreamRouter,
-                    router.branches().len(),
-                )?;
-                (
-                    FragmentSinkKind::IcebergChangeStreamRouter,
-                    Required(DestinationGroups(count)),
-                )
-            }
+            FragmentSinkProgram::ConnectorWrite(_) => (FragmentSinkKind::ConnectorWrite, None),
         };
         Ok(Self {
             program,

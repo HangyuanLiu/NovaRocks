@@ -390,7 +390,7 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                 outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
                 error_code: String::new(),
                 error_detail: String::new(),
-                iceberg_commits: vec![],
+                connector_staged_report_frames: vec![],
                 tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
                     tablet_id: 100,
                     backend_id: 9,

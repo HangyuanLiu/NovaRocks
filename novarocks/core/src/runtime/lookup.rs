@@ -155,6 +155,7 @@ fn execute_connector_lookup_request(
             })?;
         let mut reader = binding
             .read()
+            .ok_or_else(|| "connector lookup binding has no read capability".to_string())?
             .open_reader(&split, request.clone())
             .map_err(|error| error.to_string())?;
         let read_result = (|| -> Result<(), String> {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorSplit,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorSplit, ConnectorWriteExecution,
 };
 
 /// Immutable identity shared across FE control and BE execution processes.
@@ -48,7 +48,8 @@ pub trait ConnectorReadExecution: Send + Sync {
 pub struct ConnectorExecutionBinding {
     provider_id: ConnectorProviderId,
     key: ConnectorExecutionBindingKey,
-    read: Arc<dyn ConnectorReadExecution>,
+    read: Option<Arc<dyn ConnectorReadExecution>>,
+    write: Option<Arc<dyn ConnectorWriteExecution>>,
 }
 
 impl ConnectorExecutionBinding {
@@ -57,16 +58,41 @@ impl ConnectorExecutionBinding {
         key: ConnectorExecutionBindingKey,
         read: Arc<dyn ConnectorReadExecution>,
     ) -> Result<Self, ConnectorError> {
-        if read.binding_key() != &key {
+        Self::try_new_capabilities(provider_id, key, Some(read), None)
+    }
+
+    pub fn try_new_capabilities(
+        provider_id: ConnectorProviderId,
+        key: ConnectorExecutionBindingKey,
+        read: Option<Arc<dyn ConnectorReadExecution>>,
+        write: Option<Arc<dyn ConnectorWriteExecution>>,
+    ) -> Result<Self, ConnectorError> {
+        if read.is_none() && write.is_none() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector execution binding requires at least one capability",
+            ));
+        }
+        if read.as_ref().is_some_and(|read| read.binding_key() != &key) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector read execution owner does not match its execution binding",
+            ));
+        }
+        if write
+            .as_ref()
+            .is_some_and(|write| write.binding_key() != &key)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write execution owner does not match its execution binding",
             ));
         }
         Ok(Self {
             provider_id,
             key,
             read,
+            write,
         })
     }
 
@@ -78,8 +104,12 @@ impl ConnectorExecutionBinding {
         &self.key
     }
 
-    pub fn read(&self) -> &Arc<dyn ConnectorReadExecution> {
-        &self.read
+    pub fn read(&self) -> Option<&Arc<dyn ConnectorReadExecution>> {
+        self.read.as_ref()
+    }
+
+    pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteExecution>> {
+        self.write.as_ref()
     }
 }
 

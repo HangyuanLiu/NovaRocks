@@ -1174,7 +1174,12 @@ pub fn encode_query_terminal_snapshot(
                 outcome,
                 error_code,
                 error_detail,
-                iceberg_commits: fragment.sink().iceberg_commits.clone(),
+                connector_staged_report_frames: fragment
+                    .sink()
+                    .connector_staged_report_frames
+                    .iter()
+                    .map(crate::query_execution::write::encode_connector_staged_report_frame)
+                    .collect(),
                 tablet_commit_infos: fragment
                     .sink()
                     .tablet_commit_infos
@@ -1249,7 +1254,12 @@ pub fn decode_query_terminal_snapshot(
                 QueryLifecycleError::invalid_manifest("terminal fragment load stats are required")
             })?;
             let sink = SinkCommitReportSnapshot {
-                iceberg_commits: fragment.iceberg_commits.clone(),
+                connector_staged_report_frames: fragment
+                    .connector_staged_report_frames
+                    .iter()
+                    .map(crate::query_execution::write::decode_connector_staged_report_frame)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| QueryLifecycleError::invalid_manifest(error.message()))?,
                 tablet_commit_infos: fragment
                     .tablet_commit_infos
                     .iter()
@@ -1754,23 +1764,7 @@ mod tests {
     fn terminal_snapshot_wire_round_trips_digest_with_profile_and_sink_facts() {
         let profile = RuntimeProfile::new("terminal-profile");
         profile.counter_set("RowsRead", ProfileUnit::Unit, 7);
-        let sink = SinkCommitReportSnapshot {
-            iceberg_commits: vec![crate::proto::novarocks::IcebergCommitInfo {
-                iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
-                    path: Some("s3://warehouse/table/data.parquet".to_string()),
-                    column_stats: Some(crate::proto::novarocks::IcebergColumnStats {
-                        column_sizes: HashMap::from([(2, 20), (1, 10)]),
-                        value_counts: HashMap::from([(2, 2), (1, 1)]),
-                        lower_bounds: HashMap::from([(2, vec![2]), (1, vec![1])]),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                is_overwrite: Some(false),
-                is_rewrite: Some(false),
-            }],
-            ..Default::default()
-        };
+        let sink = SinkCommitReportSnapshot::default();
         let fragment = crate::query_execution::lifecycle::FragmentTerminalSnapshot::new(
             crate::common::types::UniqueId { hi: 7, lo: 9 },
             3,

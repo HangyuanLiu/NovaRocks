@@ -33,6 +33,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle::QueryExecutionId;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
+use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -163,12 +164,16 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
 }
 
 /// Derive the only permitted instance distribution plan from prepared reads
-/// and their actual BE placement.  A scan node having an empty assigned split
-/// set is still installed: an empty source can be opened by the fragment and
-/// must resolve its real instance without a query-local fallback.
+/// and placement-frozen writers at their actual BE placements. A scan node
+/// having an empty assigned split set is still installed: an empty source can
+/// be opened by the fragment and must resolve its real instance without a
+/// query-local fallback. Write-only fragments install the exact declaration
+/// retained by their planning lease, never a declaration for a later current
+/// incarnation.
 pub(crate) fn compile_install_plan(
     prepared: &PreparedFragmentSet,
     schedule: &SchedulingPlan,
+    connector_write_plan: Option<&ConnectorWritePlanAttachment>,
 ) -> Result<ConnectorBindingInstallPlan, DistributedQueryError> {
     let mut by_backend: BTreeMap<
         usize,
@@ -222,6 +227,57 @@ pub(crate) fn compile_install_plan(
         }
     }
 
+    if let Some(attachment) = connector_write_plan {
+        let declaration = attachment.execution_declaration();
+        let instance_id = declaration.descriptor().instance_id.clone();
+        for writer in attachment.manifest().writers() {
+            let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
+                contract_error("connector writer manifest contains a negative fragment ID")
+            })?;
+            let placements = schedule.by_fragment.get(&fragment_id).ok_or_else(|| {
+                contract_error(format!(
+                    "connector writer manifest references absent fragment {fragment_id}"
+                ))
+            })?;
+            let placement = placements
+                .iter()
+                .find(|placement| {
+                    i32::try_from(placement.instance_index).ok() == Some(writer.backend_num())
+                        && writer.fragment_instance_id()
+                            == connector_writer_fragment_instance_bytes(placement.finst_id)
+                })
+                .ok_or_else(|| {
+                    contract_error(format!(
+                        "connector writer manifest does not match a scheduled placement for fragment {fragment_id} backend {}",
+                        writer.backend_num()
+                    ))
+                })?;
+            let endpoint = placement_socket_addr(&placement.endpoint)?;
+            let entry = by_backend
+                .entry(placement.backend_idx)
+                .or_insert_with(|| (endpoint, BTreeMap::new()));
+            if entry.0 != endpoint {
+                return Err(contract_error(format!(
+                    "connector binding writer schedule assigns backend {} to conflicting endpoints {} and {}",
+                    placement.backend_idx, entry.0, endpoint
+                )));
+            }
+            match entry.1.get(&instance_id) {
+                Some(existing) if existing != declaration => {
+                    return Err(contract_error(format!(
+                        "connector instance '{}' has conflicting read/write declarations for backend {}",
+                        instance_id.as_str(),
+                        placement.backend_idx
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    entry.1.insert(instance_id.clone(), declaration.clone());
+                }
+            }
+        }
+    }
+
     Ok(ConnectorBindingInstallPlan {
         backends: by_backend
             .into_iter()
@@ -234,6 +290,13 @@ pub(crate) fn compile_install_plan(
             )
             .collect(),
     })
+}
+
+fn connector_writer_fragment_instance_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes
 }
 
 fn placement_socket_addr(

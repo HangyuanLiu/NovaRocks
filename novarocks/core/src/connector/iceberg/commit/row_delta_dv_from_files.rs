@@ -1096,10 +1096,6 @@ mod tests {
         let fixture = empty_v3_iceberg_table().await;
         let metadata = fixture.table.metadata().clone();
         let finst_id = UniqueId { hi: 7007, lo: 1 };
-        crate::runtime::sink_commit::unregister(finst_id);
-        crate::runtime::sink_commit::register(finst_id);
-        crate::runtime::sink_commit::add_iceberg_commit(finst_id, test_native_puffin_dv_commit());
-
         let collector = IcebergCommitCollector::new(
             CommitOpKind::RowDeltaDvFromFiles,
             fixture.table_ident.clone(),
@@ -1111,6 +1107,7 @@ mod tests {
             finst_id,
         )
         .with_table_metadata(metadata);
+        collector.inject_written_file(test_written_puffin_dv_file());
         collector.inject_delete_group(PositionDeleteGroup {
             referenced_data_file: "s3://b/data/f.parquet".to_string(),
             partition_spec_id: 0,
@@ -1138,7 +1135,6 @@ mod tests {
             collector.abort_log.drain_data_files(),
             vec!["s3://b/data/dv-00000000.puffin".to_string()]
         );
-        crate::runtime::sink_commit::unregister(finst_id);
     }
 
     fn test_live_file(partition_spec_id: i32) -> LiveFile {
@@ -1251,35 +1247,6 @@ mod tests {
             content_offset: Some(written.content_offset),
             content_size_in_bytes: Some(written.content_size_in_bytes),
             cardinality: Some(cardinality),
-        }
-    }
-
-    fn test_native_puffin_dv_commit() -> crate::proto::novarocks::IcebergCommitInfo {
-        crate::proto::novarocks::IcebergCommitInfo {
-            iceberg_data_file: Some(crate::proto::novarocks::IcebergDataFile {
-                path: Some("s3://b/data/dv-00000000.puffin".to_string()),
-                format: Some("puffin".to_string()),
-                record_count: Some(3),
-                file_size_in_bytes: Some(40),
-                partition_path: None,
-                split_offsets: None,
-                column_stats: None,
-                partition_null_fingerprint: None,
-                file_content: crate::proto::novarocks::IcebergFileContent::PositionDeletes as i32,
-                referenced_data_file: Some("s3://b/data/f.parquet".to_string()),
-                first_row_id: None,
-                equality_ids: None,
-                key_metadata: None,
-                partition_values_descriptor: Some(
-                    crate::proto::novarocks::IcebergPartitionDescriptor { values: Vec::new() },
-                ),
-                partition_spec_id: Some(0),
-                content_offset: Some(4),
-                content_size_in_bytes: Some(12),
-                cardinality: Some(3),
-            }),
-            is_overwrite: None,
-            is_rewrite: None,
         }
     }
 }

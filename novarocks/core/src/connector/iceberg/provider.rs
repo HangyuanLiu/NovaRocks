@@ -66,6 +66,9 @@ use super::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
     IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
 };
+use super::write_control::IcebergWriteControlAdapter;
+use super::write_execution::IcebergDataWriteExecution;
+use super::write_service::RegisteredIcebergWriteControlBackend;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -254,6 +257,38 @@ impl IcebergReadBinding {
                     .with_retryable_before_progress()
             })
     }
+
+    /// Recreate provider-private writer storage configuration from the BE
+    /// startup binding. Credentials remain local to the exact incarnation.
+    pub(crate) fn write_object_store_config(
+        &self,
+        data_location: &str,
+    ) -> Result<Option<super::sink_plan::IcebergSinkObjectStoreConfig>, String> {
+        let Some(bucket) =
+            super::changes::expected_object_store_bucket_from_location(data_location)?
+        else {
+            return Ok(None);
+        };
+        let config = self.object_store_config.as_ref().ok_or_else(|| {
+            format!(
+                "Iceberg connector writer needs a startup object-store binding for bucket {bucket}"
+            )
+        })?;
+        Ok(Some(super::sink_plan::IcebergSinkObjectStoreConfig {
+            endpoint: config.endpoint.clone(),
+            bucket,
+            access_key_id: config.access_key_id.clone(),
+            access_key_secret: config.access_key_secret.clone(),
+            session_token: config.session_token.clone(),
+            region: config.region.clone(),
+            enable_path_style_access: config.enable_path_style_access,
+            retry_max_times: config.retry_max_times,
+            retry_min_delay_ms: config.retry_min_delay_ms,
+            retry_max_delay_ms: config.retry_max_delay_ms,
+            timeout_ms: config.timeout_ms,
+            io_timeout_ms: config.io_timeout_ms,
+        }))
+    }
 }
 
 /// Startup-composed installer for Iceberg read-only instances.  The payload
@@ -287,10 +322,14 @@ pub(crate) fn compose_compat_execution_binding(
         instance_id,
         incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
     };
-    ConnectorExecutionBinding::try_new(
+    ConnectorExecutionBinding::try_new_capabilities(
         ConnectorProviderId::parse(PROVIDER_ID)?,
         key.clone(),
-        Arc::new(IcebergReadOnlyConnectorInstance { key, binding }),
+        Some(Arc::new(IcebergReadOnlyConnectorInstance {
+            key: key.clone(),
+            binding: binding.clone(),
+        })),
+        Some(Arc::new(IcebergDataWriteExecution::new(key, binding))),
     )
 }
 
@@ -428,13 +467,17 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
             ));
         }
         let key = declaration.binding_key();
-        ConnectorExecutionBinding::try_new(
+        ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),
             key.clone(),
-            Arc::new(IcebergReadOnlyConnectorInstance {
-                key,
+            Some(Arc::new(IcebergReadOnlyConnectorInstance {
+                key: key.clone(),
                 binding: self.binding.clone(),
-            }),
+            })),
+            Some(Arc::new(IcebergDataWriteExecution::new(
+                key,
+                self.binding.clone(),
+            ))),
         )
     }
 }
@@ -614,12 +657,24 @@ impl IcebergControlProvider {
             descriptor: descriptor.clone(),
             instance_id,
             incarnation,
-            registry,
+            registry: Arc::clone(&registry),
             snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
                 MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
             )),
         });
-        ConnectorControlBinding::try_new(
+        let write_key = ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation,
+        };
+        let services = registry
+            .read()
+            .map_err(|error| internal(format!("Iceberg catalog registry read lock: {error}")))?
+            .write_services();
+        let write = Arc::new(IcebergWriteControlAdapter::new(
+            write_key,
+            Arc::new(RegisteredIcebergWriteControlBackend::new(services)),
+        )?);
+        ConnectorControlBinding::try_new_with_write(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -629,6 +684,7 @@ impl IcebergControlProvider {
                 incarnation,
             }),
             Some(provider),
+            Some(write),
         )
     }
 

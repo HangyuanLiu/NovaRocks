@@ -85,8 +85,8 @@ impl DataPartition {
 pub(crate) enum DataSink {
     Result,
     Noop,
-    IcebergWrite(super::write::sink::IcebergWriteFragmentSink),
-    IcebergChangeStreamRouter(super::write::change_stream::IcebergChangeStreamRouterSink),
+    ConnectorWrite(super::write::sink::ConnectorWriteFragmentSink),
+    ChangeStreamRouter(super::write::change_stream::ChangeStreamRouterSink),
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +110,7 @@ pub(crate) enum FragmentEdgeKind {
         cte_id: CteId,
         receive_producer_column_ids: Vec<ColumnId>,
     },
-    IcebergChangeStreamRouter {
+    ChangeStreamRouter {
         router_group_id: i32,
         branch_id: i32,
         branch_kind: crate::sql::common::ChangeStreamBranchKind,

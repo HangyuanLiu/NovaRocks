@@ -98,7 +98,7 @@ pub(crate) fn prepare_fragments(
         .copied()
         .filter(|&fragment_id| {
             plan.write_contracts()
-                .iceberg_write_output(fragment_id)
+                .connector_write_output(fragment_id)
                 .is_some()
         })
         .collect::<BTreeSet<_>>();
@@ -515,10 +515,6 @@ mod tests {
             nullable: false,
             is_internal: false,
         }];
-        let mut sink_spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-        sink_spec.target_table.columns[0].data_type = DataType::Int64;
-        sink_spec.target_columns[0].data_type = DataType::Int64;
         let fragment = PlanFragment {
             fragment_id: 9,
             root: DistributedNode {
@@ -543,11 +539,11 @@ mod tests {
             },
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::IcebergWrite(
-                crate::sql::planner::distributed::write::sink::IcebergWriteFragmentSink {
-                    descriptor_database: "default".to_string(),
-                    spec: sink_spec,
-                    input: crate::sql::planner::distributed::write::sink::IcebergWriteInputBinding::RootOutputByOrdinal,
+            sink: DataSink::ConnectorWrite(
+                crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
+                    handle: None,
+                    input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    output_contract: None,
                 },
             ),
             output_exprs: None,

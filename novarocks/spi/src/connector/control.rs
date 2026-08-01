@@ -22,7 +22,8 @@ use super::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
     ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorTableHandle,
+    ConnectorSplitPlanningResult, ConnectorTableHandle, ConnectorWriteControl,
+    ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -62,6 +63,7 @@ pub struct ConnectorControlBinding {
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
     mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+    write: Option<Arc<dyn ConnectorWriteControl>>,
 }
 
 impl ConnectorControlBinding {
@@ -72,6 +74,27 @@ impl ConnectorControlBinding {
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
         mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_write(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_write(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
     ) -> Result<Self, ConnectorError> {
         if metadata.instance_id() != &descriptor.instance_id {
             return Err(ConnectorError::new(
@@ -93,6 +116,15 @@ impl ConnectorControlBinding {
                 "connector mutation capability owner does not match its control binding generation",
             ));
         }
+        if write.as_ref().is_some_and(|write| {
+            write.binding_key().instance_id != descriptor.instance_id
+                || write.binding_key().incarnation != incarnation
+        }) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write capability owner does not match its control binding generation",
+            ));
+        }
         Ok(Self {
             descriptor,
             incarnation,
@@ -100,6 +132,7 @@ impl ConnectorControlBinding {
             planning,
             distribution,
             mutation,
+            write,
         })
     }
 
@@ -121,6 +154,14 @@ impl ConnectorControlBinding {
 
     pub fn mutation(&self) -> Option<&Arc<dyn ConnectorCatalogMutation>> {
         self.mutation.as_ref()
+    }
+
+    pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
+        self.write.as_ref()
+    }
+
+    pub fn execution_distribution(&self) -> &Arc<dyn ConnectorExecutionDistribution> {
+        &self.distribution
     }
 
     pub fn execution_declaration(
@@ -153,7 +194,7 @@ pub trait ConnectorControlResolver: Send + Sync {
 /// Lifecycle port owned by the frontend composition root. Core may register
 /// or retire a logical control generation, but it never owns the registry.
 pub trait ConnectorControlRegistry:
-    ConnectorControlResolver + ConnectorCatalogMutationResolver
+    ConnectorControlResolver + ConnectorCatalogMutationResolver + ConnectorWriteResolver
 {
     fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError>;
 

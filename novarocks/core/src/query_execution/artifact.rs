@@ -47,6 +47,7 @@ use crate::query_execution::preparation::{
 use crate::query_execution::schedule::{
     FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
 };
+use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::analysis::cte::CteId;
@@ -108,6 +109,7 @@ impl PreparedDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule,
+            connector_write_plan: None,
         })
     }
 }
@@ -129,9 +131,60 @@ pub struct ScheduleBoundDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentBundle,
     schedule: ValidatedFragmentSchedule,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 impl ScheduleBoundDistributedQuery {
+    /// Terminal write fragments derived from the same prepared artifact that
+    /// was sealed before scheduling.  Callers cannot nominate an arbitrary
+    /// fragment set when creating a connector writer manifest.
+    pub fn terminal_write_fragment_ids(&self) -> BTreeSet<FragmentId> {
+        self.prepared
+            .scheduling_view()
+            .fragments()
+            .filter(|fragment| fragment.execution_role().is_terminal_write())
+            .map(|fragment| fragment.fragment_id())
+            .collect()
+    }
+
+    /// Freeze the writer identities after placement and before the BE binding
+    /// barrier.  Planning remains caller-owned because only the DML owner has
+    /// the operation-specific table, intent, and provider payload.
+    pub fn freeze_connector_write_manifest(
+        &self,
+        terminal_write_fragment_ids: &BTreeSet<FragmentId>,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+        owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorWriteManifest, DistributedQueryError> {
+        ConnectorWriteManifest::freeze(
+            self.schedule.planning_schedule(),
+            terminal_write_fragment_ids,
+            operation_id,
+            cohort_id,
+            owner,
+            self.schedule.execution_id(),
+        )
+        .map_err(|error| contract_error(error.to_string()))
+    }
+
+    /// Attach one already-frozen provider-neutral plan.  The attachment owns
+    /// the exact control-generation lease and is carried through every later
+    /// typestate until the caller receives completion ownership.  No implicit
+    /// planning occurs at this layer.
+    pub fn attach_connector_write_plan(
+        mut self,
+        attachment: ConnectorWritePlanAttachment,
+    ) -> Result<Self, DistributedQueryError> {
+        attach_connector_write_plan(
+            &mut self.connector_write_plan,
+            self.schedule.planning_schedule(),
+            self.schedule.execution_id(),
+            attachment,
+        )?;
+        Ok(self)
+    }
+
     pub fn initialize_query(
         self,
         options: QueryInitOptions,
@@ -169,6 +222,7 @@ impl ScheduleBoundDistributedQuery {
             options,
             query_lifecycle_lease,
             stage_bindings,
+            connector_write_plan: self.connector_write_plan,
         })
     }
 
@@ -184,6 +238,7 @@ impl ScheduleBoundDistributedQuery {
         options: &ResolvedQueryOptions,
         live_backends: &[LiveBackendTarget],
     ) -> Result<InProcessTestArtifact, DistributedQueryError> {
+        let connector_write_plan = self.connector_write_plan;
         let runtime_filters = crate::query_execution::runtime_filter::compile_contribution_plan(
             self.schedule.execution_id,
             self.prepared.runtime_filter_graph(),
@@ -209,6 +264,7 @@ impl ScheduleBoundDistributedQuery {
         let install_plan = crate::query_execution::connector_binding::compile_install_plan(
             &self.prepared,
             &self.schedule.inner,
+            connector_write_plan.as_ref(),
         )?;
         let declarations = install_plan
             .backends()
@@ -224,6 +280,7 @@ impl ScheduleBoundDistributedQuery {
                 query_id,
                 options: options.runtime_options().clone(),
             },
+            connector_write_plan.as_ref(),
         )?;
         Ok(InProcessTestArtifact {
             submissions: assembled
@@ -243,6 +300,25 @@ impl ScheduleBoundDistributedQuery {
     }
 }
 
+fn attach_connector_write_plan(
+    slot: &mut Option<ConnectorWritePlanAttachment>,
+    schedule: &SchedulingPlan,
+    execution_id: QueryExecutionId,
+    attachment: ConnectorWritePlanAttachment,
+) -> Result<(), DistributedQueryError> {
+    if slot.is_some() {
+        return Err(contract_error(
+            "distributed query already has a connector write plan attachment",
+        ));
+    }
+    attachment
+        .manifest()
+        .validate_schedule(schedule, execution_id)
+        .map_err(|error| contract_error(error.to_string()))?;
+    *slot = Some(attachment);
+    Ok(())
+}
+
 /// Query lifecycle is ready, but connector instances still require their
 /// independent process-scoped install/ACK barrier before preparing native
 /// Stage batches.
@@ -253,6 +329,7 @@ pub struct ControlReadyDistributedQuery {
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
     stage_bindings: Vec<StageParticipantBinding>,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 impl ControlReadyDistributedQuery {
@@ -263,6 +340,7 @@ impl ControlReadyDistributedQuery {
         let plan = crate::query_execution::connector_binding::compile_install_plan(
             &self.prepared,
             &self.schedule.inner,
+            self.connector_write_plan.as_ref(),
         )?;
         let connector_binding_lease = match barrier.install_all(self.schedule.execution_id, plan) {
             Ok(lease) => lease,
@@ -282,6 +360,7 @@ impl ControlReadyDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease,
             stage_bindings: self.stage_bindings,
+            connector_write_plan: self.connector_write_plan,
         })
     }
 }
@@ -297,27 +376,41 @@ pub struct ConnectorBindingReadyDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     stage_bindings: Vec<StageParticipantBinding>,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 impl ConnectorBindingReadyDistributedQuery {
+    pub fn connector_write_plan(&self) -> Option<&ConnectorWritePlanAttachment> {
+        self.connector_write_plan.as_ref()
+    }
+
     pub fn prepare_stage(self) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
-        let context = match self.options.native_submission_context() {
+        let ConnectorBindingReadyDistributedQuery {
+            prepared,
+            native_bundle,
+            schedule,
+            options,
+            query_lifecycle_lease,
+            connector_binding_lease,
+            stage_bindings,
+            connector_write_plan,
+        } = self;
+        let context = match options.native_submission_context() {
             Ok(context) => context,
             Err(error) => {
                 let kind = error.kind();
-                let message = self
-                    .query_lifecycle_lease
-                    .abort_preserving(error.message().to_string());
-                let message = self.connector_binding_lease.abort_preserving(message);
+                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
         let assembled = assemble_native_execution(
-            self.prepared,
-            self.native_bundle,
-            self.schedule.inner,
-            self.schedule.execution_id,
+            prepared,
+            native_bundle,
+            schedule.inner,
+            schedule.execution_id,
             context,
+            connector_write_plan.as_ref(),
         );
         match assembled {
             Ok(assembled) => {
@@ -329,13 +422,13 @@ impl ConnectorBindingReadyDistributedQuery {
                         .or_default()
                         .push(fragment);
                 }
-                let mut batches = Vec::with_capacity(self.stage_bindings.len());
-                for binding in self.stage_bindings {
+                let mut batches = Vec::with_capacity(stage_bindings.len());
+                for binding in stage_bindings {
                     let fragments = fragments_by_backend
                         .remove(&binding.target().backend_idx())
                         .unwrap_or_default();
                     batches.push(
-                        StageBatch::new(self.schedule.execution_id, binding, fragments)
+                        StageBatch::new(schedule.execution_id, binding, fragments)
                             .map_err(|error| contract_error(error.to_string()))?,
                     );
                 }
@@ -345,10 +438,9 @@ impl ConnectorBindingReadyDistributedQuery {
                         fragments_by_backend.keys().collect::<Vec<_>>()
                     ));
                     let kind = error.kind();
-                    let message = self
-                        .query_lifecycle_lease
-                        .abort_preserving(error.message().to_string());
-                    let message = self.connector_binding_lease.abort_preserving(message);
+                    let message =
+                        query_lifecycle_lease.abort_preserving(error.message().to_string());
+                    let message = connector_binding_lease.abort_preserving(message);
                     return Err(DistributedQueryError::new(kind, message));
                 }
                 Ok(StagePreparedDistributedQuery {
@@ -356,16 +448,15 @@ impl ConnectorBindingReadyDistributedQuery {
                     root_fetch: assembled.root_fetch,
                     writer_registrations: assembled.writer_registrations,
                     expected_output: assembled.expected_output,
-                    query_lifecycle_lease: self.query_lifecycle_lease,
-                    connector_binding_lease: self.connector_binding_lease,
+                    query_lifecycle_lease,
+                    connector_binding_lease,
+                    connector_write_plan,
                 })
             }
             Err(error) => {
                 let kind = error.kind();
-                let message = self
-                    .query_lifecycle_lease
-                    .abort_preserving(error.message().to_string());
-                let message = self.connector_binding_lease.abort_preserving(message);
+                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
+                let message = connector_binding_lease.abort_preserving(message);
                 Err(DistributedQueryError::new(kind, message))
             }
         }
@@ -483,7 +574,7 @@ impl SchedulingEdgeView<'_> {
         let kind = match self.edge.edge_kind {
             FragmentEdgeKind::Stream => self.edge.stream_kind,
             FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
-            FragmentEdgeKind::IcebergChangeStreamRouter { .. } => self.edge.stream_kind,
+            FragmentEdgeKind::ChangeStreamRouter { .. } => self.edge.stream_kind,
         };
         match kind {
             FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
@@ -780,6 +871,14 @@ impl ValidatedFragmentSchedule {
     pub(crate) const fn lifecycle_projection(&self) -> &FragmentLifecycleProjection {
         &self.lifecycle
     }
+
+    /// Return the immutable placement result used to freeze a connector write
+    /// manifest before the binding-install barrier.  The schedule remains
+    /// sealed: callers can inspect it for control planning but cannot alter
+    /// placements after writer identities have been derived.
+    pub(crate) const fn planning_schedule(&self) -> &SchedulingPlan {
+        &self.inner
+    }
 }
 
 const FRAGMENT_INSTANCE_ID_DOMAIN: &[u8] = b"novarocks.query-lifecycle.fragment-instance.v1\0";
@@ -1020,6 +1119,10 @@ impl RootFetchMetadata {
 
 pub(crate) struct WriterRegistration {
     pub(crate) query_id: UniqueId,
+    /// The immutable native query attempt that owns this writer.  The staged
+    /// report envelope repeats this identity, so report aggregation can reject
+    /// a late report from a previous attempt before any provider commit work.
+    pub(crate) execution_id: QueryExecutionId,
     pub(crate) fragment_id: FragmentId,
     pub(crate) fragment_instance_id: UniqueId,
     pub(crate) backend_num: i32,
@@ -1103,6 +1206,7 @@ pub struct StagePreparedDistributedQuery {
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 struct AssembledNativeExecution {
@@ -1129,6 +1233,10 @@ pub(crate) struct InProcessTestArtifact {
 }
 
 impl StagePreparedDistributedQuery {
+    pub fn connector_write_plan(&self) -> Option<&ConnectorWritePlanAttachment> {
+        self.connector_write_plan.as_ref()
+    }
+
     pub fn batches(&self) -> &[StageBatch] {
         &self.batches
     }
@@ -1170,6 +1278,7 @@ impl StagePreparedDistributedQuery {
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
+            connector_write_plan: self.connector_write_plan,
         })
     }
 }
@@ -1198,6 +1307,7 @@ pub struct StagedDistributedQuery {
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 impl StagedDistributedQuery {
@@ -1223,6 +1333,7 @@ impl StagedDistributedQuery {
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
+            connector_write_plan: self.connector_write_plan,
         })
     }
 }
@@ -1235,6 +1346,7 @@ pub struct RunningDistributedQuery {
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 impl RunningDistributedQuery {
@@ -1245,6 +1357,7 @@ impl RunningDistributedQuery {
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
+            connector_write_plan: self.connector_write_plan,
         }
     }
 }
@@ -1255,6 +1368,7 @@ pub struct RunningNativeExecutionParts {
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
     pub connector_binding_lease: ConnectorBindingInstallLease,
+    pub connector_write_plan: Option<ConnectorWritePlanAttachment>,
 }
 
 fn assemble_native_execution(
@@ -1263,6 +1377,7 @@ fn assemble_native_execution(
     schedule: SchedulingPlan,
     execution_id: QueryExecutionId,
     context: NativeSubmissionContext,
+    connector_write_plan: Option<&ConnectorWritePlanAttachment>,
 ) -> Result<AssembledNativeExecution, DistributedQueryError> {
     crate::query_execution::assembly::validate_prepared_native_payloads(&prepared, &native_bundle)
         .map_err(contract_error)?;
@@ -1377,6 +1492,7 @@ fn assemble_native_execution(
         .collect::<BTreeMap<PlannerFragmentId, _>>();
     let mut submissions_by_fragment = BTreeMap::new();
     let mut writer_registrations = Vec::new();
+    let mut consumed_connector_writers = BTreeSet::new();
     for (&fragment_id, placements) in &schedule.by_fragment {
         let fragment = prepared
             .fragment(fragment_id)
@@ -1417,12 +1533,54 @@ fn assemble_native_execution(
                 if is_writer {
                     writer_registrations.push(WriterRegistration {
                         query_id,
+                        execution_id,
                         fragment_id,
                         fragment_instance_id: placement.finst_id,
                         backend_num: placement.instance_index as i32,
                     });
                 }
                 let mut native_fragment = template.clone();
+                if is_writer {
+                    if let Some(attachment) = connector_write_plan {
+                        let backend_num = i32::try_from(placement.instance_index).map_err(|_| {
+                            contract_error("connector writer backend number exceeds i32 width")
+                        })?;
+                        let writer_fragment_id = i32::try_from(fragment_id).map_err(|_| {
+                            contract_error("connector writer fragment ID exceeds i32 width")
+                        })?;
+                        let handle = attachment
+                            .plan()
+                            .handles()
+                            .iter()
+                            .find(|handle| {
+                                let writer = handle.writer();
+                                writer.fragment_id() == writer_fragment_id
+                                    && writer.backend_num() == backend_num
+                                    && writer.fragment_instance_id()
+                                        == connector_writer_unique_id_bytes(placement.finst_id)
+                                    && writer.sink_ordinal() == 0
+                            })
+                            .ok_or_else(|| {
+                                contract_error(format!(
+                                    "connector write plan has no handle for terminal writer fragment={fragment_id} backend_num={backend_num} finst={:?}",
+                                    placement.finst_id
+                                ))
+                            })?;
+                        if !consumed_connector_writers.insert(handle.writer().clone()) {
+                            return Err(contract_error(format!(
+                                "connector write plan reuses a writer handle for terminal writer fragment={fragment_id} backend_num={backend_num}"
+                            )));
+                        }
+                        crate::query_execution::assembly::patch_native_connector_write_sink(
+                            &mut native_fragment,
+                            fragment_id,
+                            placement.finst_id,
+                            backend_num,
+                            handle,
+                        )
+                        .map_err(contract_error)?;
+                    }
+                }
                 for (&node_id, splits) in &placement.connector_splits {
                     crate::query_execution::assembly::patch_native_connector_read_splits(
                         &mut native_fragment,
@@ -1434,7 +1592,7 @@ fn assemble_native_execution(
                 if !is_root && !is_writer && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         crate::query_execution::assembly::
-                            patch_native_iceberg_change_stream_router_sink(
+                            patch_native_change_stream_router_sink(
                                 &mut native_fragment,
                                 fragment_id,
                                 *router_group_id,
@@ -1495,6 +1653,25 @@ fn assemble_native_execution(
             "assembled submissions contain unknown fragments",
         ));
     }
+    if let Some(attachment) = connector_write_plan {
+        let expected = attachment
+            .manifest()
+            .writers()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if consumed_connector_writers != expected {
+            let missing = expected
+                .difference(&consumed_connector_writers)
+                .collect::<Vec<_>>();
+            let unexpected = consumed_connector_writers
+                .difference(&expected)
+                .collect::<Vec<_>>();
+            return Err(contract_error(format!(
+                "connector write plan consumption does not exactly cover the frozen manifest: missing={missing:?} unexpected={unexpected:?}"
+            )));
+        }
+    }
 
     Ok(AssembledNativeExecution {
         submissions,
@@ -1504,6 +1681,13 @@ fn assemble_native_execution(
         },
         expected_output,
     })
+}
+
+fn connector_writer_unique_id_bytes(value: UniqueId) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&value.hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&value.lo.to_be_bytes());
+    bytes
 }
 
 fn build_expected_output_schema(
@@ -1542,9 +1726,27 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use super::{build_fragment_lifecycle_projection, derive_fragment_instance_id};
+    use arrow::datatypes::Schema;
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
+        ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+        ConnectorWriteAbortRequest, ConnectorWriteCommitRequest, ConnectorWriteControl,
+        ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
+        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
+        ConnectorWriteReconcileRequest, ConnectorWriterHandle,
+    };
+
+    use super::{
+        attach_connector_write_plan, build_fragment_lifecycle_projection,
+        derive_fragment_instance_id,
+    };
     use crate::common::types::UniqueId;
     use crate::query_execution::backend::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
@@ -1585,6 +1787,222 @@ mod tests {
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
         }
+    }
+
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestWriteControl {
+        key: ConnectorExecutionBindingKey,
+    }
+
+    struct TestWriteDistribution {
+        key: ConnectorExecutionBindingKey,
+    }
+
+    impl ConnectorExecutionDistribution for TestWriteDistribution {
+        fn declaration(
+            &self,
+            _context: &ConnectorRequestContext,
+        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+            ConnectorExecutionDeclaration::try_new(
+                ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("test").expect("valid provider ID"),
+                    instance_id: self.key.instance_id.clone(),
+                },
+                self.key.incarnation,
+                Bytes::from_static(b"test-write-binding"),
+            )
+        }
+    }
+
+    impl ConnectorWriteControl for TestWriteControl {
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+
+        fn plan_write(
+            &self,
+            request: ConnectorWritePlanningRequest,
+        ) -> Result<ConnectorWritePlan, ConnectorError> {
+            let handles = request
+                .expected_writers
+                .into_iter()
+                .map(|writer| {
+                    ConnectorWriterHandle::try_new(
+                        self.key.clone(),
+                        writer,
+                        1,
+                        Bytes::from_static(b"test-handle"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ConnectorWritePlan::try_new(
+                self.key.clone(),
+                request.operation_id,
+                request.cohort_id,
+                request.execution_id,
+                handles,
+                Bytes::new(),
+            )
+        }
+
+        fn commit(
+            &self,
+            _request: ConnectorWriteCommitRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<ConnectorWriteReceipt>,
+            ConnectorError,
+        > {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test control does not commit",
+            ))
+        }
+
+        fn abort(
+            &self,
+            _request: ConnectorWriteAbortRequest,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test control does not abort",
+            ))
+        }
+
+        fn reconcile(
+            &self,
+            _request: ConnectorWriteReconcileRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<ConnectorWriteReceipt>,
+            ConnectorError,
+        > {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test control does not reconcile",
+            ))
+        }
+    }
+
+    fn write_owner() -> ConnectorExecutionBindingKey {
+        ConnectorExecutionBindingKey {
+            instance_id: ConnectorInstanceId::parse("test-write").expect("valid instance"),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        }
+    }
+
+    fn write_execution() -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(41, 73),
+            AttemptId::new(3).expect("valid attempt"),
+        )
+        .expect("valid execution")
+    }
+
+    fn write_schedule(finst_id: UniqueId) -> SchedulingPlan {
+        SchedulingPlan {
+            root_fragment_id: 3,
+            by_fragment: BTreeMap::from([(3, vec![placement(3, 0, finst_id, 8)])]),
+            root_finst_id: finst_id,
+            root_backend_idx: 8,
+        }
+    }
+
+    fn planned_attachment(schedule: &SchedulingPlan) -> super::ConnectorWritePlanAttachment {
+        let owner = write_owner();
+        let operation_id = ConnectorWriteOperationId::from_bytes([4; 16]);
+        let execution_id = write_execution();
+        let manifest = crate::query_execution::write_plan::ConnectorWriteManifest::freeze(
+            schedule,
+            &BTreeSet::from([3]),
+            operation_id,
+            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
+            owner.clone(),
+            execution_id,
+        )
+        .expect("freeze manifest");
+        let control: Arc<dyn ConnectorWriteControl> =
+            Arc::new(TestWriteControl { key: owner.clone() });
+        let lease = ConnectorWriteLease::new_with_execution_distribution(
+            owner.clone(),
+            control,
+            Arc::new(TestWriteDistribution { key: owner.clone() }),
+            || {},
+        )
+        .expect("valid exact control lease");
+        let query_id = execution_id.query_id();
+        let mut query_id_bytes = [0; 16];
+        query_id_bytes[..8].copy_from_slice(&query_id.high().to_be_bytes());
+        query_id_bytes[8..].copy_from_slice(&query_id.low().to_be_bytes());
+        manifest
+            .plan(
+                lease,
+                ConnectorWritePlanningRequest {
+                    operation_id,
+                    cohort_id: manifest.cohort_id(),
+                    execution_id: ConnectorWriteExecutionId::new(
+                        query_id_bytes,
+                        execution_id.attempt_id().get(),
+                    ),
+                    table: ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::new())
+                        .expect("valid table"),
+                    intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
+                    input_schema: Arc::new(Schema::empty()),
+                    expected_writers: Vec::new(),
+                    provider_payload: Bytes::new(),
+                    context: ConnectorRequestContext::try_new(
+                        Instant::now() + Duration::from_secs(1),
+                        Arc::new(NeverCancelled),
+                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+                    )
+                    .expect("valid context"),
+                },
+            )
+            .expect("provider returns the frozen writer manifest")
+    }
+
+    #[test]
+    fn connector_write_attachment_rejects_duplicate_and_mismatched_placements() {
+        let execution = write_execution();
+        let schedule = write_schedule(UniqueId { hi: 3, lo: 30 });
+        let mut slot = None;
+        attach_connector_write_plan(
+            &mut slot,
+            &schedule,
+            execution,
+            planned_attachment(&schedule),
+        )
+        .expect("first attachment belongs to the exact schedule");
+        let duplicate = attach_connector_write_plan(
+            &mut slot,
+            &schedule,
+            execution,
+            planned_attachment(&schedule),
+        )
+        .expect_err("a query may carry only one write attachment");
+        assert!(duplicate.message().contains("already has"));
+
+        let mismatched = write_schedule(UniqueId { hi: 3, lo: 31 });
+        let mut mismatched_slot = None;
+        let mismatch = attach_connector_write_plan(
+            &mut mismatched_slot,
+            &mismatched,
+            execution,
+            planned_attachment(&schedule),
+        )
+        .expect_err("an attachment cannot cross placement manifests");
+        assert!(
+            mismatch
+                .message()
+                .contains("does not match a validated fragment placement")
+        );
+        assert!(mismatched_slot.is_none());
     }
 
     #[test]

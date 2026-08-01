@@ -257,6 +257,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
 
     let mut reader = installed
         .read()
+        .expect("read capability")
         .open_reader(
             &split,
             ConnectorOpenReaderRequest {
@@ -432,6 +433,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     for _ in 0..2 {
         let mut reader = execution
             .read()
+            .expect("read capability")
             .open_reader(
                 &splits[0],
                 ConnectorOpenReaderRequest {
@@ -563,7 +565,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
     );
 
     let execution = install_execution(&instance);
-    let error = match execution.read().open_reader(
+    let error = match execution.read().expect("read capability").open_reader(
         &stale_split,
         ConnectorOpenReaderRequest {
             expected_schema: Arc::clone(&resolved.schema),
@@ -622,6 +624,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         .remove(0);
     let mut reader = execution
         .read()
+        .expect("read capability")
         .open_reader(
             &current_split,
             ConnectorOpenReaderRequest {

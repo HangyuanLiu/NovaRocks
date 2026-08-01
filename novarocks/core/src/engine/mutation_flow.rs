@@ -25,13 +25,14 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::arrow::schema_to_arrow_schema;
+use sha2::{Digest, Sha256};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    IcebergCommitCollector, IcebergUpdateMode, ensure_iceberg_write_supported,
-    select_iceberg_update_mode,
+    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector, IcebergUpdateMode,
+    ensure_iceberg_write_supported, select_iceberg_update_mode,
 };
+use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
@@ -41,7 +42,6 @@ use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{
@@ -1072,29 +1072,26 @@ fn execute_mor_update(
         target_ref,
         write,
         execution,
+        connector_context,
     )?;
     Ok(StatementResult::Ok)
 }
 
 struct MorUpdateChangeStreamExecutor {
     state: Arc<StandaloneState>,
-    target: crate::engine::backend_resolver::TargetBackend,
-    write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
-    commit_executor: IcebergWriteCommitExecutor,
-    commit_plan: Mutex<
-        Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
-    >,
+    planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
     execution: QueryExecutionContext,
 }
 
 struct MorMergeChangeStreamExecutor {
     state: Arc<StandaloneState>,
-    target: crate::engine::backend_resolver::TargetBackend,
-    write: Mutex<Option<crate::engine::dml_change_stream::DmlChangeStreamWritePlan>>,
-    commit_executor: IcebergWriteCommitExecutor,
-    commit_plan: Mutex<
-        Option<crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan>,
-    >,
+    planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
     execution: QueryExecutionContext,
 }
 
@@ -1103,28 +1100,18 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut plan = self
-            .write
+        let planned = self
+            .planned
             .lock()
             .expect("MOR UPDATE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
-        let planned = crate::engine::dml_change_stream::plan_dml_change_stream_write(
-            &self.state,
-            &self.target,
-            &mut plan,
-        )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
-            commit_plan,
-            #[cfg(test)]
             topology,
+            ..
         } = planned;
-        *self
-            .commit_plan
-            .lock()
-            .expect("MOR UPDATE change-stream commit plan lock poisoned") = Some(commit_plan);
         #[cfg(test)]
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
@@ -1135,8 +1122,10 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
             native_bundle,
             None,
             Some(&self.execution),
+            Some(self.connector_write.clone()),
         )?;
-        if let Some(commit) = result.write_commit.as_ref()
+        if result.connector_completion.is_none()
+            && let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
         {
             if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
@@ -1150,24 +1139,17 @@ impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
         Ok(result)
     }
 
-    fn commit(
+    fn commit_connector_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let guard = self
-            .commit_plan
-            .lock()
-            .expect("MOR UPDATE change-stream commit plan lock poisoned");
-        let plan = guard.as_ref().ok_or_else(|| {
-            CommitServiceError::known_uncommitted(
-                "MOR UPDATE change-stream commit plan is missing; coordinated write did not complete"
-                    .to_string(),
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        self.commit_executor
-            .commit_change_stream_write_input(write_commit, plan)
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
+        Some(
+            crate::engine::iceberg_writer::commit_iceberg_connector_write(
+                &self.commit_executor,
+                completion,
+            ),
+        )
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
@@ -1180,28 +1162,18 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<QueryExecutionResult, String> {
-        let mut plan = self
-            .write
+        let planned = self
+            .planned
             .lock()
             .expect("MOR MERGE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
-        let planned = crate::engine::dml_change_stream::plan_dml_change_stream_write(
-            &self.state,
-            &self.target,
-            &mut plan,
-        )?;
         let crate::engine::PlannedIcebergChangeStreamWrite {
             prepared,
             native_bundle,
-            commit_plan,
-            #[cfg(test)]
             topology,
+            ..
         } = planned;
-        *self
-            .commit_plan
-            .lock()
-            .expect("MOR MERGE change-stream commit plan lock poisoned") = Some(commit_plan);
         #[cfg(test)]
         if let Some(result) = crate::engine::observe_change_stream_write_build_for_test(&topology) {
             return Ok(result);
@@ -1212,8 +1184,10 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
             native_bundle,
             None,
             Some(&self.execution),
+            Some(self.connector_write.clone()),
         )?;
-        if let Some(commit) = result.write_commit.as_ref()
+        if result.connector_completion.is_none()
+            && let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
         {
             if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
@@ -1227,24 +1201,17 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
         Ok(result)
     }
 
-    fn commit(
+    fn commit_connector_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let guard = self
-            .commit_plan
-            .lock()
-            .expect("MOR MERGE change-stream commit plan lock poisoned");
-        let plan = guard.as_ref().ok_or_else(|| {
-            CommitServiceError::known_uncommitted(
-                "MOR MERGE change-stream commit plan is missing; coordinated write did not complete"
-                    .to_string(),
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        self.commit_executor
-            .commit_change_stream_write_input(write_commit, plan)
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
+        Some(
+            crate::engine::iceberg_writer::commit_iceberg_connector_write(
+                &self.commit_executor,
+                completion,
+            ),
+        )
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
@@ -1252,42 +1219,104 @@ impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
     }
 }
 
-/// N-ary fold for MERGE branch writes: concatenate every part's
-/// `WriteCommitInput.writers` into one transaction-wide `WriteCommitInput` so a
-/// single collector drives one commit. Used by the folded multi-branch MERGE
-/// executor (matched data/DV writers all share one collector). The first
-/// part's `query_result` is kept (callers only need a sentinel here). If any
-/// part reported a `write_abort`, the first such abort is propagated so the
-/// transaction runner can clean up and discard the partial commit.
-fn merge_all_write_commits(
-    parts: Vec<QueryExecutionResult>,
-) -> Result<QueryExecutionResult, String> {
-    if parts.is_empty() {
-        return Err("merge_all_write_commits requires at least one part".to_string());
-    }
-    let mut write_abort = None;
-    let mut query_result = None;
-    let mut merged_commit: Option<WriteCommitInput> = None;
-    for part in parts {
-        if write_abort.is_none() {
-            write_abort = part.write_abort;
-        }
-        if query_result.is_none() {
-            query_result = Some(part.query_result);
-        }
-        if let Some(commit) = part.write_commit {
-            match merged_commit.as_mut() {
-                Some(existing) => existing.writers.extend(commit.writers),
-                None => merged_commit = Some(commit),
+/// Build each change-stream terminal writer's opaque handle on the FE before
+/// placement planning.  Deletion-vector branches freeze every base-snapshot
+/// fact here; data branches use the ordinary secret-free sink codec.
+fn change_stream_writer_handle_payloads(
+    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+) -> Result<BTreeMap<i32, bytes::Bytes>, String> {
+    let mut payloads = BTreeMap::new();
+    for branch in &topology.writer_branches {
+        let fragment_id = i32::try_from(branch.writer_fragment_id).map_err(|_| {
+            format!(
+                "change-stream writer fragment {} exceeds i32 handle-map range",
+                branch.writer_fragment_id
+            )
+        })?;
+        let mut sink_spec = branch.sink_spec.clone();
+        sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+        let payload = match sink_spec.mode {
+            IcebergWriteSinkMode::DeletionVectors => {
+                crate::engine::delete_engine::standard::frozen_deletion_vector_handle_payload(
+                    &sink_spec,
+                    table,
+                    entry,
+                    base_snapshot_id,
+                )?
             }
+            IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+                encode_data_sink_spec_handle_payload(&sink_spec)?
+            }
+            other => {
+                return Err(format!(
+                    "change-stream generic writer does not support sink mode {other:?}"
+                ));
+            }
+        };
+        if payloads.insert(fragment_id, payload).is_some() {
+            return Err(format!(
+                "change-stream topology has duplicate terminal writer fragment {fragment_id}"
+            ));
         }
     }
-    Ok(QueryExecutionResult {
-        query_result: query_result.expect("non-empty parts => query_result set"),
-        write_commit: merged_commit,
-        write_abort,
-        fragment_profiles: Vec::new(),
-    })
+    if payloads.is_empty() {
+        return Err("change-stream topology has no terminal writer fragments".to_string());
+    }
+    Ok(payloads)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_change_stream_connector_write_template(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    commit_plan: crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    let handle_payloads = change_stream_writer_handle_payloads(
+        topology,
+        &commit_executor.table,
+        entry,
+        base_snapshot_id,
+    )?;
+    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
+        version: 1,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: commit_executor.target_ref.clone(),
+    };
+    let committer: Arc<dyn crate::connector::iceberg::write_service::IcebergWriteReportCommitter> =
+        Arc::new(
+            crate::connector::iceberg::write_service::IcebergChangeStreamWriteReportCommitter::new(
+                Arc::clone(&commit_executor),
+                commit_plan,
+            ),
+        );
+    let service = crate::connector::iceberg::write_service::IcebergWriteControlService::new(
+        crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_fragment_handle_payloads(
+            handle_payloads,
+            plan_payload.clone(),
+            committer,
+        )
+        .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
+    );
+    crate::engine::iceberg_writer::register_iceberg_connector_write_service(
+        state,
+        target,
+        &commit_executor.target_ref,
+        novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+        Arc::new(Schema::empty()),
+        plan_payload,
+        service,
+        operation_id,
+        context,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1302,10 +1331,11 @@ fn run_mor_update_change_stream_transaction(
     target_ref: &str,
     write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -1316,7 +1346,22 @@ fn run_mor_update_change_stream_transaction(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
+    });
+    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let mut write = write;
+    let planned =
+        crate::engine::dml_change_stream::plan_dml_change_stream_write(state, target, &mut write)?;
+    let connector_write = build_change_stream_connector_write_template(
+        state,
+        target,
+        &planned.topology,
+        planned.commit_plan.clone(),
+        Arc::clone(&commit_executor),
+        &entry,
+        base_snapshot_id,
+        operation_id,
+        connector_context.clone(),
+    )?;
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
             catalog: target.catalog.clone(),
@@ -1325,13 +1370,7 @@ fn run_mor_update_change_stream_transaction(
             ref_name: (target_ref != "main").then(|| target_ref.to_string()),
         },
         operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:mor-update-change-stream:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
+        attempt_id: operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
@@ -1344,12 +1383,13 @@ fn run_mor_update_change_stream_transaction(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
+    let commit_plan = planned.commit_plan.clone();
     let executor = MorUpdateChangeStreamExecutor {
         state: Arc::clone(state),
-        target: target.clone(),
-        write: Mutex::new(Some(write)),
+        planned: Mutex::new(Some(planned)),
+        connector_write,
         commit_executor,
-        commit_plan: Mutex::new(None),
+        commit_plan,
         execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
@@ -1369,10 +1409,11 @@ fn run_mor_merge_change_stream_transaction(
     target_ref: &str,
     write: crate::engine::dml_change_stream::DmlChangeStreamWritePlan,
     execution: QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -1383,7 +1424,22 @@ fn run_mor_merge_change_stream_transaction(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
+    });
+    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let mut write = write;
+    let planned =
+        crate::engine::dml_change_stream::plan_dml_change_stream_write(state, target, &mut write)?;
+    let connector_write = build_change_stream_connector_write_template(
+        state,
+        target,
+        &planned.topology,
+        planned.commit_plan.clone(),
+        Arc::clone(&commit_executor),
+        &entry,
+        base_snapshot_id,
+        operation_id,
+        connector_context.clone(),
+    )?;
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
             catalog: target.catalog.clone(),
@@ -1392,13 +1448,7 @@ fn run_mor_merge_change_stream_transaction(
             ref_name: (target_ref != "main").then(|| target_ref.to_string()),
         },
         operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:mor-merge-change-stream:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
+        attempt_id: operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
@@ -1411,12 +1461,13 @@ fn run_mor_merge_change_stream_transaction(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
+    let commit_plan = planned.commit_plan.clone();
     let executor = MorMergeChangeStreamExecutor {
         state: Arc::clone(state),
-        target: target.clone(),
-        write: Mutex::new(Some(write)),
+        planned: Mutex::new(Some(planned)),
+        connector_write,
         commit_executor,
-        commit_plan: Mutex::new(None),
+        commit_plan,
         execution,
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
@@ -1429,6 +1480,7 @@ fn no_mutation_write_result() -> QueryExecutionResult {
         query_result: QueryResult::empty(),
         write_commit: None,
         write_abort: None,
+        connector_completion: None,
         fragment_profiles: Vec::new(),
     }
 }
@@ -1513,7 +1565,7 @@ fn execute_cow_update(
 /// `ExplicitFiles`-bound table to register before the write (and drop after),
 /// the rewrite SELECT that re-emits every row of that file (replacing matched
 /// rows with their new values and preserving `_row_id`), and the matched row
-/// ids that live in this file (recorded on the resulting `CowUpdateTouchedFile`).
+/// IDs retained by the provider-private cohort context on the FE.
 struct CowFileRewritePlan {
     old_file: String,
     namespace: String,
@@ -1523,14 +1575,13 @@ struct CowFileRewritePlan {
     matched_row_ids: Vec<i64>,
 }
 
-/// Fully-planned distributed COW UPDATE write: the per-file rewrite plans, the
-/// shared row-lineage data sink spec, and the commit-side rewrite-set identity.
+/// Fully-planned distributed COW UPDATE write. The old/new-file mapping is
+/// constructed only by the Iceberg aggregate control adapter after every
+/// sealed cohort has staged successfully.
 struct CowUpdateDistributedWrite {
     file_plans: Vec<CowFileRewritePlan>,
     data_sink_spec: IcebergWriteSinkSpec,
     base_snapshot_id: i64,
-    target_table_uuid: String,
-    updated_row_ids: Vec<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1624,8 +1675,6 @@ fn build_cow_update_distributed_write(
         file_plans,
         data_sink_spec,
         base_snapshot_id,
-        target_table_uuid: table.metadata().uuid().to_string(),
-        updated_row_ids: matched.row_ids.clone(),
     })
 }
 
@@ -1815,8 +1864,9 @@ struct DistributedCowUpdateExecutor {
     state: Arc<StandaloneState>,
     target: crate::engine::backend_resolver::TargetBackend,
     write: Mutex<Option<CowUpdateDistributedWrite>>,
-    commit_executor: IcebergWriteCommitExecutor,
-    cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    operation_session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    cohort_by_old_file: BTreeMap<String, novarocks_spi::connector::ConnectorWriteCohortId>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
@@ -1836,55 +1886,34 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             return Ok(no_mutation_write_result());
         }
 
-        let rewrite = run_cow_update_file_rewrites(
+        match run_cow_update_file_rewrites(
             &self.state,
             &self.target,
             write,
-            self.commit_executor.table.metadata(),
-            &self.commit_executor.collector,
-            // Pure UPDATE appends no net-new data files; only a folded MERGE
-            // not-matched INSERT (M3b) populates `appended_files`.
-            Vec::new(),
+            &self.operation_session,
+            &self.cohort_by_old_file,
             &self.execution,
             &self.connector_context,
-        )?;
-
-        let write_commit = rewrite.write_commit;
-        *self
-            .cow_update_rewrite
-            .lock()
-            .expect("COW UPDATE rewrite lock poisoned") = Some(rewrite.rewrite_set);
-
-        Ok(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(write_commit),
-            write_abort: None,
-            fragment_profiles: Vec::new(),
-        })
+        ) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let _ = self.operation_session.abort(self.connector_context.clone());
+                Err(error)
+            }
+        }
     }
 
-    fn commit(
+    fn commit_connector_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let commit_executor = IcebergWriteCommitExecutor {
-            state: Arc::clone(&self.commit_executor.state),
-            target: self.commit_executor.target.clone(),
-            catalog: Arc::clone(&self.commit_executor.catalog),
-            table: self.commit_executor.table.clone(),
-            collector: Arc::clone(&self.commit_executor.collector),
-            fs: self.commit_executor.fs.clone(),
-            cleanup_path_mapper: self.commit_executor.cleanup_path_mapper.clone(),
-            cow_update_rewrite: self
-                .cow_update_rewrite
-                .lock()
-                .expect("COW UPDATE rewrite lock poisoned")
-                .clone(),
-            target_ref: self.commit_executor.target_ref.clone(),
-            snapshot_properties: self.commit_executor.snapshot_properties.clone(),
-        };
-        commit_executor.commit_write_input(write_commit)
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
+        Some(
+            crate::engine::iceberg_writer::commit_iceberg_connector_write(
+                &self.commit_executor,
+                completion,
+            ),
+        )
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
@@ -1892,88 +1921,53 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
     }
 }
 
-/// One file's BE rewrite output: the replacement data-file paths (for the
-/// `CowUpdateTouchedFile.new_files` mapping) and the coordinated write commit
-/// that carries them.
-struct CowFileRewriteOutput {
-    paths: Vec<String>,
-    write_commit: Option<WriteCommitInput>,
-}
-
-/// Fully-run COW UPDATE rewrite: the transaction-wide `WriteCommitInput` (every
-/// touched file's replacement data files) and the commit-side rewrite-set
-/// identity (touched files + any net-new appended INSERT data).
-struct CowUpdateRewriteRun {
-    write_commit: WriteCommitInput,
-    rewrite_set: CowUpdateRewriteSet,
-}
-
-/// Run every per-file BE rewrite of a planned COW UPDATE into one shared
-/// collector, returning the merged writer commit and the assembled
-/// `CowUpdateRewriteSet`. Shared by the standalone COW UPDATE executor (no
-/// appended files) and the folded MERGE executor (which passes the not-matched
-/// INSERT's net-new data files as `appended_files`). The INSERT writers must be
-/// injected into the SAME collector's flat `written` channel by the caller so
-/// `CowUpdateCommit`'s written-set reconciliation (every written file is a
-/// rewrite output or a declared appended file) holds.
+/// Run every sealed old-file cohort serially. Each execution registers one
+/// accepted attempt in the shared operation session; only the final completion
+/// is returned to the transaction runner because it commits the aggregate.
 fn run_cow_update_file_rewrites(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     write: CowUpdateDistributedWrite,
-    metadata: &iceberg::spec::TableMetadata,
-    collector: &Arc<IcebergCommitCollector>,
-    appended_files: Vec<crate::connector::iceberg::commit::WrittenFile>,
+    operation_session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    cohort_by_old_file: &BTreeMap<String, novarocks_spi::connector::ConnectorWriteCohortId>,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<CowUpdateRewriteRun, String> {
-    let mut merged_commit: Option<WriteCommitInput> = None;
-    let mut touched_data_files = Vec::with_capacity(write.file_plans.len());
+) -> Result<QueryExecutionResult, String> {
+    let mut final_result = None;
     for plan in write.file_plans {
-        let new_files = run_one_cow_file_rewrite(
+        let cohort_id = cohort_by_old_file
+            .get(&plan.old_file)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "COW UPDATE old file `{}` has no sealed rewrite cohort",
+                    plan.old_file
+                )
+            })?;
+        let registration =
+            crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                operation_session.clone(),
+                cohort_id,
+            )
+            .map_err(|error| error.to_string())?;
+        let result = run_one_cow_file_rewrite(
             state,
             target,
             &plan,
             &write.data_sink_spec,
-            metadata,
-            collector,
+            registration,
             execution,
             connector_context,
         )?;
-        // Merge this file's writer commits into the single transaction-wide
-        // `WriteCommitInput`; the collector turns all of them into committed
-        // data files in one `CowUpdateCommit`.
-        if let Some(commit) = new_files.write_commit {
-            match merged_commit.as_mut() {
-                Some(existing) => existing.writers.extend(commit.writers),
-                None => merged_commit = Some(commit),
-            }
+        if result.connector_completion.is_none() {
+            return Err(format!(
+                "COW UPDATE rewrite for data file `{}` completed without a connector cohort",
+                plan.old_file
+            ));
         }
-        touched_data_files.push(CowUpdateTouchedFile {
-            old_file: plan.old_file,
-            new_files: new_files.paths,
-            row_ids: plan.matched_row_ids,
-        });
+        final_result = Some(result);
     }
-
-    let write_commit = merged_commit.ok_or_else(|| {
-        "COW UPDATE distributed rewrite produced no replacement data files".to_string()
-    })?;
-    if !write_commit_has_files(&write_commit) {
-        return Err(
-            "COW UPDATE distributed rewrite produced no replacement data files".to_string(),
-        );
-    }
-
-    Ok(CowUpdateRewriteRun {
-        write_commit,
-        rewrite_set: CowUpdateRewriteSet {
-            base_snapshot_id: write.base_snapshot_id,
-            target_table_uuid: write.target_table_uuid,
-            updated_row_ids: write.updated_row_ids,
-            touched_data_files,
-            appended_files,
-        },
-    })
+    final_result.ok_or_else(|| "COW UPDATE operation has no rewrite cohorts".to_string())
 }
 
 /// Register the synthetic single-file table, run the scoped BE rewrite, and
@@ -1984,17 +1978,16 @@ fn run_one_cow_file_rewrite(
     target: &crate::engine::backend_resolver::TargetBackend,
     plan: &CowFileRewritePlan,
     data_sink_spec: &IcebergWriteSinkSpec,
-    metadata: &iceberg::spec::TableMetadata,
-    collector: &Arc<IcebergCommitCollector>,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<CowFileRewriteOutput, String> {
+) -> Result<QueryExecutionResult, String> {
     crate::engine::query_prep::register_synthetic_table_for_query(
         state,
         &plan.namespace,
         plan.synthetic_table_def.clone(),
     )?;
-    let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
+    let result = crate::engine::execute_query_as_iceberg_write_in_operation_with_connector_context(
         state,
         Some(&target.catalog),
         &target.namespace,
@@ -2004,6 +1997,7 @@ fn run_one_cow_file_rewrite(
         None,
         Some(execution),
         connector_context,
+        connector_write,
     );
     let drop_result = crate::engine::query_prep::drop_local_table_registration_if_exists(
         state,
@@ -2019,33 +2013,11 @@ fn run_one_cow_file_rewrite(
             plan.old_file, abort.reason
         ));
     }
-    let write_commit = result.write_commit.filter(write_commit_has_files);
-    let Some(commit) = write_commit else {
-        return Err(format!(
-            "COW UPDATE rewrite for data file `{}` produced no replacement data files \
-             (rows={}, query={})",
-            plan.old_file,
-            result.query_result.row_count(),
-            plan.rewrite_query
-        ));
-    };
-    // Extract the replacement file paths from the writer reports. These go
-    // through the same domain conversion the commit collector uses, so the
-    // recorded `new_files` paths match
-    // the collector's `written` paths exactly (CowUpdateCommit requires
-    // bidirectional set equality).
-    let mut paths = Vec::new();
-    for writer in &commit.writers {
-        let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
-            writer.iceberg_commits.clone(),
-            metadata,
-        )?;
-        for report in reports {
-            let file = collector.convert_writer_report(report)?;
-            paths.push(file.path);
-        }
-    }
-    if paths.is_empty() {
+    if result
+        .write_commit
+        .as_ref()
+        .is_none_or(|commit| !write_commit_has_files(commit))
+    {
         return Err(format!(
             "COW UPDATE rewrite for data file `{}` produced no replacement data files \
              (rows={}, query={})",
@@ -2054,10 +2026,7 @@ fn run_one_cow_file_rewrite(
             plan.rewrite_query
         ));
     }
-    Ok(CowFileRewriteOutput {
-        paths,
-        write_commit: Some(commit),
-    })
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2076,7 +2045,7 @@ fn run_cow_update_distributed_transaction(
 ) -> Result<(), String> {
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -2087,7 +2056,106 @@ fn run_cow_update_distributed_transaction(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
+    });
+    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let mut write = write;
+    write
+        .file_plans
+        .sort_by(|left, right| left.old_file.cmp(&right.old_file));
+    let handle_payload = encode_data_sink_spec_handle_payload(&write.data_sink_spec)?;
+    let input_schema = Arc::new(Schema::new(
+        write
+            .data_sink_spec
+            .target_columns
+            .iter()
+            .map(|column| {
+                arrow::datatypes::Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
+        version: 1,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: target_ref.to_string(),
     };
+    let mut private_contexts = BTreeMap::new();
+    let mut cohort_templates = Vec::with_capacity(write.file_plans.len());
+    let mut cohort_by_old_file = BTreeMap::new();
+    for file_plan in &mut write.file_plans {
+        file_plan.matched_row_ids.sort_unstable();
+        if file_plan
+            .matched_row_ids
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(format!(
+                "COW UPDATE old file `{}` contains duplicate matched row IDs",
+                file_plan.old_file
+            ));
+        }
+        let semantic_digest: [u8; 32] = Sha256::digest(file_plan.old_file.as_bytes()).into();
+        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
+            operation_id,
+            b"cow-rewrite",
+            semantic_digest,
+        )
+        .map_err(|error| format!("derive COW rewrite cohort: {error}"))?;
+        let private =
+            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_rewrite(
+                handle_payload.clone(),
+                &plan_payload,
+                write.base_snapshot_id,
+                file_plan.old_file.clone(),
+                file_plan.matched_row_ids.clone(),
+            )
+            .map_err(|error| format!("build COW rewrite cohort context: {error}"))?;
+        cohort_templates.push((
+            cohort_id,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            Arc::clone(&input_schema),
+            private.planning_payload(),
+            connector_context.clone(),
+        ));
+        if private_contexts.insert(cohort_id, private).is_some()
+            || cohort_by_old_file
+                .insert(file_plan.old_file.clone(), cohort_id)
+                .is_some()
+        {
+            return Err("COW UPDATE generated a duplicate rewrite cohort".to_string());
+        }
+    }
+    let committer: Arc<dyn crate::connector::iceberg::write_service::IcebergWriteReportCommitter> =
+        Arc::new(
+            crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
+                Arc::clone(&commit_executor),
+            ),
+        );
+    let service = crate::connector::iceberg::write_service::IcebergWriteControlService::new(
+        crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_cohorts(
+            private_contexts,
+            committer,
+        )
+        .map_err(|error| format!("build COW write operation service: {error}"))?,
+    );
+    let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
+        state,
+        target,
+        target_ref,
+        service,
+        operation_id,
+        cohort_templates,
+    )?;
+    let registration =
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(templates)
+            .map_err(|error| error.to_string())?;
+    let operation_session = state
+        .query_execution
+        .begin_write_operation(registration)
+        .map_err(|error| error.to_string())?;
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
             catalog: target.catalog.clone(),
@@ -2096,13 +2164,7 @@ fn run_cow_update_distributed_transaction(
             ref_name: (target_ref != "main").then(|| target_ref.to_string()),
         },
         operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:cow-update-distributed:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
+        attempt_id: operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             commit_op_kind: CommitOpKind::CowUpdate,
             base_snapshot_id,
@@ -2120,7 +2182,8 @@ fn run_cow_update_distributed_transaction(
         target: target.clone(),
         write: Mutex::new(Some(write)),
         commit_executor,
-        cow_update_rewrite: Mutex::new(None),
+        operation_session,
+        cohort_by_old_file,
         execution,
         connector_context: connector_context.clone(),
     };
@@ -2579,6 +2642,7 @@ pub(crate) fn execute_merge_statement(
             target_ref,
             write,
             execution.clone(),
+            connector_context,
         )?;
         return Ok(StatementResult::Ok);
     }
@@ -2638,7 +2702,7 @@ pub(crate) fn execute_merge_statement(
 
     // Build the matched branch by table write mode. Cardinality
     // (at-most-one-match) is enforced here in the orchestrator before any write.
-    let matched_branch = if let Some(clause) = stmt.matched.as_ref() {
+    let mut matched_branch = if let Some(clause) = stmt.matched.as_ref() {
         let matched = matched_update_batch_from_record_batch(&match_rows.matched_batch()?)?;
         if matched.row_ids.is_empty() {
             MergeMatchedBranch::None
@@ -2711,7 +2775,7 @@ pub(crate) fn execute_merge_statement(
 
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -2722,6 +2786,20 @@ pub(crate) fn execute_merge_statement(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
+    });
+    let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let cow_operation = match &mut matched_branch {
+        MergeMatchedBranch::CowUpdate(write) => Some(prepare_cow_merge_operation(
+            state,
+            &target,
+            target_ref,
+            write,
+            insert_branch.as_ref(),
+            Arc::clone(&commit_executor),
+            operation_id,
+            connector_context,
+        )?),
+        MergeMatchedBranch::None => None,
     };
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
@@ -2731,13 +2809,7 @@ pub(crate) fn execute_merge_statement(
             ref_name: None,
         },
         operation_kind: IcebergOperationKind::RowDelta,
-        attempt_id: format!(
-            "{}.{}.{}:merge-distributed:{}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            uuid::Uuid::new_v4()
-        ),
+        attempt_id: operation_id.to_string(),
         commit: IcebergWriteCommitPolicy {
             commit_op_kind,
             base_snapshot_id,
@@ -2760,12 +2832,162 @@ pub(crate) fn execute_merge_statement(
         })),
         commit_executor,
         execution: execution.clone(),
-        cow_update_rewrite: Mutex::new(None),
+        cow_operation,
         connector_context: connector_context.clone(),
     };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
     Ok(StatementResult::Ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_cow_merge_operation(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    target_ref: &str,
+    write: &mut CowUpdateDistributedWrite,
+    insert: Option<&(sqlparser::ast::Query, IcebergWriteSinkSpec)>,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<CowMergeOperation, String> {
+    write
+        .file_plans
+        .sort_by(|left, right| left.old_file.cmp(&right.old_file));
+    let rewrite_handle = encode_data_sink_spec_handle_payload(&write.data_sink_spec)?;
+    let rewrite_schema = Arc::new(Schema::new(
+        write
+            .data_sink_spec
+            .target_columns
+            .iter()
+            .map(|column| {
+                arrow::datatypes::Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let plan_payload = crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1 {
+        version: 1,
+        target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+        target_ref: target_ref.to_string(),
+    };
+    let mut private_contexts = BTreeMap::new();
+    let mut templates = Vec::with_capacity(write.file_plans.len() + usize::from(insert.is_some()));
+    let mut cohort_by_old_file = BTreeMap::new();
+    for file_plan in &mut write.file_plans {
+        file_plan.matched_row_ids.sort_unstable();
+        if file_plan
+            .matched_row_ids
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err(format!(
+                "MERGE COW old file `{}` contains duplicate matched row IDs",
+                file_plan.old_file
+            ));
+        }
+        let semantic_digest: [u8; 32] = Sha256::digest(file_plan.old_file.as_bytes()).into();
+        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
+            operation_id,
+            b"cow-rewrite",
+            semantic_digest,
+        )
+        .map_err(|error| format!("derive MERGE COW rewrite cohort: {error}"))?;
+        let private =
+            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_rewrite(
+                rewrite_handle.clone(),
+                &plan_payload,
+                write.base_snapshot_id,
+                file_plan.old_file.clone(),
+                file_plan.matched_row_ids.clone(),
+            )
+            .map_err(|error| format!("build MERGE COW rewrite cohort: {error}"))?;
+        templates.push((
+            cohort_id,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            Arc::clone(&rewrite_schema),
+            private.planning_payload(),
+            connector_context.clone(),
+        ));
+        private_contexts.insert(cohort_id, private);
+        cohort_by_old_file.insert(file_plan.old_file.clone(), cohort_id);
+    }
+    let append_cohort = if let Some((_, sink_spec)) = insert {
+        let semantic_digest: [u8; 32] = Sha256::digest(b"cow-append").into();
+        let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::derive(
+            operation_id,
+            b"cow-append",
+            semantic_digest,
+        )
+        .map_err(|error| format!("derive MERGE COW append cohort: {error}"))?;
+        let private =
+            crate::connector::iceberg::write_service::IcebergWriteCohortContext::cow_append(
+                encode_data_sink_spec_handle_payload(sink_spec)?,
+                &plan_payload,
+                write.base_snapshot_id,
+            )
+            .map_err(|error| format!("build MERGE COW append cohort: {error}"))?;
+        let schema = Arc::new(Schema::new(
+            sink_spec
+                .target_columns
+                .iter()
+                .map(|column| {
+                    arrow::datatypes::Field::new(
+                        &column.name,
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        templates.push((
+            cohort_id,
+            novarocks_spi::connector::ConnectorWriteIntent::Append,
+            schema,
+            private.planning_payload(),
+            connector_context.clone(),
+        ));
+        private_contexts.insert(cohort_id, private);
+        Some(cohort_id)
+    } else {
+        None
+    };
+    let committer: Arc<dyn crate::connector::iceberg::write_service::IcebergWriteReportCommitter> =
+        Arc::new(
+            crate::connector::iceberg::write_service::IcebergCowWriteReportCommitter::new(
+                commit_executor,
+            ),
+        );
+    let service = crate::connector::iceberg::write_service::IcebergWriteControlService::new(
+        crate::connector::iceberg::write_service::IcebergWriteControlServiceContext::new_with_cohorts(
+            private_contexts,
+            committer,
+        )
+        .map_err(|error| format!("build MERGE COW operation service: {error}"))?,
+    );
+    let templates = crate::engine::iceberg_writer::register_iceberg_connector_write_cohort_service(
+        state,
+        target,
+        target_ref,
+        service,
+        operation_id,
+        templates,
+    )?;
+    let registration =
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(templates)
+            .map_err(|error| error.to_string())?;
+    let session = state
+        .query_execution
+        .begin_write_operation(registration)
+        .map_err(|error| error.to_string())?;
+    Ok(CowMergeOperation {
+        session,
+        cohort_by_old_file,
+        append_cohort,
+    })
 }
 
 /// Resolved target column ordering for `WHEN NOT MATCHED INSERT`. Each entry
@@ -3503,30 +3725,60 @@ struct DistributedMergeExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     commit_op_kind: CommitOpKind,
     branches: Mutex<Option<MergeBranchSet>>,
-    commit_executor: IcebergWriteCommitExecutor,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
-    /// Populated by `run_coordinated_write` for the COW fold so `commit` can
-    /// carry the rewrite set (touched files + appended INSERT data) on the
-    /// commit context. `None` for MOR / DELETE / INSERT-only folds.
-    cow_update_rewrite: Mutex<Option<CowUpdateRewriteSet>>,
+    cow_operation: Option<CowMergeOperation>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 }
 
+struct CowMergeOperation {
+    session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    cohort_by_old_file: BTreeMap<String, novarocks_spi::connector::ConnectorWriteCohortId>,
+    append_cohort: Option<novarocks_spi::connector::ConnectorWriteCohortId>,
+}
+
 impl DistributedMergeExecutor {
-    /// Run the not-matched INSERT branch on the BE and return its converted
-    /// net-new data files. These rows are genuinely new (no preserved
-    /// `_row_id`) so the caller routes them into a FRESH row-lineage channel.
+    fn run_insert_cohort(
+        &self,
+        query: &sqlparser::ast::Query,
+        sink_spec: &IcebergWriteSinkSpec,
+        registration: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+    ) -> Result<QueryExecutionResult, String> {
+        let result =
+            crate::engine::execute_query_as_iceberg_write_in_operation_with_connector_context(
+                &self.state,
+                Some(&self.target.catalog),
+                &self.target.namespace,
+                query,
+                sink_spec.clone(),
+                None,
+                None,
+                Some(&self.execution),
+                &self.connector_context,
+                registration,
+            )?;
+        if let Some(abort) = &result.write_abort {
+            return Err(format!(
+                "MERGE not-matched INSERT cohort aborted: {}",
+                abort.reason
+            ));
+        }
+        if result.connector_completion.is_none()
+            || result
+                .write_commit
+                .as_ref()
+                .is_none_or(|commit| !write_commit_has_files(commit))
+        {
+            return Err("MERGE not-matched INSERT cohort produced no data files".to_string());
+        }
+        Ok(result)
+    }
+
     fn run_insert_branch(
         &self,
         query: &sqlparser::ast::Query,
         sink_spec: &IcebergWriteSinkSpec,
-    ) -> Result<
-        (
-            QueryExecutionResult,
-            Vec<crate::connector::iceberg::commit::WrittenFile>,
-        ),
-        String,
-    > {
+    ) -> Result<QueryExecutionResult, String> {
         let result = crate::engine::execute_query_as_iceberg_write_with_connector_context(
             &self.state,
             Some(&self.target.catalog),
@@ -3537,6 +3789,7 @@ impl DistributedMergeExecutor {
             None,
             Some(&self.execution),
             &self.connector_context,
+            None,
         )?;
         if let Some(abort) = &result.write_abort {
             return Err(format!(
@@ -3544,31 +3797,10 @@ impl DistributedMergeExecutor {
                 abort.reason
             ));
         }
-        // The orchestrator only builds the INSERT branch when the unmatched
-        // batch is non-empty, so a file-less, non-aborted result is a real bug:
-        // committing without the INSERT rows would silently drop them.
-        let commit = result
-            .write_commit
-            .as_ref()
-            .filter(|c| write_commit_has_files(c));
-        let Some(commit) = commit else {
+        if result.connector_completion.is_none() {
             return Err("MERGE not-matched INSERT branch produced no data files".to_string());
-        };
-        let mut files = Vec::new();
-        for writer in &commit.writers {
-            let reports = crate::runtime::sink_commit::iceberg_commit_infos_to_writer_reports(
-                writer.iceberg_commits.clone(),
-                self.commit_executor.table.metadata(),
-            )?;
-            for report in reports {
-                files.push(
-                    self.commit_executor
-                        .collector
-                        .convert_writer_report(report)?,
-                );
-            }
         }
-        Ok((result, files))
+        Ok(result)
     }
 }
 
@@ -3588,106 +3820,72 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
             .take()
             .ok_or_else(|| "MERGE branch set was already consumed".to_string())?;
 
-        // Matched-branch writer results that flow through the shared
-        // `WriteCommitInput` (reuse channel). INSERT files are routed
-        // separately per commit-op kind.
-        let mut commit_parts: Vec<QueryExecutionResult> = Vec::new();
-
         match branches.matched {
             MergeMatchedBranch::None => {}
             MergeMatchedBranch::CowUpdate(write) => {
-                // The per-file rewrite outputs land in the shared collector's
-                // flat `written` channel via the returned `WriteCommitInput`.
-                // The INSERT files (if any) are folded in below before the
-                // rewrite set is finalized, so `CowUpdateCommit`'s written-set
-                // reconciliation (every written file is a rewrite output or a
-                // declared appended file) holds.
-                let insert_files = match branches.insert.as_ref() {
-                    Some((query, sink_spec)) => {
-                        let (insert_result, files) = self.run_insert_branch(query, sink_spec)?;
-                        commit_parts.push(insert_result);
-                        files
+                let cow = self.cow_operation.as_ref().ok_or_else(|| {
+                    "MERGE COW branches have no sealed connector operation".to_string()
+                })?;
+                let staged = (|| {
+                    let mut final_result = run_cow_update_file_rewrites(
+                        &self.state,
+                        &self.target,
+                        write,
+                        &cow.session,
+                        &cow.cohort_by_old_file,
+                        &self.execution,
+                        &self.connector_context,
+                    )?;
+                    if let Some((query, sink_spec)) = branches.insert.as_ref() {
+                        let cohort_id = cow.append_cohort.ok_or_else(|| {
+                            "MERGE COW append branch has no sealed append cohort".to_string()
+                        })?;
+                        let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                            cow.session.clone(),
+                            cohort_id,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        final_result = self.run_insert_cohort(query, sink_spec, registration)?;
                     }
-                    None => Vec::new(),
-                };
-                let rewrite = run_cow_update_file_rewrites(
-                    &self.state,
-                    &self.target,
-                    write,
-                    self.commit_executor.table.metadata(),
-                    &self.commit_executor.collector,
-                    insert_files,
-                    &self.execution,
-                    &self.connector_context,
-                )?;
-                commit_parts.push(QueryExecutionResult {
-                    query_result: QueryResult::empty(),
-                    write_commit: Some(rewrite.write_commit),
-                    write_abort: None,
-                    fragment_profiles: Vec::new(),
-                });
-                *self
-                    .cow_update_rewrite
-                    .lock()
-                    .expect("MERGE COW rewrite lock poisoned") = Some(rewrite.rewrite_set);
-                // COW handled the INSERT branch inline; return now.
-                return merge_all_write_commits(commit_parts);
+                    Ok(final_result)
+                })();
+                if staged.is_err() {
+                    let _ = cow.session.abort(self.connector_context.clone());
+                }
+                return staged;
             }
         }
 
-        // INSERT branch for the non-COW folds (MOR / DELETE / INSERT-only).
+        // The only non-COW shape represented here is INSERT-only MERGE. Its
+        // sealed primary cohort is committed through the same provider-owned
+        // aggregate control path as every other distributed write.
         if let Some((query, sink_spec)) = branches.insert.as_ref() {
-            let (insert_result, files) = self.run_insert_branch(query, sink_spec)?;
-            match self.commit_op_kind {
-                CommitOpKind::RowDeltaDvFromFiles => {
-                    // Fresh INSERT data → dedicated appended channel so the
-                    // commit allocates fresh `_row_id`s. Its writers must NOT
-                    // also flow through the reuse `written` channel.
-                    self.commit_executor.collector.inject_appended_files(files);
-                }
-                CommitOpKind::FastAppend => {
-                    // INSERT-only MERGE: standard append, files flow through the
-                    // reuse channel as a normal FastAppend.
-                    let _ = files;
-                    commit_parts.push(insert_result);
-                }
-                other => {
-                    return Err(format!(
-                        "MERGE not-matched INSERT fold does not support commit op {other:?}"
-                    ));
-                }
+            if self.commit_op_kind != CommitOpKind::FastAppend {
+                return Err(format!(
+                    "MERGE not-matched INSERT fold does not support commit op {:?}",
+                    self.commit_op_kind
+                ));
             }
+            return self.run_insert_branch(query, sink_spec);
         }
-
-        merge_all_write_commits(commit_parts)
-    }
-
-    fn commit(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        write_commit: &WriteCommitInput,
-    ) -> Result<CommitOutcome, CommitServiceError> {
-        let commit_executor = IcebergWriteCommitExecutor {
-            state: Arc::clone(&self.commit_executor.state),
-            target: self.commit_executor.target.clone(),
-            catalog: Arc::clone(&self.commit_executor.catalog),
-            table: self.commit_executor.table.clone(),
-            collector: Arc::clone(&self.commit_executor.collector),
-            fs: self.commit_executor.fs.clone(),
-            cleanup_path_mapper: self.commit_executor.cleanup_path_mapper.clone(),
-            cow_update_rewrite: self
-                .cow_update_rewrite
-                .lock()
-                .expect("MERGE COW rewrite lock poisoned")
-                .clone(),
-            target_ref: self.commit_executor.target_ref.clone(),
-            snapshot_properties: self.commit_executor.snapshot_properties.clone(),
-        };
-        commit_executor.commit_write_input(write_commit)
+        Err("MERGE operation produced no writable branch".to_string())
     }
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
+    }
+
+    fn commit_connector_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
+        Some(
+            crate::engine::iceberg_writer::commit_iceberg_connector_write(
+                &self.commit_executor,
+                completion,
+            ),
+        )
     }
 }
 

@@ -33,7 +33,6 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};
 use crate::query_execution::request_context::{QueryExecutionContext, RequestContext};
-use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::parser::ast::{Literal, ObjectName};
 
@@ -211,7 +210,7 @@ impl IcebergPreparedInsert for CorePreparedIcebergInsert {
 }
 
 struct CoreIcebergInsertCommit {
-    input: Option<WriteCommitInput>,
+    completion: crate::query_execution::ConnectorWriteCompletion,
 }
 
 impl IcebergInsertCommit for CoreIcebergInsertCommit {
@@ -358,13 +357,7 @@ impl InsertEngine for Arc<StandaloneState> {
                     crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
                 )
             })?;
-        let input = commit.input.as_ref().ok_or_else(|| {
-            CommitServiceError::known_uncommitted(
-                "Iceberg write produced no commit input".to_string(),
-                crate::connector::iceberg::commit::CleanupAttempt::not_attempted(),
-            )
-        })?;
-        prepared.prepared.commit(input)
+        prepared.prepared.commit(&commit.completion)
     }
 
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {
@@ -383,28 +376,22 @@ fn downcast_prepared(
 
 fn iceberg_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
-    commit_op_kind: CommitOpKind,
+    _commit_op_kind: CommitOpKind,
 ) -> IcebergWriteReport {
     if let Some(abort) = result.write_abort {
         let has_staged_files = abort
             .completed_writer_outputs
             .iter()
-            .flat_map(|writer| &writer.iceberg_commits)
-            .any(|commit| commit.iceberg_data_file.is_some());
+            .any(|writer| !writer.connector_staged_report_frames.is_empty());
         return IcebergWriteReport::Aborted {
             reason: abort.reason,
             has_staged_files,
         };
     }
-    let Some(input) = result.write_commit else {
+    let Some(completion) = result.connector_completion else {
         return IcebergWriteReport::NoOp;
     };
-    let has_files = crate::engine::write_transaction::write_commit_has_files(&input);
-    if !has_files && matches!(commit_op_kind, CommitOpKind::FastAppend) {
-        return IcebergWriteReport::NoOp;
-    }
-    let commit: Arc<dyn IcebergInsertCommit> =
-        Arc::new(CoreIcebergInsertCommit { input: Some(input) });
+    let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit { completion });
     IcebergWriteReport::CommitRequired(commit)
 }
 
@@ -552,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn query_execution_result_maps_fileless_overwrite_to_commit_required_handle() {
+    fn query_execution_result_ignores_legacy_fileless_overwrite_carrier() {
         let report = iceberg_write_report_from_result(
             QueryExecutionResult {
                 query_result: QueryResult::empty(),
@@ -561,19 +548,13 @@ mod tests {
                     writers: Vec::new(),
                 }),
                 write_abort: None,
+                connector_completion: None,
                 fragment_profiles: Vec::new(),
             },
             CommitOpKind::Overwrite,
         );
 
-        let IcebergWriteReport::CommitRequired(handle) = report else {
-            panic!("fileless overwrite output must require a commit");
-        };
-        let handle = handle
-            .as_any()
-            .downcast_ref::<CoreIcebergInsertCommit>()
-            .expect("core commit handle");
-        assert!(handle.input.is_some());
+        assert!(matches!(report, IcebergWriteReport::NoOp));
     }
 
     #[test]
@@ -583,6 +564,7 @@ mod tests {
                 query_result: QueryResult::empty(),
                 write_commit: None,
                 write_abort: None,
+                connector_completion: None,
                 fragment_profiles: Vec::new(),
             },
             CommitOpKind::Overwrite,
@@ -601,6 +583,7 @@ mod tests {
                     writers: Vec::new(),
                 }),
                 write_abort: None,
+                connector_completion: None,
                 fragment_profiles: Vec::new(),
             },
             CommitOpKind::FastAppend,
@@ -618,6 +601,7 @@ mod tests {
                 crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file(
                 ),
             ),
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         }, CommitOpKind::FastAppend);
 
@@ -636,13 +620,15 @@ mod tests {
     fn query_execution_result_does_not_treat_empty_commit_info_as_staged_file() {
         let mut abort =
             crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file();
-        abort.completed_writer_outputs[0].iceberg_commits =
-            vec![crate::proto::novarocks::IcebergCommitInfo::default()];
+        abort.completed_writer_outputs[0]
+            .connector_staged_report_frames
+            .clear();
         let report = iceberg_write_report_from_result(
             QueryExecutionResult {
                 query_result: QueryResult::empty(),
                 write_commit: None,
                 write_abort: Some(abort),
+                connector_completion: None,
                 fragment_profiles: Vec::new(),
             },
             CommitOpKind::FastAppend,

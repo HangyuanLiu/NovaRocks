@@ -48,6 +48,8 @@ pub struct RuntimeState {
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
     native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
     load_tracking_sink: Option<std::sync::Arc<dyn LoadTrackingLogSink>>,
+    connector_staged_report_collector:
+        Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +88,7 @@ impl Default for RuntimeState {
             spill_manager: None,
             native_runtime_filter_context: None,
             load_tracking_sink: None,
+            connector_staged_report_collector: None,
         }
     }
 }
@@ -107,6 +110,7 @@ impl Clone for RuntimeState {
             spill_manager: self.spill_manager.clone(),
             native_runtime_filter_context: self.native_runtime_filter_context.clone(),
             load_tracking_sink: self.load_tracking_sink.clone(),
+            connector_staged_report_collector: self.connector_staged_report_collector.clone(),
         }
     }
 }
@@ -149,6 +153,7 @@ impl RuntimeState {
             spill_manager,
             native_runtime_filter_context: None,
             load_tracking_sink: None,
+            connector_staged_report_collector: None,
         }
     }
 
@@ -166,6 +171,29 @@ impl RuntimeState {
     ) -> Self {
         self.load_tracking_sink = sink;
         self
+    }
+
+    pub(crate) fn with_connector_staged_report_collector(
+        mut self,
+        collector: Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
+    ) -> Self {
+        self.connector_staged_report_collector = collector;
+        self
+    }
+
+    pub(crate) fn connector_staged_report_collector(
+        &self,
+    ) -> Option<&crate::runtime::connector_write_report::ConnectorStagedReportCollector> {
+        self.connector_staged_report_collector.as_ref()
+    }
+
+    pub(crate) fn take_connector_staged_report_frames(
+        &self,
+    ) -> Vec<novarocks_spi::connector::ConnectorStagedReportFrame> {
+        self.connector_staged_report_collector
+            .as_ref()
+            .map(|collector| collector.take())
+            .unwrap_or_default()
     }
 
     pub(crate) fn native_runtime_filter_context(
@@ -189,24 +217,6 @@ impl RuntimeState {
 
     pub(crate) fn fragment_instance_id(&self) -> Option<UniqueId> {
         self.fragment_instance_id
-    }
-
-    pub(crate) fn add_iceberg_writer_report(
-        &self,
-        report: crate::connector::iceberg::report::IcebergWriterReport,
-        metadata: &iceberg::spec::TableMetadata,
-    ) -> Result<(), String> {
-        let commit_info =
-            crate::runtime::sink_commit::writer_report_to_iceberg_commit_info(report, metadata)?;
-        let Some(finst_id) = self.fragment_instance_id else {
-            debug!(
-                target: "novarocks::sink_commit",
-                "skip iceberg commit info because fragment_instance_id is missing"
-            );
-            return Ok(());
-        };
-        sink_commit::add_iceberg_commit(finst_id, commit_info);
-        Ok(())
     }
 
     /// Push a per-file Theta sketch set produced by the Iceberg sink into

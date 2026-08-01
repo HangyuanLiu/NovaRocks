@@ -21,21 +21,24 @@ pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
-    if matches!(src.sink, DataSink::IcebergWrite(_)) {
-        // The planner finalized the write output expressions and target output
+    if matches!(
+        src.sink,
+        DataSink::ConnectorWrite(ref sink) if sink.output_contract.is_some()
+    ) {
+        // The planner finalized the connector writer output expressions and target output
         // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of
         // synthesizing the target schema or falling back to the fragment's output
         // columns / input binding.
         let contract = required_context_ref(ctx.write_contracts, || {
             format!(
-                "native Iceberg write fragment {} has no sealed write contract",
+                "native connector write fragment {} has no sealed write contract",
                 src.fragment_id
             )
         })?
-        .iceberg_write_output(src.fragment_id)
+        .connector_write_output(src.fragment_id)
         .ok_or_else(|| {
             format!(
-                "native Iceberg write fragment {} is missing from the sealed write contract",
+                "native connector write fragment {} is missing from the sealed write contract",
                 src.fragment_id
             )
         })?;

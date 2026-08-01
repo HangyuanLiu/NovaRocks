@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorExecutionBinding, ConnectorOpenReaderRequest,
-    ConnectorReaderMetricsSnapshot, ConnectorSplit,
+    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
+    ConnectorOpenReaderRequest, ConnectorReaderMetricsSnapshot, ConnectorSplit,
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -665,7 +665,15 @@ impl ConnectorReadBinding {
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, novarocks_spi::connector::ConnectorError> {
         match self {
-            Self::Execution(binding) => binding.read().open_reader(split, request),
+            Self::Execution(binding) => binding
+                .read()
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "connector execution binding has no read capability",
+                    )
+                })?
+                .open_reader(split, request),
         }
     }
 }

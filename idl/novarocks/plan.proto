@@ -334,7 +334,7 @@ message FragmentEdgeKind {
   oneof kind {
     bool stream = 1;                                      // true for a normal stream edge.
     CteMulticastEdge cte_multicast = 2;                   // CTE multicast edge metadata.
-    IcebergChangeStreamRouterEdge iceberg_change_stream_router = 3; // Iceberg change-stream router edge metadata.
+    ChangeStreamRouterEdge change_stream_router = 3; // Iceberg change-stream router edge metadata.
   }
 }
 
@@ -349,7 +349,7 @@ message CteMulticastEdge {
 // Iceberg change-stream router edge metadata.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
-message IcebergChangeStreamRouterEdge {
+message ChangeStreamRouterEdge {
   int32 router_group_id = 1;                  // router group id.
   int32 branch_id = 2;                        // branch id within the router group.
   ChangeStreamBranchKind branch_kind = 3;     // branch semantic kind.
@@ -408,10 +408,10 @@ message DataSink {
   oneof kind {
     bool result = 1;                                      // true for a result sink.
     bool noop = 2;                                        // true for a no-op sink.
-    IcebergWriteFragmentSink iceberg_write = 3;           // Iceberg write sink.
-    IcebergChangeStreamRouterSink iceberg_change_stream_router = 4; // Iceberg change-stream router sink.
+    ChangeStreamRouterSink change_stream_router = 4; // Iceberg change-stream router sink.
     DataStreamSink data_stream = 5;                       // Exchange stream sink.
     MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
+    ConnectorWriteFragmentSink connector_write = 7;       // Provider-neutral staged writer sink.
   }
 }
 
@@ -441,24 +441,51 @@ message MultiCastDataStreamSink {
   repeated DataStreamSink sinks = 1;
   repeated StreamDestinationList destinations = 2;
 }
+// Provider-neutral writer owner. This carrier intentionally contains no
+// catalog client, credential or provider-specific table/file metadata.
+message ConnectorWriterIdentity {
+  bytes operation_id = 1;                         // UUID v7 bytes.
+  bytes execution_query_id = 2;                   // native query UUID bytes.
+  uint64 execution_attempt_id = 3;                // exact query attempt.
+  novarocks.common.UniqueId fragment_instance_id = 4;
+  int32 fragment_id = 5;
+  int32 backend_num = 6;
+  uint32 sink_ordinal = 7;
+  string connector_instance_id = 8;
+  bytes connector_incarnation = 9;                // exact connector generation UUID bytes.
+  bytes cohort_id = 10;                           // stable 32-byte semantic cohort identity.
+}
 
-// Iceberg write sink payload.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergWriteFragmentSink {
-  string descriptor_database = 1;     // database used for descriptor naming.
-  IcebergWriteSinkSpec spec = 2;      // write target and file-writing specification.
-  IcebergWriteInputBinding input = 3; // mapping from fragment output to sink input.
+// Bounded opaque handle produced by FE control planning and consumed only by
+// the exact BE execution binding.
+message ConnectorWriterHandleEnvelope {
+  uint32 contract_version = 1;
+  ConnectorWriterIdentity writer = 2;
+  bytes payload = 3;
+  bytes payload_sha256 = 4;
+}
+
+// Mapping from fragment output columns to a provider-neutral writer input.
+message ConnectorWriteInputBinding {
+  oneof kind {
+    bool root_output_by_ordinal = 1;
+    UInt64List output_ordinals = 2;
+  }
+}
+
+message ConnectorWriteFragmentSink {
+  ConnectorWriterHandleEnvelope handle = 1;
+  ConnectorWriteInputBinding input = 2;
 }
 
 // Iceberg change-stream router sink payload.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
-message IcebergChangeStreamRouterSink {
+message ChangeStreamRouterSink {
   int32 group_id = 1;                              // change-stream router group id.
   uint64 change_op_output_ordinal = 2;             // output ordinal carrying the change op.
   optional uint64 data_route_output_ordinal = 3;   // optional output ordinal carrying route choice.
-  repeated IcebergChangeStreamBranchRoute branches = 4; // target writer branches.
+  repeated ChangeStreamBranchRoute branches = 4; // target writer branches.
 }
 
 // Join kind. Mirrors src/sql/common/expr.rs JoinKind.
@@ -1451,86 +1478,10 @@ message IcebergPartitionValue {
   }
 }
 
-// Iceberg write sink specification.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergWriteSinkSpec {
-  IcebergWriteSinkMode mode = 1;                        // write sink mode.
-  int64 target_table_id = 2;                             // synthetic or catalog target table id.
-  TableDef target_table = 3;                             // target table definition.
-  IcebergTableInfo iceberg = 4;                          // target Iceberg table info.
-  repeated ColumnDef target_columns = 5;                 // target write columns.
-  string table_location = 6;                             // Iceberg table location.
-  string data_location = 7;                              // data file output location.
-  int32 target_partition_spec_id = 8;                    // target partition spec id.
-  map<string, string> cloud_properties = 9;              // object-store properties.
-  string file_format = 10;                               // output file format.
-  IcebergWriteFileCompression compression = 11;          // output file compression.
-  PositionDeleteDescriptorInput position_delete_output_descriptor = 12; // optional position-delete descriptor.
-}
-
-// Iceberg write sink mode.
-enum IcebergWriteSinkMode {
-  ICEBERG_WRITE_SINK_MODE_UNSPECIFIED = 0;
-  ICEBERG_WRITE_SINK_MODE_DATA = 1;
-  ICEBERG_WRITE_SINK_MODE_ROW_LINEAGE_DATA = 2;
-  ICEBERG_WRITE_SINK_MODE_POSITION_DELETES = 3;
-  ICEBERG_WRITE_SINK_MODE_DELETION_VECTORS = 4;
-  ICEBERG_WRITE_SINK_MODE_EQUALITY_DELETES = 5;
-}
-
-// Iceberg write file compression.
-enum IcebergWriteFileCompression {
-  ICEBERG_WRITE_FILE_COMPRESSION_UNSPECIFIED = 0;
-  ICEBERG_WRITE_FILE_COMPRESSION_SNAPPY = 1;
-}
-
-// Mapping from fragment output columns to Iceberg writer input.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message IcebergWriteInputBinding {
-  oneof kind {
-    bool root_output_by_ordinal = 1; // true when writer consumes root output by ordinal.
-    UInt64List output_ordinals = 2;  // explicit output ordinals consumed by writer.
-  }
-}
-
-// Position-delete output descriptor.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message PositionDeleteDescriptorInput {
-  PositionDeleteOutputField file_path = 1;                      // file-path output field.
-  PositionDeleteOutputField pos = 2;                            // row-position output field.
-  repeated PositionDeletePartitionSourceField partition_source_fields = 3; // partition source fields.
-  int32 target_partition_spec_id = 4;                           // target partition spec id.
-}
-
-// One position-delete output field.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message PositionDeleteOutputField {
-  uint64 output_expr_index = 1;              // output expression index.
-  string name = 2;                           // output field name.
-  novarocks.common.TypeDesc data_type = 3;   // output field SQL type.
-  int32 field_id = 4;                        // Iceberg field id.
-}
-
-// One partition source field for position-delete output.
-// Owner: produced by the future FE/native plan encoder and consumed by the
-// future BE/native plan prepare layer.
-message PositionDeletePartitionSourceField {
-  uint64 output_expr_index = 1;            // output expression index.
-  string source_column_name = 2;           // source data column name.
-  string partition_field_name = 3;         // output partition field name.
-  string transform_expr = 4;               // Iceberg transform expression string.
-  int32 source_field_id = 5;               // Iceberg source field id.
-  novarocks.common.TypeDesc data_type = 6; // source field SQL type.
-}
-
 // One Iceberg change-stream branch route.
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
-message IcebergChangeStreamBranchRoute {
+message ChangeStreamBranchRoute {
   int32 branch_id = 1;                       // branch id within the router group.
   ChangeStreamBranchKind branch_kind = 2;    // branch semantic kind.
   uint32 target_fragment_id = 3;             // target writer fragment id.

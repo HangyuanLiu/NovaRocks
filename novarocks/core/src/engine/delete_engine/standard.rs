@@ -30,22 +30,23 @@
 //!    which commits the generated position-delete files and drives
 //!    finalization lifecycle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
+use bytes::Bytes;
 use chrono::NaiveDateTime;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
+    CommitOpKind, CommitOutcome, CommitServiceError, DeletionVector, IcebergCommitCollector,
     IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
 };
 #[cfg(test)]
@@ -60,19 +61,24 @@ use crate::connector::iceberg::delete_visibility::{
     ExistingDeleteVisibilityByDataFile, data_file_row_is_visible,
 };
 use crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
+use crate::connector::iceberg::sink::build_position_delete_data_file_partition_index;
+use crate::connector::iceberg::sink_plan::IcebergSinkObjectStoreConfig;
+use crate::connector::iceberg::write_contract::{
+    encode_deletion_vector_sink_handle_payload, encode_position_delete_sink_handle_payload,
+};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, prepared_delete,
 };
-use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
+use crate::engine::write_transaction::IcebergWriteCommitExecutor;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::query_execution::write::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_spi::connector::{ConnectorWriteIntent, ConnectorWriteOperationId};
 
 pub(crate) fn prepare_delete_statement(
     state: &Arc<StandaloneState>,
@@ -236,9 +242,10 @@ struct DistributedDeleteWriteExecutor {
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
-    commit_executor: IcebergWriteCommitExecutor,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 }
 
 impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
@@ -253,19 +260,19 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             None,
             Some(&self.execution),
             &self.connector_context,
+            Some(self.connector_write.clone()),
         )?;
-        if result
-            .write_commit
-            .as_ref()
-            .is_some_and(|commit| !write_commit_has_files(commit))
-        {
-            result.write_commit = None;
-        }
         Ok(result)
     }
 
-    fn commit(&self, write_commit: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
+    fn commit(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+            &self.commit_executor,
+            completion,
+        )
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -278,9 +285,10 @@ struct DistributedDvDeleteWriteExecutor {
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
-    commit_executor: IcebergWriteCommitExecutor,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 }
 
 impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
@@ -295,19 +303,19 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
             Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
             Some(&self.execution),
             &self.connector_context,
+            Some(self.connector_write.clone()),
         )?;
-        if result
-            .write_commit
-            .as_ref()
-            .is_some_and(|commit| !write_commit_has_files(commit))
-        {
-            result.write_commit = None;
-        }
         Ok(result)
     }
 
-    fn commit(&self, write_commit: &WriteCommitInput) -> Result<CommitOutcome, CommitServiceError> {
-        self.commit_executor.commit_write_input(write_commit)
+    fn commit(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+            &self.commit_executor,
+            completion,
+        )
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -352,6 +360,16 @@ fn prepare_delete_dv_write(
     )?;
 
     let metadata = table.metadata();
+    let writer_handle_payload =
+        frozen_deletion_vector_handle_payload(&sink_spec, &table, &entry, base_snapshot_id)?;
+    let input_schema = Arc::new(Schema::new(
+        sink_spec
+            .target_columns
+            .iter()
+            .take(2)
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>(),
+    ));
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
@@ -376,7 +394,7 @@ fn prepare_delete_dv_write(
     );
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -387,14 +405,19 @@ fn prepare_delete_dv_write(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
-    let attempt_id = format!(
-        "{}.{}.{}:delete-dv:{}",
-        target.catalog,
-        target.namespace,
-        target.table,
-        uuid::Uuid::new_v4()
-    );
+    });
+    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_connector_write(
+        state,
+        target,
+        target_ref,
+        ConnectorWriteIntent::RowDelta,
+        input_schema,
+        writer_handle_payload,
+        Arc::clone(&commit_executor),
+        connector_operation_id,
+        connector_context.clone(),
+    )?;
     let executor = DistributedDvDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -403,6 +426,7 @@ fn prepare_delete_dv_write(
         commit_executor,
         execution,
         connector_context: connector_context.clone(),
+        connector_write,
     };
     Ok(prepared_delete(
         DeleteOperation {
@@ -410,7 +434,7 @@ fn prepare_delete_dv_write(
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             target_ref: target_ref.to_string(),
-            attempt_id,
+            attempt_id: connector_operation_id.to_string(),
             commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
         },
@@ -433,9 +457,32 @@ fn prepare_delete_write(
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedDelete, String> {
+    let metadata = table.metadata();
+    let mut sink_spec = sink_spec;
+    sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let position_index_storage = position_delete_index_storage_config(&entry, metadata.location())?;
+    let position_delete_partitions = build_position_delete_data_file_partition_index(
+        metadata,
+        base_snapshot_id,
+        metadata.location(),
+        position_index_storage.as_ref(),
+    )?;
+    let writer_handle_payload = encode_position_delete_sink_handle_payload(
+        &sink_spec,
+        metadata,
+        &position_delete_partitions,
+    )?;
+    let input_schema = Arc::new(Schema::new(
+        sink_spec
+            .target_columns
+            .iter()
+            .take(2)
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>(),
+    ));
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = IcebergWriteCommitExecutor {
+    let commit_executor = Arc::new(IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
         catalog,
@@ -446,14 +493,19 @@ fn prepare_delete_write(
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
-    };
-    let attempt_id = format!(
-        "{}.{}.{}:delete:{}",
-        target.catalog,
-        target.namespace,
-        target.table,
-        uuid::Uuid::new_v4()
-    );
+    });
+    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_write = crate::engine::iceberg_writer::register_iceberg_connector_write(
+        state,
+        target,
+        target_ref,
+        ConnectorWriteIntent::RowDelta,
+        input_schema,
+        writer_handle_payload,
+        Arc::clone(&commit_executor),
+        connector_operation_id,
+        connector_context.clone(),
+    )?;
     let executor = DistributedDeleteWriteExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -462,6 +514,7 @@ fn prepare_delete_write(
         commit_executor,
         execution,
         connector_context: connector_context.clone(),
+        connector_write,
     };
     Ok(prepared_delete(
         DeleteOperation {
@@ -469,12 +522,117 @@ fn prepare_delete_write(
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             target_ref: target_ref.to_string(),
-            attempt_id,
+            attempt_id: connector_operation_id.to_string(),
             commit_op_kind: CommitOpKind::RowDelta,
             base_snapshot_id,
         },
         Arc::new(executor),
     ))
+}
+
+/// Freeze all deletion-vector facts needed by a BE-only writer at the exact
+/// base snapshot. Credentials and catalog clients stay on the FE.
+pub(crate) fn frozen_deletion_vector_handle_payload(
+    sink_spec: &IcebergWriteSinkSpec,
+    table: &iceberg::table::Table,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+) -> Result<Bytes, String> {
+    let metadata = table.metadata();
+    let position_index_storage = position_delete_index_storage_config(entry, metadata.location())?;
+    let position_delete_partitions = build_position_delete_data_file_partition_index(
+        metadata,
+        base_snapshot_id,
+        metadata.location(),
+        position_index_storage.as_ref(),
+    )?;
+    let existing_vectors = frozen_deletion_vectors_at_snapshot(table, base_snapshot_id, entry)?;
+    encode_deletion_vector_sink_handle_payload(
+        sink_spec,
+        metadata,
+        &position_delete_partitions,
+        &existing_vectors,
+    )
+}
+
+fn position_delete_index_storage_config(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    table_location: &str,
+) -> Result<Option<IcebergSinkObjectStoreConfig>, String> {
+    let Some(bucket) =
+        crate::connector::iceberg::changes::expected_object_store_bucket_from_location(
+            table_location,
+        )?
+    else {
+        return Ok(None);
+    };
+    let config = entry.object_store_config().ok_or_else(|| {
+        format!(
+            "Iceberg position-delete planning requires object-store credentials for bucket {bucket}"
+        )
+    })?;
+    Ok(Some(IcebergSinkObjectStoreConfig {
+        endpoint: config.endpoint.clone(),
+        bucket,
+        access_key_id: config.access_key_id.clone(),
+        access_key_secret: config.access_key_secret.clone(),
+        session_token: config.session_token.clone(),
+        region: config.region.clone(),
+        enable_path_style_access: config.enable_path_style_access,
+        retry_max_times: config.retry_max_times,
+        retry_min_delay_ms: config.retry_min_delay_ms,
+        retry_max_delay_ms: config.retry_max_delay_ms,
+        timeout_ms: config.timeout_ms,
+        io_timeout_ms: config.io_timeout_ms,
+    }))
+}
+
+fn frozen_deletion_vectors_at_snapshot(
+    table: &iceberg::table::Table,
+    snapshot_id: Option<i64>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+) -> Result<HashMap<String, DeletionVector>, String> {
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(HashMap::new());
+    };
+    let object_store_config = entry.object_store_config();
+    let factory =
+        crate::connector::iceberg::changes::build_factory_for_table(table, object_store_config)?;
+    let expected_bucket =
+        crate::connector::iceberg::changes::expected_object_store_bucket_for_table(table)?;
+    let positions =
+        crate::connector::iceberg::scan_deletes::previously_deleted_positions_at_snapshot(
+            table,
+            snapshot_id,
+            &factory,
+            &|path| {
+                crate::connector::iceberg::changes::normalize_delete_projection_path(
+                    path,
+                    object_store_config,
+                    expected_bucket.as_deref(),
+                )
+            },
+            |_| true,
+        )
+        .map_err(|error| {
+            format!(
+                "read frozen Iceberg deletion-vector positions at snapshot {snapshot_id}: {error}"
+            )
+        })?;
+    positions
+        .into_iter()
+        .map(|(path, positions)| {
+            let mut vector = DeletionVector::new();
+            for position in positions {
+                vector.insert(position).map_err(|error| {
+                    format!(
+                        "encode frozen Iceberg deletion-vector position {position} for `{path}`: {error}"
+                    )
+                })?;
+            }
+            Ok((path, vector))
+        })
+        .collect()
 }
 
 fn build_delete_position_sink_query(

@@ -20,10 +20,9 @@
 //! Lifetime: created by Iceberg write preparation or `engine/delete_flow.rs`
 //! before lowering, dropped after `run_iceberg_commit` returns.
 //!
-//! At pipeline finish, [`take_written_files`](IcebergCommitCollector::take_written_files)
-//! consumes writer reports decoded by the runtime sink-commit wire adapter and
-//! converts them into [`WrittenFile`]s. Each file path is mirrored into the
-//! [`AbortLog`] so that a later commit failure can clean up via OpenDAL.
+//! Provider-owned writer reports are injected before commit and converted into
+//! [`WrittenFile`]s. Each file path is mirrored into the [`AbortLog`] so that a
+//! later commit failure can clean up via OpenDAL.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +45,17 @@ use super::types::{CommitOpKind, WrittenFile};
 use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
 
+#[derive(Default)]
+struct StagedEffectCounters {
+    injected_data_rows: u128,
+    appended_data_rows: u128,
+    delete_rows: u128,
+}
+
+fn staged_row_count(value: u128) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Query-scoped Iceberg INSERT / INSERT OVERWRITE / DELETE state.
 pub struct IcebergCommitCollector {
     pub op_kind: CommitOpKind,
@@ -59,13 +69,7 @@ pub struct IcebergCommitCollector {
     pub staging_dir: String,
     pub finst_id: UniqueId,
     pub abort_log: Arc<AbortLog>,
-    /// Files supplied directly by the engine layer when it bypasses the
-    /// IcebergSink path (e.g. standalone INSERT/DELETE that uses iceberg-rust
-    /// `DataFileWriter` directly, mirroring phase4a). When non-empty,
-    /// [`take_written_files`] returns these instead of draining
-    /// [`runtime::sink_commit`]. [`AbortLog`] entries are still recorded
-    /// because abort cleanup applies regardless of which channel produced
-    /// the file.
+    /// Files supplied by the provider execution/control boundary.
     injected: Mutex<Vec<WrittenFile>>,
     /// Net-new data files (content == Data, NO preserved `_row_id`) that a folded
     /// MERGE not-matched INSERT branch produced. Kept separate from `injected`
@@ -75,6 +79,11 @@ pub struct IcebergCommitCollector {
     /// Drained via [`take_appended_files`]. Empty for every non-folded path,
     /// keeping MOR-UPDATE / DELETE byte-identical.
     appended: Mutex<Vec<WrittenFile>>,
+    /// Cumulative logical effect of every validated file/group injected into
+    /// this collector. Commit actions drain the concrete channels above, but
+    /// MV refresh still needs the exact staged row counts after an external
+    /// commit has completed in connector control.
+    staged_effect: Mutex<StagedEffectCounters>,
     /// Grouped `(referenced_data_file, positions)` records produced by the
     /// engine-side row-lineage DELETE flow. Only used when
     /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
@@ -120,6 +129,7 @@ impl IcebergCommitCollector {
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
             appended: Mutex::new(Vec::new()),
+            staged_effect: Mutex::new(StagedEffectCounters::default()),
             delete_groups: Mutex::new(Vec::new()),
             sketch_sets: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
@@ -150,6 +160,13 @@ impl IcebergCommitCollector {
     /// engine-side row-lineage DELETE flow so that `RowDeltaDvCommit` can
     /// build the merged Puffin DV files at commit time.
     pub fn inject_delete_group(&self, group: PositionDeleteGroup) {
+        let mut effect = self
+            .staged_effect
+            .lock()
+            .expect("collector staged_effect lock poisoned");
+        effect.delete_rows = effect
+            .delete_rows
+            .saturating_add(group.positions.len() as u128);
         self.delete_groups
             .lock()
             .expect("collector delete_groups lock poisoned")
@@ -193,20 +210,16 @@ impl IcebergCommitCollector {
         sets
     }
 
-    /// Sum of `record_count` across all currently-injected
-    /// [`WrittenFile`]s with `content == Data`. Non-destructive; used by
-    /// IVM-A1 refresh accounting (added-row count for the MV row total).
+    /// Cumulative `record_count` across every injected [`WrittenFile`] with
+    /// `content == Data`. Commit actions may already have drained the concrete
+    /// file channel; this accounting evidence remains available to the MV
+    /// refresh publisher.
     pub fn injected_data_record_count(&self) -> i64 {
-        use iceberg::spec::DataContentType;
-        let guard = self
-            .injected
+        let effect = self
+            .staged_effect
             .lock()
-            .expect("collector injected lock poisoned");
-        guard
-            .iter()
-            .filter(|wf| matches!(wf.content, DataContentType::Data))
-            .map(|wf| wf.record_count as i64)
-            .sum()
+            .expect("collector staged_effect lock poisoned");
+        staged_row_count(effect.injected_data_rows)
     }
 
     /// Sum of data rows across both preserved/reuse files and net-new appended
@@ -214,56 +227,26 @@ impl IcebergCommitCollector {
     /// materialize rows into the target snapshot, even though RowDeltaDvFromFiles
     /// keeps them separate for row-lineage assignment.
     pub fn injected_or_appended_data_record_count(&self) -> i64 {
-        use iceberg::spec::DataContentType;
-        let injected_rows: i64 = {
-            let guard = self
-                .injected
-                .lock()
-                .expect("collector injected lock poisoned");
-            guard
-                .iter()
-                .filter(|wf| matches!(wf.content, DataContentType::Data))
-                .map(|wf| wf.record_count as i64)
-                .sum()
-        };
-        let appended_rows: i64 = {
-            let guard = self
-                .appended
-                .lock()
-                .expect("collector appended lock poisoned");
-            guard
-                .iter()
-                .filter(|wf| matches!(wf.content, DataContentType::Data))
-                .map(|wf| wf.record_count as i64)
-                .sum()
-        };
-        injected_rows + appended_rows
+        let effect = self
+            .staged_effect
+            .lock()
+            .expect("collector staged_effect lock poisoned");
+        staged_row_count(
+            effect
+                .injected_data_rows
+                .saturating_add(effect.appended_data_rows),
+        )
     }
 
     /// Sum of delete-side rows across coordinator-built delete groups and
     /// BE-written delete files. Non-destructive; used by IVM-A1 refresh
     /// accounting and empty-write gating.
     pub fn injected_delete_record_count(&self) -> i64 {
-        use iceberg::spec::DataContentType;
-        let group_rows: i64 = {
-            let guard = self
-                .delete_groups
-                .lock()
-                .expect("collector delete_groups lock poisoned");
-            guard.iter().map(|g| g.positions.len() as i64).sum()
-        };
-        let injected_delete_rows: i64 = {
-            let guard = self
-                .injected
-                .lock()
-                .expect("collector injected lock poisoned");
-            guard
-                .iter()
-                .filter(|wf| matches!(wf.content, DataContentType::PositionDeletes))
-                .map(|wf| wf.record_count as i64)
-                .sum()
-        };
-        group_rows + injected_delete_rows
+        let effect = self
+            .staged_effect
+            .lock()
+            .expect("collector staged_effect lock poisoned");
+        staged_row_count(effect.delete_rows)
     }
 
     /// Pre-load a written file into the collector. Used by the standalone
@@ -278,6 +261,28 @@ impl IcebergCommitCollector {
     /// validated. Each path is recorded in the [`AbortLog`] so abort cleanup
     /// still works.
     pub(crate) fn inject_written_files(&self, files: Vec<WrittenFile>) {
+        use iceberg::spec::DataContentType;
+
+        {
+            let mut effect = self
+                .staged_effect
+                .lock()
+                .expect("collector staged_effect lock poisoned");
+            for file in &files {
+                match file.content {
+                    DataContentType::Data => {
+                        effect.injected_data_rows = effect
+                            .injected_data_rows
+                            .saturating_add(file.record_count as u128);
+                    }
+                    DataContentType::PositionDeletes => {
+                        effect.delete_rows =
+                            effect.delete_rows.saturating_add(file.record_count as u128);
+                    }
+                    DataContentType::EqualityDeletes => {}
+                }
+            }
+        }
         let mut guard = self
             .injected
             .lock()
@@ -294,6 +299,21 @@ impl IcebergCommitCollector {
     /// [`inject_written_files`] (the reuse channel). Each path is recorded in the
     /// [`AbortLog`] so abort cleanup still works.
     pub(crate) fn inject_appended_files(&self, files: Vec<WrittenFile>) {
+        use iceberg::spec::DataContentType;
+
+        {
+            let mut effect = self
+                .staged_effect
+                .lock()
+                .expect("collector staged_effect lock poisoned");
+            for file in &files {
+                if matches!(file.content, DataContentType::Data) {
+                    effect.appended_data_rows = effect
+                        .appended_data_rows
+                        .saturating_add(file.record_count as u128);
+                }
+            }
+        }
         let mut guard = self
             .appended
             .lock()
@@ -347,36 +367,16 @@ impl IcebergCommitCollector {
 
     /// Returns the [`WrittenFile`] set produced by this query.
     ///
-    /// If the engine pre-loaded files via [`inject_written_file`], those are
-    /// returned and the per-fragment-instance `sink_commit` table is left
-    /// untouched. Otherwise the collector drains
-    /// [`runtime::sink_commit::list`] and decodes each transport payload into a
-    /// writer report before converting it into a [`WrittenFile`].
+    /// The distributed writer contract requires provider-owned reports to be
+    /// decoded and injected before this point. The collector never reads a
+    /// process-global runtime report side channel.
     pub fn take_written_files(&self) -> Result<Vec<WrittenFile>, String> {
-        {
-            let mut guard = self
+        Ok(std::mem::take(
+            &mut *self
                 .injected
                 .lock()
-                .expect("collector injected lock poisoned");
-            if !guard.is_empty() {
-                return Ok(std::mem::take(&mut *guard));
-            }
-        }
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            crate::common::engine_error::EngineError::iceberg_write_descriptor_mismatch(
-                "IcebergCommitCollector missing table metadata",
-            )
-            .to_bracketed_user_message()
-        })?;
-        let reports =
-            crate::runtime::sink_commit::list_iceberg_writer_reports(self.finst_id, metadata)?;
-        let mut out = Vec::with_capacity(reports.len());
-        for report in reports {
-            let wf = self.convert_writer_report(report)?;
-            self.abort_log.record_data_file(wf.path.clone());
-            out.push(wf);
-        }
-        Ok(out)
+                .expect("collector injected lock poisoned"),
+        ))
     }
 
     /// Reconstruct a [`WrittenFile`] from a writer report.
@@ -1471,6 +1471,41 @@ mod tests {
 
         assert_eq!(collector.injected_data_record_count(), 7);
         assert_eq!(collector.injected_delete_record_count(), 3);
+    }
+
+    #[test]
+    fn staged_effect_counts_survive_commit_channel_drain() {
+        let collector = unpartitioned_collector(int_schema());
+        collector.inject_written_files(vec![
+            written_file_with_content(
+                "file:///warehouse/t/data/reuse.parquet",
+                DataContentType::Data,
+                DataFileFormat::Parquet,
+                2,
+            ),
+            written_file_with_content(
+                "file:///warehouse/t/data/delete.puffin",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+                2,
+            ),
+        ]);
+        collector.inject_appended_files(vec![written_file_with_content(
+            "file:///warehouse/t/data/fresh.parquet",
+            DataContentType::Data,
+            DataFileFormat::Parquet,
+            1,
+        )]);
+
+        assert_eq!(
+            collector.take_written_files().expect("drain written").len(),
+            2
+        );
+        assert_eq!(collector.take_appended_files().len(), 1);
+
+        assert_eq!(collector.injected_data_record_count(), 2);
+        assert_eq!(collector.injected_or_appended_data_record_count(), 3);
+        assert_eq!(collector.injected_delete_record_count(), 2);
     }
 
     #[test]

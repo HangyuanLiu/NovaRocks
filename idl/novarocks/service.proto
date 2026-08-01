@@ -330,17 +330,36 @@ message QueryTerminalLoadStats {
   int64 filtered_rows = 3;
 }
 
+// One bounded fragment of an opaque provider staged report. The frontend
+// validates every frame before counting the logical writer as staged.
+message ConnectorStagedReportFrame {
+  uint32 contract_version = 1;
+  novarocks.plan.ConnectorWriterIdentity writer = 2;
+  uint32 terminal_state = 3;
+  uint64 input_rows = 4;
+  uint64 staged_bytes = 5;
+  uint64 artifact_count = 6;
+  uint32 part_index = 7;
+  uint32 part_count = 8;
+  uint64 logical_payload_len = 9;
+  bytes logical_payload_sha256 = 10;
+  bytes frame_payload = 11;
+  bytes frame_payload_sha256 = 12;
+}
+
 message QueryTerminalFragmentSnapshot {
   novarocks.common.UniqueId fragment_instance_id = 1;
   int32 backend_num = 2;
   QueryTerminalFragmentOutcome outcome = 3;
   string error_code = 4;
   string error_detail = 5;
-  repeated IcebergCommitInfo iceberg_commits = 6;
+  reserved 6;
+  reserved "iceberg_commits";
   repeated QueryTerminalTabletInfo tablet_commit_infos = 7;
   repeated QueryTerminalTabletInfo tablet_fail_infos = 8;
   QueryTerminalLoadStats load_stats = 9;
   RuntimeProfileTree profile = 10;
+  repeated ConnectorStagedReportFrame connector_staged_report_frames = 11;
 }
 
 message QueryTerminalSnapshot {
@@ -643,76 +662,4 @@ enum ProfileUnit {
   PROFILE_UNIT_TIME_MS = 5;
   PROFILE_UNIT_TIME_S = 6;
   PROFILE_UNIT_NONE = 7;
-}
-
-// Optional list wrappers preserve the thrift distinction between an absent list
-// field and a present-but-empty list field for Iceberg commit metadata.
-message Int64List {
-  repeated int64 values = 1;
-}
-
-message Int32List {
-  repeated int32 values = 1;
-}
-
-// Native Iceberg file content enum. Mirrors TIcebergFileContent values carried
-// in the FE-compatible thrift path.
-enum IcebergFileContent {
-  ICEBERG_FILE_CONTENT_UNSPECIFIED = 0;
-  DATA = 1;
-  POSITION_DELETES = 2;
-  EQUALITY_DELETES = 3;
-}
-
-// Native Iceberg column statistics for one data/delete file.
-message IcebergColumnStats {
-  map<int32, int64> column_sizes = 1;
-  map<int32, int64> value_counts = 2;
-  map<int32, int64> null_value_counts = 3;
-  map<int32, int64> nan_value_counts = 4;
-  map<int32, bytes> lower_bounds = 5;
-  map<int32, bytes> upper_bounds = 6;
-}
-
-// One serialized Iceberg partition value. datum_bytes is optional because empty
-// bytes can be a real encoded value distinct from thrift absence.
-message IcebergPartitionValue {
-  optional bool is_null = 1;
-  optional bytes datum_bytes = 2;
-}
-
-// Native Iceberg partition descriptor used by the writer->coordinator report.
-message IcebergPartitionDescriptor {
-  repeated IcebergPartitionValue values = 1;
-}
-
-// Native Iceberg data/delete file commit metadata. This mirrors the
-// NovaRocks-internal TIcebergDataFile fields needed by pure-mode commits.
-message IcebergDataFile {
-  optional string path = 1;
-  optional string format = 2;
-  optional int64 record_count = 3;
-  optional int64 file_size_in_bytes = 4;
-  optional string partition_path = 5;
-  Int64List split_offsets = 6;
-  IcebergColumnStats column_stats = 7;
-  optional string partition_null_fingerprint = 8;
-  IcebergFileContent file_content = 9;
-  optional string referenced_data_file = 10;
-  optional int64 first_row_id = 11;
-  Int32List equality_ids = 12;
-  optional bytes key_metadata = 13;
-  optional int32 partition_spec_id = 14;
-  IcebergPartitionDescriptor partition_values_descriptor = 15;
-  optional int64 content_offset = 16;
-  optional int64 content_size_in_bytes = 17;
-  optional int64 cardinality = 18;
-}
-
-// Native sink commit info for pure NovaRocks report path. Hive/tablet/load-only
-// fields stay on the StarRocksFrontend thrift compatibility path.
-message IcebergCommitInfo {
-  IcebergDataFile iceberg_data_file = 1;
-  optional bool is_overwrite = 2;
-  optional bool is_rewrite = 3;
 }

@@ -607,6 +607,7 @@ fn write_outcome_preserves_commit_or_abort() {
             .expect("commit result"),
             write_commit: Some(commit.clone()),
             write_abort: None,
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         })
         .expect("Write intent accepts a commit payload");
@@ -629,6 +630,7 @@ fn write_outcome_preserves_commit_or_abort() {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_commit: None,
             write_abort: Some(abort.clone()),
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         })
         .expect("Write intent accepts an abort payload");
@@ -652,6 +654,7 @@ fn profile_outcome_preserves_fragment_profiles() {
             .expect("profile result"),
             write_commit: None,
             write_abort: None,
+            connector_completion: None,
             fragment_profiles: vec![profile.clone()],
         })
         .expect("Profile intent accepts fragment profiles");
@@ -675,6 +678,7 @@ fn result_outcome_preserves_query_result() {
             .expect("result payload"),
             write_commit: None,
             write_abort: None,
+            connector_completion: None,
             fragment_profiles: Vec::new(),
         })
         .expect("Result intent accepts a plain query result");
