@@ -24,6 +24,39 @@ use crate::sql::mv_refresh::first_refresh::{
 };
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
+/// Build the ordinary data-writer sink from the target frozen by the MV
+/// refresh context.  This adapter owns concrete Iceberg table metadata; the
+/// SQL prepared artifact itself remains provider-neutral and contains none of
+/// these catalog handles.
+pub(crate) fn build_mv_first_refresh_sink_spec(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: ctx.rewrite.target.catalog.clone(),
+        namespace: ctx.rewrite.target.namespace.clone(),
+        table: ctx.rewrite.target.table.clone(),
+    };
+    let target_table = ctx.target_bindings.runtime().target_table();
+    let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
+        target_table.metadata().current_schema(),
+    )?;
+    let resolved = crate::connector::backend::ResolvedTable {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+        columns: columns.clone(),
+        statistics_pin: None,
+    };
+    crate::engine::iceberg_writer::build_insert_write_sink_spec(
+        &target,
+        &resolved,
+        target_table,
+        ctx.target_bindings.runtime().target_entry(),
+        &columns,
+    )
+}
+
 pub(crate) fn execute_prepared_mv_first_refresh_staging(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
