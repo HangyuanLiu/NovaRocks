@@ -3711,7 +3711,13 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         || normalized.contains("variant columns cannot appear in the partition spec")
         || normalized.contains("unsupported iceberg type evolution")
         || normalized.contains("decimal scale change is not allowed")
+        || normalized.contains("decimal precision must strictly increase")
+        || normalized.contains("parent path must point to a struct")
+        || (normalized.contains("iceberg column `") && normalized.contains("already exists"))
+        || (normalized.contains("column path '") && normalized.contains("not found"))
         || normalized.contains("format-version is reserved")
+        || normalized.contains("iceberg internal metadata key")
+        || normalized.contains("novarocks.* namespace is reserved")
     {
         // These are local Iceberg semantic rejections, before any catalog
         // commit can have been dispatched.  Keeping them out of the unknown
@@ -3748,6 +3754,39 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn local_schema_and_property_validation_is_known_uncommitted() {
+        for (message, expected_kind) in [
+            (
+                "ADD COLUMN parent path must point to a STRUCT",
+                ConnectorErrorKind::InvalidRequest,
+            ),
+            (
+                "decimal precision must strictly increase",
+                ConnectorErrorKind::InvalidRequest,
+            ),
+            (
+                "Iceberg column `v2` already exists",
+                ConnectorErrorKind::InvalidRequest,
+            ),
+            (
+                "column path 'c1.v2.v5' not found",
+                ConnectorErrorKind::NotFound,
+            ),
+            (
+                "identifier-field-ids is an Iceberg internal metadata key",
+                ConnectorErrorKind::InvalidRequest,
+            ),
+            (
+                "novarocks.* namespace is reserved for engine-owned properties",
+                ConnectorErrorKind::InvalidRequest,
+            ),
+        ] {
+            let error = map_iceberg_error(message.to_string());
+            assert_eq!(error.kind(), expected_kind, "{message}");
+        }
     }
 
     struct NotCancelled;

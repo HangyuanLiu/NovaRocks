@@ -464,11 +464,7 @@ fn align_arrays_to_schema(
                 return Ok(array);
             }
 
-            let casted = if matches!(
-                target_type,
-                DataType::FixedSizeBinary(width)
-                    if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
-            ) {
+            let casted = if data_type_contains_largeint(target_type) {
                 cast_with_special_rules(&array, target_type)
             } else {
                 cast(array.as_ref(), target_type).map_err(|e| e.to_string())
@@ -498,6 +494,22 @@ fn align_arrays_to_schema(
             Ok(casted)
         })
         .collect()
+}
+
+fn data_type_contains_largeint(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeBinary(width) => {
+            *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+        }
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            data_type_contains_largeint(field.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| data_type_contains_largeint(field.data_type())),
+        DataType::Map(entries, _) => data_type_contains_largeint(entries.data_type()),
+        _ => false,
+    }
 }
 
 fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
