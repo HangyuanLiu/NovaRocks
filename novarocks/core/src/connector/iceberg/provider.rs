@@ -4275,6 +4275,41 @@ pub(crate) fn load_table_def_at(
     Ok((table_def, schema_id, statistics_pin))
 }
 
+/// Resolve a fixed Iceberg snapshot without publishing a synthetic table to
+/// the process-wide local catalog. The returned planning lease is retained by
+/// the query binding and later reused by statistics and split preparation.
+pub(crate) fn load_time_travel_table_def_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    snapshot_id: i64,
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<ResolvedTableStatisticsPin>,
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+    ),
+    String,
+> {
+    let (mut table_def, _schema_id, statistics_pin, planning_lease) =
+        load_schema_table_def_with_lease(controls, context, catalog, namespace, table)?;
+    let crate::sql::planner::table::ScanSource::IcebergDataFiles {
+        table,
+        files,
+        binding,
+        ..
+    } = &mut table_def.source
+    else {
+        return Err("Iceberg time travel metadata did not produce a file scan".to_string());
+    };
+    table.current_snapshot_id = Some(snapshot_id);
+    files.clear();
+    *binding = super::scan_model::IcebergDataFileBinding::ExplicitFiles;
+    Ok((table_def, statistics_pin, planning_lease))
+}
+
 pub(crate) fn load_metadata_table_def(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,

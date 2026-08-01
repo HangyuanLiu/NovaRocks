@@ -7563,10 +7563,18 @@ mysql_port = 47892
         let connectors = crate::connector::ConnectorRegistry::default();
         let mv_ctx = dummy_mv_refresh_context_for_validator_test();
         let query_execution = super::test_query_execution_service();
-        let validator =
-            |_outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome| {
+        struct RejectingImvRewriteInput;
+        impl crate::sql::compiler::SqlImvRewriteInput for RejectingImvRewriteInput {
+            fn rewrite(
+                &self,
+                _logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+                _factory: crate::sql::column_id::ColumnRefFactory,
+                _optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+            ) -> Result<crate::sql::compiler::SqlImvRewriteOutput, String> {
                 Err("sentinel IMV validator error".to_string())
-            };
+            }
+        }
+        let validator = RejectingImvRewriteInput;
 
         let err = super::execute_query_with_options_and_imv_validator(
             &query,

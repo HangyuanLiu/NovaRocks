@@ -117,6 +117,23 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         namespace: &str,
         table: &str,
     ) -> Result<QueryTableBinding, String> {
+        if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
+            let (mut planner, statistics_pin, planning_lease) =
+                crate::connector::iceberg::provider::load_time_travel_table_def_with_lease(
+                    self.controls,
+                    self.connector_context.clone(),
+                    catalog,
+                    namespace,
+                    base_table,
+                    snapshot_id,
+                )?;
+            planner.name = table.to_string();
+            return Ok(QueryTableBinding {
+                resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+                statistics_pin,
+                planning_lease: Some(planning_lease),
+            });
+        }
         let (planner, _schema_id, statistics_pin, planning_lease) =
             crate::connector::iceberg::provider::load_schema_table_def_with_lease(
                 self.controls,
@@ -148,6 +165,18 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             metadata_table_type,
         )
     }
+}
+
+/// Query-prep encodes time-travel selectors as a synthetic analyzer identity.
+/// The identity is recognized only by this query-scoped binding loader, so it
+/// cannot leak into the global local catalog or another request's memo.
+fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
+    let encoded = table.strip_prefix("__sqlx1_tt_")?;
+    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
+    (!base_table.is_empty())
+        .then(|| snapshot_id.parse::<i64>().ok())
+        .flatten()
+        .map(|snapshot_id| (base_table, snapshot_id))
 }
 
 pub(crate) type QueryStatsPlan = crate::sql::compiler::SqlStatisticsPlan;
@@ -531,5 +560,19 @@ mod unified_tests {
         assert!(request.metrics().contains(&StatisticsMetric::ThetaNdv {
             column: Arc::from("k"),
         }));
+    }
+
+    #[test]
+    fn sqlx1_resolution_time_travel_overlay_identity_is_canonical() {
+        assert_eq!(
+            parse_time_travel_overlay_identity("__sqlx1_tt_orders_42"),
+            Some(("orders", 42))
+        );
+        assert_eq!(
+            parse_time_travel_overlay_identity("__sqlx1_tt_sales_orders_-7"),
+            Some(("sales_orders", -7))
+        );
+        assert_eq!(parse_time_travel_overlay_identity("orders"), None);
+        assert_eq!(parse_time_travel_overlay_identity("__sqlx1_tt__bad"), None);
     }
 }
