@@ -21,7 +21,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/catalog", "novarocks/compat", "novarocks/core", "novarocks/frontend", "novarocks/fs", "novarocks/protocol", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
+members = ["novarocks/backend", "novarocks/catalog", "novarocks/compat", "novarocks/connector/starrocks", "novarocks/core", "novarocks/frontend", "novarocks/fs", "novarocks/protocol", "novarocks/spi", "novarocks/state-store", "novarocks/types", "novarocks/version", "novarocks-server"]
 # Native development defaults to the server package and does not select the
 # optional compat dependency. `--workspace` intentionally includes
 # novarocks-compat, so reserve it for whole-workspace or compat validation.
