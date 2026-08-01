@@ -2418,7 +2418,7 @@ mod tests {
                 &[expr_id],
                 &[false],
                 arena.as_ref(),
-                producer_context,
+                Arc::new(producer_context),
                 1,
             )
             .unwrap(),

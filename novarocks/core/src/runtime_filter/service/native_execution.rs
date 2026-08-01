@@ -482,6 +482,7 @@ impl ResolvedNativeProducer {
             binding_id: self.binding_id,
             fragment_instance_id: self.fragment_instance_id,
             inbound_contract: self.inbound_contract.clone(),
+            max_contribution_bytes: self.max_contribution_bytes,
         }))
     }
 
@@ -596,9 +597,14 @@ struct NativeExecutionProducerAdapter {
     binding_id: BindingId,
     fragment_instance_id: UniqueId,
     inbound_contract: super::registry::InboundProducerContract,
+    max_contribution_bytes: usize,
 }
 
 impl execution::RuntimeFilterProducer for NativeExecutionProducerAdapter {
+    fn max_contribution_bytes(&self) -> usize {
+        self.max_contribution_bytes
+    }
+
     fn submit(
         &self,
         partition: execution::PartitionId,

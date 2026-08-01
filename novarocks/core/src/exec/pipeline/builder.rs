@@ -30,6 +30,8 @@
 
 use std::sync::Arc;
 
+use novarocks_execution::runtime_filter as execution;
+
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::aggregate::{
     AggregateNode, AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
@@ -935,13 +937,14 @@ fn native_join_producer_factory(
     }
     let context =
         native_runtime_filter_context(&ctx.runtime_filter_execution, specs[0].binding_id)?;
+    let session: execution::RuntimeFilterSessionRef = Arc::new(context.clone());
     Ok(Some(Arc::new(
         NativeRuntimeFilterProducerFactory::from_plan(
             specs,
             build_keys,
             eq_null_safe,
             ctx.arena.as_ref(),
-            context.clone(),
+            session,
             build_dop,
         )?,
     )))

@@ -413,6 +413,12 @@ pub enum RuntimeFilterSubscriptionHandle {
 }
 
 pub trait RuntimeFilterProducer: Send + Sync {
+    /// The maximum canonical contribution payload accepted by this exact
+    /// fragment-local producer route. It is an execution capability, not a
+    /// deployment descriptor, so callers can bound local encoding without
+    /// observing the installed service state.
+    fn max_contribution_bytes(&self) -> usize;
+
     fn submit(
         &self,
         partition: PartitionId,
@@ -549,6 +555,10 @@ mod tests {
     }
     struct Producer;
     impl RuntimeFilterProducer for Producer {
+        fn max_contribution_bytes(&self) -> usize {
+            1024
+        }
+
         fn submit(
             &self,
             _: PartitionId,
