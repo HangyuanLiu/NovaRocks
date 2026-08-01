@@ -72,7 +72,6 @@ fn standalone_open_services(
         host.execution_role(),
         system_catalog,
         host.view_service(),
-        host.statistics_service(),
         host.table_maintenance_service(),
         host.mv_repository(),
         host.mv_application_service(),
@@ -85,6 +84,10 @@ fn standalone_open_services(
         0,
     )
     .with_terminal_ingress(host.terminal_ingress())
+    .with_statistics_application(host.statistics_application_port())
+    .with_statistics_target_resolver_sink(host.statistics_application_port())
+    .with_statistics_table_reader_sink(host.statistics_application_port())
+    .with_statistics_attempt_executor_sink(host.statistics_application_port())
 }
 
 /// Opens the frontend services once for an externally composed server. The

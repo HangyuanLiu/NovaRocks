@@ -23,6 +23,7 @@ pub(crate) mod scan_model;
 pub mod schema;
 pub mod starrocks;
 pub(crate) mod stats;
+pub(crate) mod unified_statistics;
 
 pub(crate) use backend::MvBackend;
 #[cfg(test)]
@@ -292,6 +293,13 @@ pub(crate) fn metadata_load_table(
             namespace: metadata.identity.namespace.to_string(),
             table: metadata.identity.table.to_string(),
             columns,
+            statistics_pin: metadata
+                .statistics_data_version
+                .clone()
+                .map(|data_version| backend::ResolvedTableStatisticsPin {
+                    table: metadata.table.clone(),
+                    data_version,
+                }),
         },
         schema_id,
     ))

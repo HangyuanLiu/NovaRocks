@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
-use arrow::array::StringArray;
+use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tokio::runtime::Handle;
@@ -70,6 +70,7 @@ pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
 pub mod statistics;
+pub mod statistics_application;
 pub mod system_catalog;
 pub mod table_maintenance;
 pub mod view;
@@ -278,6 +279,8 @@ pub(crate) struct StandaloneState {
     pub(crate) catalog_service: Arc<StandaloneCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
+    /// Frontend-owned durable application boundary for typed statistics commands.
+    pub(crate) statistics_application: Arc<dyn statistics_application::StatisticsApplicationPort>,
     /// Frontend composition owns logical connector generations. The engine
     /// only consumes this SPI lifecycle port.
     pub(crate) connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -333,6 +336,9 @@ impl Default for StandaloneState {
             catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
+            statistics_application: Arc::new(
+                statistics_application::UnavailableStatisticsApplicationPort,
+            ),
             connector_control: Arc::new(TestConnectorControlRegistry::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             mv_refresh_pruning_limits: MvRefreshPruningLimits::default(),
@@ -503,6 +509,50 @@ impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRe
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorControlRegistry {
+    fn acquire_current_statistics(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorStatisticsLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active statistics binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        let statistics = binding.statistics().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no statistics capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorStatisticsLease::new(
+            binding.descriptor().clone(),
+            binding.incarnation(),
+            statistics,
+            || {},
+        )
+    }
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControlRegistry {
     fn register(
         &self,
@@ -572,6 +622,15 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         crate::query_execution::contract::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
+        if request.intent() == crate::query_execution::contract::DistributedQueryIntent::Statistics
+        {
+            return Err(
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Rejected,
+                    "test query coordinator does not provide a statistics collection sink",
+                ),
+            );
+        }
         crate::query_execution::in_process_test::execute(request)
     }
 }
@@ -671,6 +730,23 @@ pub struct StandaloneOpenServices {
     pub system_catalog: std::sync::Arc<dyn system_catalog::SystemCatalog>,
     pub view_service: std::sync::Arc<dyn crate::engine::view::ViewService>,
     pub statistics_service: std::sync::Arc<dyn statistics::StatisticsService>,
+    /// Frontend-owned durable application boundary. `new` defaults to an
+    /// unavailable implementation so non-frontend compositions fail closed.
+    pub statistics_application:
+        std::sync::Arc<dyn statistics_application::StatisticsApplicationPort>,
+    /// Receives the Core-owned target resolver once connector control is
+    /// ready. It is intentionally distinct from command dispatch.
+    pub statistics_target_resolver_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>>,
+    /// Receives Core's generation-fenced read-only statistics reader after
+    /// connector control is ready. It does not imply durable job ownership.
+    pub statistics_table_reader_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>>,
+    /// Receives the Core-owned distributed collection/publish executor after
+    /// connector control and the coordinator are ready. The frontend starts a
+    /// durable worker only when it also owns a StateStore repository.
+    pub statistics_attempt_executor_sink:
+        Option<std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -721,6 +797,12 @@ impl StandaloneOpenServices {
             system_catalog,
             view_service,
             statistics_service,
+            statistics_application: std::sync::Arc::new(
+                statistics_application::UnavailableStatisticsApplicationPort,
+            ),
+            statistics_target_resolver_sink: None,
+            statistics_table_reader_sink: None,
+            statistics_attempt_executor_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -742,6 +824,40 @@ impl StandaloneOpenServices {
         ingress: std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>,
     ) -> Self {
         self.terminal_ingress = Some(ingress);
+        self
+    }
+
+    pub fn with_statistics_application(
+        mut self,
+        statistics_application: std::sync::Arc<
+            dyn statistics_application::StatisticsApplicationPort,
+        >,
+    ) -> Self {
+        self.statistics_application = statistics_application;
+        self
+    }
+
+    pub fn with_statistics_target_resolver_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsTargetResolverSink>,
+    ) -> Self {
+        self.statistics_target_resolver_sink = Some(sink);
+        self
+    }
+
+    pub fn with_statistics_table_reader_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsTableReaderSink>,
+    ) -> Self {
+        self.statistics_table_reader_sink = Some(sink);
+        self
+    }
+
+    pub fn with_statistics_attempt_executor_sink(
+        mut self,
+        sink: std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>,
+    ) -> Self {
+        self.statistics_attempt_executor_sink = Some(sink);
         self
     }
 }
@@ -811,6 +927,10 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            statistics_application,
+            statistics_target_resolver_sink,
+            statistics_table_reader_sink,
+            statistics_attempt_executor_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -836,6 +956,7 @@ impl StandaloneNovaRocks {
             system_catalog,
             view_service,
             statistics_service,
+            statistics_application,
             connector_control,
             table_maintenance_service,
             self_weak: self_weak.clone(),
@@ -853,6 +974,15 @@ impl StandaloneNovaRocks {
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
         let engine = Self { inner };
+        if let Some(sink) = statistics_target_resolver_sink {
+            sink.bind_statistics_target_resolver(engine.statistics_target_resolver())?;
+        }
+        if let Some(sink) = statistics_table_reader_sink {
+            sink.bind_statistics_table_reader(engine.statistics_table_reader())?;
+        }
+        if let Some(sink) = statistics_attempt_executor_sink {
+            sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
+        }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
         if let Err(error) = engine.inner.table_maintenance_service.start(engine_port) {
@@ -889,6 +1019,43 @@ impl StandaloneNovaRocks {
 
     pub fn delete_engine(&self) -> Arc<dyn delete_engine::DeleteEngine> {
         Arc::new(Arc::clone(&self.inner))
+    }
+
+    /// Resolve an ANALYZE target once through the current connector control
+    /// generation. The frontend persists the returned opaque pin before it
+    /// creates a durable job; workers never receive this resolver.
+    pub fn statistics_target_resolver(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsTargetResolver> {
+        Arc::new(
+            statistics_application::ConnectorStatisticsTargetResolver::new(Arc::clone(
+                &self.inner.connector_control,
+            )),
+        )
+    }
+
+    /// Read-only generation-fenced statistics reader. It does not require a
+    /// durable job repository and remains valid without StateStore.
+    pub fn statistics_table_reader(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsTableReader> {
+        Arc::new(statistics_application::ConnectorStatisticsTableReader::new(
+            Arc::clone(&self.inner.connector_control),
+        ))
+    }
+
+    /// Native connector statistics execution exposed only to the frontend
+    /// durable job worker. It shares this engine's connector registry,
+    /// coordinator and live backend topology; no standalone/local fallback is
+    /// constructed for ANALYZE.
+    pub fn statistics_attempt_executor(
+        &self,
+    ) -> Arc<dyn statistics_application::StatisticsAttemptExecutor> {
+        Arc::new(
+            statistics_application::ConnectorStatisticsAttemptExecutor::new(Arc::downgrade(
+                &self.inner,
+            )),
+        )
     }
 
     pub(crate) fn publish_coordinator_report_bound_port(&self, port: u16) {
@@ -1120,18 +1287,6 @@ impl StandaloneSession {
                 )
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) = self.inner.statistics_service.try_query(
-                    &normalized,
-                    query,
-                    statistics::StatisticsRequestContext {
-                        current_catalog,
-                        current_database,
-                    },
-                )? {
-                    return Ok(PreparedQueryOperation::Immediate(PreparedImmediateQuery {
-                        result: StatementResult::Query(result),
-                    }));
-                }
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -1177,9 +1332,6 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
-                self.inner
-                    .statistics_service
-                    .observe_query(&prepared, current_database)?;
                 let request = prepare_query_with_options_and_imv_validator_with_catalog_provider(
                     &prepared,
                     &analyzer_provider,
@@ -1256,7 +1408,10 @@ impl StandaloneSession {
                 &mut scalar_arena,
             )?;
         let mut query_stats = query_stats::QueryStatsCollector::new(
-            query_stats::QueryStatsProviders::from_standalone_state(&self.inner),
+            query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+                &self.inner,
+                analyzer_provider.statistics_pins(),
+            ),
         )
         .collect(&mut optimizer_expr);
         let optimizer_settings = optimizer_settings_for_execution(Some(execution));
@@ -1411,20 +1566,36 @@ impl StandaloneSession {
                 }
             });
         }
-        if let Some(result) = self.inner.statistics_service.try_handle_statement(
-            &self.inner,
-            &normalized,
-            statistics::StatisticsRequestContext {
-                current_catalog,
-                current_database,
-            },
-        )? {
-            return Ok(match result {
-                statistics::StatisticsStatementResult::Ok => StatementResult::Ok,
-                statistics::StatisticsStatementResult::Query(result) => {
-                    StatementResult::Query(result)
+        // Statistics syntax has one typed parse and one typed application
+        // dispatch.  It must precede the legacy service so valid commands do
+        // not enter a raw-SQL interceptor while the old path is being removed.
+        {
+            let sr_dialect = StarRocksDialect;
+            if let Ok(ref peek_parser) =
+                sqlparser::parser::Parser::new(&sr_dialect).try_with_sql(&normalized)
+            {
+                use crate::sql::parser::dialect::statistics::{
+                    looks_like_analyze_table, looks_like_cancel_analyze,
+                    looks_like_show_analyze_jobs, looks_like_show_table_stats,
+                };
+                if looks_like_analyze_table(peek_parser)
+                    || looks_like_show_analyze_jobs(peek_parser)
+                    || looks_like_cancel_analyze(peek_parser)
+                    || looks_like_show_table_stats(peek_parser)
+                {
+                    let statement = crate::sql::parser::parse_sql(&normalized)?
+                        .pop()
+                        .ok_or_else(|| "custom parser returned no statements".to_string())?;
+                    return dispatch_statement(
+                        &self.inner,
+                        current_catalog,
+                        current_database,
+                        statement,
+                        request_context,
+                        &connector_context,
+                    );
                 }
-            });
+            }
         }
         if let Some((target, source)) = parse_create_table_like(&normalized)? {
             return self.handle_create_table_like(
@@ -1724,16 +1895,6 @@ impl StandaloneSession {
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Query(ref query) => {
-                if let Some(result) = self.inner.statistics_service.try_query(
-                    &normalized,
-                    query,
-                    statistics::StatisticsRequestContext {
-                        current_catalog,
-                        current_database,
-                    },
-                )? {
-                    return Ok(StatementResult::Query(result));
-                }
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -1793,9 +1954,6 @@ impl StandaloneSession {
                     connector_context.clone(),
                     TableLookupMode::SchemaOnly,
                 );
-                self.inner
-                    .statistics_service
-                    .observe_query(&prepared, current_database)?;
                 let result = execute_query_with_catalog_provider_with_execution(
                     &prepared,
                     &analyzer_provider,
@@ -1832,9 +1990,6 @@ impl StandaloneSession {
                     request_context.execution(),
                     &connector_context,
                 )?;
-                self.inner
-                    .statistics_service
-                    .observe_update(&normalized, current_database)?;
                 Ok(result)
             }
             ref merge_stmt @ sqlast::Statement::Merge(_) => {
@@ -2420,7 +2575,6 @@ impl StandaloneSession {
                     self.inner
                         .view_service
                         .drop_database("default_catalog", &database)?;
-                    self.inner.statistics_service.drop_database(&database);
                     return Ok(StatementResult::Ok);
                 }
                 let target = crate::engine::backend_resolver::resolve_namespace_target(
@@ -2439,9 +2593,6 @@ impl StandaloneSession {
                 self.inner
                     .view_service
                     .drop_database(&target.catalog, &target.namespace)?;
-                self.inner
-                    .statistics_service
-                    .drop_database(&target.namespace);
                 Ok(result)
             }
             DropResult::Table(stmt) => {
@@ -2454,17 +2605,6 @@ impl StandaloneSession {
                     stmt.force,
                     connector_context,
                 )?;
-                match stmt.name.parts.as_slice() {
-                    [table] => self
-                        .inner
-                        .statistics_service
-                        .drop_table(current_database, table),
-                    [database, table] => self.inner.statistics_service.drop_table(database, table),
-                    [_, database, table] => {
-                        self.inner.statistics_service.drop_table(database, table)
-                    }
-                    _ => {}
-                }
                 Ok(result)
             }
         }
@@ -2890,7 +3030,155 @@ pub(crate) fn dispatch_statement(
                 .show_backends()
                 .map(StatementResult::Query)
         }
+        Statement::AnalyzeTable(stmt) => execute_statistics_application_command(
+            state,
+            statistics_application::StatisticsApplicationCommand::AnalyzeTable {
+                target: statistics_application_target(
+                    &stmt.name,
+                    current_catalog,
+                    current_database,
+                )?,
+                columns: stmt.columns,
+            },
+        ),
+        Statement::ShowAnalyzeJobs(_) => execute_statistics_application_command(
+            state,
+            statistics_application::StatisticsApplicationCommand::ShowAnalyzeJobs,
+        ),
+        Statement::CancelAnalyze(stmt) => execute_statistics_application_command(
+            state,
+            statistics_application::StatisticsApplicationCommand::CancelAnalyze {
+                job_id: uuid::Uuid::parse_str(&stmt.job_id).map_err(|error| {
+                    format!("invalid ANALYZE job ID '{}': {error}", stmt.job_id)
+                })?,
+            },
+        ),
+        Statement::ShowTableStats(stmt) => execute_statistics_application_command(
+            state,
+            statistics_application::StatisticsApplicationCommand::ShowTableStats {
+                target: statistics_application_target(
+                    &stmt.name,
+                    current_catalog,
+                    current_database,
+                )?,
+            },
+        ),
     }
+}
+
+fn statistics_application_target(
+    name: &crate::sql::parser::ast::ObjectName,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<statistics_application::StatisticsTableTarget, String> {
+    let default_catalog = current_catalog.unwrap_or("default_catalog");
+    let (catalog, namespace, table) = match name.parts.as_slice() {
+        [table] => (default_catalog, current_database, table.as_str()),
+        [namespace, table] => (default_catalog, namespace.as_str(), table.as_str()),
+        [catalog, namespace, table] => (catalog.as_str(), namespace.as_str(), table.as_str()),
+        _ => {
+            return Err(format!(
+                "statistics table name must be table, db.table, or catalog.db.table: {}",
+                name.parts.join(".")
+            ));
+        }
+    };
+    Ok(statistics_application::StatisticsTableTarget {
+        catalog: normalize_identifier(catalog)?,
+        namespace: normalize_identifier(namespace)?,
+        table: normalize_identifier(table)?,
+    })
+}
+
+fn execute_statistics_application_command(
+    state: &Arc<StandaloneState>,
+    command: statistics_application::StatisticsApplicationCommand,
+) -> Result<StatementResult, String> {
+    let result = state
+        .statistics_application
+        .execute(command)
+        .map_err(|error| error.to_string())?;
+    statistics_application_result(result)
+}
+
+fn statistics_application_result(
+    result: statistics_application::StatisticsApplicationResult,
+) -> Result<StatementResult, String> {
+    use statistics_application::StatisticsApplicationResult;
+
+    match result {
+        StatisticsApplicationResult::JobSubmitted(_)
+        | StatisticsApplicationResult::JobCancellationRequested(_) => Ok(StatementResult::Ok),
+        StatisticsApplicationResult::AnalyzeJobs(jobs) => statistics_string_result(
+            &[
+                "job_id",
+                "operation_id",
+                "state",
+                "attempt",
+                "catalog",
+                "namespace",
+                "table",
+            ],
+            jobs.into_iter()
+                .map(|job| {
+                    vec![
+                        Some(job.job_id.to_string()),
+                        Some(job.operation_id.to_string()),
+                        Some(job.state),
+                        Some(job.attempt.to_string()),
+                        Some(job.target.catalog),
+                        Some(job.target.namespace),
+                        Some(job.target.table),
+                    ]
+                })
+                .collect(),
+        ),
+        StatisticsApplicationResult::TableStats(rows) => statistics_string_result(
+            &["metric", "value", "status"],
+            rows.into_iter()
+                .map(|row| vec![Some(row.metric), row.value, Some(row.status)])
+                .collect(),
+        ),
+    }
+}
+
+fn statistics_string_result(
+    names: &[&str],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<StatementResult, String> {
+    if rows.iter().any(|row| row.len() != names.len()) {
+        return Err("statistics application returned malformed tabular result".to_string());
+    }
+    let columns = names
+        .iter()
+        .map(|name| QueryResultColumn {
+            name: (*name).to_string(),
+            data_type: DataType::Utf8,
+            nullable: true,
+            logical_type: None,
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays = (0..names.len())
+        .map(|column| {
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row[column].clone())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|error| format!("build statistics application result failed: {error}"))?;
+    Ok(StatementResult::Query(QueryResult {
+        columns,
+        chunks: vec![record_batch_to_chunk(batch)?],
+    }))
 }
 
 fn require_backend_management_role(
@@ -3268,8 +3556,13 @@ fn explain_analyze_query(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
@@ -3487,8 +3780,13 @@ fn explain_query(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
@@ -3917,7 +4215,10 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
+    let providers = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        analyzer_provider.statistics_pins(),
+    );
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
@@ -4495,7 +4796,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
@@ -4527,7 +4828,7 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = query_stats::QueryStatsProviders::from_connectors(connectors);
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
@@ -4645,8 +4946,13 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         &mut scalar_arena,
     )?;
     let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+        .map(|state| {
+            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+                Some(state),
+                analyzer_catalog.statistics_pins(),
+            )
+        })
+        .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
     let mut query_stats =
         query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     // MV query rewrite: discover fresh Iceberg MV candidates and inject their
@@ -4776,9 +5082,9 @@ pub(crate) fn execute_logical_plan_with_options(
         &logical_plan,
         &mut scalar_arena,
     )?;
-    let providers = mv_rewrite_state
-        .map(query_stats::QueryStatsProviders::from_standalone_state)
-        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    // This entrypoint is handed an already-analyzed logical plan, so it has
+    // no query-resolution pins. Do not re-resolve `latest` for statistics.
+    let providers = query_stats::QueryStatisticsContext::unavailable();
     let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
     let optimized_tree = crate::sql::optimizer::optimize(
         optimizer_expr,
@@ -5526,6 +5832,11 @@ mod tests {
         CatalogTableStatistics, StatisticsEngine, StatisticsInsertObservation,
         StatisticsRequestContext, StatisticsService, StatisticsStatementResult,
     };
+    use crate::engine::statistics_application::{
+        StatisticsApplicationCommand, StatisticsApplicationError, StatisticsApplicationPort,
+        StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
+        StatisticsTableTarget,
+    };
     use crate::engine::system_catalog::{SystemCatalog, SystemCatalogInputs, SystemTableData};
     use crate::engine::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
     use crate::exec::spill::{SpillConfig, SpillMode};
@@ -5637,6 +5948,67 @@ mod tests {
         let entry = registry.get(catalog).expect("fixture Iceberg catalog");
         crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, rows)
             .expect("insert Iceberg fixture rows");
+    }
+
+    #[derive(Default)]
+    struct RecordingStatisticsApplicationPort {
+        commands: Mutex<Vec<StatisticsApplicationCommand>>,
+    }
+
+    impl RecordingStatisticsApplicationPort {
+        fn commands(&self) -> Vec<StatisticsApplicationCommand> {
+            self.commands.lock().expect("statistics commands").clone()
+        }
+    }
+
+    impl StatisticsApplicationPort for RecordingStatisticsApplicationPort {
+        fn execute(
+            &self,
+            command: StatisticsApplicationCommand,
+        ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
+            self.commands
+                .lock()
+                .expect("statistics commands")
+                .push(command.clone());
+            match command {
+                StatisticsApplicationCommand::AnalyzeTable { target, .. } => Ok(
+                    StatisticsApplicationResult::JobSubmitted(StatisticsJobView {
+                        job_id: uuid::Uuid::nil(),
+                        operation_id: uuid::Uuid::nil(),
+                        state: "SUBMITTED".into(),
+                        attempt: 0,
+                        target,
+                    }),
+                ),
+                StatisticsApplicationCommand::ShowAnalyzeJobs => {
+                    Ok(StatisticsApplicationResult::AnalyzeJobs(vec![
+                        StatisticsJobView {
+                            job_id: uuid::Uuid::nil(),
+                            operation_id: uuid::Uuid::nil(),
+                            state: "SUBMITTED".into(),
+                            attempt: 0,
+                            target: StatisticsTableTarget {
+                                catalog: "ice".into(),
+                                namespace: "analytics".into(),
+                                table: "orders".into(),
+                            },
+                        },
+                    ]))
+                }
+                StatisticsApplicationCommand::CancelAnalyze { .. } => {
+                    Ok(StatisticsApplicationResult::AnalyzeJobs(Vec::new()))
+                }
+                StatisticsApplicationCommand::ShowTableStats { .. } => {
+                    Ok(StatisticsApplicationResult::TableStats(vec![
+                        StatisticsTableStatView {
+                            metric: "row_count".into(),
+                            value: Some("42".into()),
+                            status: "FULL_EXACT".into(),
+                        },
+                    ]))
+                }
+            }
+        }
     }
 
     struct AlwaysUnavailableMvApplicationService;
@@ -10572,6 +10944,49 @@ path = "meta/operations.sqlite"
                AND EXISTS (SELECT 1 FROM t2 WHERE t2.k = t1.k AND t2.v > 100) \
              ORDER BY 1",
             vec![Some(1)],
+        );
+    }
+
+    #[test]
+    fn typed_statistics_statements_use_the_injected_application_port() {
+        let port = Arc::new(RecordingStatisticsApplicationPort::default());
+        let engine = StandaloneNovaRocks::open(
+            StandaloneOptions::default(),
+            test_open_services().with_statistics_application(port.clone()),
+        )
+        .expect("open engine");
+        let session = engine.session();
+
+        session
+            .execute("ANALYZE TABLE ice.analytics.orders (order_id)")
+            .expect("submit typed analyze");
+        let show_stats = session
+            .query("SHOW TABLE STATS ice.analytics.orders")
+            .expect("show typed table stats");
+        assert_eq!(show_stats.columns[0].name, "metric");
+        assert_eq!(show_stats.columns[1].name, "value");
+        assert_eq!(string_cell(&show_stats, 0, 0), "row_count");
+        assert_eq!(string_cell(&show_stats, 0, 1), "42");
+
+        assert_eq!(
+            port.commands(),
+            vec![
+                StatisticsApplicationCommand::AnalyzeTable {
+                    target: StatisticsTableTarget {
+                        catalog: "ice".into(),
+                        namespace: "analytics".into(),
+                        table: "orders".into(),
+                    },
+                    columns: vec!["order_id".into()],
+                },
+                StatisticsApplicationCommand::ShowTableStats {
+                    target: StatisticsTableTarget {
+                        catalog: "ice".into(),
+                        namespace: "analytics".into(),
+                        table: "orders".into(),
+                    },
+                },
+            ]
         );
     }
 }

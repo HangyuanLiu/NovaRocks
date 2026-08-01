@@ -36,6 +36,9 @@ use crate::query_execution::lifecycle::{
 use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::service::QueryExecutionService;
+use crate::query_execution::statistics::{
+    StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
+};
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::planner::distributed::{
@@ -43,6 +46,7 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -591,6 +595,184 @@ fn outcome_factory_rejects_intent_mismatch() {
     );
 }
 
+fn statistics_program() -> crate::query_execution::statistics::StatisticsCollectionProgram {
+    let table = novarocks_spi::connector::ConnectorTableHandle::try_new(
+        novarocks_spi::connector::ConnectorInstanceId::parse("statistics-test")
+            .expect("instance ID"),
+        Bytes::from_static(b"pinned-table"),
+    )
+    .expect("table handle");
+    let data_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
+        Bytes::from_static(b"snapshot-42"),
+    )
+    .expect("data version");
+    let evidence_revision = novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
+        Bytes::from_static(b"collection-42"),
+    )
+    .expect("evidence revision");
+    let metrics = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
+        novarocks_spi::connector::StatisticsMetric::RowCount,
+    ])
+    .expect("metrics");
+    let plan = novarocks_spi::connector::StatisticsCollectionPlan::try_new(
+        table,
+        data_version,
+        evidence_revision,
+        metrics,
+        Vec::new(),
+        Bytes::from_static(b"provider-plan"),
+    )
+    .expect("plan");
+    crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
+        plan,
+        StatisticsExecutionPolicy::try_new(
+            StatisticsExecutionMode::DurableJobAttempt,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("policy"),
+    )
+    .expect("program")
+}
+
+fn statistics_result(
+    program: &crate::query_execution::statistics::StatisticsCollectionProgram,
+    data_version: novarocks_spi::connector::StatisticsDataVersion,
+    metrics: std::collections::BTreeMap<
+        novarocks_spi::connector::StatisticsMetric,
+        novarocks_spi::connector::StatisticsMetricState,
+    >,
+) -> novarocks_spi::connector::StatisticsCollectionResult {
+    novarocks_spi::connector::StatisticsCollectionResult::try_new(
+        novarocks_spi::connector::StatisticsEvidence {
+            data_version,
+            evidence_revision: novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
+                Bytes::from_static(b"evidence-1"),
+            )
+            .expect("revision"),
+            coverage: novarocks_spi::connector::StatisticsCoverage::Full,
+            accuracy: novarocks_spi::connector::StatisticsAccuracy::Exact,
+            interval: None,
+            provenance: novarocks_spi::connector::StatisticsProvenance::VisibleRows,
+            metrics,
+        },
+        program.plan().provider_payload().clone(),
+    )
+    .expect("result")
+}
+
+#[test]
+fn statistics_outcome_is_typed_and_never_carries_query_rows() {
+    let program = statistics_program();
+    let metric = novarocks_spi::connector::StatisticsMetric::RowCount;
+    let result = statistics_result(
+        &program,
+        program.plan().data_version.clone(),
+        std::collections::BTreeMap::from([(
+            metric.clone(),
+            novarocks_spi::connector::StatisticsMetricState::Available(
+                novarocks_spi::connector::StatisticsMetricValue::U64(7),
+            ),
+        )]),
+    );
+
+    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Statistics)
+        .statistics(&program, result)
+        .expect("statistics completion");
+    let collection = outcome
+        .into_statistics()
+        .expect("statistics outcome variant")
+        .into_collection_result();
+    assert_eq!(
+        collection.evidence.metrics.get(&metric),
+        Some(&novarocks_spi::connector::StatisticsMetricState::Available(
+            novarocks_spi::connector::StatisticsMetricValue::U64(7)
+        ))
+    );
+}
+
+#[test]
+fn statistics_sink_rejects_version_drift_and_metric_expansion() {
+    let program = statistics_program();
+    let mut sink = program.result_sink();
+    let drifted_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
+        Bytes::from_static(b"snapshot-43"),
+    )
+    .expect("drifted data version");
+    let drifted = statistics_result(
+        &program,
+        drifted_version,
+        std::collections::BTreeMap::from([(
+            novarocks_spi::connector::StatisticsMetric::RowCount,
+            novarocks_spi::connector::StatisticsMetricState::Available(
+                novarocks_spi::connector::StatisticsMetricValue::U64(7),
+            ),
+        )]),
+    );
+    assert_eq!(
+        sink.accept(drifted)
+            .expect_err("version drift must fail")
+            .kind(),
+        DistributedQueryErrorKind::ContractViolation
+    );
+
+    let expanded = statistics_result(
+        &program,
+        program.plan().data_version.clone(),
+        std::collections::BTreeMap::from([
+            (
+                novarocks_spi::connector::StatisticsMetric::RowCount,
+                novarocks_spi::connector::StatisticsMetricState::Available(
+                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
+                ),
+            ),
+            (
+                novarocks_spi::connector::StatisticsMetric::ThetaNdv {
+                    column: Arc::from("id"),
+                },
+                novarocks_spi::connector::StatisticsMetricState::Available(
+                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
+                ),
+            ),
+        ]),
+    );
+    assert_eq!(
+        sink.accept(expanded)
+            .expect_err("metric expansion must fail")
+            .kind(),
+        DistributedQueryErrorKind::ContractViolation
+    );
+}
+
+#[test]
+fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
+    let policy = StatisticsExecutionPolicy::try_new(
+        StatisticsExecutionMode::DurableJobAttempt,
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .expect("maximum durable policy");
+    assert!(!policy.mode().statement_cancellation_terminates_execution());
+    assert_eq!(
+        policy.attempt_timeout(),
+        std::time::Duration::from_secs(30 * 60)
+    );
+    assert!(
+        StatisticsExecutionPolicy::try_new(
+            StatisticsExecutionMode::DurableJobAttempt,
+            std::time::Duration::from_secs(30 * 60 + 1),
+        )
+        .is_err()
+    );
+    assert!(StatisticsExecutionMode::SynchronousWait.statement_cancellation_terminates_execution());
+}
+
+#[test]
+fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
+    let left = ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("left partial");
+    let right = ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("right partial");
+    let merged = ThetaSketchPartial::try_union([left, right]).expect("two-phase union");
+    assert_eq!(merged.finalize().estimate(), 3.0);
+}
+
 #[test]
 fn write_outcome_preserves_commit_or_abort() {
     let write_id = crate::common::types::UniqueId { hi: 41, lo: 73 };
@@ -759,4 +941,21 @@ fn query_execution_service_uses_explicitly_injected_coordinator() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.intent(), DistributedQueryIntent::Result);
+}
+
+#[test]
+fn generic_request_builder_rejects_statistics_without_a_typed_program() {
+    let (prepared, native_bundle) = real_execution_artifacts();
+    let result = build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        DistributedQueryIntent::Statistics,
+        &test_execution(QueryCancellationSource::new().view()),
+    );
+    let Err(error) = result else {
+        panic!("statistics must use the typed request builder");
+    };
+    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+    assert!(error.message().contains("StatisticsCollectionProgram"));
 }

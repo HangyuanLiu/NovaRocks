@@ -642,6 +642,147 @@ impl ExternalMutationEvidence {
         hasher.update(self.provider_payload.as_ref());
         hasher.finalize().into()
     }
+
+    /// Encodes only operation-specific reconciliation evidence.  This compact
+    /// wire form is deliberately owned by SPI so a durable frontend never
+    /// reimplements connector identity parsing.
+    pub fn try_to_wire_v1(&self) -> Result<Bytes, ConnectorError> {
+        const MAGIC: &[u8; 4] = b"EME1";
+        let provider_id = self.descriptor.provider_id.as_str().as_bytes();
+        let instance_id = self.descriptor.instance_id.as_str().as_bytes();
+        let operation_kind = self.operation_kind.as_bytes();
+        let payload = self.provider_payload.as_ref();
+        let bounded_u16 = |value: &[u8], field: &str| {
+            u16::try_from(value.len()).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    format!("external mutation evidence {field} exceeds wire bound"),
+                )
+            })
+        };
+        let provider_id_len = bounded_u16(provider_id, "provider ID")?;
+        let instance_id_len = bounded_u16(instance_id, "instance ID")?;
+        let operation_kind_len = bounded_u16(operation_kind, "operation kind")?;
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "external mutation evidence payload exceeds wire bound",
+            )
+        })?;
+        let mut encoded = Vec::with_capacity(
+            MAGIC.len()
+                + 2
+                + 2
+                + provider_id.len()
+                + 2
+                + instance_id.len()
+                + 16
+                + 16
+                + 2
+                + operation_kind.len()
+                + 4
+                + payload.len(),
+        );
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&self.schema_version.to_be_bytes());
+        encoded.extend_from_slice(&provider_id_len.to_be_bytes());
+        encoded.extend_from_slice(provider_id);
+        encoded.extend_from_slice(&instance_id_len.to_be_bytes());
+        encoded.extend_from_slice(instance_id);
+        encoded.extend_from_slice(&self.incarnation.to_bytes());
+        encoded.extend_from_slice(&self.operation_id.to_bytes());
+        encoded.extend_from_slice(&operation_kind_len.to_be_bytes());
+        encoded.extend_from_slice(operation_kind);
+        encoded.extend_from_slice(&payload_len.to_be_bytes());
+        encoded.extend_from_slice(payload);
+        Ok(Bytes::from(encoded))
+    }
+
+    pub fn try_from_wire_v1(bytes: &[u8]) -> Result<Self, ConnectorError> {
+        const MAGIC: &[u8; 4] = b"EME1";
+        let mut offset = 0usize;
+        let read = |offset: &mut usize, len: usize| -> Result<&[u8], ConnectorError> {
+            let end = offset.checked_add(len).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "external mutation evidence wire overflow",
+                )
+            })?;
+            let slice = bytes.get(*offset..end).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "truncated external mutation evidence wire",
+                )
+            })?;
+            *offset = end;
+            Ok(slice)
+        };
+        if read(&mut offset, MAGIC.len())? != MAGIC {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "unsupported external mutation evidence wire version",
+            ));
+        }
+        let read_u16 = |offset: &mut usize| -> Result<u16, ConnectorError> {
+            let raw = read(offset, 2)?;
+            Ok(u16::from_be_bytes([raw[0], raw[1]]))
+        };
+        let schema_version = read_u16(&mut offset)?;
+        let provider_id_len = read_u16(&mut offset)? as usize;
+        let provider_id =
+            std::str::from_utf8(read(&mut offset, provider_id_len)?).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "external mutation evidence provider ID is not UTF-8",
+                )
+            })?;
+        let instance_id_len = read_u16(&mut offset)? as usize;
+        let instance_id =
+            std::str::from_utf8(read(&mut offset, instance_id_len)?).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "external mutation evidence instance ID is not UTF-8",
+                )
+            })?;
+        let incarnation: [u8; 16] = read(&mut offset, 16)?
+            .try_into()
+            .expect("fixed-width evidence incarnation");
+        let operation_id: [u8; 16] = read(&mut offset, 16)?
+            .try_into()
+            .expect("fixed-width evidence operation ID");
+        let operation_kind_len = read_u16(&mut offset)? as usize;
+        let operation_kind =
+            std::str::from_utf8(read(&mut offset, operation_kind_len)?).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "external mutation evidence operation kind is not UTF-8",
+                )
+            })?;
+        let payload_len_raw = read(&mut offset, 4)?;
+        let payload_len = u32::from_be_bytes(
+            payload_len_raw
+                .try_into()
+                .expect("fixed-width evidence payload length"),
+        ) as usize;
+        let payload = read(&mut offset, payload_len)?;
+        if offset != bytes.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "external mutation evidence wire has trailing bytes",
+            ));
+        }
+        Self::try_new(
+            schema_version,
+            ConnectorInstanceDescriptor {
+                provider_id: super::ConnectorProviderId::parse(provider_id)?,
+                instance_id: ConnectorInstanceId::parse(instance_id)?,
+            },
+            ConnectorInstanceIncarnation::from_bytes(incarnation),
+            ConnectorMutationOperationId::from_bytes(operation_id),
+            operation_kind,
+            Bytes::copy_from_slice(payload),
+        )
+    }
 }
 
 impl fmt::Debug for ExternalMutationEvidence {
@@ -822,5 +963,52 @@ impl Drop for MutationLeaseRelease {
         if let Some(release) = release.take() {
             release();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{ConnectorMutationOperationId, ExternalMutationEvidence};
+    use crate::connector::{
+        ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorProviderId,
+    };
+
+    fn evidence() -> ExternalMutationEvidence {
+        ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("analytics").expect("instance ID"),
+            },
+            ConnectorInstanceIncarnation::new(),
+            ConnectorMutationOperationId::new(),
+            "statistics-publish",
+            Bytes::from_static(b"operation-specific-evidence"),
+        )
+        .expect("evidence")
+    }
+
+    #[test]
+    fn external_mutation_evidence_wire_round_trips_exactly() {
+        let evidence = evidence();
+        let wire = evidence.try_to_wire_v1().expect("encode evidence");
+        let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).expect("decode evidence");
+        assert_eq!(decoded, evidence);
+        assert_eq!(decoded.digest(), evidence.digest());
+    }
+
+    #[test]
+    fn external_mutation_evidence_wire_rejects_trailing_data() {
+        let mut wire = evidence()
+            .try_to_wire_v1()
+            .expect("encode evidence")
+            .to_vec();
+        wire.push(0);
+        let error = ExternalMutationEvidence::try_from_wire_v1(&wire)
+            .expect_err("trailing bytes must not be accepted");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 }

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_catalog::schema::SqlType;
 use novarocks_fs::{
@@ -36,21 +36,29 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorControlBinding,
-    ConnectorDataType, ConnectorDefaultValue, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReadSelector, ConnectorRefreshPublicationGuard, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
-    ConnectorStaticPredicateLiteral, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy,
-    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, normalize_predicate_dispositions, validate_static_predicates,
+    ConnectorDataType, ConnectorDefaultValue, ConnectorDropTableDataDisposition, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionInstaller,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector,
+    ConnectorRefreshPublicationGuard, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
+    ConnectorStaticPredicateDataType, ConnectorStaticPredicateKind,
+    ConnectorStaticPredicateLiteral, ConnectorStatistics, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest, ConnectorTableResolution, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
+    StatisticsReconcileRequest, StatisticsScanColumn, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,6 +77,8 @@ use super::scan_model::{
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::RegisteredIcebergWriteControlBackend;
+use crate::connector::stats::TableStatsProvider;
+use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
@@ -82,11 +92,107 @@ const MAX_CACHED_SNAPSHOT_MEMBERSHIPS: usize = 64;
 const ICEBERG_DECLARATION_V1: u16 = 1;
 const DEFAULT_ACCESS_BINDING: &str = "default";
 const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
+const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
+const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
 /// Compat has no NovaRocks catalog instance identity on the wire.  Its
 /// read-only Iceberg binding is therefore composed once per BE process, not
 /// synthesized for each query or inferred from an HDFS path.
 pub const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
 const COMPAT_ICEBERG_INCARNATION: [u8; 16] = [0; 16];
+
+fn statistics_data_version(
+    table_uuid: &str,
+    snapshot_id: Option<i64>,
+) -> Result<StatisticsDataVersion, ConnectorError> {
+    StatisticsDataVersion::try_new(Bytes::from(format!(
+        "iceberg/v1/{table_uuid}/{}",
+        snapshot_id
+            .map(|snapshot| snapshot.to_string())
+            .unwrap_or_else(|| "empty".to_string())
+    )))
+}
+
+fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
+    match metric {
+        StatisticsMetric::RowCount => None,
+        StatisticsMetric::NullCount { column }
+        | StatisticsMetric::Minimum { column }
+        | StatisticsMetric::Maximum { column }
+        | StatisticsMetric::AverageSize { column }
+        | StatisticsMetric::ThetaNdv { column } => Some(column),
+    }
+}
+
+/// Build the physical layout from the metadata serialized into the resolved
+/// table handle.  In particular, this must not call `load_table`: durable
+/// ANALYZE consumes the original snapshot/schema pin even if latest metadata
+/// has advanced while a job was waiting for its worker lease.
+fn statistics_scan_layout(
+    table: &TablePayload,
+    projection: &[usize],
+) -> Result<Vec<StatisticsScanColumn>, ConnectorError> {
+    let table_info = table.table_info.as_ref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg statistics collection requires a resolved base table payload",
+        )
+    })?;
+    let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg statistics collection payload is missing serialized pinned metadata",
+        )
+    })?;
+    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized).map_err(|e| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("decode pinned Iceberg statistics metadata: {e}"),
+        )
+    })?;
+    if metadata.current_schema_id() != table_info.schema_id {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg statistics collection metadata does not match its pinned schema ID",
+        ));
+    }
+    let schema =
+        iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).map_err(|e| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("convert pinned Iceberg statistics schema to Arrow: {e}"),
+            )
+        })?;
+    projection
+        .iter()
+        .map(|&ordinal| {
+            let field = schema.fields().get(ordinal).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "Iceberg statistics metric projection index {ordinal} is outside the pinned schema"
+                    ),
+                )
+            })?;
+            // Arrow field metadata can carry provider implementation details;
+            // the cross-layer statistics layout intentionally retains only the
+            // typed scan contract needed by the internal sink.
+            let data_type = match table
+                .logical_type_columns
+                .get(&field.name().to_ascii_lowercase())
+                .map(String::as_str)
+            {
+                Some("bitmap") | Some("hll") => DataType::Binary,
+                _ => field.data_type().clone(),
+            };
+            StatisticsScanColumn::try_new(
+                ordinal,
+                Arc::<str>::from(field.name().as_str()),
+                data_type,
+                field.is_nullable(),
+            )
+        })
+        .collect()
+}
 
 /// Provider-owned, secret-free declaration used to install an Iceberg read
 /// instance into a BE.  Catalog clients and credentials deliberately do not
@@ -597,6 +703,19 @@ struct IcebergMutationEvidenceV1 {
     target: IcebergMutationEvidenceTarget,
 }
 
+/// Minimal, secret-free proof needed to determine whether an uncertain Puffin
+/// publication reached the catalog.  The operation-specific path is both the
+/// idempotency key and the orphan-cleanup target; it is never a replacement
+/// statistics authority.
+#[derive(Deserialize, Serialize)]
+struct IcebergStatisticsEvidenceV1 {
+    version: u16,
+    namespace: String,
+    table: String,
+    data_version: Vec<u8>,
+    statistics_path: String,
+}
+
 #[derive(Deserialize, Serialize)]
 enum IcebergMutationEvidenceTarget {
     Namespace {
@@ -674,7 +793,7 @@ impl IcebergControlProvider {
             write_key,
             Arc::new(RegisteredIcebergWriteControlBackend::new(services)),
         )?);
-        ConnectorControlBinding::try_new_with_write(
+        ConnectorControlBinding::try_new_with_capabilities(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -683,8 +802,9 @@ impl IcebergControlProvider {
                 descriptor,
                 incarnation,
             }),
-            Some(provider),
+            Some(provider.clone()),
             Some(write),
+            Some(provider),
         )
     }
 
@@ -1046,6 +1166,53 @@ impl IcebergControlProvider {
         )
     }
 
+    fn statistics_evidence(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        table: &TablePayload,
+        data_version: &StatisticsDataVersion,
+        statistics_path: &str,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        let payload = serde_json::to_vec(&IcebergStatisticsEvidenceV1 {
+            version: ICEBERG_STATISTICS_EVIDENCE_VERSION,
+            namespace: table.namespace.clone(),
+            table: table.table.clone(),
+            data_version: data_version.as_bytes().to_vec(),
+            statistics_path: statistics_path.to_string(),
+        })
+        .map_err(|error| internal(format!("encode Iceberg statistics evidence: {error}")))?;
+        ExternalMutationEvidence::try_new(
+            ICEBERG_STATISTICS_EVIDENCE_VERSION,
+            self.descriptor.clone(),
+            self.incarnation,
+            operation_id,
+            ICEBERG_STATISTICS_OPERATION_KIND,
+            Bytes::from(payload),
+        )
+    }
+
+    fn statistics_receipt(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        data_version: StatisticsDataVersion,
+        evidence_revision: StatisticsEvidenceRevision,
+        provider_payload: Bytes,
+        effect: ExternalMutationEffect,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt: StatisticsReceipt::try_new(
+                self.descriptor.clone(),
+                self.incarnation,
+                operation_id,
+                data_version,
+                evidence_revision,
+                provider_payload,
+            )?,
+            finalization: ExternalMutationFinalization::Complete,
+        })
+    }
+
     fn table_payload(&self, table: &ConnectorTableHandle) -> Result<TablePayload, ConnectorError> {
         ensure_owner(table.owner(), &self.instance_id)?;
         decode_payload(table.payload(), "table handle")
@@ -1315,7 +1482,11 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         Err(error) => Err(error),
                     }
                 }
-                ConnectorCatalogMutationOperation::DropTable { table, policy, .. } => {
+                ConnectorCatalogMutationOperation::DropTable {
+                    table,
+                    policy,
+                    data_disposition,
+                } => {
                     if table.instance_id != self.instance_id {
                         return Err(ConnectorError::new(
                             ConnectorErrorKind::InvalidRequest,
@@ -1331,7 +1502,23 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                             .map(|loaded| loaded.is_some());
                     match existing {
                         Ok(false) if policy == DropPolicy::NoOpIfMissing => {
-                            Ok(ExternalMutationEffect::NoOp)
+                            if data_disposition == ConnectorDropTableDataDisposition::Purge {
+                                super::catalog::registry::purge_orphan_s3_table_prefix(
+                                    &entry,
+                                    &table.namespace,
+                                    &table.table,
+                                )
+                                .map(|purged| {
+                                    if purged {
+                                        ExternalMutationEffect::Applied
+                                    } else {
+                                        ExternalMutationEffect::NoOp
+                                    }
+                                })
+                                .map_err(map_iceberg_error)
+                            } else {
+                                Ok(ExternalMutationEffect::NoOp)
+                            }
                         }
                         Ok(false) => Err(ConnectorError::new(
                             ConnectorErrorKind::NotFound,
@@ -1641,6 +1828,17 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
 fn known_uncommitted(
     error: ConnectorError,
 ) -> ExternalMutationOutcome<ConnectorCatalogMutationReceipt> {
+    ExternalMutationOutcome::KnownUncommitted {
+        failure: ConnectorMutationFailure::new(
+            mutation_failure_kind(error.kind()),
+            error.to_string(),
+        ),
+    }
+}
+
+fn statistics_known_uncommitted(
+    error: ConnectorError,
+) -> ExternalMutationOutcome<StatisticsReceipt> {
     ExternalMutationOutcome::KnownUncommitted {
         failure: ConnectorMutationFailure::new(
             mutation_failure_kind(error.kind()),
@@ -2654,6 +2852,10 @@ impl ConnectorMetadata for IcebergControlProvider {
         let version = Some(Bytes::copy_from_slice(
             &loaded.table.metadata().current_schema_id().to_le_bytes(),
         ));
+        let statistics_data_version = statistics_data_version(
+            &loaded.table.metadata().uuid().to_string(),
+            loaded.table.metadata().current_snapshot_id(),
+        )?;
         let table = build_table_payload(
             &entry,
             self.instance_id.as_str(),
@@ -2670,6 +2872,7 @@ impl ConnectorMetadata for IcebergControlProvider {
             },
             schema,
             version,
+            statistics_data_version: Some(statistics_data_version),
             table: ConnectorTableHandle::try_new(
                 self.instance_id.clone(),
                 encode_payload(
@@ -2680,6 +2883,652 @@ impl ConnectorMetadata for IcebergControlProvider {
             )?,
         })
     }
+}
+
+impl StatisticsReader for IcebergControlProvider {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn read_statistics(
+        &self,
+        request: StatisticsReadRequest,
+    ) -> Result<StatisticsEvidence, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics require a resolved base table payload",
+            )
+        })?;
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics request data version does not match its resolved table pin",
+            ));
+        }
+
+        let snapshot_id = table_info.current_snapshot_id.ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "Iceberg table has no current snapshot for statistics",
+            )
+        })?;
+        let legacy = super::stats::IcebergTableStatsProvider::new(Arc::clone(&self.registry));
+        let base = legacy
+            .estimate_table_statistics(&crate::connector::stats::TableStatsRequest {
+                catalog: Some(self.instance_id.as_str().to_string()),
+                database: table.namespace.clone(),
+                table: table.table.clone(),
+                source: crate::connector::stats::ScanSourceIdentity::IcebergTable {
+                    catalog: self.instance_id.as_str().to_string(),
+                    namespace: table.namespace.clone(),
+                    table: table.table.clone(),
+                },
+                snapshot: Some(crate::connector::stats::TableSnapshotRef::SnapshotId(
+                    snapshot_id,
+                )),
+            })
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("read Iceberg statistics: {error:?}"),
+                )
+            })?;
+        // A metadata-only `update_statistics` leaves the Iceberg snapshot (and
+        // therefore the data-version) unchanged.  Its registered Puffin path
+        // is nevertheless a new immutable evidence revision, so derive the
+        // resolver-cache key from it rather than from the snapshot alone.
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table changed while its statistics evidence was loading",
+            ));
+        }
+        // A manifest summary is authoritative only when it describes every
+        // live data file and no delete file can change the visible row set.
+        // `read_pinned_table_statistics` deliberately exposes only data-file
+        // metrics to the optimizer, so retain the raw file set here to prove
+        // that this is an append-only snapshot before upgrading its evidence.
+        let manifest_files = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
+            .map_err(map_iceberg_error)?;
+        let manifest_is_complete = manifest_evidence_is_complete(&base.row_count, &manifest_files);
+        let evidence_path = metadata
+            .statistics_for_snapshot(snapshot_id)
+            .map(|statistics| statistics.statistics_path.as_str())
+            .unwrap_or("none");
+
+        let mut metrics = BTreeMap::new();
+        for metric in request.metrics.metrics() {
+            let state = match metric {
+                StatisticsMetric::RowCount => metric_state_u64(&base.row_count),
+                StatisticsMetric::NullCount { column } => {
+                    manifest_null_count(&manifest_files, column)
+                }
+                StatisticsMetric::Minimum { column } => base
+                    .columns
+                    .get(column.as_ref())
+                    .map(|statistics| metric_state_f64(&statistics.min_value))
+                    .unwrap_or_else(|| missing_column(column)),
+                StatisticsMetric::Maximum { column } => base
+                    .columns
+                    .get(column.as_ref())
+                    .map(|statistics| metric_state_f64(&statistics.max_value))
+                    .unwrap_or_else(|| missing_column(column)),
+                StatisticsMetric::AverageSize { column } => base
+                    .columns
+                    .get(column.as_ref())
+                    .map(|statistics| metric_state_f64(&statistics.average_row_size))
+                    .unwrap_or_else(|| missing_column(column)),
+                StatisticsMetric::ThetaNdv { column } => base
+                    .columns
+                    .get(column.as_ref())
+                    .map(|statistics| metric_state_f64(&statistics.ndv))
+                    .unwrap_or_else(|| missing_column(column)),
+            };
+            metrics.insert(metric.clone(), state);
+        }
+        let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+            "iceberg/v1/{}/{snapshot_id}/{evidence_path}",
+            table_info
+                .table_uuid
+                .as_deref()
+                .expect("table UUID checked above"),
+        )))?;
+        Ok(StatisticsEvidence {
+            data_version: expected_data_version,
+            evidence_revision,
+            // Do not infer exactness from a manifest in the presence of
+            // deletes. For an append-only snapshot, the manifest list is the
+            // complete visible data-file set and its record counts are exact.
+            coverage: if manifest_is_complete {
+                StatisticsCoverage::Full
+            } else {
+                StatisticsCoverage::Subset
+            },
+            accuracy: if manifest_is_complete {
+                StatisticsAccuracy::Exact
+            } else {
+                StatisticsAccuracy::Approximate
+            },
+            interval: None,
+            provenance: StatisticsProvenance::Manifest,
+            metrics,
+        })
+    }
+}
+
+impl StatisticsCollection for IcebergControlProvider {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn prepare_collection(
+        &self,
+        request: StatisticsCollectionRequest,
+    ) -> Result<StatisticsCollectionPlan, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics collection requires a resolved base table payload",
+            )
+        })?;
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics collection request does not match its resolved table pin",
+            ));
+        }
+        let mut scan_projection = request
+            .metrics
+            .metrics()
+            .iter()
+            .filter_map(statistics_metric_column)
+            .map(|column| {
+                table_info
+                    .schema
+                    .fields
+                    .iter()
+                    .position(|field| field.name.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            format!(
+                                "Iceberg statistics metric column `{column}` is absent from the resolved schema"
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scan_projection.sort_unstable();
+        scan_projection.dedup();
+        // The opaque payload is the provider's resolved table envelope. Core
+        // may compile normal distributed scans from it but cannot reinterpret
+        // catalog credentials or re-resolve latest metadata.
+        let provider_payload = request.table.payload().clone();
+        let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+            "iceberg/v1/{}/{}/collection/{}",
+            table_info
+                .table_uuid
+                .as_deref()
+                .expect("table UUID checked above"),
+            table_info.current_snapshot_id.unwrap_or_default(),
+            uuid::Uuid::from_bytes(request.operation_id.to_bytes()),
+        )))?;
+        let scan_columns = statistics_scan_layout(&table, &scan_projection)?;
+        StatisticsCollectionPlan::try_new(
+            request.table,
+            request.data_version,
+            evidence_revision,
+            request.metrics,
+            scan_columns,
+            provider_payload,
+        )
+    }
+
+    fn prepare_publish(
+        &self,
+        request: StatisticsPublishPreparationRequest,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let table_info = table.table_info.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication requires a resolved base table payload",
+            )
+        })?;
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.result.evidence.data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication does not match its resolved table pin",
+            ));
+        }
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table changed after statistics collection; recompute before publishing",
+            ));
+        }
+        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cannot publish Iceberg statistics for a table without a snapshot",
+            )
+        })?;
+        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
+            metadata,
+            snapshot_id,
+            request.operation_id.to_bytes(),
+        );
+        self.statistics_evidence(
+            request.operation_id,
+            &table,
+            &expected_data_version,
+            &statistics_path,
+        )
+    }
+
+    fn publish_statistics(
+        &self,
+        request: StatisticsPublishRequest,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let table = self.table_payload(&request.table)?;
+        let Some(table_info) = table.table_info.as_ref() else {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication requires a resolved base table payload",
+            )));
+        };
+        let expected_data_version = statistics_data_version(
+            table_info.table_uuid.as_deref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg table payload is missing its table UUID",
+                )
+            })?,
+            table_info.current_snapshot_id,
+        )?;
+        if request.result.evidence.data_version != expected_data_version {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication does not match its resolved table pin",
+            )));
+        }
+        if request.result.evidence.coverage != StatisticsCoverage::Full
+            || request.result.evidence.accuracy != StatisticsAccuracy::Exact
+            || request.result.evidence.provenance != StatisticsProvenance::VisibleRows
+        {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication requires Full Exact visible-row evidence",
+            )));
+        }
+        let (artifact_version, theta) =
+            crate::query_execution::statistics::decode_visible_row_artifact(
+                request.result.provider_payload(),
+            )
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("decode Core statistics artifact: {error}"),
+                )
+            })?;
+        if artifact_version != expected_data_version {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Core statistics artifact does not match its resolved table pin",
+            )));
+        }
+        if theta.is_empty() {
+            return self.statistics_receipt(
+                request.operation_id,
+                expected_data_version,
+                request.result.evidence.evidence_revision,
+                Bytes::new(),
+                ExternalMutationEffect::NoOp,
+            );
+        }
+
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_table(&entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table changed after statistics collection; recompute before publishing",
+            )));
+        }
+        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cannot publish Iceberg statistics for a table without a snapshot",
+            )
+        })?;
+        let sequence_number = metadata
+            .current_snapshot()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "cannot publish Iceberg statistics for a table without a current snapshot",
+                )
+            })?
+            .sequence_number();
+        let field_ids = metadata
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| (field.name.to_ascii_lowercase(), field.id))
+            .collect::<HashMap<_, _>>();
+        let mut sketches = HashMap::new();
+        for (column, partial) in theta {
+            let field_id = field_ids.get(&column.to_ascii_lowercase()).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("statistics artifact column `{column}` is absent from the pinned Iceberg schema"),
+                )
+            })?;
+            let (lg_k, theta, hashes) = partial.compact_parts();
+            let sketch =
+                super::theta_sketch::ThetaSketchHandle::from_compact_parts(lg_k, theta, hashes)
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+            sketches.insert(*field_id, sketch);
+        }
+        let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
+            metadata,
+            snapshot_id,
+            request.operation_id.to_bytes(),
+        );
+        let expected_evidence = self.statistics_evidence(
+            request.operation_id,
+            &table,
+            &expected_data_version,
+            &statistics_path,
+        )?;
+        if request.evidence != expected_evidence {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg statistics publication evidence does not match its pinned operation",
+            )));
+        }
+        let written =
+            super::catalog::registry::block_on_iceberg(super::stats_assembler::write_puffin(
+                loaded.table.file_io(),
+                &statistics_path,
+                snapshot_id,
+                sequence_number,
+                &sketches,
+            ))
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("write Iceberg statistics runtime: {error}"),
+                )
+            })?
+            .map_err(map_iceberg_error)?;
+        let Some(statistics_file) = written else {
+            return self.statistics_receipt(
+                request.operation_id,
+                expected_data_version,
+                request.result.evidence.evidence_revision,
+                Bytes::from(statistics_path),
+                ExternalMutationEffect::NoOp,
+            );
+        };
+        let catalog =
+            super::catalog::registry::build_iceberg_catalog(&entry).map_err(map_iceberg_error)?;
+        match super::catalog::registry::block_on_iceberg(
+            super::commit::statistics::commit_statistics_file(
+                &loaded.table,
+                catalog.as_ref(),
+                statistics_file,
+            ),
+        ) {
+            Ok(Ok(())) => {
+                // A statistics-only Iceberg commit changes metadata but not
+                // the snapshot pin.  Invalidate the catalog cache so a
+                // subsequent SHOW/optimizer read observes the newly
+                // registered Puffin rather than a stale metadata envelope.
+                entry.invalidate_table_cache(&table.namespace, &table.table);
+                self.statistics_receipt(
+                    request.operation_id,
+                    expected_data_version,
+                    request.result.evidence.evidence_revision,
+                    Bytes::from(statistics_path),
+                    ExternalMutationEffect::Applied,
+                )
+            }
+            Ok(Err(error)) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    format!("commit Iceberg statistics: {error}"),
+                ),
+                evidence: request.evidence,
+            }),
+            Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Internal,
+                    format!("commit Iceberg statistics runtime: {error}"),
+                ),
+                evidence: request.evidence,
+            }),
+        }
+    }
+
+    fn reconcile_statistics(
+        &self,
+        request: StatisticsReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        let evidence: IcebergStatisticsEvidenceV1 =
+            serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("decode Iceberg statistics evidence: {error}"),
+                )
+            })?;
+        if request.evidence.schema_version() != ICEBERG_STATISTICS_EVIDENCE_VERSION
+            || evidence.version != ICEBERG_STATISTICS_EVIDENCE_VERSION
+            || request.evidence.operation_kind() != ICEBERG_STATISTICS_OPERATION_KIND
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "unsupported Iceberg statistics reconciliation evidence",
+            ));
+        }
+        let expected_data_version =
+            StatisticsDataVersion::try_new(Bytes::from(evidence.data_version))?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded =
+            load_existing_table_for_reconcile(&entry, &evidence.namespace, &evidence.table)?;
+        let Some(loaded) = loaded else {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "Iceberg table disappeared before statistics publication reconciled",
+            )));
+        };
+        let metadata = loaded.table.metadata();
+        let current_data_version =
+            statistics_data_version(&metadata.uuid().to_string(), metadata.current_snapshot_id())?;
+        if current_data_version != expected_data_version {
+            return Ok(statistics_known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg table version changed before statistics publication could be reconciled",
+            )));
+        }
+        let path_is_registered = metadata
+            .statistics_iter()
+            .any(|file| file.statistics_path == evidence.statistics_path);
+        if path_is_registered {
+            return self.statistics_receipt(
+                request.evidence.operation_id(),
+                expected_data_version,
+                StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+                    "iceberg/statistics/v1/{}",
+                    evidence.statistics_path
+                )))?,
+                Bytes::from(evidence.statistics_path),
+                ExternalMutationEffect::Applied,
+            );
+        }
+        Ok(statistics_known_uncommitted(ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "Iceberg statistics artifact is not registered in table metadata",
+        )))
+    }
+}
+
+impl ConnectorStatistics for IcebergControlProvider {
+    fn collection(&self) -> Option<&dyn StatisticsCollection> {
+        Some(self)
+    }
+}
+
+fn metric_state_u64(value: &StatValue<u64>) -> StatisticsMetricState {
+    match value {
+        StatValue::Known { value, .. } => {
+            StatisticsMetricState::Available(StatisticsMetricValue::U64(*value))
+        }
+        StatValue::Missing { reason } => metric_missing(reason),
+    }
+}
+
+fn metric_state_f64(value: &StatValue<f64>) -> StatisticsMetricState {
+    match value {
+        StatValue::Known { value, .. } => {
+            StatisticsMetricState::Available(StatisticsMetricValue::F64(*value))
+        }
+        StatValue::Missing { reason } => metric_missing(reason),
+    }
+}
+
+/// Return a null count only when every live data file reports one. This keeps
+/// the manifest fast path exact without reconstructing a count from a lossy
+/// floating-point null fraction.
+fn manifest_null_count(
+    files: &[super::catalog::registry::DataFileWithStats],
+    column: &str,
+) -> StatisticsMetricState {
+    let total = files.iter().try_fold(0_u64, |total, file| {
+        let count = file
+            .column_stats
+            .as_ref()?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(column))?
+            .1
+            .null_count?;
+        let count = u64::try_from(count).ok()?;
+        total.checked_add(count)
+    });
+    match total {
+        Some(total) => StatisticsMetricState::Available(StatisticsMetricValue::U64(total)),
+        None => StatisticsMetricState::Missing(StatisticsMissing {
+            kind: StatisticsMissingKind::IncompleteEvidence,
+            message: Arc::from(format!(
+                "Iceberg manifest does not report an exact null count for `{column}`"
+            )),
+        }),
+    }
+}
+
+fn manifest_evidence_is_complete(
+    row_count: &StatValue<u64>,
+    files: &[super::catalog::registry::DataFileWithStats],
+) -> bool {
+    matches!(row_count, StatValue::Known { .. })
+        && files.iter().all(|file| file.delete_files.is_empty())
+}
+
+fn missing_column(column: &str) -> StatisticsMetricState {
+    StatisticsMetricState::Missing(StatisticsMissing {
+        kind: StatisticsMissingKind::NotCollected,
+        message: Arc::from(format!(
+            "statistics for column `{column}` are not collected"
+        )),
+    })
+}
+
+fn metric_missing(reason: &StatsMissingReason) -> StatisticsMetricState {
+    let (kind, message) = match reason {
+        StatsMissingReason::NoCurrentSnapshot | StatsMissingReason::NoDataFiles => (
+            StatisticsMissingKind::NotAvailableForVersion,
+            format!("{reason:?}"),
+        ),
+        StatsMissingReason::StatsFileMissing => {
+            (StatisticsMissingKind::NotCollected, format!("{reason:?}"))
+        }
+        StatsMissingReason::ManifestMissingRowCount | StatsMissingReason::ColumnNotReported(_) => (
+            StatisticsMissingKind::IncompleteEvidence,
+            format!("{reason:?}"),
+        ),
+        StatsMissingReason::ConnectorUnsupported(_) => (
+            StatisticsMissingKind::UnsupportedMetric,
+            format!("{reason:?}"),
+        ),
+        StatsMissingReason::CatalogLoadError(_) => (
+            StatisticsMissingKind::CorruptArtifact,
+            format!("{reason:?}"),
+        ),
+    };
+    StatisticsMetricState::Missing(StatisticsMissing {
+        kind,
+        message: Arc::from(message),
+    })
 }
 
 impl ConnectorScanPlanning for IcebergControlProvider {
@@ -2700,6 +3549,17 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?;
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
             (None, None)
+        } else if matches!(request.selector, ConnectorReadSelector::Current) {
+            let table_info = table.table_info.as_ref().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg current scan is missing its resolved table pin",
+                )
+            })?;
+            (
+                table_info.current_snapshot_id,
+                table_info.table_uuid.clone(),
+            )
         } else {
             let (snapshot_id, table_uuid) =
                 self.select_snapshot(&entry, &table, request.selector)?;
@@ -3703,6 +4563,11 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         // (and ordinary CREATE) into an internal error before dispatch.
         || normalized.contains("unknown table")
         || normalized.contains("no metadata files")
+        // The local Hadoop catalog uses this normalized absence error when
+        // probing a table's metadata directory.  Catalog mutations perform
+        // that probe before CREATE TABLE, so it must retain NotFound semantics
+        // rather than being surfaced as an internal failure.
+        || normalized.contains("unknown table:")
     {
         ConnectorErrorKind::NotFound
     } else if normalized.contains("format-version 3")
@@ -3718,6 +4583,7 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         || normalized.contains("format-version is reserved")
         || normalized.contains("iceberg internal metadata key")
         || normalized.contains("novarocks.* namespace is reserved")
+        || normalized.contains("variant columns cannot appear in the partition spec")
     {
         // These are local Iceberg semantic rejections, before any catalog
         // commit can have been dispatched.  Keeping them out of the unknown
@@ -3810,6 +4676,125 @@ mod tests {
         .expect("connector request context")
     }
 
+    #[test]
+    fn local_unknown_table_error_is_not_found() {
+        let error = map_iceberg_error("unknown table: analytics.orders".to_string());
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn local_schema_and_property_validation_errors_are_invalid_requests() {
+        for message in [
+            "ADD COLUMN parent path must point to a STRUCT (LIST element is not a STRUCT)",
+            "decimal precision must strictly increase (current decimal(20,2), new decimal(20,2))",
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): `current-schema-id`: Iceberg internal metadata key, not user-settable",
+            "ALTER TABLE TBLPROPERTIES rejected reserved key(s): `novarocks.x`: novarocks.* namespace is reserved for engine-owned properties",
+        ] {
+            assert_eq!(
+                map_iceberg_error(message.to_string()).kind(),
+                ConnectorErrorKind::InvalidRequest,
+                "{message}"
+            );
+        }
+    }
+
+    fn data_file_with_column_null_count(
+        column: &str,
+        null_count: Option<i64>,
+    ) -> crate::connector::iceberg::catalog::registry::DataFileWithStats {
+        crate::connector::iceberg::catalog::registry::DataFileWithStats {
+            path: "file:///tmp/table/data.parquet".to_string(),
+            size: 12,
+            record_count: Some(4),
+            column_stats: Some(HashMap::from([(
+                column.to_string(),
+                crate::connector::iceberg::scan_model::IcebergColumnStats {
+                    null_count,
+                    value_count: Some(4),
+                    column_size: Some(32),
+                    lower_bound: None,
+                    upper_bound: None,
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            partition_values: None,
+            manifest_path: None,
+            partition_field_values: Vec::new(),
+            first_row_id: None,
+            data_sequence_number: None,
+            delete_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn manifest_null_count_requires_complete_per_file_evidence() {
+        let files = vec![
+            data_file_with_column_null_count("value", Some(1)),
+            data_file_with_column_null_count("VALUE", Some(2)),
+        ];
+        assert!(matches!(
+            manifest_null_count(&files, "value"),
+            StatisticsMetricState::Available(StatisticsMetricValue::U64(3))
+        ));
+
+        let incomplete = vec![
+            data_file_with_column_null_count("value", Some(1)),
+            data_file_with_column_null_count("value", None),
+        ];
+        assert!(matches!(
+            manifest_null_count(&incomplete, "value"),
+            StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::IncompleteEvidence,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_evidence_requires_known_rows_and_no_delete_files() {
+        let files = vec![data_file_with_column_null_count("value", Some(0))];
+        assert!(manifest_evidence_is_complete(
+            &StatValue::known(
+                4,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                crate::sql::optimizer::stats_input::StatsSource::IcebergManifest,
+            ),
+            &files
+        ));
+        assert!(!manifest_evidence_is_complete(
+            &StatValue::missing(StatsMissingReason::ManifestMissingRowCount),
+            &files
+        ));
+
+        let mut files_with_delete = files;
+        files_with_delete[0].delete_files.push(
+            crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+                path: "file:///tmp/table/delete.parquet".to_string(),
+                file_format:
+                    crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+                file_content:
+                    crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position,
+                length: Some(4),
+                content_offset: None,
+                content_size_in_bytes: None,
+                sequence_number: None,
+                partition_spec_id: None,
+                partition_key: None,
+                equality_column_names: Vec::new(),
+                equality_field_ids: Vec::new(),
+            },
+        );
+        assert!(!manifest_evidence_is_complete(
+            &StatValue::known(
+                4,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                crate::sql::optimizer::stats_input::StatsSource::IcebergManifest,
+            ),
+            &files_with_delete
+        ));
+    }
+
     fn mutation_provider_without_catalog() -> IcebergControlProvider {
         let instance_id = ConnectorInstanceId::parse("ice.test").expect("instance ID");
         IcebergControlProvider {
@@ -3864,8 +4849,14 @@ mod tests {
             )
             .expect("evidence does not require a catalog access");
         assert_eq!(evidence.schema_version(), ICEBERG_MUTATION_EVIDENCE_VERSION);
-        assert_eq!(evidence.descriptor(), provider.descriptor());
-        assert_eq!(evidence.incarnation(), provider.incarnation());
+        assert_eq!(
+            evidence.descriptor(),
+            novarocks_spi::connector::ConnectorCatalogMutation::descriptor(&provider)
+        );
+        assert_eq!(
+            evidence.incarnation(),
+            novarocks_spi::connector::ConnectorCatalogMutation::incarnation(&provider)
+        );
         assert_eq!(evidence.operation_id(), operation_id);
         assert_eq!(evidence.operation_kind(), "create-namespace");
         assert!(format!("{evidence:?}").contains("provider_payload_len"));
