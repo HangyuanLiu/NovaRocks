@@ -39,7 +39,7 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
@@ -100,13 +100,13 @@ impl NativeFragmentQueryRuntime {
             query_expire,
         )?;
         let runtime_filter = if has_runtime_filter_bindings {
-            Some(
+            Some(Arc::new(
                 self.manager
                     .runtime_filter_context_for_native_execution_attempt(
                         execution,
                         fragment_instance_id,
                     )?,
-            )
+            ) as RuntimeFilterSessionRef)
         } else {
             None
         };
@@ -171,10 +171,10 @@ impl NativeFragmentQueryRuntime {
         self.manager
             .ensure_native_context(query_id, false, delivery_expire, query_expire)?;
         let runtime_filter = if has_runtime_filter_bindings {
-            Some(
+            Some(Arc::new(
                 self.manager
                     .runtime_filter_context_for_native_execution(query_id, fragment_instance_id)?,
-            )
+            ) as RuntimeFilterSessionRef)
         } else {
             None
         };
@@ -309,7 +309,7 @@ fn execution_key(execution_id: QueryExecutionId) -> QueryExecutionKey {
 pub struct NativeFragmentAdmissionResources {
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
-    runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    runtime_filter: Option<RuntimeFilterSessionRef>,
 }
 
 impl NativeFragmentAdmissionResources {

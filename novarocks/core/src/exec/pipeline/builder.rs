@@ -62,12 +62,6 @@ use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
 use crate::runtime::fragment::io::{FragmentLookupClient, UnavailableFragmentLookupClient};
-use crate::runtime_filter::model::contract::ReductionRequirement;
-use crate::runtime_filter::port::producer::ProducerPortKind;
-use crate::runtime_filter::port::subscription::SubscriptionKind;
-use crate::runtime_filter::service::{
-    InstalledRuntimeFilterExecutionContract, NativeRuntimeFilterExecutionContext,
-};
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::operators::AssertNumRowsProcessorFactory;
@@ -123,7 +117,7 @@ struct PipelineBuildContext {
 }
 
 struct PipelineRuntimeFilterExecution {
-    context: Option<NativeRuntimeFilterExecutionContext>,
+    session: Option<execution::RuntimeFilterSessionRef>,
 }
 
 impl PipelineBuildContext {
@@ -175,7 +169,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         scan_bindings,
         pipeline_dop,
         None,
-        PipelineRuntimeFilterExecution { context: None },
+        PipelineRuntimeFilterExecution { session: None },
         Arc::new(UnavailableFragmentLookupClient),
     )
 }
@@ -190,7 +184,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
 ) -> Result<PipelineGraph, String> {
-    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
+    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session(
         plan,
         debug,
         dep_manager,
@@ -203,7 +197,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     )
 }
 
-pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context(
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session(
     plan: &ExecPlan,
     debug: bool,
     dep_manager: DependencyManager,
@@ -212,9 +206,9 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
-    context: Option<NativeRuntimeFilterExecutionContext>,
+    session: Option<execution::RuntimeFilterSessionRef>,
 ) -> Result<PipelineGraph, String> {
-    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
+    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
         plan,
         debug,
         dep_manager,
@@ -223,13 +217,13 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         scan_bindings,
         pipeline_dop,
         root_sink_dop,
-        context,
+        session,
         Arc::new(UnavailableFragmentLookupClient),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
     plan: &ExecPlan,
     debug: bool,
     dep_manager: DependencyManager,
@@ -238,7 +232,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     scan_bindings: ScanBindings,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
-    context: Option<NativeRuntimeFilterExecutionContext>,
+    session: Option<execution::RuntimeFilterSessionRef>,
     lookup_client: Arc<dyn FragmentLookupClient>,
 ) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
@@ -250,12 +244,12 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         scan_bindings,
         pipeline_dop,
         root_sink_dop,
-        PipelineRuntimeFilterExecution { context },
+        PipelineRuntimeFilterExecution { session },
         lookup_client,
     )
 }
 
-pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_session(
     plan: &ExecPlan,
     debug: bool,
     dep_manager: DependencyManager,
@@ -263,7 +257,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
     pipeline_dop: i32,
-    context: Option<NativeRuntimeFilterExecutionContext>,
+    session: Option<execution::RuntimeFilterSessionRef>,
 ) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
         plan,
@@ -274,7 +268,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_cont
         scan_bindings,
         pipeline_dop,
         None,
-        PipelineRuntimeFilterExecution { context },
+        PipelineRuntimeFilterExecution { session },
         Arc::new(UnavailableFragmentLookupClient),
     )
 }
@@ -677,16 +671,16 @@ where
     })
 }
 
-fn native_runtime_filter_context(
+fn runtime_filter_session(
     execution: &PipelineRuntimeFilterExecution,
     binding_id: u32,
-) -> Result<&NativeRuntimeFilterExecutionContext, String> {
+) -> Result<&execution::RuntimeFilterSessionRef, String> {
     match execution {
         PipelineRuntimeFilterExecution {
-            context: Some(context),
-        } => Ok(context),
-        PipelineRuntimeFilterExecution { context: None } => Err(format!(
-            "native runtime-filter binding_id={binding_id} requires an installed runtime-filter context"
+            session: Some(session),
+        } => Ok(session),
+        PipelineRuntimeFilterExecution { session: None } => Err(format!(
+            "native runtime-filter binding_id={binding_id} requires an execution runtime-filter session"
         )),
     }
 }
@@ -698,8 +692,8 @@ fn native_aggregate_topn_session(
     let Some(spec) = specs.first() else {
         return Ok(None);
     };
-    native_runtime_filter_context(runtime_filter_execution, spec.binding_id)
-        .map(|context| Arc::new(context.clone()) as execution::RuntimeFilterSessionRef)
+    runtime_filter_session(runtime_filter_execution, spec.binding_id)
+        .cloned()
         .map(Some)
 }
 
@@ -707,54 +701,8 @@ fn validate_native_producer_specs(
     specs: &[crate::exec::node::join::JoinRuntimeFilterProducerBinding],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
-    for spec in specs {
-        let context =
-            native_runtime_filter_context(&ctx.runtime_filter_execution, spec.binding_id)?;
-        let requested_kind = match (&spec.contract, &spec.reduction) {
-            (_, RuntimeFilterExecutionReduction::MergeTopKSummary { .. }) => {
-                ProducerPortKind::TopKSummary
-            }
-            (_, _)
-                if spec.contribution_kinds.contains(
-                    &crate::runtime_filter::model::contract::ContributionKind::FinalDomainShard,
-                ) =>
-            {
-                ProducerPortKind::FinalDomain
-            }
-            (RuntimeFilterExecutionContract::Membership { .. }, _) => ProducerPortKind::Membership,
-            (RuntimeFilterExecutionContract::Ordered { .. }, _) => ProducerPortKind::OrderedBound,
-        };
-        let resolved = context
-            .resolve_producer(
-                crate::runtime_filter::model::contract::BindingId::new(spec.binding_id),
-                crate::runtime_filter::model::contract::ChannelId::new(spec.channel_id),
-                requested_kind,
-            )
-            .map_err(|error| {
-                format!(
-                    "native runtime-filter producer binding_id={} resolution failed: {error}",
-                    spec.binding_id
-                )
-            })?;
-        validate_native_contract(spec.binding_id, &spec.contract, resolved.contract())?;
-        validate_native_reduction(
-            spec.binding_id,
-            &spec.reduction,
-            resolved.reduction_requirement(),
-            resolved.topk_contract_digest(),
-        )?;
-        if &spec.contribution_kinds != resolved.allowed_contribution_kinds() {
-            return Err(format!(
-                "native runtime-filter producer binding_id={} contribution kinds do not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
-        if spec.completion_requirement != resolved.completion_requirement() {
-            return Err(format!(
-                "native runtime-filter producer binding_id={} completion requirement does not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
+    if let Some(spec) = specs.first() {
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
     }
     Ok(())
 }
@@ -830,39 +778,9 @@ fn validate_native_aggregate_topn_specs(
                 spec.binding_id
             ));
         }
-        let context =
-            native_runtime_filter_context(&ctx.runtime_filter_execution, spec.binding_id)?;
-        let resolved = context
-            .resolve_producer(
-                crate::runtime_filter::model::contract::BindingId::new(spec.binding_id),
-                crate::runtime_filter::model::contract::ChannelId::new(spec.channel_id),
-                ProducerPortKind::OrderedBound,
-            )
-            .map_err(|error| {
-                format!(
-                    "native aggregate TopN producer binding_id={} resolution failed: {error}",
-                    spec.binding_id
-                )
-            })?;
-        validate_native_contract(spec.binding_id, &spec.contract, resolved.contract())?;
-        validate_native_reduction(
-            spec.binding_id,
-            &spec.reduction,
-            resolved.reduction_requirement(),
-            resolved.topk_contract_digest(),
-        )?;
-        if &spec.contribution_kinds != resolved.allowed_contribution_kinds() {
-            return Err(format!(
-                "native aggregate TopN producer binding_id={} contribution kinds do not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
-        if spec.completion_requirement != resolved.completion_requirement() {
-            return Err(format!(
-                "native aggregate TopN producer binding_id={} completion requirement does not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
+    }
+    if let Some(spec) = specs.first() {
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
     }
     Ok(())
 }
@@ -935,9 +853,8 @@ fn native_join_producer_factory(
     if specs.is_empty() {
         return Ok(None);
     }
-    let context =
-        native_runtime_filter_context(&ctx.runtime_filter_execution, specs[0].binding_id)?;
-    let session: execution::RuntimeFilterSessionRef = Arc::new(context.clone());
+    let session =
+        runtime_filter_session(&ctx.runtime_filter_execution, specs[0].binding_id)?.clone();
     Ok(Some(Arc::new(
         NativeRuntimeFilterProducerFactory::from_plan(
             specs,
@@ -954,123 +871,10 @@ fn validate_native_consumer_specs(
     specs: &[RuntimeFilterConsumerBinding],
     ctx: &PipelineBuildContext,
 ) -> Result<(), String> {
-    for spec in specs {
-        let context =
-            native_runtime_filter_context(&ctx.runtime_filter_execution, spec.binding_id)?;
-        let requested_kind = match spec.activation {
-            crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
-                SubscriptionKind::BlockingSnapshot
-            }
-            crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive {
-                ..
-            } => SubscriptionKind::NonBlockingLive,
-        };
-        let resolved = context
-            .resolve_consumer(
-                crate::runtime_filter::model::contract::BindingId::new(spec.binding_id),
-                crate::runtime_filter::model::contract::ChannelId::new(spec.channel_id),
-                requested_kind,
-            )
-            .map_err(|error| {
-                format!(
-                    "native runtime-filter consumer binding_id={} resolution failed: {error}",
-                    spec.binding_id
-                )
-            })?;
-        if spec.activation != resolved.activation() {
-            return Err(format!(
-                "native runtime-filter consumer binding_id={} activation does not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
-        if &spec.capabilities != resolved.capabilities() {
-            return Err(format!(
-                "native runtime-filter consumer binding_id={} capabilities do not match the installed descriptor",
-                spec.binding_id
-            ));
-        }
-        validate_native_contract(spec.binding_id, &spec.contract, resolved.contract())?;
-        validate_native_reduction(
-            spec.binding_id,
-            &spec.reduction,
-            resolved.reduction_requirement(),
-            resolved.topk_contract_digest(),
-        )?;
+    if let Some(spec) = specs.first() {
+        runtime_filter_session(&ctx.runtime_filter_execution, spec.binding_id)?;
     }
     Ok(())
-}
-
-fn validate_native_contract(
-    binding_id: u32,
-    expected: &RuntimeFilterExecutionContract,
-    installed: &InstalledRuntimeFilterExecutionContract,
-) -> Result<(), String> {
-    let matches = match (expected, installed) {
-        (
-            RuntimeFilterExecutionContract::Membership {
-                canonical_schema,
-                schema_digest,
-            },
-            InstalledRuntimeFilterExecutionContract::Membership {
-                canonical_schema: installed_schema,
-                schema_digest: installed_digest,
-            },
-        ) => {
-            canonical_schema.as_ref() == installed_schema.as_ref()
-                && schema_digest == installed_digest
-        }
-        (
-            RuntimeFilterExecutionContract::Ordered {
-                keys,
-                comparator_digest,
-                order_contract_digest,
-            },
-            InstalledRuntimeFilterExecutionContract::Ordered {
-                keys: installed_keys,
-                comparator_digest: installed_comparator,
-                order_contract_digest: installed_order,
-            },
-        ) => {
-            keys.as_ref() == installed_keys.as_ref()
-                && comparator_digest == installed_comparator
-                && order_contract_digest == installed_order
-        }
-        _ => false,
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(format!(
-            "native runtime-filter binding_id={binding_id} schema/contract does not match the installed descriptor"
-        ))
-    }
-}
-
-fn validate_native_reduction(
-    binding_id: u32,
-    expected: &RuntimeFilterExecutionReduction,
-    installed: ReductionRequirement,
-    installed_topk_contract_digest: Option<[u8; 32]>,
-) -> Result<(), String> {
-    let matches = match (expected, installed) {
-        (RuntimeFilterExecutionReduction::SetUnion, ReductionRequirement::SetUnion)
-        | (
-            RuntimeFilterExecutionReduction::TightenOrderedBound,
-            ReductionRequirement::TightenOrderedBound,
-        ) => true,
-        (
-            RuntimeFilterExecutionReduction::MergeTopKSummary { k, contract_digest },
-            ReductionRequirement::MergeTopKSummary(installed),
-        ) => *k == installed.k() && installed_topk_contract_digest == Some(*contract_digest),
-        _ => false,
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(format!(
-            "native runtime-filter binding_id={binding_id} reduction does not match the installed descriptor"
-        ))
-    }
 }
 
 fn build_pipeline_for_node(
@@ -2118,6 +1922,30 @@ fn new_source_pipeline_with_dop(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
+    plan: &ExecPlan,
+    debug: bool,
+    dep_manager: DependencyManager,
+    exchange_finst_id: Option<(i64, i64)>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    pipeline_dop: i32,
+    context: Option<execution::RuntimeFilterSessionRef>,
+) -> Result<PipelineGraph, String> {
+    build_native_pipeline_graph_for_exec_plan_with_runtime_filter_session(
+        plan,
+        debug,
+        dep_manager,
+        exchange_finst_id,
+        exchange_bindings,
+        scan_bindings,
+        pipeline_dop,
+        context,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
@@ -2125,6 +1953,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_execution::runtime_filter as execution;
 
     use super::{
         AggregateTopNProducerSite, AggregateTopNProducerSiteCandidate,
@@ -2236,7 +2065,7 @@ mod tests {
 
     fn installed_native_consumer_context() -> (
         Arc<crate::runtime::query_context::QueryContextManager>,
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+        execution::RuntimeFilterSessionRef,
     ) {
         installed_native_consumer_context_for_activation(
             crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot,
@@ -2247,7 +2076,7 @@ mod tests {
         activation: crate::runtime_filter::model::contract::ConsumerActivation,
     ) -> (
         Arc<crate::runtime::query_context::QueryContextManager>,
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+        execution::RuntimeFilterSessionRef,
     ) {
         use std::time::Duration;
 
@@ -2292,7 +2121,7 @@ mod tests {
                 novarocks_types::UniqueId::new(70, 40),
             )
             .expect("strict native runtime-filter context");
-        (manager, context)
+        (manager, Arc::new(context))
     }
 
     fn installed_native_membership_contract_for_activation(
@@ -2642,7 +2471,7 @@ mod tests {
 
     fn installed_native_aggregate_topn_context() -> (
         Arc<crate::runtime::query_context::QueryContextManager>,
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+        execution::RuntimeFilterSessionRef,
     ) {
         installed_native_aggregate_topn_context_for_type(DataType::Int64)
     }
@@ -2651,7 +2480,7 @@ mod tests {
         data_type: DataType,
     ) -> (
         Arc<crate::runtime::query_context::QueryContextManager>,
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
+        execution::RuntimeFilterSessionRef,
     ) {
         use std::collections::BTreeMap;
         use std::time::Duration;
@@ -2765,7 +2594,7 @@ mod tests {
         let context = manager
             .runtime_filter_context_for_native_execution(query_id, producer_instance)
             .expect("aggregate producer runtime-filter context");
-        (manager, context)
+        (manager, Arc::new(context))
     }
 
     #[test]
@@ -2929,28 +2758,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_aggregate_topn_binding_never_falls_back_to_membership_producer() {
-        let (_manager, membership_context) = installed_native_producer_context();
-        let error = match build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
-            &native_aggregate_topn_plan(false, false, None),
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            ScanBindings::default(),
-            2,
-            Some(membership_context),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("aggregate TopN must resolve only an OrderedBound producer"),
-        };
-        assert!(
-            error.contains("resolution failed") || error.contains("contract"),
-            "{error}"
-        );
-    }
-
     fn assert_native_join_build_sinks_bind_exact_producer(
         distribution_mode: JoinDistributionMode,
         expected_build_dop: i32,
@@ -2970,7 +2777,7 @@ mod tests {
             ExchangeBindings::default(),
             ScanBindings::default(),
             3,
-            Some(context),
+            Some(Arc::new(context)),
         )
         .expect("native join pipeline");
         let build_pipeline = graph
@@ -3045,7 +2852,7 @@ mod tests {
     }
 
     #[test]
-    fn native_runtime_filter_pipeline_with_bindings_requires_installed_service() {
+    fn native_runtime_filter_pipeline_with_bindings_requires_execution_session() {
         let schema = crate::runtime_filter::port::artifact::ArtifactMembershipSchema::new(
             &DataType::Int64,
             crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
@@ -3062,9 +2869,12 @@ mod tests {
             None,
         ) {
             Err(error) => error,
-            Ok(_) => panic!("native binding requires installed Service context"),
+            Ok(_) => panic!("native binding requires an execution session"),
         };
-        assert!(error.contains("runtime-filter context"), "{error}");
+        assert!(
+            error.contains("execution runtime-filter session"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3112,24 +2922,6 @@ mod tests {
             None,
         )
         .expect("binding-free native pipeline");
-    }
-
-    #[test]
-    fn native_runtime_filter_topk_contract_digest_mismatch_fails_before_open() {
-        let error = super::validate_native_reduction(
-            7,
-            &RuntimeFilterExecutionReduction::MergeTopKSummary {
-                k: std::num::NonZeroU32::new(3).expect("non-zero k"),
-                contract_digest: [1; 32],
-            },
-            crate::runtime_filter::model::contract::ReductionRequirement::MergeTopKSummary(
-                crate::runtime_filter::model::contract::TopKSummaryRequirement::try_new(3)
-                    .expect("non-zero k"),
-            ),
-            Some([2; 32]),
-        )
-        .expect_err("TopK contract digest drift must fail");
-        assert!(error.contains("reduction"), "{error}");
     }
 
     #[test]

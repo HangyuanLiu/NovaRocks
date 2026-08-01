@@ -27,13 +27,12 @@ use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::sink_commit;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 /// RuntimeState is a per-fragment-instance execution context, similar to StarRocks BE RuntimeState.
 ///
 /// Today it mainly provides access to frequently used query options (e.g. `batch_size` / chunk size).
 /// More execution-time parameters and state can be migrated here over time.
-#[derive(Debug)]
 pub struct RuntimeState {
     query_options: Option<QueryOptions>,
     cache_options: Option<crate::cache::CacheOptions>,
@@ -45,9 +44,17 @@ pub struct RuntimeState {
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
     spill_config: Option<SpillConfig>,
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
-    native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+    runtime_filter_session: Option<RuntimeFilterSessionRef>,
     connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
+}
+
+impl std::fmt::Debug for RuntimeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeState")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +91,7 @@ impl Default for RuntimeState {
             mem_tracker: None,
             spill_config: None,
             spill_manager: None,
-            native_runtime_filter_context: None,
+            runtime_filter_session: None,
             connector_staged_report_collector: None,
         }
     }
@@ -105,7 +112,7 @@ impl Clone for RuntimeState {
             mem_tracker: self.mem_tracker.clone(),
             spill_config: self.spill_config.clone(),
             spill_manager: self.spill_manager.clone(),
-            native_runtime_filter_context: self.native_runtime_filter_context.clone(),
+            runtime_filter_session: self.runtime_filter_session.clone(),
             connector_staged_report_collector: self.connector_staged_report_collector.clone(),
         }
     }
@@ -147,16 +154,16 @@ impl RuntimeState {
             mem_tracker,
             spill_config,
             spill_manager,
-            native_runtime_filter_context: None,
+            runtime_filter_session: None,
             connector_staged_report_collector: None,
         }
     }
 
-    pub(crate) fn with_native_runtime_filter_context(
+    pub(crate) fn with_runtime_filter_session(
         mut self,
-        context: Option<NativeRuntimeFilterExecutionContext>,
+        session: Option<RuntimeFilterSessionRef>,
     ) -> Self {
-        self.native_runtime_filter_context = context;
+        self.runtime_filter_session = session;
         self
     }
 
@@ -183,19 +190,8 @@ impl RuntimeState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn native_runtime_filter_context(
-        &self,
-    ) -> Option<&NativeRuntimeFilterExecutionContext> {
-        self.native_runtime_filter_context.as_ref()
-    }
-
-    pub(crate) fn runtime_filter_session(
-        &self,
-    ) -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> {
-        self.native_runtime_filter_context.as_ref().map(|context| {
-            std::sync::Arc::new(context.clone())
-                as novarocks_execution::runtime_filter::RuntimeFilterSessionRef
-        })
+    pub(crate) fn runtime_filter_session(&self) -> Option<&RuntimeFilterSessionRef> {
+        self.runtime_filter_session.as_ref()
     }
 
     #[allow(dead_code)]

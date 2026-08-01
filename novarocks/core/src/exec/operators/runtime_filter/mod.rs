@@ -2655,7 +2655,7 @@ mod tests {
         )
         .unwrap();
         let consumer_state = crate::runtime::runtime_state::RuntimeState::default()
-            .with_native_runtime_filter_context(Some(consumer_context));
+            .with_runtime_filter_session(Some(Arc::new(consumer_context)));
 
         let producer_spec = JoinRuntimeFilterProducerBinding {
             binding_id: 10,
@@ -3369,7 +3369,7 @@ mod native_ordered_live_consumer_tests {
             },
         );
         let consumers = NativeOrderedLiveConsumerSet::from_plan(&[spec], Arc::new(arena)).unwrap();
-        let state = RuntimeState::default().with_native_runtime_filter_context(Some(context));
+        let state = RuntimeState::default().with_runtime_filter_session(Some(Arc::new(context)));
 
         consumers.bind(&state).unwrap();
 

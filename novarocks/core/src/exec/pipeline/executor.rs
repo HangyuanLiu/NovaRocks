@@ -38,7 +38,7 @@ use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::runtime_state::RuntimeState;
 
-use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client;
+use super::builder::build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
 use super::global_driver_executor::{DriverTask, FragmentCompletion, global_driver_executor};
@@ -236,7 +236,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
-    let runtime_filter_context = runtime_state.native_runtime_filter_context().cloned();
+    let runtime_filter_session = runtime_state.runtime_filter_session().cloned();
     execute_plan_with_pipeline(
         plan,
         debug,
@@ -252,7 +252,7 @@ pub(crate) fn execute_native_plan_with_pipeline_with_root_sink_dop(
         fe_addr,
         backend_num,
         root_sink_dop,
-        runtime_filter_context,
+        runtime_filter_session,
     )
 }
 
@@ -340,9 +340,7 @@ pub(crate) fn prepare_pipeline_execution(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-    runtime_filter_context: Option<
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
-    >,
+    runtime_filter_session: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> Result<PreparedPipelineExecution, String> {
     prepare_pipeline_execution_inner(
@@ -360,7 +358,7 @@ pub(crate) fn prepare_pipeline_execution(
         fe_addr,
         backend_num,
         root_sink_dop,
-        runtime_filter_context,
+        runtime_filter_session,
         event_sink,
         Arc::new(UnavailableFragmentLookupClient),
         false,
@@ -380,9 +378,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     root_sink_dop: Option<i32>,
-    runtime_filter_context: Option<
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
-    >,
+    runtime_filter_session: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
     lookup_client: Arc<dyn FragmentLookupClient>,
 ) -> Result<PreparedPipelineExecution, String> {
@@ -401,7 +397,7 @@ pub(crate) fn prepare_report_neutral_pipeline_execution(
         None,
         None,
         root_sink_dop,
-        runtime_filter_context,
+        runtime_filter_session,
         event_sink,
         lookup_client,
         true,
@@ -424,9 +420,7 @@ fn prepare_pipeline_execution_inner(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-    runtime_filter_context: Option<
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
-    >,
+    runtime_filter_session: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
     lookup_client: Arc<dyn FragmentLookupClient>,
     report_neutral: bool,
@@ -436,7 +430,7 @@ fn prepare_pipeline_execution_inner(
     // Use the FE-calculated DOP as the base graph DOP. Some terminal sinks can
     // request a narrower root pipeline when their finalization state must be local.
     let graph =
-        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_context_and_lookup_client(
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
             &plan,
             debug,
             dep_manager.clone(),
@@ -445,7 +439,7 @@ fn prepare_pipeline_execution_inner(
             scan_bindings,
             pipeline_dop,
             root_sink_dop,
-            runtime_filter_context,
+            runtime_filter_session,
             lookup_client,
         )?;
 
@@ -565,9 +559,7 @@ fn execute_plan_with_pipeline(
     fe_addr: Option<RuntimeEndpoint>,
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
-    runtime_filter_context: Option<
-        crate::runtime_filter::service::NativeRuntimeFilterExecutionContext,
-    >,
+    runtime_filter_session: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
 ) -> Result<(), String> {
     prepare_pipeline_execution(
         plan,
@@ -584,7 +576,7 @@ fn execute_plan_with_pipeline(
         fe_addr,
         backend_num,
         root_sink_dop,
-        runtime_filter_context,
+        runtime_filter_session,
         Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
     )?
     .start()
@@ -1166,14 +1158,14 @@ mod tests {
             None,
             1,
             Arc::new(
-                RuntimeState::default().with_native_runtime_filter_context(Some(
+                RuntimeState::default().with_runtime_filter_session(Some(Arc::new(
                     context_manager
                         .runtime_filter_context_for_native_execution(
                             query_id,
                             UniqueId::new(70, 30),
                         )
                         .expect("producer runtime-filter context"),
-                )),
+                ))),
             ),
             Some(query_id),
             None,
@@ -1252,14 +1244,14 @@ mod tests {
             None,
             1,
             Arc::new(
-                RuntimeState::default().with_native_runtime_filter_context(Some(
+                RuntimeState::default().with_runtime_filter_session(Some(Arc::new(
                     context_manager
                         .runtime_filter_context_for_native_execution(
                             query_id,
                             UniqueId::new(70, 40),
                         )
                         .expect("consumer runtime-filter context"),
-                )),
+                ))),
             ),
             Some(query_id),
             None,
