@@ -693,13 +693,13 @@ fn native_runtime_filter_context(
 
 fn native_aggregate_topn_context(
     specs: &[AggregateTopNRuntimeFilterProducerBinding],
-    execution: &PipelineRuntimeFilterExecution,
-) -> Result<Option<NativeRuntimeFilterExecutionContext>, String> {
+    runtime_filter_execution: &PipelineRuntimeFilterExecution,
+) -> Result<Option<execution::RuntimeFilterSessionRef>, String> {
     let Some(spec) = specs.first() else {
         return Ok(None);
     };
-    native_runtime_filter_context(execution, spec.binding_id)
-        .cloned()
+    native_runtime_filter_context(runtime_filter_execution, spec.binding_id)
+        .map(|context| Arc::new(context.clone()) as execution::RuntimeFilterSessionRef)
         .map(Some)
 }
 

@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use novarocks_execution::runtime_filter as execution;
 
 use crate::common::failpoint;
 use crate::common::ids::SlotId;
@@ -49,7 +50,6 @@ use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
@@ -406,7 +406,7 @@ impl AggregateProcessorFactory {
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
         topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
-        runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+        runtime_filter_session: Option<execution::RuntimeFilterSessionRef>,
         local_partition_count: i32,
         final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
     ) -> Result<Self, String> {
@@ -460,15 +460,15 @@ impl AggregateProcessorFactory {
         let native_topn_session_factory = if topn_producers.is_empty() {
             None
         } else {
-            let context = runtime_filter_context.ok_or_else(|| {
+            let session = runtime_filter_session.ok_or_else(|| {
                 format!(
-                    "native aggregate TopN producer binding_id={} requires an installed runtime-filter context",
+                    "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
                     topn_producers[0].binding_id
                 )
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
                 &topn_producers,
-                Arc::new(context),
+                session,
                 local_partition_count,
             )?))
         };
