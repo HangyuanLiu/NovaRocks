@@ -59,9 +59,11 @@ pub(crate) enum MvFirstRefreshShape {
     Projection,
     UnionProjection,
     Aggregate,
+    FanInAggregate,
     BranchUnionAggregate,
     Join,
-    Composed,
+    JoinAggregate,
+    ComposedAggregate,
 }
 
 /// Target facts frozen before a first-refresh writer is admitted.  It carries
@@ -89,6 +91,11 @@ impl MvFirstRefreshTargetContract {
             .iter()
             .map(|field| field.id)
             .collect();
+        if schema.field_by_name(&hidden_hash_key).is_none() {
+            return Err(format!(
+                "MV first-refresh target schema is missing hidden hash key {hidden_hash_key}"
+            ));
+        }
         Self::try_new(
             std::sync::Arc::new(arrow_schema),
             field_ids,
@@ -103,7 +110,8 @@ impl MvFirstRefreshTargetContract {
         partition_spec_id: i32,
         hidden_hash_key: String,
     ) -> Result<Self, String> {
-        if schema.fields().len() != field_ids.len()
+        if schema.fields().is_empty()
+            || schema.fields().len() != field_ids.len()
             || field_ids.iter().any(|field_id| *field_id <= 0)
             || field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len()
             || partition_spec_id < 0
@@ -355,6 +363,46 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     })
 }
 
+/// Fan-in aggregate first refresh uses the same state-shaped physical project
+/// as a single aggregate.  The canonical SELECT already contains the pinned
+/// UNION ALL input, so keeping this as a separate entry point makes the shape
+/// contract explicit without reintroducing a frontend materialization phase.
+pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
+    select_sql: &str,
+    calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<MvFirstRefreshPhysicalSql, String> {
+    prepare_aggregate_first_refresh_write_sql(
+        select_sql,
+        calls,
+        pin,
+        current_catalog,
+        current_database,
+    )
+}
+
+/// A composed aggregate (for example aggregate-over-join) is still one
+/// state-shaped SELECT.  Its join/fan-in relationship lives below the common
+/// aggregate project and therefore remains BE-owned all the way to the
+/// connector writer.
+pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
+    select_sql: &str,
+    calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<MvFirstRefreshPhysicalSql, String> {
+    prepare_aggregate_first_refresh_write_sql(
+        select_sql,
+        calls,
+        pin,
+        current_catalog,
+        current_database,
+    )
+}
+
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
     select_sql: &str,
     branch_count: usize,
@@ -587,5 +635,58 @@ mod tests {
         assert!(prepared.sql().contains("sum_state_visible"));
         assert!(prepared.sql().contains("__agg_state_total"));
         assert!(!prepared.sql().contains("RecordBatch"));
+    }
+
+    #[test]
+    fn fan_in_aggregate_remains_one_pinned_be_state_project() {
+        let sql = "SELECT k, sum(v) AS total FROM (SELECT k, v FROM ice.db.a UNION ALL SELECT k, v FROM ice.db.b) AS input GROUP BY k";
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql).unwrap();
+        let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected SELECT")
+        };
+        let calls =
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+                .unwrap();
+        let pin = RefreshSnapshotPin::from_entries_for_tests(&[
+            ("ice.db.a", 11, "a-uuid"),
+            ("ice.db.b", 22, "b-uuid"),
+        ]);
+        let prepared =
+            prepare_fan_in_aggregate_first_refresh_write_sql(sql, &calls, &pin, Some("ice"), "db")
+                .unwrap();
+        assert_eq!(prepared.root_hash_column(), ROW_ID_COLUMN);
+        assert!(prepared.sql().contains("VERSION AS OF 11"));
+        assert!(prepared.sql().contains("VERSION AS OF 22"));
+        assert!(prepared.sql().contains("sum_state_visible"));
+    }
+
+    #[test]
+    fn composed_aggregate_remains_one_pinned_be_state_project() {
+        let sql = "SELECT a.k, count(*) AS total FROM ice.db.a AS a JOIN ice.db.b AS b ON a.k = b.k GROUP BY a.k";
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql).unwrap();
+        let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected SELECT")
+        };
+        let calls =
+            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
+                .unwrap();
+        let pin = RefreshSnapshotPin::from_entries_for_tests(&[
+            ("ice.db.a", 11, "a-uuid"),
+            ("ice.db.b", 22, "b-uuid"),
+        ]);
+        let prepared = prepare_composed_aggregate_first_refresh_write_sql(
+            sql,
+            &calls,
+            &pin,
+            Some("ice"),
+            "db",
+        )
+        .unwrap();
+        assert_eq!(prepared.root_hash_column(), ROW_ID_COLUMN);
+        assert!(prepared.sql().contains("VERSION AS OF 11"));
+        assert!(prepared.sql().contains("VERSION AS OF 22"));
+        assert!(prepared.sql().contains("count_state_visible"));
     }
 }

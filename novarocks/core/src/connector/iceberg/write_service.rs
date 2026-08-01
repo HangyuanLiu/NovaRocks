@@ -354,6 +354,21 @@ impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
                 CommitServiceError::invalid_input("first-refresh row count overflow".to_string())
             })
         })?;
+        // A first refresh targets an empty staging ref.  Empty input is an
+        // explicit no-op: do not manufacture an empty Iceberg snapshot.  The
+        // provider owns cleanup because it is the only layer that can decode
+        // the staged report payloads into object-store paths.
+        if row_count == 0 {
+            let cleanup = self
+                .executor
+                .abort_iceberg_writer_reports(reports)
+                .unwrap_or_else(|error| CleanupAttempt::completed(vec![error]));
+            return Err(CommitServiceError::known_uncommitted(
+                "first-refresh produced zero rows; staging was aborted without a snapshot"
+                    .to_string(),
+                cleanup,
+            ));
+        }
         let mut provenance = self.provenance_properties.clone();
         provenance.insert(
             "novarocks.mv.refresh.row_count".to_string(),
