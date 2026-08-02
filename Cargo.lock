@@ -3214,6 +3214,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-execution",
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
@@ -3270,6 +3271,7 @@ dependencies = [
  "iceberg",
  "novarocks",
  "novarocks-connector-starrocks",
+ "novarocks-execution",
  "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
@@ -3350,6 +3352,14 @@ dependencies = [
  "tonic",
  "tonic-build",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-execution"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-types",
 ]
 
 [[package]]

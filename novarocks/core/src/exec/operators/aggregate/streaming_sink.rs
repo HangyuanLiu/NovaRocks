@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use novarocks_execution::runtime_filter as execution;
 
 use super::streaming_state::AggregateStreamingState;
 use super::{
@@ -55,7 +56,6 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::port::producer::ProducerFailureReason;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 use super::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
@@ -93,7 +93,7 @@ impl AggregateStreamingSinkFactory {
         output_chunk_schema: ChunkSchemaRef,
         state: AggregateStreamingState,
         topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
-        runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+        runtime_filter_session: Option<execution::RuntimeFilterSessionRef>,
         local_partition_count: i32,
     ) -> Result<Self, String> {
         let name = if node_id >= 0 {
@@ -105,15 +105,15 @@ impl AggregateStreamingSinkFactory {
         let native_topn_session_factory = if topn_producers.is_empty() {
             None
         } else {
-            let context = runtime_filter_context.ok_or_else(|| {
+            let session = runtime_filter_session.ok_or_else(|| {
                 format!(
-                    "native aggregate TopN producer binding_id={} requires an installed runtime-filter context",
+                    "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
                     topn_producers[0].binding_id
                 )
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
                 &topn_producers,
-                &context,
+                session,
                 local_partition_count,
             )?))
         };

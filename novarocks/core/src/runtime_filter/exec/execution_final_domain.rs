@@ -15,8 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod execution_final_domain;
-pub(crate) mod execution_predicate;
-pub(crate) mod membership_delta;
-pub(crate) mod membership_predicate;
-pub(crate) mod ordered_range_predicate;
+use novarocks_execution::runtime_filter as execution;
+
+use crate::runtime_filter::port::value_domain::ValueDomainDelta;
+
+/// Converts Core's current value-domain implementation into the opaque
+/// Execution completion payload. The Service adapter validates this exact
+/// native payload before it freezes a partition; neither callers nor this
+/// helper receives an issuance authority.
+pub(crate) fn final_domain_payload(
+    domain: ValueDomainDelta,
+) -> Result<execution::RuntimeFilterFinalDomain, String> {
+    let mut canonical = Vec::new();
+    domain
+        .encode_canonical_into(&mut canonical)
+        .map_err(|error| error.to_string())?;
+    Ok(execution::RuntimeFilterFinalDomain::new(canonical, domain))
+}

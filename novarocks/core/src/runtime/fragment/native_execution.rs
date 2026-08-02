@@ -35,7 +35,7 @@ use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::fragment_output::FragmentOutput;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
@@ -158,7 +158,7 @@ pub(crate) struct NativeExecutionContext {
     pub(crate) profiler: Option<Profiler>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) readiness: NativeExecutionReadiness,
-    pub(crate) runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    pub(crate) runtime_filter: Option<RuntimeFilterSessionRef>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -234,7 +234,7 @@ pub(crate) fn execute_native_submission(
             fragment_instance_id: Some(fragment_instance_id),
             backend_num: Some(backend_num),
             mem_tracker: context.mem_tracker.clone(),
-            native_runtime_filter_context: context.runtime_filter.clone(),
+            runtime_filter_session: context.runtime_filter.clone(),
             connector_staged_report_collector: program
                 .sink()
                 .program()

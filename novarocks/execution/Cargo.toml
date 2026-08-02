@@ -1,0 +1,11 @@
+[package]
+name = "novarocks-execution"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+arrow = { version = "58.2.0" }
+novarocks-types = { path = "../types" }

@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use novarocks_execution::runtime_filter as execution;
+
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 pub use crate::runtime_filter::model::contract::{
@@ -32,18 +34,48 @@ pub use crate::runtime_filter::port::ordered_bound::{
     RuntimeOrderContract, RuntimeOrderKey, comparator_digest_for_plan,
 };
 pub use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+pub use execution::RuntimeFilterExecutionContract;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RuntimeFilterExecutionContract {
-    Membership {
-        canonical_schema: Arc<[u8]>,
-        schema_digest: [u8; 32],
-    },
-    Ordered {
-        keys: Arc<[RuntimeOrderKey]>,
-        comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
-    },
+/// Ordered-bound evaluation remains a Core-local concern while plan bindings
+/// carry the canonical Execution contract. Convert only at the evaluator
+/// boundary; producers and subscriptions pass the Execution contract through
+/// unchanged.
+pub(crate) fn core_order_keys(keys: &[execution::RuntimeOrderKey]) -> Arc<[RuntimeOrderKey]> {
+    keys.iter()
+        .map(|key| {
+            RuntimeOrderKey::new(
+                key.data_type().clone(),
+                match key.direction() {
+                    execution::RuntimeOrderSortDirection::Ascending => SortDirection::Ascending,
+                    execution::RuntimeOrderSortDirection::Descending => SortDirection::Descending,
+                },
+                match key.null_order() {
+                    execution::RuntimeOrderNullOrder::First => NullOrder::First,
+                    execution::RuntimeOrderNullOrder::Last => NullOrder::Last,
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+pub(crate) fn execution_order_keys(keys: &[RuntimeOrderKey]) -> Arc<[execution::RuntimeOrderKey]> {
+    keys.iter()
+        .map(|key| {
+            execution::RuntimeOrderKey::new(
+                key.data_type().clone(),
+                match key.direction() {
+                    SortDirection::Ascending => execution::RuntimeOrderSortDirection::Ascending,
+                    SortDirection::Descending => execution::RuntimeOrderSortDirection::Descending,
+                },
+                match key.null_order() {
+                    NullOrder::First => execution::RuntimeOrderNullOrder::First,
+                    NullOrder::Last => execution::RuntimeOrderNullOrder::Last,
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,30 +125,6 @@ impl RuntimeFilterConsumerNode {
 
     pub fn input_mut(&mut self) -> &mut ExecNode {
         &mut self.input
-    }
-}
-
-impl RuntimeFilterExecutionContract {
-    pub fn membership(canonical_schema: Arc<[u8]>, schema_digest: [u8; 32]) -> Self {
-        Self::Membership {
-            canonical_schema,
-            schema_digest,
-        }
-    }
-
-    pub fn try_ordered(
-        keys: Arc<[RuntimeOrderKey]>,
-        comparator_digest: [u8; 32],
-        order_contract_digest: [u8; 32],
-    ) -> Result<Self, String> {
-        if keys.is_empty() {
-            return Err("runtime-filter ordered contract requires at least one key".to_string());
-        }
-        Ok(Self::Ordered {
-            keys,
-            comparator_digest,
-            order_contract_digest,
-        })
     }
 }
 
@@ -240,7 +248,7 @@ mod tests {
                 ]),
                 completion_requirement: CompletionRequirement::ProducerClosed,
                 contract: RuntimeFilterExecutionContract::Ordered {
-                    keys: Arc::from([
+                    keys: execution_order_keys(&[
                         crate::runtime_filter::port::ordered_bound::RuntimeOrderKey::new(
                             DataType::Int64,
                             crate::runtime_filter::model::contract::SortDirection::Ascending,

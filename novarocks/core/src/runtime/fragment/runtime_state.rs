@@ -28,7 +28,7 @@ use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 pub(crate) struct RuntimeStateInputs {
     pub(crate) query_options: Option<QueryOptions>,
@@ -36,7 +36,7 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) fragment_instance_id: Option<UniqueId>,
     pub(crate) backend_num: Option<i32>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
-    pub(crate) native_runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+    pub(crate) runtime_filter_session: Option<RuntimeFilterSessionRef>,
     pub(crate) connector_staged_report_collector:
         Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
 }
@@ -78,7 +78,7 @@ pub(crate) fn build_runtime_state(
             spill_config,
             spill_manager,
         )
-        .with_native_runtime_filter_context(inputs.native_runtime_filter_context)
+        .with_runtime_filter_session(inputs.runtime_filter_session)
         .with_connector_staged_report_collector(inputs.connector_staged_report_collector),
     ))
 }

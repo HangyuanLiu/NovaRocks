@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use novarocks_execution::runtime_filter as execution;
 
 use crate::common::failpoint;
 use crate::common::ids::SlotId;
@@ -49,19 +50,19 @@ use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime_filter::exec::execution_final_domain::final_domain_payload;
+#[cfg(test)]
 use crate::runtime_filter::port::identity::PartitionId;
-use crate::runtime_filter::port::producer::{ProducerFailureReason, RuntimeContractViolationKind};
+use crate::runtime_filter::port::producer::ProducerFailureReason;
 use crate::runtime_filter::port::value_domain::MembershipValues;
 #[cfg(test)]
 use crate::runtime_filter::port::value_domain::ValueDomainDelta;
-use crate::runtime_filter::service::{FinalDomainCompletionSession, FinalDomainPartitionCommitter};
 
 use self::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
@@ -75,10 +76,10 @@ pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 
 /// Factory-owned capability for binding one final hash-aggregate driver per local partition.
 ///
-/// The completion session stays here so its owner lease covers the complete factory lifetime.
+/// The completion capability stays here for the complete factory lifetime.
 /// Operators receive only their one-shot partition committer.
 pub(crate) struct AggregateFinalDomainSessionBuilder {
-    session: FinalDomainCompletionSession,
+    completion: execution::RuntimeFilterFinalDomainCompletionHandle,
     declared_dop: i32,
     installed_membership_key_type: DataType,
     max_domain_canonical_bytes: usize,
@@ -93,31 +94,41 @@ type AggregateFinalDomainPartitionObserver =
 struct AggregateFinalDomainPartitionCommitter {
     #[cfg(test)]
     partition_id: PartitionId,
-    committer: FinalDomainPartitionCommitter,
+    committer: execution::RuntimeFilterFinalDomainPartitionHandle,
 }
 
 impl AggregateFinalDomainSessionBuilder {
     pub(crate) fn new(
-        session: FinalDomainCompletionSession,
+        completion: execution::RuntimeFilterFinalDomainCompletionHandle,
         declared_dop: i32,
-        max_domain_canonical_bytes: usize,
+        requested_max_domain_canonical_bytes: usize,
     ) -> Result<Self, String> {
         if declared_dop <= 0 {
-            let _ = session.fail(ProducerFailureReason::ExecutionFailed);
+            let _ = completion.fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
             return Err(format!(
                 "aggregate final-domain session requires positive declared DOP, got {declared_dop}"
             ));
         }
-        if max_domain_canonical_bytes == 0 {
-            let _ = session.fail(ProducerFailureReason::ExecutionFailed);
+        if requested_max_domain_canonical_bytes == 0 {
+            let _ = completion.fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
             return Err(
                 "aggregate final-domain session requires a positive canonical domain budget"
                     .to_string(),
             );
         }
-        let installed_membership_key_type = session.membership_key_type().clone();
+        let max_domain_canonical_bytes = completion
+            .max_domain_canonical_bytes()
+            .min(requested_max_domain_canonical_bytes);
+        if max_domain_canonical_bytes == 0 {
+            let _ = completion.fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(
+                "aggregate final-domain session adapter exposes no canonical domain budget"
+                    .to_string(),
+            );
+        }
+        let installed_membership_key_type = completion.membership_key_type();
         Ok(Self {
-            session,
+            completion,
             declared_dop,
             installed_membership_key_type,
             max_domain_canonical_bytes,
@@ -141,22 +152,23 @@ impl AggregateFinalDomainSessionBuilder {
         driver_id: i32,
     ) -> Result<AggregateFinalDomainPartitionCommitter, String> {
         if actual_dop != self.declared_dop {
-            let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+            self.fail();
             return Err(format!(
                 "aggregate final-domain DOP mismatch: declared={} actual={actual_dop}",
                 self.declared_dop
             ));
         }
         if driver_id < 0 || driver_id >= actual_dop {
-            let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+            self.fail();
             return Err(format!(
                 "aggregate final-domain driver id is outside the actual DOP: driver_id={driver_id} dop={actual_dop}"
             ));
         }
+        #[cfg(test)]
         let partition_id = PartitionId::new(driver_id as u32);
         let committer = self
-            .session
-            .partition(partition_id)
+            .completion
+            .claim_partition(execution::PartitionId::new(driver_id as u32))
             .map_err(|error| {
                 format!(
                     "aggregate final-domain partition acquisition failed for driver_id={driver_id}: {error}"
@@ -170,7 +182,9 @@ impl AggregateFinalDomainSessionBuilder {
     }
 
     fn fail(&self) {
-        let _ = self.session.fail(ProducerFailureReason::ExecutionFailed);
+        let _ = self
+            .completion
+            .fail(execution::RuntimeFilterProducerFailure::ExecutionFailed);
     }
 }
 
@@ -406,7 +420,7 @@ impl AggregateProcessorFactory {
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
         topn_producers: Vec<AggregateTopNRuntimeFilterProducerBinding>,
-        runtime_filter_context: Option<NativeRuntimeFilterExecutionContext>,
+        runtime_filter_session: Option<execution::RuntimeFilterSessionRef>,
         local_partition_count: i32,
         final_domain_session: Option<AggregateFinalDomainSessionBuilder>,
     ) -> Result<Self, String> {
@@ -460,15 +474,15 @@ impl AggregateProcessorFactory {
         let native_topn_session_factory = if topn_producers.is_empty() {
             None
         } else {
-            let context = runtime_filter_context.ok_or_else(|| {
+            let session = runtime_filter_session.ok_or_else(|| {
                 format!(
-                    "native aggregate TopN producer binding_id={} requires an installed runtime-filter context",
+                    "native aggregate TopN producer binding_id={} requires an execution runtime-filter session",
                     topn_producers[0].binding_id
                 )
             })?;
             Some(Arc::new(AggregateTopNProducerSessionFactory::from_plan(
                 &topn_producers,
-                &context,
+                session,
                 local_partition_count,
             )?))
         };
@@ -1211,8 +1225,9 @@ impl AggregateProcessorOperator {
             .expect("checked aggregate final-domain committer");
         #[cfg(test)]
         let observed_domain = domain.clone();
+        let domain = final_domain_payload(domain)?;
         if let Err(error) = partition.committer.seal(domain) {
-            if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
+            if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed {
                 return Ok(());
             }
             return Err(error.to_string());
@@ -1222,7 +1237,7 @@ impl AggregateProcessorOperator {
             observer(partition.partition_id, &observed_domain);
         }
         if let Err(error) = partition.committer.close() {
-            if error.kind() == RuntimeContractViolationKind::ServiceUnavailable {
+            if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed {
                 return Ok(());
             }
             return Err(error.to_string());
@@ -1709,6 +1724,8 @@ mod tests {
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_execution::runtime_filter as execution;
+    use novarocks_execution::runtime_filter::RuntimeFilterSession;
 
     use super::{
         AggregateFinalDomainSessionBuilder, AggregateProcessorFactory,
@@ -1738,7 +1755,9 @@ mod tests {
         MemoryAccountError, RuntimeFilterClock, RuntimeFilterMemoryAccount,
     };
     use crate::runtime_filter::port::value_domain::{MembershipValues, ValueDomainDelta};
-    use crate::runtime_filter::service::RuntimeFilterService;
+    use crate::runtime_filter::service::{
+        NativeRuntimeFilterExecutionContext, RuntimeFilterService,
+    };
 
     const RF_BINDING: BindingId = BindingId::new(10);
     const RF_CHANNEL: ChannelId = ChannelId::new(1);
@@ -1850,11 +1869,35 @@ mod tests {
             dop: i32,
             max_domain_canonical_bytes: usize,
         ) -> AggregateFinalDomainSessionBuilder {
-            let session = self
-                .service
-                .open_final_aggregate_producer(RF_BINDING, RF_INSTANCE, dop as u32)
-                .expect("final-domain completion session");
-            AggregateFinalDomainSessionBuilder::new(session, dop, max_domain_canonical_bytes)
+            let context = NativeRuntimeFilterExecutionContext::new(
+                Arc::clone(&self.service),
+                UniqueId::new(70, 0),
+                DeploymentEpoch::new(9),
+                RF_INSTANCE,
+            );
+            let resolved = context
+                .resolve_producer(
+                    RF_BINDING,
+                    RF_CHANNEL,
+                    crate::runtime_filter::port::producer::ProducerPortKind::FinalDomain,
+                )
+                .expect("installed final-domain producer resolves");
+            let request = execution::RuntimeFilterFinalDomainOpenRequest::new(
+                execution::RuntimeFilterProducerContract::new(
+                    execution::RuntimeFilterBindingId::new(RF_BINDING.get()),
+                    execution::RuntimeFilterChannelId::new(RF_CHANNEL.get()),
+                    execution::RuntimeFilterProducerKind::FinalDomain,
+                    resolved.execution_contract(),
+                ),
+                dop as u32,
+            );
+            let execution::RuntimeFilterBindOutcome::Bound(completion) = context
+                .open_final_domain_completion(request)
+                .expect("final-domain completion capability opens")
+            else {
+                panic!("installed final-domain producer must be available")
+            };
+            AggregateFinalDomainSessionBuilder::new(completion, dop, max_domain_canonical_bytes)
                 .expect("aggregate final-domain session builder")
         }
 

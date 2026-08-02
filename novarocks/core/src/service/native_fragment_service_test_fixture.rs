@@ -57,7 +57,7 @@ use crate::runtime::profile::{ProfileUnit, Profiler};
 use crate::runtime::query_context::{QueryContextManager, QueryId, query_context_manager};
 use crate::runtime::query_options::{QueryOptions, query_expire_durations};
 use crate::runtime::result_buffer;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 fn profile_report_interval_ns(
     enable_profile: bool,
@@ -93,7 +93,7 @@ fn spawn_exec_fragment_native(
     uses_fetch_result_buffer: bool,
     finst_id: UniqueId,
     query_id: QueryId,
-    runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    runtime_filter: Option<RuntimeFilterSessionRef>,
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
     mgr: Arc<QueryContextManager>,
@@ -234,11 +234,14 @@ fn prepare_native_query_before_fragment_registration(
     finst_id: UniqueId,
     query_opts: &QueryOptions,
     has_runtime_filter_bindings: bool,
-) -> Result<Option<NativeRuntimeFilterExecutionContext>, String> {
+) -> Result<Option<RuntimeFilterSessionRef>, String> {
     let (delivery_expire, query_expire) = query_expire_durations(Some(query_opts));
     mgr.ensure_native_context(query_id, false, delivery_expire, query_expire)?;
     let runtime_filter = if has_runtime_filter_bindings {
-        Some(mgr.runtime_filter_context_for_native_execution(query_id, finst_id)?)
+        Some(
+            Arc::new(mgr.runtime_filter_context_for_native_execution(query_id, finst_id)?)
+                as RuntimeFilterSessionRef,
+        )
     } else {
         None
     };
@@ -475,14 +478,16 @@ mod tests {
             ..Default::default()
         };
 
-        let error = prepare_native_query_before_fragment_registration(
+        let error = match prepare_native_query_before_fragment_registration(
             manager.as_ref(),
             query_id,
             finst_id,
             &conflicting_query_options,
             true,
-        )
-        .expect_err("cache conflict must fail after strict Service acquisition");
+        ) {
+            Ok(_) => panic!("cache conflict must fail after strict Service acquisition"),
+            Err(error) => error,
+        };
 
         assert!(error.contains("cache options mismatch"), "{error}");
         assert_eq!(manager.fragment_counts_for_test(query_id), Some((0, 0)));

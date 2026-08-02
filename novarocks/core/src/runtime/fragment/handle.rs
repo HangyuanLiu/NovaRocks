@@ -45,12 +45,12 @@ use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
-use crate::runtime_filter::service::NativeRuntimeFilterExecutionContext;
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 
 pub struct FragmentPrepareContext {
     profiler: Option<Profiler>,
     mem_tracker: Option<Arc<MemTracker>>,
-    runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+    runtime_filter: Option<RuntimeFilterSessionRef>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
@@ -95,7 +95,7 @@ impl FragmentPrepareContext {
     pub(crate) fn new(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
-        runtime_filter: Option<NativeRuntimeFilterExecutionContext>,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
@@ -509,7 +509,7 @@ pub fn prepare_fragment(
                 fragment_instance_id: Some(finst_id),
                 backend_num: Some(instance.backend_num().get()),
                 mem_tracker: context.mem_tracker.clone(),
-                native_runtime_filter_context: context.runtime_filter.clone(),
+                runtime_filter_session: context.runtime_filter.clone(),
                 connector_staged_report_collector: program
                     .sink()
                     .program()

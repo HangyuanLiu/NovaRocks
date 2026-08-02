@@ -1330,7 +1330,7 @@ fn native_contract(contract: &DecodedRuntimeFilterContract) -> RuntimeFilterExec
             comparator_digest,
             order_contract_digest,
         } => RuntimeFilterExecutionContract::Ordered {
-            keys: Arc::clone(keys),
+            keys: crate::exec::node::runtime_filter::execution_order_keys(keys),
             comparator_digest: *comparator_digest,
             order_contract_digest: *order_contract_digest,
         },
@@ -2837,11 +2837,11 @@ mod tests {
         assert_eq!(keys[0].data_type(), &DataType::Int64);
         assert_eq!(
             keys[0].direction(),
-            crate::runtime_filter::model::contract::SortDirection::Descending
+            novarocks_execution::runtime_filter::RuntimeOrderSortDirection::Descending
         );
         assert_eq!(
             keys[0].null_order(),
-            crate::runtime_filter::model::contract::NullOrder::First
+            novarocks_execution::runtime_filter::RuntimeOrderNullOrder::First
         );
         assert_ne!(*comparator_digest, [0; 32]);
         assert_ne!(*order_contract_digest, [0; 32]);
