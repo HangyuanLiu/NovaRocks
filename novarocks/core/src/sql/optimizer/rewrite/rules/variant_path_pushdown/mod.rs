@@ -105,11 +105,8 @@ mod tests {
         }
     }
 
-    fn starrocks_source() -> ScanSource {
-        ScanSource::StarRocks {
-            db_id: 1,
-            table_id: 2,
-        }
+    fn connector_pinned_source() -> ScanSource {
+        ScanSource::ConnectorPinned
     }
 
     fn scan_with_source(
@@ -741,7 +738,7 @@ mod tests {
         ] {
             let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
             let source = if name == "non_iceberg_scan" {
-                starrocks_source()
+                connector_pinned_source()
             } else {
                 iceberg_source()
             };

@@ -229,19 +229,10 @@ is_allowed_aws_hit() {
     novarocks/fs/src/*) return 0 ;;
     novarocks/core/src/fs/object_store_credentials.rs) return 0 ;;
     novarocks/core/src/fs/object_store.rs) return 0 ;;
-    novarocks/core/src/connector/starrocks/object_store_profile.rs) return 0 ;;
     novarocks/core/src/connector/iceberg/fs_io.rs) return 0 ;;
     novarocks/core/src/connector/iceberg/catalog/registry.rs) return 0 ;;
     novarocks/core/src/connector/iceberg/stats.rs) return 0 ;;
     novarocks/core/src/connector/iceberg/sink_plan.rs) return 0 ;;
-  esac
-  case "$file:$text" in
-    novarocks/core/src/connector/starrocks/scan/op.rs:*'provide aws.s3.*'* ) return 0 ;;
-    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.endpoint"'* ) return 0 ;;
-    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeyId"'* ) return 0 ;;
-    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.accessKeySecret"'* ) return 0 ;;
-    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.region"'* ) return 0 ;;
-    novarocks/core/src/runtime/starlet_shard_registry.rs:*'"aws.s3.enable_path_style_access"'* ) return 0 ;;
   esac
   return 1
 }

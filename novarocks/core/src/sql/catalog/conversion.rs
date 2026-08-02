@@ -27,12 +27,6 @@ impl CatalogRuntimeMetadata {
         table_def: &TableDef,
     ) -> Result<Self, String> {
         let binding = match &table_def.source {
-            ScanSource::StarRocks { .. } => {
-                return Err(format!(
-                    "StarRocks scan source {}.{}.{} requires an external connector binding; native session catalogs cannot register internal StarRocks tables",
-                    identity.catalog, identity.namespace, identity.table
-                ));
-            }
             ScanSource::IcebergDataFiles {
                 table,
                 cloud_properties,

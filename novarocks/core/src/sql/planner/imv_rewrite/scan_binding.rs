@@ -172,7 +172,7 @@ fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableIn
         | ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => Ok(table),
         ScanSource::ConnectorPinned
-        | ScanSource::StarRocks { .. }
+        | ScanSource::ConnectorPinned
         | ScanSource::IcebergMvTargetState { .. }
         | ScanSource::IcebergMvTargetLocator { .. } => {
             Err("BindIcebergScan only supports Iceberg scan sources".to_string())

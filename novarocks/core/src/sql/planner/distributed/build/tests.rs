@@ -3653,10 +3653,7 @@ fn table_def() -> TableDef {
         name: "t".to_string(),
         columns: vec![column_def("k", DataType::Int64, false)],
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::StarRocks {
-            db_id: 1,
-            table_id: 2,
-        },
+        source: ScanSource::ConnectorPinned,
     }
 }
 
@@ -3668,10 +3665,7 @@ fn table_def_with_columns(columns: &[OutputColumn]) -> TableDef {
             .map(|column| column_def(&column.name, column.data_type.clone(), column.nullable))
             .collect(),
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::StarRocks {
-            db_id: 1,
-            table_id: 2,
-        },
+        source: ScanSource::ConnectorPinned,
     }
 }
 

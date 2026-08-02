@@ -39,7 +39,6 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::descriptor_snapshot::LookupNodesInfo;
-use crate::runtime::descriptor_snapshot::is_lake_row_position;
 use crate::runtime::fragment::io::{
     FragmentLookupClient, LookupColumn, LookupKind, LookupRequest, LookupTarget,
 };
@@ -175,14 +174,7 @@ impl FetchProcessor {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-            let is_lake = is_lake_row_position(row_pos_desc.row_position_type);
-            if is_lake {
-                return Err(
-                    "lake late-materialization lookup is retired; row-position virtual columns are not part of the fragment kernel"
-                        .to_string(),
-                );
-            }
-            let expected_ref_slots = if is_lake { 3 } else { 2 };
+            let expected_ref_slots = 2;
             if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(
                     "FETCH_NODE node_id={} expects {} fetch_ref_slots, got {}",

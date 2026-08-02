@@ -62,7 +62,6 @@ pub(crate) mod write_descriptor;
 pub(crate) mod write_execution;
 pub(crate) mod write_service;
 
-pub use metadata::plan_compat_iceberg_metadata_read_source;
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanRange,
     IcebergMetadataTableType,
@@ -71,20 +70,10 @@ pub use metadata::{
     plan_native_iceberg_metadata_read_source,
     plan_native_iceberg_metadata_read_source_with_cancellation,
 };
-pub use provider::{
-    COMPAT_ICEBERG_INSTANCE_ID, build_compat_delta_read_splits, build_compat_read_splits,
-};
+pub(crate) use schema::build_projected_output_schema_from_scan_model;
 pub use schema::{
     IcebergArrowColumn, IcebergPartitionInfo, IcebergSchemaDescriptor,
     IcebergSchemaFieldDescriptor, IcebergTableColumn, IcebergTableDescriptor,
     apply_field_id_recursive, build_full_output_schema, build_projected_output_schema,
 };
-pub(crate) use schema::{
-    build_projected_output_schema_from_descriptor, build_projected_output_schema_from_scan_model,
-};
 pub use sink_plan::IcebergSinkMode;
-pub use write_contract::{
-    CompatIcebergColumnStats, CompatIcebergDataFile, CompatIcebergFileContent,
-    CompatIcebergPartitionValue, CompatIcebergSinkCommitInfo, plan_compat_connector_write,
-    project_compat_sink_commit_infos,
-};

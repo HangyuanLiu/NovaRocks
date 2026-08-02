@@ -714,10 +714,7 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 1,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 columns: vec![
@@ -762,10 +759,7 @@ mod tests {
                     name: "part".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 2,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 columns: vec![
@@ -803,10 +797,7 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 1,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 columns: vec![
@@ -1574,10 +1565,7 @@ mod tests {
                     name: "other".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 99,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 columns: vec![

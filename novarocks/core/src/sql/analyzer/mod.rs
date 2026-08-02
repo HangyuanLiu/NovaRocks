@@ -4085,10 +4085,7 @@ mod tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::StarRocks {
-                            db_id: 0,
-                            table_id: 0,
-                        },
+                        source: ScanSource::ConnectorPinned,
                     })
                 }
                 "array_test" => Ok(TableDef {
@@ -4138,10 +4135,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "orders" => Ok(TableDef {
                     name: "orders".to_string(),
@@ -4190,10 +4184,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "lineitem" => Ok(TableDef {
                     name: "lineitem".to_string(),
@@ -4263,10 +4254,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "supplier" => Ok(TableDef {
                     name: "supplier".to_string(),
@@ -4294,10 +4282,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "part" => Ok(TableDef {
                     name: "part".to_string(),
@@ -4325,10 +4310,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "partsupp" => Ok(TableDef {
                     name: "partsupp".to_string(),
@@ -4363,10 +4345,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "customer" => Ok(TableDef {
                     name: "customer".to_string(),
@@ -4394,10 +4373,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 "nation" => Ok(TableDef {
                     name: "nation".to_string(),
@@ -4418,10 +4394,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 }),
                 // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
                 // table exposing the row-lineage metadata pseudo-columns
@@ -6649,7 +6622,11 @@ mod tests {
     struct CatalogAwareTestCatalog;
 
     impl CatalogAwareTestCatalog {
-        fn starrocks_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
+        fn connector_pinned_table_def(
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> TableDef {
             let catalog_name = catalog.unwrap_or("default_catalog");
             TableDef {
                 name: format!("{catalog_name}_{database}_{table}"),
@@ -6661,15 +6638,12 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: if catalog == Some("ice") { 100 } else { 1 },
-                    table_id: 2,
-                },
+                source: ScanSource::ConnectorPinned,
             }
         }
 
         fn iceberg_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
-            let mut table_def = Self::starrocks_table_def(catalog, database, table);
+            let mut table_def = Self::connector_pinned_table_def(catalog, database, table);
             table_def.source = ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info_for(
                     catalog.unwrap_or("default_catalog"),
@@ -6695,7 +6669,7 @@ mod tests {
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog,
                 database,
-                Self::starrocks_table_def(catalog, database, table),
+                Self::connector_pinned_table_def(catalog, database, table),
             ))
         }
 

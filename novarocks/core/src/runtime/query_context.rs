@@ -32,7 +32,6 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::protocol::native::RuntimeFilterQueryLifecycleOptions;
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
 use crate::runtime::mem_tracker::{self, MemTracker};
-pub(crate) use crate::runtime::query_options::query_expire_durations;
 use crate::runtime::runtime_filter_observability::{
     QueryKey, RegistryRuntimeFilterEventSink, RuntimeFilterLifecycleRegistry,
 };
@@ -48,24 +47,8 @@ use novarocks_types::UniqueId;
 pub(crate) use novarocks_types::QueryId;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct StarRocksQueryGeneration(NonZeroU64);
-
-impl StarRocksQueryGeneration {
-    pub(crate) fn new(generation: u64) -> Result<Self, String> {
-        NonZeroU64::new(generation)
-            .map(Self)
-            .ok_or_else(|| "StarRocks query generation must be non-zero".to_string())
-    }
-
-    pub(crate) const fn get(self) -> u64 {
-        self.0.get()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum QueryExecutionGeneration {
     Native(NonZeroU64),
-    StarRocks(StarRocksQueryGeneration),
 }
 
 fn legacy_native_attempt() -> NonZeroU64 {
@@ -80,8 +63,7 @@ pub(crate) struct QueryExecutionKey {
 
 impl QueryExecutionKey {
     /// Legacy native callers predate lifecycle attempts. New native lifecycle
-    /// code must use `native_attempt`; keeping this constructor preserves the
-    /// standalone/compat-neutral internal helpers until their owners migrate.
+    /// code must use `native_attempt`.
     pub(crate) fn native(query_id: QueryId) -> Self {
         Self {
             query_id,
@@ -96,28 +78,13 @@ impl QueryExecutionKey {
         }
     }
 
-    pub(crate) const fn starrocks(query_id: QueryId, generation: StarRocksQueryGeneration) -> Self {
-        Self {
-            query_id,
-            generation: QueryExecutionGeneration::StarRocks(generation),
-        }
-    }
-
     pub(crate) const fn query_id(self) -> QueryId {
         self.query_id
-    }
-
-    pub(crate) const fn starrocks_generation(self) -> Option<StarRocksQueryGeneration> {
-        match self.generation {
-            QueryExecutionGeneration::Native(_) => None,
-            QueryExecutionGeneration::StarRocks(generation) => Some(generation),
-        }
     }
 
     pub(crate) const fn native_attempt_id(self) -> Option<NonZeroU64> {
         match self.generation {
             QueryExecutionGeneration::Native(attempt) => Some(attempt),
-            QueryExecutionGeneration::StarRocks(_) => None,
         }
     }
 }
@@ -125,8 +92,6 @@ impl QueryExecutionKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueryContextGeneration {
     Native(NonZeroU64),
-    StarRocksUnbound,
-    StarRocks(StarRocksQueryGeneration),
 }
 
 pub struct QueryCleanupLease {
@@ -201,9 +166,7 @@ pub(crate) struct QueryContext {
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
     pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
-    pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
-    starrocks_preparing_admissions: usize,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
@@ -398,9 +361,7 @@ impl QueryContext {
             row_pos_descs: HashMap::new(),
             lookup_fetchers: HashMap::new(),
             connector_glm_contexts: HashMap::new(),
-            lake_tablet_paths: HashMap::new(),
             mem_tracker,
-            starrocks_preparing_admissions: 0,
             cleanup_leases: Vec::new(),
         }
     }
@@ -412,47 +373,15 @@ impl QueryContext {
                 (
                     QueryContextGeneration::Native(_),
                     QueryExecutionGeneration::Native(_)
-                ) | (
-                    QueryContextGeneration::StarRocks(_),
-                    QueryExecutionGeneration::StarRocks(_)
                 )
             )
             && match (self.execution_generation, key.generation) {
-                (
-                    QueryContextGeneration::StarRocks(current),
-                    QueryExecutionGeneration::StarRocks(requested),
-                ) => current == requested,
                 (
                     QueryContextGeneration::Native(current),
                     QueryExecutionGeneration::Native(requested),
                 ) => current == requested,
                 _ => false,
             }
-    }
-
-    #[cfg(test)]
-    fn bind_starrocks_generation(
-        &mut self,
-        generation: StarRocksQueryGeneration,
-    ) -> Result<(), String> {
-        match self.execution_generation {
-            QueryContextGeneration::StarRocksUnbound if self.num_fragments == 0 => {
-                self.execution_generation = QueryContextGeneration::StarRocks(generation);
-                Ok(())
-            }
-            QueryContextGeneration::StarRocks(current) if current == generation => Ok(()),
-            QueryContextGeneration::StarRocksUnbound => {
-                Err("cannot bind StarRocks generation after fragment registration".to_string())
-            }
-            QueryContextGeneration::StarRocks(current) => Err(format!(
-                "StarRocks query generation mismatch: current={} requested={}",
-                current.get(),
-                generation.get()
-            )),
-            QueryContextGeneration::Native(_) => {
-                Err("cannot bind StarRocks generation to native query context".to_string())
-            }
-        }
     }
 
     pub(crate) fn increment_num_fragments(&mut self) {
@@ -657,14 +586,6 @@ impl QueryContext {
     pub(crate) fn cache_options(&self) -> Option<CacheOptions> {
         self.cache_options.clone()
     }
-
-    pub(crate) fn set_lake_tablet_paths(&mut self, cache_key: String, paths: HashMap<i64, String>) {
-        self.lake_tablet_paths.insert(cache_key, paths);
-    }
-
-    pub(crate) fn lake_tablet_paths(&self, cache_key: &str) -> Option<HashMap<i64, String>> {
-        self.lake_tablet_paths.get(cache_key).cloned()
-    }
 }
 
 fn new_runtime_filter_service(
@@ -864,19 +785,6 @@ pub(crate) struct FragmentFinishReportDecision {
 pub(crate) struct FinstCancelResult {
     pub(crate) query_id: Option<QueryId>,
     pub(crate) finsts: Vec<UniqueId>,
-}
-
-pub(crate) struct StarRocksQueryHandoff {
-    pub(crate) execution: QueryExecutionKey,
-    pub(crate) delivery_expire: Duration,
-    pub(crate) query_expire: Duration,
-    pub(crate) fragment_count: usize,
-    pub(crate) cache_options: CacheOptions,
-    pub(crate) descriptor_snapshot: Option<Arc<DescriptorSnapshot>>,
-    pub(crate) total_fragments: Option<usize>,
-    pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
-    pub(crate) instances: Vec<(UniqueId, HashMap<i32, Option<SlotId>>)>,
 }
 
 impl QueryContextManager {
@@ -1944,98 +1852,6 @@ impl QueryContextManager {
         }
     }
 
-    pub(crate) fn get_or_register_compat(
-        &self,
-        query_id: QueryId,
-        return_error_if_not_exist: bool,
-        delivery_expire: Duration,
-        query_expire: Duration,
-    ) -> Result<(), String> {
-        self.get_or_register_internal_with_generation(
-            query_id,
-            return_error_if_not_exist,
-            delivery_expire,
-            query_expire,
-            true,
-            QueryContextGeneration::StarRocksUnbound,
-            false,
-        )
-    }
-
-    pub(crate) fn ensure_compat_context(
-        &self,
-        query_id: QueryId,
-        return_error_if_not_exist: bool,
-        delivery_expire: Duration,
-        query_expire: Duration,
-    ) -> Result<(), String> {
-        self.get_or_register_internal_with_generation(
-            query_id,
-            return_error_if_not_exist,
-            delivery_expire,
-            query_expire,
-            false,
-            QueryContextGeneration::StarRocksUnbound,
-            false,
-        )
-    }
-
-    pub(crate) fn prepare_starrocks_admission(
-        &self,
-        query_id: QueryId,
-        delivery_expire: Duration,
-        query_expire: Duration,
-        cache_options: CacheOptions,
-    ) -> Result<Arc<MemTracker>, String> {
-        self.ensure_compat_context(query_id, false, delivery_expire, query_expire)?;
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let context = if guard.active.contains_key(&query_id) {
-            guard.active.get_mut(&query_id).expect("checked active")
-        } else {
-            guard
-                .second_chance
-                .get_mut(&query_id)
-                .ok_or_else(|| "QueryContext disappeared during StarRocks admission".to_string())?
-        };
-        context.set_cache_options(cache_options)?;
-        context.starrocks_preparing_admissions += 1;
-        Ok(context.mem_tracker())
-    }
-
-    pub(crate) fn release_starrocks_admission(&self, query_id: QueryId) {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let location = if guard.active.contains_key(&query_id) {
-            Some(true)
-        } else if guard.second_chance.contains_key(&query_id) {
-            Some(false)
-        } else {
-            None
-        };
-        let Some(in_active) = location else {
-            return;
-        };
-        let context = if in_active {
-            guard.active.get_mut(&query_id).expect("checked active")
-        } else {
-            guard
-                .second_chance
-                .get_mut(&query_id)
-                .expect("checked second chance")
-        };
-        context.starrocks_preparing_admissions =
-            context.starrocks_preparing_admissions.saturating_sub(1);
-        let remove = context.starrocks_preparing_admissions == 0
-            && context.execution_generation == QueryContextGeneration::StarRocksUnbound
-            && context.num_fragments == 0;
-        if remove {
-            if in_active {
-                guard.active.remove(&query_id);
-            } else {
-                guard.second_chance.remove(&query_id);
-            }
-        }
-    }
-
     fn ensure_context(
         &self,
         query_id: QueryId,
@@ -2146,187 +1962,6 @@ impl QueryContextManager {
         }
         guard.active.insert(query_id, ctx);
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_or_register_compat_generation(
-        &self,
-        execution: QueryExecutionKey,
-        return_error_if_not_exist: bool,
-        delivery_expire: Duration,
-        query_expire: Duration,
-    ) -> Result<(), String> {
-        let generation = execution
-            .starrocks_generation()
-            .ok_or_else(|| "compat query registration requires StarRocks generation".to_string())?;
-        let query_id = execution.query_id();
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if guard
-            .finst_to_query
-            .values()
-            .any(|existing| existing.query_id() == query_id && *existing != execution)
-        {
-            return Err(format!(
-                "previous StarRocks query generation still has fragment routing: query_id={query_id}"
-            ));
-        }
-        if let Some(ctx) = guard.active.get_mut(&query_id) {
-            ctx.bind_starrocks_generation(generation)?;
-            ctx.increment_num_fragments();
-            return Ok(());
-        }
-        if guard.second_chance.contains_key(&query_id) {
-            guard
-                .second_chance
-                .get_mut(&query_id)
-                .expect("checked")
-                .bind_starrocks_generation(generation)?;
-            let mut ctx = guard.second_chance.remove(&query_id).expect("checked");
-            ctx.increment_num_fragments();
-            guard.active.insert(query_id, ctx);
-            return Ok(());
-        }
-        if return_error_if_not_exist {
-            return Err("Query terminates prematurely (missing QueryContext)".to_string());
-        }
-        let mut ctx = QueryContext::new_with_generation(
-            query_id,
-            QueryContextGeneration::StarRocks(generation),
-            delivery_expire,
-            query_expire,
-        );
-        ctx.increment_num_fragments();
-        guard.active.insert(query_id, ctx);
-        Ok(())
-    }
-
-    pub(crate) fn commit_starrocks_handoff<F>(
-        &self,
-        handoff: StarRocksQueryHandoff,
-        make_cleanup_lease: F,
-    ) -> Result<Arc<MemTracker>, String>
-    where
-        F: FnOnce() -> Option<QueryCleanupLease>,
-    {
-        let generation = handoff
-            .execution
-            .starrocks_generation()
-            .ok_or_else(|| "StarRocks handoff requires query generation".to_string())?;
-        if handoff.fragment_count == 0 || handoff.fragment_count != handoff.instances.len() {
-            return Err("StarRocks handoff fragment count does not match instances".to_string());
-        }
-
-        let query_id = handoff.execution.query_id();
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if guard
-            .finst_to_query
-            .values()
-            .any(|existing| existing.query_id() == query_id && *existing != handoff.execution)
-        {
-            return Err(format!(
-                "previous StarRocks query generation still has fragment routing: query_id={query_id}"
-            ));
-        }
-        let mut incoming_finsts = HashSet::with_capacity(handoff.instances.len());
-        for (finst_id, _) in &handoff.instances {
-            if !incoming_finsts.insert(*finst_id) {
-                return Err(format!(
-                    "duplicate fragment instance in StarRocks handoff: finst_id={finst_id}"
-                ));
-            }
-            if let Some(existing) = guard.finst_to_query.get(finst_id) {
-                return Err(format!(
-                    "fragment instance is already registered: finst_id={finst_id} execution={existing:?}"
-                ));
-            }
-        }
-
-        let existing = guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id));
-        if let Some(context) = existing {
-            match context.execution_generation {
-                QueryContextGeneration::StarRocksUnbound if context.num_fragments == 0 => {}
-                QueryContextGeneration::StarRocks(current) if current == generation => {}
-                QueryContextGeneration::StarRocksUnbound => {
-                    return Err(
-                        "cannot bind StarRocks generation after fragment registration".to_string(),
-                    );
-                }
-                QueryContextGeneration::StarRocks(current) => {
-                    return Err(format!(
-                        "StarRocks query generation mismatch: current={} requested={}",
-                        current.get(),
-                        generation.get()
-                    ));
-                }
-                QueryContextGeneration::Native(_) => {
-                    return Err(
-                        "cannot bind StarRocks generation to native query context".to_string()
-                    );
-                }
-            }
-            if context
-                .cache_options
-                .as_ref()
-                .is_some_and(|current| current != &handoff.cache_options)
-            {
-                return Err("cache options mismatch for query".to_string());
-            }
-            context.validate_row_pos_descs(&handoff.row_pos_descs)?;
-        }
-
-        // All fallible checks finish before the descriptor lease is created or any Q state is
-        // published. The caller may therefore keep the descriptor-cache lock across this call
-        // without risking a cleanup-lease drop while that lock is held.
-        let cleanup_lease = make_cleanup_lease();
-        let mut context = if let Some(context) = guard.active.remove(&query_id) {
-            context
-        } else if let Some(context) = guard.second_chance.remove(&query_id) {
-            context
-        } else {
-            QueryContext::new_with_generation(
-                query_id,
-                QueryContextGeneration::StarRocks(generation),
-                handoff.delivery_expire,
-                handoff.query_expire,
-            )
-        };
-        if context.execution_generation == QueryContextGeneration::StarRocksUnbound {
-            context.execution_generation = QueryContextGeneration::StarRocks(generation);
-        }
-        if context.cache_options.is_none() {
-            context.cache_options = Some(handoff.cache_options);
-        }
-        if let Some(snapshot) = handoff.descriptor_snapshot {
-            context.desc_snapshot = Some(snapshot);
-        }
-        if let Some(total_fragments) = handoff.total_fragments {
-            context.total_fragments = Some(
-                context
-                    .total_fragments
-                    .map_or(total_fragments, |current| current.max(total_fragments)),
-            );
-        }
-        for (tuple_id, descriptor) in handoff.row_pos_descs {
-            context.row_pos_descs.entry(tuple_id).or_insert(descriptor);
-        }
-        context.register_lookup_fetchers(&handoff.lookup_fetchers);
-        context.num_fragments += handoff.fragment_count;
-        context.num_active_fragments += handoff.fragment_count;
-        if let Some(lease) = cleanup_lease {
-            context.attach_cleanup_lease(lease);
-        }
-        let mem_tracker = context.mem_tracker();
-        guard.active.insert(query_id, context);
-        for (finst_id, contracts) in handoff.instances {
-            guard.finst_to_query.insert(finst_id, handoff.execution);
-            guard
-                .incremental_change_op_slots
-                .insert(finst_id, contracts);
-        }
-        Ok(mem_tracker)
     }
 
     pub(crate) fn with_context_mut<T, F>(&self, query_id: QueryId, f: F) -> Result<T, String>
@@ -2508,31 +2143,6 @@ impl QueryContextManager {
             claim.install.epoch(),
             fragment_instance_id,
         ))
-    }
-
-    pub(crate) fn set_lake_tablet_paths(
-        &self,
-        query_id: QueryId,
-        cache_key: String,
-        paths: HashMap<i64, String>,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.set_lake_tablet_paths(cache_key, paths);
-            Ok(())
-        })
-    }
-
-    pub(crate) fn lake_tablet_paths(
-        &self,
-        query_id: QueryId,
-        cache_key: &str,
-    ) -> Option<HashMap<i64, String>> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.lake_tablet_paths(cache_key))
     }
 
     pub(crate) fn register_row_pos_descs(
@@ -2800,32 +2410,6 @@ impl QueryContextManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn register_starrocks_finsts<I>(
-        &self,
-        finst_ids: I,
-        execution: QueryExecutionKey,
-    ) -> Result<(), String>
-    where
-        I: IntoIterator<Item = UniqueId>,
-    {
-        if execution.starrocks_generation().is_none() {
-            return Err("StarRocks finst registration requires generation".to_string());
-        }
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        let context = guard
-            .active
-            .get(&execution.query_id())
-            .ok_or_else(|| "QueryContext not found".to_string())?;
-        if !context.matches_execution(execution) {
-            return Err("StarRocks query generation is not active".to_string());
-        }
-        for finst_id in finst_ids {
-            guard.finst_to_query.insert(finst_id, execution);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
     pub(crate) fn register_finsts_with_incremental_contracts<I>(
         &self,
         instances: I,
@@ -2977,55 +2561,6 @@ impl QueryContextManager {
         guard.incremental_scan_nodes.remove(&finst_id);
         guard.pending_incremental_scan_ranges.remove(&finst_id);
         guard.incremental_change_op_slots.remove(&finst_id);
-    }
-
-    /// Undo a StarRocks batch handoff before its shared start gate is released.
-    ///
-    /// The handoff publishes every fragment route and the query context atomically.
-    /// Its adapter-side rollback therefore removes the same complete route set and
-    /// drops the context, including descriptor cleanup leases, as one operation.
-    pub(crate) fn rollback_starrocks_handoff(
-        &self,
-        execution: QueryExecutionKey,
-        fragment_instance_ids: &[UniqueId],
-    ) -> bool {
-        let query_id = execution.query_id();
-        let removed = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let context_matches = guard
-                .active
-                .get(&query_id)
-                .is_some_and(|context| context.matches_execution(execution));
-            let registered = guard
-                .finst_to_query
-                .iter()
-                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
-                .collect::<HashSet<_>>();
-            let requested = fragment_instance_ids
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>();
-            if !context_matches || requested != registered {
-                return false;
-            }
-
-            for finst_id in fragment_instance_ids.iter().rev() {
-                guard.finst_to_query.remove(finst_id);
-                guard.incremental_scan_nodes.remove(finst_id);
-                guard.pending_incremental_scan_ranges.remove(finst_id);
-                guard.incremental_change_op_slots.remove(finst_id);
-            }
-            guard.active.remove(&query_id)
-        };
-
-        if let Some(context) = removed {
-            context.runtime_filter_service().shutdown();
-            drop(context);
-            self.remove_runtime_filter_lifecycle_if_context_absent(query_id);
-            true
-        } else {
-            false
-        }
     }
 
     pub(crate) fn get_query_timeout_by_finst(&self, finst_id: UniqueId) -> Option<Duration> {
@@ -3552,107 +3087,6 @@ mod fragment_cancellation_boundary_tests {
 }
 
 #[cfg(test)]
-mod generation_race_tests {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::Duration;
-
-    use crate::common::types::UniqueId;
-
-    use super::{
-        QueryContextManager, QueryContextManagerInner, QueryExecutionKey, QueryId,
-        StarRocksQueryGeneration,
-    };
-
-    fn test_manager() -> Arc<QueryContextManager> {
-        Arc::new(QueryContextManager {
-            inner: Mutex::new(QueryContextManagerInner::default()),
-            stopped: AtomicBool::new(false),
-        })
-    }
-
-    #[test]
-    fn cancel_resolution_is_atomic_with_old_generation_drain_and_reuse() {
-        let manager = test_manager();
-        let query_id = QueryId::new(86_001, 86_002);
-        let old_finst = UniqueId::new(86_003, 86_004);
-        let new_finst = UniqueId::new(86_005, 86_006);
-        let old_execution = QueryExecutionKey::starrocks(
-            query_id,
-            StarRocksQueryGeneration::new(1).expect("old generation"),
-        );
-        let new_execution = QueryExecutionKey::starrocks(
-            query_id,
-            StarRocksQueryGeneration::new(2).expect("new generation"),
-        );
-        manager
-            .get_or_register_compat_generation(
-                old_execution,
-                false,
-                Duration::from_secs(60),
-                Duration::from_secs(60),
-            )
-            .expect("old context");
-        manager
-            .register_starrocks_finsts([old_finst], old_execution)
-            .expect("old routing");
-
-        let (resolved_tx, resolved_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let cancel_manager = Arc::clone(&manager);
-        let cancel = std::thread::spawn(move || {
-            cancel_manager.cancel_finst_with_binding_observer(
-                old_finst,
-                "old generation cancel".to_string(),
-                || {
-                    resolved_tx.send(()).expect("signal resolved binding");
-                    release_rx.recv().expect("release cancel lock");
-                },
-            )
-        });
-        resolved_rx.recv().expect("cancel resolved old binding");
-
-        let (reuse_started_tx, reuse_started_rx) = mpsc::channel();
-        let reuse_manager = Arc::clone(&manager);
-        let reuse = std::thread::spawn(move || {
-            reuse_started_tx.send(()).expect("signal reuse attempt");
-            reuse_manager.unregister_finst_execution(old_finst, old_execution);
-            reuse_manager.finish_fragment_execution(old_execution);
-            reuse_manager
-                .get_or_register_compat_generation(
-                    new_execution,
-                    false,
-                    Duration::from_secs(60),
-                    Duration::from_secs(60),
-                )
-                .expect("new context after old routing drain");
-            reuse_manager
-                .register_starrocks_finsts([new_finst], new_execution)
-                .expect("new routing");
-        });
-        reuse_started_rx.recv().expect("reuse thread started");
-        release_tx.send(()).expect("release cancel lock");
-
-        let cancelled = cancel.join().expect("cancel thread");
-        reuse.join().expect("reuse thread");
-        assert_eq!(cancelled.query_id, Some(query_id));
-        assert_eq!(cancelled.finsts, vec![old_finst]);
-        assert_eq!(
-            manager.query_execution_by_finst(new_finst),
-            Some(new_execution)
-        );
-        assert!(
-            !manager.is_query_canceled(query_id),
-            "old cancellation must only touch the service captured for its generation"
-        );
-
-        manager.unregister_finst_execution(new_finst, new_execution);
-        manager.cancel_query_execution(new_execution, "test cleanup".to_string());
-        manager.finish_fragment_execution(new_execution);
-    }
-}
-
-#[cfg(test)]
 mod lookup_lifecycle_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -4134,69 +3568,6 @@ mod incremental_scan_domain_tests {
             manager
                 .pending_incremental_scan_ranges_for_test(finst_id, 42)
                 .is_empty()
-        );
-    }
-}
-
-#[cfg(test)]
-mod row_position_descriptor_tests {
-    use std::collections::HashMap;
-
-    use super::{QueryContext, QueryId};
-    use crate::common::ids::SlotId;
-    use crate::exec::row_position::{RowPositionDescriptor, RowPositionType};
-
-    fn descriptor(row_source_slot: u32) -> RowPositionDescriptor {
-        RowPositionDescriptor {
-            row_position_type: RowPositionType::Lake,
-            row_source_slot: SlotId::new(row_source_slot),
-            fetch_ref_slots: vec![SlotId::new(12), SlotId::new(13), SlotId::new(14)],
-            lookup_ref_slots: vec![SlotId::new(15)],
-        }
-    }
-
-    #[test]
-    fn row_position_registration_is_idempotent_and_merges_distinct_tuples() {
-        let mut context = QueryContext::new(
-            QueryId::new(71, 72),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(1),
-        );
-        context
-            .merge_row_pos_descs(HashMap::from([(3, descriptor(11))]))
-            .expect("register lookup descriptor");
-        context
-            .merge_row_pos_descs(HashMap::from([(3, descriptor(11)), (4, descriptor(21))]))
-            .expect("idempotent registration and distinct tuple merge");
-
-        assert_eq!(
-            context.row_pos_desc(3).unwrap().row_source_slot,
-            SlotId::new(11)
-        );
-        assert_eq!(
-            context.row_pos_desc(4).unwrap().row_source_slot,
-            SlotId::new(21)
-        );
-    }
-
-    #[test]
-    fn row_position_registration_rejects_conflicting_tuple_metadata() {
-        let mut context = QueryContext::new(
-            QueryId::new(73, 74),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(1),
-        );
-        context
-            .merge_row_pos_descs(HashMap::from([(3, descriptor(11))]))
-            .expect("register lookup descriptor");
-
-        let error = context
-            .merge_row_pos_descs(HashMap::from([(3, descriptor(21)), (4, descriptor(31))]))
-            .expect_err("conflicting metadata must fail");
-        assert_eq!(error, "conflicting row position descriptor for tuple_id=3");
-        assert!(
-            context.row_pos_desc(4).is_none(),
-            "a rejected registration must not leave partial metadata"
         );
     }
 }

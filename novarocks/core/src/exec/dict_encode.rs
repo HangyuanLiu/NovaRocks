@@ -17,14 +17,8 @@
 
 //! Storage-agnostic global-dictionary encode helpers.
 //!
-//! These were originally part of `connector::starrocks::scan::reader` and are
-//! lifted here so that the Iceberg/HDFS Parquet scan path can reuse them
-//! without creating a `formats → connector` dependency cycle.  The StarRocks
-//! reader re-exports the public items from this module so existing call sites
-//! are unaffected.
-
-// NOTE: some log/error strings below still say "starrocks native"; genericize
-// them when the iceberg/HDFS scan path starts calling these helpers.
+//! They are shared here so the Iceberg/HDFS Parquet scan path can reuse them
+//! without creating a `formats → connector` dependency cycle.
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkSchemaRef;

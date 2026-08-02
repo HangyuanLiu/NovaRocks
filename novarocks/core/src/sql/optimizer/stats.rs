@@ -2754,10 +2754,7 @@ mod tests {
                 name: name.to_string(),
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 1,
-                    table_id: 1,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             stats_ref: Some(stats_ref),

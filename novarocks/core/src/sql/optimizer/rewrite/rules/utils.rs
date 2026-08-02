@@ -976,10 +976,7 @@ mod column_id_helper_tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
+            source: ScanSource::ConnectorPinned,
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
@@ -1207,10 +1204,7 @@ mod column_id_helper_tests {
                     name: table.to_string(),
                     columns: column_defs,
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: Some(alias.to_string()),
                 columns: output,

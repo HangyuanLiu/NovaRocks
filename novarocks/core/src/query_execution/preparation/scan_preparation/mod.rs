@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
@@ -152,9 +151,6 @@ fn prepare_scan_node(
                 node_id,
                 vec![build_iceberg_metadata_scan_range_params()],
             );
-        }
-        ScanSource::StarRocks { .. } => {
-            return Err("native StarRocks catalog scan planning is unavailable".to_string());
         }
         source if scan_source_requires_resolver(source) => {
             let source_context = scan_source_context(source);
@@ -307,23 +303,6 @@ fn exact_query_binding_lease(
     Ok(lease)
 }
 
-fn store_planned_starrocks_scan(
-    fragment_id: FragmentId,
-    node_id: i32,
-    planned: PlannedNativeStarRocksScan,
-    bindings: &mut ScanExecutionBindings,
-) -> Result<(), String> {
-    if bindings.scan_ranges(fragment_id, node_id).is_some()
-        || bindings.starrocks_source(node_id).is_some()
-    {
-        return Err(format!(
-            "duplicate StarRocks scan planning fragment_id={fragment_id} node_id={node_id}"
-        ));
-    }
-    bindings.insert_starrocks_source(node_id, planned.source)?;
-    bindings.insert_scan_ranges(fragment_id, node_id, planned.ranges)
-}
-
 fn validate_resolved_execution_kind(
     node_id: i32,
     source: &ScanSource,
@@ -340,7 +319,7 @@ fn validate_resolved_execution_kind(
         | ScanSource::IcebergMvTargetLocator(_) => {
             matches!(execution, ResolvedScanExecution::IcebergFiles(_))
         }
-        ScanSource::StarRocks { .. } | ScanSource::IcebergMetadataTable { .. } => true,
+        ScanSource::IcebergMetadataTable { .. } => true,
     };
     if valid {
         return Ok(());
@@ -400,7 +379,6 @@ fn scan_source_requires_resolver(source: &ScanSource) -> bool {
 fn scan_source_kind(source: &ScanSource) -> &'static str {
     match source {
         ScanSource::ConnectorPinned => "ConnectorPinned",
-        ScanSource::StarRocks { .. } => "StarRocks",
         ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
         ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",

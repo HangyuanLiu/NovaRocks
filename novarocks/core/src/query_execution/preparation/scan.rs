@@ -26,7 +26,6 @@ use novarocks_spi::connector::{
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
-use crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::TypedExpr;
@@ -209,7 +208,6 @@ pub(crate) struct ScanExecutionBindings {
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
     connector_reads: BTreeMap<(FragmentId, i32), PlannedConnectorRead>,
-    starrocks_sources: BTreeMap<i32, StarRocksScanSourceDescriptor>,
 }
 
 impl ScanExecutionBindings {
@@ -321,26 +319,6 @@ impl ScanExecutionBindings {
 
     pub(super) fn connector_read_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
         self.connector_reads.keys().copied()
-    }
-
-    pub(crate) fn insert_starrocks_source(
-        &mut self,
-        node_id: i32,
-        source: StarRocksScanSourceDescriptor,
-    ) -> Result<(), String> {
-        if self.starrocks_sources.contains_key(&node_id) {
-            return Err(format!("duplicate StarRocks scan source node_id={node_id}"));
-        }
-        self.starrocks_sources.insert(node_id, source);
-        Ok(())
-    }
-
-    pub(crate) fn starrocks_source(&self, node_id: i32) -> Option<&StarRocksScanSourceDescriptor> {
-        self.starrocks_sources.get(&node_id)
-    }
-
-    pub(super) fn starrocks_source_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
-        self.starrocks_sources.keys().copied()
     }
 }
 
@@ -619,58 +597,5 @@ mod tests {
             assert!(err.contains("planner="), "{err}");
             assert!(err.contains("source="), "{err}");
         }
-    }
-
-    #[test]
-    fn range_and_starrocks_source_insertions_are_checked_and_read_only() {
-        let mut bindings = ScanExecutionBindings::default();
-        bindings
-            .insert_scan_ranges(3, 61, Vec::new())
-            .expect("first scan ranges");
-        assert!(bindings.scan_ranges(3, 61).expect("scan ranges").is_empty());
-        let range_err = bindings
-            .insert_scan_ranges(3, 61, Vec::new())
-            .expect_err("duplicate scan ranges");
-        assert!(range_err.contains("fragment_id=3"));
-        assert!(range_err.contains("node_id=61"));
-
-        let source = crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor {
-            catalog_name: "default_catalog".to_string(),
-            db_id: 1,
-            table_id: 2,
-            schema_id: 3,
-            storage_columns: Vec::new(),
-            tablet_schema:
-                crate::connector::scan_model::starrocks::test_starrocks_tablet_schema_descriptor(
-                    3,
-                    &[],
-                ),
-        };
-        bindings
-            .insert_starrocks_source(62, source)
-            .expect("first StarRocks source");
-        assert_eq!(
-            bindings
-                .starrocks_source(62)
-                .expect("StarRocks source")
-                .table_id,
-            2
-        );
-        let duplicate = crate::connector::scan_model::starrocks::StarRocksScanSourceDescriptor {
-            catalog_name: "default_catalog".to_string(),
-            db_id: 1,
-            table_id: 2,
-            schema_id: 3,
-            storage_columns: Vec::new(),
-            tablet_schema:
-                crate::connector::scan_model::starrocks::test_starrocks_tablet_schema_descriptor(
-                    3,
-                    &[],
-                ),
-        };
-        let source_err = bindings
-            .insert_starrocks_source(62, duplicate)
-            .expect_err("duplicate StarRocks source");
-        assert!(source_err.contains("node_id=62"));
     }
 }

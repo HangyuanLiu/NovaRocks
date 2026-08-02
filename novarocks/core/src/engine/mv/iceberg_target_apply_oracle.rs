@@ -3420,7 +3420,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::ScanSource::StarRocks { db_id, table_id },
+            source: crate::sql::planner::table::ScanSource::ConnectorPinned,
         }
     }
 

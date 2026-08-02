@@ -2399,10 +2399,7 @@ mod tests {
                 name: "t".to_string(),
                 columns: Vec::new(),
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::StarRocks {
-                    db_id: 1,
-                    table_id: 2,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             columns,

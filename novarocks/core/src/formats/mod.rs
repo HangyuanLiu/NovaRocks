@@ -17,7 +17,6 @@
 pub mod orc;
 #[path = "parquet_adapter.rs"]
 pub mod parquet;
-pub mod starrocks;
 
 #[derive(Clone, Debug)]
 pub enum FileFormatConfig {

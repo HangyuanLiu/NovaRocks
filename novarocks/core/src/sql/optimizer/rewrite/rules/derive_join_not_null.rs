@@ -297,10 +297,7 @@ mod tests {
                     })
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: Some(alias.to_string()),
             stats_ref: None,
@@ -576,10 +573,7 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: Some("l".to_string()),
             stats_ref: None,
@@ -607,10 +601,7 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: Some("r".to_string()),
             stats_ref: None,

@@ -52,10 +52,7 @@ impl TestCatalog {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             }),
             "maps" => Ok(TableDef {
                 name: "maps".to_string(),
@@ -88,10 +85,7 @@ impl TestCatalog {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             }),
             "t" => Ok(TableDef {
                 name: "t".to_string(),
@@ -112,10 +106,7 @@ impl TestCatalog {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             }),
             "iv_orders" => Ok(TableDef {
                 name: "iv_orders".to_string(),
@@ -151,10 +142,7 @@ impl TestCatalog {
                         logical_type: None,
                     },
                 ],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             }),
             "t1" | "t2" => {
                 let value_col = if table == "t1" { "v1" } else { "v2" };
@@ -184,10 +172,7 @@ impl TestCatalog {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 })
             }
             other => Err(format!("unknown test table: {other}")),

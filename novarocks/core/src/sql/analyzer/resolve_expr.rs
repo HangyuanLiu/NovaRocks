@@ -5384,10 +5384,7 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,

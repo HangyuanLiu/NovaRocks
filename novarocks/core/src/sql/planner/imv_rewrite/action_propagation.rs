@@ -856,10 +856,7 @@ mod tests {
 
     fn starrocks_scan() -> PlanScanNode {
         let mut s = delta_scan();
-        s.table.source = ScanSource::StarRocks {
-            db_id: 0,
-            table_id: 0,
-        };
+        s.table.source = ScanSource::ConnectorPinned;
         s
     }
 

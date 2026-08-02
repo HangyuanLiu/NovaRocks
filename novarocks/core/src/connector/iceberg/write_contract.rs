@@ -22,7 +22,6 @@
 //! locally; neither can cross a native fragment boundary.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use base64::Engine;
@@ -36,9 +35,6 @@ use novarocks_spi::connector::{
     ConnectorStagedReportSummary, ConnectorWriteReceipt, ConnectorWriterHandle,
     ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
-use novarocks_spi::connector::{
-    ConnectorExecutionBinding, ConnectorOpenWriterRequest, ConnectorRequestContext,
-};
 
 use super::commit::DeletionVector;
 use super::delete_file::{IcebergFileContent, IcebergFileFormat};
@@ -48,8 +44,7 @@ use super::report::{
 };
 use super::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use super::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
-    PositionDeleteDataFilePartition,
+    IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
 use super::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,
@@ -902,58 +897,6 @@ pub(crate) fn writer_handle_from_sink_plan(
         .map_err(|error| format!("build Iceberg connector writer handle failed: {error}"))
 }
 
-/// Build the common connector writer used by the StarRocks-compatible
-/// boundary. Iceberg remains the sole owner of its canonical handle codec and
-/// of the exact output-expression projection required by the Thrift sink.
-pub fn plan_compat_connector_write(
-    binding: Arc<ConnectorExecutionBinding>,
-    writer: ConnectorWriterIdentity,
-    mut input: IcebergSinkFactoryInput,
-    root_input_width: usize,
-    context: ConnectorRequestContext,
-) -> Result<crate::exec::fragment::sink::ConnectorWriteSinkProgram, String> {
-    if writer.binding_key() != binding.key() {
-        return Err(
-            "compat Iceberg writer identity does not match the exact execution binding".to_string(),
-        );
-    }
-    if let Some(deferred) = input
-        .plan
-        .position_delete_data_file_partition_index_input
-        .take()
-    {
-        if !input.plan.position_delete_data_file_partitions.is_empty() {
-            return Err(
-                "compat Iceberg deferred partition index conflicts with resolved entries"
-                    .to_string(),
-            );
-        }
-        input.plan.position_delete_data_file_partitions =
-            super::sink::build_position_delete_data_file_partition_index(
-                &deferred.metadata,
-                deferred.target_snapshot_id,
-                &deferred.table_location,
-                deferred.object_store_s3.as_ref(),
-            )?;
-    }
-    let expected_schema = Arc::clone(&input.plan.output_schema);
-    let output_exprs = std::mem::take(&mut input.plan.output_exprs);
-    let handle = writer_handle_from_sink_plan(binding.key().clone(), writer, &input.plan)?;
-    crate::exec::fragment::sink::ConnectorWriteSinkProgram::try_new_with_expression_projection(
-        binding,
-        ConnectorOpenWriterRequest {
-            handle,
-            expected_schema: Arc::clone(&expected_schema),
-            context,
-        },
-        root_input_width,
-        input.arena,
-        output_exprs,
-        expected_schema,
-    )
-    .map_err(|error| error.to_string())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IcebergStagedReportsPayloadV1 {
@@ -1267,208 +1210,6 @@ pub(crate) fn decode_writer_reports(
         .into_iter()
         .map(|report| report.into_report(metadata))
         .collect()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompatIcebergPartitionValue {
-    pub is_null: bool,
-    pub datum_bytes: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompatIcebergColumnStats {
-    pub column_sizes: Option<BTreeMap<i32, i64>>,
-    pub value_counts: Option<BTreeMap<i32, i64>>,
-    pub null_value_counts: Option<BTreeMap<i32, i64>>,
-    pub nan_value_counts: Option<BTreeMap<i32, i64>>,
-    pub lower_bounds: Option<BTreeMap<i32, Vec<u8>>>,
-    pub upper_bounds: Option<BTreeMap<i32, Vec<u8>>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CompatIcebergFileContent {
-    Data,
-    PositionDeletes,
-    EqualityDeletes,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompatIcebergDataFile {
-    pub path: String,
-    pub format: String,
-    pub record_count: i64,
-    pub file_size_in_bytes: i64,
-    pub partition_path: String,
-    pub split_offsets: Option<Vec<i64>>,
-    pub column_stats: Option<CompatIcebergColumnStats>,
-    pub partition_null_fingerprint: String,
-    pub file_content: CompatIcebergFileContent,
-    pub referenced_data_file: Option<String>,
-    pub first_row_id: Option<i64>,
-    pub equality_ids: Option<Vec<i32>>,
-    pub key_metadata: Option<Vec<u8>>,
-    pub partition_spec_id: i32,
-    pub partition_values: Vec<CompatIcebergPartitionValue>,
-    pub content_offset: Option<i64>,
-    pub content_size_in_bytes: Option<i64>,
-    pub cardinality: Option<i64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompatIcebergSinkCommitInfo {
-    pub data_file: CompatIcebergDataFile,
-    pub is_overwrite: Option<bool>,
-    pub is_rewrite: Option<bool>,
-}
-
-/// Provider-owned final-boundary projection for StarRocks compatibility.
-/// The returned DTO is Thrift-independent so core remains protocol neutral.
-pub fn project_compat_sink_commit_infos(
-    reports: &[ConnectorStagedReport],
-) -> Result<Vec<CompatIcebergSinkCommitInfo>, String> {
-    reports
-        .iter()
-        .try_fold(Vec::new(), |mut projected, report| {
-            projected.extend(project_one_compat_sink_commit_info(report)?);
-            Ok(projected)
-        })
-}
-
-fn project_one_compat_sink_commit_info(
-    report: &ConnectorStagedReport,
-) -> Result<Vec<CompatIcebergSinkCommitInfo>, String> {
-    use novarocks_spi::connector::ConnectorWriterTerminalState;
-
-    if report.version() != CONNECTOR_WRITE_CONTRACT_VERSION {
-        return Err(format!(
-            "unsupported connector staged report contract version {}; expected {}",
-            report.version(),
-            CONNECTOR_WRITE_CONTRACT_VERSION
-        ));
-    }
-    if report.state() != ConnectorWriterTerminalState::Staged {
-        return Err("cannot project a non-staged connector report to TSinkCommitInfo".to_string());
-    }
-    if report.writer().binding_key().instance_id.as_str()
-        != super::provider::COMPAT_ICEBERG_INSTANCE_ID
-    {
-        return Err(format!(
-            "compat Iceberg projector received report for connector instance `{}`",
-            report.writer().binding_key().instance_id.as_str()
-        ));
-    }
-    let payload: IcebergStagedReportsPayloadV1 =
-        decode_canonical_json(report.payload(), "staged report")?;
-    if payload.version != ICEBERG_WRITE_PAYLOAD_VERSION {
-        return Err(format!(
-            "unsupported Iceberg staged report payload version {}; expected {}",
-            payload.version, ICEBERG_WRITE_PAYLOAD_VERSION
-        ));
-    }
-    ensure_canonical_json(report.payload(), &payload, "staged report")?;
-    payload
-        .reports
-        .into_iter()
-        .map(project_one_compat_iceberg_file)
-        .collect()
-}
-
-fn project_one_compat_iceberg_file(
-    report: IcebergWriterReportV1,
-) -> Result<CompatIcebergSinkCommitInfo, String> {
-    let file = report.file;
-    validate_secret_free_text("staged file path", &file.path)?;
-    if let Some(path) = &file.referenced_data_file {
-        validate_secret_free_text("referenced data file", path)?;
-    }
-    let partition_values = file
-        .partition
-        .values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let datum_bytes = match (value.is_null, value.datum_base64) {
-                (true, None) => None,
-                (true, Some(_)) => {
-                    return Err(format!(
-                        "compat Iceberg partition value {index} is null but carries a payload"
-                    ));
-                }
-                (false, Some(value)) => Some(base64_decode(&value, "partition datum")?),
-                (false, None) => {
-                    return Err(format!(
-                        "compat Iceberg partition value {index} is non-null but has no payload"
-                    ));
-                }
-            };
-            Ok(CompatIcebergPartitionValue {
-                is_null: value.is_null,
-                datum_bytes,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let column_stats = file
-        .column_stats
-        .map(|stats| {
-            Ok::<_, String>(CompatIcebergColumnStats {
-                column_sizes: (!stats.column_sizes.is_empty()).then_some(stats.column_sizes),
-                value_counts: (!stats.value_counts.is_empty()).then_some(stats.value_counts),
-                null_value_counts: (!stats.null_value_counts.is_empty())
-                    .then_some(stats.null_value_counts),
-                nan_value_counts: (!stats.nan_value_counts.is_empty())
-                    .then_some(stats.nan_value_counts),
-                lower_bounds: non_empty_base64_stats(stats.lower_bounds_base64, "lower bound")?,
-                upper_bounds: non_empty_base64_stats(stats.upper_bounds_base64, "upper bound")?,
-            })
-        })
-        .transpose()?;
-    let file_content = match file.content {
-        IcebergFileContentV1::Data => CompatIcebergFileContent::Data,
-        IcebergFileContentV1::PositionDeletes => CompatIcebergFileContent::PositionDeletes,
-        IcebergFileContentV1::EqualityDeletes => CompatIcebergFileContent::EqualityDeletes,
-    };
-    Ok(CompatIcebergSinkCommitInfo {
-        data_file: CompatIcebergDataFile {
-            path: file.path,
-            format: file.format,
-            record_count: file.record_count,
-            file_size_in_bytes: file.file_size_in_bytes,
-            partition_path: file.partition.partition_path,
-            split_offsets: file.split_offsets,
-            column_stats,
-            partition_null_fingerprint: file.partition.null_fingerprint,
-            file_content,
-            referenced_data_file: file.referenced_data_file,
-            first_row_id: file.first_row_id,
-            equality_ids: file.equality_ids,
-            key_metadata: file
-                .key_metadata_base64
-                .as_deref()
-                .map(|value| base64_decode(value, "key metadata"))
-                .transpose()?,
-            partition_spec_id: file.partition.partition_spec_id,
-            partition_values,
-            content_offset: file.content_offset,
-            content_size_in_bytes: file.content_size_in_bytes,
-            cardinality: file.cardinality,
-        },
-        is_overwrite: report.is_overwrite,
-        is_rewrite: report.is_rewrite,
-    })
-}
-
-fn non_empty_base64_stats(
-    values: BTreeMap<i32, String>,
-    subject: &str,
-) -> Result<Option<BTreeMap<i32, Vec<u8>>>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    values
-        .into_iter()
-        .map(|(field_id, value)| base64_decode(&value, subject).map(|value| (field_id, value)))
-        .collect::<Result<BTreeMap<_, _>, _>>()
-        .map(Some)
 }
 
 pub(crate) fn staged_report_from_iceberg_reports(
@@ -1837,27 +1578,6 @@ mod tests {
         )
     }
 
-    fn compat_writer_identity() -> ConnectorWriterIdentity {
-        let binding_key = ConnectorExecutionBindingKey {
-            instance_id: ConnectorInstanceId::parse(
-                crate::connector::iceberg::COMPAT_ICEBERG_INSTANCE_ID,
-            )
-            .expect("compat instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        };
-        let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
-        ConnectorWriterIdentity::new(
-            operation_id,
-            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
-            ConnectorWriteExecutionId::new([2; 16], 3),
-            [4; 16],
-            5,
-            6,
-            0,
-            binding_key,
-        )
-    }
-
     #[test]
     fn staged_report_payload_is_deterministic_and_round_trips_data_and_delete_facts() {
         let metadata = metadata();
@@ -1918,42 +1638,6 @@ mod tests {
             String::from_utf8(first.to_vec())
                 .expect("utf8")
                 .contains("\"version\":1")
-        );
-    }
-
-    #[test]
-    fn compat_projection_flattens_generic_multifile_report_at_the_thrift_boundary() {
-        let metadata = metadata();
-        let reports = vec![
-            report(
-                IcebergFileContent::Data,
-                "file:///warehouse/db/t/data/a.parquet",
-            ),
-            report(
-                IcebergFileContent::PositionDeletes,
-                "file:///warehouse/db/t/delete/a.puffin",
-            ),
-        ];
-        let staged = staged_report_from_iceberg_reports(
-            compat_writer_identity(),
-            ConnectorWriterTerminalState::Staged,
-            ConnectorStagedReportSummary {
-                input_rows: 3,
-                staged_bytes: 42,
-                artifact_count: 2,
-            },
-            &reports,
-            &metadata,
-        )
-        .expect("staged report");
-        let projected = project_compat_sink_commit_infos(&[staged]).expect("projection");
-        assert_eq!(projected.len(), 2);
-        let data = &projected[0].data_file;
-        assert_eq!(data.path, "file:///warehouse/db/t/data/a.parquet");
-        assert_eq!(data.split_offsets.as_deref(), Some(&[4, 12][..]));
-        assert_eq!(
-            projected[1].data_file.referenced_data_file.as_deref(),
-            Some("file:///warehouse/db/t/data/base.parquet")
         );
     }
 

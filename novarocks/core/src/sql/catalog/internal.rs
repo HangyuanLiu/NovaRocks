@@ -69,7 +69,7 @@ mod tests {
     use novarocks_catalog::registry::Catalog;
     use novarocks_catalog::schema::ColumnDef;
 
-    fn starrocks_table_def() -> TableDef {
+    fn connector_pinned_table_def() -> TableDef {
         TableDef {
             name: "orders".to_string(),
             columns: vec![ColumnDef {
@@ -80,28 +80,25 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 5,
-                table_id: 6,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 
     #[test]
-    fn default_catalog_rejects_registered_internal_starrocks_table() {
+    fn default_catalog_rejects_registered_connector_pinned_table() {
         let mut local = PlannerMemoryCatalog::default();
         local.create_database("sales").expect("create database");
         local
-            .register("sales", starrocks_table_def())
+            .register("sales", connector_pinned_table_def())
             .expect("register table");
         let catalog = InternalCatalog::new("default_catalog", Arc::new(RwLock::new(local)));
 
         let error = catalog
             .get_table_metadata("sales", "orders")
-            .expect_err("native session catalog must reject internal StarRocks tables");
+            .expect_err("native session catalog must reject synthetic connector-pinned tables");
         assert_eq!(
             error,
-            "StarRocks scan source default_catalog.sales.orders requires an external connector binding; native session catalogs cannot register internal StarRocks tables"
+            "synthetic plan-time scan source is not a catalog base table: default_catalog.sales.orders"
         );
     }
 

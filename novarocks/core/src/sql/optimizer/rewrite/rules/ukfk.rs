@@ -597,7 +597,7 @@ fn iceberg_table_info(
         | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::StarRocks { .. }
+        | crate::sql::planner::table::ScanSource::ConnectorPinned
         | crate::sql::planner::table::ScanSource::IcebergMvTargetState { .. }
         | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator { .. } => None,
     }
@@ -825,10 +825,7 @@ mod tests {
                 name: table_name.to_string(),
                 columns,
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             stats_ref: None,

@@ -274,11 +274,6 @@ pub(crate) fn is_iceberg_v3_row_position(row_position_type: RowPositionType) -> 
     row_position_type == RowPositionType::Iceberg
 }
 
-#[allow(dead_code)]
-pub(crate) fn is_lake_row_position(row_position_type: RowPositionType) -> bool {
-    row_position_type == RowPositionType::Lake
-}
-
 pub(crate) fn lookup_file_format_config(
     file_format: HdfsScanFileFormat,
     parquet_cfg: ParquetScanConfig,

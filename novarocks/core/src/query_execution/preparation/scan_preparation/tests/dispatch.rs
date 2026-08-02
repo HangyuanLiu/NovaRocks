@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::{collect_scan_bindings, store_planned_starrocks_scan};
+use super::super::collect_scan_bindings;
 use super::*;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 use std::sync::Arc;
@@ -426,66 +426,4 @@ fn resolver_execution_kind_must_match_semantic_source() {
     assert!(err.contains("IcebergVersionTable"), "{err}");
     assert!(err.contains("requires IcebergFiles execution"), "{err}");
     assert!(err.contains("node_id=41"), "{err}");
-}
-
-#[test]
-fn starrocks_planning_result_stores_ranges_and_source_descriptor() {
-    use crate::connector::scan_model::starrocks::{
-        PlannedNativeStarRocksScan, StarRocksScanSourceDescriptor,
-        StarRocksStorageColumnDescriptor, test_starrocks_tablet_schema_descriptor,
-    };
-
-    let storage_columns = vec![StarRocksStorageColumnDescriptor {
-        name: "id".to_string(),
-        unique_id: 1,
-        default_value: None,
-    }];
-    let planned = PlannedNativeStarRocksScan {
-        ranges: vec![
-            crate::runtime::scan_range::ScanRangeParams::starrocks_tablet(300, 100, 7)
-                .expect("tablet range"),
-        ],
-        source: StarRocksScanSourceDescriptor {
-            catalog_name: "default_catalog".to_string(),
-            db_id: 10,
-            table_id: 20,
-            schema_id: 30,
-            storage_columns: storage_columns.clone(),
-            tablet_schema: test_starrocks_tablet_schema_descriptor(30, &storage_columns),
-        },
-    };
-    let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
-
-    store_planned_starrocks_scan(0, 42, planned, &mut bindings)
-        .expect("store StarRocks planning result");
-
-    let ranges = bindings.scan_ranges(0, 42).expect("ranges");
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::StarRocksTablet(range) = &ranges[0].range else {
-        panic!("expected tablet range");
-    };
-    assert_eq!(range.tablet_id, 300);
-    let source = bindings.starrocks_source(42).expect("source descriptor");
-    assert_eq!(source.db_id, 10);
-    assert_eq!(source.table_id, 20);
-    assert_eq!(source.schema_id, 30);
-    assert!(bindings.binding(42).is_none());
-
-    let duplicate = PlannedNativeStarRocksScan {
-        ranges: Vec::new(),
-        source: StarRocksScanSourceDescriptor {
-            catalog_name: "other_catalog".to_string(),
-            db_id: 11,
-            table_id: 21,
-            schema_id: 31,
-            storage_columns: Vec::new(),
-            tablet_schema: test_starrocks_tablet_schema_descriptor(31, &[]),
-        },
-    };
-    let err = store_planned_starrocks_scan(0, 42, duplicate, &mut bindings)
-        .expect_err("duplicate StarRocks planning must fail before partial insertion");
-    assert_eq!(
-        err,
-        "duplicate StarRocks scan planning fragment_id=0 node_id=42"
-    );
 }

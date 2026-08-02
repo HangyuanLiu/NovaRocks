@@ -235,9 +235,6 @@ fn native_file_range(
         crate::runtime::scan_range::ScanRange::SchemaSelection(_) => {
             panic!("expected native file range, got StarRocks schema selection")
         }
-        crate::runtime::scan_range::ScanRange::StarRocksTablet(_) => {
-            panic!("expected file range")
-        }
     }
 }
 
