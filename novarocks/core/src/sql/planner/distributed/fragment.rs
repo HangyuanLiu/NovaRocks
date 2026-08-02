@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime_filter::model::refined_wait_graph::RefinedFragmentEdge;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::planner::runtime_filter::wait_graph::RefinedFragmentEdge;
 
-use super::activation_decision::DraftRuntimeFilterGraph;
 use super::node::DistributedNode;
+use crate::sql::planner::runtime_filter::activation::ActivationConstraint;
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraphData;
 
 pub(crate) type FragmentId = u32;
 
@@ -154,5 +155,6 @@ pub(in crate::sql::planner::distributed) struct DistributedPlanDraft {
     pub(in crate::sql::planner::distributed) edges: Vec<FragmentEdge>,
     // Planner-private graph whose consumer activations remain constraints until
     // the seal-time activation decision pass consumes and materializes them.
-    pub(in crate::sql::planner::distributed) runtime_filter_graph: DraftRuntimeFilterGraph,
+    pub(in crate::sql::planner::distributed) runtime_filter_graph:
+        RuntimeFilterGraphData<ActivationConstraint>,
 }

@@ -11,26 +11,12 @@ use super::runtime_filter_binding::{
     RuntimeFilterProbeBinding as ProbeBinding, populate_runtime_filter_graph,
 };
 use super::{build_distributed_plan, union_distinct_must_be_rewritten_error};
-use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
-    ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
-    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-    RuntimeFilterPolicyRequirement, SortDirection,
-};
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::model::graph::{
-    ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
-    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    RuntimeFilterGraph, RuntimeFilterGraphData,
-};
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
 };
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::distributed::activation_decision::{
-    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
-};
+use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
 use crate::sql::planner::distributed::runtime_filter_progress::build_join_progress_proof_catalog;
 use crate::sql::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -52,6 +38,19 @@ use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, PhysicalHashAggregateNode, PhysicalHashJoinEqCondition,
     PhysicalHashJoinNode, PhysicalNestLoopJoinNode, PhysicalPlanKind, PhysicalPlanNode,
     PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind, RedistributeMode, RedistributeNode,
+};
+use crate::sql::planner::runtime_filter::activation::{ActivationConstraint, ActivationFallback};
+use crate::sql::planner::runtime_filter::contract::{
+    ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
+    ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder, NullSemantics,
+    ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    RuntimeFilterPolicyRequirement, SortDirection,
+};
+use crate::sql::planner::runtime_filter::coverage::Coverage;
+use crate::sql::planner::runtime_filter::graph::{
+    ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
+    RuntimeFilterBindingRoleData, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+    RuntimeFilterGraph, RuntimeFilterGraphData,
 };
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
@@ -80,9 +79,9 @@ struct ActivationNeutralBindingStructure {
     binding_id: BindingId,
     channel_id: ChannelId,
     coverage_witness_id: Option<CoverageWitnessId>,
-    location: crate::runtime_filter::model::graph::PlanLocation,
+    location: crate::sql::planner::runtime_filter::graph::PlanLocation,
     expression: String,
-    apply_point: crate::runtime_filter::model::graph::ApplyPoint,
+    apply_point: crate::sql::planner::runtime_filter::graph::ApplyPoint,
     role: ActivationNeutralBindingRoleStructure,
 }
 
@@ -1045,7 +1044,7 @@ fn aggregate_topn_runtime_filter_materializes_ordered_live_graph() {
     assert_eq!(
         requirement.activation,
         ConsumerActivation::NonBlockingLive {
-            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            late_apply: crate::sql::planner::runtime_filter::contract::LateApplyGranularity::Batch,
         }
     );
 
@@ -1087,8 +1086,8 @@ fn aggregate_topn_runtime_filter_keeps_ordered_bound_contract_live_in_draft() {
     assert_eq!(
         requirement.activation,
         ActivationConstraint::LiveOnly {
-            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
-            reason: crate::sql::planner::distributed::activation_decision::RequiredLiveReason::OrderedBoundContract,
+            late_apply: crate::sql::planner::runtime_filter::contract::LateApplyGranularity::Batch,
+            reason: crate::sql::planner::runtime_filter::activation::RequiredLiveReason::OrderedBoundContract,
         }
     );
 }
@@ -1195,7 +1194,7 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
     };
     assert_eq!(
         requirement.target,
-        crate::runtime_filter::model::graph::ConsumerBindingTarget::DirectInput {
+        crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::DirectInput {
             input_ordinal: 0,
         }
     );
@@ -1380,7 +1379,8 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     });
     assert_snapshot_detects_binding_mutation(&sealed_graph, "location", |binding| {
         if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
-            binding.location.node_id = crate::runtime_filter::model::contract::PlanNodeId::new(99);
+            binding.location.node_id =
+                crate::sql::planner::runtime_filter::contract::PlanNodeId::new(99);
         }
     });
     assert_snapshot_detects_binding_mutation(&sealed_graph, "expression", |binding| {
@@ -1390,7 +1390,7 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     });
     assert_snapshot_detects_binding_mutation(&sealed_graph, "apply_point", |binding| {
         if matches!(&binding.role, RuntimeFilterBindingRole::Producer(_)) {
-            binding.apply_point = crate::runtime_filter::model::graph::ApplyPoint::NodeInput;
+            binding.apply_point = crate::sql::planner::runtime_filter::graph::ApplyPoint::NodeInput;
         }
     });
     assert_snapshot_detects_binding_mutation(
@@ -1475,10 +1475,12 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     let draft_consumer = draft_graph
         .bindings()
         .find_map(|binding| match &binding.role {
-            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Consumer(
+            crate::sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData::Consumer(
                 consumer,
             ) => Some(consumer),
-            crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData::Producer(_) => None,
+            crate::sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData::Producer(
+                _,
+            ) => None,
         })
         .expect("draft consumer");
     assert_eq!(

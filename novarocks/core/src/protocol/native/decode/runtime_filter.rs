@@ -29,8 +29,8 @@ use crate::runtime_filter::model::contract::{
     OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
     TopKSummaryRequirement,
 };
-use crate::runtime_filter::model::graph::ProducerBindingTarget;
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 
@@ -60,7 +60,7 @@ pub(crate) enum DecodedBindingRole {
     Producer {
         contribution_kinds: BTreeSet<ContributionKind>,
         completion_requirement: CompletionRequirement,
-        target: ProducerBindingTarget,
+        target: RuntimeFilterProducerTarget,
     },
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
@@ -917,7 +917,7 @@ fn decode_role(
                 )
             })? {
                 plan::runtime_filter_producer_role::Target::JoinBuildKey(join) => {
-                    ProducerBindingTarget::JoinBuildKey {
+                    RuntimeFilterProducerTarget::JoinBuildKey {
                         ordinal: usize::try_from(join.ordinal).map_err(|_| {
                             super::NativeFragmentDecodeError::invalid_value(
                                 target_path.clone().field("join_build_key").field("ordinal"),
@@ -929,7 +929,7 @@ fn decode_role(
                     }
                 }
                 plan::runtime_filter_producer_role::Target::AggregateTopnKey(aggregate) => {
-                    ProducerBindingTarget::AggregateTopNKey {
+                    RuntimeFilterProducerTarget::AggregateTopNKey {
                         group_key_ordinal: usize::try_from(aggregate.group_key_ordinal).map_err(
                             |_| {
                                 super::NativeFragmentDecodeError::invalid_value(
@@ -1151,8 +1151,8 @@ mod tests {
         NullOrder, NullSemantics, OrderContract, OrderKeyContract, SortDirection,
         TopKSummaryRequirement,
     };
-    use crate::runtime_filter::model::graph::ProducerBindingTarget;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+    use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
     use crate::runtime_filter::port::ordered_bound::{
         COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
     };
@@ -1263,7 +1263,7 @@ mod tests {
 
     fn decode_producer_binding_target(
         target: Option<plan::runtime_filter_producer_role::Target>,
-    ) -> Result<ProducerBindingTarget, super::super::NativeFragmentDecodeError> {
+    ) -> Result<RuntimeFilterProducerTarget, super::super::NativeFragmentDecodeError> {
         let role = producer_role_with_target(target);
         let DecodedBindingRole::Producer { target, .. } =
             decode_role(17, Some(&role), FieldPath::root("binding").field("role"))?
@@ -1276,8 +1276,8 @@ mod tests {
     #[test]
     fn producer_binding_target_proto_round_trips_both_variants_exactly() {
         let cases = [
-            ProducerBindingTarget::JoinBuildKey { ordinal: 7 },
-            ProducerBindingTarget::AggregateTopNKey {
+            RuntimeFilterProducerTarget::JoinBuildKey { ordinal: 7 },
+            RuntimeFilterProducerTarget::AggregateTopNKey {
                 group_key_ordinal: 11,
                 limit: NonZeroU32::new(19).unwrap(),
             },
@@ -1285,7 +1285,7 @@ mod tests {
 
         for expected in cases {
             let wire_target =
-                crate::protocol::native::encode::plan::encode_runtime_filter_producer_target(
+                crate::protocol::native::encode::plan::encode_runtime_filter_runtime_producer_target(
                     17, expected,
                 )
                 .expect("encode typed producer target");

@@ -17,13 +17,15 @@
 
 use std::collections::BTreeSet;
 
-use crate::runtime_filter::model::contract::CompletionRequirement;
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRoleData, RuntimeFilterGraphData};
-pub(crate) use crate::runtime_filter::model::join_progress::{
+use crate::sql::planner::physical::runtime_filter_placement::rf_sides_for_join;
+use crate::sql::planner::runtime_filter::contract::CompletionRequirement;
+use crate::sql::planner::runtime_filter::graph::{
+    RuntimeFilterBindingRoleData, RuntimeFilterGraphData,
+};
+pub(crate) use crate::sql::planner::runtime_filter::progress::{
     FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
     JoinBuildProgressSkip,
 };
-use crate::sql::planner::physical::runtime_filter_placement::rf_sides_for_join;
 
 use super::{DistributedNode, DistributedNodeKind, FragmentId, PlanFragment};
 
@@ -192,16 +194,6 @@ mod tests {
 
     use crate::runtime_filter::deployment::DeploymentError;
     use crate::runtime_filter::deployment::wait_for::validate_wait_for;
-    use crate::runtime_filter::model::contract::{
-        BindingId, ChannelId, ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId,
-    };
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingRole,
-        RuntimeFilterBindingSpec, RuntimeFilterGraph,
-    };
-    use crate::runtime_filter::model::refined_wait_graph::{
-        ConsumerWaitBehavior, ConsumerWaitInput, ProducerWaitInput,
-    };
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
@@ -211,6 +203,16 @@ mod tests {
     use crate::sql::planner::physical::runtime_filter::JoinExecutionMode;
     use crate::sql::planner::physical::{
         JoinDistribution, PhysicalHashJoinNode, PhysicalPlanStats, PlannerConfidence,
+    };
+    use crate::sql::planner::runtime_filter::contract::{
+        BindingId, ChannelId, ContributionKind, CoverageWitnessId, PlanFragmentId, PlanNodeId,
+    };
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingRole,
+        RuntimeFilterBindingSpec, RuntimeFilterGraph,
+    };
+    use crate::sql::planner::runtime_filter::wait_graph::{
+        ConsumerWaitBehavior, ConsumerWaitInput, ProducerWaitInput,
     };
 
     fn stats() -> PhysicalPlanStats {
@@ -347,7 +349,7 @@ mod tests {
                     ]),
                     completion_requirement: CompletionRequirement::ProducerClosed,
                     target:
-                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                        crate::sql::planner::runtime_filter::graph::ProducerBindingTarget::JoinBuildKey {
                             ordinal: 0,
                         },
                 }),

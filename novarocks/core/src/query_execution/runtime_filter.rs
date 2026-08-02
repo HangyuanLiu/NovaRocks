@@ -36,14 +36,15 @@ use crate::runtime_filter::deployment::{
     RuntimeFilterDeploymentPolicy, RuntimeFilterQueryDeploymentPolicy,
     RuntimeFilterQueryTransportPolicy, participant_id_for_backend,
 };
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
 use crate::runtime_filter::port::install::{
     MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
     RuntimeFilterParticipantInstall,
 };
 use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
-use crate::sql::planner::distributed::{FragmentEdge, JoinBuildProgressCatalog};
+use crate::sql::planner::distributed::FragmentEdge;
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraph;
+use crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)

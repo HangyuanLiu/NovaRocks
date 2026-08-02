@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+use crate::sql::planner::runtime_filter::contract::{BindingId, ChannelId};
 
 /// Neutral projection of a planner-owned fragment input edge. The deployment
 /// compiler validates this projection against the sealed planner edge set.
@@ -26,7 +26,6 @@ pub(crate) struct FrontierEdge {
     pub(crate) source_fragment: u32,
     pub(crate) target_exchange_node: i32,
 }
-
 /// Planner-sealed proof that one hash-join producer can publish its runtime
 /// filter after only its build-side frontier completes, independent of the
 /// probe side and of the rest of the fragment.
@@ -124,7 +123,7 @@ mod tests {
         FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
         JoinBuildProgressSkip,
     };
-    use crate::runtime_filter::model::contract::{BindingId, ChannelId};
+    use crate::sql::planner::runtime_filter::contract::{BindingId, ChannelId};
 
     type Key = (ChannelId, BindingId, u32);
 

@@ -39,7 +39,6 @@ pub(crate) struct RuntimeFilterChannelSpec {
     pub required_consumer_capabilities: BTreeSet<ArtifactCapability>,
     pub policy: RuntimeFilterPolicyRequirement,
 }
-
 #[derive(Clone, Debug)]
 pub(crate) struct ProducerRequirement {
     pub contribution_kinds: BTreeSet<ContributionKind>,

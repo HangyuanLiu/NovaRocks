@@ -59,6 +59,7 @@ code-anchors:
 - ADR-0001 — runtime filter 等待环为何静态 strict-fail，而不是靠运行时 timeout 兜底（active）
 - ADR-0002 — multicast 反压为何保持消费者耦合（active）
 - ADR-0003 — RF consumer 为何默认 BlockingSnapshot、NonBlockingLive 只做定点降级（active）
+- ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active）
 
 ### join-execution
 

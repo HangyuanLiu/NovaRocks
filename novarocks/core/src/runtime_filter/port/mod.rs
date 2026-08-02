@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod artifact;
+pub(crate) mod binding;
 pub(crate) mod events;
 pub(crate) mod final_domain;
 pub(crate) mod identity;

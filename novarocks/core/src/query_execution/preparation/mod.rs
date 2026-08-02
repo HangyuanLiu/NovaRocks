@@ -250,8 +250,7 @@ pub(crate) fn prepare_fragments(
         topological_fragment_order,
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
-        plan.runtime_filter_graph().clone(),
-        plan.runtime_filter_join_progress().clone(),
+        plan.sealed_runtime_filter_plan().clone(),
     ))
 }
 
@@ -307,8 +306,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         plan.topology().topological_fragment_order().to_vec(),
         plan.topology().execution_anchor_fragment_id(),
         plan.edges().to_vec(),
-        plan.runtime_filter_graph().clone(),
-        plan.runtime_filter_join_progress().clone(),
+        plan.sealed_runtime_filter_plan().clone(),
     ))
 }
 
@@ -387,10 +385,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::runtime_filter::model::contract::{
-        BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
-    };
-    use crate::runtime_filter::model::graph::RuntimeFilterBindingRoleData;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
@@ -398,23 +392,27 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::runtime_filter::contract::{
+        BindingId, ChannelId, ConsumerActivation, LateApplyGranularity,
+    };
+    use crate::sql::planner::runtime_filter::graph::RuntimeFilterBindingRoleData;
 
     fn draft_runtime_filter_graph() -> crate::sql::planner::distributed::DraftRuntimeFilterGraph {
-        use crate::runtime_filter::model::contract::{
+        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+        use crate::sql::planner::distributed::{
+            ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
+        };
+        use crate::sql::planner::runtime_filter::contract::{
             ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
             ContributionKind, CoverageWitnessId, LateApplyGranularity, NullSemantics,
             PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
             RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
         };
-        use crate::runtime_filter::model::coverage::Coverage;
-        use crate::runtime_filter::model::graph::{
+        use crate::sql::planner::runtime_filter::coverage::Coverage;
+        use crate::sql::planner::runtime_filter::graph::{
             ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
-            ProducerRequirement, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
-            RuntimeFilterChannelSpec,
-        };
-        use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-        use crate::sql::planner::distributed::{
-            ActivationConstraint, DraftRuntimeFilterGraph, RequiredLiveReason,
+            ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
+            RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
         };
 
         let channel_id = ChannelId::new(1);
@@ -472,10 +470,7 @@ mod tests {
                     completion_requirement: CompletionRequirement::FencedFinalDomain(
                         CompletionFenceKind::CommittedDomainFrozen,
                     ),
-                    target:
-                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
-                            ordinal: 0,
-                        },
+                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
                 }),
             })
             .expect("unique producer binding");

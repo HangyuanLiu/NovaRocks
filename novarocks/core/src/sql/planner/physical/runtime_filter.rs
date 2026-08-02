@@ -23,8 +23,8 @@
 
 use std::num::NonZeroU32;
 
-use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
 use crate::sql::analysis::TypedExpr;
+use crate::sql::planner::runtime_filter::contract::{NullOrder, SortDirection};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterBuildIntent {

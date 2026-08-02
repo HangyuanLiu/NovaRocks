@@ -15,21 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Planner — builds logical plans, materializes optimizer output into planner
-//! physical IR, and plans distributed fragment topology.
-//!
-//! The stage transitions are explicit: optimizer bridge produces
-//! `PhysicalPlanNode`; the planner pipeline applies physical placement passes
-//! before distributed planning cuts fragments and wires cross-fragment state.
+//! Runtime-local producer target facts decoded from native plan wire data.
 
-pub(crate) mod distributed;
-pub(crate) mod imv_rewrite;
-pub(crate) mod logical;
-pub(crate) mod optimizer_bridge;
-pub(crate) mod ordering;
-pub(crate) mod payload;
-pub(crate) mod physical;
-pub(crate) mod pipeline;
-pub(crate) mod runtime_filter;
-pub(crate) mod table;
-pub(crate) use logical::build::{plan_output_columns, plan_query};
+use std::num::NonZeroU32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterProducerTarget {
+    JoinBuildKey {
+        ordinal: usize,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: usize,
+        limit: NonZeroU32,
+    },
+}

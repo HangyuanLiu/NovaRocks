@@ -38,7 +38,6 @@ pub(crate) enum PolicyField {
     DeadlineMs,
     MaxRetries,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GraphValidationErrorKind {
     ChannelIdMismatch {

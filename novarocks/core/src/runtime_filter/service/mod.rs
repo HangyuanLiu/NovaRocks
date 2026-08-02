@@ -2923,18 +2923,18 @@ pub(super) mod test_support {
     use crate::runtime_filter::deployment::{
         RuntimeFilterDeploymentPlan, RuntimeFilterDeploymentPolicy,
     };
-    use crate::runtime_filter::model::contract::*;
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
-    };
     use crate::runtime_filter::port::identity::*;
     use crate::runtime_filter::port::install::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
+    use crate::sql::planner::runtime_filter::contract::*;
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
+        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRole,
+        RuntimeFilterBindingSpec, RuntimeFilterChannelSpec, RuntimeFilterGraph,
     };
 
     pub(super) fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
@@ -2992,10 +2992,7 @@ pub(super) mod test_support {
                 role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
                     contribution_kinds: contributions,
                     completion_requirement: CompletionRequirement::ProducerClosed,
-                    target:
-                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
-                            ordinal: 0,
-                        },
+                    target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
                 }),
             })
             .unwrap();
@@ -3013,8 +3010,7 @@ pub(super) mod test_support {
                 role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
                     capabilities,
                     activation: ConsumerActivation::BlockingSnapshot,
-                    target:
-                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
+                    target: ConsumerBindingTarget::SourceBoundary,
                 }),
             })
             .unwrap();
@@ -3112,11 +3108,6 @@ pub(crate) mod tests {
     use crate::runtime_filter::materializer::{MaterializationOutcome, Materializer};
     use crate::runtime_filter::model::contract::*;
     use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
-    };
     use crate::runtime_filter::port::artifact::{
         ArtifactBundle, ArtifactKind, ArtifactMembershipSchema, ConsumerArtifactProfile,
         ConsumerProfileId, PhysicalArtifact,
@@ -3165,6 +3156,9 @@ pub(crate) mod tests {
         RuntimeFilterEnvelopeSink, SinkCompletion, SinkSubmitOutcome, SinkTransportError,
     };
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::planner::runtime_filter::{
+        contract as sql_contract, coverage::Coverage as SqlCoverage, graph as sql_graph,
+    };
 
     use super::materialization::MaterializationWorkClaim;
     use super::memory::MemTrackerMemoryAccount;
@@ -4112,71 +4106,87 @@ pub(crate) mod tests {
             data_type: DataType::Int64,
             nullable: false,
         };
-        let mut graph = RuntimeFilterGraph::default();
+        let mut graph = sql_graph::RuntimeFilterGraph::default();
         graph
-            .insert_channel(RuntimeFilterChannelSpec {
-                channel_id: deployment.channel_id(),
-                logical_domain: deployment.logical_domain().clone(),
-                lifecycle: deployment.lifecycle(),
-                availability_coverage: deployment.availability_coverage().clone(),
-                terminal_coverage: deployment.terminal_coverage().clone(),
-                reduction_requirement: deployment.reduction_requirement(),
-                allowed_contribution_kinds: deployment.allowed_contribution_kinds().clone(),
-                required_consumer_capabilities: BTreeSet::from([
-                    ArtifactCapability::Membership,
-                    ArtifactCapability::EmptyDomain,
+            .insert_channel(sql_graph::RuntimeFilterChannelSpec {
+                channel_id: sql_contract::ChannelId::new(deployment.channel_id().get()),
+                logical_domain: sql_contract::RuntimeFilterLogicalDomain::Membership {
+                    value_type: DataType::Int64,
+                    null_semantics: sql_contract::NullSemantics::NullSafeEqual,
+                },
+                lifecycle: sql_contract::RuntimeFilterLifecycle::CompleteOnce,
+                availability_coverage: SqlCoverage::AllOf(vec![SqlCoverage::Leaf(
+                    sql_contract::CoverageWitnessId::new(101),
+                )]),
+                terminal_coverage: SqlCoverage::AllOf(vec![SqlCoverage::Leaf(
+                    sql_contract::CoverageWitnessId::new(101),
+                )]),
+                reduction_requirement: sql_contract::ReductionRequirement::SetUnion,
+                allowed_contribution_kinds: BTreeSet::from([
+                    sql_contract::ContributionKind::FinalDomainShard,
+                    sql_contract::ContributionKind::ProducerClosed,
                 ]),
-                policy: deployment.policy(),
+                required_consumer_capabilities: BTreeSet::from([
+                    sql_contract::ArtifactCapability::Membership,
+                    sql_contract::ArtifactCapability::EmptyDomain,
+                ]),
+                policy: sql_contract::RuntimeFilterPolicyRequirement {
+                    max_contribution_bytes: deployment.policy().max_contribution_bytes,
+                    max_artifact_bytes: deployment.policy().max_artifact_bytes,
+                    deadline_ms: deployment.policy().deadline_ms,
+                    max_retries: deployment.policy().max_retries,
+                },
             })
             .unwrap();
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: BindingId::new(10),
-                channel_id: ChannelId::new(1),
-                coverage_witness_id: Some(CoverageWitnessId::new(101)),
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(0),
-                    node_id: PlanNodeId::new(1),
+            .insert_binding(sql_graph::RuntimeFilterBindingSpec {
+                binding_id: sql_contract::BindingId::new(10),
+                channel_id: sql_contract::ChannelId::new(1),
+                coverage_witness_id: Some(sql_contract::CoverageWitnessId::new(101)),
+                location: sql_graph::PlanLocation {
+                    fragment_id: sql_contract::PlanFragmentId::new(0),
+                    node_id: sql_contract::PlanNodeId::new(1),
                 },
                 expression: expression.clone(),
-                apply_point: ApplyPoint::NodeOutput,
-                role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                    contribution_kinds: BTreeSet::from([
-                        ContributionKind::FinalDomainShard,
-                        ContributionKind::ProducerClosed,
-                    ]),
-                    completion_requirement: CompletionRequirement::FencedFinalDomain(
-                        CompletionFenceKind::CommittedDomainFrozen,
-                    ),
-                    target:
-                        crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
-                            ordinal: 0,
-                        },
-                }),
+                apply_point: sql_graph::ApplyPoint::NodeOutput,
+                role: sql_graph::RuntimeFilterBindingRole::Producer(
+                    sql_graph::ProducerRequirement {
+                        contribution_kinds: BTreeSet::from([
+                            sql_contract::ContributionKind::FinalDomainShard,
+                            sql_contract::ContributionKind::ProducerClosed,
+                        ]),
+                        completion_requirement:
+                            sql_contract::CompletionRequirement::FencedFinalDomain(
+                                sql_contract::CompletionFenceKind::CommittedDomainFrozen,
+                            ),
+                        target: sql_graph::ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
+                    },
+                ),
             })
             .unwrap();
         graph
-            .insert_binding(RuntimeFilterBindingSpec {
-                binding_id: BindingId::new(30),
-                channel_id: ChannelId::new(1),
+            .insert_binding(sql_graph::RuntimeFilterBindingSpec {
+                binding_id: sql_contract::BindingId::new(30),
+                channel_id: sql_contract::ChannelId::new(1),
                 coverage_witness_id: None,
-                location: PlanLocation {
-                    fragment_id: PlanFragmentId::new(0),
-                    node_id: PlanNodeId::new(2),
+                location: sql_graph::PlanLocation {
+                    fragment_id: sql_contract::PlanFragmentId::new(0),
+                    node_id: sql_contract::PlanNodeId::new(2),
                 },
                 expression,
-                apply_point: ApplyPoint::NodeInput,
-                role: RuntimeFilterBindingRole::Consumer(ConsumerRequirement {
-                    capabilities: BTreeSet::from([
-                        ArtifactCapability::Membership,
-                        ArtifactCapability::EmptyDomain,
-                    ]),
-                    activation: ConsumerActivation::NonBlockingLive {
-                        late_apply: LateApplyGranularity::Batch,
+                apply_point: sql_graph::ApplyPoint::NodeInput,
+                role: sql_graph::RuntimeFilterBindingRole::Consumer(
+                    sql_graph::ConsumerRequirement {
+                        capabilities: BTreeSet::from([
+                            sql_contract::ArtifactCapability::Membership,
+                            sql_contract::ArtifactCapability::EmptyDomain,
+                        ]),
+                        activation: sql_contract::ConsumerActivation::NonBlockingLive {
+                            late_apply: sql_contract::LateApplyGranularity::Batch,
+                        },
+                        target: sql_graph::ConsumerBindingTarget::SourceBoundary,
                     },
-                    target:
-                        crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
-                }),
+                ),
             })
             .unwrap();
         let placement = FragmentInstancePlacement {

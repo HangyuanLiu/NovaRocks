@@ -18,9 +18,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::novarocks_logging::debug;
-use crate::runtime_filter::model::contract::{BindingId, ChannelId, CompletionRequirement};
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRoleData, RuntimeFilterGraphData};
-use crate::runtime_filter::model::join_progress::{
+use crate::sql::planner::runtime_filter::contract::{BindingId, ChannelId, CompletionRequirement};
+use crate::sql::planner::runtime_filter::graph::{
+    RuntimeFilterBindingRoleData, RuntimeFilterGraphData,
+};
+use crate::sql::planner::runtime_filter::progress::{
     JoinBuildProgressCatalog, JoinBuildProgressProof, JoinBuildProgressSkip,
 };
 
@@ -30,7 +32,6 @@ pub(crate) struct RefinedFragmentEdge {
     pub(crate) target_fragment: u32,
     pub(crate) target_exchange_node: i32,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProducerWaitInput {
     pub(crate) channel: ChannelId,
@@ -779,23 +780,23 @@ mod tests {
         RefinedFragmentEdge, RefinedWaitGraph, WaitEdgeKind, WaitGraph, WaitNode, WaitProvenance,
         add_wait_edge, build_refined_wait_graph,
     };
-    use crate::runtime_filter::model::contract::{
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::planner::runtime_filter::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
         ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
         RuntimeFilterPolicyRequirement,
     };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
         ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
         ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
         RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
     };
-    use crate::runtime_filter::model::join_progress::{
+    use crate::sql::planner::runtime_filter::progress::{
         FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
         JoinBuildProgressSkip,
     };
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     fn edge(
         source_fragment: u32,
@@ -1029,7 +1030,7 @@ mod tests {
 
         let live_draft = wait_fixture(DraftActivation::LiveOnly);
         let live_sealed = wait_fixture(ConsumerActivation::NonBlockingLive {
-            late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+            late_apply: crate::sql::planner::runtime_filter::contract::LateApplyGranularity::Batch,
         });
         for waits in [
             super::project_consumer_waits(&live_draft, |_| ConsumerWaitBehavior::NeverBlocks),
@@ -1219,7 +1220,7 @@ mod tests {
         let mut completion_wait = q23_wait();
         completion_wait.producers[0].completion_requirement =
             CompletionRequirement::FencedFinalDomain(
-                crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen,
+                crate::sql::planner::runtime_filter::contract::CompletionFenceKind::CommittedDomainFrozen,
             );
         assert_coarse(
             canonical.clone(),

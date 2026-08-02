@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::common::types::UniqueId;
 use crate::query_execution::backend::LiveBackendSnapshot;
 use crate::query_execution::schedule::SchedulingPlan;
+use crate::runtime_filter::deployment::planning_adapter as planning;
 use crate::runtime_filter::deployment::role_graph::{
     ChannelRoleInputs, ConsumerPlacement, ProducerPlacement, RoleGraph, RouteEdgeAllocator,
     build_channel_role_graph,
@@ -36,12 +37,15 @@ use crate::runtime_filter::deployment::{
 use crate::runtime_filter::model::contract::{
     BindingId, ChannelId, CompletionRequirement, CoverageWitnessId,
 };
-use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
-use crate::runtime_filter::model::refined_wait_graph::{
+use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
+use crate::sql::planner::distributed::{FragmentEdge, FragmentId};
+use crate::sql::planner::runtime_filter::graph::{
+    RuntimeFilterBindingRole as SqlRuntimeFilterBindingRole, RuntimeFilterGraph,
+};
+use crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog;
+use crate::sql::planner::runtime_filter::wait_graph::{
     ConsumerWaitBehavior, project_consumer_waits,
 };
-use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-use crate::sql::planner::distributed::{FragmentEdge, FragmentId, JoinBuildProgressCatalog};
 
 /// Compile a query-global [`RuntimeFilterGraph`] plus COOR-2 scheduling/placement
 /// into a coordinator-side [`RuntimeFilterDeploymentPlan`]: a full role graph
@@ -120,11 +124,11 @@ pub(crate) fn compile_with_join_progress(
                 .by_fragment
                 .get(&fragment)
                 .ok_or(DeploymentError::MissingPlacement {
-                    fragment: binding.location.fragment_id,
+                    fragment: planning::fragment_id(binding.location.fragment_id),
                 })?;
         if placements.is_empty() {
             return Err(DeploymentError::MissingPlacement {
-                fragment: binding.location.fragment_id,
+                fragment: planning::fragment_id(binding.location.fragment_id),
             });
         }
         let mut participants: BTreeSet<RuntimeFilterParticipantId> = BTreeSet::new();
@@ -137,42 +141,49 @@ pub(crate) fn compile_with_join_progress(
             let participant = participant_id_for_backend(p.backend_idx)?;
             participants.insert(participant);
             instances
-                .entry((binding.channel_id, binding.binding_id, participant))
+                .entry((
+                    planning::channel_id(binding.channel_id),
+                    planning::binding_id(binding.binding_id),
+                    participant,
+                ))
                 .or_default()
                 .insert(p.finst_id);
         }
         match &binding.role {
-            RuntimeFilterBindingRole::Producer(req) => {
+            SqlRuntimeFilterBindingRole::Producer(req) => {
                 producer_placements
-                    .entry(binding.channel_id)
+                    .entry(planning::channel_id(binding.channel_id))
                     .or_default()
                     .push(ProducerPlacement {
-                        binding: binding.binding_id,
+                        binding: planning::binding_id(binding.binding_id),
                         participants,
                     });
                 channel_completion
-                    .entry(binding.channel_id)
-                    .or_insert(req.completion_requirement);
+                    .entry(planning::channel_id(binding.channel_id))
+                    .or_insert(planning::completion(req.completion_requirement));
                 if let Some(witness) = binding.coverage_witness_id {
                     producer_witness
-                        .entry(binding.channel_id)
+                        .entry(planning::channel_id(binding.channel_id))
                         .or_default()
-                        .insert(binding.binding_id, witness);
+                        .insert(
+                            planning::binding_id(binding.binding_id),
+                            planning::witness_id(witness),
+                        );
                 }
             }
-            RuntimeFilterBindingRole::Consumer(req) => {
+            SqlRuntimeFilterBindingRole::Consumer(req) => {
                 consumer_placements
-                    .entry(binding.channel_id)
+                    .entry(planning::channel_id(binding.channel_id))
                     .or_default()
                     .push(ConsumerPlacement {
-                        binding: binding.binding_id,
+                        binding: planning::binding_id(binding.binding_id),
                         participants,
                     });
                 consumer_facts.insert(
-                    binding.binding_id,
+                    planning::binding_id(binding.binding_id),
                     ConsumerBindingFacts {
-                        activation: req.activation,
-                        capabilities: req.capabilities.clone(),
+                        activation: planning::activation(req.activation),
+                        capabilities: planning::capabilities(&req.capabilities),
                     },
                 );
             }
@@ -186,12 +197,12 @@ pub(crate) fn compile_with_join_progress(
         .map(FragmentEdge::as_refined_runtime_filter_edge)
         .collect::<Vec<_>>();
     let consumer_waits = project_consumer_waits(graph, |activation| match activation {
-        crate::runtime_filter::model::contract::ConsumerActivation::BlockingSnapshot => {
+        crate::sql::planner::runtime_filter::contract::ConsumerActivation::BlockingSnapshot => {
             ConsumerWaitBehavior::BlocksUntilComplete
         }
-        crate::runtime_filter::model::contract::ConsumerActivation::NonBlockingLive { .. } => {
-            ConsumerWaitBehavior::NeverBlocks
-        }
+        crate::sql::planner::runtime_filter::contract::ConsumerActivation::NonBlockingLive {
+            ..
+        } => ConsumerWaitBehavior::NeverBlocks,
     });
     validate_wait_for(&refined_edges, &consumer_waits, join_progress)?;
 
@@ -204,10 +215,10 @@ pub(crate) fn compile_with_join_progress(
     let mut role_graph = RoleGraph::default();
     let mut channel_specs: BTreeMap<ChannelId, ChannelProjectionSpec> = BTreeMap::new();
     for channel in graph.channels() {
-        let channel_id = channel.channel_id;
+        let channel_id = planning::channel_id(channel.channel_id);
         let inputs = ChannelRoleInputs {
             channel_id,
-            availability_coverage: channel.availability_coverage.clone(),
+            availability_coverage: planning::coverage(&channel.availability_coverage),
             producers: producer_placements
                 .get(&channel_id)
                 .cloned()
@@ -232,14 +243,16 @@ pub(crate) fn compile_with_join_progress(
             channel_id,
             ChannelProjectionSpec {
                 channel_id,
-                logical_domain: channel.logical_domain.clone(),
-                lifecycle: channel.lifecycle,
-                availability_coverage: channel.availability_coverage.clone(),
-                terminal_coverage: channel.terminal_coverage.clone(),
-                reduction_requirement: channel.reduction_requirement,
-                allowed_contribution_kinds: channel.allowed_contribution_kinds.clone(),
+                logical_domain: planning::logical_domain(&channel.logical_domain),
+                lifecycle: planning::lifecycle(channel.lifecycle),
+                availability_coverage: planning::coverage(&channel.availability_coverage),
+                terminal_coverage: planning::coverage(&channel.terminal_coverage),
+                reduction_requirement: planning::reduction(channel.reduction_requirement),
+                allowed_contribution_kinds: planning::contribution_kinds(
+                    &channel.allowed_contribution_kinds,
+                ),
                 completion_requirement: completion,
-                policy: channel.policy,
+                policy: planning::policy(channel.policy),
                 producer_witness: producer_witness
                     .get(&channel_id)
                     .cloned()
@@ -286,26 +299,27 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::deployment::extension::RuntimeFilterDeploymentExtension;
     use crate::runtime_filter::deployment::role_graph::RouteKind;
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
-        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
-        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement, SortDirection, TopKSummaryRequirement,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-    };
     use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
     };
+    use crate::sql::planner::runtime_filter::comparator::comparator_digest_for_plan;
+    use crate::sql::planner::runtime_filter::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
+        OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
+        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        SortDirection, TopKSummaryRequirement,
+    };
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation,
+        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRole,
+        RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+    };
 
-    /// Mirrors `model::graph::tests::expression()` exactly (literal `Int(1)`,
-    /// `Int64`, non-nullable) — that module is `pub(super)`-scoped to `model`,
-    /// so RFD-2 cannot import it directly; the construction is copied instead.
+    /// Minimal typed expression used by compiler fixtures.
     fn sample_typed_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -352,9 +366,7 @@ mod tests {
         }
     }
 
-    /// Membership/CompleteOnce/SetUnion Join-shaped channel — mirrors
-    /// `model::graph::tests::join_channel()`, which RFD-2 cannot import
-    /// directly for the same `pub(super)` reason as `sample_typed_expr()`.
+    /// Membership/CompleteOnce/SetUnion Join-shaped channel fixture.
     fn channel_spec(id: u32) -> RuntimeFilterChannelSpec {
         RuntimeFilterChannelSpec {
             channel_id: ChannelId::new(id),
@@ -389,11 +401,7 @@ mod tests {
         RuntimeFilterChannelSpec {
             channel_id: ChannelId::new(id),
             logical_domain: RuntimeFilterLogicalDomain::OrderedBound(OrderContract {
-                comparator_digest:
-                    crate::runtime_filter::port::ordered_bound::comparator_digest_for_test(
-                        &keys,
-                        crate::runtime_filter::port::ordered_bound::COMPARATOR_ALGORITHM_VERSION,
-                    ),
+                comparator_digest: comparator_digest_for_plan(&keys).expect("supported order"),
                 keys,
                 inclusive: true,
             }),
@@ -429,20 +437,14 @@ mod tests {
             expression: sample_typed_expr(),
             apply_point: ApplyPoint::NodeOutput,
             role: RuntimeFilterBindingRole::Producer(ProducerRequirement {
-                // NOTE: the plan's "Test helper reference" appendix lists only
-                // `ValueDomainDelta` here, which fails `validate_producer`'s
-                // `RequiredProducerContributionMissing(ProducerClosed)` check
-                // (a Membership channel without FinalDomainShard requires
-                // {ValueDomainDelta, ProducerClosed}, matching
-                // `join_producer_binding` in model::graph::tests). Corrected.
+                // Membership producers without FinalDomainShard must include
+                // ValueDomainDelta and ProducerClosed.
                 contribution_kinds: BTreeSet::from([
                     ContributionKind::ValueDomainDelta,
                     ContributionKind::ProducerClosed,
                 ]),
                 completion_requirement: CompletionRequirement::ProducerClosed,
-                target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
-                    ordinal: 0,
-                },
+                target: ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
             }),
         }
     }
@@ -488,7 +490,7 @@ mod tests {
                     ArtifactCapability::EmptyDomain,
                 ]),
                 activation,
-                target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
+                target: ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
@@ -679,8 +681,8 @@ mod tests {
             DeploymentEpoch::new(9),
         )
         .unwrap();
-        let channel_id = ChannelId::new(5);
-        let producer_binding = BindingId::new(10);
+        let channel_id = crate::runtime_filter::model::contract::ChannelId::new(5);
+        let producer_binding = crate::runtime_filter::model::contract::BindingId::new(10);
         let aggregator = pid(2);
         let remote_producer = pid(7);
         let remote_consumer = pid(11);
@@ -705,7 +707,7 @@ mod tests {
         assert!(
             aggregator_channel
                 .consumers()
-                .contains_key(&BindingId::new(11))
+                .contains_key(&crate::runtime_filter::model::contract::BindingId::new(11))
         );
         assert!(plan.install_views.contains_key(&remote_producer));
         assert!(plan.routing_shards.contains_key(&remote_producer));
@@ -744,7 +746,8 @@ mod tests {
                 DeploymentEpoch::new(9),
             )
             .unwrap();
-            let replica_routes = plan.role_graph.channels[&ChannelId::new(5)]
+            let replica_routes = plan.role_graph.channels
+                [&crate::runtime_filter::model::contract::ChannelId::new(5)]
                 .routes
                 .iter()
                 .filter(|route| route.kind == RouteKind::ReplicaDirect)
@@ -752,7 +755,9 @@ mod tests {
             let projected_outbound_routes = plan
                 .routing_shards
                 .values()
-                .filter_map(|shard| shard.channel(ChannelId::new(5)))
+                .filter_map(|shard| {
+                    shard.channel(crate::runtime_filter::model::contract::ChannelId::new(5))
+                })
                 .map(|channel| channel.outbound_edges().len())
                 .sum::<usize>();
             assert_eq!(replica_routes, redundancy as usize);
@@ -813,7 +818,7 @@ mod tests {
         assert_eq!(
             err,
             DeploymentError::MissingPlacement {
-                fragment: PlanFragmentId::new(2)
+                fragment: crate::runtime_filter::model::contract::PlanFragmentId::new(2)
             }
         );
     }
@@ -929,11 +934,13 @@ mod tests {
             DeploymentEpoch::new(7),
         )
         .unwrap();
-        let deployment =
-            &plan.install_views[&RuntimeFilterParticipantId::new(1)].channels()[&ChannelId::new(5)];
+        let deployment = &plan.install_views[&RuntimeFilterParticipantId::new(1)].channels()
+            [&crate::runtime_filter::model::contract::ChannelId::new(5)];
         assert_eq!(
             deployment.reduction_requirement(),
-            ReductionRequirement::MergeTopKSummary(TopKSummaryRequirement::try_new(3).unwrap())
+            crate::runtime_filter::model::contract::ReductionRequirement::MergeTopKSummary(
+                crate::runtime_filter::model::contract::TopKSummaryRequirement::try_new(3).unwrap(),
+            )
         );
     }
 

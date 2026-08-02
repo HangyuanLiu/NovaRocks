@@ -15,21 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Planner — builds logical plans, materializes optimizer output into planner
-//! physical IR, and plans distributed fragment topology.
+//! SQL-private runtime-filter planning algebra.
+// Design: ADR-0027 (docs/adr/ADR-0027-sql-runtime-filter-planning-ownership.md)
 //!
-//! The stage transitions are explicit: optimizer bridge produces
-//! `PhysicalPlanNode`; the planner pipeline applies physical placement passes
-//! before distributed planning cuts fragments and wires cross-fragment state.
+//! This module owns the planner's declarative graph, activation and progress
+//! proofs. Runtime installation, transport and execution consume only typed
+//! projections of these facts; they never own or reconstruct this graph.
 
-pub(crate) mod distributed;
-pub(crate) mod imv_rewrite;
-pub(crate) mod logical;
-pub(crate) mod optimizer_bridge;
-pub(crate) mod ordering;
-pub(crate) mod payload;
-pub(crate) mod physical;
-pub(crate) mod pipeline;
-pub(crate) mod runtime_filter;
-pub(crate) mod table;
-pub(crate) use logical::build::{plan_output_columns, plan_query};
+pub(crate) mod activation;
+pub(crate) mod comparator;
+pub(crate) mod contract;
+pub(crate) mod coverage;
+pub(crate) mod graph;
+pub(crate) mod policy;
+pub(crate) mod progress;
+pub(crate) mod sealed;
+pub(crate) mod validation;
+pub(crate) mod wait_graph;

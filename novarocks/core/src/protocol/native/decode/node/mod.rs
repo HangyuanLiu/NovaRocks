@@ -76,7 +76,7 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::runtime_filter::model::graph::ProducerBindingTarget;
+use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -986,7 +986,7 @@ fn attach_hash_join_producers(
                 ),
             ));
         };
-        let ProducerBindingTarget::JoinBuildKey {
+        let RuntimeFilterProducerTarget::JoinBuildKey {
             ordinal: build_key_index,
         } = *target
         else {
@@ -1131,7 +1131,7 @@ fn attach_hash_aggregate_producers(
                 ),
             ));
         };
-        let ProducerBindingTarget::AggregateTopNKey {
+        let RuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal,
             limit,
         } = *target

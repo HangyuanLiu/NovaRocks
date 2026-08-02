@@ -15,19 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::runtime_filter::model::join_progress::JoinBuildProgressCatalog;
-use crate::runtime_filter::model::refined_wait_graph::{
+use crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog;
+use crate::sql::planner::runtime_filter::wait_graph::{
     ConsumerWaitInput, RefinedFragmentEdge, build_refined_wait_graph,
 };
 
-#[cfg(test)]
-use crate::runtime_filter::model::join_progress::JoinBuildProgressProof;
-#[cfg(test)]
-use crate::runtime_filter::model::refined_wait_graph::{
-    ExecutionDependencyGraph, ProducerWaitInput, ProofRejection, revalidate_proof,
-};
-
-use super::DeploymentError;
+use super::{DeploymentError, planning_adapter};
 
 // Design: ADR-0001 (docs/adr/ADR-0001-runtime-filter-strict-fail-liveness-philosophy.md)
 pub(crate) fn validate_wait_for(
@@ -41,8 +34,8 @@ pub(crate) fn validate_wait_for(
         Some(cycle) => {
             let wait = cycle.primary_wait();
             Err(DeploymentError::BlockingFeedbackCycle {
-                channel: wait.channel,
-                binding: wait.consumer_binding,
+                channel: planning_adapter::channel_id(wait.channel),
+                binding: planning_adapter::binding_id(wait.consumer_binding),
                 cycle: cycle.render(),
             })
         }
@@ -54,11 +47,15 @@ pub(crate) fn validate_wait_for(
 mod tests {
     use super::DeploymentError;
     use super::*;
-    use crate::runtime_filter::model::contract::{
-        BindingId, ChannelId, CompletionRequirement, ConsumerActivation, LateApplyGranularity,
+    use crate::sql::planner::runtime_filter::contract::{
+        BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
+        LateApplyGranularity,
     };
-    use crate::runtime_filter::model::join_progress::FrontierEdge;
-    use crate::runtime_filter::model::refined_wait_graph::ConsumerWaitBehavior;
+    use crate::sql::planner::runtime_filter::progress::{FrontierEdge, JoinBuildProgressProof};
+    use crate::sql::planner::runtime_filter::wait_graph::{
+        ConsumerWaitBehavior, ExecutionDependencyGraph, ProducerWaitInput, ProofRejection,
+        revalidate_proof,
+    };
 
     pub(super) fn edge(source: u32, target: u32) -> RefinedFragmentEdge {
         RefinedFragmentEdge {
@@ -415,9 +412,8 @@ mod tests {
         let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
         let c = catalog(vec![proof(1, 10, vec![(3, 30)], vec![(2, 20)])]);
         let mut consumer = consumer;
-        consumer.producers[0].completion_requirement = CompletionRequirement::FencedFinalDomain(
-            crate::runtime_filter::model::contract::CompletionFenceKind::CommittedDomainFrozen,
-        );
+        consumer.producers[0].completion_requirement =
+            CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen);
 
         assert!(matches!(
             validate_wait_for(&edges, &[consumer], &c),
@@ -471,8 +467,14 @@ mod tests {
         else {
             panic!("expected cycle");
         };
-        assert_eq!(channel, ChannelId::new(7));
-        assert_eq!(binding, BindingId::new(10));
+        assert_eq!(
+            channel,
+            crate::runtime_filter::model::contract::ChannelId::new(7)
+        );
+        assert_eq!(
+            binding,
+            crate::runtime_filter::model::contract::BindingId::new(10)
+        );
         let rendered = cycle.join(", ");
         assert!(rendered.contains("channel=7"));
         assert!(rendered.contains("consumer-binding=10"));
@@ -545,7 +547,10 @@ mod tests {
         let DeploymentError::BlockingFeedbackCycle { binding, cycle, .. } = err else {
             panic!("expected cycle");
         };
-        assert_eq!(binding, BindingId::new(10));
+        assert_eq!(
+            binding,
+            crate::runtime_filter::model::contract::BindingId::new(10)
+        );
         assert!(cycle.iter().any(|step| step.contains(
             "--backpressure(frag 1) channel=7 consumer-binding=10 producer-binding=100-->"
         )));
