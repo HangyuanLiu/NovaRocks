@@ -4715,6 +4715,25 @@ fn refresh_iceberg_union_projection_mv(
                 mv_definition.mv_id,
                 uuid::Uuid::new_v4().simple()
             );
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let physical_sql = crate::sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    branch_count,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                )?;
+                if let Some(result) = try_stage_sql_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
+                    physical_sql,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 target,
