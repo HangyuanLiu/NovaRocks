@@ -165,13 +165,13 @@ struct OverwritePartitionsTxnAction {
 }
 
 #[derive(Clone)]
-struct LiveFileWithSpec {
-    data_file: DataFile,
-    snapshot_id: i64,
-    sequence_number: i64,
-    file_sequence_number: Option<i64>,
-    manifest_spec_id: i32,
-    effective_first_row_id: Option<i64>,
+pub(super) struct LiveFileWithSpec {
+    pub(super) data_file: DataFile,
+    pub(super) snapshot_id: i64,
+    pub(super) sequence_number: i64,
+    pub(super) file_sequence_number: Option<i64>,
+    pub(super) manifest_spec_id: i32,
+    pub(super) effective_first_row_id: Option<i64>,
 }
 
 impl OverwritePartitionsTxnAction {
@@ -518,7 +518,7 @@ impl TransactionAction for OverwritePartitionsTxnAction {
 /// Used by `OverwritePartitionsCommit` to emit surviving data files (those in
 /// non-touched partitions) into the new snapshot's manifest list.
 #[allow(clippy::too_many_arguments)]
-async fn write_existing_data_manifest(
+pub(super) async fn write_existing_data_manifest(
     file_io: &FileIO,
     out_path: &str,
     surviving: &[(DataFile, i64, i64, Option<i64>, Option<i64>, i32)],
@@ -570,7 +570,7 @@ async fn write_existing_data_manifest(
 /// Used by `OverwritePartitionsCommit` to preserve surviving delete files
 /// (position-delete / equality-delete / DV) in non-touched partitions.
 #[allow(clippy::too_many_arguments)]
-async fn write_existing_deletes_manifest(
+pub(super) async fn write_existing_deletes_manifest(
     file_io: &FileIO,
     out_path: &str,
     surviving: &[(DataFile, i64, i64, Option<i64>)],
@@ -622,7 +622,7 @@ async fn enumerate_live_all_files_with_spec(
     enumerate_live_all_files_with_spec_at_snapshot(table, file_io, snapshot_id).await
 }
 
-async fn enumerate_live_all_files_with_spec_at_snapshot(
+pub(super) async fn enumerate_live_all_files_with_spec_at_snapshot(
     table: &Table,
     file_io: &FileIO,
     snapshot_id: Option<i64>,
