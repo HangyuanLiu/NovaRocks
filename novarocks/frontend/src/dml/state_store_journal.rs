@@ -861,6 +861,10 @@ impl OperationJournal for StateStoreOperationJournal {
     ) -> Result<StoredOperation, DmlError> {
         self.blocking(self.mutate_statement_operation_async(request))
     }
+
+    fn preflight_statement_operation(&self, operation: &StoredOperation) -> Result<(), DmlError> {
+        encode_operation_with_limit(operation, self.store.limits().max_value_bytes).map(|_| ())
+    }
 }
 
 fn operation_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {

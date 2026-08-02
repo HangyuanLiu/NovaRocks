@@ -51,11 +51,21 @@ const OPERATION_PREFIX: &str = "novarocks/frontend/dml/v1/operations/";
 const UNFINISHED_PREFIX: &str = "novarocks/frontend/dml/v1/unfinished/";
 
 fn config(path: &std::path::Path) -> StateStoreHostConfig {
+    config_with_max_value_bytes(path, None)
+}
+
+fn config_with_max_value_bytes(
+    path: &std::path::Path,
+    max_value_bytes: Option<usize>,
+) -> StateStoreHostConfig {
     StateStoreHostConfig {
         state_store: StateStoreAppConfig {
             store: StateStoreConfig {
                 cluster_id: "dml-journal-test".to_string(),
-                limits: StateStoreLimitOverrides::default(),
+                limits: StateStoreLimitOverrides {
+                    max_value_bytes,
+                    ..StateStoreLimitOverrides::default()
+                },
                 provider: StateStoreProviderConfig::Sqlite {
                     path: path.to_path_buf(),
                     deployment_owner: "dml-journal-fe".to_string(),
@@ -74,10 +84,21 @@ async fn open_store(
     Arc<dyn StateStore>,
     StateStoreOperationJournal,
 ) {
+    open_store_with_max_value_bytes(path, None).await
+}
+
+async fn open_store_with_max_value_bytes(
+    path: &std::path::Path,
+    max_value_bytes: Option<usize>,
+) -> (
+    StateStoreHost,
+    Arc<dyn StateStore>,
+    StateStoreOperationJournal,
+) {
     let registry = builtin_state_store_provider_registry().expect("provider registry");
     let host = StateStoreHost::open(
         &registry,
-        config(path),
+        config_with_max_value_bytes(path, max_value_bytes),
         FeDeploymentView {
             active_fe_count: NonZeroUsize::new(1).unwrap(),
             topology_revision: Bytes::from_static(b"dml-journal-topology"),
@@ -526,6 +547,98 @@ async fn oversized_record_is_rejected_without_truncation() {
     let error = journal.create_preparing(oversized).unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(journal.list_unfinished().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_preflight_uses_real_state_store_value_limit_at_exact_boundary() {
+    let temp = TempDir::new().unwrap();
+    let (_source_host, _source_store, source_journal) =
+        open_store(&temp.path().join("source.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let mut operation = source_journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::Truncate,
+            OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+                phase: TruncateLifecyclePhase::Preparing,
+                connector_operation_id: Uuid::now_v7(),
+                provider_id: Some("iceberg".to_string()),
+                connector_instance_id: Some("iceberg-rest".to_string()),
+                connector_incarnation: Some("09".repeat(16)),
+                target_ref: "main".to_string(),
+                request_digest: Some("request-digest".to_string()),
+                plan_digest: Some("plan-digest".to_string()),
+                state_digest: Some("state-digest".to_string()),
+                plan_summary: Some(DurableMutationSummary {
+                    file_count: 0,
+                    row_count: 0,
+                    total_bytes: 0,
+                }),
+                outcome: None,
+                next_action: StatementNextAction::None,
+            }),
+        ))
+        .unwrap();
+    operation.state = OperationState::CommitUnknown;
+    operation.payload = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+        phase: TruncateLifecyclePhase::CommitUnknown,
+        connector_operation_id: match &operation.payload {
+            OperationPayload::TruncateLifecycle(record) => record.connector_operation_id,
+            _ => unreachable!(),
+        },
+        provider_id: Some("iceberg".to_string()),
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some("09".repeat(16)),
+        target_ref: "main".to_string(),
+        request_digest: Some("request-digest".to_string()),
+        plan_digest: Some("plan-digest".to_string()),
+        state_digest: Some("state-digest".to_string()),
+        plan_summary: Some(DurableMutationSummary {
+            file_count: 0,
+            row_count: 0,
+            total_bytes: 0,
+        }),
+        outcome: Some(DurableExternalFact {
+            outcome: ExternalFactOutcome::CommitUnknown,
+            receipt: None,
+            evidence: Some("ab".repeat(DML_EXTERNAL_FACT_ENCODED_LIMIT / 2)),
+            finalization_failure: None,
+            failure: Some(
+                json!({
+                    "version": 1,
+                    "kind": "UNAVAILABLE",
+                    "message_prefix": "x".repeat(2 * 1024),
+                    "message_truncated": true,
+                    "original_message_bytes": 128 * 1024,
+                    "original_message_sha256": "cd".repeat(32),
+                })
+                .to_string(),
+            ),
+        }),
+        next_action: StatementNextAction::Reconcile,
+    });
+
+    let encoded_len = serde_json::to_vec(&operation).unwrap().len();
+    let (_exact_host, exact_store, exact_journal) =
+        open_store_with_max_value_bytes(&temp.path().join("exact.sqlite"), Some(encoded_len)).await;
+    assert_eq!(exact_store.limits().max_value_bytes, encoded_len);
+    exact_journal
+        .preflight_statement_operation(&operation)
+        .unwrap();
+
+    let (_short_host, short_store, short_journal) =
+        open_store_with_max_value_bytes(&temp.path().join("short.sqlite"), Some(encoded_len - 1))
+            .await;
+    assert_eq!(short_store.limits().max_value_bytes, encoded_len - 1);
+    let error = short_journal
+        .preflight_statement_operation(&operation)
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+    assert!(error.to_string().contains(&format!(
+        "encoded size {encoded_len} exceeds StateStore value limit {}",
+        encoded_len - 1
+    )));
 }
 
 fn ctas_payload(phase: CtasSagaPhase) -> OperationPayload {

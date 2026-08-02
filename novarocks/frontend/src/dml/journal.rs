@@ -51,6 +51,18 @@ pub trait OperationJournal: Send + Sync {
             "statement-specific DML operation mutation is not supported by this journal",
         ))
     }
+
+    /// Validate that a complete post-dispatch statement envelope can be
+    /// durably encoded by this journal before the external side effect starts.
+    ///
+    /// Journals must opt in with their real storage limits. Failing closed is
+    /// intentional: executing without this guarantee could make the external
+    /// truth impossible to record.
+    fn preflight_statement_operation(&self, _operation: &StoredOperation) -> Result<(), DmlError> {
+        Err(DmlError::journal_unavailable(
+            "statement-specific DML operation preflight is not supported by this journal",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +188,15 @@ pub(crate) mod testing {
                 operation.finished_at_ms = Some(operation.updated_at_ms);
             }
             Ok(())
+        }
+
+        fn preflight_statement_operation(
+            &self,
+            operation: &StoredOperation,
+        ) -> Result<(), DmlError> {
+            serde_json::to_vec(operation)
+                .map(|_| ())
+                .map_err(DmlError::journal_corruption)
         }
 
         fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError> {
