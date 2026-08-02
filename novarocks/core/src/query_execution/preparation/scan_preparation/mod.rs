@@ -271,7 +271,7 @@ fn prepare_scan_node(
                 })
                 .unwrap_or_default();
             let exact_lease = query_table_bindings
-                .map(|bindings| exact_query_binding_lease(bindings, &files.table, files.binding))
+                .map(|bindings| exact_query_binding_lease_for_source(bindings, &scan.table.source))
                 .transpose()?;
             let planned = plan_iceberg_connector_read(
                 controls,
@@ -290,19 +290,13 @@ fn prepare_scan_node(
             (Vec::new(), Vec::new(), Some(planned))
         }
         ResolvedScanExecution::IcebergDelta(_) => {
-            let ScanSource::IcebergDeltaTable { table, .. } = &scan.table.source else {
+            let ScanSource::IcebergDeltaTable { .. } = &scan.table.source else {
                 return Err(format!(
                     "scan preparation node_id={node_id}: IcebergDelta execution requires IcebergDeltaTable source"
                 ));
             };
             let exact_lease = query_table_bindings
-                .map(|bindings| {
-                    exact_query_binding_lease(
-                        bindings,
-                        table,
-                        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    )
-                })
+                .map(|bindings| exact_query_binding_lease_for_source(bindings, &scan.table.source))
                 .transpose()?;
             let planned = plan_iceberg_delta_connector_read(
                 controls,
@@ -333,30 +327,41 @@ fn prepare_scan_node(
 /// Once SQL catalog resolution selected a query binding, preparation must use
 /// that same connector generation.  A missing binding is a contract error,
 /// not permission to reacquire `current` and silently mix metadata versions.
-fn exact_query_binding_lease(
+fn exact_query_binding_lease_for_source(
     bindings: &QueryTableBindingStore,
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    source: &ScanSource,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
-    let binding = bindings
-        .iceberg_data_file_binding(table, binding)
-        .ok_or_else(|| {
-            format!(
-                "scan preparation has no exact query binding for '{}.{}.{}'",
-                table.catalog, table.namespace, table.table
-            )
-        })?;
-    let lease = binding.planning_lease.clone().ok_or_else(|| {
-        format!(
-            "query binding for '{}.{}.{}' has no connector planning lease",
-            table.catalog, table.namespace, table.table
-        )
+    let (binding_id, expected_catalog, source_name) = match source {
+        ScanSource::IcebergDataFiles { table, binding, .. } => (
+            bindings.iceberg_data_file_binding_id(table, *binding),
+            table.catalog.as_str(),
+            format!("'{}.{}.{}'", table.catalog, table.namespace, table.table),
+        ),
+        ScanSource::IcebergDeltaTable { table, .. } => (
+            bindings.iceberg_data_file_binding_id(
+                table,
+                crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            ),
+            table.catalog.as_str(),
+            format!("'{}.{}.{}'", table.catalog, table.namespace, table.table),
+        ),
+        source => {
+            return Err(format!(
+                "scan preparation cannot recover an exact query binding from source {}",
+                scan_source_kind(source)
+            ));
+        }
+    };
+    let binding_id = binding_id
+        .ok_or_else(|| format!("scan preparation has no exact query binding for {source_name}"))?;
+    let lease = bindings.planning_lease(binding_id)?.ok_or_else(|| {
+        format!("query binding for {source_name} has no connector planning lease")
     })?;
-    if lease.binding().descriptor().instance_id.as_str() != table.catalog {
+    if lease.binding().descriptor().instance_id.as_str() != expected_catalog {
         return Err(format!(
             "query binding lease owner '{:?}' does not match scan catalog '{}'",
             lease.binding().descriptor().instance_id,
-            table.catalog
+            expected_catalog
         ));
     }
     Ok(lease)

@@ -201,19 +201,36 @@ impl QueryTableBindingStore {
         key: QueryTableBindingKey,
         load: impl FnOnce() -> Result<QueryTableBinding, String>,
     ) -> Result<SqlTableBindingId, String> {
+        self.resolve_or_insert_with_id(key, |_| load())
+    }
+
+    /// Reserve the request-local token before projecting provider facts into a
+    /// SQL table.  The loader cannot observe any other request's token, and
+    /// the provisional token is inserted only when materialization succeeds.
+    ///
+    /// This is the admission seam used by the `SqlScanSource` cutover: the
+    /// application loader receives the exact token that the resulting SQL
+    /// table will carry, while the concrete scan authority remains in this
+    /// store. Failed loads remain memoized and never publish their token.
+    pub(crate) fn resolve_or_insert_with_id(
+        &self,
+        key: QueryTableBindingKey,
+        load: impl FnOnce(SqlTableBindingId) -> Result<QueryTableBinding, String>,
+    ) -> Result<SqlTableBindingId, String> {
         let mut entries = self.entries.lock().expect("query table binding lock");
         if let Some(entry) = entries.get(&key) {
             return entry.as_ref().map(|stored| stored.id).map_err(Clone::clone);
         }
 
-        let result = load().and_then(|binding| {
-            let id = self.allocate_id()?;
-            let binding = Arc::new(binding);
-            self.by_id
-                .lock()
-                .expect("query table binding by-id lock")
-                .insert(id, Arc::clone(&binding));
-            Ok(StoredBinding { id })
+        let result = self.allocate_id().and_then(|id| {
+            load(id).map(|binding| {
+                let binding = Arc::new(binding);
+                self.by_id
+                    .lock()
+                    .expect("query table binding by-id lock")
+                    .insert(id, Arc::clone(&binding));
+                StoredBinding { id }
+            })
         });
         let response = result
             .as_ref()
@@ -287,31 +304,6 @@ impl QueryTableBindingStore {
         self.binding_for_key(&QueryTableBindingKey::strict_base(
             catalog, namespace, table,
         ))
-    }
-
-    pub(crate) fn iceberg_data_file_binding(
-        &self,
-        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
-    ) -> Option<Arc<QueryTableBinding>> {
-        use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
-
-        let key = match binding {
-            IcebergDataFileBinding::ExplicitFiles => table.current_snapshot_id.map(|snapshot_id| {
-                QueryTableBindingKey::snapshot(
-                    &table.catalog,
-                    &table.namespace,
-                    &table.table,
-                    snapshot_id,
-                )
-            }),
-            _ => Some(QueryTableBindingKey::strict_base(
-                &table.catalog,
-                &table.namespace,
-                &table.table,
-            )),
-        }?;
-        self.binding_for_key(&key)
     }
 
     /// Transitional lookup for legacy physical scan facts.  It resolves only
@@ -467,5 +459,26 @@ mod tests {
             "orders"
         );
         assert!(second.binding(first_token).is_err());
+    }
+
+    #[test]
+    fn sqlx2_binding_loader_receives_the_token_published_by_the_store() {
+        let store = QueryTableBindingStore::try_new().expect("store");
+        let key = QueryTableBindingKey::strict_base("ice", "db", "orders");
+        let observed = std::sync::Mutex::new(None);
+
+        let token = store
+            .resolve_or_insert_with_id(key, |id| {
+                *observed.lock().expect("observed token lock") = Some(id);
+                Ok(local_binding())
+            })
+            .expect("binding token");
+
+        assert_eq!(
+            *observed.lock().expect("observed token lock"),
+            Some(token),
+            "the SQL projection must carry the exact token published by admission"
+        );
+        assert!(store.binding(token).is_ok());
     }
 }
