@@ -1534,6 +1534,43 @@ impl IcebergControlProvider {
         decode_payload(table.payload(), "table handle")
     }
 
+    fn hydrate_frozen_rewrite_source(
+        &self,
+        entry: &IcebergCatalogEntry,
+        table: &mut TablePayload,
+    ) -> Result<(), ConnectorError> {
+        let Some(frozen) = table.frozen_rewrite.as_ref() else {
+            return Ok(());
+        };
+        if frozen.version != 1
+            || !matches!(
+                frozen.operation_kind.as_str(),
+                novarocks_spi::connector::REWRITE_DATA_FILES_KIND
+                    | novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND
+            )
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg frozen rewrite source is invalid",
+            ));
+        }
+        let loaded =
+            load_table(entry, &table.namespace, &table.table).map_err(map_iceberg_error)?;
+        let group = super::distributed_rewrite::load_frozen_rewrite_group(
+            loaded.table.file_io(),
+            &frozen.group,
+        )?;
+        if frozen.operation_kind != novarocks_spi::connector::REWRITE_DATA_FILES_KIND {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg position-delete rewrite source requires the dedicated maintenance reader",
+            ));
+        }
+        table.prepared_files = group.data_files.clone();
+        table.explicit_files = Some(group.data_files);
+        Ok(())
+    }
+
     fn scan_payload(&self, scan: &ConnectorScanHandle) -> Result<ScanPayload, ConnectorError> {
         ensure_owner(scan.owner(), &self.instance_id)?;
         decode_payload(scan.payload(), "scan handle")
@@ -3955,8 +3992,9 @@ impl ConnectorScanPlanning for IcebergControlProvider {
     ) -> Result<ConnectorScan, ConnectorError> {
         self.validate_context(&request.context)?;
         validate_static_predicates(&request.static_predicates)?;
-        let table = self.table_payload(table)?;
+        let mut table = self.table_payload(table)?;
         let entry = self.entry(self.instance_id.as_str())?;
+        self.hydrate_frozen_rewrite_source(&entry, &mut table)?;
         let output_schema =
             self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?;
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
@@ -4356,6 +4394,7 @@ fn build_table_payload(
         explicit_files: None,
         logical_type_columns,
         hidden_columns,
+        frozen_rewrite: None,
     })
 }
 
@@ -4372,6 +4411,57 @@ struct TablePayload {
     logical_type_columns: BTreeMap<String, String>,
     #[serde(default)]
     hidden_columns: Vec<String>,
+    #[serde(default)]
+    frozen_rewrite: Option<FrozenRewriteSourcePayloadV1>,
+}
+
+/// A bounded reference to an Iceberg-owned rewrite artifact.  It is the only
+/// special table handle C1 needs: the detailed file list is rehydrated by the
+/// FE provider, then reaches BEs through ordinary opaque Iceberg splits.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenRewriteSourcePayloadV1 {
+    version: u16,
+    operation_kind: String,
+    group: super::distributed_rewrite::IcebergRewriteGroupPayloadV1,
+}
+
+pub(crate) fn frozen_rewrite_source_table_handle(
+    original: &ConnectorTableHandle,
+    operation: &novarocks_spi::connector::ConnectorDistributedRewriteOperation,
+    group: super::distributed_rewrite::IcebergRewriteGroupPayloadV1,
+) -> Result<ConnectorTableHandle, ConnectorError> {
+    let table: TablePayload = decode_payload(original.payload(), "Iceberg rewrite source table")?;
+    if table.metadata_table_type.is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg distributed rewrite requires a base table source",
+        ));
+    }
+    let payload = TablePayload {
+        namespace: table.namespace,
+        table: table.table,
+        table_info: None,
+        metadata_columns: Vec::new(),
+        metadata_table_type: None,
+        prepared_files: Vec::new(),
+        explicit_files: None,
+        logical_type_columns: BTreeMap::new(),
+        hidden_columns: Vec::new(),
+        frozen_rewrite: Some(FrozenRewriteSourcePayloadV1 {
+            version: 1,
+            operation_kind: operation.kind().to_string(),
+            group,
+        }),
+    };
+    ConnectorTableHandle::try_new(
+        original.owner().clone(),
+        encode_payload(
+            &payload,
+            "Iceberg frozen rewrite source table",
+            novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES,
+        )?,
+    )
 }
 
 pub(crate) fn decode_data_mutation_table_target(
@@ -5014,6 +5104,7 @@ fn plan_native_iceberg_read_with_bound_lease(
                     .then(|| explicit_files.expect("non-empty explicit files").to_vec()),
                 logical_type_columns: BTreeMap::new(),
                 hidden_columns: Vec::new(),
+                frozen_rewrite: None,
             },
             "table handle",
             context.max_handle_payload_bytes(),
@@ -5710,6 +5801,7 @@ mod tests {
             explicit_files: None,
             logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
+            frozen_rewrite: None,
         };
         let supported = ConnectorStaticPredicate {
             id: novarocks_spi::connector::ConnectorStaticPredicateId(3),
@@ -5779,6 +5871,7 @@ mod tests {
             explicit_files: None,
             logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
+            frozen_rewrite: None,
         };
         let payload = SplitPayload {
             version: ICEBERG_SPLIT_V1,
@@ -6003,6 +6096,7 @@ mod tests {
                         explicit_files: Some(files),
                         logical_type_columns: BTreeMap::new(),
                         hidden_columns: Vec::new(),
+                        frozen_rewrite: None,
                     },
                     snapshot_id: None,
                     table_uuid: None,
