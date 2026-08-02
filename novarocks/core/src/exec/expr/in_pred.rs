@@ -18,7 +18,6 @@ use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::function::compare_values_with_null;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, cast_with_special_rules};
-use crate::exec::variant::VariantValue;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -29,6 +28,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::compute::kernels::cmp::eq;
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_types::value::variant::VariantValue;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 

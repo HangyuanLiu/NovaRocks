@@ -25,6 +25,7 @@ pub mod largeint;
 pub mod logical;
 mod predicate;
 pub mod primitive;
+pub mod value;
 
 pub use arithmetic::{
     arithmetic_result_type, arithmetic_result_type_with_op, canonical_agg_decimal_type,

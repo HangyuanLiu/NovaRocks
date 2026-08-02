@@ -197,7 +197,7 @@ impl JoinRefreshDescriptor {
         if !self
             .action_column
             .name
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
             || self.action_column.data_type != DataType::Int8
             || self.action_column.nullable
             || !self.action_column.is_internal
@@ -368,7 +368,7 @@ impl JoinRefreshDescriptor {
 fn validate_row_id_column(side: &str, column: &OutputColumn) -> Result<(), String> {
     if !column
         .name
-        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
         || column.data_type != DataType::Int64
         || column.nullable
         || !column.is_internal
@@ -434,21 +434,21 @@ mod tests {
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(
                 1,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             right_row_id_column: out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             action_column: out(
                 3,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
@@ -473,7 +473,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         9,
-                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        crate::sql::common::CHANGE_OP_COLUMN,
                         DataType::Int8,
                         false,
                         true,

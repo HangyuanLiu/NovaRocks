@@ -160,7 +160,7 @@ mod tests {
             right_row_id_column: out(2, "_row_id", DataType::Int64, false, true),
             action_column: out(
                 3,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
@@ -185,7 +185,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         9,
-                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        crate::sql::common::CHANGE_OP_COLUMN,
                         DataType::Int8,
                         false,
                         true,

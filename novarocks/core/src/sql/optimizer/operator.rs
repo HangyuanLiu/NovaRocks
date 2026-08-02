@@ -24,7 +24,9 @@
 use std::collections::HashSet;
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::{ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn, WindowFrame};
+use crate::sql::common::{
+    ApplyKind, CteId, ImvVersionRef, JoinKind, OutputColumn, SqlTopNType, WindowFrame,
+};
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
 use crate::sql::optimizer::stats_input::StatsRef;
 use crate::sql::planner::table::{BranchScope, TableDef};
@@ -356,7 +358,7 @@ pub(crate) struct SortOp {
     /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking
     /// kind. `None` ⇒ ordinary sort. See OQ-13 ranking-window design spec §4.
     pub partition_limit: Option<usize>,
-    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
+    pub topn_type: Option<SqlTopNType>,
 }
 
 #[derive(Clone, Debug)]

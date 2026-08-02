@@ -1939,26 +1939,26 @@ pub(crate) mod tests {
         assert!(
             output_names
                 .iter()
-                .any(|name| name
-                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)),
+                .any(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)),
             "root output must include target _file locator metadata; items: {output_names:?}"
         );
         assert!(
             output_names
                 .iter()
-                .any(|name| name
-                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)),
+                .any(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)),
             "root output must include target _pos locator metadata; items: {output_names:?}"
         );
         assert!(
-            output_names.iter().any(
-                |name| name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-            ),
+            output_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)),
             "root output must include target _row_id lineage metadata; items: {output_names:?}"
         );
         assert!(
-            output_names.iter().any(|name| name
-                .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)),
+            output_names
+                .iter()
+                .any(|name| name
+                    .eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)),
             "root output must include target _last_updated_sequence_number lineage metadata; items: {output_names:?}"
         );
     }
@@ -1982,7 +1982,7 @@ pub(crate) mod tests {
                             data_type: DataType::Utf8,
                             nullable: false,
                         },
-                        output_name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                        output_name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
                         output_column_id: ColumnId(2),
                     },
                     ProjectItem {
@@ -1991,7 +1991,7 @@ pub(crate) mod tests {
                             data_type: DataType::Int64,
                             nullable: false,
                         },
-                        output_name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                        output_name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
                         output_column_id: ColumnId(3),
                     },
                 ],

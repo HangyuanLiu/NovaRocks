@@ -62,7 +62,7 @@ pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert
 /// The binary format remains an execution-layer concern; frontend receives
 /// only opaque bytes and owns the decision to fold `parse_json(...)`.
 pub fn encode_insert_variant_json(json_text: &str) -> Result<Vec<u8>, String> {
-    crate::exec::variant_encode::encode_json_text_to_variant_bytes(json_text)
+    novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json_text)
 }
 
 /// One admitted INSERT statement at the frontend route boundary.

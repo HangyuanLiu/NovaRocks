@@ -40,7 +40,7 @@ use novarocks_catalog::schema::ColumnDef;
 pub(crate) struct ImvRowIdColumn;
 
 impl ImvRowIdColumn {
-    pub(crate) const NAME: &'static str = crate::exec::row_position::ICEBERG_ROW_ID_COL;
+    pub(crate) const NAME: &'static str = crate::sql::common::ICEBERG_ROW_ID_COL;
 
     pub(crate) fn output_column(column_id: ColumnId) -> OutputColumn {
         OutputColumn {

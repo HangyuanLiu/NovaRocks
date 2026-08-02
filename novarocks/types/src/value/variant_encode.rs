@@ -29,10 +29,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::Value;
 
-use crate::exec::variant::VariantValue;
+use super::variant::VariantValue;
 
 /// Encode JSON text into NovaRocks' size-prefixed variant payload.
-pub(crate) fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u8>, String> {
+pub fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u8>, String> {
     let value: Value =
         serde_json::from_str(json_text).map_err(|e| format!("parse_json: invalid JSON: {e}"))?;
     encode_json_value_to_variant_bytes(&value)
@@ -40,7 +40,7 @@ pub(crate) fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u
 
 /// Encode an already-parsed JSON value. Same output shape as
 /// [`encode_json_text_to_variant_bytes`].
-pub(crate) fn encode_json_value_to_variant_bytes(value: &Value) -> Result<Vec<u8>, String> {
+pub fn encode_json_value_to_variant_bytes(value: &Value) -> Result<Vec<u8>, String> {
     let mut keys = BTreeSet::new();
     collect_object_keys(value, &mut keys);
     let (metadata, key_to_id) = build_metadata(&keys);
@@ -316,7 +316,7 @@ fn encode_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::variant::{
+    use crate::value::variant::{
         VariantValue, is_variant_null, parse_variant_path, variant_query, variant_to_bool,
         variant_to_f64, variant_to_i64, variant_to_string,
     };
@@ -347,6 +347,20 @@ mod tests {
     }
 
     #[test]
+    fn sqlx2_value_codec_variant_json_utf8_and_malformed_are_stable() {
+        let bytes = encode_json_text_to_variant_bytes(r#"{"é":{"nested":[true,42]}}"#)
+            .expect("encode utf8 json");
+        let decoded = VariantValue::from_serialized(&bytes).expect("decode variant");
+        let nested = variant_query(
+            &decoded,
+            &parse_variant_path("$['é'].nested[1]").expect("path"),
+        )
+        .expect("query nested value");
+        assert_eq!(variant_to_i64(&nested).expect("integer"), 42);
+        assert!(encode_json_text_to_variant_bytes("{").is_err());
+    }
+
+    #[test]
     fn encode_int_picks_smallest_width() {
         let cases: &[(i64, &str)] = &[
             (0, "0"),
@@ -374,7 +388,7 @@ mod tests {
         // size:u32 LE
         let size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
         // empty metadata is [0x11, 0, 0] (sorted, dict_size=0, one zero offset).
-        let value_start = 4 + (bytes.len() - 4 - 2); // value follows metadata, 2 bytes for Int8
+        let _value_start = 4 + (bytes.len() - 4 - 2); // value follows metadata, 2 bytes for Int8
         let _ = size;
         // Locate value bytes: empty metadata is exactly 3 bytes for an empty dict.
         let value = &bytes[4 + 3..];

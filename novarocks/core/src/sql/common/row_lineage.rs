@@ -14,23 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#![allow(dead_code)]
-#![allow(unused_variables)]
 
-mod array_to_bitmap;
-mod bitmap_functions;
-mod bitmap_to_array;
-mod bitmap_to_string;
-mod dispatch;
-mod ds_hll_functions;
-mod hll_codec;
-pub(crate) mod hll_hash;
-mod json_object;
-pub mod percentile_functions;
-pub(crate) mod to_bitmap;
-mod utility_functions;
+//! SQL-owned hidden-column names for Iceberg row-lineage planning.
 
-pub use dispatch::{eval_object_function, metadata, register};
-pub use hll_hash::eval_hll_hash;
-pub use percentile_functions::eval_percentile_hash;
-pub use to_bitmap::eval_to_bitmap;
+pub(crate) const ICEBERG_FILE_PATH_COL: &str = "_file";
+pub(crate) const ICEBERG_ROW_POS_COL: &str = "_pos";
+pub(crate) const ICEBERG_ROW_ID_COL: &str = "_row_id";
+pub(crate) const ICEBERG_LAST_UPDATED_SEQ_COL: &str = "_last_updated_sequence_number";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlx2_planner_vocabulary_row_lineage_columns_are_stable() {
+        assert_eq!(ICEBERG_FILE_PATH_COL, "_file");
+        assert_eq!(ICEBERG_ROW_POS_COL, "_pos");
+        assert_eq!(ICEBERG_ROW_ID_COL, "_row_id");
+        assert_eq!(
+            ICEBERG_LAST_UPDATED_SEQ_COL,
+            "_last_updated_sequence_number"
+        );
+    }
+}

@@ -29,6 +29,7 @@ use base64::Engine;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use novarocks_types::largeint;
+use novarocks_types::value::bitmap as bitmap_common;
 
 fn row_index(
     row: usize,
@@ -196,7 +197,7 @@ fn i64_arg_at(
 
 fn encode_bitmap_values(values: &[u64]) -> Result<Vec<u8>, String> {
     let set: BTreeSet<u64> = values.iter().copied().collect();
-    super::bitmap_common::encode_internal_bitmap(&set)
+    bitmap_common::encode_internal_bitmap(&set)
 }
 
 fn bitmap_minmax_impl(
@@ -219,7 +220,7 @@ fn bitmap_minmax_impl(
             continue;
         }
         let arr = arr_opt.unwrap();
-        let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
+        let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
                 values_i128.push(None);
@@ -264,7 +265,7 @@ pub fn eval_bitmap_empty(
 ) -> Result<ArrayRef, String> {
     let mut builder = BinaryBuilder::new();
     for _ in 0..chunk.len() {
-        builder.append_value([super::bitmap_common::BITMAP_TYPE_EMPTY]);
+        builder.append_value([bitmap_common::BITMAP_TYPE_EMPTY]);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -286,9 +287,9 @@ pub fn eval_bitmap_from_string(
                     builder.append_null();
                     continue;
                 }
-                match super::bitmap_common::parse_bitmap_string($arr.value(idx)) {
+                match bitmap_common::parse_bitmap_string($arr.value(idx)) {
                     Ok(values) => {
-                        builder.append_value(super::bitmap_common::encode_internal_bitmap(&values)?)
+                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)
                     }
                     Err(_) => builder.append_null(),
                 }
@@ -309,9 +310,9 @@ pub fn eval_bitmap_from_string(
                     builder.append_null();
                     continue;
                 };
-                match super::bitmap_common::parse_bitmap_string(text) {
+                match bitmap_common::parse_bitmap_string(text) {
                     Ok(values) => {
-                        builder.append_value(super::bitmap_common::encode_internal_bitmap(&values)?)
+                        builder.append_value(bitmap_common::encode_internal_bitmap(&values)?)
                     }
                     Err(_) => builder.append_null(),
                 }
@@ -364,7 +365,7 @@ pub fn eval_bitmap_count(
             continue;
         }
         let arr = arr_opt.unwrap();
-        match super::bitmap_common::decode_bitmap(arr.value(idx)) {
+        match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => {
                 let count = i64::try_from(values.len())
                     .map_err(|_| format!("bitmap_count cardinality overflow: {}", values.len()))?;
@@ -416,14 +417,14 @@ pub fn eval_bitmap_and(
             builder.append_null();
             continue;
         }
-        let left = match super::bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
+        let left = match bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        let right = match super::bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
+        let right = match bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
@@ -462,14 +463,14 @@ pub fn eval_bitmap_has_any(
             builder.append_null();
             continue;
         }
-        let left = match super::bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
+        let left = match bitmap_common::decode_bitmap(lhs_opt.unwrap().value(lhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        let right = match super::bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
+        let right = match bitmap_common::decode_bitmap(rhs_opt.unwrap().value(rhs_idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
@@ -515,14 +516,13 @@ pub fn eval_sub_bitmap(
             builder.append_null();
             continue;
         }
-        let values =
-            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-                Ok(values) => values.into_iter().collect::<Vec<_>>(),
-                Err(_) => {
-                    builder.append_null();
-                    continue;
-                }
-            };
+        let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+            Ok(values) => values.into_iter().collect::<Vec<_>>(),
+            Err(_) => {
+                builder.append_null();
+                continue;
+            }
+        };
         let cardinality = i64::try_from(values.len())
             .map_err(|_| format!("sub_bitmap cardinality overflow: len={}", values.len()))?;
         let offset = offset.expect("checked");
@@ -589,14 +589,13 @@ pub fn eval_bitmap_subset_limit(
             builder.append_null();
             continue;
         }
-        let values =
-            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-                Ok(values) => values.into_iter().collect::<Vec<_>>(),
-                Err(_) => {
-                    builder.append_null();
-                    continue;
-                }
-            };
+        let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+            Ok(values) => values.into_iter().collect::<Vec<_>>(),
+            Err(_) => {
+                builder.append_null();
+                continue;
+            }
+        };
         if values.is_empty() {
             builder.append_null();
             continue;
@@ -678,14 +677,13 @@ pub fn eval_bitmap_subset_in_range(
             builder.append_null();
             continue;
         }
-        let values =
-            match super::bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
-                Ok(values) => values.into_iter().collect::<Vec<_>>(),
-                Err(_) => {
-                    builder.append_null();
-                    continue;
-                }
-            };
+        let values = match bitmap_common::decode_bitmap(bitmap_opt.unwrap().value(bitmap_idx)) {
+            Ok(values) => values.into_iter().collect::<Vec<_>>(),
+            Err(_) => {
+                builder.append_null();
+                continue;
+            }
+        };
         if values.is_empty() {
             builder.append_null();
             continue;
@@ -735,14 +733,14 @@ pub fn eval_bitmap_to_binary(
             continue;
         }
         let arr = arr_opt.unwrap();
-        let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
+        let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        builder.append_value(super::bitmap_common::encode_external_bitmap(&values)?);
+        builder.append_value(bitmap_common::encode_external_bitmap(&values)?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -830,9 +828,9 @@ pub fn eval_bitmap_from_binary(
             builder.append_null();
             continue;
         }
-        match super::bitmap_common::decode_external_bitmap(&payload) {
+        match bitmap_common::decode_external_bitmap(&payload) {
             Ok(values) => {
-                builder.append_value(super::bitmap_common::encode_internal_bitmap(&values)?);
+                builder.append_value(bitmap_common::encode_internal_bitmap(&values)?);
             }
             Err(_) => builder.append_null(),
         }
@@ -857,14 +855,14 @@ pub fn eval_bitmap_to_base64(
             continue;
         }
         let arr = arr_opt.unwrap();
-        let values = match super::bitmap_common::decode_bitmap(arr.value(idx)) {
+        let values = match bitmap_common::decode_bitmap(arr.value(idx)) {
             Ok(values) => values,
             Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        let binary = super::bitmap_common::encode_external_bitmap(&values)?;
+        let binary = bitmap_common::encode_external_bitmap(&values)?;
         builder.append_value(base64::engine::general_purpose::STANDARD.encode(binary));
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -923,10 +921,10 @@ fn bitmap_binary_op(
             out.append_null();
             continue;
         }
-        let a = super::bitmap_common::decode_bitmap(lhs_bin.unwrap().value(i))?;
-        let b = super::bitmap_common::decode_bitmap(rhs_bin.unwrap().value(i))?;
+        let a = bitmap_common::decode_bitmap(lhs_bin.unwrap().value(i))?;
+        let b = bitmap_common::decode_bitmap(rhs_bin.unwrap().value(i))?;
         let merged = op(&a, &b);
-        out.append_value(super::bitmap_common::encode_internal_bitmap(&merged)?);
+        out.append_value(bitmap_common::encode_internal_bitmap(&merged)?);
     }
     Ok(Arc::new(out.finish()) as ArrayRef)
 }
@@ -996,7 +994,7 @@ pub(crate) fn eval_bitmap_contains_arrays(
             out.append_null();
             continue;
         }
-        let a = super::bitmap_common::decode_bitmap(lhs.value(i))?;
+        let a = bitmap_common::decode_bitmap(lhs.value(i))?;
         let v = rhs.value(i);
         out.append_value(v >= 0 && a.contains(&(v as u64)));
     }
@@ -1092,10 +1090,8 @@ pub fn eval_bitmap_contains(
 #[cfg(test)]
 mod bitmap_binary_op_tests {
     use super::*;
-    use crate::exec::expr::function::object::bitmap_common::{
-        decode_bitmap, encode_internal_bitmap,
-    };
     use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int64Array};
+    use novarocks_types::value::bitmap::{decode_bitmap, encode_internal_bitmap};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 

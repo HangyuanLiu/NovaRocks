@@ -1559,8 +1559,8 @@ mod is_known_rule_name_tests {
 
     #[test]
     fn optimize_preserves_ranking_window_partition_topn_sort() {
-        use crate::exec::node::sort::SortTopNType;
         use crate::sql::catalog::PlannerTableProvider;
+        use crate::sql::common::SqlTopNType;
         use crate::sql::optimizer::operator::Operator;
         use crate::sql::optimizer::optimized_tree::OptimizedOperatorNode;
         use crate::sql::planner::table::{ScanSource, TableDef};
@@ -1612,7 +1612,7 @@ mod is_known_rule_name_tests {
         fn has_rank_partition_topn_sort(plan: &OptimizedOperatorNode) -> bool {
             if let Operator::PhysicalSort(sort) = &plan.op
                 && sort.partition_limit == Some(2)
-                && sort.topn_type == Some(SortTopNType::Rank)
+                && sort.topn_type == Some(SqlTopNType::Rank)
             {
                 return true;
             }
@@ -1624,7 +1624,7 @@ mod is_known_rule_name_tests {
         ) -> bool {
             if let crate::sql::planner::logical::LogicalPlanKind::Sort(sort) = &plan.kind
                 && sort.partition_limit == Some(2)
-                && sort.topn_type == Some(SortTopNType::Rank)
+                && sort.topn_type == Some(SqlTopNType::Rank)
             {
                 return true;
             }

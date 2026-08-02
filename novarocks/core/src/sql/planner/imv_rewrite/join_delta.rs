@@ -1131,16 +1131,16 @@ fn join_delta_payload_output_columns(
 fn is_iceberg_row_identity_metadata_output(column: &OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+        .eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 pub(crate) fn mark_delta_scan(
@@ -2213,28 +2213,28 @@ mod tests {
         scan.columns.extend([
             OutputColumn {
                 column_id: ColumnId(first_id + 2),
-                name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 3),
-                name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 4),
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 5),
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,

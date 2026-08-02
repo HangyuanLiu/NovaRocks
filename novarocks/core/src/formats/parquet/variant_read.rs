@@ -34,10 +34,10 @@ use parquet::variant::{
 };
 
 use crate::common::ids::SlotId;
-use crate::exec::variant::{
+use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
+use novarocks_types::value::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
 };
-use crate::formats::parquet::{ParquetSlotKind, VariantPathSpec};
 
 fn is_binary_like(dt: &DataType) -> bool {
     matches!(
@@ -615,7 +615,7 @@ mod tests {
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::function::variant::{eval_try_variant_get, eval_variant_get};
     use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-    use crate::exec::variant::{
+    use novarocks_types::value::variant::{
         parse_variant_path, variant_query, variant_to_i64, variant_to_string,
     };
 

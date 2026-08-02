@@ -19,6 +19,17 @@ use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
 
+/// Ranking semantics selected by SQL for a TopN boundary.
+///
+/// Native encoding and execution translate this SQL fact explicitly; it is
+/// deliberately not an execution-node re-export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqlTopNType {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyKind {
     Scalar,
@@ -35,4 +46,16 @@ pub(crate) struct ScanVariantColumn {
     pub canonical_path: String,
     pub requested_type: DataType,
     pub strict: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqlTopNType;
+
+    #[test]
+    fn sqlx2_planner_vocabulary_topn_ranking_is_sql_owned() {
+        assert_ne!(SqlTopNType::RowNumber, SqlTopNType::Rank);
+        assert_ne!(SqlTopNType::Rank, SqlTopNType::DenseRank);
+        assert_ne!(SqlTopNType::DenseRank, SqlTopNType::RowNumber);
+    }
 }

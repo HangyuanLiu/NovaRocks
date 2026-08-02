@@ -53,13 +53,13 @@ use novarocks_catalog::schema::ColumnDef;
 pub(crate) struct ImvActionColumn;
 
 impl ImvActionColumn {
-    pub(crate) const NAME: &'static str = crate::exec::change_op::CHANGE_OP_COLUMN;
+    pub(crate) const NAME: &'static str = crate::sql::common::CHANGE_OP_COLUMN;
     // Consumed by IMV refresh execution.
     #[allow(dead_code)]
-    pub(crate) const INSERT_VALUE: i8 = crate::exec::change_op::CHANGE_OP_INSERT;
+    pub(crate) const INSERT_VALUE: i8 = crate::sql::common::CHANGE_OP_INSERT;
     // Consumed by IMV refresh execution.
     #[allow(dead_code)]
-    pub(crate) const DELETE_VALUE: i8 = crate::exec::change_op::CHANGE_OP_DELETE;
+    pub(crate) const DELETE_VALUE: i8 = crate::sql::common::CHANGE_OP_DELETE;
 
     /// Construct an `OutputColumn` for the action column with the given id.
     pub(crate) fn output_column(column_id: ColumnId) -> OutputColumn {

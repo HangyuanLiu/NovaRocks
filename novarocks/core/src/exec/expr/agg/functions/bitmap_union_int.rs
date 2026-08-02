@@ -23,6 +23,9 @@ use arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
+use novarocks_types::value::bitmap::{
+    BITMAP_TYPE_EMPTY, decode_bitmap, encode_bitmap_aggregate as encode_bitmap,
+};
 
 use super::super::*;
 use super::AggregateFunction;
@@ -41,11 +44,6 @@ struct BitmapState {
     /// (e.g. `bitmap_empty()`) still marks the group as non-NULL.
     has_value: bool,
 }
-
-const BITMAP_TYPE_EMPTY: u8 = 0;
-const BITMAP_TYPE_SINGLE32: u8 = 1;
-const BITMAP_TYPE_SINGLE64: u8 = 3;
-const BITMAP_TYPE_SET: u8 = 10;
 
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
@@ -111,167 +109,6 @@ unsafe fn take_state(ptr: *mut u8) -> Option<Box<BitmapState>> {
             *slot = std::ptr::null_mut();
             Some(Box::from_raw(raw))
         }
-    }
-}
-
-fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), String> {
-    let mut out = 0u64;
-    let mut shift = 0u32;
-    for (idx, byte) in bytes.iter().enumerate() {
-        out |= u64::from(byte & 0x7f) << shift;
-        if (byte & 0x80) == 0 {
-            return Ok((out, idx + 1));
-        }
-        shift += 7;
-        if shift > 63 {
-            return Err("bitmap_union_int decode varint overflow".to_string());
-        }
-    }
-    Err("bitmap_union_int decode varint reached end of payload".to_string())
-}
-
-fn encode_bitmap(values: &BitmapValues) -> Result<Vec<u8>, String> {
-    if values.is_empty() {
-        return Ok(vec![BITMAP_TYPE_EMPTY]);
-    }
-    if values.len() == 1 {
-        let value = values
-            .first()
-            .copied()
-            .ok_or_else(|| "bitmap_union_int internal empty set".to_string())?;
-        if let Ok(v32) = u32::try_from(value) {
-            let mut out = Vec::with_capacity(5);
-            out.push(BITMAP_TYPE_SINGLE32);
-            out.extend_from_slice(&v32.to_le_bytes());
-            return Ok(out);
-        }
-        let mut out = Vec::with_capacity(9);
-        out.push(BITMAP_TYPE_SINGLE64);
-        out.extend_from_slice(&value.to_le_bytes());
-        return Ok(out);
-    }
-
-    let count = u32::try_from(values.len())
-        .map_err(|_| format!("bitmap_union_int value count overflow: {}", values.len()))?;
-    let mut out = Vec::with_capacity(1 + 4 + values.len() * 8);
-    out.push(BITMAP_TYPE_SET);
-    out.extend_from_slice(&count.to_le_bytes());
-    for value in values {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(out)
-}
-
-fn decode_bitmap(bytes: &[u8]) -> Result<BitmapValues, String> {
-    if bytes.is_empty() {
-        return Err("bitmap_union_int payload is empty".to_string());
-    }
-    match bytes[0] {
-        BITMAP_TYPE_EMPTY => {
-            if bytes.len() != 1 {
-                return Err(format!(
-                    "bitmap_union_int EMPTY payload length mismatch: expected=1 actual={}",
-                    bytes.len()
-                ));
-            }
-            Ok(BTreeSet::new())
-        }
-        BITMAP_TYPE_SINGLE32 => {
-            if bytes.len() != 5 {
-                return Err(format!(
-                    "bitmap_union_int SINGLE32 payload length mismatch: expected=5 actual={}",
-                    bytes.len()
-                ));
-            }
-            let value = u32::from_le_bytes(
-                bytes[1..5]
-                    .try_into()
-                    .map_err(|_| "bitmap_union_int decode SINGLE32 value failed".to_string())?,
-            );
-            Ok(BTreeSet::from([u64::from(value)]))
-        }
-        BITMAP_TYPE_SINGLE64 => {
-            if bytes.len() != 9 {
-                return Err(format!(
-                    "bitmap_union_int SINGLE64 payload length mismatch: expected=9 actual={}",
-                    bytes.len()
-                ));
-            }
-            let value = u64::from_le_bytes(
-                bytes[1..9]
-                    .try_into()
-                    .map_err(|_| "bitmap_union_int decode SINGLE64 value failed".to_string())?,
-            );
-            Ok(BTreeSet::from([value]))
-        }
-        BITMAP_TYPE_SET => {
-            if bytes.len() < 5 {
-                return Err(format!(
-                    "bitmap_union_int SET payload too short: actual={}",
-                    bytes.len()
-                ));
-            }
-            let count = u32::from_le_bytes(
-                bytes[1..5]
-                    .try_into()
-                    .map_err(|_| "bitmap_union_int decode SET count failed".to_string())?,
-            ) as usize;
-            let fixed_expected = 1usize + 4 + count.saturating_mul(8);
-            if bytes.len() == fixed_expected {
-                let mut values = BTreeSet::new();
-                let mut offset = 5usize;
-                for idx in 0..count {
-                    let value =
-                        u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_err(|_| {
-                            format!(
-                                "bitmap_union_int decode SET fixed64 value failed at entry {}",
-                                idx
-                            )
-                        })?);
-                    offset += 8;
-                    values.insert(value);
-                }
-                return Ok(values);
-            }
-
-            let mut offset = 5usize;
-            let mut values = BTreeSet::new();
-            for idx in 0..count {
-                let (value, consumed) = decode_varint_u64(&bytes[offset..]).map_err(|e| {
-                    format!(
-                        "bitmap_union_int decode SET value failed at entry {}: {}",
-                        idx, e
-                    )
-                })?;
-                if consumed == 0 {
-                    return Err(format!(
-                        "bitmap_union_int decode SET consumed zero bytes at entry {}",
-                        idx
-                    ));
-                }
-                offset = offset.saturating_add(consumed);
-                if offset > bytes.len() {
-                    return Err(format!(
-                        "bitmap_union_int SET payload overflow: offset={} len={}",
-                        offset,
-                        bytes.len()
-                    ));
-                }
-                values.insert(value);
-            }
-            if offset != bytes.len() {
-                return Err(format!(
-                    "bitmap_union_int SET payload has trailing bytes: offset={} len={}",
-                    offset,
-                    bytes.len()
-                ));
-            }
-            Ok(values)
-        }
-        other => Err(format!(
-            "bitmap_union_int unsupported payload type code: {}",
-            other
-        )),
     }
 }
 

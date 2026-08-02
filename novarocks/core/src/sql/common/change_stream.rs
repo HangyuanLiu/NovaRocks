@@ -15,17 +15,56 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) use crate::exec::change_op::{
-    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
-    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
-};
+//! SQL-owned change-stream action and route vocabulary.
+//!
+//! These facts describe the logical writer branches selected by SQL planning.
+//! Execution translates them at its native boundary; SQL must not inherit the
+//! execution-layer representation or constants.
+
+pub(crate) const CHANGE_OP_COLUMN: &str = "__change_op";
+pub(crate) const CHANGE_OP_INSERT: i8 = 1;
+pub(crate) const CHANGE_OP_DELETE: i8 = -1;
+pub(crate) const DATA_ROUTE_REUSE: i32 = 1;
+pub(crate) const DATA_ROUTE_FRESH: i32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ChangeStreamBranchKind {
+    DeleteDv,
+    ReuseData,
+    FreshData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ChangeStreamRouteKey {
+    pub(crate) change_op: i32,
+    pub(crate) data_route: Option<i32>,
+}
+
+impl ChangeStreamBranchKind {
+    pub(crate) fn route_key(self) -> ChangeStreamRouteKey {
+        match self {
+            Self::DeleteDv => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_DELETE.into(),
+                data_route: None,
+            },
+            Self::ReuseData => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_INSERT.into(),
+                data_route: Some(DATA_ROUTE_REUSE),
+            },
+            Self::FreshData => ChangeStreamRouteKey {
+                change_op: CHANGE_OP_INSERT.into(),
+                data_route: Some(DATA_ROUTE_FRESH),
+            },
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn branch_kind_maps_to_canonical_route_key() {
+    fn sqlx2_planner_vocabulary_change_stream_branch_maps_to_sql_route_key() {
         assert_eq!(
             ChangeStreamBranchKind::DeleteDv.route_key(),
             ChangeStreamRouteKey {

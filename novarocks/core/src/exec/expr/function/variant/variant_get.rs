@@ -34,7 +34,7 @@ use parquet::variant::{
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use crate::exec::variant::{
+use novarocks_types::value::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
 };
 

@@ -290,7 +290,7 @@ mod tests {
                 // non-empty: partition-topn Sort always carries these
                 analytic_partition_exprs: vec![partition_expr],
                 partition_limit: Some(2),
-                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+                topn_type: Some(crate::sql::common::SqlTopNType::Rank),
             }),
             children: vec![scan_group],
         };

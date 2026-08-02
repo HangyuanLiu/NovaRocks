@@ -19,7 +19,6 @@ use std::{collections::HashMap, fmt::Write};
 
 use arrow::datatypes::DataType;
 
-use crate::query_execution::profile::{ActualMetrics, DistributedProfileSummary};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ScanVariantColumn;
@@ -53,25 +52,100 @@ use crate::sql::planner::runtime_filter::contract::{
 use crate::sql::planner::runtime_filter::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
 use crate::sql::planner::table::{ScanSource, TableDef};
 
-pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
-    explain_distributed_plan_inner(dp, level, None, None)
+/// SQL-owned operator observations rendered by `EXPLAIN ANALYZE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SqlOperatorMetrics {
+    pub(crate) output_rows: i64,
+    pub(crate) total_time_ns: i64,
+    pub(crate) peak_mem_bytes: i64,
+    pub(crate) total_time_max_ns: i64,
+    pub(crate) total_time_min_ns: i64,
+    pub(crate) build_ht_ns: i64,
+    pub(crate) search_ns: i64,
+    pub(crate) out_build_ns: i64,
+    pub(crate) out_probe_ns: i64,
+    pub(crate) dict_input_rows: i64,
+    pub(crate) dict_input_columns: i64,
+    pub(crate) dict_kept_rows: i64,
+    pub(crate) dict_kept_columns: i64,
+    pub(crate) dict_hydrated_rows: i64,
+    pub(crate) dict_hydrated_columns: i64,
+    pub(crate) dict_unsupported_columns: i64,
 }
 
-pub(crate) fn explain_distributed_plan_analyze(
+/// SQL-owned summary for one logical fragment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SqlFragmentProfile {
+    pub(crate) operator_active_time_ns: i64,
+    pub(crate) driver_blocked_time_ns: i64,
+    pub(crate) dependency_wait_time_ns: i64,
+    pub(crate) exchange_wait_time_ns: i64,
+    pub(crate) network_time_ns: i64,
+    pub(crate) scan_io_time_ns: i64,
+}
+
+/// Complete query-scoped profile projection accepted by SQL formatting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SqlExplainProfile {
+    pub(crate) operators: HashMap<i32, SqlOperatorMetrics>,
+    pub(crate) fragments: HashMap<i32, SqlFragmentProfile>,
+}
+
+pub(crate) trait SqlOperatorProfileView {
+    fn as_sql_operator_metrics(&self) -> SqlOperatorMetrics;
+}
+
+impl SqlOperatorProfileView for SqlOperatorMetrics {
+    fn as_sql_operator_metrics(&self) -> SqlOperatorMetrics {
+        *self
+    }
+}
+
+pub(crate) trait SqlFragmentProfileView {
+    fn as_sql_fragment_profile(&self) -> SqlFragmentProfile;
+}
+
+impl SqlFragmentProfileView for SqlFragmentProfile {
+    fn as_sql_fragment_profile(&self) -> SqlFragmentProfile {
+        *self
+    }
+}
+
+pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
+    explain_distributed_plan_inner::<SqlOperatorMetrics, SqlFragmentProfile>(dp, level, None, None)
+}
+
+pub(crate) fn explain_distributed_plan_analyze<M, F>(
     dp: &DistributedPlan,
     level: ExplainLevel,
-    actuals: &HashMap<i32, ActualMetrics>,
-    per_fragment: Option<&HashMap<i32, DistributedProfileSummary>>,
-) -> Vec<String> {
+    actuals: &HashMap<i32, M>,
+    per_fragment: Option<&HashMap<i32, F>>,
+) -> Vec<String>
+where
+    M: SqlOperatorProfileView,
+    F: SqlFragmentProfileView,
+{
     explain_distributed_plan_inner(dp, level, Some(actuals), per_fragment)
 }
 
-fn explain_distributed_plan_inner(
+pub(crate) fn explain_distributed_plan_with_profile(
     dp: &DistributedPlan,
     level: ExplainLevel,
-    actuals: Option<&HashMap<i32, ActualMetrics>>,
-    per_fragment: Option<&HashMap<i32, DistributedProfileSummary>>,
+    profile: &SqlExplainProfile,
 ) -> Vec<String> {
+    explain_distributed_plan_analyze(dp, level, &profile.operators, Some(&profile.fragments))
+}
+
+fn explain_distributed_plan_inner<M, F>(
+    dp: &DistributedPlan,
+    level: ExplainLevel,
+    actuals: Option<&HashMap<i32, M>>,
+    per_fragment: Option<&HashMap<i32, F>>,
+) -> Vec<String>
+where
+    M: SqlOperatorProfileView,
+    F: SqlFragmentProfileView,
+{
     let mut out = Vec::new();
     let fragments = explain_fragment_order(dp);
     let detailed = is_detailed(level);
@@ -164,6 +238,7 @@ fn explain_distributed_plan_inner(
                 // derives from the `execute_fragment (plan_node_id=N)` tree root. Unique per
                 // fragment and never a cross-fragment-shared exchange id.
                 if let Some(s) = per_fragment.get(&fragment.root.node_id) {
+                    let s = s.as_sql_fragment_profile();
                     out.push(format!(
                         "  Profile: active={} blocked={} dep_wait={} exch_wait={} net={} scan_io={}",
                         fmt_time_ns(s.operator_active_time_ns),
@@ -399,13 +474,15 @@ fn format_distributed_shared_plan_node_detail_lines(
     }
 }
 
-fn format_distributed_node(
+fn format_distributed_node<M>(
     node: &DistributedNode,
     level: ExplainLevel,
     indent: usize,
-    actuals: Option<&HashMap<i32, ActualMetrics>>,
+    actuals: Option<&HashMap<i32, M>>,
     out: &mut Vec<String>,
-) {
+) where
+    M: SqlOperatorProfileView,
+{
     let pad = "  ".repeat(indent);
     let costs_suffix = costs_suffix(&node.stats, level);
     let stats_suffix = format!(
@@ -489,13 +566,15 @@ fn format_distributed_node(
     }
 }
 
-fn format_children(
+fn format_children<M>(
     node: &DistributedNode,
     level: ExplainLevel,
     indent: usize,
-    actuals: Option<&HashMap<i32, ActualMetrics>>,
+    actuals: Option<&HashMap<i32, M>>,
     out: &mut Vec<String>,
-) {
+) where
+    M: SqlOperatorProfileView,
+{
     for child in &node.children {
         format_distributed_node(child, level, indent + 1, actuals, out);
     }
@@ -847,9 +926,9 @@ fn format_sort_node(
     let mut suffix = String::new();
     if let Some(limit) = sort.partition_limit {
         let topn_type = match sort.topn_type {
-            Some(crate::exec::node::sort::SortTopNType::RowNumber) => "ROW_NUMBER",
-            Some(crate::exec::node::sort::SortTopNType::Rank) => "RANK",
-            Some(crate::exec::node::sort::SortTopNType::DenseRank) => "DENSE_RANK",
+            Some(crate::sql::common::SqlTopNType::RowNumber) => "ROW_NUMBER",
+            Some(crate::sql::common::SqlTopNType::Rank) => "RANK",
+            Some(crate::sql::common::SqlTopNType::DenseRank) => "DENSE_RANK",
             None => "ROW_NUMBER",
         };
         suffix = format!(" partition_limit={limit} topn_type={topn_type}");
@@ -1148,7 +1227,7 @@ fn join_distribution_label(
     }
 }
 
-fn dict_actual_suffix(actual: &ActualMetrics) -> String {
+fn dict_actual_suffix(actual: &SqlOperatorMetrics) -> String {
     if actual.dict_input_rows == 0 && actual.dict_input_columns == 0 {
         return String::new();
     }
@@ -1164,9 +1243,13 @@ fn dict_actual_suffix(actual: &ActualMetrics) -> String {
     )
 }
 
-fn actual_suffix(node: &DistributedNode, actuals: Option<&HashMap<i32, ActualMetrics>>) -> String {
+fn actual_suffix<M>(node: &DistributedNode, actuals: Option<&HashMap<i32, M>>) -> String
+where
+    M: SqlOperatorProfileView,
+{
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
         Some(metrics) => {
+            let metrics = metrics.as_sql_operator_metrics();
             let total_time_ns = metrics.total_time_ns.max(0);
             let total_time_max_ns = metrics.total_time_max_ns.max(0);
             let total_time_min_ns = metrics.total_time_min_ns.max(0);
@@ -1195,7 +1278,7 @@ fn actual_suffix(node: &DistributedNode, actuals: Option<&HashMap<i32, ActualMet
                 s.push_str(&format!(" out_probe={}", fmt_time_ns(metrics.out_probe_ns)));
             }
             s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
-            s.push_str(&dict_actual_suffix(metrics));
+            s.push_str(&dict_actual_suffix(&metrics));
             s
         }
         None => String::new(),
@@ -1648,15 +1731,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        explain_distributed_plan_analyze, explain_fragment_order,
-        format_distributed_shared_plan_node_header,
+        SqlFragmentProfile as DistributedProfileSummary, SqlOperatorMetrics as ActualMetrics,
+        explain_fragment_order, format_distributed_shared_plan_node_header,
     };
-    use crate::exec::node::sort::SortTopNType;
-    use crate::query_execution::profile::{ActualMetrics, DistributedProfileSummary};
     use crate::sql::analysis::{
         ExprKind, JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::common::SqlTopNType;
     use crate::sql::explain::distributed::explain_distributed_plan;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage};
     use crate::sql::optimizer::operator::{
@@ -1684,6 +1766,15 @@ mod tests {
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::schema::ColumnDef;
+
+    fn explain_distributed_plan_analyze(
+        plan: &crate::sql::planner::distributed::DistributedPlan,
+        level: ExplainLevel,
+        actuals: &HashMap<i32, ActualMetrics>,
+        fragments: Option<&HashMap<i32, DistributedProfileSummary>>,
+    ) -> Vec<String> {
+        super::explain_distributed_plan_analyze(plan, level, actuals, fragments)
+    }
 
     fn prepare_bridge2_test_props(node: &mut OptimizedOperatorNode) {
         for child in &mut node.children {
@@ -2728,7 +2819,7 @@ mod tests {
                 ),
                 analytic_partition_exprs: vec![],
                 partition_limit: Some(3),
-                topn_type: Some(SortTopNType::Rank),
+                topn_type: Some(SqlTopNType::Rank),
             }),
             vec![child],
             output_columns,

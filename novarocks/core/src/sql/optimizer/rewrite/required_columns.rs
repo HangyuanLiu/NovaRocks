@@ -740,7 +740,7 @@ fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) ->
     column.is_internal
         && column
             .name
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
 }
 
 fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn) -> bool {
@@ -752,7 +752,7 @@ fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn)
 fn is_join_refresh_row_id_column(column: &crate::sql::analysis::OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
 }
 
 fn tag_intersect(
@@ -1636,7 +1636,7 @@ mod tests {
         let arena_rc = make_arena();
         let mut action = make_output_column(
             ColumnId::new_for_test(14),
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
         );
         action.data_type = DataType::Int8;
         action.is_internal = true;
@@ -1648,7 +1648,7 @@ mod tests {
         join_apply_key.is_internal = true;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         row_id.data_type = DataType::Int64;
         row_id.is_internal = true;
@@ -1697,7 +1697,7 @@ mod tests {
         let arena_rc = make_arena();
         let mut action = make_output_column(
             ColumnId::new_for_test(14),
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
         );
         action.data_type = DataType::Int8;
         action.is_internal = true;
@@ -1709,13 +1709,13 @@ mod tests {
         join_apply_key.is_internal = false;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         row_id.data_type = DataType::Int64;
         row_id.is_internal = true;
         let mut branch_row_id = make_output_column(
             ColumnId::new_for_test(91),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         branch_row_id.data_type = DataType::Int64;
         branch_row_id.is_internal = true;

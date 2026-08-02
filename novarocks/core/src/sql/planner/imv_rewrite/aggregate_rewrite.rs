@@ -398,28 +398,28 @@ fn push_unique_name(names: &mut Vec<String>, name: &str) {
 fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
     vec![
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+            name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
             data_type: DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
             data_type: DataType::Int64,
             nullable: true,
             write_default: None,
@@ -1024,28 +1024,28 @@ fn aggregate_change_stream_output_columns(
     }
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
         true,
@@ -1061,14 +1061,14 @@ fn aggregate_change_stream_output_columns(
 }
 
 fn is_locator_metadata_column(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+    name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
         || is_reuse_lineage_metadata_column(name)
 }
 
 fn is_reuse_lineage_metadata_column(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+    name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 fn column_ref(column: &OutputColumn) -> TypedExpr {
@@ -1275,10 +1275,10 @@ fn aggregate_old_state_passthrough_items(
         push_unique_name(&mut names, &state_column.name);
     }
     for name in [
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
     ] {
         push_unique_name(&mut names, name);
     }
@@ -2472,10 +2472,10 @@ mod tests {
 
     fn expected_row_lineage_metadata_names() -> Vec<&'static str> {
         vec![
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         ]
     }
 
@@ -3221,10 +3221,10 @@ mod tests {
                 "v",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                crate::sql::common::ICEBERG_FILE_PATH_COL,
+                crate::sql::common::ICEBERG_ROW_POS_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
                 "__change_op"
             ]
         );
@@ -3254,25 +3254,21 @@ mod tests {
         let expanded_plan = filter_plan.unary_input();
         let left_join_plan = expanded_plan.left();
         let old_outputs = plan_output_columns(left_join_plan.right()).expect("old outputs");
-        let old_file = find_output_column_by_name(
-            &old_outputs,
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-        )
-        .expect("old file locator")
-        .column_id;
-        let old_pos = find_output_column_by_name(
-            &old_outputs,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
-        )
-        .expect("old row position locator")
-        .column_id;
+        let old_file =
+            find_output_column_by_name(&old_outputs, crate::sql::common::ICEBERG_FILE_PATH_COL)
+                .expect("old file locator")
+                .column_id;
+        let old_pos =
+            find_output_column_by_name(&old_outputs, crate::sql::common::ICEBERG_ROW_POS_COL)
+                .expect("old row position locator")
+                .column_id;
 
         let file_item = project
             .items
             .iter()
             .find(|item| {
                 item.output_name
-                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+                    .eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
             })
             .expect("expected file locator output");
         let pos_item = project
@@ -3280,7 +3276,7 @@ mod tests {
             .iter()
             .find(|item| {
                 item.output_name
-                    .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+                    .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
             })
             .expect("expected row position locator output");
 
@@ -3610,10 +3606,10 @@ mod tests {
                 "k",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                crate::exec::row_position::ICEBERG_ROW_POS_COL,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
-                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                crate::sql::common::ICEBERG_FILE_PATH_COL,
+                crate::sql::common::ICEBERG_ROW_POS_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
             ]
         );
         for item in &project.items {

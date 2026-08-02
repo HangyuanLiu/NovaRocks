@@ -256,7 +256,7 @@ fn can_derive_key_from_row_id_assignment(keyed_assert: &PreExpandKeyedAssertSpec
         .eq_ignore_ascii_case("__nr_row_id")
         && keyed_assert
             .key_label
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
 }
 
 fn find_pre_expand_key_column_id_from_assignment(

@@ -16,7 +16,8 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
+use crate::proto::{common, plan};
+use crate::sql::common::{ChangeStreamBranchKind, JoinKind, SqlTopNType};
 use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
@@ -183,15 +184,12 @@ pub(super) fn encode_change_stream_branch_kind(src: ChangeStreamBranchKind) -> i
     }
 }
 
-pub(super) fn encode_sort_topn_type(src: crate::exec::node::sort::SortTopNType) -> i32 {
+/// Explicit SQL-to-native conversion for the SQL-owned TopN ranking fact.
+pub(super) fn encode_sort_topn_type(src: SqlTopNType) -> i32 {
     match src {
-        crate::exec::node::sort::SortTopNType::RowNumber => {
-            plan::SortTopNType::SortTopnTypeRowNumber as i32
-        }
-        crate::exec::node::sort::SortTopNType::Rank => plan::SortTopNType::SortTopnTypeRank as i32,
-        crate::exec::node::sort::SortTopNType::DenseRank => {
-            plan::SortTopNType::SortTopnTypeDenseRank as i32
-        }
+        SqlTopNType::RowNumber => plan::SortTopNType::SortTopnTypeRowNumber as i32,
+        SqlTopNType::Rank => plan::SortTopNType::SortTopnTypeRank as i32,
+        SqlTopNType::DenseRank => plan::SortTopNType::SortTopnTypeDenseRank as i32,
     }
 }
 

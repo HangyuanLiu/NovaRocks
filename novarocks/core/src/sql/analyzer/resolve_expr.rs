@@ -2199,7 +2199,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     match &args_typed[2].kind {
                         ExprKind::Literal(LiteralValue::String(t)) => {
                             return_type =
-                                crate::exec::expr::function::variant::variant_get_target_type(t)?;
+                                novarocks_types::value::variant::variant_get_target_type(t)?;
                         }
                         _ => {
                             return Err(format!("{name} type argument must be a string literal"));

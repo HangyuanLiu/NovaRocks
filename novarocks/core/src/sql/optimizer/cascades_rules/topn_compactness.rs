@@ -1068,7 +1068,7 @@ mod tests {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: Some(2),
-                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+                topn_type: Some(crate::sql::common::SqlTopNType::Rank),
             }),
             children: vec![child_group],
         }

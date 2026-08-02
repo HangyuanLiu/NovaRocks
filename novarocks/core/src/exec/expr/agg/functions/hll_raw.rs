@@ -22,6 +22,7 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_types::value::hll::{MURMUR_SEED, murmur_hash64a};
 
 use crate::exec::node::aggregate::AggFunction;
 
@@ -38,9 +39,6 @@ const HLL_DATA_FULL: u8 = 3;
 const HLL_COLUMN_PRECISION: usize = 14;
 pub(crate) const HLL_REGISTERS_COUNT: usize = 16 * 1024;
 const HLL_SPARSE_THRESHOLD: usize = 4096;
-
-const MURMUR_PRIME: u64 = 0xc6a4_a793_5bd1_e995;
-const MURMUR_SEED: u32 = 0xadc8_3b19;
 
 #[derive(Default)]
 struct HllRawState {
@@ -267,37 +265,6 @@ fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
-    let r: u32 = 47;
-    let mut h = (seed as u64) ^ (data.len() as u64).wrapping_mul(MURMUR_PRIME);
-
-    let mut offset = 0usize;
-    while offset + 8 <= data.len() {
-        let mut block = [0u8; 8];
-        block.copy_from_slice(&data[offset..offset + 8]);
-        let mut k = u64::from_le_bytes(block);
-        k = k.wrapping_mul(MURMUR_PRIME);
-        k ^= k >> r;
-        k = k.wrapping_mul(MURMUR_PRIME);
-        h ^= k;
-        h = h.wrapping_mul(MURMUR_PRIME);
-        offset += 8;
-    }
-
-    let tail = &data[offset..];
-    if !tail.is_empty() {
-        for (idx, byte) in tail.iter().enumerate() {
-            h ^= (*byte as u64) << (idx * 8);
-        }
-        h = h.wrapping_mul(MURMUR_PRIME);
-    }
-
-    h ^= h >> r;
-    h = h.wrapping_mul(MURMUR_PRIME);
-    h ^= h >> r;
-    h
 }
 
 pub(crate) fn hash_bytes_for_hll(bytes: &[u8]) -> u64 {

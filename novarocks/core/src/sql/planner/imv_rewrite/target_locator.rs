@@ -215,25 +215,25 @@ fn build_target_locator_join(
         .transpose()?;
     let right_file_id = allocate_imv_column(
         ctx,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
         false,
     )?;
     let right_pos_id = allocate_imv_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         false,
     )?;
     let right_row_id_id = allocate_imv_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         false,
     )?;
     let right_last_updated_seq_id = allocate_imv_column(
         ctx,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
     )?;
@@ -269,22 +269,22 @@ fn build_target_locator_join(
         .collect::<Vec<_>>();
     items.push(nullable_locator_project_item(
         right_file_id,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
     ));
     items.push(nullable_locator_project_item(
         right_pos_id,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
     ));
     items.push(nullable_locator_project_item(
         right_row_id_id,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
     ));
     items.push(nullable_locator_project_item(
         right_last_updated_seq_id,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
     ));
     Ok(LogicalPlanNode::new(
@@ -326,28 +326,28 @@ fn build_target_locator_scan(
     }
     let metadata_columns = vec![
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+            name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
             data_type: DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
             data_type: DataType::Int64,
             nullable: true,
             write_default: None,
@@ -372,28 +372,28 @@ fn build_target_locator_scan(
     }
     scan_columns.push(output_column(
         right_file_id,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
         false,
         true,
     ));
     scan_columns.push(output_column(
         right_pos_id,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         false,
         true,
     ));
     scan_columns.push(output_column(
         right_row_id_id,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         false,
         true,
     ));
     scan_columns.push(output_column(
         right_last_updated_seq_id,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
         true,
@@ -441,7 +441,7 @@ fn target_locator_join_condition(
         BinOp::Eq,
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(i64::from(
-                crate::exec::change_op::CHANGE_OP_DELETE,
+                crate::sql::common::CHANGE_OP_DELETE,
             ))),
             data_type: DataType::Int8,
             nullable: false,
@@ -508,10 +508,10 @@ fn reserved_locator_output_name(columns: &[OutputColumn]) -> Option<&str> {
     columns.iter().find_map(|column| {
         if column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
             || column
                 .name
-                .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+                .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
         {
             Some(column.name.as_str())
         } else {
@@ -525,8 +525,8 @@ fn subtree_has_target_locator_join(plan: &LogicalPlanNode) -> bool {
 }
 
 fn is_row_lineage_locator_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+    name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 fn project_item_for_output_column(column: &OutputColumn) -> ProjectItem {
@@ -599,10 +599,10 @@ fn output_column(
 
 fn is_internal_output_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(ImvActionColumn::NAME)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
         || name.eq_ignore_ascii_case(HIDDEN_APPLY_KEY_COLUMN_NAME)
         || name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
         || name.eq_ignore_ascii_case(JOIN_APPLY_KEY_COLUMN_NAME)

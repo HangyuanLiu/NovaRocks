@@ -14,23 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#![allow(dead_code)]
-#![allow(unused_variables)]
 
-mod array_to_bitmap;
-mod bitmap_functions;
-mod bitmap_to_array;
-mod bitmap_to_string;
-mod dispatch;
-mod ds_hll_functions;
-mod hll_codec;
-pub(crate) mod hll_hash;
-mod json_object;
-pub mod percentile_functions;
-pub(crate) mod to_bitmap;
-mod utility_functions;
+//! Canonical in-memory and byte representations for SQL value formats.
 
-pub use dispatch::{eval_object_function, metadata, register};
-pub use hll_hash::eval_hll_hash;
-pub use percentile_functions::eval_percentile_hash;
-pub use to_bitmap::eval_to_bitmap;
+pub mod bitmap;
+pub mod hll;
+pub mod variant;
+pub mod variant_encode;

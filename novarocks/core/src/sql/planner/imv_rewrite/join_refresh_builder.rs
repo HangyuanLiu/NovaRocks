@@ -233,19 +233,19 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     let explicit_generated_ids = [
         ("net", ColumnId(net_column_id)),
         (
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
             ColumnId(locator_file_column_id),
         ),
         (
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
             ColumnId(locator_pos_column_id),
         ),
         (
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
             ColumnId(locator_row_id_column_id),
         ),
         (
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
             ColumnId(locator_last_updated_seq_column_id),
         ),
     ];
@@ -606,28 +606,28 @@ fn build_target_locator_scan(
     }];
     let metadata_columns = vec![
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+            name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
             data_type: DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
             data_type: DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
             data_type: DataType::Int64,
             nullable: true,
             write_default: None,
@@ -644,28 +644,28 @@ fn build_target_locator_scan(
         ),
         output_column(
             locator_file_column_id,
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
             false,
             true,
         ),
         output_column(
             locator_pos_column_id,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
             DataType::Int64,
             false,
             true,
         ),
         output_column(
             locator_row_id_column_id,
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
             DataType::Int64,
             false,
             true,
         ),
         output_column(
             locator_last_updated_seq_column_id,
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
             DataType::Int64,
             true,
             true,
@@ -714,13 +714,13 @@ fn build_locator_assert_filter(
     let locator_present = binary(
         is_not_null(locator_column_ref(
             locator_file_column_id,
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
         )),
         BinOp::And,
         is_not_null(locator_column_ref(
             locator_pos_column_id,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
             DataType::Int64,
         )),
     );
@@ -768,37 +768,37 @@ fn build_final_coalesce_project(
     items.push(ProjectItem {
         expr: locator_column_ref(
             locator_file_column_id,
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
         ),
-        output_name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+        output_name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
         output_column_id: locator_file_column_id,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
             locator_pos_column_id,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
             DataType::Int64,
         ),
-        output_name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+        output_name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
         output_column_id: locator_pos_column_id,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
             locator_row_id_column_id,
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
             DataType::Int64,
         ),
-        output_name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        output_name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
         output_column_id: locator_row_id_column_id,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
             locator_last_updated_seq_column_id,
-            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+            crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
             DataType::Int64,
         ),
-        output_name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        output_name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
         output_column_id: locator_last_updated_seq_column_id,
     });
     Ok(LogicalPlanNode::new(
@@ -822,12 +822,12 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
                     int_literal(0, DataType::Int64),
                 ),
                 int_literal(
-                    i64::from(crate::exec::change_op::CHANGE_OP_INSERT),
+                    i64::from(crate::sql::common::CHANGE_OP_INSERT),
                     DataType::Int8,
                 ),
             )],
             else_expr: Some(Box::new(int_literal(
-                i64::from(crate::exec::change_op::CHANGE_OP_DELETE),
+                i64::from(crate::sql::common::CHANGE_OP_DELETE),
                 DataType::Int8,
             ))),
         },
@@ -897,10 +897,10 @@ fn is_reserved_coalesce_payload_output_name(name: &str) -> bool {
             | "__nr_join_delta_key_shape"
             | "__nr_join_delta_coalesced"
             | "__nr_join_delta_target_locator"
-            | crate::exec::row_position::ICEBERG_FILE_PATH_COL
-            | crate::exec::row_position::ICEBERG_ROW_POS_COL
-            | crate::exec::row_position::ICEBERG_ROW_ID_COL
-            | crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+            | crate::sql::common::ICEBERG_FILE_PATH_COL
+            | crate::sql::common::ICEBERG_ROW_POS_COL
+            | crate::sql::common::ICEBERG_ROW_ID_COL
+            | crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL
     )
 }
 
@@ -1091,7 +1091,7 @@ fn project_item_for_mapping(
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
                     kind: ExprKind::Cast {
                         expr: Box::new(int_literal(
-                            i64::from(crate::exec::change_op::CHANGE_OP_INSERT),
+                            i64::from(crate::sql::common::CHANGE_OP_INSERT),
                             DataType::Int8,
                         )),
                         target: DataType::Int8,
@@ -1167,8 +1167,8 @@ fn input_internal_matches(actual: &OutputColumn, expected: &OutputColumn) -> boo
 }
 
 fn is_internal_output_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+    name.eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
         || name.eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
@@ -1238,21 +1238,21 @@ mod tests {
             out(1, "k", DataType::Int64, false, false),
             out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 3,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 4,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
@@ -1279,14 +1279,14 @@ mod tests {
             out(1, "k", DataType::Int64, false, false),
             out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 4,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
@@ -1319,14 +1319,14 @@ mod tests {
             out(1, "k", DataType::Int64, false, false),
             out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 3,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
@@ -1551,8 +1551,8 @@ mod tests {
     #[test]
     fn coalesce_plan_rejects_reserved_locator_payload_output_name() {
         for reserved in [
-            crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-            crate::exec::row_position::ICEBERG_ROW_POS_COL,
+            crate::sql::common::ICEBERG_FILE_PATH_COL,
+            crate::sql::common::ICEBERG_ROW_POS_COL,
         ] {
             let mut desc = test_coalesce_descriptor();
             desc.output_mappings[0].mv_output_column.name = reserved.to_string();
@@ -1671,18 +1671,12 @@ mod tests {
                     crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
                     ColumnId(90),
                 ),
-                (crate::exec::change_op::CHANGE_OP_COLUMN, ColumnId(91)),
+                (crate::sql::common::CHANGE_OP_COLUMN, ColumnId(91)),
+                (crate::sql::common::ICEBERG_FILE_PATH_COL, ColumnId(101)),
+                (crate::sql::common::ICEBERG_ROW_POS_COL, ColumnId(102)),
+                (crate::sql::common::ICEBERG_ROW_ID_COL, ColumnId(103)),
                 (
-                    crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                    ColumnId(101)
-                ),
-                (
-                    crate::exec::row_position::ICEBERG_ROW_POS_COL,
-                    ColumnId(102)
-                ),
-                (crate::exec::row_position::ICEBERG_ROW_ID_COL, ColumnId(103)),
-                (
-                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
                     ColumnId(104)
                 ),
             ]
@@ -1952,21 +1946,21 @@ mod tests {
             out(1, "k", DataType::Int64, false, false),
             out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 3,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             out(
                 4,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
@@ -1990,14 +1984,14 @@ mod tests {
         let payload_output = out(80, "mv_k", DataType::Int64, false, false);
         let action = out(
             4,
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
             DataType::Int8,
             false,
             true,
         );
         let action_output = out(
             91,
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
             DataType::Int8,
             false,
             true,
@@ -2037,14 +2031,14 @@ mod tests {
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(
                 2,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
             ),
             right_row_id_column: out(
                 3,
-                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                crate::sql::common::ICEBERG_ROW_ID_COL,
                 DataType::Int64,
                 false,
                 true,
@@ -2112,20 +2106,20 @@ mod tests {
         assert_column_ref(
             &args[1].kind,
             ColumnId(2),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         assert_string_literal(&args[2].kind, "right-uuid");
         assert_column_ref(
             &args[3].kind,
             ColumnId(3),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
     }
 
     fn assert_action_item(item: &ProjectItem) {
         assert!(
             item.output_name
-                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+                .eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
         );
         assert_eq!(item.output_column_id, ColumnId(91));
         let ExprKind::Cast { target, .. } = &item.expr.kind else {
@@ -2138,14 +2132,14 @@ mod tests {
         assert_column_ref(
             &expr.kind,
             ColumnId(4),
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
         );
     }
 
     fn assert_constant_insert_action_item(item: &ProjectItem) {
         assert!(
             item.output_name
-                .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+                .eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
         );
         assert_eq!(item.output_column_id, ColumnId(91));
         let ExprKind::Cast { expr, target } = &item.expr.kind else {
@@ -2155,7 +2149,7 @@ mod tests {
         let ExprKind::Literal(LiteralValue::Int(value)) = &expr.kind else {
             panic!("expected action literal");
         };
-        assert_eq!(*value, i64::from(crate::exec::change_op::CHANGE_OP_INSERT));
+        assert_eq!(*value, i64::from(crate::sql::common::CHANGE_OP_INSERT));
     }
 
     fn assert_string_literal(kind: &ExprKind, expected: &str) {

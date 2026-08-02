@@ -273,28 +273,28 @@ fn branch_union_aggregate_change_stream_output_columns(
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
         true,
@@ -660,26 +660,20 @@ mod tests {
             .expect("branch-union aggregate output must include branch id");
         let file_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL))
             .expect("branch-union aggregate output must include file locator");
         let pos_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL))
             .expect("branch-union aggregate output must include row-position locator");
         let row_id_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL))
             .expect("branch-union aggregate output must include row-lineage id");
         let last_updated_seq_idx = output_names
             .iter()
             .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+                name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
             })
             .expect("branch-union aggregate output must include last-updated sequence");
         let action_idx = output_names

@@ -20,7 +20,7 @@ use arrow::array::{Array, ArrayRef, StringBuilder};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::variant::{VariantValue, variant_typeof};
+use novarocks_types::value::variant::{VariantValue, variant_typeof};
 
 pub fn eval_variant_typeof(
     arena: &ExprArena,

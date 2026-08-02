@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use arrow::datatypes::{DataType, TimeUnit};
 use base64::Engine;
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Timelike, Utc,
@@ -818,6 +819,24 @@ pub fn parse_variant_path(path: &str) -> Result<VariantPath, String> {
     parser.parse()
 }
 
+/// Map a `variant_get` type-string literal to its SQL Arrow type.
+pub fn variant_get_target_type(type_str: &str) -> Result<DataType, String> {
+    match type_str.trim().to_ascii_lowercase().as_str() {
+        "boolean" | "bool" => Ok(DataType::Boolean),
+        "int" | "integer" | "int32" => Ok(DataType::Int32),
+        "bigint" | "long" | "int64" => Ok(DataType::Int64),
+        "float" | "float32" => Ok(DataType::Float32),
+        "double" | "float64" => Ok(DataType::Float64),
+        "string" | "varchar" => Ok(DataType::Utf8),
+        "date" => Ok(DataType::Date32),
+        "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        other => Err(format!(
+            "variant_get: unsupported type '{other}' \\
+             (supported: boolean, int, bigint, float, double, string, date, datetime)"
+        )),
+    }
+}
+
 fn normalize_variant_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -964,23 +983,23 @@ impl<'a> PathParser<'a> {
     }
 
     fn parse_quoted_string(&mut self, quote: u8) -> Result<String, String> {
-        let mut out = String::new();
+        let mut out = Vec::new();
         while !self.is_end() && self.peek_char() != quote {
             let c = self.advance();
             if c == b'\\' && !self.is_end() {
                 let escaped = self.advance();
                 match escaped {
-                    b'"' | b'\'' | b'\\' => out.push(escaped as char),
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    other => out.push(other as char),
+                    b'"' | b'\'' | b'\\' => out.push(escaped),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    other => out.push(other),
                 }
             } else {
-                out.push(c as char);
+                out.push(c);
             }
         }
-        Ok(out)
+        String::from_utf8(out).map_err(|_| "Variant path key is not valid UTF-8".to_string())
     }
 
     fn peek_char(&self) -> u8 {
