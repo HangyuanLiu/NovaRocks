@@ -35,6 +35,9 @@ pub enum CommitOpKind {
     /// Iceberg OPTIMIZE whole-table rewrite: replaces all current live data
     /// files with compacted data files and drops all current delete files.
     RewriteDataFiles,
+    /// Connector distributed rewrite: replace only the provider-frozen file
+    /// set and retain every other live entry in one replace snapshot.
+    SelectedRewrite,
     /// Iceberg v3 row-lineage UPDATE in copy-on-write mode: rewrites touched
     /// data files while preserving `_row_id`.
     CowUpdate,
@@ -190,6 +193,7 @@ mod tests {
             CommitOpKind::RowDeltaDv,
             CommitOpKind::RowDeltaDvFromFiles,
             CommitOpKind::RewriteDataFiles,
+            CommitOpKind::SelectedRewrite,
             CommitOpKind::CowUpdate,
             CommitOpKind::Truncate,
             CommitOpKind::OverwritePartitions,

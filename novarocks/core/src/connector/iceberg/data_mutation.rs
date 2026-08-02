@@ -438,6 +438,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 file_io,
                 cleanup_path_mapper,
                 cow_update_rewrite: None,
+                selected_rewrite: None,
                 target_ref: payload.target_ref.clone(),
                 snapshot_properties,
             })

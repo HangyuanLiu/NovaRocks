@@ -233,6 +233,7 @@ impl IcebergWriteCommitExecutor {
             file_io,
             cleanup_path_mapper: self.cleanup_path_mapper.clone(),
             cow_update_rewrite: self.cow_update_rewrite.clone(),
+            selected_rewrite: None,
             target_ref: self.target_ref.clone(),
             snapshot_properties,
         };
@@ -263,7 +264,7 @@ impl IcebergWriteCommitExecutor {
         Ok(())
     }
 
-    fn cleanup_converted_writer_files(&self, files: &[WrittenFile]) -> CleanupAttempt {
+    pub(crate) fn cleanup_converted_writer_files(&self, files: &[WrittenFile]) -> CleanupAttempt {
         let abort_log = AbortLog::new();
         for file in files {
             abort_log.record_data_file(file.path.clone());

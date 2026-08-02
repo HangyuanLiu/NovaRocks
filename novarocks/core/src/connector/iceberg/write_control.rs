@@ -245,6 +245,10 @@ impl IcebergWriteReconcileEvidenceV1 {
             "operation id",
         )?))
     }
+
+    pub(crate) fn aggregate_digest(&self) -> Result<[u8; 32], ConnectorError> {
+        decode_32(&self.aggregate_digest_base64, "aggregate digest")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

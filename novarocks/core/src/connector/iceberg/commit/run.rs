@@ -41,6 +41,7 @@ use super::rewrite_data_files::RewriteDataFilesCommit;
 use super::row_delta::RowDeltaCommit;
 use super::row_delta_dv::RowDeltaDvCommit;
 use super::row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
+use super::selected_rewrite::SelectedRewriteCommit;
 use super::service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
 };
@@ -59,6 +60,7 @@ pub struct RunInput {
     pub file_io: FileIO,
     pub cleanup_path_mapper: Option<CleanupPathMapper>,
     pub cow_update_rewrite: Option<CowUpdateRewriteSet>,
+    pub selected_rewrite: Option<super::selected_rewrite::SelectedRewriteFiles>,
     /// Iceberg ref to commit to. `"main"` is the default; branch-qualified
     /// DML (`INSERT INTO t.branch_dev`) supplies the branch name here.
     pub target_ref: String,
@@ -79,6 +81,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         file_io,
         cleanup_path_mapper,
         cow_update_rewrite,
+        selected_rewrite,
         target_ref,
         snapshot_properties,
     } = input;
@@ -90,6 +93,13 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
         CommitOpKind::RowDeltaDvFromFiles => Box::new(RowDeltaDvFromFilesCommit),
         CommitOpKind::RewriteDataFiles => Box::new(RewriteDataFilesCommit),
+        CommitOpKind::SelectedRewrite => Box::new(SelectedRewriteCommit {
+            files: selected_rewrite.ok_or_else(|| {
+                CommitServiceError::invalid_input(
+                    "selected rewrite commit requires its frozen file set".to_string(),
+                )
+            })?,
+        }),
         CommitOpKind::CowUpdate => Box::new(CowUpdateCommit {
             rewrite: cow_update_rewrite.ok_or_else(|| {
                 CommitServiceError::invalid_input(
@@ -223,6 +233,7 @@ mod tests {
             file_io,
             cleanup_path_mapper: None,
             cow_update_rewrite: None,
+            selected_rewrite: None,
             target_ref: "main".to_string(),
             snapshot_properties: BTreeMap::new(),
         }

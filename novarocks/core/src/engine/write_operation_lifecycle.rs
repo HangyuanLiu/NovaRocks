@@ -131,9 +131,9 @@ fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind
         | CommitOpKind::RowDeltaDv
         | CommitOpKind::RowDeltaDvFromFiles
         | CommitOpKind::CowUpdate => IcebergOperationKind::RowDelta,
-        CommitOpKind::RewriteDataFiles | CommitOpKind::RewriteManifests => {
-            IcebergOperationKind::Maintenance
-        }
+        CommitOpKind::RewriteDataFiles
+        | CommitOpKind::SelectedRewrite
+        | CommitOpKind::RewriteManifests => IcebergOperationKind::Maintenance,
     }
 }
 

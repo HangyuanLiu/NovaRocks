@@ -880,19 +880,27 @@ impl IcebergControlProvider {
             .write_services();
         let write = Arc::new(IcebergWriteControlAdapter::new(
             write_key.clone(),
-            Arc::new(RegisteredIcebergWriteControlBackend::new(services)),
+            Arc::new(RegisteredIcebergWriteControlBackend::new(services.clone())),
         )?);
         let data_mutation = Arc::new(IcebergDataMutationAdapter::new_registered(
             write_key.clone(),
             descriptor.instance_id.clone(),
             Arc::clone(&registry),
         )?);
+        let distributed_rewrite = Arc::new(
+            super::distributed_rewrite::IcebergDistributedRewriteAdapter::new_registered(
+                write_key.clone(),
+                descriptor.instance_id.clone(),
+                Arc::clone(&registry),
+                services.clone(),
+            )?,
+        );
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new_registered(
             write_key,
             descriptor.instance_id.clone(),
             registry,
         )?);
-        ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
+        ConnectorControlBinding::try_new_with_all_maintenance_capabilities(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -904,6 +912,7 @@ impl IcebergControlProvider {
             Some(provider.clone()),
             Some(data_mutation),
             Some(metadata_maintenance),
+            Some(distributed_rewrite),
             Some(write),
             Some(provider),
         )
