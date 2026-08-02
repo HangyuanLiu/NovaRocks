@@ -75,6 +75,7 @@ pub(crate) mod testing {
     use super::*;
     use crate::dml::model::{
         DML_OPERATION_SCHEMA_VERSION, OperationPayload, validate_operation_transition,
+        validate_statement_operation_transition,
     };
     use crate::dml::now_unix_millis;
 
@@ -293,8 +294,12 @@ pub(crate) mod testing {
                     request.operation_id, request.expected_revision, operation.revision
                 )));
             }
-            validate_operation_transition(operation.state, request.state)
-                .map_err(DmlError::journal_unavailable)?;
+            validate_statement_operation_transition(
+                operation.operation_kind,
+                operation.state,
+                request.state,
+            )
+            .map_err(DmlError::journal_unavailable)?;
             operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
             operation.revision = operation
                 .revision

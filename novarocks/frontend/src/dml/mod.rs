@@ -23,6 +23,7 @@
 //! contract. DML-1 ships the runner + fake-backed tests; the real executor and
 //! SQL routing land in DML-2.
 
+pub mod ctas;
 mod delete;
 pub mod error;
 pub mod insert;
