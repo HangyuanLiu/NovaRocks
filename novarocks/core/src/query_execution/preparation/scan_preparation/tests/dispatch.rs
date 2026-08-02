@@ -83,14 +83,35 @@ fn scan_preparation_propagates_caller_cancellation() {
 }
 
 #[test]
-fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() {
-    let root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
+fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring_current() {
+    let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
     let DistributedNodeKind::Scan(scan) = &root.payload else {
         panic!("fixture root must be a scan");
     };
-    let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source else {
+    let ScanSource::IcebergDataFiles {
+        table,
+        files,
+        binding,
+        ..
+    } = &scan.table.source
+    else {
         panic!("fixture scan must use IcebergDataFiles");
     };
+    let table = table.clone();
+    let files = files.clone();
+    let binding = *binding;
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::IcebergDataFiles {
+        files: stale_files, ..
+    } = &mut scan.table.source
+    else {
+        panic!("fixture scan must use IcebergDataFiles");
+    };
+    // The plan's legacy file carrier is deliberately stale.  Preparation must
+    // take the exact request-local materialization retained at admission.
+    stale_files.clear();
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
     let lease = controls
@@ -112,6 +133,13 @@ fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() 
             ),
             statistics_pin: None,
             planning_lease: Some(lease.clone()),
+            scan_materialization: Some(
+                crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
+                    table: table.clone(),
+                    files,
+                    binding,
+                },
+            ),
         },
     );
 
@@ -124,6 +152,14 @@ fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() 
         super::super::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("exact query binding must plan the scan");
+    assert!(
+        !prepared
+            .connector_read(0, 10)
+            .expect("prepared connector read")
+            .splits
+            .is_empty(),
+        "preparation must use files retained by the binding, not stale SQL plan files"
+    );
     let retained = prepared
         .connector_read(0, 10)
         .expect("prepared connector read")

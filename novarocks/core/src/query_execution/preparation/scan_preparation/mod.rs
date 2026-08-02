@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::engine::query_planning::bindings::{QueryScanMaterialization, QueryTableBindingStore};
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
@@ -162,11 +162,44 @@ fn prepare_scan_node(
             files,
             binding,
             ..
-        } => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-            table: table.clone(),
-            files: files.clone(),
-            binding: *binding,
-        }),
+        } => match query_table_bindings {
+            Some(bindings) => {
+                let binding_id = bindings
+                    .iceberg_data_file_binding_id(table, *binding)
+                    .ok_or_else(|| {
+                        format!(
+                            "scan preparation has no query-local token for '{}.{}.{}'",
+                            table.catalog, table.namespace, table.table
+                        )
+                    })?;
+                let materialization =
+                    bindings.scan_materialization(binding_id)?.ok_or_else(|| {
+                        format!(
+                            "query binding for '{}.{}.{}' has no scan materialization",
+                            table.catalog, table.namespace, table.table
+                        )
+                    })?;
+                let QueryScanMaterialization::IcebergDataFiles {
+                    table,
+                    files,
+                    binding,
+                } = materialization;
+                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                    table,
+                    files,
+                    binding,
+                })
+            }
+            // Compatibility coverage for synthetic unit fixtures that do not
+            // model request admission. Production compiler callers always
+            // retain a binding store and therefore use the exact materialized
+            // provider facts above.
+            None => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                table: table.clone(),
+                files: files.clone(),
+                binding: *binding,
+            }),
+        },
         ScanSource::IcebergMetadataTable { .. } => {
             return bindings.insert_scan_ranges(
                 fragment_id,

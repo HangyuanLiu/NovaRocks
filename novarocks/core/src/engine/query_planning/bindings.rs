@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
+use crate::connector::iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
+};
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 
@@ -126,6 +129,23 @@ pub(crate) struct QueryTableBinding {
     pub(crate) resolved: ResolvedAnalyzerTable,
     pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub(crate) planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+    /// Provider facts required by scan preparation.  This is deliberately
+    /// application-owned and paired with the same token as `resolved`; it is
+    /// never embedded in a SQL logical or distributed plan.
+    pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+}
+
+/// Exact provider scan facts retained after admission.  The concrete Iceberg
+/// representation is temporary only at this application boundary while SQL
+/// callers are migrated to `SqlScanSource`; preparation must obtain it by the
+/// request-local binding token rather than from a planner table.
+#[derive(Clone)]
+pub(crate) enum QueryScanMaterialization {
+    IcebergDataFiles {
+        table: IcebergTableInfo,
+        files: Vec<IcebergDataFileInfo>,
+        binding: IcebergDataFileBinding,
+    },
 }
 
 impl QueryTableBinding {
@@ -134,6 +154,7 @@ impl QueryTableBinding {
             resolved,
             statistics_pin: None,
             planning_lease: None,
+            scan_materialization: None,
         }
     }
 }
@@ -226,6 +247,16 @@ impl QueryTableBindingStore {
         id: SqlTableBindingId,
     ) -> Result<Option<novarocks_spi::connector::ConnectorControlPlanningLease>, String> {
         Ok(self.binding(id)?.planning_lease.clone())
+    }
+
+    /// Recover provider scan facts only through the exact request-local token.
+    /// A missing materialization is a submission-time contract failure, not a
+    /// reason to resolve a current table or connector generation.
+    pub(crate) fn scan_materialization(
+        &self,
+        id: SqlTableBindingId,
+    ) -> Result<Option<QueryScanMaterialization>, String> {
+        Ok(self.binding(id)?.scan_materialization.clone())
     }
 
     /// Return the immutable bindings captured during admission.  The caller
@@ -372,6 +403,7 @@ mod tests {
             ),
             statistics_pin: None,
             planning_lease: None,
+            scan_materialization: None,
         }
     }
 

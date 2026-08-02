@@ -26,7 +26,9 @@ use novarocks_spi::connector::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
-use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingStore};
+use crate::engine::query_planning::bindings::{
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
+};
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;
@@ -236,10 +238,12 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                     snapshot_id,
                 )?;
             planner.name = table.to_string();
+            let scan_materialization = scan_materialization_from_planner(&planner)?;
             return Ok(QueryTableBinding {
                 resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
                 statistics_pin,
                 planning_lease: Some(planning_lease),
+                scan_materialization,
             });
         }
         let (planner, _schema_id, statistics_pin, planning_lease) =
@@ -250,10 +254,12 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 namespace,
                 table,
             )?;
+        let scan_materialization = scan_materialization_from_planner(&planner)?;
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
             statistics_pin,
             planning_lease: Some(planning_lease),
+            scan_materialization,
         })
     }
 
@@ -295,6 +301,27 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             table,
             metadata_table_type,
         )
+    }
+}
+
+fn scan_materialization_from_planner(
+    planner: &crate::sql::planner::table::TableDef,
+) -> Result<Option<QueryScanMaterialization>, String> {
+    match &planner.source {
+        crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table,
+            files,
+            binding,
+            ..
+        } => Ok(Some(QueryScanMaterialization::IcebergDataFiles {
+            table: table.clone(),
+            files: files.clone(),
+            binding: *binding,
+        })),
+        crate::sql::planner::table::ScanSource::ConnectorPinned => Ok(None),
+        source => Err(format!(
+            "catalog base-table resolution returned unsupported application scan source {source:?}"
+        )),
     }
 }
 
