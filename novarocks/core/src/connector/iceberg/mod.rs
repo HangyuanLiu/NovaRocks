@@ -33,6 +33,7 @@ pub(crate) mod file_pruning;
 pub(crate) mod file_reader;
 pub(crate) mod fs_io;
 pub mod metadata;
+pub(crate) mod metadata_maintenance;
 pub(crate) mod metadata_read;
 pub(crate) mod operation_lifecycle;
 pub(crate) mod partition_spec;

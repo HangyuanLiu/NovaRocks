@@ -22,10 +22,9 @@
 //! artifacts, markers and external mutation all remain behind the SPI.
 
 use std::fmt;
-use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
