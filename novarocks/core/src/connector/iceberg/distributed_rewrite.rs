@@ -275,7 +275,11 @@ impl IcebergDistributedRewritePlanner {
                 internal(format!("convert Iceberg rewrite schema to Arrow: {error}"))
             })?,
         );
-        let input_schema = rewrite_input_schema(request.operation(), physical_schema);
+        let input_schema = rewrite_input_schema(
+            request.operation(),
+            physical_schema,
+            super::catalog::backend::row_lineage_enabled(metadata),
+        );
         let cohorts = cohort_plans_from_artifact(
             request,
             artifact_digest,
@@ -474,7 +478,7 @@ impl IcebergDistributedRewriteAdapter {
                     encode_frozen_data_rewrite_handle_payload(
                         table.metadata(),
                         artifact.base_snapshot_id,
-                        table.metadata().format_version() == iceberg::spec::FormatVersion::V3,
+                        super::catalog::backend::row_lineage_enabled(table.metadata()),
                     )
                     .map_err(|error| {
                         invalid(format!("encode data rewrite writer handle: {error}"))
@@ -1702,8 +1706,25 @@ pub(crate) fn cohort_plans_from_artifact(
 pub(crate) fn rewrite_input_schema(
     operation: &ConnectorDistributedRewriteOperation,
     physical_schema: SchemaRef,
+    row_lineage_data: bool,
 ) -> SchemaRef {
     match operation {
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage_data => {
+            let mut fields = physical_schema.fields().to_vec();
+            fields.extend([
+                Arc::new(Field::new(
+                    crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                    DataType::Int64,
+                    false,
+                )),
+                Arc::new(Field::new(
+                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    DataType::Int64,
+                    true,
+                )),
+            ]);
+            Arc::new(Schema::new(fields))
+        }
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => physical_schema,
         ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
             Arc::new(Schema::new(vec![

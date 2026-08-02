@@ -1638,6 +1638,77 @@ impl IcebergControlProvider {
         Ok(Arc::new(Schema::new(fields)))
     }
 
+    fn frozen_data_rewrite_schema(
+        &self,
+        entry: &IcebergCatalogEntry,
+        namespace: &str,
+        table: &str,
+        projection: &[usize],
+    ) -> Result<SchemaRef, ConnectorError> {
+        let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
+        let storage_schema =
+            iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
+                .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
+        let mut storage_fields = storage_schema.fields().to_vec();
+        if super::catalog::backend::row_lineage_enabled(loaded.table.metadata()) {
+            storage_fields.extend([
+                Arc::new(Field::new(
+                    crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                    DataType::Int64,
+                    false,
+                )),
+                Arc::new(Field::new(
+                    crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    DataType::Int64,
+                    true,
+                )),
+            ]);
+        }
+        let indexes = if projection.is_empty() {
+            (0..storage_fields.len()).collect::<Vec<_>>()
+        } else {
+            projection.to_vec()
+        };
+        let fields = indexes
+            .into_iter()
+            .map(|index| {
+                let storage_field = storage_fields.get(index).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        format!("Iceberg rewrite projection index {index} is outside the table schema"),
+                    )
+                })?;
+                if crate::exec::row_position::is_iceberg_row_id(storage_field.name())
+                    || crate::exec::row_position::is_iceberg_last_updated_sequence_number(
+                        storage_field.name(),
+                    )
+                {
+                    return Ok(storage_field.clone());
+                }
+                let logical_column = loaded
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(storage_field.name()))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::CorruptData,
+                            format!(
+                                "Iceberg table schema field {} is missing its logical column definition",
+                                storage_field.name()
+                            ),
+                        )
+                    })?;
+                Ok(Arc::new(
+                    storage_field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(logical_column.data_type.clone()),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
     fn select_snapshot(
         &self,
         entry: &IcebergCatalogEntry,
@@ -4016,6 +4087,13 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             Some(novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND) => {
                 rewrite_position_output_schema()
             }
+            Some(novarocks_spi::connector::REWRITE_DATA_FILES_KIND) => self
+                .frozen_data_rewrite_schema(
+                    &entry,
+                    &table.namespace,
+                    &table.table,
+                    &request.projection,
+                )?,
             _ => self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?,
         };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {

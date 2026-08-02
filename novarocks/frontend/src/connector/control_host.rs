@@ -488,7 +488,7 @@ impl ConnectorControlHost {
         key: &ConnectorExecutionBindingKey,
         require_active: bool,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let (descriptor, metadata, planning, rewrite, write, distribution) = {
+        let (binding, descriptor, metadata, planning, rewrite, write, distribution) = {
             let mut state = self.lock_state()?;
             let generation = state.generations.get_mut(key).ok_or_else(|| {
                 ConnectorError::new(
@@ -520,7 +520,9 @@ impl ConnectorControlHost {
             })?;
             generation.distributed_rewrite_leases =
                 generation.distributed_rewrite_leases.saturating_add(1);
+            generation.planning_leases = generation.planning_leases.saturating_add(1);
             (
+                Arc::clone(&generation.binding),
                 generation.binding.descriptor().clone(),
                 Arc::clone(generation.binding.metadata()),
                 Arc::clone(generation.binding.planning()),
@@ -532,9 +534,21 @@ impl ConnectorControlHost {
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         let lease_key = key.clone();
+        let planning_state = Arc::downgrade(&self.state);
+        let planning_retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let planning_key = key.clone();
+        let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
+            release_lease(
+                &planning_state,
+                &planning_retirement_sink,
+                planning_key,
+                LeaseKind::Planning,
+            );
+        });
         ConnectorDistributedRewriteLease::new(
             descriptor,
             key.clone(),
+            planning_lease,
             metadata,
             planning,
             rewrite,

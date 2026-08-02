@@ -14,12 +14,12 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext, ConnectorScanPlanning,
-    ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteCohortId,
-    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext,
+    ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteAttemptCompletion,
+    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -573,6 +573,7 @@ pub trait ConnectorDistributedRewriteResolver: Send + Sync {
 pub struct ConnectorDistributedRewriteLease {
     descriptor: ConnectorInstanceDescriptor,
     key: ConnectorExecutionBindingKey,
+    planning_lease: ConnectorControlPlanningLease,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     rewrite: Arc<dyn ConnectorDistributedRewrite>,
@@ -589,6 +590,7 @@ impl ConnectorDistributedRewriteLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         key: ConnectorExecutionBindingKey,
+        planning_lease: ConnectorControlPlanningLease,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         rewrite: Arc<dyn ConnectorDistributedRewrite>,
@@ -597,6 +599,8 @@ impl ConnectorDistributedRewriteLease {
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
         if descriptor.instance_id != key.instance_id
+            || planning_lease.binding().descriptor() != &descriptor
+            || planning_lease.binding().incarnation() != key.incarnation
             || metadata.instance_id() != &key.instance_id
             || planning.instance_id() != &key.instance_id
             || rewrite.descriptor() != &descriptor
@@ -610,6 +614,7 @@ impl ConnectorDistributedRewriteLease {
         Ok(Self {
             descriptor,
             key,
+            planning_lease,
             metadata,
             planning,
             rewrite,
@@ -625,6 +630,12 @@ impl ConnectorDistributedRewriteLease {
     }
     pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.key
+    }
+    /// Retain the exact control generation through the generic execution
+    /// binding barrier for a frozen rewrite read. This is derived from the
+    /// composite rewrite lease; it never performs a current-generation lookup.
+    pub fn planning_lease(&self) -> ConnectorControlPlanningLease {
+        self.planning_lease.clone()
     }
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata

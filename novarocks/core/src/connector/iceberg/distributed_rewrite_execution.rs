@@ -112,18 +112,31 @@ fn build_rewrite_sink_spec(
                 .ok_or_else(|| {
                     "distributed rewrite execution names an unknown cohort".to_string()
                 })?;
-            if cohort.input_schema().fields().len() != columns.len() {
-                return Err(
-                    "frozen data rewrite input schema does not match target schema".to_string(),
-                );
+            let sink_spec = if super::catalog::backend::row_lineage_enabled(loaded.table.metadata())
+            {
+                crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
+                    &target,
+                    &resolved,
+                    &loaded.table,
+                    &entry,
+                )
+            } else {
+                crate::engine::iceberg_writer::build_insert_write_sink_spec(
+                    &target,
+                    &resolved,
+                    &loaded.table,
+                    &entry,
+                    &columns,
+                )
+            }?;
+            if cohort.input_schema().fields().len() != sink_spec.target_columns.len() {
+                return Err(format!(
+                    "frozen data rewrite input schema does not match target schema (cohort fields={}, sink fields={})",
+                    cohort.input_schema().fields().len(),
+                    sink_spec.target_columns.len(),
+                ));
             }
-            crate::engine::iceberg_writer::build_insert_write_sink_spec(
-                &target,
-                &resolved,
-                &loaded.table,
-                &entry,
-                &columns,
-            )
+            Ok(sink_spec)
         }
         novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND => {
             crate::engine::iceberg_writer::build_position_delete_sink_spec(

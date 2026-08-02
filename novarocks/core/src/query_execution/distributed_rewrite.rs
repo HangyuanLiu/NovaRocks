@@ -98,10 +98,10 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
         predicate_dispositions: Vec::new(),
         residual_predicates: Vec::new(),
         batch,
-        // The outer rewrite session owns the composite lease through the
-        // native ensure barrier and external commit.  A current planning
-        // lease would be both redundant and incorrect here.
-        planning_lease: None,
+        // This clone is derived from the composite rewrite lease, so the
+        // generic ensure barrier retains the same exact generation without a
+        // later current-generation lookup.
+        planning_lease: Some(lease.planning_lease()),
         read_session: split_result.session,
     })
 }
@@ -557,11 +557,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorDistributedRewrite, ConnectorDistributedRewriteCohortPlan,
-        ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
-        ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
+        ConnectorCancellation, ConnectorControlBinding, ConnectorDistributedRewrite,
+        ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
+        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
+        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
         ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteCohortId, ConnectorWriteControl,
         ConnectorWritePlan, ConnectorWritePlanningRequest,
     };
@@ -813,6 +813,27 @@ mod tests {
         let lease = ConnectorDistributedRewriteLease::new(
             descriptor.clone(),
             key.clone(),
+            novarocks_spi::connector::ConnectorControlPlanningLease::new(
+                Arc::new(
+                    ConnectorControlBinding::try_new(
+                        descriptor.clone(),
+                        key.incarnation,
+                        Arc::new(TestMetadata {
+                            instance: key.instance_id.clone(),
+                        }),
+                        Arc::new(TestPlanning {
+                            instance: key.instance_id.clone(),
+                        }),
+                        Arc::new(TestDistribution {
+                            descriptor: descriptor.clone(),
+                            key: key.clone(),
+                        }),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                || {},
+            ),
             Arc::new(TestMetadata {
                 instance: instance.clone(),
             }),

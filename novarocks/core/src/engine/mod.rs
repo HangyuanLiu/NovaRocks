@@ -774,6 +774,7 @@ fn test_distributed_rewrite_lease(
     novarocks_spi::connector::ConnectorDistributedRewriteLease::new(
         binding.descriptor().clone(),
         key,
+        novarocks_spi::connector::ConnectorControlPlanningLease::new(binding.clone(), || {}),
         Arc::clone(binding.metadata()),
         Arc::clone(binding.planning()),
         rewrite,

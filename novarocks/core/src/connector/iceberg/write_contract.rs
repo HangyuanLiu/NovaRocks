@@ -420,6 +420,34 @@ pub(crate) fn encode_frozen_data_rewrite_handle_payload(
         .get("write.data.path")
         .cloned()
         .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let mut data_input_schema =
+        crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen(
+            metadata.current_schema(),
+        )
+        .fields;
+    if row_lineage_data {
+        data_input_schema.extend([
+            IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+            IcebergSchemaFieldDef {
+                field_id:
+                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+        ]);
+    }
     canonical_json(&IcebergWriteHandlePayloadV1 {
         version: ICEBERG_WRITE_PAYLOAD_VERSION,
         mode: IcebergSinkModeV1::Data,
@@ -435,10 +463,16 @@ pub(crate) fn encode_frozen_data_rewrite_handle_payload(
         partition_source_column_names,
         partition_column_names,
         transform_exprs,
-        // The frozen rewrite source already carries Iceberg field metadata in
-        // its physical Arrow schema. Re-annotating a second time here would
-        // make nested-row-lineage evolution ambiguous.
-        data_input_schema: None,
+        // Native connector output columns intentionally carry only generic
+        // Arrow facts. Preserve the Iceberg field-ID tree in this private
+        // handle so the BE can re-annotate that generic schema before writing
+        // Parquet; the frozen source schema itself never crosses the wire.
+        data_input_schema: Some(
+            data_input_schema
+                .iter()
+                .map(IcebergWriterSchemaFieldV1::from)
+                .collect(),
+        ),
         position_delete_binding: None,
         position_delete_partitions: Vec::new(),
     })
@@ -1912,6 +1946,69 @@ mod tests {
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
                 .map(String::as_str),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn frozen_data_rewrite_handle_restores_iceberg_field_ids_on_generic_input() {
+        let metadata: TableMetadata = serde_json::from_str(
+            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        )
+        .expect("decode metadata");
+        let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, false)
+            .expect("encode frozen data rewrite handle");
+        let raw_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+        let plan = data_sink_plan_from_handle_payload(&payload, raw_schema, None)
+            .expect("reconstruct annotated frozen data rewrite plan");
+        assert_eq!(
+            plan.output_schema.fields()[0]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn frozen_row_lineage_rewrite_handle_preserves_reserved_field_ids() {
+        let metadata: TableMetadata = serde_json::from_str(
+            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        )
+        .expect("decode metadata");
+        let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, true)
+            .expect("encode frozen row-lineage rewrite handle");
+        let raw_schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        let plan = data_sink_plan_from_handle_payload(&payload, raw_schema, None)
+            .expect("reconstruct row-lineage rewrite plan");
+        assert_eq!(
+            plan.output_schema.fields()[1]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(|value| value.parse::<i32>().expect("field id")),
+            Some(crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID)
+        );
+        assert_eq!(
+            plan.output_schema.fields()[2]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(|value| value.parse::<i32>().expect("field id")),
+            Some(crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
         );
     }
 
