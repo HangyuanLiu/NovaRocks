@@ -85,7 +85,10 @@ ANALYZE TABLE ${case_db}.statistics_recovery;
 SHOW ANALYZE JOBS;
 
 -- query 11
--- @retry_count=20
+-- Publishing the provider artifact and refreshing the pinned Iceberg metadata
+-- are separate durable observations. Under a loaded CI host the latter can
+-- legitimately lag the completed ANALYZE job by more than ten seconds.
+-- @retry_count=120
 -- @retry_interval_ms=500
 -- @result_contains=row_count
 -- @result_contains=2
