@@ -408,6 +408,7 @@ pub struct ConnectorDistributedRewriteAttemptCheckpoint {
     pub attempt_digest: [u8; 32],
     pub artifact_digest: [u8; 32],
     pub artifact_handle: Bytes,
+    pub checkpoint_digest: [u8; 32],
 }
 
 impl ConnectorDistributedRewriteAttemptCheckpoint {
@@ -419,12 +420,20 @@ impl ConnectorDistributedRewriteAttemptCheckpoint {
         artifact_handle: Bytes,
     ) -> Result<Self, ConnectorError> {
         validate_payload(&artifact_handle, "attempt checkpoint")?;
+        let checkpoint_digest = checkpoint_digest(
+            cohort_id,
+            disposition,
+            attempt_digest,
+            artifact_digest,
+            &artifact_handle,
+        );
         Ok(Self {
             cohort_id,
             disposition,
             attempt_digest,
             artifact_digest,
             artifact_handle,
+            checkpoint_digest,
         })
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
@@ -436,7 +445,7 @@ impl ConnectorDistributedRewriteAttemptCheckpoint {
             self.artifact_digest,
             &self.artifact_handle,
         );
-        if self.artifact_digest != expected {
+        if self.checkpoint_digest != expected {
             return Err(invalid("distributed rewrite checkpoint digest is invalid"));
         }
         Ok(())
@@ -616,6 +625,63 @@ impl ConnectorDistributedRewriteLease {
         self.validate_plan(plan)?;
         self.rewrite.activate_rewrite(plan)
     }
+    pub fn checkpoint_attempt(
+        &self,
+        plan: &ConnectorDistributedRewritePlan,
+        disposition: ConnectorDistributedRewriteAttemptDisposition,
+        completion: &ConnectorWriteAttemptCompletion,
+    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
+        self.validate_plan(plan)?;
+        self.validate_attempt(plan, completion)?;
+        let checkpoint = self
+            .rewrite
+            .checkpoint_attempt(plan, disposition, completion)?;
+        checkpoint.validate()?;
+        if checkpoint.cohort_id != completion.cohort_id()
+            || checkpoint.attempt_digest != completion.digest()
+        {
+            return Err(invalid(
+                "distributed rewrite checkpoint does not match attempt completion",
+            ));
+        }
+        Ok(checkpoint)
+    }
+    pub fn restore_attempt(
+        &self,
+        plan: &ConnectorDistributedRewritePlan,
+        checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
+    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
+        self.validate_plan(plan)?;
+        checkpoint.validate()?;
+        if !plan
+            .cohorts
+            .iter()
+            .any(|cohort| cohort.cohort_id == checkpoint.cohort_id)
+        {
+            return Err(invalid(
+                "distributed rewrite checkpoint names unknown cohort",
+            ));
+        }
+        let completion = self.rewrite.restore_attempt(plan, checkpoint)?;
+        self.validate_attempt(plan, &completion)?;
+        if completion.digest() != checkpoint.attempt_digest {
+            return Err(invalid(
+                "distributed rewrite restored attempt digest does not match checkpoint",
+            ));
+        }
+        Ok(completion)
+    }
+    pub fn finalize_rewrite(
+        &self,
+        plan: &ConnectorDistributedRewritePlan,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<ConnectorDistributedRewriteReceipt, ConnectorError> {
+        self.validate_plan(plan)?;
+        receipt.validate()?;
+        let rewrite_receipt = self.rewrite.finalize_rewrite(plan, receipt)?;
+        rewrite_receipt.validate()?;
+        Ok(rewrite_receipt)
+    }
     pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, ConnectorError> {
         let retained = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
@@ -629,6 +695,24 @@ impl ConnectorDistributedRewriteLease {
         plan.validate()?;
         if plan.owner != self.key {
             return Err(invalid("distributed rewrite plan does not match lease"));
+        }
+        Ok(())
+    }
+    fn validate_attempt(
+        &self,
+        plan: &ConnectorDistributedRewritePlan,
+        completion: &ConnectorWriteAttemptCompletion,
+    ) -> Result<(), ConnectorError> {
+        if completion.owner() != &self.key
+            || completion.operation_id() != plan.operation_id
+            || !plan
+                .cohorts
+                .iter()
+                .any(|cohort| cohort.cohort_id == completion.cohort_id())
+        {
+            return Err(invalid(
+                "distributed rewrite attempt does not belong to plan or exact lease",
+            ));
         }
         Ok(())
     }
