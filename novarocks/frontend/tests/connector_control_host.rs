@@ -31,9 +31,12 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanningRequest,
+    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReconcileRequest,
+    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderId,
+    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
     ConnectorTableRequest, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
     StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsProvenance,
     StatisticsReadRequest, StatisticsReader,
@@ -243,6 +246,69 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
     .expect("control binding with data mutation")
 }
 
+struct TestMetadataMaintenance {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_maintenance(
+        &self,
+        _request: ConnectorMetadataMaintenancePlanningRequest,
+    ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn execute(
+        &self,
+        _request: ConnectorMetadataMaintenanceExecuteRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn reconcile(
+        &self,
+        _request: ConnectorMetadataMaintenanceReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBinding {
+    let binding = binding(incarnation_byte);
+    let descriptor = binding.descriptor().clone();
+    let incarnation = binding.incarnation();
+    let key = ConnectorExecutionBindingKey {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    };
+    let provider = Arc::new(TestControl {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    });
+    ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
+        descriptor.clone(),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+        None,
+        None,
+        Some(Arc::new(TestMetadataMaintenance { descriptor, key })),
+        None,
+        None,
+    )
+    .expect("control binding with metadata maintenance")
+}
+
 struct TestStatistics {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
@@ -447,6 +513,92 @@ fn exact_data_mutation_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready[0].key, old_key);
 
     let error = match host.acquire_exact_data_mutation(&old_key) {
+        Ok(_) => panic!("retired generation must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
+}
+
+#[test]
+fn metadata_maintenance_lease_requires_the_capability_and_fences_retirement() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7))
+        .expect("register no-metadata-maintenance generation");
+    let error = match host.acquire_current_metadata_maintenance(&instance_id) {
+        Ok(_) => panic!("missing capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire no-metadata-maintenance generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_metadata_maintenance(8))
+        .expect("register metadata-maintenance generation");
+    let lease = host
+        .acquire_current_metadata_maintenance(&instance_id)
+        .expect("metadata-maintenance lease");
+    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.metadata().instance_id(), &instance_id);
+    host.retire_current(&instance_id)
+        .expect("retire metadata-maintenance generation");
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(lease);
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    host.register(binding_with_metadata_maintenance(7))
+        .expect("register old generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let error = match host.acquire_current_metadata_maintenance(&instance_id) {
+        Ok(_) => panic!("retiring generation must not accept current acquisition"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    host.register(binding_with_metadata_maintenance(8))
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_metadata_maintenance(&instance_id)
+        .expect("replacement metadata-maintenance lease");
+    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+
+    let exact_old = host
+        .acquire_exact_metadata_maintenance(&old_key)
+        .expect("exact retiring generation lease");
+    assert_eq!(exact_old.binding_key(), &old_key);
+
+    let unknown_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+    };
+    let error = match host.acquire_exact_metadata_maintenance(&unknown_key) {
+        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_metadata_maintenance(&old_key) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

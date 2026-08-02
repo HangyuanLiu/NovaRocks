@@ -27,9 +27,7 @@ use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::expire_snapshots::{ExpireParams, run_expire_snapshots};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
-use crate::connector::iceberg::commit::rewrite_manifests::run_rewrite_manifests;
 use crate::connector::iceberg::commit::rewrite_position_delete_files::{
     RewritePositionDeleteOptions, run_rewrite_position_delete_files,
 };
@@ -119,26 +117,43 @@ pub(crate) fn current_snapshot_id(
 fn run_rewrite_manifests_action(
     state: &Arc<StandaloneState>,
     target: MaintenanceTarget,
-    _use_caching: Option<bool>,
+    use_caching: Option<bool>,
     spec_id: Option<i32>,
 ) -> Result<MaintenanceActionOutcome, String> {
+    if use_caching.is_some() {
+        return Err(
+            "rewrite_manifests `use_caching` is not implemented in NovaRocks yet".to_string(),
+        );
+    }
     if spec_id.is_some() {
         return Err("rewrite_manifests `spec_id` is not implemented in NovaRocks yet".to_string());
     }
-    let (catalog, table_ident, _) =
-        resolve_maintenance_catalog(state, &target.catalog, &target.namespace, &target.table)?;
-    let outcome =
-        block_on_iceberg(async move { run_rewrite_manifests(catalog, table_ident).await })?
-            .map_err(|error| {
-                format!(
-                    "REWRITE MANIFESTS failed for {}: {error}",
-                    action_target(&target)
-                )
-            })?;
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    let completed = crate::connector::metadata_maintenance::execute_metadata_maintenance(
+        state.connector_control.as_ref(),
+        state.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        },
+        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::rewrite_metadata_layout(
+        ),
+        crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
+    )?;
+    let summary = completed.receipt.summary();
 
     Ok(MaintenanceActionOutcome::RewriteManifests {
-        rewritten_manifests_count: outcome.rewritten_manifests_count,
-        added_manifests_count: outcome.added_manifests_count,
+        rewritten_manifests_count: i32::try_from(summary.rewritten_items)
+            .map_err(|_| "rewrite manifest count exceeds Spark result range".to_string())?,
+        added_manifests_count: i32::try_from(summary.added_items)
+            .map_err(|_| "added manifest count exceeds Spark result range".to_string())?,
     })
 }
 
@@ -148,24 +163,29 @@ fn run_expire_snapshots_action(
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
 ) -> Result<MaintenanceActionOutcome, String> {
-    let (catalog, table_ident, _) =
-        resolve_maintenance_catalog(state, &target.catalog, &target.namespace, &target.table)?;
-    let params = ExpireParams {
-        older_than_ms,
-        retain_last,
-    };
-    let outcome =
-        block_on_iceberg(async move { run_expire_snapshots(catalog, table_ident, params).await })?
-            .map_err(|error| {
-                format!(
-                    "EXPIRE SNAPSHOTS failed for {}: {error}",
-                    action_target(&target)
-                )
-            })?;
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    crate::connector::metadata_maintenance::execute_metadata_maintenance(
+        state.connector_control.as_ref(),
+        state.as_ref(),
+        &instance_id,
+        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: target.namespace.clone().into(),
+            table: target.table.clone().into(),
+        },
+        crate::connector::metadata_maintenance::MetadataMaintenanceIntent::expire_table_versions(
+            older_than_ms,
+            retain_last,
+        ),
+        crate::connector::connector_request_context(
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?,
+    )?;
 
     tracing::info!(
-        expired_snapshot_count = outcome.expired_snapshot_count,
-        deleted_file_count = outcome.deleted_file_count,
         catalog = %target.catalog,
         namespace = %target.namespace,
         table = %target.table,

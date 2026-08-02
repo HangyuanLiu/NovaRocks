@@ -64,14 +64,27 @@ pub async fn run_rewrite_manifests(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
 ) -> Result<RewriteManifestsOutcome, String> {
+    run_rewrite_manifests_with_marker(catalog, table_ident, None).await
+}
+
+/// Executes the legacy retry wrapper while attaching a provider-owned operation
+/// marker to the replace snapshot. The metadata-maintenance adapter supplies a
+/// marker and will later use the typed frozen-plan entrypoint; keeping this
+/// narrow helper makes marker placement testable independently.
+pub async fn run_rewrite_manifests_with_marker(
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    marker: Option<String>,
+) -> Result<RewriteManifestsOutcome, String> {
     let outcome: Arc<Mutex<Option<RewriteManifestsOutcome>>> = Arc::new(Mutex::new(None));
     let outcome_out = outcome.clone();
     commit_with_retry(|_attempt| {
         let catalog = catalog.clone();
         let table_ident = table_ident.clone();
         let outcome_out = outcome_out.clone();
+        let marker = marker.clone();
         async move {
-            let next = run_rewrite_manifests_one_attempt(catalog, table_ident).await?;
+            let next = run_rewrite_manifests_one_attempt(catalog, table_ident, marker).await?;
             *outcome_out
                 .lock()
                 .expect("rewrite manifests outcome mutex poisoned") = Some(next);
@@ -86,9 +99,19 @@ pub async fn run_rewrite_manifests(
         .ok_or_else(|| "rewrite_manifests finished without an outcome".to_string())
 }
 
+/// Runs one frozen-plan attempt without the legacy OCC retry loop.
+pub(crate) async fn run_rewrite_manifests_once_with_marker(
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    marker: Option<String>,
+) -> Result<RewriteManifestsOutcome, iceberg::Error> {
+    run_rewrite_manifests_one_attempt(catalog, table_ident, marker).await
+}
+
 async fn run_rewrite_manifests_one_attempt(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
+    marker: Option<String>,
 ) -> Result<RewriteManifestsOutcome, iceberg::Error> {
     let table = catalog.load_table(&table_ident).await?;
     let metadata = table.metadata();
@@ -205,21 +228,25 @@ async fn run_rewrite_manifests_one_attempt(
         rewritten_manifests_count: checked_i32_metric(replaced_count, "rewritten_manifests_count")?,
         added_manifests_count: checked_i32_metric(added_count, "added_manifests_count")?,
     };
+    let mut additional_properties = finalize_snapshot_summary(
+        [
+            (
+                "replaced-manifests-count".to_string(),
+                replaced_count.to_string(),
+            ),
+            ("added-manifests-count".to_string(), added_count.to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        metadata.current_snapshot().map(|s| s.summary()),
+        false,
+    );
+    if let Some(marker) = marker {
+        additional_properties.insert("novarocks.connector.maintenance.v1".to_string(), marker);
+    }
     let summary = Summary {
         operation: Operation::Replace,
-        additional_properties: finalize_snapshot_summary(
-            [
-                (
-                    "replaced-manifests-count".to_string(),
-                    replaced_count.to_string(),
-                ),
-                ("added-manifests-count".to_string(), added_count.to_string()),
-            ]
-            .into_iter()
-            .collect(),
-            metadata.current_snapshot().map(|s| s.summary()),
-            false,
-        ),
+        additional_properties,
     };
 
     let snapshot_builder = iceberg::spec::Snapshot::builder()

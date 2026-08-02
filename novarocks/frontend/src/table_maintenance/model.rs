@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 1;
+pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 2;
+pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobCreate {
@@ -189,6 +191,184 @@ impl From<&StoredOptimizeJobV1> for OptimizeJob {
             base_snapshot_id: value.base_snapshot_id,
             state: value.state.into(),
             outcome: value.outcome.clone().map(Into::into),
+            error_message: value.error_message.clone(),
+            created_at_ms: value.created_at_ms,
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+/// Durable, frontend-owned state for a metadata-only connector maintenance
+/// operation.  This is deliberately separate from the v1 OPTIMIZE job model:
+/// E1 operations run synchronously but still need a recovery record before any
+/// external catalog dispatch occurs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MetadataMaintenanceOperationKind {
+    RewriteMetadataLayout,
+    ExpireTableVersions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MetadataMaintenanceOperationState {
+    Pending,
+    Running,
+    ReconcilePending,
+    Finished,
+    Failed,
+    Unresolved,
+}
+
+impl MetadataMaintenanceOperationState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed)
+    }
+
+    pub const fn holds_active_fence(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Running | Self::ReconcilePending | Self::Unresolved
+        )
+    }
+
+    pub const fn as_key_component(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::ReconcilePending => "reconcile-pending",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataMaintenanceOperationCreate {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: MetadataMaintenanceOperationKind,
+    pub request_digest: [u8; 32],
+    pub request_payload_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub request_payload: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
+/// Persisted exact-generation identity.  It is stored as canonical primitive
+/// fields rather than a process-local lease so recovery can reconstruct and
+/// validate the exact `ConnectorExecutionBindingKey` before reconcile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetadataMaintenanceExactOwner {
+    pub instance_id: String,
+    pub incarnation_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataMaintenancePlanPayload {
+    pub plan_digest: [u8; 32],
+    pub payload_digest: [u8; 32],
+    pub payload: Vec<u8>,
+    pub summary: [u64; 5],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataMaintenanceOpaquePayload {
+    pub digest: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataMaintenanceOperation {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: MetadataMaintenanceOperationKind,
+    pub request_digest: [u8; 32],
+    pub request_payload_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub plan_digest: Option<[u8; 32]>,
+    pub plan_summary: Option<[u64; 5]>,
+    pub state: MetadataMaintenanceOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredMetadataMaintenanceOperationV2 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub target: StoredMaintenanceTargetV1,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: MetadataMaintenanceOperationKind,
+    pub request_digest: [u8; 32],
+    pub request_payload_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub plan_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub plan_summary: Option<[u64; 5]>,
+    pub state: MetadataMaintenanceOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StoredMetadataMaintenanceTransactionActionV2 {
+    Create,
+    Start,
+    ReconcilePending,
+    Finish,
+    Fail,
+    Unresolve,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredMetadataMaintenanceTransactionV2 {
+    pub schema_version: u8,
+    pub transaction_operation_id: Uuid,
+    pub action: StoredMetadataMaintenanceTransactionActionV2,
+    pub operation_id: Uuid,
+    pub post_operation: StoredMetadataMaintenanceOperationV2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StoredMetadataMaintenancePayloadKindV2 {
+    Request,
+    Plan,
+    Receipt,
+    Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredMetadataMaintenancePayloadV2 {
+    pub schema_version: u8,
+    pub kind: StoredMetadataMaintenancePayloadKindV2,
+    pub digest: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+impl From<&StoredMetadataMaintenanceOperationV2> for MetadataMaintenanceOperation {
+    fn from(value: &StoredMetadataMaintenanceOperationV2) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            target: value.target.clone().into(),
+            owner: value.owner.clone(),
+            kind: value.kind,
+            request_digest: value.request_digest,
+            request_payload_digest: value.request_payload_digest,
+            base_state_digest: value.base_state_digest,
+            plan_digest: value.plan_digest,
+            plan_summary: value.plan_summary,
+            state: value.state,
             error_message: value.error_message.clone(),
             created_at_ms: value.created_at_ms,
             started_at_ms: value.started_at_ms,

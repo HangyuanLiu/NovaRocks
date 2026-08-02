@@ -82,6 +82,17 @@ pub async fn run_expire_snapshots(
     table_ident: TableIdent,
     params: ExpireParams,
 ) -> Result<ExpireOutcome, String> {
+    run_expire_snapshots_with_marker(catalog, table_ident, params, None).await
+}
+
+/// Executes snapshot expiry while atomically carrying the provider-owned
+/// operation marker in the same metadata commit.
+pub async fn run_expire_snapshots_with_marker(
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    params: ExpireParams,
+    marker: Option<String>,
+) -> Result<ExpireOutcome, String> {
     use std::sync::Mutex;
     // Shared state to capture the outcome across the retry closure boundary.
     let outcome: Arc<Mutex<Option<ExpireOutcome>>> = Arc::new(Mutex::new(None));
@@ -92,8 +103,11 @@ pub async fn run_expire_snapshots(
         let outcome_inner = outcome_clone.clone();
         let catalog = catalog.clone();
         let table_ident = table_ident.clone();
+        let marker = marker.clone();
         async move {
-            let res = run_expire_one_attempt(&catalog, &table_ident, older, retain).await?;
+            let res =
+                run_expire_one_attempt(&catalog, &table_ident, older, retain, marker.as_deref())
+                    .await?;
             *outcome_inner.lock().unwrap() = Some(res);
             Ok(())
         }
@@ -105,6 +119,23 @@ pub async fn run_expire_snapshots(
     }))
 }
 
+/// Runs one frozen-plan attempt without the legacy OCC retry loop.
+pub(crate) async fn run_expire_snapshots_once_with_marker(
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    params: ExpireParams,
+    marker: Option<String>,
+) -> Result<ExpireOutcome, iceberg::Error> {
+    run_expire_one_attempt(
+        &catalog,
+        &table_ident,
+        params.older_than_ms,
+        params.retain_last,
+        marker.as_deref(),
+    )
+    .await
+}
+
 /// Single attempt body; returns an `iceberg::Error` on failure so
 /// `commit_with_retry` can classify it as retryable or not.
 async fn run_expire_one_attempt(
@@ -112,6 +143,7 @@ async fn run_expire_one_attempt(
     table_ident: &TableIdent,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
+    marker: Option<&str>,
 ) -> Result<ExpireOutcome, iceberg::Error> {
     let table = catalog.load_table(table_ident).await?;
     let metadata = table.metadata();
@@ -179,11 +211,22 @@ async fn run_expire_one_attempt(
             snapshot_id: Some(main_ref.snapshot_id),
         });
     }
+    let mut updates = vec![TableUpdate::RemoveSnapshots {
+        snapshot_ids: candidates.clone(),
+    }];
+    if let Some(marker) = marker {
+        updates.push(TableUpdate::SetProperties {
+            updates: [(
+                "novarocks.connector.maintenance.v1".to_string(),
+                marker.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+    }
     let commit = TableCommit::builder()
         .ident(table_ident.clone())
-        .updates(vec![TableUpdate::RemoveSnapshots {
-            snapshot_ids: candidates.clone(),
-        }])
+        .updates(updates)
         .requirements(requirements)
         .build();
     catalog.update_table(commit).await?;

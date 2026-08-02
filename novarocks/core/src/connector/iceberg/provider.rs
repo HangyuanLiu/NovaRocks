@@ -70,6 +70,7 @@ use super::catalog::registry::{
 };
 use super::catalog::views;
 use super::data_mutation::IcebergDataMutationAdapter;
+use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
 use super::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -998,11 +999,16 @@ impl IcebergControlProvider {
             Arc::new(RegisteredIcebergWriteControlBackend::new(services)),
         )?);
         let data_mutation = Arc::new(IcebergDataMutationAdapter::new_registered(
+            write_key.clone(),
+            descriptor.instance_id.clone(),
+            Arc::clone(&registry),
+        )?);
+        let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new_registered(
             write_key,
             descriptor.instance_id.clone(),
             registry,
         )?);
-        ConnectorControlBinding::try_new_with_all_capabilities(
+        ConnectorControlBinding::try_new_with_all_capabilities_and_metadata_maintenance(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -1013,6 +1019,7 @@ impl IcebergControlProvider {
             }),
             Some(provider.clone()),
             Some(data_mutation),
+            Some(metadata_maintenance),
             Some(write),
             Some(provider),
         )

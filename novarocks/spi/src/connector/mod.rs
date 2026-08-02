@@ -24,6 +24,7 @@ mod execution;
 mod handle;
 mod identity;
 mod metadata;
+mod metadata_maintenance;
 mod mutation;
 mod predicate;
 mod read;
@@ -68,6 +69,17 @@ pub use metadata::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
     ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
+};
+pub use metadata_maintenance::{
+    CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION, ConnectorMetadataMaintenance,
+    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
+    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
+    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
+    EXPIRE_TABLE_VERSIONS_KIND, MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
     ConnectorCatalogMutation, ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,

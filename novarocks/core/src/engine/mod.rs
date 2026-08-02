@@ -558,6 +558,95 @@ fn test_data_mutation_lease(
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
+    for TestConnectorControlRegistry
+{
+    fn acquire_current_metadata_maintenance(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active metadata maintenance binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        test_metadata_maintenance_lease(binding)
+    }
+
+    fn acquire_exact_metadata_maintenance(
+        &self,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(&key.instance_id)
+            .filter(|binding| binding.incarnation() == key.incarnation)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector metadata maintenance generation is unavailable",
+                )
+            })?;
+        test_metadata_maintenance_lease(binding)
+    }
+}
+
+#[cfg(test)]
+fn test_metadata_maintenance_lease(
+    binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
+) -> Result<
+    novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let maintenance = binding.metadata_maintenance().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no metadata maintenance capability",
+        )
+    })?;
+    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    novarocks_spi::connector::ConnectorMetadataMaintenanceLease::new(
+        binding.descriptor().clone(),
+        key,
+        Arc::clone(binding.metadata()),
+        maintenance,
+        || {},
+    )
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRegistry {
     fn acquire_current_write(
         &self,

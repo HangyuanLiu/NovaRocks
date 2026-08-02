@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::{
     CommitResolution, Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord,
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
@@ -30,12 +31,19 @@ use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::model::{
-    OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate, OptimizeJobOutcome,
-    StoredMaintenanceTargetV1, StoredOptimizeCounterV1, StoredOptimizeJobStateV1,
-    StoredOptimizeJobV1, StoredOptimizeOperationActionV1, StoredOptimizeOperationV1,
-    StoredOptimizeOutcomeV1,
+    METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
+    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
+    MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
+    OptimizeJobOutcome, StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
+    StoredMetadataMaintenancePayloadKindV2, StoredMetadataMaintenancePayloadV2,
+    StoredMetadataMaintenanceTransactionActionV2, StoredMetadataMaintenanceTransactionV2,
+    StoredOptimizeCounterV1, StoredOptimizeJobStateV1, StoredOptimizeJobV1,
+    StoredOptimizeOperationActionV1, StoredOptimizeOperationV1, StoredOptimizeOutcomeV1,
 };
 
 const COUNTER_KEY: &str = "novarocks/frontend/table-maintenance/v1/counter";
@@ -44,6 +52,12 @@ const PENDING_PREFIX: &str = "novarocks/frontend/table-maintenance/v1/state/pend
 const RUNNING_PREFIX: &str = "novarocks/frontend/table-maintenance/v1/state/running/";
 const ACTIVE_PREFIX: &str = "novarocks/frontend/table-maintenance/v1/active/";
 const OPERATION_PREFIX: &str = "novarocks/frontend/table-maintenance/v1/operations/";
+
+const METADATA_OPERATION_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/operations/";
+const METADATA_PAYLOAD_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/payloads/";
+const METADATA_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/state/";
+const METADATA_ACTIVE_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/active/";
+const METADATA_TRANSACTION_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/transactions/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorKind {
@@ -684,6 +698,26 @@ async fn apply_create(
             RepositoryErrorKind::AlreadyActive,
             format!(
                 "create optimize job for {} failed: target already has active job {active_job_id}",
+                target_context(&request.target)
+            ),
+        )));
+    }
+
+    // The v1 OPTIMIZE and v2 metadata-maintenance repositories own separate
+    // records, but must never run concurrently for one Iceberg table.
+    let metadata_active_key = match metadata_active_target_key(&request.target) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(active) = transaction.get(&metadata_active_key).await? {
+        let operation_id = match decode_uuid_index_value(&active.value, "metadata active target") {
+            Ok(operation_id) => operation_id,
+            Err(error) => return Ok(Err(error)),
+        };
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            format!(
+                "create optimize job for {} failed: target has active metadata maintenance operation {operation_id}",
                 target_context(&request.target)
             ),
         )));
@@ -1416,6 +1450,1674 @@ fn target_context(target: &MaintenanceTarget) -> String {
     format!(
         "target {}.{}.{}",
         target.catalog, target.namespace, target.table
+    )
+}
+
+// ---------------------------------------------------------------------------
+// V2 metadata-maintenance operation repository.
+//
+// A metadata operation is intentionally not represented as an OPTIMIZE job.
+// Its durable plan is the dispatch fence: the caller may only invoke the
+// external provider after `start` has committed, and recovery may only
+// reconcile that exact plan.
+
+#[derive(Clone)]
+pub struct MetadataMaintenanceOperationRepository {
+    store: Arc<dyn StateStore>,
+    metrics: Arc<StateStoreMetrics>,
+}
+
+impl fmt::Debug for MetadataMaintenanceOperationRepository {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetadataMaintenanceOperationRepository")
+            .field("provider", &self.metrics.provider())
+            .finish_non_exhaustive()
+    }
+}
+
+/// SHA-256 v1 digest for an opaque durable payload.  The domain separator
+/// prevents payload digests from being confused with the SPI request/plan
+/// digests that include richer semantic inputs.
+pub fn metadata_maintenance_payload_digest(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.metadata-maintenance.payload.v1\0");
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+impl MetadataMaintenanceOperationRepository {
+    pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
+        let provider_id = store.metrics_snapshot().provider;
+        let repository = Self {
+            metrics: Arc::new(StateStoreMetrics::new(provider_id)),
+            store,
+        };
+        repository.list().await?;
+        Ok(repository)
+    }
+
+    pub async fn create(
+        &self,
+        request: MetadataMaintenanceOperationCreate,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!(
+            "create metadata maintenance operation {}",
+            request.operation_id
+        );
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "create frontend metadata maintenance operation",
+            |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    apply_metadata_create(transaction, transaction_operation_id, request).await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Create,
+            request.operation_id,
+            &context,
+        )
+        .await
+    }
+
+    /// Atomically persists the opaque plan and changes PENDING to RUNNING.
+    /// The returned record is the only state that authorizes provider execute.
+    pub async fn start(
+        &self,
+        operation_id: Uuid,
+        plan: MetadataMaintenancePlanPayload,
+        now_ms: i64,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "metadata maintenance plan payload",
+        )?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("start metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "start frontend metadata maintenance operation",
+            |transaction| {
+                let plan = plan.clone();
+                Box::pin(async move {
+                    apply_metadata_start(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        plan,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Start,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending(
+        &self,
+        operation_id: Uuid,
+        evidence: MetadataMaintenanceOpaquePayload,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &evidence.payload,
+            evidence.digest,
+            "metadata maintenance reconcile evidence",
+        )?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context =
+            format!("record reconcile-pending metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "record frontend metadata maintenance reconcile evidence",
+            |transaction| {
+                let evidence = evidence.clone();
+                Box::pin(async move {
+                    apply_metadata_reconcile_pending(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        evidence,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::ReconcilePending,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn finish(
+        &self,
+        operation_id: Uuid,
+        receipt: MetadataMaintenanceOpaquePayload,
+        now_ms: i64,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_payload(
+            &receipt.payload,
+            receipt.digest,
+            "metadata maintenance receipt",
+        )?;
+        self.transition_terminal(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Finish,
+            Some(receipt),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn fail(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        self.transition_terminal(
+            operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Fail,
+            None,
+            Some(message),
+            now_ms,
+        )
+        .await
+    }
+
+    /// An unresolved operation retains its table fence.  A later incarnation
+    /// must not silently turn it into a current-generation operation.
+    pub async fn mark_unresolved(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        validate_metadata_error(&message)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("mark metadata maintenance operation {operation_id} unresolved");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "mark frontend metadata maintenance operation unresolved",
+            |transaction| {
+                let message = message.clone();
+                Box::pin(async move {
+                    apply_metadata_unresolved(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        message,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    pub async fn get(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<MetadataMaintenanceOperation>> {
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "begin metadata maintenance operation read failed: {error}"
+            ))
+        })?;
+        let result = load_metadata_operation(transaction.as_mut(), operation_id)
+            .await
+            .map_err(|error| {
+                RepositoryError::store(format!(
+                    "read metadata maintenance operation failed: {error}"
+                ))
+            })?;
+        let finish = transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "finish metadata maintenance operation read failed: {error}"
+            ))
+        });
+        finish?;
+        result.map(|record| record.map(|record| MetadataMaintenanceOperation::from(&record.stored)))
+    }
+
+    pub async fn list(&self) -> RepositoryResult<Vec<MetadataMaintenanceOperation>> {
+        let prefix = make_key(
+            METADATA_OPERATION_PREFIX,
+            "build metadata maintenance operation range",
+        )?;
+        let range = KeyRange::for_prefix(prefix).map_err(|error| {
+            RepositoryError::store(format!(
+                "build metadata maintenance operation range failed: {error}"
+            ))
+        })?;
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "begin metadata maintenance operation list failed: {error}"
+            ))
+        })?;
+        let mut request = RangeRequest {
+            range,
+            direction: Direction::Forward,
+            page_size: self.store.limits().max_page_size,
+            continuation: None,
+        };
+        let mut operations = Vec::new();
+        let mut ids = BTreeSet::new();
+        loop {
+            let page = transaction.range(&request).await.map_err(|error| {
+                RepositoryError::store(format!(
+                    "list metadata maintenance operation page failed: {error}"
+                ))
+            })?;
+            for record in page.records {
+                let stored = decode_metadata_operation_record(record)?;
+                if !ids.insert(stored.operation_id) {
+                    return Err(RepositoryError::corruption(format!(
+                        "duplicate metadata maintenance operation {}",
+                        stored.operation_id
+                    )));
+                }
+                operations.push(MetadataMaintenanceOperation::from(&stored));
+            }
+            let Some(continuation) = page.continuation else {
+                break;
+            };
+            request.continuation = Some(continuation);
+        }
+        transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "finish metadata maintenance operation list failed: {error}"
+            ))
+        })?;
+        operations.sort_by_key(|operation| operation.operation_id);
+        Ok(operations)
+    }
+
+    pub async fn list_reconcile_candidates(
+        &self,
+    ) -> RepositoryResult<Vec<MetadataMaintenanceOperation>> {
+        let mut operations = Vec::new();
+        for state in [
+            MetadataMaintenanceOperationState::Running,
+            MetadataMaintenanceOperationState::ReconcilePending,
+        ] {
+            operations.extend(self.list_by_state(state).await?);
+        }
+        operations.sort_by_key(|operation| operation.operation_id);
+        Ok(operations)
+    }
+
+    pub async fn load_plan(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<MetadataMaintenancePlanPayload>> {
+        let Some(payload) = self
+            .load_payload(operation_id, StoredMetadataMaintenancePayloadKindV2::Plan)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(operation) = self.get(operation_id).await? else {
+            return Ok(None);
+        };
+        let Some(plan_digest) = operation.plan_digest else {
+            return Err(RepositoryError::corruption(
+                "metadata maintenance plan payload exists without a plan digest",
+            ));
+        };
+        Ok(Some(MetadataMaintenancePlanPayload {
+            plan_digest,
+            payload_digest: payload.digest,
+            payload: payload.payload,
+            summary: operation.plan_summary.ok_or_else(|| {
+                RepositoryError::corruption("metadata maintenance operation has no plan summary")
+            })?,
+        }))
+    }
+
+    pub async fn load_evidence(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<MetadataMaintenanceOpaquePayload>> {
+        self.load_payload(
+            operation_id,
+            StoredMetadataMaintenancePayloadKindV2::Evidence,
+        )
+        .await
+    }
+
+    pub async fn load_receipt(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<MetadataMaintenanceOpaquePayload>> {
+        self.load_payload(
+            operation_id,
+            StoredMetadataMaintenancePayloadKindV2::Receipt,
+        )
+        .await
+    }
+
+    pub async fn has_active_target(&self, target: &MaintenanceTarget) -> RepositoryResult<bool> {
+        let key = metadata_active_target_key(target)?;
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "begin metadata maintenance active check failed: {error}"
+            ))
+        })?;
+        let record = transaction.get(&key).await.map_err(|error| {
+            RepositoryError::store(format!(
+                "read metadata maintenance active check failed: {error}"
+            ))
+        })?;
+        transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "finish metadata maintenance active check failed: {error}"
+            ))
+        })?;
+        Ok(record.is_some())
+    }
+
+    async fn load_payload(
+        &self,
+        operation_id: Uuid,
+        kind: StoredMetadataMaintenancePayloadKindV2,
+    ) -> RepositoryResult<Option<MetadataMaintenanceOpaquePayload>> {
+        let key = metadata_payload_key(operation_id, kind)?;
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "begin metadata maintenance payload read failed: {error}"
+            ))
+        })?;
+        let record = transaction.get(&key).await.map_err(|error| {
+            RepositoryError::store(format!("read metadata maintenance payload failed: {error}"))
+        })?;
+        transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "finish metadata maintenance payload read failed: {error}"
+            ))
+        })?;
+        record
+            .map(decode_metadata_payload_record)
+            .transpose()
+            .map(|payload| {
+                payload.map(|payload| MetadataMaintenanceOpaquePayload {
+                    digest: payload.digest,
+                    payload: payload.payload,
+                })
+            })
+    }
+
+    async fn list_by_state(
+        &self,
+        state: MetadataMaintenanceOperationState,
+    ) -> RepositoryResult<Vec<MetadataMaintenanceOperation>> {
+        let prefix_text = metadata_state_prefix(state);
+        let prefix = make_key(&prefix_text, "build metadata maintenance state range")?;
+        let range = KeyRange::for_prefix(prefix).map_err(|error| {
+            RepositoryError::store(format!(
+                "build metadata maintenance state range failed: {error}"
+            ))
+        })?;
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "begin metadata maintenance state list failed: {error}"
+            ))
+        })?;
+        let mut request = RangeRequest {
+            range,
+            direction: Direction::Forward,
+            page_size: self.store.limits().max_page_size,
+            continuation: None,
+        };
+        let mut operations = Vec::new();
+        loop {
+            let page = transaction.range(&request).await.map_err(|error| {
+                RepositoryError::store(format!(
+                    "list metadata maintenance state page failed: {error}"
+                ))
+            })?;
+            for index in page.records {
+                let operation_id =
+                    decode_uuid_index_key(&prefix_text, &index.key, "metadata maintenance state")?;
+                let indexed_id =
+                    decode_uuid_index_value(&index.value, "metadata maintenance state")?;
+                if operation_id != indexed_id {
+                    return Err(RepositoryError::corruption(
+                        "metadata maintenance state index identity mismatch",
+                    ));
+                }
+                let Some(operation) = load_metadata_operation(transaction.as_mut(), operation_id)
+                    .await
+                    .map_err(|error| {
+                        RepositoryError::store(format!(
+                            "load metadata maintenance state operation failed: {error}"
+                        ))
+                    })??
+                else {
+                    return Err(RepositoryError::corruption(
+                        "metadata maintenance state index references missing operation",
+                    ));
+                };
+                if operation.stored.state != state {
+                    return Err(RepositoryError::corruption(
+                        "metadata maintenance state index references wrong operation state",
+                    ));
+                }
+                operations.push(MetadataMaintenanceOperation::from(&operation.stored));
+            }
+            let Some(continuation) = page.continuation else {
+                break;
+            };
+            request.continuation = Some(continuation);
+        }
+        transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!(
+                "finish metadata maintenance state list failed: {error}"
+            ))
+        })?;
+        Ok(operations)
+    }
+
+    async fn transition_terminal(
+        &self,
+        operation_id: Uuid,
+        action: StoredMetadataMaintenanceTransactionActionV2,
+        receipt: Option<MetadataMaintenanceOpaquePayload>,
+        message: Option<String>,
+        now_ms: i64,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        let transaction_operation_id = OperationId::new_v7();
+        let context = format!("terminal metadata maintenance operation {operation_id}");
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "terminal frontend metadata maintenance operation",
+            |transaction| {
+                let receipt = receipt.clone();
+                let message = message.clone();
+                Box::pin(async move {
+                    apply_metadata_terminal(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        action,
+                        receipt,
+                        message,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_metadata_result(
+            result,
+            transaction_operation_id,
+            action,
+            operation_id,
+            &context,
+        )
+        .await
+    }
+
+    async fn resolve_metadata_result(
+        &self,
+        result: Result<
+            novarocks_state_store::RunSuccess<RepositoryResult<MetadataMaintenanceOperation>>,
+            RunFailure,
+        >,
+        transaction_operation_id: OperationId,
+        expected_action: StoredMetadataMaintenanceTransactionActionV2,
+        operation_id: Uuid,
+        context: &str,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        match result {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown {
+                transaction_id,
+                error,
+            }) => {
+                self.recover_metadata_transaction(
+                    transaction_id,
+                    transaction_operation_id,
+                    expected_action,
+                    operation_id,
+                    context,
+                    error,
+                )
+                .await
+            }
+            Err(failure) => Err(format_run_failure(context, failure)),
+        }
+    }
+
+    async fn recover_metadata_transaction(
+        &self,
+        transaction_id: TransactionId,
+        transaction_operation_id: OperationId,
+        expected_action: StoredMetadataMaintenanceTransactionActionV2,
+        operation_id: Uuid,
+        context: &str,
+        commit_error: StateStoreError,
+    ) -> RepositoryResult<MetadataMaintenanceOperation> {
+        let resolution = self
+            .store
+            .resolve_commit(&transaction_id)
+            .await
+            .map_err(|error| {
+                commit_unknown_error(
+                    context,
+                    transaction_id,
+                    &commit_error,
+                    &format!("commit resolution failed: {error}"),
+                )
+            })?;
+        match resolution {
+            CommitResolution::NotCommitted => {
+                return Err(RepositoryError::store(format!(
+                    "{context} transaction {} was not committed after commit-unknown: {commit_error}",
+                    transaction_id.as_uuid()
+                )));
+            }
+            CommitResolution::Unresolved => {
+                return Err(commit_unknown_error(
+                    context,
+                    transaction_id,
+                    &commit_error,
+                    "commit resolution remains unresolved",
+                ));
+            }
+            CommitResolution::Committed(receipt) if receipt.transaction_id != transaction_id => {
+                return Err(RepositoryError::corruption(format!(
+                    "{context} commit resolution returned a different transaction"
+                )));
+            }
+            CommitResolution::Committed(_) => {}
+        }
+        let key = metadata_transaction_key(transaction_operation_id)?;
+        let mut transaction = self.store.begin_read().await.map_err(|error| {
+            RepositoryError::store(format!("{context}: begin recovery read failed: {error}"))
+        })?;
+        let marker_record = transaction
+            .get(&key)
+            .await
+            .map_err(|error| {
+                RepositoryError::store(format!("{context}: read recovery marker failed: {error}"))
+            })?
+            .ok_or_else(|| {
+                RepositoryError::corruption(format!(
+                    "{context}: committed transaction marker is absent"
+                ))
+            })?;
+        let marker: StoredMetadataMaintenanceTransactionV2 = decode_metadata_json(
+            marker_record.value.as_bytes(),
+            "metadata maintenance transaction marker",
+        )?;
+        validate_metadata_transaction_marker(&marker)?;
+        if marker.transaction_operation_id != *transaction_operation_id.as_uuid()
+            || marker.operation_id != operation_id
+            || marker.action != expected_action
+        {
+            return Err(RepositoryError::corruption(format!(
+                "{context}: recovery marker does not match request"
+            )));
+        }
+        let Some(current) = load_metadata_operation(transaction.as_mut(), operation_id)
+            .await
+            .map_err(|error| {
+                RepositoryError::store(format!(
+                    "{context}: recovery operation read failed: {error}"
+                ))
+            })??
+        else {
+            return Err(RepositoryError::corruption(format!(
+                "{context}: recovery marker references missing operation"
+            )));
+        };
+        transaction.abort().await.map_err(|error| {
+            RepositoryError::store(format!("{context}: finish recovery read failed: {error}"))
+        })?;
+        if !metadata_operation_is_legal_successor(&marker.post_operation, &current.stored) {
+            return Err(RepositoryError::corruption(format!(
+                "{context}: current operation is not a legal marker successor"
+            )));
+        }
+        Ok(MetadataMaintenanceOperation::from(&current.stored))
+    }
+}
+
+struct VersionedStoredMetadataOperation {
+    stored: StoredMetadataMaintenanceOperationV2,
+    version: VersionToken,
+}
+
+async fn apply_metadata_create(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    request: MetadataMaintenanceOperationCreate,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    if let Err(error) = validate_metadata_create(&request) {
+        return Ok(Err(error));
+    }
+    let existing = match load_metadata_operation(transaction, request.operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(existing) = existing {
+        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+            && existing.stored.owner == request.owner
+            && existing.stored.kind == request.kind
+            && existing.stored.request_digest == request.request_digest
+            && existing.stored.request_payload_digest == request.request_payload_digest
+            && existing.stored.base_state_digest == request.base_state_digest
+            && metadata_payload_matches(
+                transaction,
+                request.operation_id,
+                StoredMetadataMaintenancePayloadKindV2::Request,
+                request.request_payload_digest,
+                &request.request_payload,
+            )
+            .await?
+        {
+            return Ok(Ok(MetadataMaintenanceOperation::from(&existing.stored)));
+        }
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!(
+                "metadata maintenance operation {} conflicts with its durable request",
+                request.operation_id
+            ),
+        )));
+    }
+    let v1_active_key = match active_target_key(&request.target) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    if transaction.get(&v1_active_key).await?.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            format!(
+                "create metadata maintenance operation for {} failed: target has active optimize job",
+                target_context(&request.target)
+            ),
+        )));
+    }
+    let active_key = match metadata_active_target_key(&request.target) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(active) = transaction.get(&active_key).await? {
+        let active_id = match decode_uuid_index_value(&active.value, "metadata active target") {
+            Ok(id) => id,
+            Err(error) => return Ok(Err(error)),
+        };
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            format!(
+                "create metadata maintenance operation for {} failed: target already has active operation {active_id}",
+                target_context(&request.target)
+            ),
+        )));
+    }
+    let stored = StoredMetadataMaintenanceOperationV2 {
+        schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+        operation_id: request.operation_id,
+        target: StoredMaintenanceTargetV1::from(&request.target),
+        owner: request.owner,
+        kind: request.kind,
+        request_digest: request.request_digest,
+        request_payload_digest: request.request_payload_digest,
+        base_state_digest: request.base_state_digest,
+        plan_digest: None,
+        plan_summary: None,
+        state: MetadataMaintenanceOperationState::Pending,
+        error_message: None,
+        created_at_ms: request.created_at_ms,
+        started_at_ms: None,
+        finished_at_ms: None,
+    };
+    let operation_key = match metadata_operation_key(request.operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let pending_key = match metadata_state_key(
+        MetadataMaintenanceOperationState::Pending,
+        request.operation_id,
+    ) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let request_key = match metadata_payload_key(
+        request.operation_id,
+        StoredMetadataMaintenancePayloadKindV2::Request,
+    ) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_metadata_operation(&stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let request_value = match encode_metadata_payload(
+        StoredMetadataMaintenancePayloadKindV2::Request,
+        request.request_payload_digest,
+        request.request_payload,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let index_value = match encode_uuid_index_value(request.operation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) = match metadata_transaction_record(
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::Create,
+        &stored,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    transaction
+        .put(operation_key, operation_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(request_key, request_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(pending_key, index_value.clone(), Precondition::Absent)
+        .await?;
+    transaction
+        .put(active_key, index_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(MetadataMaintenanceOperation::from(&stored)))
+}
+
+async fn apply_metadata_start(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    plan: MetadataMaintenancePlanPayload,
+    now_ms: i64,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!(
+                "start metadata maintenance operation {operation_id} failed: operation not found"
+            ),
+        )));
+    };
+    if operation.stored.state == MetadataMaintenanceOperationState::Running
+        && operation.stored.plan_digest == Some(plan.plan_digest)
+        && metadata_payload_matches(
+            transaction,
+            operation_id,
+            StoredMetadataMaintenancePayloadKindV2::Plan,
+            plan.payload_digest,
+            &plan.payload,
+        )
+        .await?
+    {
+        return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
+    }
+    if operation.stored.state != MetadataMaintenanceOperationState::Pending {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!("start metadata maintenance operation {operation_id} failed: expected PENDING"),
+        )));
+    }
+    if let Err(error) = require_metadata_state_and_active(
+        transaction,
+        &operation.stored,
+        MetadataMaintenanceOperationState::Pending,
+        "start metadata maintenance operation",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    operation.stored.state = MetadataMaintenanceOperationState::Running;
+    operation.stored.plan_digest = Some(plan.plan_digest);
+    operation.stored.plan_summary = Some(plan.summary);
+    operation.stored.started_at_ms = Some(now_ms);
+    let plan_key =
+        match metadata_payload_key(operation_id, StoredMetadataMaintenancePayloadKindV2::Plan) {
+            Ok(key) => key,
+            Err(error) => return Ok(Err(error)),
+        };
+    let plan_value = match encode_metadata_payload(
+        StoredMetadataMaintenancePayloadKindV2::Plan,
+        plan.payload_digest,
+        plan.payload,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    metadata_transition_state(
+        transaction,
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::Start,
+        operation,
+        MetadataMaintenanceOperationState::Pending,
+        MetadataMaintenanceOperationState::Running,
+        Some((plan_key, plan_value)),
+    )
+    .await
+}
+
+async fn apply_metadata_reconcile_pending(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    evidence: MetadataMaintenanceOpaquePayload,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!(
+                "record metadata maintenance evidence {operation_id} failed: operation not found"
+            ),
+        )));
+    };
+    if operation.stored.state == MetadataMaintenanceOperationState::ReconcilePending
+        && metadata_payload_matches(
+            transaction,
+            operation_id,
+            StoredMetadataMaintenancePayloadKindV2::Evidence,
+            evidence.digest,
+            &evidence.payload,
+        )
+        .await?
+    {
+        return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
+    }
+    if operation.stored.state != MetadataMaintenanceOperationState::Running {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!("record metadata maintenance evidence {operation_id} failed: expected RUNNING"),
+        )));
+    }
+    if let Err(error) = require_metadata_state_and_active(
+        transaction,
+        &operation.stored,
+        MetadataMaintenanceOperationState::Running,
+        "record metadata maintenance evidence",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    operation.stored.state = MetadataMaintenanceOperationState::ReconcilePending;
+    let evidence_key = match metadata_payload_key(
+        operation_id,
+        StoredMetadataMaintenancePayloadKindV2::Evidence,
+    ) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let evidence_value = match encode_metadata_payload(
+        StoredMetadataMaintenancePayloadKindV2::Evidence,
+        evidence.digest,
+        evidence.payload,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    metadata_transition_state(
+        transaction,
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::ReconcilePending,
+        operation,
+        MetadataMaintenanceOperationState::Running,
+        MetadataMaintenanceOperationState::ReconcilePending,
+        Some((evidence_key, evidence_value)),
+    )
+    .await
+}
+
+async fn apply_metadata_terminal(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    action: StoredMetadataMaintenanceTransactionActionV2,
+    receipt: Option<MetadataMaintenanceOpaquePayload>,
+    message: Option<String>,
+    now_ms: i64,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!(
+                "terminal metadata maintenance operation {operation_id} failed: operation not found"
+            ),
+        )));
+    };
+    let target_state = match action {
+        StoredMetadataMaintenanceTransactionActionV2::Finish => {
+            MetadataMaintenanceOperationState::Finished
+        }
+        StoredMetadataMaintenanceTransactionActionV2::Fail => {
+            MetadataMaintenanceOperationState::Failed
+        }
+        _ => {
+            return Ok(Err(RepositoryError::corruption(
+                "metadata terminal transition has invalid action",
+            )));
+        }
+    };
+    if operation.stored.state == target_state {
+        return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
+    }
+    if !matches!(
+        operation.stored.state,
+        MetadataMaintenanceOperationState::Pending
+            | MetadataMaintenanceOperationState::Running
+            | MetadataMaintenanceOperationState::ReconcilePending
+    ) {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!(
+                "terminal metadata maintenance operation {operation_id} failed: operation is not active"
+            ),
+        )));
+    }
+    let prior = operation.stored.state;
+    if let Err(error) = require_metadata_state_and_active(
+        transaction,
+        &operation.stored,
+        prior,
+        "terminal metadata maintenance operation",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    if target_state == MetadataMaintenanceOperationState::Finished && receipt.is_none() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "finish metadata maintenance operation failed: receipt is required",
+        )));
+    }
+    operation.stored.state = target_state;
+    operation.stored.error_message = message;
+    operation.stored.finished_at_ms = Some(now_ms);
+    let extra = match receipt {
+        Some(receipt) => {
+            let key = match metadata_payload_key(
+                operation_id,
+                StoredMetadataMaintenancePayloadKindV2::Receipt,
+            ) {
+                Ok(key) => key,
+                Err(error) => return Ok(Err(error)),
+            };
+            let value = match encode_metadata_payload(
+                StoredMetadataMaintenancePayloadKindV2::Receipt,
+                receipt.digest,
+                receipt.payload,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            Some((key, value))
+        }
+        None => None,
+    };
+    metadata_transition_state(
+        transaction,
+        transaction_operation_id,
+        action,
+        operation,
+        prior,
+        target_state,
+        extra,
+    )
+    .await
+}
+
+async fn apply_metadata_unresolved(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    message: String,
+    now_ms: i64,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let loaded = match load_metadata_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!(
+                "mark metadata maintenance operation {operation_id} unresolved failed: operation not found"
+            ),
+        )));
+    };
+    if operation.stored.state == MetadataMaintenanceOperationState::Unresolved {
+        return Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)));
+    }
+    if !matches!(
+        operation.stored.state,
+        MetadataMaintenanceOperationState::Running
+            | MetadataMaintenanceOperationState::ReconcilePending
+    ) {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!(
+                "mark metadata maintenance operation {operation_id} unresolved failed: expected RUNNING or RECONCILE_PENDING"
+            ),
+        )));
+    }
+    let prior = operation.stored.state;
+    if let Err(error) = require_metadata_state_and_active(
+        transaction,
+        &operation.stored,
+        prior,
+        "mark metadata maintenance operation unresolved",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    operation.stored.state = MetadataMaintenanceOperationState::Unresolved;
+    operation.stored.error_message = Some(message);
+    operation.stored.finished_at_ms = Some(now_ms);
+    metadata_transition_state(
+        transaction,
+        transaction_operation_id,
+        StoredMetadataMaintenanceTransactionActionV2::Unresolve,
+        operation,
+        prior,
+        MetadataMaintenanceOperationState::Unresolved,
+        None,
+    )
+    .await
+}
+
+async fn metadata_transition_state(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    action: StoredMetadataMaintenanceTransactionActionV2,
+    operation: VersionedStoredMetadataOperation,
+    prior: MetadataMaintenanceOperationState,
+    next: MetadataMaintenanceOperationState,
+    payload: Option<(Key, Value)>,
+) -> TransactionResult<MetadataMaintenanceOperation> {
+    let operation_id = operation.stored.operation_id;
+    let operation_key = match metadata_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let old_state_key = match metadata_state_key(prior, operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let next_state_key = match metadata_state_key(next, operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let operation_value = match encode_metadata_operation(&operation.stored) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let index_value = match encode_uuid_index_value(operation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (marker_key, marker_value) =
+        match metadata_transaction_record(transaction_operation_id, action, &operation.stored) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+    transaction
+        .put(
+            operation_key,
+            operation_value,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    transaction
+        .delete(old_state_key, Precondition::Present)
+        .await?;
+    transaction
+        .put(next_state_key, index_value, Precondition::Absent)
+        .await?;
+    if let Some((key, value)) = payload {
+        transaction.put(key, value, Precondition::Absent).await?;
+    }
+    if next.is_terminal() {
+        let active_key = match metadata_active_target_key(&operation.stored.target.clone().into()) {
+            Ok(key) => key,
+            Err(error) => return Ok(Err(error)),
+        };
+        transaction
+            .delete(active_key, Precondition::Present)
+            .await?;
+    }
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(MetadataMaintenanceOperation::from(&operation.stored)))
+}
+
+async fn require_metadata_state_and_active(
+    transaction: &mut dyn WriteTransaction,
+    operation: &StoredMetadataMaintenanceOperationV2,
+    expected: MetadataMaintenanceOperationState,
+    context: &str,
+) -> TransactionResult<()> {
+    let state_key = match metadata_state_key(expected, operation.operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(index) = transaction.get(&state_key).await? else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context} failed: state index is missing"
+        ))));
+    };
+    let indexed_operation_id =
+        match decode_uuid_index_value(&index.value, "metadata maintenance state") {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+    if indexed_operation_id != operation.operation_id {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context} failed: state index references a different operation"
+        ))));
+    }
+    let active_key = match metadata_active_target_key(&operation.target.clone().into()) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(active) = transaction.get(&active_key).await? else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context} failed: active target index is missing"
+        ))));
+    };
+    let active_operation_id = match decode_uuid_index_value(&active.value, "metadata active target")
+    {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    if active_operation_id != operation.operation_id {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context} failed: active target index references a different operation"
+        ))));
+    }
+    Ok(Ok(()))
+}
+
+async fn load_metadata_operation(
+    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    operation_id: Uuid,
+) -> TransactionResult<Option<VersionedStoredMetadataOperation>> {
+    let key = match metadata_operation_key(operation_id) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(record) = transaction.get(&key).await? else {
+        return Ok(Ok(None));
+    };
+    let version = record.version.clone();
+    let stored = match decode_metadata_operation_record(record) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(Ok(Some(VersionedStoredMetadataOperation {
+        stored,
+        version,
+    })))
+}
+
+async fn metadata_payload_matches(
+    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    operation_id: Uuid,
+    kind: StoredMetadataMaintenancePayloadKindV2,
+    digest: [u8; 32],
+    payload: &[u8],
+) -> Result<bool, StateStoreError> {
+    let key = metadata_payload_key(operation_id, kind).map_err(repository_error_as_store)?;
+    let Some(record) = transaction.get(&key).await? else {
+        return Ok(false);
+    };
+    let decoded = decode_metadata_payload_record(record).map_err(repository_error_as_store)?;
+    Ok(decoded.digest == digest && decoded.payload == payload)
+}
+
+fn decode_metadata_operation_record(
+    record: StateRecord,
+) -> RepositoryResult<StoredMetadataMaintenanceOperationV2> {
+    let key_operation_id = decode_uuid_index_key(
+        METADATA_OPERATION_PREFIX,
+        &record.key,
+        "metadata maintenance operation",
+    )?;
+    let stored: StoredMetadataMaintenanceOperationV2 =
+        decode_metadata_json(record.value.as_bytes(), "metadata maintenance operation")?;
+    validate_metadata_operation(&stored)?;
+    if stored.operation_id != key_operation_id {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance operation identity mismatch",
+        ));
+    }
+    Ok(stored)
+}
+
+fn decode_metadata_payload_record(
+    record: StateRecord,
+) -> RepositoryResult<StoredMetadataMaintenancePayloadV2> {
+    let stored: StoredMetadataMaintenancePayloadV2 =
+        decode_metadata_json(record.value.as_bytes(), "metadata maintenance payload")?;
+    validate_stored_metadata_payload(&stored)?;
+    Ok(stored)
+}
+
+fn validate_metadata_create(request: &MetadataMaintenanceOperationCreate) -> RepositoryResult<()> {
+    validate_metadata_target(&request.target)?;
+    validate_metadata_owner(&request.owner)?;
+    validate_payload(
+        &request.request_payload,
+        request.request_payload_digest,
+        "metadata maintenance request payload",
+    )
+}
+
+fn validate_metadata_owner(owner: &MetadataMaintenanceExactOwner) -> RepositoryResult<()> {
+    ConnectorInstanceId::parse(&owner.instance_id).map_err(|_| {
+        RepositoryError::corruption(
+            "metadata maintenance owner has an invalid connector instance ID",
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_metadata_target(target: &MaintenanceTarget) -> RepositoryResult<()> {
+    if target.catalog.is_empty() || target.namespace.is_empty() || target.table.is_empty() {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance target has an empty component",
+        ));
+    }
+    if [
+        target.catalog.as_str(),
+        target.namespace.as_str(),
+        target.table.as_str(),
+    ]
+    .iter()
+    .any(|part| part.len() > 4096 || part.contains('\0'))
+    {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance target has an invalid component",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_payload(payload: &[u8], digest: [u8; 32], context: &str) -> RepositoryResult<()> {
+    if payload.len() > METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!(
+                "{context} exceeds {} byte StateStore payload limit",
+                METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    if metadata_maintenance_payload_digest(payload) != digest {
+        return Err(RepositoryError::corruption(format!(
+            "{context} digest does not match payload"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_metadata_error(message: &str) -> RepositoryResult<()> {
+    if message.is_empty() || message.len() > 8 * 1024 || message.contains('\0') {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance error message is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_operation(
+    stored: &StoredMetadataMaintenanceOperationV2,
+) -> RepositoryResult<()> {
+    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance operation has unsupported schema version",
+        ));
+    }
+    validate_metadata_target(&stored.target.clone().into())?;
+    validate_metadata_owner(&stored.owner)?;
+    match stored.state {
+        MetadataMaintenanceOperationState::Pending => {
+            if stored.plan_digest.is_some()
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "pending metadata maintenance operation has lifecycle fields",
+                ));
+            }
+        }
+        MetadataMaintenanceOperationState::Running
+        | MetadataMaintenanceOperationState::ReconcilePending => {
+            if stored.plan_digest.is_none()
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "active metadata maintenance operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        MetadataMaintenanceOperationState::Finished => {
+            if stored.plan_digest.is_none()
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "finished metadata maintenance operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        MetadataMaintenanceOperationState::Failed => {
+            if stored.finished_at_ms.is_none() || stored.error_message.is_none() {
+                return Err(RepositoryError::corruption(
+                    "failed metadata maintenance operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        MetadataMaintenanceOperationState::Unresolved => {
+            if stored.plan_digest.is_none()
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_none()
+            {
+                return Err(RepositoryError::corruption(
+                    "unresolved metadata maintenance operation has invalid lifecycle fields",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_metadata_operation(
+    stored: &StoredMetadataMaintenanceOperationV2,
+) -> RepositoryResult<Value> {
+    validate_metadata_operation(stored)?;
+    encode_metadata_json(stored, "metadata maintenance operation")
+}
+
+fn encode_metadata_payload(
+    kind: StoredMetadataMaintenancePayloadKindV2,
+    digest: [u8; 32],
+    payload: Vec<u8>,
+) -> RepositoryResult<Value> {
+    validate_payload(&payload, digest, "metadata maintenance payload")?;
+    encode_metadata_json(
+        &StoredMetadataMaintenancePayloadV2 {
+            schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+            kind,
+            digest,
+            payload,
+        },
+        "metadata maintenance payload",
+    )
+}
+
+fn validate_stored_metadata_payload(
+    stored: &StoredMetadataMaintenancePayloadV2,
+) -> RepositoryResult<()> {
+    if stored.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance payload has unsupported schema version",
+        ));
+    }
+    validate_payload(
+        &stored.payload,
+        stored.digest,
+        "metadata maintenance payload",
+    )
+}
+
+fn metadata_transaction_record(
+    transaction_operation_id: OperationId,
+    action: StoredMetadataMaintenanceTransactionActionV2,
+    post_operation: &StoredMetadataMaintenanceOperationV2,
+) -> RepositoryResult<(Key, Value)> {
+    let marker = StoredMetadataMaintenanceTransactionV2 {
+        schema_version: METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
+        transaction_operation_id: *transaction_operation_id.as_uuid(),
+        action,
+        operation_id: post_operation.operation_id,
+        post_operation: post_operation.clone(),
+    };
+    Ok((
+        metadata_transaction_key(transaction_operation_id)?,
+        encode_metadata_json(&marker, "metadata maintenance transaction marker")?,
+    ))
+}
+
+fn validate_metadata_transaction_marker(
+    marker: &StoredMetadataMaintenanceTransactionV2,
+) -> RepositoryResult<()> {
+    if marker.schema_version != METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION
+        || marker.operation_id != marker.post_operation.operation_id
+    {
+        return Err(RepositoryError::corruption(
+            "metadata maintenance transaction marker is invalid",
+        ));
+    }
+    validate_metadata_operation(&marker.post_operation)
+}
+
+fn metadata_operation_is_legal_successor(
+    post: &StoredMetadataMaintenanceOperationV2,
+    current: &StoredMetadataMaintenanceOperationV2,
+) -> bool {
+    post.operation_id == current.operation_id
+        && post.target == current.target
+        && post.owner == current.owner
+        && post.kind == current.kind
+        && post.request_digest == current.request_digest
+        && post.request_payload_digest == current.request_payload_digest
+        && post.base_state_digest == current.base_state_digest
+        && post.created_at_ms == current.created_at_ms
+        && (post == current || (post.state.holds_active_fence() && current.state.is_terminal()))
+}
+
+fn encode_metadata_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        RepositoryError::corruption(format!("encode {context} failed: {error}"))
+    })?;
+    if bytes.len() > METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!("encode {context} exceeds StateStore payload limit"),
+        ));
+    }
+    Value::try_from(Bytes::from(bytes))
+        .map_err(|error| RepositoryError::store(format!("encode {context} failed: {error}")))
+}
+
+fn decode_metadata_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let decoded: T = serde_json::from_slice(bytes).map_err(|error| {
+        RepositoryError::corruption(format!("decode {context} failed: {error}"))
+    })?;
+    let canonical = serde_json::to_vec(&decoded).map_err(|error| {
+        RepositoryError::corruption(format!("re-encode {context} failed: {error}"))
+    })?;
+    if canonical != bytes {
+        return Err(RepositoryError::corruption(format!(
+            "decode {context} failed: non-canonical JSON"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn metadata_operation_key(operation_id: Uuid) -> RepositoryResult<Key> {
+    make_key(
+        format!("{METADATA_OPERATION_PREFIX}{operation_id}"),
+        "build metadata maintenance operation key",
+    )
+}
+
+fn metadata_payload_key(
+    operation_id: Uuid,
+    kind: StoredMetadataMaintenancePayloadKindV2,
+) -> RepositoryResult<Key> {
+    let component = match kind {
+        StoredMetadataMaintenancePayloadKindV2::Request => "request",
+        StoredMetadataMaintenancePayloadKindV2::Plan => "plan",
+        StoredMetadataMaintenancePayloadKindV2::Receipt => "receipt",
+        StoredMetadataMaintenancePayloadKindV2::Evidence => "evidence",
+    };
+    make_key(
+        format!("{METADATA_PAYLOAD_PREFIX}{operation_id}/{component}"),
+        "build metadata maintenance payload key",
+    )
+}
+
+fn metadata_state_prefix(state: MetadataMaintenanceOperationState) -> String {
+    format!("{METADATA_STATE_PREFIX}{}/", state.as_key_component())
+}
+
+fn metadata_state_key(
+    state: MetadataMaintenanceOperationState,
+    operation_id: Uuid,
+) -> RepositoryResult<Key> {
+    make_key(
+        format!("{}{operation_id}", metadata_state_prefix(state)),
+        "build metadata maintenance state key",
+    )
+}
+
+fn metadata_active_target_key(target: &MaintenanceTarget) -> RepositoryResult<Key> {
+    make_key(
+        format!(
+            "{METADATA_ACTIVE_PREFIX}{}/{}/{}",
+            hex::encode(target.catalog.as_bytes()),
+            hex::encode(target.namespace.as_bytes()),
+            hex::encode(target.table.as_bytes())
+        ),
+        "build metadata maintenance active target key",
+    )
+}
+
+fn metadata_transaction_key(transaction_operation_id: OperationId) -> RepositoryResult<Key> {
+    make_key(
+        format!(
+            "{METADATA_TRANSACTION_PREFIX}{}",
+            transaction_operation_id.as_uuid()
+        ),
+        "build metadata maintenance transaction key",
+    )
+}
+
+fn encode_uuid_index_value(value: Uuid) -> RepositoryResult<Value> {
+    Value::try_from(Bytes::from(value.to_string())).map_err(|error| {
+        RepositoryError::store(format!("encode metadata maintenance index failed: {error}"))
+    })
+}
+
+fn decode_uuid_index_value(value: &Value, context: &str) -> RepositoryResult<Uuid> {
+    let text = std::str::from_utf8(value.as_bytes())
+        .map_err(|_| RepositoryError::corruption(format!("{context} index is not UTF-8")))?;
+    if text.len() != 36 || text != text.to_ascii_lowercase() {
+        return Err(RepositoryError::corruption(format!(
+            "{context} index has non-canonical UUID"
+        )));
+    }
+    Uuid::parse_str(text)
+        .map_err(|_| RepositoryError::corruption(format!("{context} index has invalid UUID")))
+}
+
+fn decode_uuid_index_key(
+    prefix: impl AsRef<[u8]>,
+    key: &Key,
+    context: &str,
+) -> RepositoryResult<Uuid> {
+    let suffix = key
+        .as_bytes()
+        .strip_prefix(prefix.as_ref())
+        .ok_or_else(|| RepositoryError::corruption(format!("{context} key has unknown prefix")))?;
+    let value = Value::try_from(Bytes::copy_from_slice(suffix))
+        .map_err(|error| RepositoryError::store(format!("decode {context} key failed: {error}")))?;
+    decode_uuid_index_value(&value, context)
+}
+
+fn repository_error_as_store(error: RepositoryError) -> StateStoreError {
+    let _ = error;
+    StateStoreError::new(
+        StateStoreErrorKind::Corruption,
+        "metadata maintenance repository invariant failed",
     )
 }
 

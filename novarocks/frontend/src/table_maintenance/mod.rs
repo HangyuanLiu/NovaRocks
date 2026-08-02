@@ -21,20 +21,33 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMutationOperationId,
+};
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
-use self::model::OptimizeJobCreate;
+use self::model::{
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
+    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
+    MetadataMaintenancePlanPayload, OptimizeJobCreate,
+};
 use self::parser::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, is_spark_maintenance_call,
     parse_maintenance_statement, parse_show_optimize,
 };
-use self::repository::{OptimizeJobRepository, RepositoryErrorKind};
+use self::repository::{
+    MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
+    metadata_maintenance_payload_digest,
+};
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::OptimizeWorker;
 
@@ -48,6 +61,8 @@ const OPTIMIZE_STATE_STORE_REQUIRED: &str = "ALTER TABLE OPTIMIZE requires front
 const SHOW_STATE_STORE_REQUIRED: &str = "SHOW ALTER TABLE OPTIMIZE requires frontend StateStore";
 const AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED: &str =
     "automatic optimize requires frontend StateStore";
+const METADATA_MAINTENANCE_STATE_STORE_REQUIRED: &str =
+    "connector metadata maintenance requires frontend StateStore";
 
 enum WorkerLifecycle {
     NotStarted,
@@ -58,20 +73,35 @@ enum WorkerLifecycle {
 // Design: ADR-0009 (docs/adr/ADR-0009-frontend-table-maintenance-owner.md)
 pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
+    metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
 }
 
 impl FrontendTableMaintenanceService {
     pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
-        let repository = match store {
-            Some(store) => Some(Arc::new(OptimizeJobRepository::open(store).await.map_err(
-                |error| format!("open frontend optimize job repository failed: {error}"),
-            )?)),
-            None => None,
+        let (repository, metadata_repository) = match store {
+            Some(store) => (
+                Some(Arc::new(
+                    OptimizeJobRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend optimize job repository failed: {error}")
+                        })?,
+                )),
+                Some(Arc::new(
+                    MetadataMaintenanceOperationRepository::open(store)
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend metadata maintenance repository failed: {error}")
+                        })?,
+                )),
+            ),
+            None => (None, None),
         };
         Ok(Self {
             repository,
+            metadata_repository,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
@@ -93,12 +123,172 @@ impl FrontendTableMaintenanceService {
         spark_result: bool,
     ) -> Result<MaintenanceStatementResult, String> {
         engine.reject_user_action_on_mv(&target)?;
+        if let ParsedMaintenanceAction::RewriteManifests {
+            use_caching,
+            spec_id,
+        } = action.clone()
+        {
+            let outcome = self.execute_durable_metadata_action(
+                engine,
+                target,
+                MetadataMaintenanceIntent::rewrite_metadata_layout(),
+                MetadataMaintenanceOperationKind::RewriteMetadataLayout,
+                use_caching,
+                spec_id,
+            )?;
+            return if spark_result {
+                action_result(outcome)
+            } else {
+                Ok(MaintenanceStatementResult::Ok)
+            };
+        }
+        if let ParsedMaintenanceAction::ExpireSnapshots {
+            older_than_ms,
+            retain_last,
+        } = action.clone()
+        {
+            let outcome = self.execute_durable_metadata_action(
+                engine,
+                target,
+                MetadataMaintenanceIntent::expire_table_versions(older_than_ms, retain_last),
+                MetadataMaintenanceOperationKind::ExpireTableVersions,
+                None,
+                None,
+            )?;
+            return if spark_result {
+                action_result(outcome)
+            } else {
+                Ok(MaintenanceStatementResult::Ok)
+            };
+        }
         let request = action.into_request(engine, target)?;
         let outcome = engine.execute_action(request)?;
         if spark_result {
             action_result(outcome)
         } else {
             Ok(MaintenanceStatementResult::Ok)
+        }
+    }
+
+    fn execute_durable_metadata_action(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+        intent: MetadataMaintenanceIntent,
+        kind: MetadataMaintenanceOperationKind,
+        use_caching: Option<bool>,
+        spec_id: Option<i32>,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        if use_caching.is_some() {
+            return Err(
+                "rewrite_manifests `use_caching` is not implemented in NovaRocks yet".to_string(),
+            );
+        }
+        if spec_id.is_some() {
+            return Err(
+                "rewrite_manifests `spec_id` is not implemented in NovaRocks yet".to_string(),
+            );
+        }
+        let repository = self
+            .metadata_repository
+            .as_ref()
+            .ok_or_else(|| METADATA_MAINTENANCE_STATE_STORE_REQUIRED.to_string())?;
+        let operation_id = ConnectorMutationOperationId::new();
+        let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        let session = engine.plan_metadata_maintenance(&target, operation_id, intent)?;
+        let plan = session.plan_ref();
+        let request_payload = plan.provider_payload().to_vec();
+        let request_payload_digest = metadata_maintenance_payload_digest(&request_payload);
+        self.block_on(repository.create(MetadataMaintenanceOperationCreate {
+            operation_id: durable_id,
+            target: target.clone(),
+            owner: MetadataMaintenanceExactOwner {
+                instance_id: plan.owner().instance_id.as_str().to_string(),
+                incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
+            },
+            kind,
+            request_digest: plan.request_digest(),
+            request_payload_digest,
+            base_state_digest: plan.state_digest(),
+            request_payload,
+            created_at_ms: now_unix_millis(),
+        }))
+        .map_err(|error| {
+            format!("persist metadata maintenance pending operation failed: {error}")
+        })?;
+        let plan_payload = plan.provider_payload().to_vec();
+        self.block_on(repository.start(
+            durable_id,
+            MetadataMaintenancePlanPayload {
+                plan_digest: plan.plan_digest(),
+                payload_digest: metadata_maintenance_payload_digest(&plan_payload),
+                payload: plan_payload,
+                summary: [
+                    plan.summary().source_items(),
+                    plan.summary().replacement_items(),
+                    plan.summary().candidate_versions(),
+                    plan.summary().cleanup_candidates(),
+                    plan.summary().total_bytes(),
+                ],
+            },
+            now_unix_millis(),
+        ))
+        .map_err(|error| format!("persist metadata maintenance plan failed: {error}"))?;
+        match engine.execute_planned_metadata_maintenance(session) {
+            Ok(completed) => {
+                let receipt = completed.receipt;
+                self.block_on(repository.finish(
+                    durable_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(receipt.provider_payload()),
+                        payload: receipt.provider_payload().to_vec(),
+                    },
+                    now_unix_millis(),
+                ))
+                .map_err(|error| format!("persist metadata maintenance receipt failed: {error}"))?;
+                let summary = receipt.summary();
+                Ok(match kind {
+                    MetadataMaintenanceOperationKind::RewriteMetadataLayout => {
+                        MaintenanceActionOutcome::RewriteManifests {
+                            rewritten_manifests_count: i32::try_from(summary.rewritten_items)
+                                .map_err(|_| {
+                                    "rewrite manifest count exceeds Spark result range".to_string()
+                                })?,
+                            added_manifests_count: i32::try_from(summary.added_items).map_err(
+                                |_| "added manifest count exceeds Spark result range".to_string(),
+                            )?,
+                        }
+                    }
+                    MetadataMaintenanceOperationKind::ExpireTableVersions => {
+                        MaintenanceActionOutcome::ExpireSnapshots {
+                            deleted_data_files_count: None,
+                            deleted_position_delete_files_count: None,
+                            deleted_equality_delete_files_count: None,
+                            deleted_manifest_files_count: None,
+                            deleted_manifest_lists_count: None,
+                            deleted_statistics_files_count: None,
+                        }
+                    }
+                })
+            }
+            Err(error) => {
+                // The engine-facing compatibility port deliberately does not
+                // claim that a provider error happened before dispatch.
+                // Preserve the operation fence and opaque evidence for an
+                // exact-generation reconcile owner.
+                let evidence = error.as_bytes().to_vec();
+                self.block_on(repository.mark_reconcile_pending(
+                    durable_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(&evidence),
+                        payload: evidence,
+                    },
+                ))
+                .map_err(|store| {
+                    format!("record metadata maintenance reconcile state failed: {store}")
+                })?;
+                Err(error)
+            }
         }
     }
 
@@ -213,10 +403,91 @@ impl FrontendTableMaintenanceService {
         }
         Ok(())
     }
+
+    fn recover_metadata_operations(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+    ) -> Result<(), String> {
+        let Some(repository) = &self.metadata_repository else {
+            return Ok(());
+        };
+        for operation in self
+            .block_on(repository.list_reconcile_candidates())
+            .map_err(|error| {
+                format!("list metadata maintenance recovery candidates failed: {error}")
+            })?
+        {
+            let result = (|| -> Result<(), String> {
+                let stored = self
+                    .block_on(repository.load_plan(operation.operation_id))
+                    .map_err(|error| {
+                        format!("load metadata maintenance recovery plan failed: {error}")
+                    })?
+                    .ok_or_else(|| "metadata maintenance recovery plan is missing".to_string())?;
+                let kind = match operation.kind {
+                    MetadataMaintenanceOperationKind::RewriteMetadataLayout => {
+                        novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND
+                    }
+                    MetadataMaintenanceOperationKind::ExpireTableVersions => {
+                        novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND
+                    }
+                };
+                let plan = ConnectorMetadataMaintenancePlan::try_restore(
+                    ConnectorExecutionBindingKey {
+                        instance_id: ConnectorInstanceId::parse(&operation.owner.instance_id)
+                            .map_err(|error| error.to_string())?,
+                        incarnation: ConnectorInstanceIncarnation::from_bytes(
+                            *operation.owner.incarnation_id.as_bytes(),
+                        ),
+                    },
+                    ConnectorMutationOperationId::from_bytes(*operation.operation_id.as_bytes()),
+                    kind,
+                    operation.request_digest,
+                    operation.base_state_digest,
+                    ConnectorMetadataMaintenancePlanSummary::new(
+                        stored.summary[0],
+                        stored.summary[1],
+                        stored.summary[2],
+                        stored.summary[3],
+                        stored.summary[4],
+                    ),
+                    bytes::Bytes::from(stored.payload),
+                    stored.plan_digest,
+                )
+                .map_err(|error| error.to_string())?;
+                let completed = engine.reconcile_metadata_maintenance(&operation.target, plan)?;
+                let receipt = completed.receipt;
+                self.block_on(repository.finish(
+                    operation.operation_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(receipt.provider_payload()),
+                        payload: receipt.provider_payload().to_vec(),
+                    },
+                    now_unix_millis(),
+                ))
+                .map_err(|error| {
+                    format!("persist recovered metadata maintenance receipt failed: {error}")
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.block_on(repository.mark_unresolved(
+                    operation.operation_id,
+                    error,
+                    now_unix_millis(),
+                ))
+                .map_err(|store| {
+                    format!("mark metadata maintenance operation unresolved failed: {store}")
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
+        self.recover_metadata_operations(engine.as_ref())?;
         let mut worker = self
             .worker
             .lock()

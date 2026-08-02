@@ -21,7 +21,8 @@ use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
     ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext, ConnectorScan,
+    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
+    ConnectorMetadataMaintenanceResolver, ConnectorRequestContext, ConnectorScan,
     ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl,
     ConnectorWriteResolver,
@@ -65,6 +66,7 @@ pub struct ConnectorControlBinding {
     distribution: Arc<dyn ConnectorExecutionDistribution>,
     mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
     data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+    metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
 }
@@ -243,9 +245,45 @@ impl ConnectorControlBinding {
             distribution,
             mutation,
             data_mutation,
+            metadata_maintenance: None,
             write,
             statistics,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_capabilities_and_metadata_maintenance(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+        metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(maintenance) = &metadata_maintenance {
+            super::metadata_maintenance::validate_metadata_maintenance_owner(
+                &descriptor,
+                incarnation,
+                maintenance.as_ref(),
+            )?;
+        }
+        let mut binding = Self::try_new_with_all_capabilities(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            write,
+            statistics,
+        )?;
+        binding.metadata_maintenance = metadata_maintenance;
+        Ok(binding)
     }
 
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
@@ -270,6 +308,10 @@ impl ConnectorControlBinding {
 
     pub fn data_mutation(&self) -> Option<&Arc<dyn ConnectorDataMutation>> {
         self.data_mutation.as_ref()
+    }
+
+    pub fn metadata_maintenance(&self) -> Option<&Arc<dyn ConnectorMetadataMaintenance>> {
+        self.metadata_maintenance.as_ref()
     }
 
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
@@ -317,6 +359,7 @@ pub trait ConnectorControlRegistry:
     ConnectorControlResolver
     + ConnectorCatalogMutationResolver
     + ConnectorDataMutationResolver
+    + ConnectorMetadataMaintenanceResolver
     + ConnectorWriteResolver
     + ConnectorStatisticsResolver
 {

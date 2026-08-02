@@ -29,8 +29,22 @@ use novarocks::engine::table_maintenance::{
     TableMaintenanceService,
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
-use novarocks_frontend::table_maintenance::model::OptimizeJobOutcome;
-use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
+use novarocks_frontend::table_maintenance::model::{
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOperationCreate,
+    MetadataMaintenanceOperationKind, MetadataMaintenanceOperationState,
+    MetadataMaintenancePlanPayload, OptimizeJobOutcome,
+};
+use novarocks_frontend::table_maintenance::repository::{
+    MetadataMaintenanceOperationRepository, OptimizeJobRepository,
+    metadata_maintenance_payload_digest,
+};
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableHandle,
+};
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
 use novarocks_state_store::{
     StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
@@ -43,6 +57,15 @@ struct FakeMaintenanceEngine {
     resolved_name_parts: Mutex<Vec<Vec<String>>>,
     guarded_targets: Mutex<Vec<MaintenanceTarget>>,
     requests: Mutex<Vec<MaintenanceActionRequest>>,
+    recovered_plans: Mutex<Vec<ConnectorMetadataMaintenancePlan>>,
+}
+
+struct NotCancelled;
+
+impl ConnectorCancellation for NotCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl FakeMaintenanceEngine {
@@ -56,6 +79,10 @@ impl FakeMaintenanceEngine {
 
     fn guarded_targets(&self) -> Vec<MaintenanceTarget> {
         self.guarded_targets.lock().unwrap().clone()
+    }
+
+    fn recovered_plans(&self) -> Vec<ConnectorMetadataMaintenancePlan> {
+        self.recovered_plans.lock().unwrap().clone()
     }
 }
 
@@ -146,6 +173,16 @@ impl TableMaintenanceEngine for FakeMaintenanceEngine {
         self.requests.lock().unwrap().push(request);
         Ok(outcome)
     }
+
+    fn reconcile_metadata_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+    ) -> Result<novarocks::connector::metadata_maintenance::CompletedMetadataMaintenance, String>
+    {
+        self.recovered_plans.lock().unwrap().push(plan);
+        Err("recorded exact generation is unavailable".to_string())
+    }
 }
 
 fn target(catalog: &str, namespace: &str, table: &str) -> MaintenanceTarget {
@@ -212,6 +249,16 @@ async fn durable_service() -> (
     .await
     .expect("open table-maintenance service");
     (temp, host, store, service)
+}
+
+fn connector_context() -> ConnectorRequestContext {
+    ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(5),
+        Arc::new(NotCancelled),
+        1024,
+        1024,
+    )
+    .expect("connector request context")
 }
 
 fn expect_ok(result: Option<MaintenanceStatementResult>) {
@@ -424,6 +471,90 @@ async fn show_uses_repository_snapshot_and_preserves_legacy_wire_shape() {
         "rewrote 4 data files and 3 delete files into 2 data files (88 rows)"
     );
     assert_eq!(&values[6..], ["777", "900", "4", "2", "3", "0"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_reconciles_only_the_persisted_exact_generation() {
+    let (_temp, _host, store, service) = durable_service().await;
+    let owner = ConnectorExecutionBindingKey {
+        instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    let operation_id = ConnectorMutationOperationId::from_bytes([9; 16]);
+    let operation = ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(
+        ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::from_static(b"table"))
+            .unwrap(),
+    )
+    .unwrap();
+    let request = ConnectorMetadataMaintenancePlanningRequest::try_new(
+        operation_id,
+        owner.clone(),
+        operation,
+        connector_context(),
+    )
+    .unwrap();
+    let plan = ConnectorMetadataMaintenancePlan::try_new(
+        &request,
+        [3; 32],
+        ConnectorMetadataMaintenancePlanSummary::new(1, 2, 3, 4, 5),
+        Bytes::from_static(b"plan"),
+    )
+    .unwrap();
+    let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+    let repository = MetadataMaintenanceOperationRepository::open(store)
+        .await
+        .unwrap();
+    repository
+        .create(MetadataMaintenanceOperationCreate {
+            operation_id: durable_id,
+            target: target("ice", "db", "orders"),
+            owner: MetadataMaintenanceExactOwner {
+                instance_id: owner.instance_id.as_str().to_string(),
+                incarnation_id: uuid::Uuid::from_bytes(owner.incarnation.to_bytes()),
+            },
+            kind: MetadataMaintenanceOperationKind::RewriteMetadataLayout,
+            request_digest: plan.request_digest(),
+            request_payload_digest: metadata_maintenance_payload_digest(plan.provider_payload()),
+            base_state_digest: plan.state_digest(),
+            request_payload: plan.provider_payload().to_vec(),
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    repository
+        .start(
+            durable_id,
+            MetadataMaintenancePlanPayload {
+                plan_digest: plan.plan_digest(),
+                payload_digest: metadata_maintenance_payload_digest(plan.provider_payload()),
+                payload: plan.provider_payload().to_vec(),
+                summary: [
+                    plan.summary().source_items(),
+                    plan.summary().replacement_items(),
+                    plan.summary().candidate_versions(),
+                    plan.summary().cleanup_candidates(),
+                    plan.summary().total_bytes(),
+                ],
+            },
+            2,
+        )
+        .await
+        .unwrap();
+
+    let engine = Arc::new(FakeMaintenanceEngine::default());
+    let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
+    service.start(engine_port).unwrap();
+
+    let recovered = engine.recovered_plans();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].owner(), &owner);
+    assert_eq!(recovered[0].operation_id(), operation_id);
+    assert!(engine.requests().is_empty());
+    assert_eq!(
+        repository.list().await.unwrap()[0].state,
+        MetadataMaintenanceOperationState::Unresolved
+    );
+    service.shutdown().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
