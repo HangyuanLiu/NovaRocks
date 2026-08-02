@@ -116,8 +116,26 @@ struct BindingSpec {
     binding_id: u32,
     channel_id: u32,
     fragment_id: u32,
+    node_id: i32,
     witness: Option<u32>,
     role: BindingRole,
+}
+
+#[derive(Clone, Copy)]
+struct FragmentEdgeSpec {
+    source_fragment_id: u32,
+    target_fragment_id: u32,
+    target_exchange_node_id: i32,
+}
+
+#[derive(Clone)]
+struct JoinProgressProof {
+    channel_id: u32,
+    producer_binding_id: u32,
+    producer_fragment_id: u32,
+    join_node_id: i32,
+    build_frontier: Vec<(u32, i32)>,
+    non_build_inputs: Vec<(u32, i32)>,
 }
 
 #[derive(Clone)]
@@ -154,7 +172,6 @@ enum RouteKind {
 
 #[derive(Clone, Copy)]
 struct Route {
-    channel_id: u32,
     edge_id: u32,
     kind: RouteKind,
     from_participant: u32,
@@ -179,6 +196,51 @@ fn compile_nonempty_deployment(
 ) -> Result<EncodedRuntimeFilterDeployment, DistributedQueryError> {
     let topology = sealed_topology(view.clone())?;
     let facts = view.deployment_facts();
+    let fragment_edges = facts
+        .fragment_edges()
+        .map(|edge| FragmentEdgeSpec {
+            source_fragment_id: edge.source_fragment_id(),
+            target_fragment_id: edge.target_fragment_id(),
+            target_exchange_node_id: edge.target_exchange_node_id(),
+        })
+        .collect::<Vec<_>>();
+    let join_progress = facts
+        .join_progress()
+        .filter_map(|progress| match progress {
+            novarocks::query_execution::RuntimeFilterJoinProgressFacts::Proven {
+                channel_id,
+                producer_binding_id,
+                producer_fragment_id,
+                join_node_id,
+                build_frontier,
+                non_build_inputs,
+            } => Some(JoinProgressProof {
+                channel_id,
+                producer_binding_id,
+                producer_fragment_id,
+                join_node_id,
+                build_frontier: build_frontier
+                    .into_iter()
+                    .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
+                    .collect(),
+                non_build_inputs: non_build_inputs
+                    .into_iter()
+                    .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
+                    .collect(),
+            }),
+            novarocks::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
+        })
+        .map(|proof| {
+            (
+                (
+                    proof.channel_id,
+                    proof.producer_binding_id,
+                    proof.producer_fragment_id,
+                ),
+                proof,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let (channels, policies) = materialize_channels(facts)?;
     if channels.is_empty() {
         return Err(compilation_error(
@@ -187,7 +249,7 @@ fn compile_nonempty_deployment(
     }
     let (bindings, instances) = materialize_bindings(facts, &channels, &topology)?;
     let roles = build_roles(&channels, &bindings, &instances, topology.len())?;
-    let wait_graph = build_wait_graph(&bindings, &roles)?;
+    let wait_graph = build_wait_graph(&bindings, &fragment_edges, &join_progress)?;
 
     let lifecycle_input = config.lifecycle.to_wire();
     let deployment_policy = FrontendRuntimeFilterDeploymentPolicy::derive(
@@ -380,7 +442,7 @@ fn materialize_bindings(
                 completion_requirement,
                 ..
             } => {
-                let witness = require_nonzero(
+                require_nonzero(
                     fact.coverage_witness_id().ok_or_else(|| {
                         compilation_error(format!(
                             "runtime filter producer binding {binding_id} has no coverage witness"
@@ -411,6 +473,7 @@ fn materialize_bindings(
             binding_id,
             channel_id,
             fragment_id: fact.fragment_id(),
+            node_id: fact.node_id(),
             witness: fact.coverage_witness_id(),
             role,
         };
@@ -533,7 +596,6 @@ fn build_roles(
                         && matches!(binding.role, BindingRole::Consumer { .. })
                 }) {
                     role.routes.push(Route {
-                        channel_id,
                         edge_id: allocate_edge(&mut next_edge)?,
                         kind: RouteKind::Direct,
                         from_participant: participant,
@@ -573,7 +635,6 @@ fn build_roles(
                             })
                         {
                             role.routes.push(Route {
-                                channel_id,
                                 edge_id: allocate_edge(&mut next_edge)?,
                                 kind: RouteKind::Direct,
                                 from_participant: *sender,
@@ -602,7 +663,6 @@ fn build_roles(
                         .then_some(*participant)
                 }) {
                     role.routes.push(Route {
-                        channel_id,
                         edge_id: allocate_edge(&mut next_edge)?,
                         kind: RouteKind::ToAggregator,
                         from_participant: participant,
@@ -622,7 +682,6 @@ fn build_roles(
                         .then_some(*participant)
                 }) {
                     role.routes.push(Route {
-                        channel_id,
                         edge_id: allocate_edge(&mut next_edge)?,
                         kind: RouteKind::FromAggregator,
                         from_participant: aggregator,
@@ -821,6 +880,49 @@ fn core_channel(
             entry.2.insert(route.edge_id);
         }
     }
+    // A materialization group belongs to the participant that sends an artifact,
+    // not necessarily to one that also hosts the consuming fragment.  In a
+    // distributed direct route those roles can be disjoint, so derive the final
+    // coverage from the sealed outbound routing facts rather than the local
+    // consumer projection above.
+    for route in role.routes.iter().filter(|route| {
+        route.from_participant == participant
+            && matches!(route.kind, RouteKind::Direct | RouteKind::FromAggregator)
+    }) {
+        let binding = bindings
+            .get(&route.to_binding)
+            .expect("role bindings come from sealed bindings");
+        let BindingRole::Consumer { capabilities, .. } = &binding.role else {
+            return Err(compilation_error(
+                "runtime filter outbound artifact route does not target a consumer binding",
+            ));
+        };
+        let owner = if matches!(route.kind, RouteKind::Direct) {
+            filter::RuntimeFilterOutboundMaterializationOwner::DirectSource as i32
+        } else {
+            filter::RuntimeFilterOutboundMaterializationOwner::Aggregator as i32
+        };
+        let profile = artifact_profile(channel, capabilities)?;
+        let entry = groups
+            .entry(profile.profile_id.clone())
+            .or_insert_with(|| (owner, profile, BTreeSet::new()));
+        if entry.0 != owner {
+            return Err(compilation_error(
+                "runtime filter materialization profile has conflicting owners",
+            ));
+        }
+        entry.2.insert(route.edge_id);
+    }
+    let max_concurrent_jobs = if groups.is_empty() {
+        policy.max_concurrent_jobs
+    } else {
+        policy
+            .max_concurrent_jobs
+            .min(u64::try_from(groups.len()).map_err(|_| {
+                compilation_error("runtime filter materialization group count exceeds wire width")
+            })?)
+    };
+
     Ok(filter::RuntimeFilterChannelDeployment {
         channel_id: channel.channel_id,
         logical_domain: Some(channel.logical_domain.clone()),
@@ -841,7 +943,7 @@ fn core_channel(
             bloom_algorithm_version: policy.bloom_algorithm_version,
             max_total_retained_bytes: policy.max_total_retained_bytes,
             max_scratch_bytes_per_job: policy.max_scratch_bytes_per_job,
-            max_concurrent_jobs: policy.max_concurrent_jobs,
+            max_concurrent_jobs,
         }),
         producers,
         consumers,
@@ -1000,9 +1102,31 @@ fn routing_edge(
 
 fn build_wait_graph(
     bindings: &BTreeMap<u32, BindingSpec>,
-    roles: &BTreeMap<u32, RoleChannel>,
+    fragment_edges: &[FragmentEdgeSpec],
+    join_progress: &BTreeMap<(u32, u32, u32), JoinProgressProof>,
 ) -> Result<RuntimeFilterWaitGraph, DistributedQueryError> {
-    let mut edges = Vec::new();
+    let dependencies = fragment_dependencies(fragment_edges)?;
+    let mut edges = fragment_edges
+        .iter()
+        .map(|edge| {
+            RuntimeFilterWaitEdge::new(edge.source_fragment_id, edge.target_fragment_id, true)
+        })
+        .collect::<Vec<_>>();
+    let mut next_virtual_node = bindings
+        .values()
+        .map(|binding| binding.fragment_id)
+        .chain(
+            fragment_edges
+                .iter()
+                .flat_map(|edge| [edge.source_fragment_id, edge.target_fragment_id]),
+        )
+        .max()
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| compilation_error("runtime filter wait graph node id overflow"))?;
+    let mut build_ready_nodes = BTreeMap::new();
+    let mut consumer_sources = Vec::new();
+
     for consumer in bindings
         .values()
         .filter(|binding| matches!(binding.role, BindingRole::Consumer { .. }))
@@ -1019,89 +1143,235 @@ fn build_wait_graph(
         if !blocking {
             continue;
         }
-        let role = roles
-            .get(&consumer.channel_id)
-            .expect("role graph has every channel");
-        for waiter in role.consumers.iter().filter_map(|(participant, bindings)| {
-            bindings
-                .contains(&consumer.binding_id)
-                .then_some(*participant)
+
+        let mut sources = Vec::new();
+        for producer in bindings.values().filter(|binding| {
+            binding.channel_id == consumer.channel_id
+                && matches!(binding.role, BindingRole::Producer { .. })
         }) {
-            for dependency in role.producers.keys() {
-                edges.push(RuntimeFilterWaitEdge::new(waiter, *dependency, true));
+            let proof = join_progress
+                .get(&(
+                    producer.channel_id,
+                    producer.binding_id,
+                    producer.fragment_id,
+                ))
+                .filter(|proof| {
+                    valid_join_progress_proof(
+                        proof,
+                        producer,
+                        consumer.fragment_id,
+                        fragment_edges,
+                        &dependencies,
+                    )
+                });
+            let source = if let Some(proof) = proof {
+                let key = (proof.producer_fragment_id, proof.join_node_id);
+                let node = if let Some(node) = build_ready_nodes.get(&key) {
+                    *node
+                } else {
+                    let node = next_virtual_node;
+                    next_virtual_node = next_virtual_node.checked_add(1).ok_or_else(|| {
+                        compilation_error("runtime filter wait graph node id overflow")
+                    })?;
+                    build_ready_nodes.insert(key, node);
+                    node
+                };
+                for &(source_fragment_id, _) in &proof.build_frontier {
+                    edges.push(RuntimeFilterWaitEdge::new(source_fragment_id, node, true));
+                }
+                edges.push(RuntimeFilterWaitEdge::new(
+                    node,
+                    proof.producer_fragment_id,
+                    true,
+                ));
+                node
+            } else {
+                producer.fragment_id
+            };
+            edges.push(RuntimeFilterWaitEdge::new(
+                source,
+                consumer.fragment_id,
+                true,
+            ));
+            sources.push(source);
+        }
+        consumer_sources.push((consumer.fragment_id, sources));
+    }
+
+    let mut outgoing = BTreeMap::<u32, BTreeSet<(u32, i32)>>::new();
+    for edge in fragment_edges {
+        outgoing
+            .entry(edge.source_fragment_id)
+            .or_default()
+            .insert((edge.target_fragment_id, edge.target_exchange_node_id));
+    }
+    for (multicast_fragment, branches) in outgoing {
+        if branches.len() < 2 {
+            continue;
+        }
+        for (target_fragment, _) in branches {
+            for (consumer_fragment, sources) in &consumer_sources {
+                if *consumer_fragment != target_fragment
+                    && !dependencies
+                        .get(consumer_fragment)
+                        .is_some_and(|predecessors| predecessors.contains(&target_fragment))
+                {
+                    continue;
+                }
+                for source in sources {
+                    edges.push(RuntimeFilterWaitEdge::new(
+                        *source,
+                        multicast_fragment,
+                        true,
+                    ));
+                }
             }
         }
     }
     Ok(RuntimeFilterWaitGraph::new(edges))
 }
 
+fn fragment_dependencies(
+    fragment_edges: &[FragmentEdgeSpec],
+) -> Result<BTreeMap<u32, BTreeSet<u32>>, DistributedQueryError> {
+    let mut direct = BTreeMap::<u32, BTreeSet<u32>>::new();
+    let mut nodes = BTreeSet::new();
+    for edge in fragment_edges {
+        nodes.insert(edge.source_fragment_id);
+        nodes.insert(edge.target_fragment_id);
+        direct
+            .entry(edge.target_fragment_id)
+            .or_default()
+            .insert(edge.source_fragment_id);
+    }
+    let mut dependencies = BTreeMap::new();
+    for node in nodes {
+        let mut closure = BTreeSet::new();
+        let mut pending = direct
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        while let Some(fragment) = pending.pop() {
+            if closure.insert(fragment) {
+                pending.extend(direct.get(&fragment).into_iter().flatten().copied());
+            }
+        }
+        dependencies.insert(node, closure);
+    }
+    Ok(dependencies)
+}
+
+fn valid_join_progress_proof(
+    proof: &JoinProgressProof,
+    producer: &BindingSpec,
+    consumer_fragment_id: u32,
+    fragment_edges: &[FragmentEdgeSpec],
+    dependencies: &BTreeMap<u32, BTreeSet<u32>>,
+) -> bool {
+    if proof.channel_id != producer.channel_id
+        || proof.producer_binding_id != producer.binding_id
+        || proof.producer_fragment_id != producer.fragment_id
+        || proof.join_node_id != producer.node_id
+        || !matches!(
+            producer.role,
+            BindingRole::Producer { completion }
+                if completion == plan::RuntimeFilterCompletionRequirement::ProducerClosed as i32
+        )
+    {
+        return false;
+    }
+    let sealed_inputs = fragment_edges
+        .iter()
+        .filter(|edge| edge.target_fragment_id == proof.producer_fragment_id)
+        .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
+        .collect::<BTreeSet<_>>();
+    let frontier = proof
+        .build_frontier
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let non_build = proof
+        .non_build_inputs
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if frontier.len() != proof.build_frontier.len()
+        || non_build.len() != proof.non_build_inputs.len()
+        || !frontier.is_disjoint(&non_build)
+        || frontier.union(&non_build).copied().collect::<BTreeSet<_>>() != sealed_inputs
+    {
+        return false;
+    }
+    consumer_fragment_id == proof.producer_fragment_id
+        || non_build.iter().any(|(source_fragment_id, _)| {
+            *source_fragment_id == consumer_fragment_id
+                || dependencies
+                    .get(source_fragment_id)
+                    .is_some_and(|predecessors| predecessors.contains(&consumer_fragment_id))
+        })
+}
+
 fn logical_domain(
     value: RuntimeFilterDeploymentLogicalDomainFacts,
 ) -> Result<filter::RuntimeFilterLogicalDomain, DistributedQueryError> {
-    let contract = match value {
+    match value {
         RuntimeFilterDeploymentLogicalDomainFacts::Membership {
             value_type,
             canonical_schema,
             schema_digest,
             ..
-        } => {
-            return Ok(filter::RuntimeFilterLogicalDomain {
-                value_type: Some(value_type),
-                contract: Some(plan::RuntimeFilterContract {
-                    kind: Some(plan::runtime_filter_contract::Kind::Membership(
-                        plan::RuntimeFilterMembershipContract {
-                            canonical_schema,
-                            schema_digest: schema_digest.to_vec(),
-                        },
-                    )),
-                }),
-            });
-        }
+        } => Ok(filter::RuntimeFilterLogicalDomain {
+            value_type: Some(value_type),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                    plan::RuntimeFilterMembershipContract {
+                        canonical_schema,
+                        schema_digest: schema_digest.to_vec(),
+                    },
+                )),
+            }),
+        }),
         RuntimeFilterDeploymentLogicalDomainFacts::Ordered {
             value_type,
             keys,
             comparator_digest,
             order_contract_digest,
-        } => {
-            return Ok(filter::RuntimeFilterLogicalDomain {
-                value_type: Some(value_type),
-                contract: Some(plan::RuntimeFilterContract {
-                    kind: Some(plan::runtime_filter_contract::Kind::Ordered(
-                        plan::RuntimeFilterOrderedContract {
-                            keys: keys
-                                .into_iter()
-                                .map(|key| plan::RuntimeFilterOrderKey {
-                                    r#type: Some(key.r#type),
-                                    direction: match key.direction {
-                                        RuntimeFilterSortDirection::Ascending => {
-                                            plan::RuntimeFilterSortDirection::Ascending as i32
-                                        }
-                                        RuntimeFilterSortDirection::Descending => {
-                                            plan::RuntimeFilterSortDirection::Descending as i32
-                                        }
-                                    },
-                                    null_order: match key.null_order {
-                                        RuntimeFilterNullOrder::First => {
-                                            plan::RuntimeFilterNullOrder::First as i32
-                                        }
-                                        RuntimeFilterNullOrder::Last => {
-                                            plan::RuntimeFilterNullOrder::Last as i32
-                                        }
-                                    },
-                                })
-                                .collect(),
-                            comparator_digest: comparator_digest.to_vec(),
-                            order_contract_digest: order_contract_digest.to_vec(),
-                        },
-                    )),
-                }),
-            });
-        }
-    };
-    Ok(filter::RuntimeFilterLogicalDomain {
-        value_type: None,
-        contract: Some(contract),
-    })
+        } => Ok(filter::RuntimeFilterLogicalDomain {
+            value_type: Some(value_type),
+            contract: Some(plan::RuntimeFilterContract {
+                kind: Some(plan::runtime_filter_contract::Kind::Ordered(
+                    plan::RuntimeFilterOrderedContract {
+                        keys: keys
+                            .into_iter()
+                            .map(|key| plan::RuntimeFilterOrderKey {
+                                r#type: Some(key.r#type),
+                                direction: match key.direction {
+                                    RuntimeFilterSortDirection::Ascending => {
+                                        plan::RuntimeFilterSortDirection::Ascending as i32
+                                    }
+                                    RuntimeFilterSortDirection::Descending => {
+                                        plan::RuntimeFilterSortDirection::Descending as i32
+                                    }
+                                },
+                                null_order: match key.null_order {
+                                    RuntimeFilterNullOrder::First => {
+                                        plan::RuntimeFilterNullOrder::First as i32
+                                    }
+                                    RuntimeFilterNullOrder::Last => {
+                                        plan::RuntimeFilterNullOrder::Last as i32
+                                    }
+                                },
+                            })
+                            .collect(),
+                        comparator_digest: comparator_digest.to_vec(),
+                        order_contract_digest: order_contract_digest.to_vec(),
+                    },
+                )),
+            }),
+        }),
+    }
 }
 
 fn coverage(
@@ -1454,36 +1724,4 @@ fn allocate_edge(next: &mut u32) -> Result<u32, DistributedQueryError> {
         compilation_error("runtime filter route edge identity space is exhausted")
     })?;
     Ok(id)
-}
-
-#[cfg(test)]
-mod tests {
-    use novarocks::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-
-    use super::require_empty_graph;
-
-    #[test]
-    fn channel_presence_is_fail_closed_until_sealed_projection_exists() {
-        let error = require_empty_graph(true).expect_err("nonempty graph must not be dropped");
-        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-        assert!(
-            error
-                .to_string()
-                .contains("sealed Frontend deployment projection")
-        );
-    }
-
-    #[test]
-    fn empty_graph_is_admitted_without_synthetic_contributions() {
-        require_empty_graph(false).expect("RF-off graph is a valid explicit empty deployment");
-    }
-}
-
-fn require_empty_graph(has_runtime_filter_channels: bool) -> Result<(), DistributedQueryError> {
-    if has_runtime_filter_channels {
-        return Err(compilation_error(
-            "runtime filter channels require the sealed Frontend deployment projection",
-        ));
-    }
-    Ok(())
 }

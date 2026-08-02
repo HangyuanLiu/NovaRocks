@@ -6,20 +6,20 @@ use std::fmt;
 /// edge is intentionally not a completion dependency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterWaitEdge {
-    waiter_participant_id: u32,
-    dependency_participant_id: u32,
+    source_node_id: u32,
+    target_node_id: u32,
     blocks_until_complete: bool,
 }
 
 impl RuntimeFilterWaitEdge {
     pub(crate) const fn new(
-        waiter_participant_id: u32,
-        dependency_participant_id: u32,
+        source_node_id: u32,
+        target_node_id: u32,
         blocks_until_complete: bool,
     ) -> Self {
         Self {
-            waiter_participant_id,
-            dependency_participant_id,
+            source_node_id,
+            target_node_id,
             blocks_until_complete,
         }
     }
@@ -43,15 +43,12 @@ impl RuntimeFilterWaitGraph {
     pub(crate) fn validate(&self) -> Result<(), RuntimeFilterLivenessError> {
         let mut adjacency = BTreeMap::<u32, BTreeSet<u32>>::new();
         for edge in &self.edges {
-            if edge.waiter_participant_id == 0 || edge.dependency_participant_id == 0 {
-                return Err(RuntimeFilterLivenessError::ZeroParticipant);
-            }
             if edge.blocks_until_complete {
                 adjacency
-                    .entry(edge.waiter_participant_id)
+                    .entry(edge.source_node_id)
                     .or_default()
-                    .insert(edge.dependency_participant_id);
-                adjacency.entry(edge.dependency_participant_id).or_default();
+                    .insert(edge.target_node_id);
+                adjacency.entry(edge.target_node_id).or_default();
             }
         }
 
@@ -110,16 +107,12 @@ fn find_cycle(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterLivenessError {
-    ZeroParticipant,
     BlockingFeedbackCycle { witness: Vec<u32> },
 }
 
 impl fmt::Display for RuntimeFilterLivenessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroParticipant => {
-                formatter.write_str("runtime filter wait graph has a zero participant id")
-            }
             Self::BlockingFeedbackCycle { witness } => write!(
                 formatter,
                 "runtime filter deployment contains an all-blocking feedback cycle: {witness:?}"

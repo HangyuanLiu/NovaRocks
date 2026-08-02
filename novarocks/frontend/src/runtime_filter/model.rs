@@ -325,37 +325,51 @@ fn validate_install_keys(
                 channel.channel_id
             )));
         }
-        let mut route_edges = BTreeSet::new();
-        for edge in channel.inbound_edges.iter().chain(&channel.outbound_edges) {
-            if edge.route_edge_id == 0 {
-                return Err(RuntimeFilterDeploymentError::Invalid(format!(
-                    "runtime filter participant {participant_id} has routing channel {} with route edge id zero",
-                    channel.channel_id
-                )));
-            }
-            if !route_edges.insert(edge.route_edge_id) {
-                return Err(RuntimeFilterDeploymentError::Invalid(format!(
-                    "runtime filter participant {participant_id} repeats route edge {} in routing channel {}",
-                    edge.route_edge_id, channel.channel_id
-                )));
-            }
-            let source = edge.source.as_ref().ok_or_else(|| {
-                RuntimeFilterDeploymentError::Invalid(format!(
-                    "runtime filter participant {participant_id} route edge {} has no source",
-                    edge.route_edge_id
-                ))
-            })?;
-            let target = edge.target.as_ref().ok_or_else(|| {
-                RuntimeFilterDeploymentError::Invalid(format!(
-                    "runtime filter participant {participant_id} route edge {} has no target",
-                    edge.route_edge_id
-                ))
-            })?;
-            if source.participant_id == 0 || target.participant_id == 0 {
-                return Err(RuntimeFilterDeploymentError::Invalid(format!(
-                    "runtime filter participant {participant_id} route edge {} has a zero endpoint participant",
-                    edge.route_edge_id
-                )));
+        // A loopback route is deliberately mirrored in both directions. The
+        // Backend routing shard verifies that such cross-side duplicates are
+        // byte-for-byte identical self edges; reject only duplicates within
+        // either direction here.
+        let mut inbound_route_edges = BTreeSet::new();
+        let mut outbound_route_edges = BTreeSet::new();
+        for (direction, edges, route_edges) in [
+            ("inbound", &channel.inbound_edges, &mut inbound_route_edges),
+            (
+                "outbound",
+                &channel.outbound_edges,
+                &mut outbound_route_edges,
+            ),
+        ] {
+            for edge in edges {
+                if edge.route_edge_id == 0 {
+                    return Err(RuntimeFilterDeploymentError::Invalid(format!(
+                        "runtime filter participant {participant_id} has routing channel {} with route edge id zero",
+                        channel.channel_id
+                    )));
+                }
+                if !route_edges.insert(edge.route_edge_id) {
+                    return Err(RuntimeFilterDeploymentError::Invalid(format!(
+                        "runtime filter participant {participant_id} repeats {direction} route edge {} in routing channel {}",
+                        edge.route_edge_id, channel.channel_id,
+                    )));
+                }
+                let source = edge.source.as_ref().ok_or_else(|| {
+                    RuntimeFilterDeploymentError::Invalid(format!(
+                        "runtime filter participant {participant_id} route edge {} has no source",
+                        edge.route_edge_id
+                    ))
+                })?;
+                let target = edge.target.as_ref().ok_or_else(|| {
+                    RuntimeFilterDeploymentError::Invalid(format!(
+                        "runtime filter participant {participant_id} route edge {} has no target",
+                        edge.route_edge_id
+                    ))
+                })?;
+                if source.participant_id == 0 || target.participant_id == 0 {
+                    return Err(RuntimeFilterDeploymentError::Invalid(format!(
+                        "runtime filter participant {participant_id} route edge {} has a zero endpoint participant",
+                        edge.route_edge_id
+                    )));
+                }
             }
         }
     }
