@@ -368,6 +368,7 @@ fn build_payload_coalesce_assert_filter(
     );
     let abs_net = TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::builtin_function_volatility("abs"),
             name: "abs".to_string(),
             args: vec![column_ref(net_column)],
             distinct: false,
@@ -919,6 +920,7 @@ fn int_literal(value: i64, data_type: DataType) -> TypedExpr {
 fn assert_true_call(predicate: TypedExpr, message: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::builtin_function_volatility("assert_true"),
             name: "assert_true".to_string(),
             args: vec![predicate, string_literal(message)],
             distinct: false,
@@ -1118,6 +1120,7 @@ fn is_internal_output_name(name: &str) -> bool {
 fn join_row_key_expr(desc: &JoinRefreshDescriptor, left_uuid: &str, right_uuid: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
             args: vec![
                 string_literal(left_uuid),
@@ -1408,9 +1411,9 @@ mod tests {
             .and_then(|distributed_plan| {
                 let prepared = crate::query_execution::preparation::prepare_fragments(
                     &distributed_plan,
-                    &connectors,
                     &controls,
                     &crate::connector::test_request_context(),
+                    None,
                     None,
                     crate::query_execution::preparation::ScanPreparationOptions::default(),
                 )?;

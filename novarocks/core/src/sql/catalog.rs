@@ -112,8 +112,15 @@ pub(crate) trait PlannerTableProvider {
     /// Statistics pins captured while this provider resolved the query's
     /// tables. A statistics read must use this exact resolution rather than
     /// resolving `latest` a second time during optimization.
-    fn statistics_pins(&self) -> Option<provider::QueryStatisticsPins> {
+    fn query_table_bindings(&self) -> Option<provider::QueryStatisticsPins> {
         None
+    }
+
+    /// Compatibility accessor during SQLX-1 call-site migration.  The value
+    /// is no longer a mutable pin map; callers should use
+    /// `query_table_bindings`.
+    fn statistics_pins(&self) -> Option<provider::QueryStatisticsPins> {
+        self.query_table_bindings()
     }
 }
 

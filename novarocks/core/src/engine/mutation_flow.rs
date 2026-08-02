@@ -135,6 +135,7 @@ pub(crate) fn execute_update_statement(
                 &target,
                 stmt,
                 current_catalog,
+                execution,
                 connector_context,
             )?;
             if matched.row_ids.is_empty() {
@@ -177,6 +178,7 @@ fn materialize_update_matches(
     target: &crate::engine::backend_resolver::TargetBackend,
     stmt: &UpdateStmt,
     current_catalog: Option<&str>,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -209,6 +211,7 @@ fn materialize_update_matches(
         Some(&target.catalog),
         &match_sql,
         &target.namespace,
+        execution,
         connector_context,
     )
 }
@@ -302,6 +305,7 @@ fn build_update_mor_change_stream_write_plan(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     target_ref: &str,
     new_sequence_number: i64,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
@@ -332,11 +336,6 @@ fn build_update_mor_change_stream_write_plan(
     }
 
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
@@ -347,11 +346,9 @@ fn build_update_mor_change_stream_write_plan(
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
         &analyzer_provider,
-        &connectors_snapshot,
         &target.namespace,
         None,
-        None,
-        false,
+        execution,
     )?;
     let producer = build_update_mor_change_event_expand_plan(
         planned.optimized_tree,
@@ -362,6 +359,10 @@ fn build_update_mor_change_stream_write_plan(
         state,
         target,
         producer,
+        planned.table_bindings.ok_or_else(|| {
+            "MOR UPDATE change-stream compilation did not retain query table bindings".to_string()
+        })?,
+        execution.clone(),
         crate::engine::dml_change_stream::DmlChangeStreamBranchSet::UpdateMor,
         target_ref,
     )?;
@@ -1059,6 +1060,7 @@ fn execute_mor_update(
         target_columns,
         target_ref,
         metadata.last_sequence_number() + 1,
+        &execution,
         connector_context,
     )?;
     run_mor_update_change_stream_transaction(
@@ -1994,7 +1996,7 @@ fn run_one_cow_file_rewrite(
         &plan.rewrite_query,
         data_sink_spec.clone(),
         None,
-        None,
+        crate::sql::compiler::RootDistributionRequirement::Any,
         Some(execution),
         connector_context,
         connector_write,
@@ -2205,18 +2207,20 @@ fn execute_update_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MatchedUpdateBatch, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal UPDATE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
+    let result = crate::engine::execute_query_with_catalog_service_with_execution(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        execution,
         connector_context,
     )?;
     matched_update_batch_from_query_result(result)
@@ -2629,6 +2633,7 @@ pub(crate) fn execute_merge_statement(
             insert_columns_resolved.as_deref(),
             target_ref,
             metadata.last_sequence_number() + 1,
+            execution,
             connector_context,
         )?;
         run_mor_merge_change_stream_transaction(
@@ -2654,6 +2659,7 @@ pub(crate) fn execute_merge_statement(
         current_catalog,
         &target_columns,
         insert_columns_resolved.as_deref(),
+        execution,
         connector_context,
     )?;
 
@@ -3191,6 +3197,7 @@ fn materialize_merge_match(
     current_catalog: Option<&str>,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     insert_columns: Option<&[MergeInsertColumn]>,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let target_alias = stmt
@@ -3307,6 +3314,7 @@ fn materialize_merge_match(
         Some(&target.catalog),
         &sql,
         &target.namespace,
+        execution,
         connector_context,
     )?;
     Ok(result)
@@ -3322,6 +3330,7 @@ fn build_merge_mor_change_stream_write_plan(
     insert_columns: Option<&[MergeInsertColumn]>,
     target_ref: &str,
     new_sequence_number: i64,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::dml_change_stream::DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
@@ -3443,11 +3452,6 @@ fn build_merge_mor_change_stream_write_plan(
     }
 
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
-    let connectors_snapshot = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
     let analyzer_provider = crate::engine::build_catalog_service_provider(
         Some(&target.catalog),
         &catalog_service_snapshot,
@@ -3458,11 +3462,9 @@ fn build_merge_mor_change_stream_write_plan(
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,
         &analyzer_provider,
-        &connectors_snapshot,
         &target.namespace,
         None,
-        None,
-        false,
+        execution,
     )?;
     let producer = build_merge_mor_change_event_expand_plan(
         planned.optimized_tree,
@@ -3476,6 +3478,10 @@ fn build_merge_mor_change_stream_write_plan(
         state,
         target,
         producer,
+        planned.table_bindings.ok_or_else(|| {
+            "MOR MERGE change-stream compilation did not retain query table bindings".to_string()
+        })?,
+        execution.clone(),
         crate::engine::dml_change_stream::DmlChangeStreamBranchSet::Merge {
             matched_update: has_matched_update,
             matched_delete: has_matched_delete,
@@ -3502,18 +3508,20 @@ fn execute_merge_match_query(
     current_catalog: Option<&str>,
     sql: &str,
     current_database: &str,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MergeMatchRows, String> {
     let statement = crate::sql::parser::parse_sql_raw(sql)?;
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("internal MERGE match query was not a SELECT".to_string());
     };
-    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
+    let result = crate::engine::execute_query_with_catalog_service_with_execution(
         state,
         current_catalog,
         current_database,
         &query,
         None,
+        execution,
         connector_context,
     )?;
     let Some(first_chunk) = result.chunks.first() else {
@@ -3752,7 +3760,7 @@ impl DistributedMergeExecutor {
                 query,
                 sink_spec.clone(),
                 None,
-                None,
+                crate::sql::compiler::RootDistributionRequirement::Any,
                 Some(&self.execution),
                 &self.connector_context,
                 registration,
@@ -3786,7 +3794,7 @@ impl DistributedMergeExecutor {
             query,
             sink_spec.clone(),
             None,
-            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
             Some(&self.execution),
             &self.connector_context,
             None,

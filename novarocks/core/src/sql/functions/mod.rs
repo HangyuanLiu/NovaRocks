@@ -42,8 +42,105 @@ pub(crate) mod registry;
 pub(crate) mod resolver;
 pub(crate) mod signature;
 
+use arrow::datatypes::DataType;
+
 pub(crate) use resolver::{
     ResolveError, ResolvedScalarFunction, resolve_scalar_function,
     resolve_scalar_function_signature,
 };
 pub(crate) use signature::{Signature, TypeSpec};
+
+/// Evaluation stability of a scalar function call.
+///
+/// This is SQL semantic metadata, not an optimizer-local policy.  It is
+/// intentionally carried by the immutable function catalog so that analysis,
+/// lambda validation, CSE, predicate derivation, and aggregate pushdown make
+/// the same decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub(crate) enum FunctionVolatility {
+    #[default]
+    Immutable,
+    Volatile,
+}
+
+impl FunctionVolatility {
+    pub(crate) const fn is_volatile(self) -> bool {
+        matches!(self, Self::Volatile)
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BuiltinSqlFunctionCatalog;
+
+impl crate::sql::compiler::SqlFunctionCatalog for BuiltinSqlFunctionCatalog {
+    fn resolve_scalar_signature(
+        &self,
+        name: &str,
+        arg_types: &[DataType],
+    ) -> Result<ResolvedScalarFunction, ResolveError> {
+        resolve_scalar_function_signature(name, arg_types)
+    }
+
+    fn volatility(&self, name: &str) -> FunctionVolatility {
+        builtin_function_volatility(name)
+    }
+}
+
+static BUILTIN_SQL_FUNCTION_CATALOG: BuiltinSqlFunctionCatalog = BuiltinSqlFunctionCatalog;
+
+pub(crate) fn builtin_sql_function_catalog() -> &'static dyn crate::sql::compiler::SqlFunctionCatalog
+{
+    &BUILTIN_SQL_FUNCTION_CATALOG
+}
+
+/// Canonical set of volatile builtins.  Keep this list here rather than in
+/// analyzer and optimizer copies.  The historical analyzer list was a strict
+/// subset; SQLX-1 deliberately adopts the optimizer's full safety set.
+pub(crate) fn builtin_function_volatility(name: &str) -> FunctionVolatility {
+    match name.to_ascii_lowercase().as_str() {
+        "rand" | "random" | "uuid" | "now" | "current_timestamp" | "current_date" | "curdate"
+        | "current_time" | "curtime" | "localtime" | "localtimestamp" | "utc_timestamp"
+        | "utc_time" => FunctionVolatility::Volatile,
+        _ => FunctionVolatility::Immutable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlx1_function_builtin_snapshot_has_canonical_volatility_set() {
+        let catalog = builtin_sql_function_catalog();
+        for name in [
+            "rand",
+            "random",
+            "uuid",
+            "now",
+            "current_timestamp",
+            "current_date",
+            "curdate",
+            "current_time",
+            "curtime",
+            "localtime",
+            "localtimestamp",
+            "utc_timestamp",
+            "utc_time",
+        ] {
+            assert_eq!(
+                catalog.volatility(name),
+                FunctionVolatility::Volatile,
+                "{name}"
+            );
+        }
+        assert_eq!(catalog.volatility("lower"), FunctionVolatility::Immutable);
+    }
+
+    #[test]
+    fn sqlx1_function_snapshot_resolves_registered_signature() {
+        let resolved = builtin_sql_function_catalog()
+            .resolve_scalar_signature("lower", &[DataType::Utf8])
+            .expect("registered function resolves through snapshot");
+        assert_eq!(resolved.return_type, DataType::Utf8);
+    }
+}

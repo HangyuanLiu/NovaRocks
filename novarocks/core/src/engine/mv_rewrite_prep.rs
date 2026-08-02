@@ -25,9 +25,11 @@
 
 use std::sync::Arc;
 
-use crate::mv::repository::MvRepository;
 use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::compiler::mv_rewrite::{
+    MvRewriteBaseTableState, MvRewriteDefinition, MvRewriteDefinitionIndex,
+};
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
@@ -35,11 +37,91 @@ use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::table::ScanSource;
 
 use super::StandaloneState;
-use super::query_stats::{QueryStatisticsContext, QueryStatsPlan};
 
 /// Upper bound on candidates per query; aligned with the StarRocks default
 /// cbo_materialized_view_rewrite_related_mvs_limit = 16.
 const MAX_MV_CANDIDATES: usize = 16;
+
+/// Freeze the repository-order MV definition set and every base-table
+/// freshness fact required by rewrite selection.
+///
+/// This is deliberately an application-facade operation: it is the only
+/// place in this module that names `StandaloneState`, the MV repository, or
+/// an Iceberg catalog. The compiler-facing preparation below receives the
+/// resulting immutable value and therefore cannot observe repository or
+/// connector changes part way through one query.
+pub(crate) fn freeze_mv_rewrite_definition_index(
+    state: &Arc<StandaloneState>,
+) -> Result<MvRewriteDefinitionIndex, String> {
+    let definitions = state
+        .mv_repository
+        .list_definitions()
+        .map_err(|error| format!("list mv definitions: {error}"))?;
+
+    Ok(MvRewriteDefinitionIndex::new(
+        definitions
+            .into_iter()
+            .map(|definition| freeze_mv_rewrite_definition(state, definition))
+            .collect(),
+    ))
+}
+
+fn freeze_mv_rewrite_definition(
+    state: &Arc<StandaloneState>,
+    definition: crate::mv::persistence::definition::StoredMvDefinition,
+) -> MvRewriteDefinition {
+    let mut base_table_states = std::collections::BTreeMap::new();
+    if definition.storage_engine == "iceberg" {
+        for fqn in &definition.base_table_refs {
+            let state = freeze_base_table_state(state, fqn)
+                .unwrap_or_else(MvRewriteBaseTableState::Unavailable);
+            base_table_states.insert(fqn.clone(), state);
+        }
+    }
+
+    MvRewriteDefinition {
+        mv_id: definition.mv_id,
+        select_sql: definition.select_sql,
+        base_table_refs: definition.base_table_refs,
+        storage_engine: definition.storage_engine,
+        target_catalog: definition.target_catalog,
+        target_namespace: definition.target_namespace,
+        target_table: definition.target_table,
+        last_refresh_snapshots: definition.last_refresh_snapshots,
+        last_refresh_table_uuids: definition.last_refresh_table_uuids,
+        base_table_states,
+    }
+}
+
+fn freeze_base_table_state(
+    state: &Arc<StandaloneState>,
+    fqn: &str,
+) -> Result<MvRewriteBaseTableState, String> {
+    let table_ref = crate::engine::mv::refresh_io::parse_iceberg_table_refs(&[fqn.to_string()])?
+        .into_iter()
+        .next()
+        .expect("one table reference produces one parsed identity");
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg catalogs read lock");
+        registry.get(&table_ref.catalog)?
+    };
+    let loaded = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &table_ref.namespace,
+        &table_ref.table,
+    )?;
+    Ok(MvRewriteBaseTableState::Resolved {
+        snapshot_id: loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id()),
+        table_uuid: Some(loaded.table.metadata().uuid().to_string()),
+    })
+}
 
 struct PreparedMvRewriteCandidate {
     mv_name: String,
@@ -54,23 +136,27 @@ fn supports_current_mv_rewrite_shape(desc: &SpjgDescriptor) -> bool {
 }
 
 pub(crate) fn prepare_mv_rewrite_candidates(
-    state: &Arc<StandaloneState>,
+    definitions: &MvRewriteDefinitionIndex,
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
-    query_stats: &mut QueryStatsPlan,
+    functions: &dyn crate::sql::compiler::SqlFunctionCatalog,
+    statistics_context: &dyn crate::sql::compiler::SqlStatisticsSnapshot,
+    query_stats: &mut crate::sql::compiler::SqlStatisticsPlan,
     optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Vec<MvRewriteCandidate> {
     if !optimizer_settings.mv_rewrite_enabled() {
         return Vec::new();
     }
     match try_prepare(
-        state,
+        definitions,
         analyzer_catalog,
         current_database,
         logical,
         factory,
+        functions,
+        statistics_context,
         query_stats,
     ) {
         Ok(c) => c,
@@ -81,13 +167,41 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     }
 }
 
+impl crate::sql::compiler::SqlMvRewriteSnapshot for MvRewriteDefinitionIndex {
+    fn prepare_candidates(
+        &self,
+        catalog: &dyn PlannerTableProvider,
+        current_database: &str,
+        logical: &LogicalPlanNode,
+        factory: &mut ColumnRefFactory,
+        functions: &dyn crate::sql::compiler::SqlFunctionCatalog,
+        statistics: &dyn crate::sql::compiler::SqlStatisticsSnapshot,
+        query_stats: &mut crate::sql::compiler::SqlStatisticsPlan,
+        optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
+    ) -> Vec<MvRewriteCandidate> {
+        prepare_mv_rewrite_candidates(
+            self,
+            catalog,
+            current_database,
+            logical,
+            factory,
+            functions,
+            statistics,
+            query_stats,
+            optimizer_settings,
+        )
+    }
+}
+
 fn try_prepare(
-    state: &Arc<StandaloneState>,
+    definitions: &MvRewriteDefinitionIndex,
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
-    query_stats: &mut QueryStatsPlan,
+    functions: &dyn crate::sql::compiler::SqlFunctionCatalog,
+    statistics_context: &dyn crate::sql::compiler::SqlStatisticsSnapshot,
+    query_stats: &mut crate::sql::compiler::SqlStatisticsPlan,
 ) -> Result<Vec<MvRewriteCandidate>, String> {
     // 1. Iceberg base tables referenced by the query, as "cat.ns.tbl" FQNs
     //    (the exact format of StoredMvDefinition.base_table_refs, produced
@@ -98,18 +212,8 @@ fn try_prepare(
         return Ok(Vec::new());
     }
 
-    // 2. List stored MVs.
-    let definitions = state
-        .mv_repository
-        .list_definitions()
-        .map_err(|e| format!("list mv definitions: {e}"))?;
-
-    let statistics_context = QueryStatisticsContext::from_optional_state_with_pins(
-        Some(state),
-        analyzer_catalog.statistics_pins(),
-    );
     let mut candidates = Vec::new();
-    for def in definitions {
+    for def in definitions.definitions() {
         if candidates.len() >= MAX_MV_CANDIDATES {
             tracing::warn!("mv rewrite: candidate cap {MAX_MV_CANDIDATES} reached, rest skipped");
             break;
@@ -122,13 +226,10 @@ fn try_prepare(
         if !def.base_table_refs.iter().any(|r| query_fqns.contains(r)) {
             continue;
         }
-        match build_candidate(state, analyzer_catalog, current_database, &def, factory) {
+        match build_candidate(analyzer_catalog, current_database, def, factory, functions) {
             Ok(Some(c)) => {
-                let (target_label, target_stats) = super::query_stats::collect_table_stats(
-                    &statistics_context,
-                    &c.target_database,
-                    &c.target_table,
-                );
+                let (target_label, target_stats) = statistics_context
+                    .collect_table_statistics(&c.target_database, &c.target_table);
                 let target_stats_ref = query_stats.add_stats(target_label, target_stats);
                 candidates.push(MvRewriteCandidate {
                     mv_name: c.mv_name,
@@ -147,33 +248,19 @@ fn try_prepare(
 }
 
 fn build_candidate(
-    state: &Arc<StandaloneState>,
     analyzer_catalog: &dyn PlannerTableProvider,
     current_database: &str,
-    def: &crate::mv::persistence::definition::StoredMvDefinition,
+    def: &MvRewriteDefinition,
     factory: &mut ColumnRefFactory,
+    functions: &dyn crate::sql::compiler::SqlFunctionCatalog,
 ) -> Result<Option<PreparedMvRewriteCandidate>, String> {
     // 2b. Strict freshness: every base table's CURRENT snapshot must equal
     //     the pinned snapshot from the last refresh. Never refreshed -> skip.
     if def.last_refresh_snapshots.is_empty() {
         return Ok(None);
     }
-    let base_refs = crate::engine::mv::refresh_io::parse_iceberg_table_refs(&def.base_table_refs)?;
-    for r in &base_refs {
-        let fqn = r.fqn();
-        let Some(pinned) = def.last_refresh_snapshots.get(&fqn) else {
-            return Ok(None);
-        };
-        let current = current_snapshot_id(state, r)?;
-        if current != Some(*pinned) {
-            return Ok(None); // stale (or unreadable) -> strict mode skips
-        }
-        if let Some(pinned_uuid) = def.last_refresh_table_uuids.get(&fqn)
-            && current_table_uuid(state, r)?.as_deref() != Some(pinned_uuid.as_str())
-        {
-            // table was dropped & recreated
-            return Ok(None);
-        }
+    if !definition_is_fresh(def)? {
+        return Ok(None);
     }
 
     // 3. Re-analyze the defining SQL on a CLONE of the query's factory, then
@@ -189,12 +276,14 @@ fn build_candidate(
     //    have a fully analyzed+planned MV; on success the write-back threads
     //    the advanced ids so the query and every candidate stay collision-free.
     let select = crate::engine::mv::iceberg_refresh::parse_mv_select_query(&def.select_sql)?;
-    let (resolved, ctes, returned) = crate::sql::analyzer::analyze_with_factory(
-        &select,
-        analyzer_catalog,
-        current_database,
-        factory.clone(),
-    )?;
+    let (resolved, ctes, returned) =
+        crate::sql::analyzer::analyze_with_factory_and_function_catalog(
+            &select,
+            analyzer_catalog,
+            current_database,
+            factory.clone(),
+            functions,
+        )?;
     let mut returned = returned;
     let mv_logical = crate::sql::planner::plan_query(resolved, ctes, &mut returned)?;
     *factory = returned;
@@ -220,9 +309,9 @@ fn build_candidate(
         ));
     }
 
-    // 4. Build the executable target TableDef via the iceberg connector pair.
-    //    This does not materialize local catalog state; ScanOp embeds the
-    //    TableDef directly.
+    // 4. Resolve the executable target through the same query-scoped table
+    // binding store as analysis and statistics. This preserves the exact
+    // control generation and avoids a second current/latest acquire.
     let (Some(cat), Some(ns), Some(tbl)) = (
         &def.target_catalog,
         &def.target_namespace,
@@ -230,21 +319,9 @@ fn build_candidate(
     ) else {
         return Ok(None);
     };
-    let connectors = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-    let (target_table, _, _) = crate::connector::iceberg::provider::load_schema_table_def(
-        state.connector_control.as_ref(),
-        crate::connector::connector_request_context(
-            None,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?,
-        cat,
-        ns,
-        tbl,
-    )?;
+    let target_table = analyzer_catalog
+        .resolve_table_for_analysis(Some(cat), ns, tbl)?
+        .planner;
 
     // Duplicate output names break the by-name visible-column mapping.
     let mut names: Vec<&str> = mv_desc.outputs.iter().map(|o| o.name.as_str()).collect();
@@ -260,6 +337,35 @@ fn build_candidate(
         target_database: ns.clone(),
         target_table,
     }))
+}
+
+fn definition_is_fresh(def: &MvRewriteDefinition) -> Result<bool, String> {
+    for fqn in &def.base_table_refs {
+        let Some(pinned) = def.last_refresh_snapshots.get(fqn) else {
+            return Ok(false);
+        };
+        match def.base_table_states.get(fqn) {
+            Some(MvRewriteBaseTableState::Resolved {
+                snapshot_id,
+                table_uuid,
+            }) => {
+                if *snapshot_id != Some(*pinned) {
+                    return Ok(false); // stale -> strict mode skips
+                }
+                if let Some(pinned_uuid) = def.last_refresh_table_uuids.get(fqn)
+                    && table_uuid.as_deref() != Some(pinned_uuid.as_str())
+                {
+                    // table was dropped & recreated
+                    return Ok(false);
+                }
+            }
+            Some(MvRewriteBaseTableState::Unavailable(error)) => {
+                return Err(format!("read frozen base table {fqn}: {error}"));
+            }
+            None => return Err(format!("missing frozen base table state for {fqn}")),
+        }
+    }
+    Ok(true)
 }
 
 fn rewrite_candidate_display_name(target_table: &str) -> String {
@@ -289,49 +395,10 @@ fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
     }
 }
 
-/// Current snapshot id of a base table, read through the query's shared
-/// catalog cache view.
-///
-/// Unlike the test helper at engine/mod.rs:~7009 this deliberately does NOT
-/// call `entry.invalidate_table_cache(...)`: the freshness check must observe
-/// the same snapshot the query's own scan resolution will use. Forcing a
-/// disk re-read here could see a newer snapshot than the one the query binds,
-/// which would make a candidate look stale (or fresh) inconsistently with the
-/// plan being optimized.
-fn current_snapshot_id(
-    state: &Arc<StandaloneState>,
-    r: &novarocks_catalog::identifier::TableIdentity,
-) -> Result<Option<i64>, String> {
-    let registry = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalogs read lock");
-    let entry = registry.get(&r.catalog)?;
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, &r.namespace, &r.table)?;
-    Ok(loaded
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id()))
-}
-
-/// Current table UUID of a base table, read through the same shared cache
-/// view as `current_snapshot_id` (no cache invalidation; see its docs).
-fn current_table_uuid(
-    state: &Arc<StandaloneState>,
-    r: &novarocks_catalog::identifier::TableIdentity,
-) -> Result<Option<String>, String> {
-    let registry = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalogs read lock");
-    let entry = registry.get(&r.catalog)?;
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, &r.namespace, &r.table)?;
-    Ok(Some(loaded.table.metadata().uuid().to_string()))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use arrow::datatypes::DataType;
 
     use super::*;
@@ -374,6 +441,24 @@ mod tests {
         }
     }
 
+    fn frozen_definition(state: MvRewriteBaseTableState) -> MvRewriteDefinition {
+        MvRewriteDefinition {
+            mv_id: 1,
+            select_sql: "select 1".to_string(),
+            base_table_refs: vec!["iceberg.db.base".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("iceberg".to_string()),
+            target_namespace: Some("db".to_string()),
+            target_table: Some("mv_target".to_string()),
+            last_refresh_snapshots: BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
+            last_refresh_table_uuids: BTreeMap::from([(
+                "iceberg.db.base".to_string(),
+                "original-uuid".to_string(),
+            )]),
+            base_table_states: BTreeMap::from([("iceberg.db.base".to_string(), state)]),
+        }
+    }
+
     #[test]
     fn current_mv_rewrite_shape_support_accepts_single_table_descriptor() {
         let desc = descriptor_with_joins(None);
@@ -404,5 +489,42 @@ mod tests {
             rewrite_candidate_display_name("target_agg_mv"),
             "target_agg_mv"
         );
+    }
+
+    #[test]
+    fn sqlx1_mv_rewrite_uses_the_frozen_snapshot_and_uuid() {
+        let definition = frozen_definition(MvRewriteBaseTableState::Resolved {
+            snapshot_id: Some(42),
+            table_uuid: Some("original-uuid".to_string()),
+        });
+
+        assert_eq!(definition_is_fresh(&definition), Ok(true));
+    }
+
+    #[test]
+    fn sqlx1_mv_rewrite_rejects_stale_or_recreated_frozen_base_table() {
+        let stale = frozen_definition(MvRewriteBaseTableState::Resolved {
+            snapshot_id: Some(43),
+            table_uuid: Some("original-uuid".to_string()),
+        });
+        let recreated = frozen_definition(MvRewriteBaseTableState::Resolved {
+            snapshot_id: Some(42),
+            table_uuid: Some("replacement-uuid".to_string()),
+        });
+
+        assert_eq!(definition_is_fresh(&stale), Ok(false));
+        assert_eq!(definition_is_fresh(&recreated), Ok(false));
+    }
+
+    #[test]
+    fn sqlx1_mv_rewrite_keeps_frozen_read_errors_as_warn_and_skip_inputs() {
+        let definition = frozen_definition(MvRewriteBaseTableState::Unavailable(
+            "catalog unavailable".to_string(),
+        ));
+
+        assert!(matches!(
+            definition_is_fresh(&definition),
+            Err(error) if error.contains("catalog unavailable")
+        ));
     }
 }

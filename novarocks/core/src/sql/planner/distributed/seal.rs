@@ -884,9 +884,9 @@ mod tests {
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());
         let prepared = crate::query_execution::preparation::prepare_fragments(
             &plan,
-            &registry,
             &controls,
             &crate::connector::test_request_context(),
+            None,
             None,
             crate::query_execution::preparation::ScanPreparationOptions::default(),
         )

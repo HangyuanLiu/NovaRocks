@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::ConnectorRegistry;
 use crate::connector::scan_model::starrocks::PlannedNativeStarRocksScan;
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
     ScanExecutionBindings,
 };
+use crate::sql::catalog::provider::QueryTableBindingStore;
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId,
 };
@@ -55,9 +55,9 @@ impl Default for ScanPreparationOptions {
 
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
-    connectors: &ConnectorRegistry,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
+    query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: ScanPreparationOptions,
 ) -> Result<ScanExecutionBindings, String> {
@@ -67,9 +67,9 @@ pub(super) fn prepare_scan_bindings(
         collect_scan_bindings(
             fragment.fragment_id,
             &fragment.root,
-            connectors,
             controls,
             context,
+            query_table_bindings,
             resolver,
             options,
             &mut seen_scan_node_ids,
@@ -82,9 +82,9 @@ pub(super) fn prepare_scan_bindings(
 fn collect_scan_bindings(
     fragment_id: FragmentId,
     node: &DistributedNode,
-    connectors: &ConnectorRegistry,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
+    query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: ScanPreparationOptions,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
@@ -98,9 +98,9 @@ fn collect_scan_bindings(
             fragment_id,
             node.node_id,
             scan,
-            connectors,
             controls,
             context,
+            query_table_bindings,
             resolver,
             options,
             bindings,
@@ -111,9 +111,9 @@ fn collect_scan_bindings(
             collect_scan_bindings(
                 fragment_id,
                 child,
-                connectors,
                 controls,
                 context,
+                query_table_bindings,
                 resolver,
                 options,
                 seen_scan_node_ids,
@@ -128,9 +128,9 @@ fn prepare_scan_node(
     fragment_id: FragmentId,
     node_id: i32,
     scan: &PlanScanNode,
-    connectors: &ConnectorRegistry,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: &novarocks_spi::connector::ConnectorRequestContext,
+    query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: ScanPreparationOptions,
     bindings: &mut ScanExecutionBindings,
@@ -219,8 +219,12 @@ fn prepare_scan_node(
                     lower_static_connector_predicates(scan, &connector_schema_fields)
                 })
                 .unwrap_or_default();
+            let exact_lease = query_table_bindings
+                .map(|bindings| exact_query_binding_lease(bindings, &files.table, files.binding))
+                .transpose()?;
             let planned = plan_iceberg_connector_read(
                 controls,
+                exact_lease,
                 context.clone(),
                 scan,
                 &execution,
@@ -233,9 +237,28 @@ fn prepare_scan_node(
             (Vec::new(), Vec::new(), Some(planned))
         }
         ResolvedScanExecution::IcebergDelta(_) => {
-            let planned =
-                plan_iceberg_delta_connector_read(controls, context.clone(), scan, &execution)
-                    .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            let ScanSource::IcebergDeltaTable { table, .. } = &scan.table.source else {
+                return Err(format!(
+                    "scan preparation node_id={node_id}: IcebergDelta execution requires IcebergDeltaTable source"
+                ));
+            };
+            let exact_lease = query_table_bindings
+                .map(|bindings| {
+                    exact_query_binding_lease(
+                        bindings,
+                        table,
+                        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    )
+                })
+                .transpose()?;
+            let planned = plan_iceberg_delta_connector_read(
+                controls,
+                exact_lease,
+                context.clone(),
+                scan,
+                &execution,
+            )
+            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             (Vec::new(), Vec::new(), Some(planned))
         }
     };
@@ -250,6 +273,38 @@ fn prepare_scan_node(
         bindings.insert_connector_read(fragment_id, node_id, connector_read)?;
     }
     bindings.insert_scan_ranges(fragment_id, node_id, ranges)
+}
+
+/// Once SQL catalog resolution selected a query binding, preparation must use
+/// that same connector generation.  A missing binding is a contract error,
+/// not permission to reacquire `current` and silently mix metadata versions.
+fn exact_query_binding_lease(
+    bindings: &QueryTableBindingStore,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
+    let binding = bindings
+        .iceberg_data_file_binding(table, binding)
+        .ok_or_else(|| {
+            format!(
+                "scan preparation has no exact query binding for '{}.{}.{}'",
+                table.catalog, table.namespace, table.table
+            )
+        })?;
+    let lease = binding.planning_lease.clone().ok_or_else(|| {
+        format!(
+            "query binding for '{}.{}.{}' has no connector planning lease",
+            table.catalog, table.namespace, table.table
+        )
+    })?;
+    if lease.binding().descriptor().instance_id.as_str() != table.catalog {
+        return Err(format!(
+            "query binding lease owner '{:?}' does not match scan catalog '{}'",
+            lease.binding().descriptor().instance_id,
+            table.catalog
+        ));
+    }
+    Ok(lease)
 }
 
 fn store_planned_starrocks_scan(

@@ -171,9 +171,9 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
-        &registry,
         &controls,
         &crate::connector::test_request_context(),
+        None,
         None,
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )
@@ -530,9 +530,9 @@ fn native_encoder_emits_explicit_empty_fragment_table() {
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
-        &registry,
         &controls,
         &crate::connector::test_request_context(),
+        None,
         None,
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )

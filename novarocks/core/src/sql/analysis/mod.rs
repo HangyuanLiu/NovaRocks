@@ -311,6 +311,10 @@ pub(crate) enum ExprKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        /// Semantics resolved by the request's immutable function catalog.
+        /// The optimizer bridge preserves this value instead of reclassifying
+        /// by name from ambient process state.
+        volatility: crate::sql::functions::FunctionVolatility,
     },
     /// Higher-order function lambda expression.
     LambdaFunction {

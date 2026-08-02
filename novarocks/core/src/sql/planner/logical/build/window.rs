@@ -483,6 +483,7 @@ fn rewrite_window_calls(
             name,
             args,
             distinct,
+            volatility,
         } => TypedExpr {
             kind: ExprKind::FunctionCall {
                 name: name.clone(),
@@ -493,6 +494,7 @@ fn rewrite_window_calls(
                     })
                     .collect(),
                 distinct: *distinct,
+                volatility: *volatility,
             },
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,

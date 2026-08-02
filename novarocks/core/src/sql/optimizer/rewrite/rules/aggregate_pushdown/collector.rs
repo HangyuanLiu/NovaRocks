@@ -717,6 +717,7 @@ mod tests {
         let mut arena = make_arena();
         let rand_expr = crate::sql::analysis::TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::FunctionVolatility::Volatile,
                 name: "rand".into(),
                 args: vec![],
                 distinct: false,

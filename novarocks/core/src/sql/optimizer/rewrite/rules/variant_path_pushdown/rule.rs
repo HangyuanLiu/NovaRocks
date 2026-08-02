@@ -257,6 +257,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             name,
             args,
             distinct,
+            volatility,
         } => {
             let (args, changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
             Ok(changed.then(|| {
@@ -265,6 +266,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         name,
                         args,
                         distinct,
+                        volatility,
                     },
                     data_type,
                     nullable,
@@ -582,6 +584,7 @@ fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Variant
         name,
         args,
         distinct,
+        ..
     } = arena.node(expr)
     else {
         return None;

@@ -583,7 +583,7 @@ impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
             &self.query,
             self.sink_spec.clone(),
             None,
-            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
             self.execution.as_ref(),
             &self.connector_context,
             Some(self.connector_write.clone()),

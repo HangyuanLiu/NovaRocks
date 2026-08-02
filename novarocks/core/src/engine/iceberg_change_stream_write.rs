@@ -69,6 +69,7 @@ impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
             build_input.current_catalog.as_deref(),
             &build_input.current_database,
             &build_input.optimized_tree,
+            None,
             &mut build_input.dag,
             build_input.mv_refresh_ctx.as_deref(),
             None,

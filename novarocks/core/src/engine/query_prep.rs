@@ -183,12 +183,12 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 /// a `version: Some(...)` clause:
 ///
 /// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
-/// 2. Build a synthetic `TableDef` for that snapshot and register it in the
-///    local planner catalog under the name `<table>__at_<snapshot_id>`.
+/// 2. Encode a synthetic, query-local analyzer identity for that snapshot.
+///    `CatalogServiceProvider` memoizes the corresponding exact binding and
+///    planning lease in its request-local binding store.
 /// 3. Rewrite the `TableFactor::Table`:
-///    - Replace `name` with `default_catalog.<namespace>.<synthetic name>` so
-///      CatalogServiceProvider routes the synthetic table through the local
-///      planner catalog even when the session has an Iceberg current catalog.
+///    - Replace `name` with `<catalog>.<namespace>.<synthetic name>` so the
+///      provider resolves the overlay rather than shared local catalog state.
 ///    - Clear `version` (set to `None`).
 ///    - Preserve any existing alias; if none, set `alias` = original table name
 ///      so that `SELECT t.col FROM t FOR VERSION AS OF ...` resolves `t.col`.
@@ -354,30 +354,11 @@ fn rewrite_time_travel_in_factor(
             let binding = resolve_read_binding(&version_clause, &metadata, &fqn)?;
             let snapshot_id = binding.snapshot_id;
 
-            // Build and register the synthetic table def
-            let synthetic_table_name = format!("{}__at_{}", target.table, snapshot_id);
-            {
-                let connectors = state
-                    .connectors
-                    .read()
-                    .expect("standalone connector registry read lock")
-                    .clone();
-                let (table_def, _, _) = crate::connector::iceberg::provider::load_table_def_at(
-                    state.connector_control.as_ref(),
-                    connector_context.clone(),
-                    &target.catalog,
-                    &target.namespace,
-                    &target.table,
-                    Some(snapshot_id),
-                    false,
-                )?;
-                // Build a new TableDef with the synthetic name
-                let synthetic_def = TableDef {
-                    name: synthetic_table_name.clone(),
-                    ..table_def
-                };
-                register_local_table_registration(state, &target.namespace, synthetic_def)?;
-            }
+            // A time-travel identity is query-local.  The synthetic name is
+            // only an analyzer key; its exact snapshot table and planning
+            // lease remain in the binding store and never enter the shared
+            // in-memory catalog.
+            let synthetic_table_name = format!("__sqlx1_tt_{}_{}", target.table, snapshot_id);
 
             // Rewrite the AST node in-place:
             // - Set alias to original table name if user didn't specify one
@@ -393,14 +374,12 @@ fn rewrite_time_travel_in_factor(
                 });
             }
 
-            // Replace with an explicit default_catalog-qualified synthetic
-            // name. The synthetic table is registered in the local
-            // InMemoryCatalog, and the catalog prefix prevents a session-level
-            // Iceberg current catalog from routing `db.synthetic` back through
-            // the Iceberg CatalogMgr entry.
+            // Route the synthetic analyzer identity through the canonical
+            // connector catalog so CatalogServiceProvider resolves the
+            // query-local binding above instead of consulting global state.
             *name = sqlparser::ast::ObjectName(vec![
                 sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
-                    "default_catalog",
+                    target.catalog.clone(),
                 )),
                 sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
                     target.namespace.clone(),
@@ -444,17 +423,11 @@ pub(crate) fn materialize_external_schema_table_for_statement(
         // Non-Iceberg sources are already represented in the logical catalog.
         return Ok(());
     }
-    // Synthetic time-travel tables live only in the in-memory catalog and are
-    // unknown to the iceberg backend; never attempt to reload them.
+    // Time-travel identities live only in a query binding store and are never
+    // valid statement-level catalog objects.
     if is_synthetic_time_travel_table(&target.table) {
         return Ok(());
     }
-
-    let connectors = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
 
     {
         let registry = state
@@ -486,10 +459,16 @@ pub(crate) fn materialize_external_schema_table_for_statement(
     register_local_table_registration(state, &target.namespace, table_def)
 }
 
-/// Returns true if `table_name` was produced by the time-travel rewriter.
-/// Synthetic names follow the pattern `<original_table>__at_<snapshot_id>`
-/// where `snapshot_id` is a decimal integer (i64).
+/// Returns true if `table_name` was produced by a time-travel rewriter.
+/// SQLX-1 query-local overlays use `__sqlx1_tt_<table>_<snapshot_id>`;
+/// recognize the legacy form as well so old statement materialization cannot
+/// mistake either identity for a durable catalog object.
 fn is_synthetic_time_travel_table(table_name: &str) -> bool {
+    if let Some(encoded) = table_name.strip_prefix("__sqlx1_tt_")
+        && let Some((base, snapshot)) = encoded.rsplit_once('_')
+    {
+        return !base.is_empty() && snapshot.parse::<i64>().is_ok();
+    }
     if let Some(at_pos) = table_name.rfind("__at_") {
         let suffix = &table_name[at_pos + "__at_".len()..];
         !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-')
@@ -821,6 +800,20 @@ mod tests {
         );
         super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
             .expect("drop is idempotent for scoped cleanup");
+    }
+
+    #[test]
+    fn sqlx1_resolution_time_travel_rewrite_does_not_publish_global_catalog_entries() {
+        let source = include_str!("query_prep.rs");
+        let rewrite = source
+            .split("pub(crate) fn rewrite_time_travel_refs")
+            .nth(1)
+            .expect("time-travel rewrite source")
+            .split("pub(crate) fn materialize_external_schema_table_for_statement")
+            .next()
+            .expect("time-travel rewrite boundary");
+        assert!(rewrite.contains("__sqlx1_tt_"));
+        assert!(!rewrite.contains("register_local_table_registration"));
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {

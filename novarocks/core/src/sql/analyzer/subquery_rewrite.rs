@@ -2055,6 +2055,7 @@ impl<'a> AnalyzerContext<'a> {
                     data_type: DataType::Boolean,
                     nullable: false,
                     kind: ExprKind::FunctionCall {
+                        volatility: crate::sql::functions::builtin_function_volatility("coalesce"),
                         name: "coalesce".to_string(),
                         args: vec![
                             filter,
@@ -2279,6 +2280,7 @@ impl<'a> AnalyzerContext<'a> {
         let child_ctx = AnalyzerContext {
             catalog: self.catalog,
             current_database: self.current_database,
+            function_catalog: self.function_catalog,
             factory: self.factory.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
@@ -2828,6 +2830,7 @@ fn qualify_inner_shadowing_column_refs(
             name,
             args,
             distinct,
+            volatility,
         } => TypedExpr {
             data_type,
             nullable,
@@ -2838,6 +2841,7 @@ fn qualify_inner_shadowing_column_refs(
                     .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
                     .collect(),
                 distinct,
+                volatility,
             },
         },
         ExprKind::LambdaFunction { params, body } => TypedExpr {
@@ -4493,6 +4497,7 @@ fn replace_placeholder_in_expr(
             name,
             args,
             distinct,
+            volatility,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -4503,6 +4508,7 @@ fn replace_placeholder_in_expr(
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
+                volatility: *volatility,
             },
         },
         ExprKind::AggregateCall {

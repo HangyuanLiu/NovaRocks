@@ -1507,6 +1507,7 @@ mod tests {
             },
         ];
         let coalesced_key = typed_expr(ExprKind::FunctionCall {
+            volatility: crate::sql::functions::builtin_function_volatility("coalesce"),
             name: "coalesce".to_string(),
             args: vec![col_ref(1, "left_key"), col_ref(3, "right_key")],
             distinct: false,
@@ -1911,6 +1912,9 @@ mod tests {
                     when_then: vec![(
                         col_ref(5, "case_when"),
                         typed_expr(ExprKind::FunctionCall {
+                            volatility: crate::sql::functions::builtin_function_volatility(
+                                "then_fn",
+                            ),
                             name: "then_fn".to_string(),
                             args: vec![col_ref(4, "case_then")],
                             distinct: false,
@@ -1933,6 +1937,7 @@ mod tests {
                 }),
             ],
             distinct: false,
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
         });
 
         let mut raw = Vec::new();

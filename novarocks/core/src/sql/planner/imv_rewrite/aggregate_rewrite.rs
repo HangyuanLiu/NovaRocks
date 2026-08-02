@@ -524,6 +524,9 @@ fn build_relational_aggregate_change_stream(
                 op: UnOp::Not,
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        volatility: crate::sql::functions::builtin_function_volatility(
+                            "state_all_zero",
+                        ),
                         name: "state_all_zero".to_string(),
                         args: vec![merged_count],
                         distinct: false,
@@ -652,6 +655,7 @@ fn delta_state_with_row_id(
     items.push(ProjectItem {
         expr: TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility("mv_group_row_id"),
                 name: "mv_group_row_id".to_string(),
                 args: row_id_args,
                 distinct: false,
@@ -695,6 +699,9 @@ fn merged_state_expr(
     match state_column.state_role {
         AggregateStateRole::Single => Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility(
+                    state_union_function(state_column.function)?,
+                ),
                 name: state_union_function(state_column.function)?.to_string(),
                 args: vec![column_ref(old), column_ref(delta)],
                 distinct: false,
@@ -877,6 +884,9 @@ fn aggregate_insert_expr_for_output(
         let args = visible_state_args(state_column, merged_state, layout)?;
         return Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
+                volatility: crate::sql::functions::builtin_function_volatility(
+                    visible_state_function(state_column.function)?,
+                ),
                 name: visible_state_function(state_column.function)?.to_string(),
                 args,
                 distinct: false,
@@ -2169,6 +2179,7 @@ fn signed_state_input(value: TypedExpr, action_column: ColumnId) -> TypedExpr {
     let value_type = value.data_type.clone();
     TypedExpr {
         kind: ExprKind::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "named_struct".to_string(),
             args: vec![
                 string_literal("value"),

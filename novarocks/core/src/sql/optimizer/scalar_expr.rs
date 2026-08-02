@@ -500,26 +500,13 @@ pub(crate) fn is_true_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
 
 pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: ScalarId) -> bool {
     match arena.node(expr) {
-        ScalarNode::FunctionCall { name, args, .. } => {
-            let lower = name.to_lowercase();
-            matches!(
-                lower.as_str(),
-                "rand"
-                    | "random"
-                    | "uuid"
-                    | "now"
-                    | "current_timestamp"
-                    | "current_date"
-                    | "curdate"
-                    | "current_time"
-                    | "curtime"
-                    | "localtime"
-                    | "localtimestamp"
-                    | "utc_timestamp"
-                    | "utc_time"
-            ) || args
-                .iter()
-                .any(|arg| contains_non_deterministic_function(arena, *arg))
+        ScalarNode::FunctionCall { args, .. } => {
+            arena
+                .function_volatility(expr)
+                .is_some_and(|volatility| volatility.is_volatile())
+                || args
+                    .iter()
+                    .any(|arg| contains_non_deterministic_function(arena, *arg))
         }
         ScalarNode::AggregateCall { args, order_by, .. } => {
             args.iter()

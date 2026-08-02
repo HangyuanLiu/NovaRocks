@@ -4096,7 +4096,88 @@ pub(crate) fn load_schema_table_def(
     ),
     String,
 > {
-    load_table_def_at(controls, context, catalog, namespace, table, None, true)
+    let (table_def, schema_id, statistics_pin, _planning_lease) =
+        load_schema_table_def_with_lease(controls, context, catalog, namespace, table)?;
+    Ok((table_def, schema_id, statistics_pin))
+}
+
+/// Resolves an Iceberg schema while retaining the exact control generation
+/// that served metadata. Query-scoped callers carry this lease through
+/// statistics and split planning instead of resolving `latest` again.
+pub(crate) fn load_schema_table_def_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<i32>,
+        Option<ResolvedTableStatisticsPin>,
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+    ),
+    String,
+> {
+    use novarocks_spi::connector::{
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    };
+
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| error.to_string())?;
+    let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
+        .map_err(|error| error.to_string())?;
+    let schema_id = metadata.version.as_ref().and_then(|version| {
+        <[u8; 4]>::try_from(version.as_ref())
+            .ok()
+            .map(i32::from_le_bytes)
+    });
+    let table_info = payload
+        .table_info
+        .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
+    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
+        .into_iter()
+        .filter(|column| {
+            !payload
+                .hidden_columns
+                .iter()
+                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
+        })
+        .collect();
+    let table_def = crate::sql::planner::table::TableDef {
+        name: payload.table,
+        columns,
+        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
+            table: table_info,
+            files: Vec::new(),
+            cloud_properties: BTreeMap::new(),
+            binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+        },
+    };
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(|data_version| ResolvedTableStatisticsPin {
+            table: metadata.table.clone(),
+            data_version,
+        });
+    Ok((table_def, schema_id, statistics_pin, lease))
 }
 
 pub(crate) fn load_table_def_at(
@@ -4192,6 +4273,41 @@ pub(crate) fn load_table_def_at(
             data_version,
         });
     Ok((table_def, schema_id, statistics_pin))
+}
+
+/// Resolve a fixed Iceberg snapshot without publishing a synthetic table to
+/// the process-wide local catalog. The returned planning lease is retained by
+/// the query binding and later reused by statistics and split preparation.
+pub(crate) fn load_time_travel_table_def_with_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    snapshot_id: i64,
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<ResolvedTableStatisticsPin>,
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+    ),
+    String,
+> {
+    let (mut table_def, _schema_id, statistics_pin, planning_lease) =
+        load_schema_table_def_with_lease(controls, context, catalog, namespace, table)?;
+    let crate::sql::planner::table::ScanSource::IcebergDataFiles {
+        table,
+        files,
+        binding,
+        ..
+    } = &mut table_def.source
+    else {
+        return Err("Iceberg time travel metadata did not produce a file scan".to_string());
+    };
+    table.current_snapshot_id = Some(snapshot_id);
+    files.clear();
+    *binding = super::scan_model::IcebergDataFileBinding::ExplicitFiles;
+    Ok((table_def, statistics_pin, planning_lease))
 }
 
 pub(crate) fn load_metadata_table_def(
@@ -4382,8 +4498,57 @@ pub(crate) fn plan_native_iceberg_read(
     )
 }
 
+/// Plans an Iceberg read against a control generation selected during query
+/// metadata resolution.  Callers retain the returned lease in the prepared
+/// execution binding through the backend ensure barrier; this path must not
+/// acquire a newer control generation.
+pub(crate) fn plan_native_iceberg_read_with_lease(
+    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    binding: super::scan_model::IcebergDataFileBinding,
+    explicit_files: &[IcebergDataFileInfo],
+    projection: &[usize],
+    static_predicates: Vec<ConnectorStaticPredicate>,
+) -> Result<PlannedIcebergConnectorRead, String> {
+    plan_native_iceberg_read_with_bound_lease(
+        lease,
+        context,
+        table,
+        binding,
+        Some(explicit_files),
+        projection,
+        static_predicates,
+    )
+}
+
 fn plan_native_iceberg_read_with_file_override(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    binding: super::scan_model::IcebergDataFileBinding,
+    explicit_files: Option<&[IcebergDataFileInfo]>,
+    projection: &[usize],
+    static_predicates: Vec<ConnectorStaticPredicate>,
+) -> Result<PlannedIcebergConnectorRead, String> {
+    let instance_id =
+        ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
+    let lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    plan_native_iceberg_read_with_bound_lease(
+        lease,
+        context,
+        table,
+        binding,
+        explicit_files,
+        projection,
+        static_predicates,
+    )
+}
+
+fn plan_native_iceberg_read_with_bound_lease(
+    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
     table: &super::scan_model::IcebergTableInfo,
     binding: super::scan_model::IcebergDataFileBinding,
@@ -4395,10 +4560,14 @@ fn plan_native_iceberg_read_with_file_override(
 
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
-    let lease = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
     let control_binding = lease.binding();
+    if control_binding.descriptor().instance_id != instance_id {
+        return Err(format!(
+            "Iceberg planning lease owner '{:?}' does not match table catalog '{}'",
+            control_binding.descriptor().instance_id,
+            table.catalog
+        ));
+    }
     let declaration = control_binding
         .execution_declaration(&context)
         .map_err(|error| error.to_string())?;
@@ -4508,8 +4677,25 @@ pub(crate) fn plan_native_iceberg_delta_read(
     sources: &[super::delta::DeltaSourceFile],
     delete_side: Option<&super::delta::DeltaScanDeleteSide>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
-    let mut planned = plan_native_iceberg_read(
-        controls,
+    let instance_id =
+        ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
+    let lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    plan_native_iceberg_delta_read_with_lease(lease, context, table, sources, delete_side)
+}
+
+/// Equivalent to [`plan_native_iceberg_delta_read`] but uses the exact
+/// metadata lease already retained by the query binding store.
+pub(crate) fn plan_native_iceberg_delta_read_with_lease(
+    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    table: &super::scan_model::IcebergTableInfo,
+    sources: &[super::delta::DeltaSourceFile],
+    delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+) -> Result<PlannedIcebergConnectorRead, String> {
+    let mut planned = plan_native_iceberg_read_with_lease(
+        lease,
         context.clone(),
         table,
         super::scan_model::IcebergDataFileBinding::ExplicitFiles,

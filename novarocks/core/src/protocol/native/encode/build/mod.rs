@@ -62,9 +62,9 @@ fn build_for_test(
     let controls = crate::connector::FixtureControlResolver::new(request.connectors.clone());
     let prepared = prepare_fragments(
         request.distributed_plan,
-        request.connectors,
         &controls,
         &crate::connector::test_request_context(),
+        None,
         request.scan_binding_resolver,
         crate::query_execution::preparation::ScanPreparationOptions::default(),
     )?;

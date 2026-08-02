@@ -185,6 +185,7 @@ fn remap_scalar(
             name,
             args,
             distinct,
+            volatility,
         } => {
             let args = remap_scalar_vec(arena, args, bindings)?;
             Some(arena.intern(
@@ -192,6 +193,7 @@ fn remap_scalar(
                     name,
                     args,
                     distinct,
+                    volatility,
                 },
                 data_type,
                 nullable,

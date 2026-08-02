@@ -104,9 +104,10 @@ pub(crate) fn normalize(
             name,
             args,
             distinct,
+            volatility,
         } => NormExpr::Call {
             name: format!("fn:{}", name.to_ascii_lowercase()),
-            distinct: *distinct,
+            distinct: *distinct || volatility.is_volatile(),
             args: args
                 .iter()
                 .map(|arg| normalize(arena, *arg, base_names))
@@ -271,6 +272,7 @@ fn rewrite_children(
             name,
             args,
             distinct,
+            volatility,
         } => ScalarNode::FunctionCall {
             name,
             args: args
@@ -278,6 +280,7 @@ fn rewrite_children(
                 .map(|arg| rewrite(arena, arg))
                 .collect::<Option<Vec<_>>>()?,
             distinct,
+            volatility,
         },
         ScalarNode::AggregateCall {
             name,

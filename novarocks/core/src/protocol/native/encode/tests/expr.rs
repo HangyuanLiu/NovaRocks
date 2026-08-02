@@ -227,6 +227,7 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
                 name: "abs".to_string(),
                 args: vec![col.clone()],
                 distinct: false,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             data_type: DataType::Int64,
             nullable: true,

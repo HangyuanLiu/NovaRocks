@@ -600,6 +600,7 @@ impl AnalyzerScope {
             };
             let coalesce = TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    volatility: crate::sql::functions::builtin_function_volatility("coalesce"),
                     name: "coalesce".to_string(),
                     args: vec![left_ref, right_ref],
                     distinct: false,

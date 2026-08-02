@@ -67,6 +67,7 @@ fn encode_expr_kind(e: &TypedExpr) -> Result<expr::expr::Kind, String> {
             name,
             args,
             distinct,
+            ..
         } => Kind::FunctionCall(expr::FunctionCall {
             function_name: name.clone(),
             args: encode_exprs(args)?,

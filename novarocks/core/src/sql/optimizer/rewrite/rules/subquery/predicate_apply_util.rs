@@ -566,6 +566,7 @@ mod legacy {
                     },
                 ],
                 distinct: false,
+                volatility: crate::sql::functions::FunctionVolatility::Immutable,
             },
             data_type: DataType::Boolean,
             nullable: false,

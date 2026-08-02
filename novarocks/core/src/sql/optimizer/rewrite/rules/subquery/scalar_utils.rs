@@ -383,10 +383,12 @@ where
             name,
             args,
             distinct,
+            volatility,
         } => ScalarNode::FunctionCall {
             name,
             args: rewrite_vec(arena, args, rewrite)?,
             distinct,
+            volatility,
         },
         ScalarNode::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
             params,
@@ -531,6 +533,7 @@ pub(super) fn coalesce_false(arena: &mut ScalarArena, pred: ScalarId) -> ScalarI
     let false_lit = bool_literal(arena, false);
     arena.intern(
         ScalarNode::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
             args: vec![pred, false_lit],
             distinct: false,
@@ -548,6 +551,7 @@ pub(super) fn ifnull_zero(
     let zero = int_literal(arena, 0);
     arena.intern(
         ScalarNode::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "ifnull".to_string(),
             args: vec![value, zero],
             distinct: false,
@@ -565,6 +569,7 @@ pub(super) fn assert_true(
     let message = string_literal(arena, message);
     arena.intern(
         ScalarNode::FunctionCall {
+            volatility: crate::sql::functions::FunctionVolatility::Immutable,
             name: "assert_true".to_string(),
             args: vec![condition, message],
             distinct: false,

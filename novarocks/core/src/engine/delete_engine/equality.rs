@@ -143,7 +143,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
             &self.delete_query,
             self.sink_spec.clone(),
             None,
-            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
             Some(&self.execution),
             &self.connector_context,
             Some(self.connector_write.clone()),
