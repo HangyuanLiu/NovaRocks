@@ -358,24 +358,21 @@ fn rewrite_table_version_after_alias(sql: &str) -> Result<String, String> {
             if byte == b'\'' {
                 in_single_quote = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
         if in_double_quote {
             if byte == b'"' {
                 in_double_quote = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
         if in_backtick {
             if byte == b'`' {
                 in_backtick = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
         match byte {
@@ -406,7 +403,13 @@ fn rewrite_table_version_after_alias(sql: &str) -> Result<String, String> {
             && let Some((alias_start, alias_end, version_start, version_end)) =
                 table_version_after_alias_ranges(bytes, idx + 2)
         {
-            output.push(' ');
+            if !output
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                output.push(' ');
+            }
             output.push_str(&sql[version_start..version_end]);
             output.push_str(" AS ");
             output.push_str(&sql[alias_start..alias_end]);
@@ -414,8 +417,7 @@ fn rewrite_table_version_after_alias(sql: &str) -> Result<String, String> {
             continue;
         }
 
-        output.push(byte as char);
-        idx += 1;
+        idx = push_original_char(&mut output, sql, idx);
     }
 
     Ok(output)
@@ -1697,24 +1699,21 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             if byte == b'\'' {
                 in_single_quote = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
         if in_double_quote {
             if byte == b'"' {
                 in_double_quote = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
         if in_backtick {
             if byte == b'`' {
                 in_backtick = false;
             }
-            output.push(byte as char);
-            idx += 1;
+            idx = push_original_char(&mut output, sql, idx);
             continue;
         }
 
@@ -1747,8 +1746,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             let after_version = idx + "version".len();
             if is_identifier_byte(bytes.get(after_version).copied()) {
                 // Not a standalone keyword — push and continue.
-                output.push(byte as char);
-                idx += 1;
+                idx = push_original_char(&mut output, sql, idx);
                 continue;
             }
 
@@ -1759,8 +1757,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             if !starts_with_keyword(bytes, as_start, "as")
                 || is_identifier_byte(bytes.get(as_start + 2).copied())
             {
-                output.push(byte as char);
-                idx += 1;
+                idx = push_original_char(&mut output, sql, idx);
                 continue;
             }
             let after_as = skip_ascii_whitespace(bytes, as_start + 2);
@@ -1769,8 +1766,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             if !starts_with_keyword(bytes, after_as, "of")
                 || is_identifier_byte(bytes.get(after_as + 2).copied())
             {
-                output.push(byte as char);
-                idx += 1;
+                idx = push_original_char(&mut output, sql, idx);
                 continue;
             }
             let after_of = skip_ascii_whitespace(bytes, after_as + 2);
@@ -1778,8 +1774,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             // Check for single-quoted string literal.
             if bytes.get(after_of) != Some(&b'\'') {
                 // Numeric VERSION AS OF — leave untouched.
-                output.push(byte as char);
-                idx += 1;
+                idx = push_original_char(&mut output, sql, idx);
                 continue;
             }
 
@@ -1803,8 +1798,7 @@ fn rewrite_version_as_of_string(sql: &str) -> Result<String, String> {
             continue;
         }
 
-        output.push(byte as char);
-        idx += 1;
+        idx = push_original_char(&mut output, sql, idx);
     }
 
     Ok(output)
@@ -3150,6 +3144,17 @@ mod tests {
         let normalized = super::normalize_for_raw_parse("SELECT '王武程咬金', '中国'")
             .expect("normalize should succeed");
         assert_eq!(normalized, "SELECT '王武程咬金', '中国'");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_preserves_utf8_when_reordering_table_version() {
+        let normalized =
+            super::normalize_for_raw_parse("SELECT '日本語' FROM t AS source VERSION AS OF 42")
+                .expect("normalize should succeed");
+        assert_eq!(
+            normalized,
+            "SELECT '日本語' FROM t VERSION AS OF 42 AS source"
+        );
     }
 
     #[test]
