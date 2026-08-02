@@ -421,6 +421,17 @@ deployment_owner = "fe-1"
         "join fixture may commit only its staging branch"
     );
 
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_empty_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders WHERE k1 < 0",
+    )
+    .expect("create empty MV target");
+    let empty_outcome = engine
+        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_empty_mv")
+        .expect("stage empty first refresh through native QES");
+    assert_eq!(empty_outcome.input_rows, 0);
+    assert_eq!(empty_outcome.artifact_count, 0);
+    assert_eq!(empty_outcome.staged_bytes, 0);
+
     drop(engine);
     drop(conn);
     shutdown_tx
