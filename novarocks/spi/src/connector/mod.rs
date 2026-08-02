@@ -18,6 +18,7 @@
 mod context;
 mod control;
 mod data_mutation;
+mod distributed_rewrite;
 mod distribution;
 mod error;
 mod execution;
@@ -50,6 +51,17 @@ pub use data_mutation::{
     MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
+};
+pub use distributed_rewrite::{
+    CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION, ConnectorDistributedRewrite,
+    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
+    ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewriteLease,
+    ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
+    ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
+    ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary,
+    ConnectorDistributedRewriteResolver, MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
+    MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
+    REWRITE_POSITION_DELETES_KIND,
 };
 pub use distribution::{
     ConnectorExecutionDeclaration, ConnectorInstanceIncarnation,

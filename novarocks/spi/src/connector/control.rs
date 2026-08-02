@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorDistributedRewrite,
+    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
@@ -67,6 +68,7 @@ pub struct ConnectorControlBinding {
     mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
     data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
     metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+    distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
 }
@@ -246,6 +248,7 @@ impl ConnectorControlBinding {
             mutation,
             data_mutation,
             metadata_maintenance: None,
+            distributed_rewrite: None,
             write,
             statistics,
         })
@@ -286,6 +289,43 @@ impl ConnectorControlBinding {
         Ok(binding)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_maintenance_capabilities(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+        metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+        distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(rewrite) = &distributed_rewrite {
+            super::distributed_rewrite::validate_distributed_rewrite_owner(
+                &descriptor,
+                incarnation,
+                rewrite.as_ref(),
+            )?;
+        }
+        let mut binding = Self::try_new_with_all_capabilities_and_metadata_maintenance(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            metadata_maintenance,
+            write,
+            statistics,
+        )?;
+        binding.distributed_rewrite = distributed_rewrite;
+        Ok(binding)
+    }
+
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -312,6 +352,10 @@ impl ConnectorControlBinding {
 
     pub fn metadata_maintenance(&self) -> Option<&Arc<dyn ConnectorMetadataMaintenance>> {
         self.metadata_maintenance.as_ref()
+    }
+
+    pub fn distributed_rewrite(&self) -> Option<&Arc<dyn ConnectorDistributedRewrite>> {
+        self.distributed_rewrite.as_ref()
     }
 
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
@@ -368,6 +412,7 @@ pub trait ConnectorControlRegistry:
     + ConnectorCatalogMutationResolver
     + ConnectorDataMutationResolver
     + ConnectorMetadataMaintenanceResolver
+    + ConnectorDistributedRewriteResolver
     + ConnectorWriteResolver
     + ConnectorStatisticsResolver
 {
