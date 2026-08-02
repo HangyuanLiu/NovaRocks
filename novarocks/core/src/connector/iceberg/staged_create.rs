@@ -895,25 +895,26 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 })
             }
             Ok(Err(iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(error))) => {
-                let evidence = self.publish_evidence(
+                let receipt = self.bounded_receipt(
                     request.operation_id,
-                    operation_id,
-                    &prepared,
-                    expected_snapshot_id,
-                )?;
-                self.set_unknown(
-                    operation_id,
-                    ConnectorStagedCreateReconcilePhase::Publish,
-                    &evidence,
-                    Some(prepared),
+                    ConnectorStagedCreateReceiptPhase::Published,
+                    ExternalMutationEffect::Applied,
+                    Bytes::copy_from_slice(operation_id.to_bytes().as_slice()),
                 );
-                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
+                self.entry.invalidate_table_cache(
+                    &prepared.staged.table.identifier().namespace.to_url_string(),
+                    &prepared.staged.table.identifier().name,
+                );
+                self.record_terminal(operation_id, OperationState::Published);
+                Ok(committed_response_failure_outcome(
+                    receipt,
+                    ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
-                        error.to_string(),
+                        format!(
+                            "REST staged CTAS publication committed but response finalization failed: {error}"
+                        ),
                     ),
-                    evidence,
-                })
+                ))
             }
             Err(error) => {
                 self.operations
@@ -1228,6 +1229,16 @@ fn abort_reconcile_unknown(
     }
 }
 
+fn committed_response_failure_outcome(
+    receipt: ConnectorStagedCreateReceipt,
+    failure: ConnectorMutationFailure,
+) -> ConnectorStagedCreatePublishOutcome {
+    ConnectorStagedCreatePublishOutcome::Applied {
+        receipt,
+        finalization: ExternalMutationFinalization::Failed(failure),
+    }
+}
+
 fn operation_kind(phase: ConnectorStagedCreateReconcilePhase) -> &'static str {
     match phase {
         ConnectorStagedCreateReconcilePhase::Prepare => "staged-create-prepare",
@@ -1285,5 +1296,37 @@ mod tests {
             panic!("abort reconcile must remain unknown")
         };
         assert_eq!(retained, evidence);
+    }
+
+    #[test]
+    fn committed_response_failure_preserves_applied_truth() {
+        let operation_id = ConnectorMutationOperationId::new();
+        let receipt = ConnectorStagedCreateReceipt::try_new(
+            ConnectorExecutionBindingKey {
+                instance_id: ConnectorInstanceId::parse("rest").unwrap(),
+                incarnation: ConnectorInstanceIncarnation::new(),
+            },
+            operation_id,
+            ConnectorStagedCreateReceiptPhase::Published,
+            ExternalMutationEffect::Applied,
+            Bytes::from_static(b"published"),
+        )
+        .unwrap();
+        let outcome = committed_response_failure_outcome(
+            receipt.clone(),
+            ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                "response finalization failed",
+            ),
+        );
+        let ConnectorStagedCreatePublishOutcome::Applied {
+            receipt: retained,
+            finalization: ExternalMutationFinalization::Failed(failure),
+        } = outcome
+        else {
+            panic!("committed response failure must remain applied")
+        };
+        assert_eq!(retained, receipt);
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
     }
 }
