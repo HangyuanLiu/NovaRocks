@@ -21,6 +21,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
@@ -30,22 +31,26 @@ use novarocks::engine::table_maintenance::{
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
-    ConnectorMutationOperationId,
+    ConnectorMutationOperationId, ConnectorWriteOperationId, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
 use self::model::{
-    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
-    MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
-    MetadataMaintenancePlanPayload, OptimizeJobCreate,
+    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
+    DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
+    DistributedRewriteOperationKind, DistributedRewritePlanPayload, MetadataMaintenanceExactOwner,
+    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperationCreate,
+    MetadataMaintenanceOperationKind, MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use self::parser::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, is_spark_maintenance_call,
     parse_maintenance_statement, parse_show_optimize,
 };
 use self::repository::{
-    MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
+    DistributedRewriteOperationRepository, MetadataMaintenanceOperationRepository,
+    OptimizeJobRepository, RepositoryErrorKind, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
 };
 use self::result::{action_result, optimize_jobs_result};
@@ -63,6 +68,8 @@ const AUTOMATIC_OPTIMIZE_STATE_STORE_REQUIRED: &str =
     "automatic optimize requires frontend StateStore";
 const METADATA_MAINTENANCE_STATE_STORE_REQUIRED: &str =
     "connector metadata maintenance requires frontend StateStore";
+const DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED: &str =
+    "connector distributed rewrite requires frontend StateStore";
 
 enum WorkerLifecycle {
     NotStarted,
@@ -74,13 +81,14 @@ enum WorkerLifecycle {
 pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
+    distributed_rewrite_repository: Option<Arc<DistributedRewriteOperationRepository>>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
 }
 
 impl FrontendTableMaintenanceService {
     pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
-        let (repository, metadata_repository) = match store {
+        let (repository, metadata_repository, distributed_rewrite_repository) = match store {
             Some(store) => (
                 Some(Arc::new(
                     OptimizeJobRepository::open(Arc::clone(&store))
@@ -90,18 +98,26 @@ impl FrontendTableMaintenanceService {
                         })?,
                 )),
                 Some(Arc::new(
-                    MetadataMaintenanceOperationRepository::open(store)
+                    MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
                         .await
                         .map_err(|error| {
                             format!("open frontend metadata maintenance repository failed: {error}")
                         })?,
                 )),
+                Some(Arc::new(
+                    DistributedRewriteOperationRepository::open(store)
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend distributed rewrite repository failed: {error}")
+                        })?,
+                )),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
         Ok(Self {
             repository,
             metadata_repository,
+            distributed_rewrite_repository,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
@@ -161,6 +177,47 @@ impl FrontendTableMaintenanceService {
                 Ok(MaintenanceStatementResult::Ok)
             };
         }
+        if let ParsedMaintenanceAction::RewriteDataFiles {
+            options,
+            branch,
+            where_clause,
+        } = action.clone()
+        {
+            let intent = distributed_data_rewrite_intent(
+                &options,
+                branch.as_deref(),
+                where_clause.as_deref(),
+            )?;
+            let outcome = self.execute_durable_distributed_rewrite(
+                engine,
+                target,
+                intent,
+                DistributedRewriteOperationKind::RewriteDataFiles,
+            )?;
+            return if spark_result {
+                action_result(outcome)
+            } else {
+                Ok(MaintenanceStatementResult::Ok)
+            };
+        }
+        if let ParsedMaintenanceAction::RewritePositionDeleteFiles {
+            options,
+            where_clause,
+        } = action.clone()
+        {
+            let intent = distributed_position_rewrite_intent(&options, where_clause.as_deref())?;
+            let outcome = self.execute_durable_distributed_rewrite(
+                engine,
+                target,
+                intent,
+                DistributedRewriteOperationKind::RewritePositionDeleteFiles,
+            )?;
+            return if spark_result {
+                action_result(outcome)
+            } else {
+                Ok(MaintenanceStatementResult::Ok)
+            };
+        }
         let request = action.into_request(engine, target)?;
         let outcome = engine.execute_action(request)?;
         if spark_result {
@@ -168,6 +225,263 @@ impl FrontendTableMaintenanceService {
         } else {
             Ok(MaintenanceStatementResult::Ok)
         }
+    }
+
+    fn execute_durable_distributed_rewrite(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+        intent: DistributedRewriteIntent,
+        kind: DistributedRewriteOperationKind,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        let repository = self
+            .distributed_rewrite_repository
+            .as_ref()
+            .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
+        let operation_id = ConnectorWriteOperationId::new();
+        let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        let request_payload = distributed_rewrite_request_payload(intent);
+        let session = engine.plan_distributed_rewrite(&target, operation_id, intent)?;
+        let plan = session.plan();
+        self.block_on(repository.create(DistributedRewriteOperationCreate {
+            operation_id: durable_id,
+            target: target.clone(),
+            owner: MetadataMaintenanceExactOwner {
+                instance_id: plan.owner().instance_id.as_str().to_string(),
+                incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
+            },
+            kind,
+            request_digest: plan.request_digest(),
+            base_state_digest: plan.state_digest(),
+            request_payload_digest: distributed_rewrite_payload_digest(&request_payload),
+            request_payload,
+            created_at_ms: now_unix_millis(),
+        }))
+        .map_err(|error| {
+            format!("persist distributed rewrite pending operation failed: {error}")
+        })?;
+        let plan_payload = plan.provider_payload().to_vec();
+        self.block_on(
+            repository.plan(
+                durable_id,
+                DistributedRewritePlanPayload {
+                    plan_digest: plan.plan_digest(),
+                    manifest_digest: plan.manifest_digest(),
+                    cohort_set_digest: session.cohort_set_digest(),
+                    payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                    payload: plan_payload,
+                    cohort_count: u32::try_from(plan.cohorts().len())
+                        .map_err(|_| "distributed rewrite cohort count exceeds u32".to_string())?,
+                },
+                now_unix_millis(),
+            ),
+        )
+        .map_err(|error| format!("persist distributed rewrite plan failed: {error}"))?;
+
+        if session.is_noop() {
+            let receipt = b"distributed-rewrite-noop-v1".to_vec();
+            self.block_on(repository.finish(
+                durable_id,
+                DistributedRewriteOpaquePayload {
+                    digest: distributed_rewrite_payload_digest(&receipt),
+                    payload: receipt,
+                },
+                now_unix_millis(),
+            ))
+            .map_err(|error| {
+                format!("persist distributed rewrite no-op receipt failed: {error}")
+            })?;
+            return rewrite_noop_outcome(kind);
+        }
+
+        self.block_on(repository.start_staging(durable_id, now_unix_millis()))
+            .map_err(|error| {
+                format!("persist distributed rewrite staging state failed: {error}")
+            })?;
+        for cohort in plan.cohorts() {
+            let completion =
+                match engine.stage_distributed_rewrite_cohort(&session, cohort.cohort_id()) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        return self.abort_failed_distributed_rewrite(
+                            engine, repository, durable_id, &session, error,
+                        );
+                    }
+                };
+            let checkpoint =
+                match engine.checkpoint_distributed_rewrite_attempt(&session, &completion) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        return self.abort_failed_distributed_rewrite(
+                            engine, repository, durable_id, &session, error,
+                        );
+                    }
+                };
+            self.block_on(
+                repository
+                    .checkpoint_attempt(durable_id, distributed_rewrite_checkpoint(checkpoint)),
+            )
+            .map_err(|error| {
+                format!("persist distributed rewrite attempt checkpoint failed: {error}")
+            })?;
+        }
+        self.block_on(repository.mark_commit_pending(durable_id, now_unix_millis()))
+            .map_err(|error| format!("persist distributed rewrite commit state failed: {error}"))?;
+        match engine.commit_distributed_rewrite(&session)? {
+            ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => {
+                let rewrite_receipt = engine.finalize_distributed_rewrite(&session, &receipt)?;
+                let payload = rewrite_receipt.provider_payload().to_vec();
+                self.block_on(repository.finish(
+                    durable_id,
+                    DistributedRewriteOpaquePayload {
+                        digest: distributed_rewrite_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                ))
+                .map_err(|error| format!("persist distributed rewrite receipt failed: {error}"))?;
+                if let ExternalMutationFinalization::Failed(failure) = finalization {
+                    return Err(format!(
+                        "distributed rewrite committed but finalization failed: {failure}"
+                    ));
+                }
+                rewrite_outcome_from_receipt(kind, rewrite_receipt.summary(), plan.summary())
+            }
+            ExternalMutationOutcome::KnownUncommitted { failure } => self
+                .abort_failed_distributed_rewrite(
+                    engine,
+                    repository,
+                    durable_id,
+                    &session,
+                    format!("distributed rewrite commit was not applied: {failure}"),
+                ),
+            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+                let payload = evidence
+                    .try_to_wire_v1()
+                    .map_err(|error| error.to_string())?
+                    .to_vec();
+                let evidence = ExternalMutationEvidence::try_from_wire_v1(&payload)
+                    .map_err(|error| format!("restore distributed rewrite evidence: {error}"))?;
+                self.block_on(repository.mark_reconcile_pending(
+                    durable_id,
+                    DistributedRewriteOpaquePayload {
+                        digest: distributed_rewrite_payload_digest(&payload),
+                        payload,
+                    },
+                    now_unix_millis(),
+                ))
+                .map_err(|error| {
+                    format!("persist distributed rewrite reconcile state failed: {error}")
+                })?;
+                match engine.reconcile_distributed_rewrite(&session, evidence)? {
+                    ExternalMutationOutcome::KnownCommitted {
+                        receipt,
+                        finalization,
+                        ..
+                    } => {
+                        let rewrite_receipt =
+                            engine.finalize_distributed_rewrite(&session, &receipt)?;
+                        let payload = rewrite_receipt.provider_payload().to_vec();
+                        self.block_on(repository.finish(
+                            durable_id,
+                            DistributedRewriteOpaquePayload {
+                                digest: distributed_rewrite_payload_digest(&payload),
+                                payload,
+                            },
+                            now_unix_millis(),
+                        ))
+                        .map_err(|error| {
+                            format!("persist reconciled distributed rewrite receipt failed: {error}")
+                        })?;
+                        if let ExternalMutationFinalization::Failed(finalization) = finalization {
+                            return Err(format!(
+                                "distributed rewrite reconciled as committed but finalization failed: {finalization}"
+                            ));
+                        }
+                        rewrite_outcome_from_receipt(kind, rewrite_receipt.summary(), plan.summary())
+                    }
+                    ExternalMutationOutcome::KnownUncommitted { failure: reconcile_failure } => {
+                        self.abort_failed_distributed_rewrite(
+                            engine,
+                            repository,
+                            durable_id,
+                            &session,
+                            format!(
+                                "distributed rewrite commit was not applied after reconcile: {reconcile_failure}"
+                            ),
+                        )
+                    }
+                    ExternalMutationOutcome::CommitUnknown { failure: reconcile_failure, .. } => {
+                        Err(format!(
+                            "distributed rewrite commit outcome remains unknown after reconcile: {failure}; {reconcile_failure}"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn abort_failed_distributed_rewrite(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        repository: &DistributedRewriteOperationRepository,
+        operation_id: uuid::Uuid,
+        session: &novarocks::connector::distributed_rewrite_application::DistributedRewriteMaintenanceSession,
+        error: String,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        self.block_on(repository.mark_abort_pending(operation_id, now_unix_millis()))
+            .map_err(|store| format!("persist distributed rewrite abort state failed: {store}"))?;
+        match engine.abort_distributed_rewrite(session) {
+            Ok(_) => {
+                self.block_on(repository.fail(operation_id, error.clone(), now_unix_millis()))
+                    .map_err(|store| {
+                        format!("persist distributed rewrite failure failed: {store}")
+                    })?;
+                Err(error)
+            }
+            Err(abort) => {
+                self.block_on(repository.mark_unresolved(
+                    operation_id,
+                    format!("{error}; abort unresolved: {abort}"),
+                    now_unix_millis(),
+                ))
+                .map_err(|store| {
+                    format!("persist distributed rewrite unresolved state failed: {store}")
+                })?;
+                Err(format!(
+                    "{error}; distributed rewrite abort unresolved: {abort}"
+                ))
+            }
+        }
+    }
+
+    /// The automatic optimize worker has its own durable-job owner, but its
+    /// external rewrite must still use this exact same distributed-rewrite
+    /// operation path.  The temporary service has no worker lifecycle and is
+    /// used only to share the fenced C1 transaction implementation.
+    pub(crate) fn execute_optimize_distributed_rewrite(
+        runtime: &Handle,
+        distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        let service = Self {
+            repository: None,
+            metadata_repository: None,
+            distributed_rewrite_repository: Some(distributed_rewrite_repository),
+            worker: Mutex::new(WorkerLifecycle::NotStarted),
+            runtime: runtime.clone(),
+        };
+        service.execute_durable_distributed_rewrite(
+            engine,
+            target,
+            DistributedRewriteIntent::DataFiles { rewrite_all: true },
+            DistributedRewriteOperationKind::RewriteDataFiles,
+        )
     }
 
     fn execute_durable_metadata_action(
@@ -483,11 +797,36 @@ impl FrontendTableMaintenanceService {
         }
         Ok(())
     }
+
+    fn recover_distributed_rewrite_operations(&self) -> Result<(), String> {
+        let Some(repository) = &self.distributed_rewrite_repository else {
+            return Ok(());
+        };
+        // A rewrite lease is generation-fenced. After a frontend restart the
+        // old incarnation is intentionally unavailable, so this owner must
+        // not substitute the current binding or resubmit staged work. Keep
+        // the durable fence visible for an exact-generation recovery design.
+        for operation in self
+            .block_on(repository.list_recovery_candidates())
+            .map_err(|error| {
+                format!("list distributed rewrite recovery candidates failed: {error}")
+            })?
+        {
+            self.block_on(repository.mark_unresolved(
+                operation.operation_id,
+                "distributed rewrite requires its original exact connector generation after frontend restart".to_string(),
+                now_unix_millis(),
+            ))
+            .map_err(|error| format!("mark distributed rewrite operation unresolved failed: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         self.recover_metadata_operations(engine.as_ref())?;
+        self.recover_distributed_rewrite_operations()?;
         let mut worker = self
             .worker
             .lock()
@@ -498,9 +837,14 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     .repository
                     .as_ref()
                     .map(|repository| {
+                        let distributed_rewrite_repository = self
+                            .distributed_rewrite_repository
+                            .as_ref()
+                            .ok_or_else(|| DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED.to_string())?;
                         OptimizeWorker::start(
                             &self.runtime,
                             Arc::clone(repository),
+                            Arc::clone(distributed_rewrite_repository),
                             Arc::downgrade(&engine),
                         )
                     })
@@ -548,7 +892,35 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
-        engine.execute_action(request)
+        match request {
+            MaintenanceActionRequest::RewriteDataFiles {
+                target,
+                options,
+                branch,
+                where_clause,
+                ..
+            } => self.execute_durable_distributed_rewrite(
+                engine,
+                target,
+                distributed_data_rewrite_intent(
+                    &options,
+                    branch.as_deref(),
+                    where_clause.as_deref(),
+                )?,
+                DistributedRewriteOperationKind::RewriteDataFiles,
+            ),
+            MaintenanceActionRequest::RewritePositionDeleteFiles {
+                target,
+                options,
+                where_clause,
+            } => self.execute_durable_distributed_rewrite(
+                engine,
+                target,
+                distributed_position_rewrite_intent(&options, where_clause.as_deref())?,
+                DistributedRewriteOperationKind::RewritePositionDeleteFiles,
+            ),
+            other => engine.execute_action(other),
+        }
     }
 
     fn submit_automatic_optimize(
@@ -640,4 +1012,167 @@ fn now_unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn distributed_data_rewrite_intent(
+    options: &std::collections::BTreeMap<String, String>,
+    branch: Option<&str>,
+    where_clause: Option<&str>,
+) -> Result<DistributedRewriteIntent, String> {
+    if where_clause.is_some() {
+        return Err("rewrite_data_files where is not supported in NovaRocks yet".to_string());
+    }
+    if branch.is_some() {
+        return Err("rewrite_data_files branch is not supported in NovaRocks yet".to_string());
+    }
+    let mut rewrite_all = false;
+    for (key, value) in options {
+        match key.as_str() {
+            "rewrite-all" if value.eq_ignore_ascii_case("true") => rewrite_all = true,
+            "rewrite-all" => {
+                return Err("rewrite_data_files option `rewrite-all` must be `true`".to_string());
+            }
+            "min-input-files" | "target-file-size-bytes" => {
+                return Err(format!("unsupported rewrite_data_files option `{key}`"));
+            }
+            other => return Err(format!("unsupported rewrite_data_files option `{other}`")),
+        }
+    }
+    Ok(DistributedRewriteIntent::DataFiles { rewrite_all })
+}
+
+fn distributed_position_rewrite_intent(
+    options: &std::collections::BTreeMap<String, String>,
+    where_clause: Option<&str>,
+) -> Result<DistributedRewriteIntent, String> {
+    if where_clause.is_some() {
+        return Err(
+            "rewrite_position_delete_files where is not supported in NovaRocks".to_string(),
+        );
+    }
+    let mut rewrite_all = false;
+    let mut min_input_files = Some(2_u32);
+    for (key, value) in options {
+        match key.as_str() {
+            "rewrite-all" => {
+                rewrite_all = if value.eq_ignore_ascii_case("true") {
+                    true
+                } else if value.eq_ignore_ascii_case("false") {
+                    false
+                } else {
+                    return Err(
+                        "rewrite_position_delete_files option `rewrite-all` must be `true` or `false`"
+                            .to_string(),
+                    );
+                };
+            }
+            "min-input-files" => {
+                let parsed = value.parse::<u32>().map_err(|_| {
+                    "rewrite_position_delete_files option `min-input-files` must be positive".to_string()
+                })?;
+                if parsed == 0 {
+                    return Err("rewrite_position_delete_files option `min-input-files` must be positive".to_string());
+                }
+                min_input_files = Some(parsed);
+            }
+            "target-file-size-bytes" => return Err(
+                "rewrite_position_delete_files option `target-file-size-bytes` is not implemented in NovaRocks yet".to_string(),
+            ),
+            other => return Err(format!("unsupported rewrite_position_delete_files option `{other}`")),
+        }
+    }
+    Ok(DistributedRewriteIntent::PositionDeletes {
+        rewrite_all,
+        min_input_files,
+    })
+}
+
+fn distributed_rewrite_request_payload(intent: DistributedRewriteIntent) -> Vec<u8> {
+    match intent {
+        DistributedRewriteIntent::DataFiles { rewrite_all } => {
+            format!("distributed-rewrite-request-v1:data:{rewrite_all}").into_bytes()
+        }
+        DistributedRewriteIntent::PositionDeletes {
+            rewrite_all,
+            min_input_files,
+        } => format!(
+            "distributed-rewrite-request-v1:position:{rewrite_all}:{}",
+            min_input_files.unwrap_or_default()
+        )
+        .into_bytes(),
+    }
+}
+
+fn distributed_rewrite_checkpoint(
+    checkpoint: novarocks_spi::connector::ConnectorDistributedRewriteAttemptCheckpoint,
+) -> DistributedRewriteAttemptCheckpoint {
+    DistributedRewriteAttemptCheckpoint {
+        cohort_id: checkpoint.cohort_id.to_bytes(),
+        execution_id: checkpoint.execution_id,
+        disposition: match checkpoint.disposition {
+            novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition::Accepted => {
+                DistributedRewriteAttemptDisposition::Accepted
+            }
+            novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition::Superseded => {
+                DistributedRewriteAttemptDisposition::Superseded
+            }
+        },
+        attempt_digest: checkpoint.attempt_digest,
+        artifact_digest: checkpoint.artifact_digest,
+        artifact_handle: checkpoint.artifact_handle.to_vec(),
+        checkpoint_digest: checkpoint.checkpoint_digest,
+    }
+}
+
+fn rewrite_noop_outcome(
+    kind: DistributedRewriteOperationKind,
+) -> Result<MaintenanceActionOutcome, String> {
+    rewrite_outcome_from_receipt(
+        kind,
+        novarocks_spi::connector::ConnectorDistributedRewriteReceiptSummary::default(),
+        novarocks_spi::connector::ConnectorDistributedRewritePlanSummary::default(),
+    )
+}
+
+fn rewrite_outcome_from_receipt(
+    kind: DistributedRewriteOperationKind,
+    receipt: novarocks_spi::connector::ConnectorDistributedRewriteReceiptSummary,
+    plan: novarocks_spi::connector::ConnectorDistributedRewritePlanSummary,
+) -> Result<MaintenanceActionOutcome, String> {
+    let count = |value: u64, name: &str| {
+        i32::try_from(value).map_err(|_| format!("distributed rewrite metric `{name}` overflow"))
+    };
+    match kind {
+        DistributedRewriteOperationKind::RewriteDataFiles => {
+            Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: receipt.target_version,
+                rewritten_data_files_count: count(receipt.input_data_files, "input_data_files")?,
+                added_data_files_count: count(receipt.output_data_files, "output_data_files")?,
+                rewritten_bytes_count: i64::try_from(plan.input_bytes)
+                    .map_err(|_| "distributed rewrite input bytes overflow".to_string())?,
+                failed_data_files_count: 0,
+                removed_delete_files_count: count(
+                    receipt.input_delete_files,
+                    "input_delete_files",
+                )?,
+                output_record_count: i64::try_from(receipt.output_rows)
+                    .map_err(|_| "distributed rewrite output rows overflow".to_string())?,
+            })
+        }
+        DistributedRewriteOperationKind::RewritePositionDeleteFiles => {
+            Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                rewritten_delete_files_count: count(
+                    receipt.input_delete_files,
+                    "input_delete_files",
+                )?,
+                added_delete_files_count: count(
+                    receipt.output_delete_files,
+                    "output_delete_files",
+                )?,
+                rewritten_bytes_count: i64::try_from(plan.input_bytes)
+                    .map_err(|_| "distributed rewrite input bytes overflow".to_string())?,
+                added_bytes_count: 0,
+            })
+        }
+    }
 }

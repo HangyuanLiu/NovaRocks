@@ -775,6 +775,7 @@ fn test_distributed_rewrite_lease(
         binding.descriptor().clone(),
         key,
         Arc::clone(binding.metadata()),
+        Arc::clone(binding.planning()),
         rewrite,
         write,
         binding.execution_distribution().clone(),
@@ -4739,6 +4740,68 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         execution,
         Some(DistributedConnectorWrite::Begin(connector_write)),
     )
+}
+
+/// Execute one provider-frozen rewrite source through the ordinary C1 sink.
+/// The physical source is deliberately `ConnectorPinned`: its one-shot
+/// resolver supplies opaque splits already planned by the exact composite
+/// rewrite lease, so this path cannot reopen a current catalog binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
+    state: &Arc<StandaloneState>,
+    physical_plan: crate::sql::planner::physical::PhysicalPlanNode,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    crate::connector::validate_request_context(connector_context)?;
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: "__distributed_rewrite".to_string(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        None,
+        Some(scan_resolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let result = execute_distributed_write_with_execution(
+        &state.query_execution,
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+    )?;
+    connector_staging_completion_from_result(result)
 }
 
 fn root_distribution_output_name(

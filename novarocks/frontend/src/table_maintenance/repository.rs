@@ -3340,6 +3340,8 @@ impl DistributedRewriteOperationRepository {
             &[
                 DistributedRewriteOperationState::Planned,
                 DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
             ],
             DistributedRewriteOperationState::AbortPending,
             None,

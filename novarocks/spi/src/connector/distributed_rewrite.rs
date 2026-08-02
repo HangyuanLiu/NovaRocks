@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorMetadata, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext, ConnectorScanPlanning,
+    ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteCohortId,
+    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
     ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
@@ -574,6 +574,7 @@ pub struct ConnectorDistributedRewriteLease {
     descriptor: ConnectorInstanceDescriptor,
     key: ConnectorExecutionBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
+    planning: Arc<dyn ConnectorScanPlanning>,
     rewrite: Arc<dyn ConnectorDistributedRewrite>,
     write: Arc<dyn ConnectorWriteControl>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -589,6 +590,7 @@ impl ConnectorDistributedRewriteLease {
         descriptor: ConnectorInstanceDescriptor,
         key: ConnectorExecutionBindingKey,
         metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
         rewrite: Arc<dyn ConnectorDistributedRewrite>,
         write: Arc<dyn ConnectorWriteControl>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -596,6 +598,7 @@ impl ConnectorDistributedRewriteLease {
     ) -> Result<Self, ConnectorError> {
         if descriptor.instance_id != key.instance_id
             || metadata.instance_id() != &key.instance_id
+            || planning.instance_id() != &key.instance_id
             || rewrite.descriptor() != &descriptor
             || rewrite.binding_key() != &key
             || write.binding_key() != &key
@@ -608,6 +611,7 @@ impl ConnectorDistributedRewriteLease {
             descriptor,
             key,
             metadata,
+            planning,
             rewrite,
             write,
             distribution,
@@ -624,6 +628,29 @@ impl ConnectorDistributedRewriteLease {
     }
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata
+    }
+    /// The exact scan-planning generation retained for every frozen rewrite
+    /// source.  A rewrite must never reopen a source through a later current
+    /// control binding after its plan has been sealed.
+    pub fn planning(&self) -> &Arc<dyn ConnectorScanPlanning> {
+        &self.planning
+    }
+    /// Produce the opaque BE installer declaration from the same exact
+    /// generation that froze this rewrite.  This prevents a later active
+    /// incarnation from silently serving a staged operation.
+    pub fn execution_declaration(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        let declaration = self.distribution.declaration(context)?;
+        if declaration.descriptor() != &self.descriptor
+            || declaration.incarnation() != self.key.incarnation
+        {
+            return Err(invalid(
+                "distributed rewrite execution declaration does not match lease generation",
+            ));
+        }
+        Ok(declaration)
     }
     pub fn rewrite(&self) -> &Arc<dyn ConnectorDistributedRewrite> {
         &self.rewrite

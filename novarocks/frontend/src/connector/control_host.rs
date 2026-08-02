@@ -488,7 +488,7 @@ impl ConnectorControlHost {
         key: &ConnectorExecutionBindingKey,
         require_active: bool,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let (descriptor, metadata, rewrite, write, distribution) = {
+        let (descriptor, metadata, planning, rewrite, write, distribution) = {
             let mut state = self.lock_state()?;
             let generation = state.generations.get_mut(key).ok_or_else(|| {
                 ConnectorError::new(
@@ -523,6 +523,7 @@ impl ConnectorControlHost {
             (
                 generation.binding.descriptor().clone(),
                 Arc::clone(generation.binding.metadata()),
+                Arc::clone(generation.binding.planning()),
                 rewrite,
                 write,
                 Arc::clone(generation.binding.execution_distribution()),
@@ -535,6 +536,7 @@ impl ConnectorControlHost {
             descriptor,
             key.clone(),
             metadata,
+            planning,
             rewrite,
             write,
             distribution,

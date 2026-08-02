@@ -16,6 +16,7 @@
 // under the License.
 pub(crate) mod backend;
 pub(crate) mod data_mutation;
+pub mod distributed_rewrite_application;
 pub mod file_execution;
 pub mod iceberg;
 pub mod metadata_maintenance;

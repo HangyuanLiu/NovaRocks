@@ -366,6 +366,50 @@ async fn distributed_rewrite_persists_plan_attempts_and_terminal_fence() {
 }
 
 #[tokio::test]
+async fn distributed_rewrite_can_abort_after_known_uncommitted_commit() {
+    let (_temp, _store, repository) = rewrite_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(rewrite_create(operation_id))
+        .await
+        .unwrap();
+    let plan_payload = br#"{"artifact":"provider-owned"}"#.to_vec();
+    repository
+        .plan(
+            operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload,
+                cohort_count: 1,
+            },
+            11,
+        )
+        .await
+        .unwrap();
+    repository.start_staging(operation_id, 12).await.unwrap();
+    repository
+        .mark_commit_pending(operation_id, 13)
+        .await
+        .unwrap();
+    let abort_pending = repository
+        .mark_abort_pending(operation_id, 14)
+        .await
+        .unwrap();
+    assert_eq!(
+        abort_pending.state,
+        DistributedRewriteOperationState::AbortPending
+    );
+    let failed = repository
+        .fail(operation_id, "known uncommitted commit".to_string(), 15)
+        .await
+        .unwrap();
+    assert_eq!(failed.state, DistributedRewriteOperationState::Failed);
+}
+
+#[tokio::test]
 async fn distributed_rewrite_and_legacy_maintenance_are_mutually_exclusive() {
     let (_temp, store, repository) = rewrite_fixture().await;
     repository

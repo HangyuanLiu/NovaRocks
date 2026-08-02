@@ -29,6 +29,7 @@ pub(crate) mod delete_visibility;
 pub mod delta;
 pub(crate) mod delta_reader;
 pub(crate) mod distributed_rewrite;
+pub(crate) mod distributed_rewrite_execution;
 pub(crate) mod distributed_rewrite_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;

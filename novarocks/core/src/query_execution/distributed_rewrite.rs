@@ -11,24 +11,199 @@
 //! for every accepted or superseded attempt.  It intentionally knows neither
 //! files, manifests, nor provider report formats.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
-    ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
-    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAttemptCompletion,
-    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
-    ConnectorWriteReceipt, ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorDistributedRewriteAttemptCheckpoint,
+    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteLease,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewriteReceipt, ConnectorError,
+    ConnectorErrorKind, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
+    ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
+use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
     ConnectorWritePlanningTemplate,
 };
 use crate::query_execution::outcome::ConnectorWriteCompletion;
+use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+
+/// Plan one frozen source through the scan-planning capability retained by a
+/// composite rewrite lease.  The plan is opaque to this module: it has no
+/// Iceberg files, catalog client, or provider report decoding.
+pub(crate) fn plan_frozen_rewrite_connector_read(
+    lease: &ConnectorDistributedRewriteLease,
+    topology: &BackendTopologySnapshot,
+    source: &ConnectorTableHandle,
+    projection: Vec<usize>,
+    context: ConnectorRequestContext,
+) -> Result<PlannedConnectorRead, ConnectorError> {
+    if source.owner() != &lease.binding_key().instance_id {
+        return Err(invalid(
+            "frozen rewrite source does not belong to the exact rewrite lease",
+        ));
+    }
+    let target_parallelism = NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "distributed rewrite requires at least one live backend",
+        )
+    })?;
+    let batch = ConnectorBatchBudget {
+        max_rows: NonZeroUsize::new(4096).expect("rewrite batch rows are nonzero"),
+        max_bytes: NonZeroUsize::new(context.max_handle_payload_bytes())
+            .expect("validated connector payload budget is nonzero"),
+    };
+    let scan = lease.planning().begin_scan(
+        source,
+        ConnectorBeginScanRequest {
+            projection,
+            static_predicates: Vec::new(),
+            selector: ConnectorReadSelector::Current,
+            limit: None,
+            batch,
+            context: context.clone(),
+        },
+    )?;
+    let split_result = lease.planning().plan_splits(
+        &scan.handle,
+        ConnectorSplitPlanningRequest {
+            target_parallelism,
+            max_split_bytes: None,
+            context: context.clone(),
+        },
+    )?;
+    if split_result
+        .splits
+        .iter()
+        .any(|split| split.owner() != &lease.binding_key().instance_id)
+    {
+        return Err(invalid(
+            "distributed rewrite provider planned a split for another connector instance",
+        ));
+    }
+    Ok(PlannedConnectorRead {
+        declaration: lease.execution_declaration(&context)?,
+        scan,
+        splits: split_result.splits,
+        planning_metrics: split_result.metrics,
+        static_predicates: Vec::new(),
+        predicate_dispositions: Vec::new(),
+        residual_predicates: Vec::new(),
+        batch,
+        // The outer rewrite session owns the composite lease through the
+        // native ensure barrier and external commit.  A current planning
+        // lease would be both redundant and incorrect here.
+        planning_lease: None,
+        read_session: split_result.session,
+    })
+}
+
+/// Build the minimal physical source for one opaque frozen rewrite read.
+/// Execution preparation replaces this `ConnectorPinned` node exactly once
+/// with the `PlannedConnectorRead` above; no normal table lookup may run.
+pub(crate) fn frozen_rewrite_scan_physical_plan(
+    input_schema: &arrow::datatypes::SchemaRef,
+) -> crate::sql::planner::physical::PhysicalPlanNode {
+    let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+    let mut output_columns = Vec::with_capacity(input_schema.fields().len());
+    let mut table_columns = Vec::with_capacity(input_schema.fields().len());
+    for field in input_schema.fields() {
+        let name = field.name().to_string();
+        let data_type = field.data_type().clone();
+        let nullable = field.is_nullable();
+        let column_id = factory.create(None, name.clone(), data_type.clone(), nullable);
+        output_columns.push(crate::sql::analysis::OutputColumn {
+            column_id,
+            name: name.clone(),
+            data_type: data_type.clone(),
+            nullable,
+            is_internal: false,
+        });
+        table_columns.push(novarocks_catalog::schema::ColumnDef {
+            name,
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        });
+    }
+    crate::sql::planner::physical::PhysicalPlanNode {
+        kind: crate::sql::planner::physical::PhysicalPlanKind::Scan(
+            crate::sql::planner::payload::PlanScanNode {
+                database: "__distributed_rewrite".to_string(),
+                table: crate::sql::planner::table::TableDef {
+                    name: "__connector_frozen_rewrite".to_string(),
+                    columns: table_columns,
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                },
+                alias: None,
+                columns: output_columns.clone(),
+                predicates: Vec::new(),
+                required_columns: None,
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            },
+        ),
+        children: Vec::new(),
+        output_columns,
+        stats: crate::sql::planner::physical::PhysicalPlanStats {
+            output_row_count: 0.0,
+            row_count_confidence: crate::sql::planner::physical::PlannerConfidence::Fallback,
+            column_statistics: HashMap::new(),
+            cost_estimate: None,
+            broadcast_decision: None,
+        },
+        probe_runtime_filters: Vec::new(),
+    }
+}
+
+/// One-shot injection point for the exact frozen source plan.  Keeping this
+/// local to rewrite execution makes a second provider catalog lookup during
+/// fragment preparation structurally impossible.
+pub(crate) struct FrozenRewriteReadResolver {
+    read: Mutex<Option<PlannedConnectorRead>>,
+}
+
+impl FrozenRewriteReadResolver {
+    pub(crate) fn new(read: PlannedConnectorRead) -> Self {
+        Self {
+            read: Mutex::new(Some(read)),
+        }
+    }
+}
+
+impl crate::query_execution::preparation::scan::ScanBindingResolver for FrozenRewriteReadResolver {
+    fn resolve_scan(
+        &self,
+        _node_id: i32,
+        _scan: &crate::sql::planner::payload::PlanScanNode,
+    ) -> Result<Option<crate::query_execution::preparation::scan::ResolvedScanExecution>, String>
+    {
+        Ok(Some(
+            crate::query_execution::preparation::scan::ResolvedScanExecution::ConnectorRead,
+        ))
+    }
+
+    fn resolve_connector_read(
+        &self,
+        _node_id: i32,
+        _scan: &crate::sql::planner::payload::PlanScanNode,
+    ) -> Result<Option<PlannedConnectorRead>, String> {
+        self.read
+            .lock()
+            .map_err(|_| "frozen rewrite connector read lock poisoned".to_string())
+            .map(|mut read| read.take())
+    }
+}
 
 /// One frozen rewrite operation.  A non-empty plan is sealed into C1 before
 /// any caller can obtain a cohort execution registration.  Empty plans are a
@@ -107,6 +282,13 @@ impl ConnectorDistributedRewriteSession {
 
     pub fn plan(&self) -> &ConnectorDistributedRewritePlan {
         &self.inner.plan
+    }
+
+    /// Exact composite lease retained from frozen planning through terminal
+    /// commit or abort.  Provider-facing execution may use only this lease to
+    /// plan the opaque frozen source.
+    pub fn lease(&self) -> &ConnectorDistributedRewriteLease {
+        &self.inner.lease
     }
 
     pub fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -379,9 +561,9 @@ mod tests {
         ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
         ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
         ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId, ConnectorTableHandle,
-        ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWritePlan,
-        ConnectorWritePlanningRequest,
+        ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
+        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteCohortId, ConnectorWriteControl,
+        ConnectorWritePlan, ConnectorWritePlanningRequest,
     };
 
     use super::*;
@@ -406,6 +588,33 @@ mod tests {
 
     struct TestMetadata {
         instance: ConnectorInstanceId,
+    }
+
+    struct TestPlanning {
+        instance: ConnectorInstanceId,
+    }
+
+    impl ConnectorScanPlanning for TestPlanning {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.instance
+        }
+
+        fn begin_scan(
+            &self,
+            _table: &ConnectorTableHandle,
+            _request: novarocks_spi::connector::ConnectorBeginScanRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorScan, ConnectorError> {
+            unreachable!("rewrite session does not plan scans")
+        }
+
+        fn plan_splits(
+            &self,
+            _scan: &novarocks_spi::connector::ConnectorScanHandle,
+            _request: novarocks_spi::connector::ConnectorSplitPlanningRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorSplitPlanningResult, ConnectorError>
+        {
+            unreachable!("rewrite session does not plan scans")
+        }
     }
 
     impl ConnectorMetadata for TestMetadata {
@@ -604,7 +813,10 @@ mod tests {
         let lease = ConnectorDistributedRewriteLease::new(
             descriptor.clone(),
             key.clone(),
-            Arc::new(TestMetadata { instance }),
+            Arc::new(TestMetadata {
+                instance: instance.clone(),
+            }),
+            Arc::new(TestPlanning { instance }),
             rewrite,
             Arc::new(TestWrite { key: key.clone() }),
             Arc::new(TestDistribution { descriptor, key }),

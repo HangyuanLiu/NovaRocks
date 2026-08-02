@@ -28,13 +28,6 @@ use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
-use crate::connector::iceberg::commit::rewrite_position_delete_files::{
-    RewritePositionDeleteOptions, run_rewrite_position_delete_files,
-};
-use crate::connector::iceberg::compact::{
-    WholeTableRewriteResult, WholeTableRewriteTarget,
-    execute_whole_table_rewrite_with_metrics_for_target,
-};
 use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
@@ -50,21 +43,10 @@ pub(crate) fn execute_action(
     request: MaintenanceActionRequest,
 ) -> Result<MaintenanceActionOutcome, String> {
     match request {
-        MaintenanceActionRequest::RewriteDataFiles {
-            target,
-            base_snapshot_id,
-            job_id,
-            options,
-            branch,
-            where_clause,
-        } => run_rewrite_data_files_action(
-            state,
-            target,
-            base_snapshot_id,
-            job_id,
-            options,
-            branch,
-            where_clause,
+        MaintenanceActionRequest::RewriteDataFiles { .. }
+        | MaintenanceActionRequest::RewritePositionDeleteFiles { .. } => Err(
+            "distributed rewrite must be dispatched by the frontend table-maintenance owner"
+                .to_string(),
         ),
         MaintenanceActionRequest::RewriteManifests {
             target,
@@ -80,11 +62,6 @@ pub(crate) fn execute_action(
             target,
             older_than_ms,
         } => run_remove_orphan_files_action(state, target, older_than_ms),
-        MaintenanceActionRequest::RewritePositionDeleteFiles {
-            target,
-            options,
-            where_clause,
-        } => run_rewrite_position_delete_files_action(state, target, options, where_clause),
     }
 }
 
@@ -238,146 +215,6 @@ fn run_remove_orphan_files_action(
     Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
         orphan_file_locations: outcome.deleted_file_locations,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_rewrite_data_files_action(
-    state: &Arc<StandaloneState>,
-    target: MaintenanceTarget,
-    base_snapshot_id: i64,
-    job_id: Option<i64>,
-    options: std::collections::BTreeMap<String, String>,
-    branch: Option<String>,
-    where_clause: Option<String>,
-) -> Result<MaintenanceActionOutcome, String> {
-    validate_rewrite_data_files_request(&options, branch.as_deref(), where_clause.as_deref())?;
-    let resolved_table =
-        resolve_maintenance_table_name(state, &target.catalog, &target.namespace, &target.table)?;
-    let rewrite_target = WholeTableRewriteTarget {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: resolved_table,
-        base_snapshot_id,
-        job_id,
-    };
-    let rewrite_result =
-        execute_whole_table_rewrite_with_metrics_for_target(state, &rewrite_target).map_err(
-            |error| {
-                format!(
-                    "REWRITE DATA FILES failed for {}: {error}",
-                    action_target(&target)
-                )
-            },
-        )?;
-
-    tracing::info!(
-        catalog = %target.catalog,
-        namespace = %target.namespace,
-        table = %target.table,
-        target_snapshot_id = ?rewrite_result.outcome.target_snapshot_id,
-        rewritten_data_files_count = rewrite_result.outcome.rewritten_data_files,
-        added_data_files_count = rewrite_result.outcome.added_data_files,
-        removed_delete_files_count = rewrite_result.outcome.deleted_data_files,
-        "rewrite_data_files: completed"
-    );
-
-    rewrite_data_files_outcome_from_result(&rewrite_result)
-}
-
-fn rewrite_data_files_outcome_from_result(
-    result: &WholeTableRewriteResult,
-) -> Result<MaintenanceActionOutcome, String> {
-    Ok(MaintenanceActionOutcome::RewriteDataFiles {
-        target_snapshot_id: result.outcome.target_snapshot_id,
-        rewritten_data_files_count: checked_i32_metric(
-            result.outcome.rewritten_data_files,
-            "rewritten_data_files_count",
-        )?,
-        added_data_files_count: checked_i32_metric(
-            result.outcome.added_data_files,
-            "added_data_files_count",
-        )?,
-        rewritten_bytes_count: result.before_metrics.data_bytes,
-        failed_data_files_count: 0,
-        removed_delete_files_count: checked_i32_metric(
-            result.outcome.deleted_data_files,
-            "removed_delete_files_count",
-        )?,
-        output_record_count: result.outcome.output_record_count,
-    })
-}
-
-fn run_rewrite_position_delete_files_action(
-    state: &Arc<StandaloneState>,
-    target: MaintenanceTarget,
-    options: std::collections::BTreeMap<String, String>,
-    where_clause: Option<String>,
-) -> Result<MaintenanceActionOutcome, String> {
-    if where_clause.is_some() {
-        return Err(
-            "rewrite_position_delete_files where is not supported in NovaRocks".to_string(),
-        );
-    }
-    let options = RewritePositionDeleteOptions::from_map(&options)?;
-    let (catalog, table_ident, _) =
-        resolve_maintenance_catalog(state, &target.catalog, &target.namespace, &target.table)?;
-    let outcome = block_on_iceberg(async move {
-        run_rewrite_position_delete_files(catalog, table_ident, options).await
-    })?
-    .map_err(|error| {
-        format!(
-            "rewrite_position_delete_files failed for {}: {error}",
-            action_target(&target)
-        )
-    })?;
-
-    tracing::info!(
-        catalog = %target.catalog,
-        namespace = %target.namespace,
-        table = %target.table,
-        rewritten_delete_files_count = outcome.rewritten_delete_files_count,
-        added_delete_files_count = outcome.added_delete_files_count,
-        rewritten_bytes_count = outcome.rewritten_bytes_count,
-        added_bytes_count = outcome.added_bytes_count,
-        "rewrite_position_delete_files: completed"
-    );
-
-    Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
-        rewritten_delete_files_count: outcome.rewritten_delete_files_count,
-        added_delete_files_count: outcome.added_delete_files_count,
-        rewritten_bytes_count: outcome.rewritten_bytes_count,
-        added_bytes_count: outcome.added_bytes_count,
-    })
-}
-
-fn validate_rewrite_data_files_request(
-    options: &std::collections::BTreeMap<String, String>,
-    branch: Option<&str>,
-    where_clause: Option<&str>,
-) -> Result<(), String> {
-    if where_clause.is_some() {
-        return Err("rewrite_data_files where is not supported in NovaRocks yet".to_string());
-    }
-    if branch.is_some() {
-        return Err("rewrite_data_files branch is not supported in NovaRocks yet".to_string());
-    }
-    for (key, value) in options {
-        match key.as_str() {
-            "rewrite-all" if value.eq_ignore_ascii_case("true") => {}
-            "rewrite-all" => {
-                return Err("rewrite_data_files option `rewrite-all` must be `true`".to_string());
-            }
-            "min-input-files" | "target-file-size-bytes" => {
-                return Err(format!("unsupported rewrite_data_files option `{key}`"));
-            }
-            other => return Err(format!("unsupported rewrite_data_files option `{other}`")),
-        }
-    }
-    Ok(())
-}
-
-fn checked_i32_metric(value: i64, name: &str) -> Result<i32, String> {
-    i32::try_from(value).map_err(|_| format!("rewrite_data_files metric `{name}` overflow"))
 }
 
 /// Resolve a registered Iceberg catalog into an executable connector handle.
