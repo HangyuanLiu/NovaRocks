@@ -130,7 +130,7 @@ fn run_rewrite_manifests_action(
     }
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
-    crate::connector::metadata_maintenance::execute_metadata_maintenance(
+    let completed = crate::connector::metadata_maintenance::execute_metadata_maintenance(
         state.connector_control.as_ref(),
         state.as_ref(),
         &instance_id,
@@ -147,14 +147,13 @@ fn run_rewrite_manifests_action(
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?,
     )?;
+    let summary = completed.receipt.summary();
 
     Ok(MaintenanceActionOutcome::RewriteManifests {
-        // Iceberg's API does not expose per-manifest counts for an already
-        // committed replacement snapshot.  The provider receipt remains the
-        // durable source of truth; this legacy Spark-compatible projection is
-        // intentionally conservative.
-        rewritten_manifests_count: 0,
-        added_manifests_count: 0,
+        rewritten_manifests_count: i32::try_from(summary.rewritten_items)
+            .map_err(|_| "rewrite manifest count exceeds Spark result range".to_string())?,
+        added_manifests_count: i32::try_from(summary.added_items)
+            .map_err(|_| "added manifest count exceeds Spark result range".to_string())?,
     })
 }
 

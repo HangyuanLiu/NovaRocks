@@ -395,7 +395,7 @@ impl IcebergMetadataMaintenanceAdapter {
         let marker_text = String::from_utf8(marker_bytes.to_vec()).map_err(|error| {
             ExecFailure::KnownUncommitted(internal(format!("marker UTF-8: {error}")))
         })?;
-        let action = match plan.operation_kind() {
+        let summary = match plan.operation_kind() {
             novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND => {
                 block_on_iceberg(run_rewrite_manifests_once_with_marker(
                     catalog,
@@ -406,7 +406,15 @@ impl IcebergMetadataMaintenanceAdapter {
                     Some(marker_text),
                 ))
                 .map_err(|error| ExecFailure::Unknown(unavailable(error)))
-                .and_then(|result| result.map(|_| ()).map_err(classify_iceberg_error))
+                .and_then(|result| {
+                    result
+                        .map(|outcome| ConnectorMetadataMaintenanceReceiptSummary {
+                            rewritten_items: outcome.rewritten_manifests_count as u64,
+                            added_items: outcome.added_manifests_count as u64,
+                            ..Default::default()
+                        })
+                        .map_err(classify_iceberg_error)
+                })
             }
             novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND => {
                 block_on_iceberg(run_expire_snapshots_once_with_marker(
@@ -422,13 +430,21 @@ impl IcebergMetadataMaintenanceAdapter {
                     Some(marker_text),
                 ))
                 .map_err(|error| ExecFailure::Unknown(unavailable(error)))
-                .and_then(|result| result.map(|_| ()).map_err(classify_iceberg_error))
+                .and_then(|result| {
+                    result
+                        .map(|outcome| ConnectorMetadataMaintenanceReceiptSummary {
+                            affected_versions: outcome.expired_snapshot_count as u64,
+                            cleanup_succeeded: outcome.deleted_file_count as u64,
+                            ..Default::default()
+                        })
+                        .map_err(classify_iceberg_error)
+                })
             }
             _ => Err(ExecFailure::KnownUncommitted(invalid(
                 "unsupported metadata maintenance operation",
             ))),
         };
-        action?;
+        let summary = summary?;
         entry.invalidate_table_cache(&payload.namespace, &payload.table);
         let committed =
             load_table(&entry, &payload.namespace, &payload.table).map_err(|error| {
@@ -449,7 +465,7 @@ impl IcebergMetadataMaintenanceAdapter {
             plan.request_digest(),
             plan.plan_digest(),
             plan.state_digest(),
-            ConnectorMetadataMaintenanceReceiptSummary::default(),
+            summary,
             canonical_json(
                 &IcebergMetadataMaintenanceReceiptV1 {
                     version: PAYLOAD_VERSION,
