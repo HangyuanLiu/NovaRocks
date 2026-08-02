@@ -22,7 +22,93 @@ use crate::connector::iceberg::scan_model::{
 };
 #[cfg(test)]
 use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use crate::sql::binding::SqlTableBindingId;
 use novarocks_catalog::schema::ColumnDef;
+
+/// Immutable version selector attached to a query-local table binding.
+///
+/// The selector is a SQL planning fact, not a provider request.  The
+/// application materializes the selected table once and assigns the binding
+/// token that preparation later uses to recover the exact connector lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlTableVersionSelector {
+    Current,
+    Snapshot(i64),
+    TimestampMillis(i64),
+}
+
+/// SQL-level metadata table identity.  Provider-specific metadata APIs are
+/// deliberately not represented in the compiler vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlMetadataTableKind {
+    Snapshots,
+    History,
+    Refs,
+    Files,
+    Manifests,
+    Partitions,
+}
+
+/// Immutable SQL facts that characterize a scan without carrying provider
+/// metadata, files, credentials, or an executable connector handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SqlScanKind {
+    Data {
+        version: SqlTableVersionSelector,
+    },
+    FrozenInputSet {
+        version: SqlTableVersionSelector,
+    },
+    Metadata {
+        kind: SqlMetadataTableKind,
+        version: SqlTableVersionSelector,
+    },
+    Delta {
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    },
+    MvTargetState {
+        target_snapshot_id: Option<i64>,
+    },
+    MvTargetLocator {
+        target_snapshot_id: Option<i64>,
+    },
+}
+
+/// Canonical table identity attached to a compiler scan fact.  This is kept
+/// separate from an application catalog handle so the optimizer can reason
+/// about identity without being able to reach a provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlTableIdentity {
+    pub(crate) catalog: String,
+    pub(crate) namespace: String,
+    pub(crate) table: String,
+}
+
+/// The only scan source a SQL compiler artifact may expose to application
+/// preparation.  A token is valid exclusively in the paired
+/// `QueryTableBindingStore`; attempts to use it with another request fail
+/// before connector submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlScanSource {
+    pub(crate) binding: SqlTableBindingId,
+    pub(crate) table: SqlTableIdentity,
+    pub(crate) kind: SqlScanKind,
+}
+
+impl SqlScanSource {
+    pub(crate) fn new(
+        binding: SqlTableBindingId,
+        table: SqlTableIdentity,
+        kind: SqlScanKind,
+    ) -> Self {
+        Self {
+            binding,
+            table,
+            kind,
+        }
+    }
+}
 
 /// Metadata for an IMV target-state scan source. This struct carries only
 /// planner-safe metadata for the MV's own target state — catalog identity,
@@ -228,6 +314,8 @@ pub struct TableDef {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use arrow::datatypes::DataType;
 
     use super::*;
@@ -292,6 +380,38 @@ mod tests {
         assert_eq!(iceberg.location, "file:///tmp/test_table");
         assert_eq!(iceberg.schema.fields[0].field_id, 10);
         assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
+    }
+
+    #[test]
+    fn sqlx2_scan_source_contains_only_binding_and_sql_facts() {
+        let binding = SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(NonZeroU64::new(3).expect("scope")),
+            NonZeroU32::new(7).expect("ordinal"),
+        );
+        let scan = SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+            },
+            SqlScanKind::Metadata {
+                kind: SqlMetadataTableKind::Snapshots,
+                version: SqlTableVersionSelector::Snapshot(42),
+            },
+        );
+
+        assert_eq!(scan.binding, binding);
+        assert_eq!(scan.table.catalog, "ice");
+        assert_eq!(scan.table.namespace, "sales");
+        assert_eq!(scan.table.table, "orders");
+        assert!(matches!(
+            scan.kind,
+            SqlScanKind::Metadata {
+                kind: SqlMetadataTableKind::Snapshots,
+                version: SqlTableVersionSelector::Snapshot(42),
+            }
+        ));
     }
 }
 

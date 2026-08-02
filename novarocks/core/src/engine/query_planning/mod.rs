@@ -21,6 +21,8 @@
 //! table bindings, connector controls, and request context available solely
 //! for post-compile preparation and native request assembly.
 
+pub(crate) mod bindings;
+
 use std::{collections::HashMap, sync::Arc};
 
 use crate::query_execution::cancellation::QueryCancellationView;
