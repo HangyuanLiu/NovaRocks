@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_catalog::schema::SqlType;
@@ -74,8 +74,9 @@ use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
 use super::scan_model::{
-    IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
-    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
+    IcebergPhysicalPredicateValue,
 };
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
@@ -663,6 +664,15 @@ impl IcebergReadOnlyConnectorInstance {
             return super::delta_reader::IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
+                self.binding.clone(),
+                request,
+            )
+            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
+        }
+        if let Some(rewrite_position) = payload.distributed_rewrite_position {
+            return super::distributed_rewrite_reader::IcebergRewritePositionBatchReader::try_new(
+                payload.data_file,
+                rewrite_position,
                 self.binding.clone(),
                 request,
             )
@@ -1560,12 +1570,6 @@ impl IcebergControlProvider {
             loaded.table.file_io(),
             &frozen.group,
         )?;
-        if frozen.operation_kind != novarocks_spi::connector::REWRITE_DATA_FILES_KIND {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg position-delete rewrite source requires the dedicated maintenance reader",
-            ));
-        }
         table.prepared_files = group.data_files.clone();
         table.explicit_files = Some(group.data_files);
         Ok(())
@@ -3995,8 +3999,16 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         let mut table = self.table_payload(table)?;
         let entry = self.entry(self.instance_id.as_str())?;
         self.hydrate_frozen_rewrite_source(&entry, &mut table)?;
-        let output_schema =
-            self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?;
+        let output_schema = match table
+            .frozen_rewrite
+            .as_ref()
+            .map(|frozen| frozen.operation_kind.as_str())
+        {
+            Some(novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND) => {
+                rewrite_position_output_schema()
+            }
+            _ => self.schema_for(&entry, &table.namespace, &table.table, &request.projection)?,
+        };
         let (snapshot_id, table_uuid) = if table.explicit_files.is_some() {
             (None, None)
         } else if matches!(request.selector, ConnectorReadSelector::Current) {
@@ -4072,6 +4084,11 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                     .collect()
             }
         };
+        if scan.table.frozen_rewrite.as_ref().is_some_and(|frozen| {
+            frozen.operation_kind == novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND
+        }) {
+            return self.plan_frozen_rewrite_position_splits(scan, files, request);
+        }
         super::planning::validate_planned_files(scan.table.table_info.as_ref(), &files)?;
         if let Some(snapshot_id) = scan.snapshot_id {
             let table_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
@@ -4139,6 +4156,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 physical_predicates: scan.physical_predicates.clone(),
                 name_mapping: name_mapping.clone(),
                 delta: None,
+                distributed_rewrite_position: None,
             };
             push_split_with_budget(
                 &mut splits,
@@ -4162,6 +4180,103 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 candidate_units_pruned: u64::try_from(pruning_counters.files_pruned)
                     .unwrap_or(u64::MAX)
                     .min(candidate_units_considered),
+            },
+        )
+    }
+}
+
+impl IcebergControlProvider {
+    fn plan_frozen_rewrite_position_splits(
+        &self,
+        scan: ScanPayload,
+        files: Vec<IcebergDataFileInfo>,
+        request: ConnectorSplitPlanningRequest,
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
+        let frozen = scan.table.frozen_rewrite.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position scan is missing its frozen source",
+            )
+        })?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded = load_table(&entry, &scan.table.namespace, &scan.table.table)
+            .map_err(map_iceberg_error)?;
+        let group = super::distributed_rewrite::load_frozen_rewrite_group(
+            loaded.table.file_io(),
+            &frozen.group,
+        )?;
+        if group.data_files.len() != 1 || group.selected_position_delete_files.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position artifact group is invalid",
+            ));
+        }
+        let file = group
+            .data_files
+            .into_iter()
+            .next()
+            .expect("checked exactly one file");
+        if files.len() != 1 || files[0].path != file.path {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position scan does not match its frozen input",
+            ));
+        }
+        let selected = file
+            .delete_files
+            .iter()
+            .filter(|delete| group.selected_position_delete_files.contains(&delete.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.len() != group.selected_position_delete_files.len()
+            || selected.iter().any(|delete| {
+                !matches!(delete.file_content, IcebergDeleteFileContent::Position)
+                    || !matches!(delete.file_format, IcebergDeleteFileFormat::Puffin)
+                    || delete.content_offset.is_none()
+                    || delete.content_size_in_bytes.is_none()
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position artifact selects invalid Puffin files",
+            ));
+        }
+        let payload = SplitPayload {
+            version: ICEBERG_SPLIT_V3,
+            owner_instance_id: self.instance_id.as_str().to_string(),
+            incarnation: self.incarnation.to_bytes(),
+            namespace: scan.table.namespace,
+            table: scan.table.table,
+            snapshot_id: None,
+            table_uuid: None,
+            schema_id: None,
+            data_file: file,
+            projection: Vec::new(),
+            limit: None,
+            physical_predicates: Vec::new(),
+            name_mapping: None,
+            delta: None,
+            distributed_rewrite_position: Some(IcebergRewritePositionSplitPayloadV1 {
+                version: ICEBERG_REWRITE_POSITION_SPLIT_V1,
+                selected_delete_files: selected,
+            }),
+        };
+        let mut splits = Vec::new();
+        let mut payload_bytes = 0usize;
+        push_split_with_budget(
+            &mut splits,
+            &mut payload_bytes,
+            self.instance_id.clone(),
+            format!("rewrite-position-{}", frozen.group.group_digest_hex),
+            &payload,
+            None,
+            &request.context,
+        )?;
+        ConnectorSplitPlanningResult::try_new(
+            splits,
+            ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 1,
+                candidate_units_pruned: 0,
             },
         )
     }
@@ -4513,7 +4628,20 @@ struct SplitPayload {
     name_mapping: Option<String>,
     #[serde(default)]
     delta: Option<IcebergDeltaSplitPayload>,
+    #[serde(default)]
+    distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
 }
+
+/// Provider-private maintenance split.  The C1 carrier only transports this
+/// opaque payload; it never learns Puffin metadata or deletion-vector rows.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IcebergRewritePositionSplitPayloadV1 {
+    pub(crate) version: u16,
+    pub(crate) selected_delete_files: Vec<IcebergDeleteFileInfo>,
+}
+
+const ICEBERG_REWRITE_POSITION_SPLIT_V1: u16 = 1;
 
 const ICEBERG_SPLIT_V1: u16 = 1;
 const ICEBERG_SPLIT_V2: u16 = 2;
@@ -4588,7 +4716,24 @@ fn validate_and_normalize_split_payload(payload: &mut SplitPayload) -> Result<()
             ));
         }
     }
+    if let Some(rewrite_position) = payload.distributed_rewrite_position.as_ref() {
+        if rewrite_position.version != ICEBERG_REWRITE_POSITION_SPLIT_V1
+            || rewrite_position.selected_delete_files.is_empty()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position split is invalid",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn rewrite_position_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("_file", DataType::Utf8, false),
+        Field::new("_pos", DataType::Int64, false),
+    ]))
 }
 
 pub(crate) fn load_schema_table_def(
@@ -5251,6 +5396,7 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
                 source,
                 delete_side: delete_side.cloned(),
             }),
+            distributed_rewrite_position: None,
         };
         push_split_with_budget(
             &mut splits,
@@ -5892,6 +6038,7 @@ mod tests {
             physical_predicates: Vec::new(),
             name_mapping: None,
             delta: None,
+            distributed_rewrite_position: None,
         };
 
         let encoded = serde_json::to_vec(&payload).expect("encode split payload");
@@ -5928,6 +6075,7 @@ mod tests {
             physical_predicates: Vec::new(),
             name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
             delta: None,
+            distributed_rewrite_position: None,
         };
         validate_and_normalize_split_payload(&mut payload).expect("canonical V3 mapping");
         assert!(payload.name_mapping.is_some());
@@ -5967,6 +6115,7 @@ mod tests {
                 }],
                 name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
                 delta: None,
+                distributed_rewrite_position: None,
             };
             validate_and_normalize_split_payload(&mut payload).expect("legacy split");
             assert!(payload.name_mapping.is_none());
@@ -6001,6 +6150,7 @@ mod tests {
             physical_predicates: Vec::new(),
             name_mapping: None,
             delta: None,
+            distributed_rewrite_position: None,
         };
         let first = payload("first");
         let second = payload("second");
@@ -6072,6 +6222,7 @@ mod tests {
                 physical_predicates: Vec::new(),
                 name_mapping: None,
                 delta: None,
+                distributed_rewrite_position: None,
             })
             .collect::<Vec<_>>();
         let lengths = split_payloads
@@ -6294,6 +6445,7 @@ fn planned_table_files_fixture_binding(
                                 physical_predicates: scan.physical_predicates.clone(),
                                 name_mapping: None,
                                 delta: None,
+                                distributed_rewrite_position: None,
                             },
                             "fixture split",
                             request.context.max_handle_payload_bytes(),
