@@ -86,6 +86,40 @@ pub struct SessionOptimizerSettings {
 }
 
 impl SessionOptimizerSettings {
+    pub(crate) fn stable_digest_material(&self) -> Vec<u8> {
+        let mut disabled_rules = self.disabled_rules.clone();
+        disabled_rules.sort();
+        disabled_rules.dedup();
+        format!(
+            "ukfk={};rewrite_prune={};cbo_prune={};update_prune={};elim_agg={};rules={:?};cse={:?};rf_max={:?};rf_min={:?};probe_min={:?};probe_sel={:?};global_rf={:?};mv={:?};static_pd={:?};dp={:?};greedy={:?};exhaustive={:?};dp_n={:?};greedy_n={:?};max_n={:?};broadcast_n={:?};broadcast_mem={:?};effective_n={:?};cross_rf={:?}",
+            self.enable_ukfk_opt,
+            self.enable_query_rewrite_table_prune,
+            self.enable_cbo_table_prune,
+            self.enable_table_prune_on_update,
+            self.enable_eliminate_agg,
+            disabled_rules,
+            self.enable_common_subexpr_reuse,
+            self.rf_build_max_bytes,
+            self.rf_build_min_bytes,
+            self.rf_probe_min_bytes,
+            self.rf_probe_min_selectivity.map(f64::to_bits),
+            self.enable_global_runtime_filter,
+            self.enable_materialized_view_rewrite,
+            self.enable_connector_static_predicate_pushdown,
+            self.enable_dp_join_reorder,
+            self.enable_greedy_join_reorder,
+            self.max_reorder_node_use_exhaustive,
+            self.max_reorder_node_use_dp,
+            self.max_reorder_node_use_greedy,
+            self.max_reorder_node,
+            self.cbo_broadcast_backend_count.map(f64::to_bits),
+            self.cbo_broadcast_node_mem_budget_bytes.map(f64::to_bits),
+            self.effective_backend_count.map(f64::to_bits),
+            self.allow_cross_exchange_rf,
+        )
+        .into_bytes()
+    }
+
     pub fn set_disabled_rules(&mut self, rules: Vec<String>) {
         self.disabled_rules = rules;
     }

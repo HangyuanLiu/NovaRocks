@@ -193,6 +193,34 @@ pub(crate) trait IcebergWriteControlBackend: Send + Sync {
     ) -> Result<Option<u64>, CommitServiceError> {
         Ok(None)
     }
+
+    fn build_staged_create_action(
+        &self,
+        _completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<
+        super::commit::StagedFastAppendAction,
+        super::write_service::StagedCreateActionBuildFailure,
+    > {
+        Err(super::write_service::StagedCreateActionBuildFailure {
+            error: CommitServiceError::invalid_input(
+                "Iceberg write backend does not support atomic staged-table publication"
+                    .to_string(),
+            ),
+            abort_handle: Arc::clone(abort_handle),
+        })
+    }
+
+    fn abort_staged_create_action(
+        &self,
+        _completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
+        _abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg write backend does not support staged-table cleanup",
+        ))
+    }
 }
 
 #[derive(Clone)]

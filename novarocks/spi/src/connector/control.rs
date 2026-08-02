@@ -25,9 +25,9 @@ use super::{
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
     ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedPublicationRecovery, ConnectorStatistics,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease,
-    ConnectorWriteResolver,
+    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
+    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -70,6 +70,7 @@ pub struct ConnectorControlBinding {
     data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
     metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
+    staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
@@ -251,6 +252,7 @@ impl ConnectorControlBinding {
             data_mutation,
             metadata_maintenance: None,
             distributed_rewrite: None,
+            staged_create: None,
             write,
             statistics,
             staged_publication_recovery: None,
@@ -270,12 +272,49 @@ impl ConnectorControlBinding {
         write: Option<Arc<dyn ConnectorWriteControl>>,
         statistics: Option<Arc<dyn ConnectorStatistics>>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_all_capabilities_and_staged_create(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            metadata_maintenance,
+            None,
+            write,
+            statistics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_capabilities_and_staged_create(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+        metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+        staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
         if let Some(maintenance) = &metadata_maintenance {
             super::metadata_maintenance::validate_metadata_maintenance_owner(
                 &descriptor,
                 incarnation,
                 maintenance.as_ref(),
             )?;
+        }
+        if staged_create.as_ref().is_some_and(|capability| {
+            capability.descriptor() != &descriptor || capability.incarnation() != incarnation
+        }) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "staged-create capability owner does not match its control binding generation",
+            ));
         }
         let mut binding = Self::try_new_with_all_capabilities(
             descriptor,
@@ -289,6 +328,7 @@ impl ConnectorControlBinding {
             statistics,
         )?;
         binding.metadata_maintenance = metadata_maintenance;
+        binding.staged_create = staged_create;
         Ok(binding)
     }
 
@@ -306,14 +346,7 @@ impl ConnectorControlBinding {
         write: Option<Arc<dyn ConnectorWriteControl>>,
         statistics: Option<Arc<dyn ConnectorStatistics>>,
     ) -> Result<Self, ConnectorError> {
-        if let Some(rewrite) = &distributed_rewrite {
-            super::distributed_rewrite::validate_distributed_rewrite_owner(
-                &descriptor,
-                incarnation,
-                rewrite.as_ref(),
-            )?;
-        }
-        let mut binding = Self::try_new_with_all_capabilities_and_metadata_maintenance(
+        Self::try_new_with_all_maintenance_capabilities_and_staged_create(
             descriptor,
             incarnation,
             metadata,
@@ -322,6 +355,45 @@ impl ConnectorControlBinding {
             mutation,
             data_mutation,
             metadata_maintenance,
+            distributed_rewrite,
+            None,
+            write,
+            statistics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_maintenance_capabilities_and_staged_create(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+        metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+        distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
+        staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(rewrite) = &distributed_rewrite {
+            super::distributed_rewrite::validate_distributed_rewrite_owner(
+                &descriptor,
+                incarnation,
+                rewrite.as_ref(),
+            )?;
+        }
+        let mut binding = Self::try_new_with_all_capabilities_and_staged_create(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            metadata_maintenance,
+            staged_create,
             write,
             statistics,
         )?;
@@ -359,6 +431,10 @@ impl ConnectorControlBinding {
 
     pub fn distributed_rewrite(&self) -> Option<&Arc<dyn ConnectorDistributedRewrite>> {
         self.distributed_rewrite.as_ref()
+    }
+
+    pub fn staged_create(&self) -> Option<&Arc<dyn ConnectorStagedCreate>> {
+        self.staged_create.as_ref()
     }
 
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
@@ -521,6 +597,24 @@ impl ConnectorControlPlanningLease {
         super::ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
             drop(retained_planning_lease)
         })
+    }
+
+    /// Derive the exact-generation atomic staged-publication capability.
+    /// Unsupported providers fail before any source execution or external
+    /// create/write side effect.
+    pub fn derive_staged_create_lease(&self) -> Result<ConnectorStagedCreateLease, ConnectorError> {
+        let capability = self.binding.staged_create().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no atomic staged-create capability",
+            )
+        })?;
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: self.binding.descriptor().instance_id.clone(),
+            incarnation: self.binding.incarnation(),
+        };
+        let retained_planning_lease = self.clone();
+        ConnectorStagedCreateLease::new(owner, capability, move || drop(retained_planning_lease))
     }
 }
 

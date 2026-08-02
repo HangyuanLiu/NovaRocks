@@ -2035,6 +2035,146 @@ pub(crate) fn build_iceberg_catalog(
     }
 }
 
+/// Authoritative, typed existence check shared by staged CREATE application
+/// owners. Catalog implementations map their own NotFound representation;
+/// callers must not classify provider error strings.
+pub(crate) fn table_exists_typed(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
+    let catalog = build_iceberg_catalog(entry)?;
+    let ident = TableIdent::new(
+        NamespaceIdent::new(normalize_identifier(namespace)?),
+        normalize_identifier(table)?,
+    );
+    block_on_iceberg(async { catalog.table_exists(&ident).await })
+        .map_err(|error| format!("check iceberg table existence runtime failed: {error}"))?
+        .map_err(|error| format!("check iceberg table existence {ident}: {error}"))
+}
+
+/// Provider-private REST staged-create state. No Iceberg metadata or update
+/// DTO crosses the connector SPI boundary; the provider retains this state
+/// under the opaque handle it issued.
+#[derive(Clone)]
+pub(crate) struct RestStagedTableCreate {
+    pub catalog: Arc<iceberg_catalog_rest::RestCatalog>,
+    pub table: iceberg::table::Table,
+    pub initialization_updates: Vec<iceberg::TableUpdate>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RestStagedPrepareFailure {
+    Conflict(String),
+    KnownUncommitted(String),
+    CommitUnknown(String),
+}
+
+impl From<String> for RestStagedPrepareFailure {
+    fn from(message: String) -> Self {
+        Self::KnownUncommitted(message)
+    }
+}
+
+pub(crate) fn prepare_rest_staged_table(
+    entry: &IcebergCatalogEntry,
+    namespace_name: &str,
+    table_name: &str,
+    columns: &[TableColumnDef],
+    partition_fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
+    properties: &[(String, String)],
+) -> Result<RestStagedTableCreate, RestStagedPrepareFailure> {
+    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+        return Err(RestStagedPrepareFailure::KnownUncommitted(
+            "atomic staged table publication is unsupported by this Iceberg catalog".to_string(),
+        ));
+    }
+    let namespace_name = normalize_identifier(namespace_name)?;
+    let table_name = normalize_identifier(table_name)?;
+    let namespace = NamespaceIdent::new(namespace_name.clone());
+    let catalog = Arc::new(
+        block_on_iceberg(build_rest_catalog(entry))
+            .map_err(RestStagedPrepareFailure::KnownUncommitted)?
+            .map_err(RestStagedPrepareFailure::KnownUncommitted)?,
+    );
+    let exists = block_on_iceberg(async { catalog.namespace_exists(&namespace).await })
+        .map_err(|error| {
+            RestStagedPrepareFailure::KnownUncommitted(format!(
+                "check REST namespace runtime: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            RestStagedPrepareFailure::KnownUncommitted(format!("check REST namespace: {error}"))
+        })?;
+    if !exists {
+        return Err(RestStagedPrepareFailure::KnownUncommitted(format!(
+            "prepare staged Iceberg table failed: namespace {namespace_name} does not exist"
+        )));
+    }
+    let (format_version, mut all_properties) = extract_table_format_version_property(properties)?;
+    let schema = build_iceberg_schema(columns, format_version)?;
+    validate_create_table_variant_shredding_properties(&all_properties, &schema)?;
+    let partition_spec = crate::connector::iceberg::partition_spec::build_initial_partition_spec(
+        &schema,
+        partition_fields,
+    )?;
+    all_properties.extend(build_logical_type_properties(columns)?);
+    all_properties.push((
+        "format-version".to_string(),
+        format!("{}", format_version as u8),
+    ));
+    let publication_properties = all_properties
+        .iter()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case("format-version"))
+        .cloned()
+        .collect::<HashMap<_, _>>();
+    let creation = TableCreation::builder()
+        .name(table_name)
+        .schema(schema)
+        .properties(all_properties)
+        .format_version(format_version);
+    let creation = if let Some(spec) = partition_spec {
+        creation.partition_spec(spec).build()
+    } else {
+        creation.build()
+    };
+    let staged =
+        block_on_iceberg(async { catalog.stage_create_table_typed(&namespace, creation).await })
+            .map_err(|error| {
+                RestStagedPrepareFailure::KnownUncommitted(format!(
+                    "prepare staged REST table runtime: {error}"
+                ))
+            })?
+            .map_err(|error| match error {
+                iceberg_catalog_rest::StagedCreateError::Conflict(error) => {
+                    RestStagedPrepareFailure::Conflict(format!(
+                        "prepare staged REST table: {error}"
+                    ))
+                }
+                iceberg_catalog_rest::StagedCreateError::KnownNotDispatched(error) => {
+                    RestStagedPrepareFailure::KnownUncommitted(format!(
+                        "prepare staged REST table: {error}"
+                    ))
+                }
+                iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(error) => {
+                    RestStagedPrepareFailure::CommitUnknown(format!(
+                        "prepare staged REST table: {error}"
+                    ))
+                }
+            })?;
+    let (table, mut initialization_updates) = staged.into_parts();
+    if !publication_properties.is_empty() {
+        initialization_updates.push(iceberg::TableUpdate::SetProperties {
+            updates: publication_properties,
+        });
+    }
+    Ok(RestStagedTableCreate {
+        catalog,
+        table,
+        initialization_updates,
+    })
+}
+
 pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,

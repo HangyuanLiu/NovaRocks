@@ -240,10 +240,11 @@ async fn commit_v3_row_lineage_append(
         schema_id: ctx.table.metadata().current_schema_id(),
         abort_handle: ctx.abort_handle.clone(),
         manifest_paths_out: manifest_paths_out.clone(),
-        row_lineage_first_row_id,
-        row_lineage_added_rows,
+        row_lineage: Some((row_lineage_first_row_id, row_lineage_added_rows)),
         target_ref: ctx.target_ref.to_string(),
         snapshot_properties: ctx.snapshot_properties.clone(),
+        #[cfg(test)]
+        fail_before_manifest_list_write: false,
     };
 
     let sketch_sets = ctx.collector.take_sketch_sets();
@@ -285,6 +286,139 @@ async fn commit_v3_row_lineage_append(
     })
 }
 
+/// Snapshot changes built against an invisible staged table. The caller owns
+/// catalog publication and must prepend the staged table's initialization
+/// updates and submit exactly one assert-create commit.
+pub(crate) struct StagedFastAppendAction {
+    pub action: ActionCommit,
+    pub outcome: Option<CommitOutcome>,
+    pub abort_handle: Arc<super::abort::AbortLog>,
+}
+
+/// Build, but do not submit, v2 or v3 fast-append changes for atomic CTAS
+/// publication. This deliberately bypasses `Transaction::commit`, whose first
+/// step reloads a visible table and therefore cannot operate on a staged
+/// create response.
+pub(crate) async fn build_staged_fast_append_action(
+    ctx: CommitCtx<'_>,
+) -> Result<StagedFastAppendAction, String> {
+    let written = ctx.collector.take_written_files()?;
+    if written.is_empty() {
+        return Ok(StagedFastAppendAction {
+            action: ActionCommit::new(Vec::new(), Vec::new()),
+            outcome: None,
+            abort_handle: ctx.abort_handle,
+        });
+    }
+    for file in &written {
+        if file.content != DataContentType::Data {
+            return Err(format!(
+                "staged fast append received {:?} content; expected Data only",
+                file.content
+            ));
+        }
+    }
+    if ctx.target_ref != "main" {
+        return Err("atomic staged-table publication only supports the main ref".to_string());
+    }
+
+    if !matches!(
+        crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table),
+        IcebergWriteMode::RowLineageV3
+    ) {
+        let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
+        let action = FastAppendV3TxnAction {
+            written,
+            commit_uuid: ctx.commit_uuid,
+            file_io: ctx.file_io.clone(),
+            partition_spec: ctx.collector.partition_spec.clone(),
+            schema: ctx.table.metadata().current_schema().clone(),
+            schema_id: ctx.table.metadata().current_schema_id(),
+            abort_handle: Arc::clone(&ctx.abort_handle),
+            manifest_paths_out: Arc::clone(&manifest_paths_out),
+            row_lineage: None,
+            target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
+            #[cfg(test)]
+            fail_before_manifest_list_write: false,
+        };
+        let mut action = Arc::new(action)
+            .commit(ctx.table)
+            .await
+            .map_err(|error| format!("build staged v2 fast-append changes: {error}"))?;
+        let updates = action.take_updates();
+        let requirements = action.take_requirements();
+        let new_snapshot_id = updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                "staged v2 fast append did not build an add-snapshot update".to_string()
+            })?;
+        let written_manifest_paths = manifest_paths_out
+            .lock()
+            .expect("manifest_paths_out poisoned")
+            .clone();
+        return Ok(StagedFastAppendAction {
+            action: ActionCommit::new(updates, requirements),
+            outcome: Some(CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths,
+            }),
+            abort_handle: ctx.abort_handle,
+        });
+    }
+
+    let row_lineage_first_row_id = effective_next_row_id(ctx.table.metadata())?;
+    let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, file| {
+        sum.checked_add(file.record_count)
+            .ok_or_else(|| "row-lineage added row count overflow".to_string())
+    })?;
+    let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
+    let action = FastAppendV3TxnAction {
+        written,
+        commit_uuid: ctx.commit_uuid,
+        file_io: ctx.file_io.clone(),
+        partition_spec: ctx.collector.partition_spec.clone(),
+        schema: ctx.table.metadata().current_schema().clone(),
+        schema_id: ctx.table.metadata().current_schema_id(),
+        abort_handle: Arc::clone(&ctx.abort_handle),
+        manifest_paths_out: Arc::clone(&manifest_paths_out),
+        row_lineage: Some((row_lineage_first_row_id, row_lineage_added_rows)),
+        target_ref: ctx.target_ref.to_string(),
+        snapshot_properties: ctx.snapshot_properties.clone(),
+        #[cfg(test)]
+        fail_before_manifest_list_write: false,
+    };
+    let mut action = Arc::new(action)
+        .commit(ctx.table)
+        .await
+        .map_err(|error| format!("build staged fast-append changes: {error}"))?;
+    let updates = action.take_updates();
+    let requirements = action.take_requirements();
+    let new_snapshot_id = updates
+        .iter()
+        .find_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => Some(snapshot.snapshot_id()),
+            _ => None,
+        })
+        .ok_or_else(|| "staged fast append did not build an add-snapshot update".to_string())?;
+    let written_manifest_paths = manifest_paths_out
+        .lock()
+        .expect("manifest_paths_out poisoned")
+        .clone();
+    Ok(StagedFastAppendAction {
+        action: ActionCommit::new(updates, requirements),
+        outcome: Some(CommitOutcome {
+            new_snapshot_id,
+            written_manifest_paths,
+        }),
+        abort_handle: ctx.abort_handle,
+    })
+}
+
 struct FastAppendV3TxnAction {
     written: Vec<WrittenFile>,
     commit_uuid: Uuid,
@@ -294,10 +428,11 @@ struct FastAppendV3TxnAction {
     schema_id: i32,
     abort_handle: Arc<super::abort::AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
-    row_lineage_first_row_id: u64,
-    row_lineage_added_rows: u64,
+    row_lineage: Option<(u64, u64)>,
     target_ref: String,
     snapshot_properties: BTreeMap<String, String>,
+    #[cfg(test)]
+    fail_before_manifest_list_write: bool,
 }
 
 #[async_trait]
@@ -367,6 +502,12 @@ impl TransactionAction for FastAppendV3TxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
+        #[cfg(test)]
+        if self.fail_before_manifest_list_write {
+            return Err(to_iceberg_unexpected(
+                "injected staged append manifest-list write failure".to_string(),
+            ));
+        }
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
@@ -375,23 +516,21 @@ impl TransactionAction for FastAppendV3TxnAction {
             parent_snapshot_id,
             new_seq,
             m.format_version(),
-            Some(self.row_lineage_first_row_id),
+            self.row_lineage.map(|(first_row_id, _)| first_row_id),
         )
         .await
         .map_err(to_iceberg_unexpected)?;
-        let expected_next_row_id = self
-            .row_lineage_first_row_id
-            .checked_add(self.row_lineage_added_rows)
-            .ok_or_else(|| {
+        if let Some((first_row_id, added_rows)) = self.row_lineage {
+            let expected_next_row_id = first_row_id.checked_add(added_rows).ok_or_else(|| {
                 to_iceberg_unexpected(format!(
-                    "Row ID overflow when computing append row lineage range: first_row_id={}, added_rows={}",
-                    self.row_lineage_first_row_id, self.row_lineage_added_rows
+                    "Row ID overflow when computing append row lineage range: first_row_id={first_row_id}, added_rows={added_rows}"
                 ))
             })?;
-        if manifest_list_next_row_id != Some(expected_next_row_id) {
-            return Err(to_iceberg_unexpected(format!(
-                "Manifest list row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
-            )));
+            if manifest_list_next_row_id != Some(expected_next_row_id) {
+                return Err(to_iceberg_unexpected(format!(
+                    "Manifest list row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
+                )));
+            }
         }
 
         let snapshot = Snapshot::builder()
@@ -401,9 +540,13 @@ impl TransactionAction for FastAppendV3TxnAction {
             .with_timestamp_ms(now_ms())
             .with_manifest_list(manifest_list_path)
             .with_summary(summary)
-            .with_schema_id(self.schema_id)
-            .with_row_range(self.row_lineage_first_row_id, self.row_lineage_added_rows)
-            .build();
+            .with_schema_id(self.schema_id);
+        let snapshot = match self.row_lineage {
+            Some((first_row_id, added_rows)) => {
+                snapshot.with_row_range(first_row_id, added_rows).build()
+            }
+            None => snapshot.build(),
+        };
         let updates = vec![
             TableUpdate::AddSnapshot { snapshot },
             TableUpdate::SetSnapshotRef {
@@ -624,6 +767,214 @@ mod tests {
         assert_eq!(
             err,
             "FastAppendCommit branch target_ref=branch_a requires the custom v3 row-lineage append path"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_v2_append_registers_and_aborts_manifest_and_manifest_list() {
+        let warehouse_dir = tempfile::TempDir::new().expect("warehouse tempdir");
+        let warehouse_uri = format!(
+            "file://{}",
+            warehouse_dir.path().join("warehouse").display()
+        );
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "staged_fast_append_test",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+            ],
+        )
+        .expect("build hadoop catalog entry");
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+                .expect("build hadoop catalog"),
+        );
+        let namespace = NamespaceIdent::new("db".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create_namespace");
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("build schema");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .expect("create_table");
+        let metadata = table.metadata();
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::FastAppend,
+                TableIdent::new(namespace, "t".to_string()),
+                None,
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/staging", metadata.location()),
+                novarocks_types::UniqueId::new(0, 0),
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        collector.inject_written_file(test_written_data_file(1));
+        let file_io = table.file_io().clone();
+        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let snapshot_properties = BTreeMap::new();
+        let action = build_staged_fast_append_action(CommitCtx {
+            collector: &collector,
+            table: &table,
+            catalog: catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: Uuid::new_v4(),
+            abort_handle: Arc::clone(&abort_handle),
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        })
+        .await
+        .expect("build staged v2 append");
+        let paths = action
+            .outcome
+            .expect("non-empty staged append outcome")
+            .written_manifest_paths;
+        assert!(
+            paths.len() >= 2,
+            "manifest file and list must both be tracked"
+        );
+
+        let builder =
+            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let root_prefix = format!("file://{}/", warehouse_dir.path().display());
+        let errors = abort_handle
+            .cleanup_with_path_mapper(&fs, |path| {
+                path.strip_prefix(&root_prefix).unwrap_or(path).to_string()
+            })
+            .await;
+        assert!(errors.is_empty(), "manifest cleanup errors: {errors:?}");
+        for path in paths {
+            let relative = path.strip_prefix(&root_prefix).unwrap_or(&path);
+            assert!(
+                fs.stat(relative).await.is_err(),
+                "staged artifact leaked: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_v2_partial_manifest_failure_retains_write_time_abort_paths() {
+        let warehouse_dir = tempfile::TempDir::new().expect("warehouse tempdir");
+        let warehouse_uri = format!(
+            "file://{}",
+            warehouse_dir.path().join("warehouse").display()
+        );
+        let entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+            "staged_fast_append_fault_test",
+            &[
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse_uri),
+            ],
+        )
+        .expect("build hadoop catalog entry");
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+                .expect("build hadoop catalog"),
+        );
+        let namespace = NamespaceIdent::new("db".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create_namespace");
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .expect("build schema");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .expect("create_table");
+        let metadata = table.metadata();
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::FastAppend,
+                TableIdent::new(namespace, "t".to_string()),
+                None,
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/staging", metadata.location()),
+                novarocks_types::UniqueId::new(0, 0),
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
+        let action = FastAppendV3TxnAction {
+            written: vec![test_written_data_file(1)],
+            commit_uuid: Uuid::new_v4(),
+            file_io: table.file_io().clone(),
+            partition_spec: collector.partition_spec.clone(),
+            schema: metadata.current_schema().clone(),
+            schema_id: metadata.current_schema_id(),
+            abort_handle: Arc::clone(&abort_handle),
+            manifest_paths_out: Arc::clone(&manifest_paths_out),
+            row_lineage: None,
+            target_ref: "main".to_string(),
+            snapshot_properties: BTreeMap::new(),
+            fail_before_manifest_list_write: true,
+        };
+        let error = match Arc::new(action).commit(&table).await {
+            Ok(_) => panic!("expected injected manifest-list write failure"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("injected staged append"));
+        let paths = manifest_paths_out.lock().unwrap().clone();
+        assert_eq!(
+            paths.len(),
+            2,
+            "both attempted artifacts must be registered"
+        );
+
+        let builder =
+            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let root_prefix = format!("file://{}/", warehouse_dir.path().display());
+        let first_relative = paths[0]
+            .strip_prefix(&root_prefix)
+            .expect("manifest path under warehouse root");
+        assert!(
+            fs.stat(first_relative).await.is_ok(),
+            "data manifest was written"
+        );
+        let errors = abort_handle
+            .cleanup_with_path_mapper(&fs, |path| {
+                path.strip_prefix(&root_prefix).unwrap_or(path).to_string()
+            })
+            .await;
+        assert!(
+            errors.is_empty(),
+            "partial manifest cleanup errors: {errors:?}"
+        );
+        assert!(
+            fs.stat(first_relative).await.is_err(),
+            "data manifest leaked"
         );
     }
 

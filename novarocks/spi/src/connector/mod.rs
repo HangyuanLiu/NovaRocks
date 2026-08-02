@@ -30,6 +30,7 @@ mod mutation;
 mod predicate;
 mod read;
 mod read_session;
+mod staged_create;
 mod staged_publication_recovery;
 mod statistics;
 mod write;
@@ -125,6 +126,17 @@ pub use read::{
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
+};
+pub use staged_create::{
+    CONNECTOR_STAGED_CREATE_CONTRACT_VERSION, ConnectorStagedCreate,
+    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
+    ConnectorStagedCreateLease, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
+    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase,
+    ConnectorStagedCreateReconcileOutcome, ConnectorStagedCreateReconcilePhase,
+    ConnectorStagedCreateReconcileRequest, ConnectorStagedTableHandle,
+    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
 };
 pub use staged_publication_recovery::{
     ConnectorHistoricalPublicationAction, ConnectorStagedPublicationBaseFact,

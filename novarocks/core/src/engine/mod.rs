@@ -55,6 +55,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
+pub mod ctas_engine;
 pub mod delete_engine;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;

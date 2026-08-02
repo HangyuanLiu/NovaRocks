@@ -30,9 +30,52 @@ use iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorStagedReport, ConnectorWriteAbortRequest, ConnectorWriteCohortId,
-    ConnectorWriteCommitRequest, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
-    ExternalMutationFinalization,
+    ConnectorWriteCommitRequest, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWritePlanningRequest, ExternalMutationFinalization,
 };
+
+/// Decode the accepted provider reports from one sealed single-cohort write
+/// without submitting a catalog commit. Atomic staged publication uses this
+/// seam to build snapshot changes against the invisible staged table and then
+/// combines them with create initialization updates in one assert-create
+/// commit.
+pub(crate) fn decode_primary_write_completion(
+    completion: &ConnectorWriteOperationCompletion,
+    metadata: &TableMetadata,
+) -> Result<Vec<IcebergWriterReport>, CommitServiceError> {
+    if completion.cohorts().len() != 1 {
+        return Err(CommitServiceError::invalid_input(
+            "staged table publication requires exactly one write cohort".to_string(),
+        ));
+    }
+    let cohort = &completion.cohorts()[0];
+    let accepted = cohort.accepted().ok_or_else(|| {
+        CommitServiceError::invalid_input(
+            "staged table publication is missing the accepted write attempt".to_string(),
+        )
+    })?;
+    if accepted.operation_id() != completion.sealed().operation_id() {
+        return Err(CommitServiceError::invalid_input(
+            "staged table publication completion operation identity drifted".to_string(),
+        ));
+    }
+    let mut reports = Vec::new();
+    for staged in accepted.reports() {
+        staged.validate().map_err(|error| {
+            CommitServiceError::invalid_input(format!(
+                "validate staged table writer report: {error}"
+            ))
+        })?;
+        reports.extend(
+            decode_writer_reports(staged.payload(), metadata).map_err(|error| {
+                CommitServiceError::invalid_input(format!(
+                    "decode staged table Iceberg report: {error}"
+                ))
+            })?,
+        );
+    }
+    Ok(reports)
+}
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -52,6 +95,14 @@ use super::write_control::{
     IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
 };
 use crate::engine::IcebergWriteCommitExecutor;
+
+/// A staged-action build can create manifest artifacts before it discovers a
+/// definite failure.  Keep the exact abort register with the typed error so
+/// the staged-create owner never loses the cleanup handle.
+pub(crate) struct StagedCreateActionBuildFailure {
+    pub(crate) error: CommitServiceError,
+    pub(crate) abort_handle: Arc<super::commit::AbortLog>,
+}
 
 /// FE-local operation table for write services created by a DML owner before
 /// its durable journal record.  The table is intentionally keyed by the UUID
@@ -170,6 +221,29 @@ impl IcebergWriteServiceRegistry {
             }
         }
     }
+
+    pub(crate) fn build_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
+        self.resolve(completion.sealed().operation_id())
+            .map_err(|error| StagedCreateActionBuildFailure {
+                error: CommitServiceError::invalid_input(error.to_string()),
+                abort_handle: Arc::clone(abort_handle),
+            })?
+            .build_staged_create_action(completion, abort_handle)
+    }
+
+    pub(crate) fn abort_staged_create_completion(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        self.resolve(completion.sealed().operation_id())
+            .map_err(ConnectorError::with_retryable_before_progress)?
+            .abort_staged_create_action(completion, abort_handle)
+    }
 }
 
 /// Stable binding-level dispatch over the operation table.  The outer
@@ -235,6 +309,24 @@ impl IcebergWriteControlBackend for RegisteredIcebergWriteControlBackend {
             .resolve(operation_id)
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?
             .resulting_row_count(operation_id, outcome)
+    }
+
+    fn build_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
+        self.services
+            .build_staged_create_action(completion, abort_handle)
+    }
+
+    fn abort_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        self.services
+            .abort_staged_create_completion(completion, abort_handle)
     }
 }
 
@@ -326,6 +418,31 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
 
     fn resulting_row_count(&self, _: &CommitOutcome) -> Result<Option<u64>, CommitServiceError> {
         Ok(None)
+    }
+
+    fn build_staged_create_action(
+        &self,
+        _completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
+        Err(StagedCreateActionBuildFailure {
+            error: CommitServiceError::invalid_input(
+                "Iceberg write committer does not support atomic staged-table publication"
+                    .to_string(),
+            ),
+            abort_handle: Arc::clone(abort_handle),
+        })
+    }
+
+    fn abort_staged_create_action(
+        &self,
+        _completion: &ConnectorWriteOperationCompletion,
+        _abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg write committer does not support staged-table cleanup",
+        ))
     }
 }
 
@@ -496,6 +613,22 @@ impl IcebergWriteReportCommitter for IcebergWriteCommitExecutor {
 
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.collector)
+    }
+
+    fn build_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
+        self.build_staged_create_action(completion, abort_handle)
+    }
+
+    fn abort_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        self.abort_staged_create_action(completion, abort_handle)
     }
 }
 
@@ -1823,6 +1956,32 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
         outcome: &CommitOutcome,
     ) -> Result<Option<u64>, CommitServiceError> {
         self.context.commit_executor.resulting_row_count(outcome)
+    }
+
+    fn build_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
+        self.context
+            .validate_sealed(completion.sealed())
+            .map_err(|error| StagedCreateActionBuildFailure {
+                error: CommitServiceError::invalid_input(error.to_string()),
+                abort_handle: Arc::clone(abort_handle),
+            })?;
+        self.context
+            .commit_executor
+            .build_staged_create_action(completion, abort_handle)
+    }
+
+    fn abort_staged_create_action(
+        &self,
+        completion: &ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<super::commit::AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        self.context
+            .commit_executor
+            .abort_staged_create_action(completion, abort_handle)
     }
 }
 

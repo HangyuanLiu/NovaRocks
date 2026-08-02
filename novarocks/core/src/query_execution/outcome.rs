@@ -254,6 +254,20 @@ impl ConnectorWriteCompletion {
         &self.session
     }
 
+    /// Return the complete generic writer aggregate without invoking the
+    /// ordinary connector commit path or making a terminal session decision.
+    pub fn sealed_operation_completion(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteOperationCompletion, DistributedQueryError>
+    {
+        self.session.sealed_operation_completion().map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                format!("seal read-only connector write completion: {error}"),
+            )
+        })
+    }
+
     pub fn staging_summary(&self) -> Result<ConnectorWriteStagingSummary, DistributedQueryError> {
         let writer_count = u32::try_from(self.input.reports().len()).map_err(|_| {
             DistributedQueryError::new(

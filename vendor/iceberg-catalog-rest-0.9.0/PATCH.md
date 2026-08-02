@@ -12,6 +12,12 @@
   derived from authoritative staged metadata for a single subsequent
   `assert-create` commit.
 
+- Added typed `stage_create_table_typed` and `commit_staged_table_typed`
+  variants. They preserve `Conflict`, `KnownNotDispatched`,
+  `PossiblyDispatched`, and committed-response-finalization states so a
+  durable CTAS saga never classifies REST dispatch certainty from strings or
+  the generic `Unexpected` error kind.
+
 ## Validation
 
 This extracted crate's manifest resolves `iceberg = "0.9.0"` from crates.io

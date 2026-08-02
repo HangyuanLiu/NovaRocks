@@ -376,6 +376,32 @@ pub struct StagedTableCreate {
     initialization_updates: Vec<TableUpdate>,
 }
 
+/// Dispatch certainty for the REST staged-create request. Downstream saga
+/// owners must never infer this boundary from an error string or a generic
+/// `Unexpected` kind.
+#[derive(Debug)]
+pub enum StagedCreateError {
+    /// The server rejected the staged create because the target exists.
+    Conflict(Error),
+    /// The request was not sent to the staged-create endpoint.
+    KnownNotDispatched(Error),
+    /// The request may have reached the server and needs reconciliation.
+    PossiblyDispatched(Error),
+}
+
+/// Dispatch certainty for the assert-create publication request.
+#[derive(Debug)]
+pub enum StagedCommitError {
+    /// The assert-create requirement rejected a concurrent visible table.
+    Conflict(Error),
+    /// The publication request was not sent.
+    KnownNotDispatched(Error),
+    /// The publication request may have reached the server.
+    PossiblyDispatched(Error),
+    /// The server confirmed success but the response could not be finalized.
+    CommittedResponseInvalid(Error),
+}
+
 impl StagedTableCreate {
     /// Return the staged table. Its metadata location is absent because the
     /// table has not been published yet.
@@ -504,6 +530,179 @@ impl RestCatalog {
             table,
             initialization_updates,
         })
+    }
+
+    /// Typed staged-create variant for durable application sagas.
+    pub async fn stage_create_table_typed(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> std::result::Result<StagedTableCreate, StagedCreateError> {
+        let context = self
+            .context()
+            .await
+            .map_err(StagedCreateError::KnownNotDispatched)?;
+        let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
+        let request = context
+            .client
+            .request(Method::POST, context.config.tables_endpoint(namespace))
+            .json(&CreateTableRequest {
+                name: creation.name,
+                location: creation.location,
+                schema: creation.schema,
+                partition_spec: creation.partition_spec,
+                write_order: creation.sort_order,
+                stage_create: Some(true),
+                properties: creation.properties,
+            })
+            .build()
+            .map_err(|error| StagedCreateError::KnownNotDispatched(error.into()))?;
+        let http_response = context
+            .client
+            .query_catalog(request)
+            .await
+            .map_err(StagedCreateError::PossiblyDispatched)?;
+        let status = http_response.status();
+        let response = match status {
+            StatusCode::OK => deserialize_catalog_response::<LoadTableResult>(http_response)
+                .await
+                .map_err(StagedCreateError::PossiblyDispatched)?,
+            StatusCode::CONFLICT => {
+                return Err(StagedCreateError::Conflict(Error::new(
+                    ErrorKind::TableAlreadyExists,
+                    "The table already exists",
+                )));
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                return Err(StagedCreateError::PossiblyDispatched(
+                    deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await,
+                ));
+            }
+            _ => {
+                return Err(StagedCreateError::KnownNotDispatched(
+                    deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await,
+                ));
+            }
+        };
+        let config = response
+            .config
+            .into_iter()
+            .chain(self.user_config.props.clone())
+            .collect();
+        let file_io_location = response
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| response.metadata.location());
+        let file_io = self
+            .load_file_io(Some(file_io_location), Some(config))
+            .await
+            .map_err(StagedCreateError::PossiblyDispatched)?;
+        let table_builder = Table::builder()
+            .identifier(table_ident)
+            .file_io(file_io)
+            .metadata(response.metadata);
+        let table = match response.metadata_location {
+            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
+            None => table_builder.build(),
+        }
+        .map_err(StagedCreateError::PossiblyDispatched)?;
+        let initialization_updates = table
+            .metadata()
+            .staged_create_initialization_updates()
+            .map_err(StagedCreateError::PossiblyDispatched)?;
+        Ok(StagedTableCreate {
+            table,
+            initialization_updates,
+        })
+    }
+
+    /// Submit one staged table commit without reloading the invisible table.
+    /// The typed result preserves conflict, pre-dispatch, uncertain-dispatch,
+    /// and committed-but-unreadable response states.
+    pub async fn commit_staged_table_typed(
+        &self,
+        mut commit: TableCommit,
+    ) -> std::result::Result<Table, StagedCommitError> {
+        let context = self
+            .context()
+            .await
+            .map_err(StagedCommitError::KnownNotDispatched)?;
+        let request = context
+            .client
+            .request(
+                Method::POST,
+                context.config.table_endpoint(commit.identifier()),
+            )
+            .json(&CommitTableRequest {
+                identifier: Some(commit.identifier().clone()),
+                requirements: commit.take_requirements(),
+                updates: commit.take_updates(),
+            })
+            .build()
+            .map_err(|error| StagedCommitError::KnownNotDispatched(error.into()))?;
+        let http_response = context
+            .client
+            .query_catalog(request)
+            .await
+            .map_err(StagedCommitError::PossiblyDispatched)?;
+        let status = http_response.status();
+        let response: CommitTableResponse = match status {
+            StatusCode::OK => deserialize_catalog_response(http_response)
+                .await
+                .map_err(StagedCommitError::CommittedResponseInvalid)?,
+            StatusCode::CONFLICT => {
+                return Err(StagedCommitError::Conflict(
+                    Error::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        "CatalogCommitConflicts, one or more requirements failed.",
+                    )
+                    .with_retryable(true),
+                ));
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                return Err(StagedCommitError::PossiblyDispatched(
+                    deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await,
+                ));
+            }
+            _ => {
+                return Err(StagedCommitError::KnownNotDispatched(
+                    deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await,
+                ));
+            }
+        };
+        let file_io = self
+            .load_file_io(Some(&response.metadata_location), None)
+            .await
+            .map_err(StagedCommitError::CommittedResponseInvalid)?;
+        Table::builder()
+            .identifier(commit.identifier().clone())
+            .file_io(file_io)
+            .metadata(response.metadata)
+            .metadata_location(response.metadata_location)
+            .build()
+            .map_err(StagedCommitError::CommittedResponseInvalid)
     }
 
     async fn create_table_with_stage(
@@ -2939,6 +3138,134 @@ mod tests {
         config_mock.assert_async().await;
         stage_create_mock.assert_async().await;
         commit_mock.assert_async().await;
+    }
+
+    fn typed_stage_creation() -> TableCreation {
+        TableCreation::builder()
+            .name("test1".to_string())
+            .schema(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+    }
+
+    fn typed_staged_commit() -> TableCommit {
+        TableCommit::builder()
+            .ident(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .requirements(vec![TableRequirement::NotExist])
+            .updates(Vec::new())
+            .build()
+    }
+
+    fn catalog_error_body(status: u16) -> String {
+        json!({
+            "error": {
+                "message": "typed staged operation failure",
+                "type": "TestException",
+                "code": status
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_typed_stage_create_preserves_conflict_and_dispatch_uncertainty() {
+        for (status, expected_conflict) in [(409, true), (503, false)] {
+            let mut server = Server::new_async().await;
+            let config_mock = create_config_mock(&mut server).await;
+            let stage_mock = server
+                .mock("POST", "/v1/namespaces/ns1/tables")
+                .with_status(status)
+                .with_body(catalog_error_body(status as u16))
+                .expect(1)
+                .create_async()
+                .await;
+            let catalog = RestCatalog::new(
+                RestCatalogConfig::builder().uri(server.url()).build(),
+                Some(Arc::new(LocalFsStorageFactory)),
+            );
+            let error = catalog
+                .stage_create_table_typed(
+                    &NamespaceIdent::from_strs(["ns1"]).unwrap(),
+                    typed_stage_creation(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                expected_conflict,
+                matches!(error, StagedCreateError::Conflict(_))
+            );
+            assert_eq!(
+                !expected_conflict,
+                matches!(error, StagedCreateError::PossiblyDispatched(_))
+            );
+            config_mock.assert_async().await;
+            stage_mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_stage_create_request_build_failure_is_known_not_dispatched() {
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri("://invalid".to_string())
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let error = catalog
+            .stage_create_table_typed(
+                &NamespaceIdent::from_strs(["ns1"]).unwrap(),
+                typed_stage_creation(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StagedCreateError::KnownNotDispatched(_)));
+    }
+
+    #[tokio::test]
+    async fn test_typed_staged_commit_preserves_conflict_and_response_uncertainty() {
+        for (status, expected) in [(409, "conflict"), (503, "dispatch"), (200, "response")] {
+            let mut server = Server::new_async().await;
+            let config_mock = create_config_mock(&mut server).await;
+            let body = if status == 200 {
+                "not-json".to_string()
+            } else {
+                catalog_error_body(status)
+            };
+            let commit_mock = server
+                .mock("POST", "/v1/namespaces/ns1/tables/test1")
+                .with_status(status as usize)
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            let catalog = RestCatalog::new(
+                RestCatalogConfig::builder().uri(server.url()).build(),
+                Some(Arc::new(LocalFsStorageFactory)),
+            );
+            let error = catalog
+                .commit_staged_table_typed(typed_staged_commit())
+                .await
+                .unwrap_err();
+            match expected {
+                "conflict" => assert!(matches!(error, StagedCommitError::Conflict(_))),
+                "dispatch" => assert!(matches!(error, StagedCommitError::PossiblyDispatched(_))),
+                "response" => {
+                    assert!(matches!(
+                        error,
+                        StagedCommitError::CommittedResponseInvalid(_)
+                    ))
+                }
+                _ => unreachable!(),
+            }
+            config_mock.assert_async().await;
+            commit_mock.assert_async().await;
+        }
     }
 
     fn staged_metadata_json() -> serde_json::Value {
