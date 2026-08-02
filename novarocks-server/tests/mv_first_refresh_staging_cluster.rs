@@ -62,7 +62,11 @@ struct BackendProcess {
 }
 
 impl BackendProcess {
-    fn spawn(config: &Path, lifecycle_fault_backend_index: usize) -> Self {
+    fn spawn(
+        config: &Path,
+        lifecycle_fault_backend_index: usize,
+        fragment_failure_trigger: &Path,
+    ) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
             .arg("standalone")
             .arg("--config")
@@ -70,6 +74,10 @@ impl BackendProcess {
             .env(
                 "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
                 lifecycle_fault_backend_index.to_string(),
+            )
+            .env(
+                "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+                fragment_failure_trigger,
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -96,7 +104,7 @@ struct ThreeBackendFixture {
 }
 
 impl ThreeBackendFixture {
-    fn start(query_lifecycle_fault_dir: &Path) -> Self {
+    fn start(query_lifecycle_fault_dir: &Path, fragment_failure_trigger: &Path) -> Self {
         let root = tempfile::tempdir().expect("create backend fixture root");
         let mut reservations = (0..3)
             .map(|_| (ReservedPort::new(), ReservedPort::new()))
@@ -144,7 +152,11 @@ query_lifecycle_fault_dir = "{}"
         {
             let _ = http.release();
             let grpc_port = grpc.release();
-            processes.push(BackendProcess::spawn(config.path(), index));
+            processes.push(BackendProcess::spawn(
+                config.path(),
+                index,
+                fragment_failure_trigger,
+            ));
             wait_for_tcp(grpc_port, "backend gRPC endpoint");
         }
         Self {
@@ -194,6 +206,12 @@ fn clear_query_lifecycle_fault(root: &Path, kind: QueryLifecycleFaultKind) {
     }
 }
 
+fn arm_fragment_failure(trigger: &Path, token: &str) {
+    std::fs::write(trigger, token).expect("arm native fragment failure");
+    std::fs::write(trigger.with_extension("release"), token)
+        .expect("release native fragment failure after Start");
+}
+
 fn wait_for_tcp(port: u16, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -235,6 +253,9 @@ fn connect_mysql(port: u16) -> MysqlConn {
 #[ignore = "requires native 1FE+3BE processes"]
 fn projection_first_refresh_stages_on_three_backend_processes() {
     let query_lifecycle_fault_dir = tempfile::tempdir().expect("create query lifecycle fault root");
+    let fragment_failure_trigger = query_lifecycle_fault_dir
+        .path()
+        .join("fragment-failure.trigger");
     // The production config loader requires this runner-owned path to match
     // the frontend and each BE configuration.  This test process owns one
     // fixture at a time, so the inherited environment is unambiguous.
@@ -244,7 +265,8 @@ fn projection_first_refresh_stages_on_three_backend_processes() {
             query_lifecycle_fault_dir.path(),
         );
     }
-    let backends = ThreeBackendFixture::start(query_lifecycle_fault_dir.path());
+    let backends =
+        ThreeBackendFixture::start(query_lifecycle_fault_dir.path(), &fragment_failure_trigger);
     let fe_mysql = ReservedPort::new();
     let fe_http = ReservedPort::new();
     let fe_grpc = ReservedPort::new();
@@ -580,6 +602,38 @@ query_lifecycle_fault_dir = "{}"
         query_lifecycle_fault_dir.path(),
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
     );
+
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_fragment_failure_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create fragment-failure MV target");
+    arm_fragment_failure(&fragment_failure_trigger, "mvx2w-fragment-failure");
+    let fragment_failure = engine
+        .stage_iceberg_mv_first_refresh_for_test(
+            Some("staging_ice"),
+            "ns",
+            "orders_fragment_failure_mv",
+        )
+        .expect_err("a failed native writer fragment must not produce a staging completion");
+    assert!(
+        !fragment_failure.to_string().is_empty(),
+        "failed native writer fragment must preserve an explanatory error"
+    );
+    let fragment_failure_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_fragment_failure_mv ORDER BY k1")
+        .expect("read fragment-failure MV main ref");
+    assert!(
+        fragment_failure_main_rows.is_empty(),
+        "a failed native writer fragment must never publish the MV main ref"
+    );
+    let fragment_failure_release = fragment_failure_trigger.with_extension("release");
+    for path in [&fragment_failure_trigger, &fragment_failure_release] {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("clear native fragment failure trigger: {error}");
+        }
+    }
 
     drop(engine);
     drop(conn);
