@@ -14,6 +14,16 @@ should be re-pointed at the upstream actions.
 
 Tracked under spec §0.4 / Plan Task 9.
 
+## Patch 8 — authoritative REST staged-create initialization updates
+
+`TableMetadata::staged_create_initialization_updates` converts the metadata
+returned by a REST `stage-create=true` response into the initialization
+updates for the first `assert-create` commit. Values come exclusively from
+the authoritative response metadata, including UUID, location, schema/spec/
+sort-order IDs, high-watermarks, format version, and properties. The helper
+rejects non-initial metadata that the initialization update set cannot
+represent exactly instead of guessing or silently dropping state.
+
 ## Patch 1 — `src/transaction/action.rs`
 
 Raise `TransactionAction` trait visibility from `pub(crate)` to `pub` so that

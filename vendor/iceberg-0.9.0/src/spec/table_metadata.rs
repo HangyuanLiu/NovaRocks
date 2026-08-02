@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use uuid::Uuid;
 
+use super::partition::UNPARTITIONED_LAST_ASSIGNED_ID;
 use super::snapshot::SnapshotReference;
 pub use super::table_metadata_builder::{TableMetadataBuildResult, TableMetadataBuilder};
 use super::{
@@ -41,7 +42,7 @@ use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
 use crate::spec::EncryptedKey;
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, TableUpdate};
 
 static MAIN_BRANCH: &str = "main";
 pub(crate) static ONE_MINUTE_MS: i64 = 60_000;
@@ -137,6 +138,92 @@ pub struct TableMetadata {
 }
 
 impl TableMetadata {
+    /// Reconstruct the metadata updates required to publish authoritative
+    /// metadata returned by a REST staged-create response.
+    ///
+    /// A staged-create response is not yet a table. Its metadata must be
+    /// included with the first `assert-create` commit, followed by the
+    /// transaction's data/snapshot updates. This method deliberately accepts
+    /// only initial metadata that can be represented exactly by the Iceberg
+    /// REST metadata-update protocol. It never derives values from the
+    /// original create request.
+    pub fn staged_create_initialization_updates(&self) -> Result<Vec<TableUpdate>> {
+        if self.last_sequence_number != INITIAL_SEQUENCE_NUMBER
+            || self.current_snapshot_id.is_some()
+            || !self.snapshots.is_empty()
+            || !self.snapshot_log.is_empty()
+            || !self.metadata_log.is_empty()
+            || !self.refs.is_empty()
+            || !self.statistics.is_empty()
+            || !self.partition_statistics.is_empty()
+            || !self.encryption_keys.is_empty()
+            || self.next_row_id != INITIAL_ROW_ID
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Staged-create metadata contains state that cannot be represented as initialization updates",
+            ));
+        }
+
+        if self.schemas.len() != 1
+            || self.partition_specs.len() != 1
+            || self.sort_orders.len() != 1
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Staged-create metadata must contain exactly one schema, partition spec, and sort order",
+            ));
+        }
+
+        let schema = Arc::unwrap_or_clone(self.current_schema().clone());
+        let partition_spec = Arc::unwrap_or_clone(self.default_partition_spec().clone());
+        let sort_order = Arc::unwrap_or_clone(self.default_sort_order().clone());
+        let represented_last_partition_id = partition_spec
+            .highest_field_id()
+            .unwrap_or(UNPARTITIONED_LAST_ASSIGNED_ID);
+        if self.last_partition_id != represented_last_partition_id {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Staged-create partition high-watermark cannot be represented exactly by initialization updates",
+            ));
+        }
+
+        let mut updates = vec![TableUpdate::AssignUuid {
+            uuid: self.table_uuid,
+        }];
+        if self.format_version != FormatVersion::V1 {
+            updates.push(TableUpdate::UpgradeFormatVersion {
+                format_version: self.format_version,
+            });
+        }
+        updates.extend([
+            TableUpdate::SetLocation {
+                location: self.location.clone(),
+            },
+            TableUpdate::AddSchema {
+                schema,
+                last_column_id: Some(self.last_column_id),
+            },
+            TableUpdate::SetCurrentSchema {
+                schema_id: self.current_schema_id,
+            },
+            TableUpdate::AddSpec {
+                spec: partition_spec.into_unbound(),
+            },
+            TableUpdate::SetDefaultSpec {
+                spec_id: self.default_spec.spec_id(),
+            },
+            TableUpdate::AddSortOrder { sort_order },
+            TableUpdate::SetDefaultSortOrder {
+                sort_order_id: self.default_sort_order_id,
+            },
+            TableUpdate::SetProperties {
+                updates: self.properties.clone(),
+            },
+        ]);
+        Ok(updates)
+    }
+
     /// Convert this Table Metadata into a builder for modification.
     ///
     /// `current_file_location` is the location where the current version

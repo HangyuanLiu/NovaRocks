@@ -28,7 +28,7 @@ use iceberg::spec::{ViewMetadata, ViewVersion};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
-    TableCreation, TableIdent, ViewCommit, ViewCreation,
+    TableCreation, TableIdent, TableUpdate, ViewCommit, ViewCreation,
 };
 use itertools::Itertools;
 use reqwest::header::{
@@ -368,6 +368,32 @@ pub struct RestCatalog {
     storage_factory: Option<Arc<dyn StorageFactory>>,
 }
 
+/// A REST staged-create result and the authoritative initialization updates
+/// required by its first `assert-create` commit.
+#[derive(Debug)]
+pub struct StagedTableCreate {
+    table: Table,
+    initialization_updates: Vec<TableUpdate>,
+}
+
+impl StagedTableCreate {
+    /// Return the staged table. Its metadata location is absent because the
+    /// table has not been published yet.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Return initialization updates reconstructed from the staged response.
+    pub fn initialization_updates(&self) -> &[TableUpdate] {
+        &self.initialization_updates
+    }
+
+    /// Consume this result into the staged table and initialization updates.
+    pub fn into_parts(self) -> (Table, Vec<TableUpdate>) {
+        (self.table, self.initialization_updates)
+    }
+}
+
 impl RestCatalog {
     /// Creates a `RestCatalog` from a [`RestCatalogConfig`].
     fn new(config: RestCatalogConfig, storage_factory: Option<Arc<dyn StorageFactory>>) -> Self {
@@ -458,6 +484,105 @@ impl RestCatalog {
         let file_io = FileIOBuilder::new(factory).with_props(props).build();
 
         Ok(file_io)
+    }
+
+    /// Ask the REST service to initialize, but not publish, a table.
+    ///
+    /// The returned initialization updates are derived from the service's
+    /// authoritative metadata and must precede the transaction's snapshot
+    /// updates in one `assert-create` table commit.
+    pub async fn stage_create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<StagedTableCreate> {
+        let table = self
+            .create_table_with_stage(namespace, creation, true)
+            .await?;
+        let initialization_updates = table.metadata().staged_create_initialization_updates()?;
+        Ok(StagedTableCreate {
+            table,
+            initialization_updates,
+        })
+    }
+
+    async fn create_table_with_stage(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+        stage_create: bool,
+    ) -> Result<Table> {
+        let context = self.context().await?;
+        let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
+
+        let request = context
+            .client
+            .request(Method::POST, context.config.tables_endpoint(namespace))
+            .json(&CreateTableRequest {
+                name: creation.name,
+                location: creation.location,
+                schema: creation.schema,
+                partition_spec: creation.partition_spec,
+                write_order: creation.sort_order,
+                stage_create: Some(stage_create),
+                properties: creation.properties,
+            })
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+        let response = match http_response.status() {
+            StatusCode::OK => {
+                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+            }
+            StatusCode::NOT_FOUND => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Tried to create a table under a namespace that does not exist",
+                ));
+            }
+            StatusCode::CONFLICT => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "The table already exists",
+                ));
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    context.client.disable_header_redaction(),
+                )
+                .await);
+            }
+        };
+
+        if !stage_create && response.metadata_location.is_none() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Metadata location missing in `create_table` response!",
+            ));
+        }
+
+        let config = response
+            .config
+            .into_iter()
+            .chain(self.user_config.props.clone())
+            .collect();
+        let file_io_location = response
+            .metadata_location
+            .as_deref()
+            .unwrap_or_else(|| response.metadata.location());
+        let file_io = self
+            .load_file_io(Some(file_io_location), Some(config))
+            .await?;
+
+        let table_builder = Table::builder()
+            .identifier(table_ident)
+            .file_io(file_io)
+            .metadata(response.metadata);
+        match response.metadata_location {
+            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
+            None => table_builder.build(),
+        }
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -713,76 +838,8 @@ impl Catalog for RestCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let context = self.context().await?;
-
-        let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
-
-        let request = context
-            .client
-            .request(Method::POST, context.config.tables_endpoint(namespace))
-            .json(&CreateTableRequest {
-                name: creation.name,
-                location: creation.location,
-                schema: creation.schema,
-                partition_spec: creation.partition_spec,
-                write_order: creation.sort_order,
-                stage_create: Some(false),
-                properties: creation.properties,
-            })
-            .build()?;
-
-        let http_response = context.client.query_catalog(request).await?;
-
-        let response = match http_response.status() {
-            StatusCode::OK => {
-                deserialize_catalog_response::<LoadTableResult>(http_response).await?
-            }
-            StatusCode::NOT_FOUND => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Tried to create a table under a namespace that does not exist",
-                ));
-            }
-            StatusCode::CONFLICT => {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "The table already exists",
-                ));
-            }
-            _ => {
-                return Err(deserialize_unexpected_catalog_error(
-                    http_response,
-                    context.client.disable_header_redaction(),
-                )
-                .await);
-            }
-        };
-
-        let metadata_location = response.metadata_location.as_ref().ok_or(Error::new(
-            ErrorKind::DataInvalid,
-            "Metadata location missing in `create_table` response!",
-        ))?;
-
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-
-        let file_io = self
-            .load_file_io(Some(metadata_location), Some(config))
-            .await?;
-
-        let table_builder = Table::builder()
-            .identifier(table_ident.clone())
-            .file_io(file_io)
-            .metadata(response.metadata);
-
-        if let Some(metadata_location) = response.metadata_location {
-            table_builder.metadata_location(metadata_location).build()
-        } else {
-            table_builder.build()
-        }
+        self.create_table_with_stage(namespace, creation, false)
+            .await
     }
 
     /// Load table from the catalog.
@@ -1292,11 +1349,13 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{TimeZone, Utc};
+    use iceberg::TableRequirement;
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::spec::{
         FormatVersion, NestedField, NullOrder, Operation, PrimitiveType, Schema, Snapshot,
-        SnapshotLog, SortDirection, SortField, SortOrder, Summary, Transform, Type,
-        UnboundPartitionField, UnboundPartitionSpec,
+        SnapshotLog, SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder,
+        Summary, TableMetadata, TableMetadataBuilder, Transform, Type, UnboundPartitionField,
+        UnboundPartitionSpec,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use mockito::{Mock, Server, ServerGuard};
@@ -2714,6 +2773,238 @@ mod tests {
 
         config_mock.assert_async().await;
         create_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_stage_create_and_commit_authoritative_metadata_with_snapshot_updates() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut staged_response: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/create_table_response.json"
+        )))
+        .unwrap();
+        staged_response["metadata-location"] = serde_json::Value::Null;
+
+        let stage_create_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "name": "test1",
+                "stage-create": true,
+                "properties": {"owner": "request-owner"}
+            })))
+            .with_status(200)
+            .with_body(staged_response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let request_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "request_field", Type::Primitive(PrimitiveType::String))
+                    .into(),
+            ])
+            .with_schema_id(77)
+            .build()
+            .unwrap();
+        let staged = catalog
+            .stage_create_table(
+                &NamespaceIdent::from_strs(["ns1"]).unwrap(),
+                TableCreation::builder()
+                    .name("test1".to_string())
+                    .schema(request_schema)
+                    .properties(HashMap::from([(
+                        "owner".to_string(),
+                        "request-owner".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(None, staged.table().metadata_location());
+        assert_eq!(
+            uuid!("bf289591-dcc0-4234-ad4f-5c3eed811a29"),
+            staged.table().metadata().uuid()
+        );
+        assert_eq!(
+            "s3://warehouse/database/table",
+            staged.table().metadata().location()
+        );
+        assert_eq!(0, staged.table().metadata().current_schema_id());
+        assert_eq!(0, staged.table().metadata().default_partition_spec_id());
+        assert_eq!(0, staged.table().metadata().default_sort_order_id());
+        assert_eq!(
+            Some(&"zstd".to_string()),
+            staged
+                .table()
+                .metadata()
+                .properties()
+                .get("write.parquet.compression-codec")
+        );
+        assert!(!staged.table().metadata().properties().contains_key("owner"));
+
+        let initialization_json = serde_json::to_value(staged.initialization_updates()).unwrap();
+        let initialization_json = initialization_json.as_array().unwrap();
+        assert_eq!(9, initialization_json.len());
+        assert_eq!(
+            json!({
+                "action": "assign-uuid",
+                "uuid": "bf289591-dcc0-4234-ad4f-5c3eed811a29"
+            }),
+            initialization_json[0]
+        );
+        assert_eq!(
+            json!({
+                "action": "set-location",
+                "location": "s3://warehouse/database/table"
+            }),
+            initialization_json[1]
+        );
+        assert_eq!(0, initialization_json[2]["schema"]["schema-id"]);
+        assert_eq!(3, initialization_json[2]["last-column-id"]);
+        assert_eq!(0, initialization_json[3]["schema-id"]);
+        assert_eq!(0, initialization_json[4]["spec"]["spec-id"]);
+        assert_eq!(0, initialization_json[5]["spec-id"]);
+        assert_eq!(0, initialization_json[6]["sort-order"]["order-id"]);
+        assert_eq!(0, initialization_json[7]["sort-order-id"]);
+        assert_eq!(
+            "zstd",
+            initialization_json[8]["updates"]["write.parquet.compression-codec"]
+        );
+
+        let ident = staged.table().identifier().clone();
+        let (_, mut updates) = staged.into_parts();
+        let snapshot_id = 3055729675574597000;
+        updates.push(TableUpdate::AddSnapshot {
+            snapshot: Snapshot::builder()
+                .with_snapshot_id(snapshot_id)
+                .with_timestamp_ms(1657810968051)
+                .with_sequence_number(0)
+                .with_manifest_list("s3://warehouse/database/table/metadata/snap-proof.avro")
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build(),
+        });
+        updates.push(TableUpdate::SetSnapshotRef {
+            ref_name: "main".to_string(),
+            reference: SnapshotReference::new(
+                snapshot_id,
+                SnapshotRetention::branch(None, None, None),
+            ),
+        });
+
+        let expected_request = CommitTableRequest {
+            identifier: Some(ident.clone()),
+            requirements: vec![TableRequirement::NotExist],
+            updates: updates.clone(),
+        };
+        let commit_response = json!({
+            "metadata-location": "s3://warehouse/database/table/metadata/v1.metadata.json",
+            "metadata": staged_response["metadata"].clone()
+        });
+        let commit_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .match_body(mockito::Matcher::Json(
+                serde_json::to_value(&expected_request).unwrap(),
+            ))
+            .with_status(200)
+            .with_body(commit_response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let committed = catalog
+            .update_table(
+                TableCommit::builder()
+                    .ident(ident)
+                    .requirements(vec![TableRequirement::NotExist])
+                    .updates(updates)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            Some("s3://warehouse/database/table/metadata/v1.metadata.json"),
+            committed.metadata_location()
+        );
+
+        config_mock.assert_async().await;
+        stage_create_mock.assert_async().await;
+        commit_mock.assert_async().await;
+    }
+
+    fn staged_metadata_json() -> serde_json::Value {
+        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/create_table_response.json"
+        )))
+        .unwrap();
+        response["metadata"].clone()
+    }
+
+    #[test]
+    fn test_staged_create_initialization_updates_preserve_v2_and_v3_format() {
+        for expected in [FormatVersion::V2, FormatVersion::V3] {
+            let metadata = TableMetadataBuilder::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+                UnboundPartitionSpec::default(),
+                SortOrder::unsorted_order(),
+                "s3://warehouse/database/versioned".to_string(),
+                expected,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let updates = metadata.staged_create_initialization_updates().unwrap();
+            assert!(updates.contains(&TableUpdate::UpgradeFormatVersion {
+                format_version: expected,
+            }));
+        }
+    }
+
+    #[test]
+    fn test_staged_create_initialization_updates_reject_snapshot_state() {
+        let mut metadata_json = staged_metadata_json();
+        let snapshot_id = 3055729675574597000i64;
+        metadata_json["current-snapshot-id"] = json!(snapshot_id);
+        metadata_json["snapshots"] = json!([{
+            "snapshot-id": snapshot_id,
+            "timestamp-ms": 1657810968051i64,
+            "summary": {"operation": "append"},
+            "manifest-list": "s3://warehouse/database/table/metadata/snap-proof.avro"
+        }]);
+        metadata_json["refs"] = json!({
+            "main": {"snapshot-id": snapshot_id, "type": "branch"}
+        });
+        let metadata: TableMetadata = serde_json::from_value(metadata_json).unwrap();
+        let error = metadata.staged_create_initialization_updates().unwrap_err();
+        assert_eq!(ErrorKind::DataInvalid, error.kind());
+        assert!(error.message().contains("cannot be represented"));
+    }
+
+    #[test]
+    fn test_staged_create_initialization_updates_reject_unrepresented_partition_watermark() {
+        let mut metadata_json = staged_metadata_json();
+        metadata_json["last-partition-id"] = json!(1000);
+        let metadata: TableMetadata = serde_json::from_value(metadata_json).unwrap();
+        let error = metadata.staged_create_initialization_updates().unwrap_err();
+        assert_eq!(ErrorKind::DataInvalid, error.kind());
+        assert!(error.message().contains("partition high-watermark"));
     }
 
     #[tokio::test]

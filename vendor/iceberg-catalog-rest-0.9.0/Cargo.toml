@@ -41,6 +41,10 @@ path = "src/lib.rs"
 name = "rest_catalog_test"
 path = "tests/rest_catalog_test.rs"
 
+[[test]]
+name = "staged_create_probe"
+path = "tests/staged_create_probe.rs"
+
 [dependencies.async-trait]
 version = "0.1.89"
 
