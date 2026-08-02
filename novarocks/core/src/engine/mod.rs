@@ -77,6 +77,7 @@ pub mod statistics;
 pub mod statistics_application;
 pub mod system_catalog;
 pub mod table_maintenance;
+pub mod truncate_engine;
 pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;

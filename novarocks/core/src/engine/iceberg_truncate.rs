@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Standalone-mode iceberg `TRUNCATE TABLE` entry point.
+//! Legacy standalone-mode iceberg `TRUNCATE TABLE` entry point.
 //!
 //! Routes from `statement::execute_truncate_table_statement` for any iceberg
 //! target (with optional branch suffix `t.branch_<name>` resolved at parse
 //! time and threaded through as `target_ref`).
 //!
-//! The statement boundary constructs only a provider-neutral mutation intent.
-//! Exact-generation metadata loading, planning, commit and reconciliation are
-//! owned by the connector data-mutation bridge.
+//! The frontend-owned route uses the `TruncateEngine` reverse port.
+//! This wrapper remains temporarily for non-migrated standalone callers and
+//! delegates to the data-mutation bridge's one-shot compatibility path.
 
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::{StandaloneState, StatementResult};
