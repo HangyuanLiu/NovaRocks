@@ -22,6 +22,7 @@
 //! for post-compile preparation and native request assembly.
 
 pub(crate) mod bindings;
+pub(crate) mod catalog_materializer;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -113,7 +114,7 @@ pub(crate) fn sql_cancellation_observation(
 
 /// Application-owned facts used only after SQL has produced a plan.
 pub(crate) struct PostCompilePlanningContext<'a> {
-    pub(crate) table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    pub(crate) table_bindings: Arc<bindings::QueryTableBindingStore>,
     pub(crate) connector_controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     pub(crate) connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
 }

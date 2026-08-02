@@ -52,6 +52,16 @@ pub(crate) enum QueryTableBindingSelector {
 }
 
 impl QueryTableBindingKey {
+    /// Resolve the synthetic time-travel analyzer identity to the canonical
+    /// physical table and snapshot selector before it reaches the request
+    /// local memo.  This overlay is intentionally local to the binding
+    /// store; it must never register a synthetic table in the global catalog.
+    pub(crate) fn analysis_lookup(catalog: &str, namespace: &str, table: &str) -> Self {
+        if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
+            return Self::snapshot(catalog, namespace, base_table, snapshot_id);
+        }
+        Self::strict_base(catalog, namespace, table)
+    }
     pub(crate) fn strict_base(catalog: &str, namespace: &str, table: &str) -> Self {
         Self::new(
             catalog,
@@ -99,6 +109,15 @@ impl QueryTableBindingKey {
     }
 }
 
+pub(crate) fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
+    let encoded = table.strip_prefix("__sqlx1_tt_")?;
+    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
+    (!base_table.is_empty())
+        .then(|| snapshot_id.parse::<i64>().ok())
+        .flatten()
+        .map(|snapshot_id| (base_table, snapshot_id))
+}
+
 /// One successful application materialization.  Opaque connector authority
 /// stays here; neither the SQL scan vocabulary nor SQL catalog facts contain
 /// a provider table, files, cloud properties, or serialized metadata.
@@ -107,6 +126,16 @@ pub(crate) struct QueryTableBinding {
     pub(crate) resolved: ResolvedAnalyzerTable,
     pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub(crate) planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+}
+
+impl QueryTableBinding {
+    pub(crate) fn local(resolved: ResolvedAnalyzerTable) -> Self {
+        Self {
+            resolved,
+            statistics_pin: None,
+            planning_lease: None,
+        }
+    }
 }
 
 struct StoredBinding {
@@ -197,6 +226,69 @@ impl QueryTableBindingStore {
         id: SqlTableBindingId,
     ) -> Result<Option<novarocks_spi::connector::ConnectorControlPlanningLease>, String> {
         Ok(self.binding(id)?.planning_lease.clone())
+    }
+
+    /// Lookup the exact resolution retained for the old physical scan facts
+    /// while production callers are moved to `SqlScanSource`.  The result is
+    /// still retrieved from this one token store; this helper never acquires a
+    /// current connector generation.
+    pub(crate) fn strict_base_binding(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Option<Arc<QueryTableBinding>> {
+        self.binding_for_key(&QueryTableBindingKey::strict_base(
+            catalog, namespace, table,
+        ))
+    }
+
+    pub(crate) fn iceberg_data_file_binding(
+        &self,
+        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    ) -> Option<Arc<QueryTableBinding>> {
+        use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+
+        let key = match binding {
+            IcebergDataFileBinding::ExplicitFiles => table.current_snapshot_id.map(|snapshot_id| {
+                QueryTableBindingKey::snapshot(
+                    &table.catalog,
+                    &table.namespace,
+                    &table.table,
+                    snapshot_id,
+                )
+            }),
+            _ => Some(QueryTableBindingKey::strict_base(
+                &table.catalog,
+                &table.namespace,
+                &table.table,
+            )),
+        }?;
+        self.binding_for_key(&key)
+    }
+
+    fn binding_for_key(&self, key: &QueryTableBindingKey) -> Option<Arc<QueryTableBinding>> {
+        let id = self
+            .entries
+            .lock()
+            .expect("query table binding lock")
+            .get(key)
+            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))?;
+        self.binding(id).ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_strict_base_binding_for_test(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        binding: QueryTableBinding,
+    ) {
+        let key = QueryTableBindingKey::strict_base(catalog, namespace, table);
+        self.resolve_or_insert(key, || Ok(binding))
+            .expect("test binding insertion must allocate a token");
     }
 
     fn allocate_id(&self) -> Result<SqlTableBindingId, String> {

@@ -114,14 +114,16 @@ pub(crate) fn build_catalog_service_provider<'a>(
     catalog_service: &'a StandaloneCatalogService,
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    lookup_mode: TableLookupMode,
-) -> crate::sql::catalog::provider::CatalogServiceProvider<'a> {
-    let bindings = Arc::new(crate::sql::catalog::provider::QueryTableBindingStore::default());
+    _lookup_mode: TableLookupMode,
+) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+    let bindings = Arc::new(
+        crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+            .expect("query table binding scope allocation must not fail"),
+    );
     let loader = query_stats::iceberg_table_binding_loader(controls, connector_context);
-    crate::sql::catalog::provider::CatalogServiceProvider::with_query_table_bindings(
+    crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new(
         current_catalog,
         catalog_service,
-        lookup_mode,
         bindings,
         loader,
     )
@@ -2358,7 +2360,7 @@ impl StandaloneSession {
                 // Time-travel: `SELECT ... FROM t FOR VERSION AS OF <v>`.
                 // Rewrite version-bearing table refs to synthetic per-snapshot
                 // names and register only those synthetic TableDefs. Ordinary
-                // Iceberg refs are resolved by CatalogServiceProvider during analysis.
+                // Iceberg refs are resolved by the query catalog materializer during analysis.
                 if has_time_travel_refs(&prepared) {
                     rewrite_time_travel_refs(
                         &self.inner,
@@ -4017,7 +4019,7 @@ fn prepare_explain_query(
     )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
-    // remain untouched and resolve through CatalogServiceProvider during analysis.
+    // remain untouched and resolve through the query catalog materializer during analysis.
     if has_time_travel_refs(&prepared) {
         rewrite_time_travel_refs(
             state,
@@ -4049,7 +4051,7 @@ fn emit_mv_rewrite_diagnostics(
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -4073,9 +4075,9 @@ fn explain_analyze_query(
     )?;
     let statistics_context = mv_rewrite_state
         .map(|state| {
-            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+            query_stats::QueryStatisticsContext::from_optional_state_with_bindings(
                 Some(state),
-                analyzer_catalog.statistics_pins(),
+                Some(analyzer_catalog.query_table_bindings()),
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
@@ -4117,9 +4119,7 @@ fn explain_analyze_query(
         .ok_or_else(|| {
             "distributed explain requires a frontend connector control host".to_string()
         })?;
-    let query_table_bindings = analyzer_catalog
-        .query_table_bindings()
-        .ok_or_else(|| "distributed explain requires query table bindings".to_string())?;
+    let query_table_bindings = analyzer_catalog.query_table_bindings();
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connector_controls,
@@ -4283,7 +4283,7 @@ fn explain_logical_query(
 /// Produce EXPLAIN output for a query without executing it.
 fn explain_query(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     _codegen_catalog: &PlannerMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
@@ -4304,9 +4304,9 @@ fn explain_query(
     )?;
     let statistics_context = mv_rewrite_state
         .map(|state| {
-            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+            query_stats::QueryStatisticsContext::from_optional_state_with_bindings(
                 Some(state),
-                analyzer_catalog.statistics_pins(),
+                Some(analyzer_catalog.query_table_bindings()),
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);
@@ -4988,7 +4988,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     );
 
     let table_bindings = analyzer_provider.query_table_bindings();
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
         table_bindings.clone(),
     );
@@ -5104,7 +5104,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
         table_bindings.clone(),
     );
@@ -5311,7 +5311,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write(
     _current_catalog: Option<&str>,
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
-    query_table_bindings: Option<&crate::sql::catalog::provider::QueryTableBindingStore>,
+    query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
@@ -5341,7 +5341,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     _current_catalog: Option<&str>,
     current_database: &str,
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
-    query_table_bindings: Option<&crate::sql::catalog::provider::QueryTableBindingStore>,
+    query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
@@ -5777,7 +5777,8 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
     pub(crate) output_columns: Vec<crate::sql::analysis::OutputColumn>,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
-    pub(crate) table_bindings: Option<Arc<crate::sql::catalog::provider::QueryTableBindingStore>>,
+    pub(crate) table_bindings:
+        Option<Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5797,7 +5798,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
     // analysis catalog therefore has no ordinary query binding store; retain
     // that absence in the compiler output so physical preparation delegates
     // only to the typed refresh resolver rather than reacquiring metadata.
-    let table_bindings = analyzer_catalog.query_table_bindings();
+    let table_bindings = None;
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let statistics = query_stats::QueryStatisticsContext::unavailable();
     let request = crate::sql::compiler::SqlCompileRequest::new(
@@ -5921,7 +5922,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 #[allow(clippy::too_many_arguments)]
 fn prepare_query_with_sql_compiler_kernel(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     current_catalog: Option<&str>,
     current_database: &str,
     state: &Arc<StandaloneState>,
@@ -5942,10 +5943,8 @@ fn prepare_query_with_sql_compiler_kernel(
         .ok_or_else(|| {
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
-    let table_bindings = analyzer_catalog
-        .query_table_bindings()
-        .ok_or_else(|| "SQL compilation requires query table bindings".to_string())?;
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+    let table_bindings = analyzer_catalog.query_table_bindings();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
         table_bindings.clone(),
     );
@@ -6038,7 +6037,7 @@ fn prepare_query_with_sql_compiler_kernel(
 #[allow(clippy::too_many_arguments)]
 fn explain_query_with_sql_compiler_kernel(
     query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
+    analyzer_catalog: &crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'_>,
     current_catalog: Option<&str>,
     current_database: &str,
     state: &Arc<StandaloneState>,
@@ -6051,10 +6050,8 @@ fn explain_query_with_sql_compiler_kernel(
         .ok_or_else(|| {
             "SQL compilation requires a non-empty admitted backend topology".to_string()
         })?;
-    let table_bindings = analyzer_catalog
-        .query_table_bindings()
-        .ok_or_else(|| "SQL compilation requires query table bindings".to_string())?;
-    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+    let table_bindings = analyzer_catalog.query_table_bindings();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
         table_bindings.clone(),
     );
@@ -6141,9 +6138,9 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     )?;
     let statistics_context = mv_rewrite_state
         .map(|state| {
-            query_stats::QueryStatisticsContext::from_optional_state_with_pins(
+            query_stats::QueryStatisticsContext::from_optional_state_with_bindings(
                 Some(state),
-                analyzer_catalog.statistics_pins(),
+                None,
             )
         })
         .unwrap_or_else(query_stats::QueryStatisticsContext::unavailable);

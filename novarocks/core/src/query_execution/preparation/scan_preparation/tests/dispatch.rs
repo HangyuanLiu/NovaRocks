@@ -98,12 +98,13 @@ fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() 
             &ConnectorInstanceId::parse(&table.catalog).expect("fixture catalog instance"),
         )
         .expect("fixture planning lease");
-    let bindings = crate::sql::catalog::provider::QueryTableBindingStore::default();
+    let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        .expect("binding store");
     bindings.insert_strict_base_binding_for_test(
         &table.catalog,
         &table.namespace,
         &table.table,
-        crate::sql::catalog::provider::QueryTableBinding {
+        crate::engine::query_planning::bindings::QueryTableBinding {
             resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 Some(&table.catalog),
                 "default",
@@ -140,7 +141,8 @@ fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() 
 fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
-    let bindings = crate::sql::catalog::provider::QueryTableBindingStore::default();
+    let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        .expect("binding store");
     let error = match super::super::prepare_scan_bindings(
         &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
         &controls,

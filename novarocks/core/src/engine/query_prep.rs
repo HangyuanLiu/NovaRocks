@@ -17,7 +17,7 @@
 
 //! Synthetic/local query preparation for time-travel, delta scans, MV helpers,
 //! ANALYZE schema materialization, and catalog-service table invalidation.
-//! Ordinary SELECT external tables resolve through CatalogServiceProvider.
+//! Ordinary SELECT external tables resolve through the query catalog materializer.
 
 use std::sync::Arc;
 
@@ -115,7 +115,7 @@ fn has_time_travel_in_factor(factor: &sqlparser::ast::TableFactor) -> bool {
 ///
 /// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
 /// 2. Encode a synthetic, query-local analyzer identity for that snapshot.
-///    `CatalogServiceProvider` memoizes the corresponding exact binding and
+///    the query catalog materializer memoizes the corresponding exact binding and
 ///    planning lease in its request-local binding store.
 /// 3. Rewrite the `TableFactor::Table`:
 ///    - Replace `name` with `<catalog>.<namespace>.<synthetic name>` so the
@@ -306,7 +306,7 @@ fn rewrite_time_travel_in_factor(
             }
 
             // Route the synthetic analyzer identity through the canonical
-            // connector catalog so CatalogServiceProvider resolves the
+            // connector catalog so the query catalog materializer resolves the
             // query-local binding above instead of consulting global state.
             *name = sqlparser::ast::ObjectName(vec![
                 sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(

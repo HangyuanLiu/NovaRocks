@@ -15346,7 +15346,8 @@ const IMV_CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 
 struct ImvRefreshPlannedChangeStream<'a> {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
-    table_bindings: Option<std::sync::Arc<crate::sql::catalog::provider::QueryTableBindingStore>>,
+    table_bindings:
+        Option<std::sync::Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>>,
     output_columns: Vec<OutputColumn>,
     change_stream: crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     producer_branches: Vec<ImvChangeStreamProducerBranch>,

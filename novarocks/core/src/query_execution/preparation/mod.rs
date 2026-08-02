@@ -27,7 +27,7 @@ mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sql::catalog::provider::QueryTableBindingStore;
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::sql::planner::table::ScanSource;
 
 use boundary::validate_and_group_boundary_contracts;

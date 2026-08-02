@@ -24,10 +24,9 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::unified_statistics::{ResolvedStatisticsTable, UnifiedStatisticsResolver};
+use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingStore};
+use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::catalog::provider::{
-    QueryStatisticsPins, QueryTableBinding, QueryTableBindingLoader,
-};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::Confidence;
@@ -43,7 +42,7 @@ use crate::sql::planner::table::ScanSource;
 /// rather than a second latest-resolution path.
 pub(crate) struct QueryStatisticsContext {
     resolver: Option<Arc<UnifiedStatisticsResolver>>,
-    bindings: Option<QueryStatisticsPins>,
+    bindings: Option<Arc<QueryTableBindingStore>>,
 }
 
 impl QueryStatisticsContext {
@@ -55,22 +54,24 @@ impl QueryStatisticsContext {
         Self::none()
     }
 
-    pub(crate) fn from_standalone_state_with_pins(
+    pub(crate) fn from_standalone_state_with_bindings(
         state: &Arc<super::StandaloneState>,
-        pins: QueryStatisticsPins,
+        bindings: Arc<QueryTableBindingStore>,
     ) -> Self {
         Self {
             resolver: Some(Arc::clone(&state.unified_statistics)),
-            bindings: Some(pins),
+            bindings: Some(bindings),
         }
     }
 
-    pub(crate) fn from_optional_state_with_pins(
+    pub(crate) fn from_optional_state_with_bindings(
         state: Option<&Arc<super::StandaloneState>>,
-        pins: Option<QueryStatisticsPins>,
+        bindings: Option<Arc<QueryTableBindingStore>>,
     ) -> Self {
-        match (state, pins) {
-            (Some(state), Some(pins)) => Self::from_standalone_state_with_pins(state, pins),
+        match (state, bindings) {
+            (Some(state), Some(bindings)) => {
+                Self::from_standalone_state_with_bindings(state, bindings)
+            }
             // A caller without resolution pins must not resolve `latest` a
             // second time. Keep normal missing-statistics fallback instead.
             (Some(_), None) => Self::none(),

@@ -270,7 +270,7 @@ pub(crate) struct CtasSourceExecutionGate {
 pub(crate) struct PlannedCtasSourceQuery {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     output_columns: Vec<crate::sql::analysis::OutputColumn>,
-    table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings,
     connector_target_parallelism: std::num::NonZeroUsize,
 }

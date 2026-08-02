@@ -17,7 +17,6 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::connector::ConnectorRegistry;
 use crate::sql::planner::table::TableDef;
 use novarocks_catalog::identifier::TableIdentity;
 use novarocks_catalog::registry::{Catalog, CatalogRegistry};
@@ -29,7 +28,6 @@ mod iceberg;
 mod internal;
 pub(crate) mod local;
 mod metadata;
-pub(crate) mod provider;
 
 #[cfg(test)]
 use metadata::CatalogRuntimeBinding;
@@ -107,20 +105,6 @@ pub(crate) trait PlannerTableProvider {
 
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         None
-    }
-
-    /// Statistics pins captured while this provider resolved the query's
-    /// tables. A statistics read must use this exact resolution rather than
-    /// resolving `latest` a second time during optimization.
-    fn query_table_bindings(&self) -> Option<provider::QueryStatisticsPins> {
-        None
-    }
-
-    /// Compatibility accessor during SQLX-1 call-site migration.  The value
-    /// is no longer a mutable pin map; callers should use
-    /// `query_table_bindings`.
-    fn statistics_pins(&self) -> Option<provider::QueryStatisticsPins> {
-        self.query_table_bindings()
     }
 }
 
