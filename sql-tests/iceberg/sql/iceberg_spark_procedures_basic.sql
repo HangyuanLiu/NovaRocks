@@ -46,6 +46,9 @@ INSERT INTO proc_ice_${uuid0}.ns_${uuid0}.orders VALUES (2, 20);
 
 -- query 2
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
+-- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_ice_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.orders');
 
 -- query 3
@@ -58,6 +61,9 @@ CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders',
 
 -- query 5
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
+-- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_ice_${uuid0}.system.expire_snapshots(table => 'ns_${uuid0}.orders', retain_last => 1);
 
 -- query 6
