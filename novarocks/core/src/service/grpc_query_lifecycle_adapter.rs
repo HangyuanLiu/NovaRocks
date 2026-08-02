@@ -61,6 +61,7 @@ pub(crate) fn handle_init_query(
                 scope.start_epoch,
                 scope.token
             );
+            wait_for_runner_owned_restart(&scope);
         }
         if let Some(scope) =
             claim_backend_fault(QueryLifecycleFaultKind::InitAckDrop, execution_id)?
@@ -506,6 +507,19 @@ fn claim_backend_fault(
     )
     .map_err(tonic::Status::failed_precondition)
 }
+
+/// `RestartAfterInitAck` is a runner-owned rendezvous: the BE emits its
+/// token-scoped marker, then waits for the runner to terminate that exact
+/// process.  Without the wait, a small query can finish between the marker
+/// write and the parent's kill, which does not prove loss after admission.
+#[cfg(debug_assertions)]
+fn wait_for_runner_owned_restart(scope: &QueryLifecycleFaultScope) {
+    let _ = scope;
+    std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_runner_owned_restart(_scope: &QueryLifecycleFaultScope) {}
 
 #[cfg(debug_assertions)]
 fn observe_backend_fault(

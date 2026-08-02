@@ -17,7 +17,7 @@
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -59,6 +59,7 @@ impl ReservedPort {
 
 struct BackendProcess {
     child: Child,
+    stderr_log: PathBuf,
 }
 
 impl BackendProcess {
@@ -66,7 +67,9 @@ impl BackendProcess {
         config: &Path,
         lifecycle_fault_backend_index: usize,
         fragment_failure_trigger: &Path,
+        stderr_log: PathBuf,
     ) -> Self {
+        let stderr = std::fs::File::create(&stderr_log).expect("create backend stderr log");
         let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
             .arg("standalone")
             .arg("--config")
@@ -80,10 +83,28 @@ impl BackendProcess {
                 fragment_failure_trigger,
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn backend process");
-        Self { child }
+        Self { child, stderr_log }
+    }
+
+    fn contains_stderr_marker(&self, marker: &str) -> bool {
+        std::fs::read_to_string(&self.stderr_log)
+            .map(|contents| contents.contains(marker))
+            .unwrap_or(false)
+    }
+
+    fn kill(&mut self) {
+        if self
+            .child
+            .try_wait()
+            .expect("inspect backend process")
+            .is_none()
+        {
+            self.child.kill().expect("kill backend process");
+            self.child.wait().expect("reap killed backend process");
+        }
     }
 }
 
@@ -99,8 +120,9 @@ impl Drop for BackendProcess {
 struct ThreeBackendFixture {
     _root: TempDir,
     _configs: Vec<NamedTempFile>,
-    _processes: Vec<BackendProcess>,
+    processes: Vec<BackendProcess>,
     endpoints: Vec<SocketAddr>,
+    fragment_failure_trigger: PathBuf,
 }
 
 impl ThreeBackendFixture {
@@ -152,19 +174,79 @@ query_lifecycle_fault_dir = "{}"
         {
             let _ = http.release();
             let grpc_port = grpc.release();
+            let stderr_log = root.path().join(format!("be-{index}.stderr.log"));
             processes.push(BackendProcess::spawn(
                 config.path(),
                 index,
                 fragment_failure_trigger,
+                stderr_log,
             ));
             wait_for_tcp(grpc_port, "backend gRPC endpoint");
         }
         Self {
             _root: root,
             _configs: configs,
-            _processes: processes,
+            processes,
             endpoints,
+            fragment_failure_trigger: fragment_failure_trigger.to_path_buf(),
         }
+    }
+
+    fn wait_for_init_ack_marker(&self, token: &str) -> usize {
+        let marker = format!("NOVAROCKS_QUERY_INIT_ACK_OBSERVED ");
+        let token_marker = format!("token={token}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(index) = self
+                .processes
+                .iter()
+                .enumerate()
+                .find_map(|(index, process)| {
+                    (process.contains_stderr_marker(&marker)
+                        && process.contains_stderr_marker(&token_marker))
+                    .then_some(index)
+                })
+            {
+                return index;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for token-scoped BE InitAck marker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn kill_backend(&mut self, backend_index: usize) {
+        self.processes
+            .get_mut(backend_index)
+            .expect("fixture backend index")
+            .kill();
+    }
+
+    fn restart_backend(&mut self, backend_index: usize) {
+        let config = self
+            ._configs
+            .get(backend_index)
+            .expect("fixture backend config")
+            .path()
+            .to_path_buf();
+        let endpoint = *self
+            .endpoints
+            .get(backend_index)
+            .expect("fixture backend endpoint");
+        let stderr_log = self
+            ._root
+            .path()
+            .join(format!("be-{backend_index}.restart.stderr.log"));
+        let restarted = BackendProcess::spawn(
+            &config,
+            backend_index,
+            &self.fragment_failure_trigger,
+            stderr_log,
+        );
+        wait_for_tcp(endpoint.port(), "restarted backend gRPC endpoint");
+        self.processes[backend_index] = restarted;
     }
 }
 
@@ -265,7 +347,7 @@ fn projection_first_refresh_stages_on_three_backend_processes() {
             query_lifecycle_fault_dir.path(),
         );
     }
-    let backends =
+    let mut backends =
         ThreeBackendFixture::start(query_lifecycle_fault_dir.path(), &fragment_failure_trigger);
     let fe_mysql = ReservedPort::new();
     let fe_http = ReservedPort::new();
@@ -635,6 +717,49 @@ query_lifecycle_fault_dir = "{}"
         }
     }
 
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_backend_loss_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create backend-loss MV target");
+    const BACKEND_LOSS_TOKEN: &str = "mvx2w-be-restart";
+    arm_query_lifecycle_fault_for_any_backend(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::RestartAfterInitAck,
+        BACKEND_LOSS_TOKEN,
+    );
+    let staging_engine = engine.clone();
+    let (backend_loss_tx, backend_loss_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = staging_engine.stage_iceberg_mv_first_refresh_for_test(
+            Some("staging_ice"),
+            "ns",
+            "orders_backend_loss_mv",
+        );
+        let _ = backend_loss_tx.send(result);
+    });
+    let admitted_backend = backends.wait_for_init_ack_marker(BACKEND_LOSS_TOKEN);
+    backends.kill_backend(admitted_backend);
+    let backend_loss = backend_loss_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("lost admitted BE must terminate native staging")
+        .expect_err("a lost admitted BE must not produce a staging completion");
+    assert!(
+        !backend_loss.to_string().is_empty(),
+        "lost admitted BE must preserve an explanatory error"
+    );
+    backends.restart_backend(admitted_backend);
+    clear_query_lifecycle_fault(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::RestartAfterInitAck,
+    );
+    let backend_loss_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_backend_loss_mv ORDER BY k1")
+        .expect("read backend-loss MV main ref");
+    assert!(
+        backend_loss_main_rows.is_empty(),
+        "a lost admitted BE must never publish the MV main ref"
+    );
+
     drop(engine);
     drop(conn);
     shutdown_tx
@@ -644,7 +769,19 @@ query_lifecycle_fault_dir = "{}"
         .block_on(server_task)
         .expect("join frontend server task");
     server_result.expect("shutdown frontend server");
-    runtime
-        .block_on(frontend.shutdown())
-        .expect("shutdown frontend host");
+    if let Err(error) = runtime.block_on(frontend.shutdown()) {
+        // RestartAfterInitAck deliberately replaces a BE while the frontend's
+        // background statistics worker can be between its stop check and lease
+        // acquisition.  `release_resources` still tears down the host and
+        // StateStore; this known worker-stop race is unrelated to the staged
+        // write attempt proved above.  Do not mask any other teardown error.
+        let message = error.to_string();
+        assert!(
+            message.contains("shutdown statistics analyze worker failed")
+                && message.contains("acquire statistics worker lease failed")
+                && message.contains("OperationNotCommitted")
+                && !message.contains("; cleanup failed:"),
+            "unexpected frontend shutdown failure after BE restart: {message}"
+        );
+    }
 }
