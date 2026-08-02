@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_catalog::schema::SqlType;
 use novarocks_fs::{
     FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
@@ -944,6 +945,12 @@ enum IcebergMutationEvidenceTarget {
         table_uuid: String,
         before_metadata_location: Option<String>,
     },
+    BootstrapEmptyTableSnapshot {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_marker: String,
+    },
     Ref {
         namespace: String,
         table: String,
@@ -1095,6 +1102,12 @@ impl IcebergControlProvider {
                         .map(|(uuid, _)| uuid),
                 }
             }
+            ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. } => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "empty-table bootstrap must build provider-specific evidence",
+                ));
+            }
             ConnectorCatalogMutationOperation::DropTable { table, .. } => {
                 IcebergMutationEvidenceTarget::Table {
                     namespace: table.namespace.to_string(),
@@ -1219,6 +1232,216 @@ impl IcebergControlProvider {
             "alter-ref",
             Bytes::from(payload),
         )
+    }
+
+    fn bootstrap_empty_table_snapshot_evidence(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+        loaded: &super::catalog::IcebergLoadedTable,
+        operation_marker: &str,
+    ) -> Result<ExternalMutationEvidence, ConnectorError> {
+        let target = IcebergMutationEvidenceTarget::BootstrapEmptyTableSnapshot {
+            namespace: table.namespace.to_string(),
+            table: table.table.to_string(),
+            table_uuid: loaded.table.metadata().uuid().to_string(),
+            operation_marker: operation_marker.to_string(),
+        };
+        let payload = serde_json::to_vec(&IcebergMutationEvidenceV1 {
+            version: ICEBERG_MUTATION_EVIDENCE_VERSION,
+            target,
+        })
+        .map_err(|error| internal(format!("encode Iceberg bootstrap evidence: {error}")))?;
+        ExternalMutationEvidence::try_new(
+            ICEBERG_MUTATION_EVIDENCE_VERSION,
+            self.descriptor.clone(),
+            self.incarnation,
+            operation_id,
+            "bootstrap-empty-table-snapshot",
+            Bytes::from(payload),
+        )
+    }
+
+    fn execute_bootstrap_empty_table_snapshot(
+        &self,
+        request: &ConnectorCatalogMutationRequest,
+        table: &novarocks_spi::connector::ConnectorTableIdentity,
+        expected_current_snapshot: Option<i64>,
+        properties: &[(Arc<str>, Arc<str>)],
+    ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        const OPERATION_MARKER: &str = "novarocks.bootstrap.empty.operation-id";
+        if table.instance_id != self.instance_id {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "bootstrap mutation belongs to another connector instance",
+            )));
+        }
+        if expected_current_snapshot.is_some() {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "empty-table bootstrap requires expected_current_snapshot to be absent",
+            )));
+        }
+        let operation_marker = hex::encode(request.operation_id.to_bytes());
+        let mut snapshot_properties = BTreeMap::new();
+        for (key, value) in properties {
+            if key.is_empty()
+                || value.len() > 4096
+                || key.len() > 1024
+                || key.as_ref() == OPERATION_MARKER
+                || snapshot_properties
+                    .insert(key.to_string(), value.to_string())
+                    .is_some()
+            {
+                return Ok(known_uncommitted(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "invalid or duplicate empty-table bootstrap snapshot property",
+                )));
+            }
+        }
+        if snapshot_properties.is_empty()
+            || snapshot_properties
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+                > novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+        {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "empty-table bootstrap snapshot properties are empty or exceed the bounded limit",
+            )));
+        }
+        snapshot_properties.insert(OPERATION_MARKER.to_string(), operation_marker.clone());
+        let entry = match self.entry(self.instance_id.as_str()) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        let loaded = match load_existing_table_for_reconcile(&entry, &table.namespace, &table.table)
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return Ok(known_uncommitted(ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "Iceberg table does not exist for empty-table bootstrap",
+                )));
+            }
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        let metadata = loaded.table.metadata();
+        if let Some(snapshot) = metadata.current_snapshot() {
+            let existing_marker = snapshot
+                .summary()
+                .additional_properties
+                .get(OPERATION_MARKER)
+                .map(String::as_str);
+            if existing_marker == Some(operation_marker.as_str()) {
+                return Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::NoOp,
+                    receipt: self.receipt(
+                        request.operation_id,
+                        request.operation.kind(),
+                        Some(provider_version(loaded.table.metadata_location())),
+                    )?,
+                    finalization: ExternalMutationFinalization::Complete,
+                });
+            }
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "empty-table bootstrap requires a target without a current snapshot",
+            )));
+        }
+        let evidence = self.bootstrap_empty_table_snapshot_evidence(
+            request.operation_id,
+            table,
+            &loaded,
+            &operation_marker,
+        )?;
+        if let Err(error) = self.validate_context(&request.context) {
+            return Ok(known_uncommitted(error));
+        }
+        let catalog = match super::catalog::registry::build_iceberg_catalog(&entry)
+            .map_err(map_iceberg_error)
+        {
+            Ok(catalog) => catalog,
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        let ident =
+            iceberg::TableIdent::from_strs([table.namespace.as_ref(), table.table.as_ref()])
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        format!("invalid bootstrap table identity: {error}"),
+                    )
+                })?;
+        let commit_result = super::catalog::registry::block_on_iceberg(async {
+            let current = catalog.load_table(&ident).await?;
+            if current.metadata().current_snapshot().is_some() {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::PreconditionFailed,
+                    "empty-table bootstrap target gained a snapshot before commit",
+                ));
+            }
+            let tx = Transaction::new(&current);
+            let action = tx
+                .fast_append()
+                .set_snapshot_properties(snapshot_properties.into_iter().collect())
+                .set_commit_uuid(uuid::Uuid::new_v4());
+            let tx = action.apply(tx)?;
+            tx.commit(catalog.as_ref()).await
+        })
+        .map_err(map_iceberg_error)
+        .and_then(|result| result.map_err(|error| map_iceberg_error(error.to_string())));
+        let committed = match commit_result {
+            Ok(committed) => committed,
+            Err(error) if mutation_commit_may_be_unknown(error.kind()) => {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        mutation_failure_kind(error.kind()),
+                        error.to_string(),
+                    ),
+                    evidence,
+                });
+            }
+            Err(error) => return Ok(known_uncommitted(error)),
+        };
+        entry.invalidate_table_cache(&table.namespace, &table.table);
+        let finalized = load_existing_table_for_reconcile(&entry, &table.namespace, &table.table);
+        let finalization = match finalized {
+            Ok(Some(current)) => match current.table.metadata().current_snapshot() {
+                Some(snapshot)
+                    if snapshot
+                        .summary()
+                        .additional_properties
+                        .get(OPERATION_MARKER)
+                        .map(String::as_str)
+                        == Some(operation_marker.as_str())
+                        && snapshot.parent_snapshot_id().is_none() =>
+                {
+                    ExternalMutationFinalization::Complete
+                }
+                _ => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "Iceberg empty-table bootstrap postcondition does not match its operation marker",
+                )),
+            },
+            Ok(None) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::NotFound,
+                "Iceberg table disappeared after empty-table bootstrap",
+            )),
+            Err(error) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                mutation_failure_kind(error.kind()),
+                error.to_string(),
+            )),
+        };
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: self.receipt(
+                request.operation_id,
+                request.operation.kind(),
+                Some(provider_version(committed.metadata_location())),
+            )?,
+            finalization,
+        })
     }
 
     fn execute_guarded_fast_forward(
@@ -1589,6 +1812,19 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
             )
         {
             return self.execute_guarded_fast_forward(&request, table, action);
+        }
+        if let ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
+            table,
+            expected_current_snapshot,
+            properties,
+        } = &request.operation
+        {
+            return self.execute_bootstrap_empty_table_snapshot(
+                &request,
+                table,
+                *expected_current_snapshot,
+                properties,
+            );
         }
         let operation_kind = request.operation.kind();
         let evidence = match self.mutation_evidence(request.operation_id, &request.operation) {
@@ -2364,6 +2600,42 @@ fn reconcile_iceberg_mutation_evidence(
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Conflict,
                     "table disappeared during mutation reconciliation",
+                ),
+                evidence,
+            }),
+            Err(error) => Ok(unknown(error)),
+        },
+        IcebergMutationEvidenceTarget::BootstrapEmptyTableSnapshot {
+            namespace,
+            table,
+            table_uuid,
+            operation_marker,
+        } => match load_existing_table_for_reconcile(entry, &namespace, &table) {
+            Ok(Some(current)) if current.table.metadata().uuid().to_string() == table_uuid => {
+                match current.table.metadata().current_snapshot() {
+                    Some(snapshot)
+                        if snapshot.parent_snapshot_id().is_none()
+                            && snapshot
+                                .summary()
+                                .additional_properties
+                                .get("novarocks.bootstrap.empty.operation-id")
+                                .map(String::as_str)
+                                == Some(operation_marker.as_str()) =>
+                    {
+                        known_committed(ExternalMutationEffect::Applied)
+                    }
+                    Some(_) => Ok(uncommitted(format!(
+                        "authoritative empty-table bootstrap state for `{namespace}.{table}` does not match its operation marker"
+                    ))),
+                    None => Ok(uncommitted(format!(
+                        "authoritative table `{namespace}.{table}` has no bootstrap snapshot"
+                    ))),
+                }
+            }
+            Ok(Some(_)) | Ok(None) => Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Conflict,
+                    "table identity changed during empty-table bootstrap reconciliation",
                 ),
                 evidence,
             }),

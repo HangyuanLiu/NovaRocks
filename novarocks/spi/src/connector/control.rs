@@ -422,6 +422,29 @@ impl ConnectorControlPlanningLease {
             move || drop(retained_planning_lease),
         )?)
     }
+
+    /// Derive a catalog-mutation lease from this retained planning generation.
+    ///
+    /// CREATE-adjacent operations which first inspect or prepare against a
+    /// binding must not reacquire whichever mutation generation is current
+    /// later. Keeping the parent planning lease alive makes the mutation and
+    /// any subsequent writer lease generation-identical by construction.
+    pub fn derive_mutation_lease(
+        &self,
+    ) -> Result<super::ConnectorCatalogMutationLease, ConnectorError> {
+        let mutation = self.binding.mutation().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no catalog mutation capability",
+            )
+        })?;
+        let descriptor = self.binding.descriptor().clone();
+        let incarnation = self.binding.incarnation();
+        let retained_planning_lease = self.clone();
+        super::ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
+            drop(retained_planning_lease)
+        })
+    }
 }
 
 impl Drop for PlanningLeaseRelease {

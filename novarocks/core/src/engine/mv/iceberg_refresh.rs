@@ -383,48 +383,102 @@ impl MvEngine for StandaloneMvEngine {
     fn create_target(
         &self,
         plan: &PreparedMvCreate,
-        _operation_id: uuid::Uuid,
+        operation_id: uuid::Uuid,
     ) -> Result<CreatedMvTarget, MvEngineError> {
         let prepared = self.preparation(plan)?;
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
                 .map_err(|error| engine_target_error(error.to_string()))?;
-        let created = crate::connector::mutation::execute_catalog_mutation(
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
             self.state.connector_control.as_ref(),
             &instance_id,
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
-                table: novarocks_spi::connector::ConnectorTableIdentity {
-                    instance_id: instance_id.clone(),
-                    namespace: Arc::from(prepared.target.namespace.as_str()),
-                    table: Arc::from(prepared.target.table.as_str()),
-                },
-                columns: prepared
-                    .columns
-                    .iter()
-                    .map(crate::engine::statement::connector_column)
-                    .collect::<Result<_, _>>()
-                    .map_err(engine_target_error)?,
-                key: None,
-                partitioning: prepared
-                    .partition_fields
-                    .iter()
-                    .map(crate::engine::statement::connector_partition_transform)
-                    .collect(),
-                properties: prepared
-                    .target_properties
-                    .iter()
-                    .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
-                    .collect(),
-                policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
-            },
-            self.connector_context.clone(),
         )
-        .map_err(engine_target_error)?;
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        let mutation_lease = planning_lease
+            .derive_mutation_lease()
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: Arc::from(prepared.target.namespace.as_str()),
+            table: Arc::from(prepared.target.table.as_str()),
+        };
+        let created = require_known_committed_target_mutation(
+            crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                &mutation_lease,
+                novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+                    *operation_id.as_bytes(),
+                ),
+                novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
+                    table: table.clone(),
+                    columns: prepared
+                        .columns
+                        .iter()
+                        .map(crate::engine::statement::connector_column)
+                        .collect::<Result<_, _>>()
+                        .map_err(engine_target_error)?,
+                    key: None,
+                    partitioning: prepared
+                        .partition_fields
+                        .iter()
+                        .map(crate::engine::statement::connector_partition_transform)
+                        .collect(),
+                    properties: prepared
+                        .target_properties
+                        .iter()
+                        .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                        .collect(),
+                    policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
+                },
+                self.connector_context.clone(),
+            ),
+            "materialized view target create",
+        )?;
         if created.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
             return Err(engine_target_error(
                 "materialized view target create unexpectedly returned NoOp".to_string(),
             ));
         }
+        let bootstrap = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+            &mutation_lease,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
+                table: table.clone(),
+                expected_current_snapshot: None,
+                properties: vec![(
+                    Arc::from("novarocks.mv.bootstrap"),
+                    Arc::from("true"),
+                )],
+            },
+            self.connector_context.clone(),
+        );
+        match bootstrap {
+            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+                let cleanup = require_known_committed_target_mutation(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                        &mutation_lease,
+                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                            table,
+                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                            data_disposition:
+                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                        },
+                        self.connector_context.clone(),
+                    ),
+                    "materialized view target bootstrap cleanup",
+                );
+                return Err(engine_target_error(format!(
+                    "{}; target cleanup={cleanup:?}",
+                    EngineError::commit_known_uncommitted(format!(
+                        "materialized view target empty-snapshot bootstrap: {failure}"
+                    ))
+                )));
+            }
+            bootstrap => require_known_committed_target_mutation(
+                bootstrap,
+                "materialized view target empty-snapshot bootstrap",
+            )?,
+        };
         prepared
             .entry
             .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
@@ -569,6 +623,47 @@ fn engine_prepare_error(error: String) -> MvEngineError {
 
 fn engine_target_error(error: String) -> MvEngineError {
     MvEngineError::new(MvEngineErrorKind::TargetOperation, error)
+}
+
+/// Converts a typed external-mutation outcome into the CREATE target boundary.
+///
+/// A bootstrap that is known committed but cannot finalize remains an error:
+/// callers must not persist an MV definition unless every required target fact
+/// has been re-read successfully. Commit-unknown is likewise propagated as
+/// such, so no cleanup can erase a target whose external truth is unresolved.
+fn require_known_committed_target_mutation(
+    resolution: crate::connector::mutation::ResolvedCatalogMutation,
+    operation: &str,
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvEngineError> {
+    match resolution {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
+                &completed.finalization
+            {
+                return Err(engine_target_error(
+                    EngineError::commit_known_committed_finalize_failed(format!(
+                        "{operation}: {failure}"
+                    ))
+                    .to_string(),
+                ));
+            }
+            Ok(completed)
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+            Err(engine_target_error(
+                EngineError::commit_known_uncommitted(format!("{operation}: {failure}"))
+                    .to_string(),
+            ))
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            Err(engine_target_error(
+                EngineError::commit_unknown(format!("{operation}: {failure}")).to_string(),
+            ))
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
+            Err(engine_target_error(format!("{operation}: {error}")))
+        }
+    }
 }
 
 fn initial_refresh_configuration_for_create(
@@ -23420,6 +23515,31 @@ mod tests {
         let target =
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
                 .expect("created and inspected target");
+        let bootstrap = target
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("CREATE MV must establish a provider-owned empty snapshot");
+        assert!(
+            bootstrap.parent_snapshot_id().is_none(),
+            "the MV bootstrap snapshot must be the target table's first snapshot"
+        );
+        assert_eq!(
+            bootstrap
+                .summary()
+                .additional_properties
+                .get("novarocks.mv.bootstrap")
+                .map(String::as_str),
+            Some("true"),
+            "the bootstrap request properties must be committed by the provider"
+        );
+        assert!(
+            bootstrap
+                .summary()
+                .additional_properties
+                .contains_key("novarocks.bootstrap.empty.operation-id"),
+            "the provider must retain its idempotency marker on the bootstrap snapshot"
+        );
         let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("repository definition");
         assert!(definition.schema_contract.is_some());
