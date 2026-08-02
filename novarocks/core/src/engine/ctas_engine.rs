@@ -905,13 +905,38 @@ impl CtasEngine for Arc<crate::engine::StandaloneState> {
         use crate::sql::parser::dialect::{
             StarRocksDialect, create_table::parse_create_table_statement, looks_like_create_table,
         };
+        use sqlparser::keywords::Keyword;
+        use sqlparser::tokenizer::Token;
+
+        // Classification must stay inert for ordinary CREATE TABLE. Its
+        // established DDL parser accepts nested complex types such as
+        // ARRAY<STRUCT<...>>, while sqlparser tokenizes the closing `>>` as a
+        // shift token before the StarRocks create-table adapter can split it.
+        // Only invoke that adapter after a token-level scan proves that this
+        // statement has a top-level AS clause and therefore belongs to CTAS.
+        let mut classifier = sqlparser::parser::Parser::new(&StarRocksDialect)
+            .try_with_sql(sql)
+            .map_err(|error| error.to_string())?;
+        if !looks_like_create_table(&classifier) {
+            return Ok(None);
+        }
+        let mut depth = 0_u32;
+        let is_ctas = loop {
+            match classifier.next_token().token {
+                Token::LParen => depth = depth.saturating_add(1),
+                Token::RParen => depth = depth.saturating_sub(1),
+                Token::Word(word) if depth == 0 && word.keyword == Keyword::AS => break true,
+                Token::EOF | Token::SemiColon => break false,
+                _ => {}
+            }
+        };
+        if !is_ctas {
+            return Ok(None);
+        }
 
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
             .try_with_sql(sql)
             .map_err(|error| error.to_string())?;
-        if !looks_like_create_table(&parser) {
-            return Ok(None);
-        }
         let statement = parse_create_table_statement(&mut parser)?;
         let Some(source) = statement.as_select else {
             return Ok(None);
@@ -1584,6 +1609,20 @@ mod tests {
             Some("true")
         );
         assert_eq!(command.source_sql, "SELECT 1 AS region");
+    }
+
+    #[test]
+    fn classifier_leaves_nested_complex_type_create_table_to_ddl() {
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        let command = CtasEngine::classify_ctas(
+            &state,
+            "CREATE TABLE ice.sales.nested (\
+                 items ARRAY<STRUCT<id INT, labels ARRAY<STRING>>>\
+             ) COMMENT 'AS SELECT is text, not a CTAS clause'",
+        )
+        .expect("ordinary CREATE TABLE classification is inert");
+
+        assert!(command.is_none());
     }
 
     #[test]
