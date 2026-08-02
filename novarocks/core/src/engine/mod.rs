@@ -4031,6 +4031,18 @@ fn prepare_explain_query(
     Ok(prepared)
 }
 
+/// Application logging boundary for optional compiler diagnostics. The SQL
+/// kernel records only values; this facade owns logging policy for legacy
+/// callers that have not yet switched to `SqlCompiler::compile` output.
+fn emit_mv_rewrite_diagnostics(
+    preparation: crate::sql::compiler::mv_rewrite::SqlMvRewritePreparation,
+) -> Vec<crate::sql::optimizer::cascades_rules::mv_rewrite::MvRewriteCandidate> {
+    for diagnostic in &preparation.diagnostics {
+        tracing::warn!(mv_id = ?diagnostic.mv_id, "{}", diagnostic.message);
+    }
+    preparation.candidates
+}
+
 /// Execute the DistributedPlan, then produce an EXPLAIN-style result whose
 /// first row is `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by
 /// the profiled plan body.
@@ -4071,17 +4083,19 @@ fn explain_analyze_query(
         .collect(&mut optimizer_expr);
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
     let mv_candidates = match mv_rewrite_state {
-        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
-            analyzer_catalog,
-            current_database,
-            &logical_plan,
-            &mut factory,
-            crate::sql::functions::builtin_sql_function_catalog(),
-            &statistics_context,
-            &mut query_stats,
-            &optimizer_settings,
-        ),
+        Some(state) => {
+            emit_mv_rewrite_diagnostics(crate::sql::compiler::mv_rewrite::prepare_candidates(
+                &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
+                analyzer_catalog,
+                current_database,
+                &logical_plan,
+                &mut factory,
+                crate::sql::functions::builtin_sql_function_catalog(),
+                &statistics_context,
+                &mut query_stats,
+                &optimizer_settings,
+            ))
+        }
         None => Vec::new(),
     };
     let optimized_tree = crate::sql::optimizer::optimize(
@@ -4301,17 +4315,19 @@ fn explain_query(
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
     // context, so the gate is only `mv_rewrite_state.is_some()`).
     let mv_candidates = match mv_rewrite_state {
-        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
-            analyzer_catalog,
-            current_database,
-            &logical_plan,
-            &mut factory,
-            crate::sql::functions::builtin_sql_function_catalog(),
-            &statistics_context,
-            &mut query_stats,
-            optimizer_settings,
-        ),
+        Some(state) => {
+            emit_mv_rewrite_diagnostics(crate::sql::compiler::mv_rewrite::prepare_candidates(
+                &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
+                analyzer_catalog,
+                current_database,
+                &logical_plan,
+                &mut factory,
+                crate::sql::functions::builtin_sql_function_catalog(),
+                &statistics_context,
+                &mut query_stats,
+                optimizer_settings,
+            ))
+        }
         None => Vec::new(),
     };
     let optimized_tree = crate::sql::optimizer::optimize(
@@ -5961,9 +5977,7 @@ fn prepare_query_with_sql_compiler_kernel(
         &catalog_snapshot,
         &statistics,
         crate::sql::functions::builtin_sql_function_catalog(),
-        mv_definitions
-            .as_ref()
-            .map(|snapshot| snapshot as &dyn crate::sql::compiler::SqlMvRewriteSnapshot),
+        mv_definitions.as_ref(),
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
             crate::engine::query_planning::sql_cancellation_observation(
@@ -6141,7 +6155,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
     // queries never rewrite onto the MV they are computing.
     let mv_candidates = match mv_rewrite_state {
         Some(state) if allow_mv_rewrite_candidates && mv_refresh_ctx.is_none() => {
-            crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            emit_mv_rewrite_diagnostics(crate::sql::compiler::mv_rewrite::prepare_candidates(
                 &crate::engine::mv_rewrite_prep::freeze_mv_rewrite_definition_index(state)?,
                 analyzer_catalog,
                 current_database,
@@ -6151,7 +6165,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
                 &statistics_context,
                 &mut query_stats,
                 &optimizer_settings,
-            )
+            ))
         }
         _ => Vec::new(),
     };

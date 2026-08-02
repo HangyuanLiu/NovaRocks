@@ -108,22 +108,6 @@ pub(crate) trait SqlStatisticsSnapshot {
     );
 }
 
-/// Immutable MV rewrite facts frozen by application admission.  The compiler
-/// never enumerates repositories or opens catalog/provider clients itself.
-pub(crate) trait SqlMvRewriteSnapshot {
-    fn prepare_candidates(
-        &self,
-        catalog: &dyn crate::sql::catalog::PlannerTableProvider,
-        current_database: &str,
-        logical: &crate::sql::planner::logical::LogicalPlanNode,
-        factory: &mut crate::sql::column_id::ColumnRefFactory,
-        functions: &dyn SqlFunctionCatalog,
-        statistics: &dyn SqlStatisticsSnapshot,
-        query_stats: &mut SqlStatisticsPlan,
-        optimizer_settings: &SessionOptimizerSettings,
-    ) -> Vec<crate::sql::optimizer::cascades_rules::mv_rewrite::MvRewriteCandidate>;
-}
-
 /// Application-frozen input for incremental-MV rewrite.  SQL invokes this at
 /// the logical boundary, but does not receive an application request context
 /// or an untyped callback.  The implementation owns any refresh-specific
@@ -245,7 +229,7 @@ pub(crate) struct SqlCompileRequest<'a> {
     pub(crate) catalog: &'a dyn SqlCatalogSnapshot,
     pub(crate) statistics: &'a dyn SqlStatisticsSnapshot,
     pub(crate) functions: &'a dyn SqlFunctionCatalog,
-    pub(crate) mv_rewrite: Option<&'a dyn SqlMvRewriteSnapshot>,
+    pub(crate) mv_rewrite: Option<&'a mv_rewrite::MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a dyn SqlImvRewriteInput>,
     pub(crate) control: SqlCompileControl,
 }
@@ -260,7 +244,7 @@ impl<'a> SqlCompileRequest<'a> {
         catalog: &'a dyn SqlCatalogSnapshot,
         statistics: &'a dyn SqlStatisticsSnapshot,
         functions: &'a dyn SqlFunctionCatalog,
-        mv_rewrite: Option<&'a dyn SqlMvRewriteSnapshot>,
+        mv_rewrite: Option<&'a mv_rewrite::MvRewriteDefinitionIndex>,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -297,11 +281,13 @@ pub(crate) struct SqlOptimizedOutput {
     pub(crate) statistics: SqlStatisticsPlan,
     pub(crate) change_stream:
         crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+    pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
 }
 
 pub(crate) struct SqlDistributedOutput {
     pub(crate) distributed_plan: crate::sql::planner::distributed::DistributedPlan,
     pub(crate) statistics: SqlStatisticsPlan,
+    pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
 }
 
 /// SQL-owned compiler facts. Native DTOs/bytes, lifecycle state and result
@@ -397,10 +383,11 @@ impl SqlCompiler {
             .map_err(SqlCompileError::Compilation)?;
         let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr);
         request.check_control()?;
-        let mv_candidates = request
+        let mv_rewrite = request
             .mv_rewrite
-            .map(|snapshot| {
-                snapshot.prepare_candidates(
+            .map(|definitions| {
+                mv_rewrite::prepare_candidates(
+                    definitions,
                     catalog,
                     &request.session.current_database,
                     &logical_plan,
@@ -411,7 +398,14 @@ impl SqlCompiler {
                     &settings,
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| mv_rewrite::SqlMvRewritePreparation {
+                candidates: Vec::new(),
+                diagnostics: Vec::new(),
+            });
+        let mv_rewrite::SqlMvRewritePreparation {
+            candidates: mv_candidates,
+            diagnostics: mv_rewrite_diagnostics,
+        } = mv_rewrite;
         request.check_control()?;
         let root_distribution = match &request.intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
@@ -470,6 +464,7 @@ impl SqlCompiler {
                 optimized_tree,
                 statistics,
                 change_stream,
+                mv_rewrite_diagnostics,
             }));
         }
 
@@ -483,6 +478,7 @@ impl SqlCompiler {
         Ok(SqlCompileOutput::Distributed(SqlDistributedOutput {
             distributed_plan,
             statistics,
+            mv_rewrite_diagnostics,
         }))
     }
 }
