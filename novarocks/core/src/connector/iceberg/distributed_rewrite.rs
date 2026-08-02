@@ -278,7 +278,10 @@ impl IcebergDistributedRewritePlanner {
             input_delete_files: artifact
                 .groups
                 .iter()
-                .map(|group| group.selected_position_delete_files.len() as u64)
+                .map(|group| {
+                    (group.selected_position_delete_files.len()
+                        + group.owned_data_delete_files.len()) as u64
+                })
                 .sum(),
             input_bytes: artifact
                 .groups
@@ -372,6 +375,10 @@ pub(crate) struct IcebergFrozenRewriteGroupV1 {
     /// Data rewrite groups leave this empty; any delete dependency remains
     /// attached to its data file as read-only scan input.
     pub selected_position_delete_files: Vec<String>,
+    /// Delete files removed by a data rewrite. A shared dependency has exactly
+    /// one canonical owner, while readers retain it until aggregate commit.
+    #[serde(default)]
+    pub owned_data_delete_files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -689,6 +696,7 @@ fn group_data_files(
                 partition_key: file.partition_key.clone(),
                 data_files: vec![file],
                 selected_position_delete_files: selected,
+                owned_data_delete_files: Vec::new(),
             });
         }
         return bounded_groups(groups);
@@ -702,7 +710,7 @@ fn group_data_files(
             .or_default()
             .push(file);
     }
-    let groups = by_partition
+    let mut groups = by_partition
         .into_iter()
         .map(|((partition_spec_id, partition_key), mut data_files)| {
             data_files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -714,10 +722,40 @@ fn group_data_files(
                 partition_key,
                 data_files,
                 selected_position_delete_files: Vec::new(),
+                owned_data_delete_files: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
+    assign_data_delete_owners(&mut groups);
     bounded_groups(groups)
+}
+
+/// Assign every live delete file to one deterministic data-rewrite group.
+/// Read sources retain all applicable delete dependencies; this map is used
+/// only by the single aggregate replacement snapshot.
+fn assign_data_delete_owners(groups: &mut [IcebergFrozenRewriteGroupV1]) {
+    let mut owners = BTreeMap::<String, usize>::new();
+    for (index, group) in groups.iter().enumerate() {
+        for path in group
+            .data_files
+            .iter()
+            .flat_map(|file| file.delete_files.iter().map(|delete| delete.path.as_str()))
+        {
+            match owners.get(path) {
+                Some(existing) if groups[*existing].group_digest_hex <= group.group_digest_hex => {}
+                _ => {
+                    owners.insert(path.to_string(), index);
+                }
+            }
+        }
+    }
+    for (path, owner) in owners {
+        groups[owner].owned_data_delete_files.push(path);
+    }
+    for group in groups {
+        group.owned_data_delete_files.sort();
+        group.owned_data_delete_files.dedup();
+    }
 }
 
 fn bounded_groups(
@@ -970,6 +1008,9 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+    };
 
     #[test]
     fn data_groups_are_partition_owned_and_stably_sorted() {
@@ -1008,6 +1049,40 @@ mod tests {
     }
 
     #[test]
+    fn data_rewrite_assigns_each_shared_delete_file_one_canonical_owner() {
+        let delete = IcebergDeleteFileInfo {
+            path: "s3://bucket/shared-delete.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Equality,
+            length: Some(8),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(3),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            equality_column_names: vec!["id".to_string()],
+            equality_field_ids: vec![1],
+        };
+        let mut a = IcebergDataFileInfo::for_test("s3://bucket/a.parquet", 10, 1);
+        a.partition_key = Some("{\"day\":1}".to_string());
+        a.delete_files.push(delete.clone());
+        let mut b = IcebergDataFileInfo::for_test("s3://bucket/b.parquet", 10, 1);
+        b.partition_key = Some("{\"day\":2}".to_string());
+        b.delete_files.push(delete);
+
+        let groups = group_data_files(vec![b, a], false, None).expect("frozen groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .flat_map(|group| group.owned_data_delete_files.iter())
+                .filter(|path| path.as_str() == "s3://bucket/shared-delete.parquet")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn artifact_digest_is_content_addressed() {
         assert_eq!(artifact_digest(b"same"), artifact_digest(b"same"));
         assert_ne!(artifact_digest(b"same"), artifact_digest(b"different"));
@@ -1040,6 +1115,7 @@ mod tests {
                     1,
                 )],
                 selected_position_delete_files: Vec::new(),
+                owned_data_delete_files: Vec::new(),
             })
             .collect::<Vec<_>>();
         let parts = split_artifact_parts(&groups).unwrap();
