@@ -17,9 +17,8 @@
 
 //! Core-owned Iceberg write preparation and execution primitives.
 //!
-//! The frontend DML service owns production INSERT routing and transaction
-//! orchestration. CTAS retains an explicit legacy composition over these
-//! primitives until its later migration.
+//! Frontend DML services own production statement routing and transaction
+//! orchestration over these primitives.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -67,8 +66,7 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
-    IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
 };
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -773,8 +771,7 @@ impl PreparedIcebergWrite {
     ///
     /// Frontend application owners use this form when they must persist their
     /// intent and retain an exact connector lease before submitting native
-    /// fragments. The legacy runner continues to call `run_coordinated_write`
-    /// through the same prepared inputs.
+    /// fragments.
     pub(crate) fn into_prepared_distributed_write(
         self,
     ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String>
@@ -807,21 +804,12 @@ impl PreparedIcebergWrite {
     pub(crate) fn finalize(&self) -> Result<(), String> {
         self.executor.finalize(&self.spec)
     }
-
-    pub(crate) fn execute_with_legacy_runner(
-        self,
-    ) -> Result<crate::engine::write_transaction::IcebergWriteTransactionOutcome, String> {
-        let Self { executor, spec } = self;
-        IcebergWriteTransactionRunner::new(Arc::clone(&executor.state), &executor).run(spec)
-    }
 }
 
-/// Prepared execution payload consumed by the frontend INSERT adapter and
-/// CTAS/mutation composition roots.
+/// Prepared execution payload consumed by frontend DML adapters.
 ///
 /// This type owns no SQL routing or application transaction policy. The
-/// frontend DML service drives production INSERT, while CTAS may explicitly
-/// compose the legacy transaction runner over the same prepared primitives.
+/// frontend DML services drive production statement lifecycles.
 struct PreparedIcebergWriteExecutor {
     state: Arc<StandaloneState>,
     target: TargetBackend,
@@ -1825,43 +1813,6 @@ pub(crate) fn run_select_to_chunks(
         None,
     )?;
     query_result_to_chunks(result)
-}
-
-/// Like [`run_select_to_chunks`], but also returns the output schema columns
-/// from the query plan. The schema is always populated even when the SELECT
-/// produces zero rows — callers that need the column types for schema inference
-/// (e.g. CTAS) should use this instead of `run_select_to_chunks`.
-pub(crate) fn run_select_to_chunks_and_schema(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-    query: &sqlparser::ast::Query,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<
-    (
-        Vec<Chunk>,
-        Vec<crate::runtime::query_result::QueryResultColumn>,
-    ),
-    String,
-> {
-    // CTAS context: SELECT may reference iceberg tables (1-part or 2-part
-    // names). Passing Some(target.catalog) routes unqualified refs to iceberg,
-    // mirroring the standalone server's SELECT path.
-    let current_catalog = if target.backend_name == "iceberg" && !target.catalog.is_empty() {
-        Some(target.catalog.as_str())
-    } else {
-        None
-    };
-    let result = crate::engine::execute_query_with_catalog_service_with_connector_context(
-        state,
-        current_catalog,
-        &target.namespace,
-        query,
-        None,
-        connector_context,
-    )?;
-    let schema_cols = result.columns.clone();
-    let chunks = query_result_to_chunks(result)?;
-    Ok((chunks, schema_cols))
 }
 
 pub(crate) struct AbortCleanupOperator {

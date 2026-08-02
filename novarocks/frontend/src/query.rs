@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
+use novarocks::engine::ctas_engine::CtasEngine;
 use novarocks::engine::delete_engine::DeleteEngine;
 use novarocks::engine::insert_engine::InsertEngine;
+use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
     PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
 };
@@ -72,21 +74,35 @@ impl CoreCommandRoute for StandaloneCommandExecutor {
     }
 }
 
-fn execute_frontend_command(
+fn execute_frontend_command<C, T>(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
     delete_engine: &dyn DeleteEngine,
+    ctas_route: C,
+    truncate_route: T,
     command: &dyn CoreCommandRoute,
     sql: &str,
     context: &RequestContext,
     query_options: QueryOptions,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, String>
+where
+    C: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
+    T: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
+{
     match dml.try_execute_insert(insert_engine, sql, context, Some(&query_options)) {
         Ok(Some(())) => Ok(StatementResult::Ok),
         Ok(None) => match dml.try_execute_delete(delete_engine, sql, context, Some(&query_options))
         {
             Ok(Some(())) => Ok(StatementResult::Ok),
-            Ok(None) => command.execute(sql, context, query_options),
+            Ok(None) => match ctas_route(sql, context, &query_options) {
+                Ok(Some(())) => Ok(StatementResult::Ok),
+                Ok(None) => match truncate_route(sql, context, &query_options) {
+                    Ok(Some(())) => Ok(StatementResult::Ok),
+                    Ok(None) => command.execute(sql, context, query_options),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            },
             Err(error) => Err(error.to_string()),
         },
         Err(error) => Err(error.to_string()),
@@ -104,6 +120,8 @@ pub struct FrontendQueryService {
     dml: Arc<DmlService>,
     insert_engine: Arc<dyn InsertEngine>,
     delete_engine: Arc<dyn DeleteEngine>,
+    ctas_engine: Arc<dyn CtasEngine>,
+    truncate_engine: Arc<dyn TruncateEngine>,
 }
 
 impl FrontendQueryService {
@@ -116,6 +134,8 @@ impl FrontendQueryService {
         dml: Arc<DmlService>,
         insert_engine: Arc<dyn InsertEngine>,
         delete_engine: Arc<dyn DeleteEngine>,
+        ctas_engine: Arc<dyn CtasEngine>,
+        truncate_engine: Arc<dyn TruncateEngine>,
     ) -> Self {
         Self {
             engine,
@@ -126,6 +146,8 @@ impl FrontendQueryService {
             dml,
             insert_engine,
             delete_engine,
+            ctas_engine,
+            truncate_engine,
         }
     }
 }
@@ -453,6 +475,8 @@ impl FrontendQuerySession {
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
         let delete_engine = Arc::clone(&self.service.delete_engine);
+        let ctas_engine = Arc::clone(&self.service.ctas_engine);
+        let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let mut query_options = state.execution_settings.query_options();
         query_options.apply_sql_hints(&sql);
         let is_query = is_query_statement(&sql);
@@ -476,6 +500,22 @@ impl FrontendQuerySession {
                     dml.as_ref(),
                     insert_engine.as_ref(),
                     delete_engine.as_ref(),
+                    |sql, context, query_options| {
+                        dml.try_execute_ctas(
+                            ctas_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
+                    |sql, context, query_options| {
+                        dml.try_execute_truncate(
+                            truncate_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
                     &command_executor,
                     &sql,
                     &context,
@@ -492,6 +532,22 @@ impl FrontendQuerySession {
                     dml.as_ref(),
                     insert_engine.as_ref(),
                     delete_engine.as_ref(),
+                    |sql, context, query_options| {
+                        dml.try_execute_ctas(
+                            ctas_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
+                    |sql, context, query_options| {
+                        dml.try_execute_truncate(
+                            truncate_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
                     &command_executor,
                     &sql,
                     &context,
@@ -1261,6 +1317,22 @@ mod tests {
         ))
     }
 
+    fn not_ctas(
+        _sql: &str,
+        _context: &RequestContext,
+        _query_options: &QueryOptions,
+    ) -> Result<Option<()>, crate::dml::DmlError> {
+        Ok(None)
+    }
+
+    fn not_truncate(
+        _sql: &str,
+        _context: &RequestContext,
+        _query_options: &QueryOptions,
+    ) -> Result<Option<()>, crate::dml::DmlError> {
+        Ok(None)
+    }
+
     #[test]
     fn frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
@@ -1275,6 +1347,8 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            not_ctas,
+            not_truncate,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1301,6 +1375,8 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            not_ctas,
+            not_truncate,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1334,6 +1410,8 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            not_ctas,
+            not_truncate,
             &command,
             "DELETE FROM t WHERE a = 1",
             &context,
@@ -1362,6 +1440,8 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            not_ctas,
+            not_truncate,
             &command,
             "CREATE DATABASE db2",
             &context,
@@ -1374,6 +1454,119 @@ mod tests {
         let contexts = command.contexts.lock().unwrap();
         assert_eq!(contexts[0].topology().revision(), 91);
         assert_eq!(contexts[0].deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn frontend_router_orders_ctas_before_truncate_and_fallback() {
+        let insert = RecordingInsertEngine::default();
+        let delete = RecordingDeleteEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
+        let ctas_calls = AtomicUsize::new(0);
+        let truncate_calls = AtomicUsize::new(0);
+
+        execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            |_, _, _| {
+                ctas_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(()))
+            },
+            |_, _, _| {
+                truncate_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            &command,
+            "CREATE TABLE ice.db.dst AS SELECT 1",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("frontend CTAS route");
+
+        assert_eq!(ctas_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(truncate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frontend_router_target_errors_never_fall_back() {
+        let insert = RecordingInsertEngine::default();
+        let delete = RecordingDeleteEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(93, Instant::now() + Duration::from_secs(30), &cancellation);
+        let error = execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            |_, _, _| Err(crate::dml::DmlError::executor("CTAS failed")),
+            |_, _, _| panic!("TRUNCATE route must not follow a CTAS error"),
+            &command,
+            "CREATE TABLE ice.db.dst AS SELECT 1",
+            &context,
+            QueryOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("CTAS failed"));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+
+        let error = execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            |_, _, _| Ok(None),
+            |_, _, _| Err(crate::dml::DmlError::executor("TRUNCATE failed")),
+            &command,
+            "TRUNCATE TABLE ice.db.dst",
+            &context,
+            QueryOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("TRUNCATE failed"));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frontend_router_runs_truncate_before_fallback() {
+        let insert = RecordingInsertEngine::default();
+        let delete = RecordingDeleteEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
+        let ctas_calls = AtomicUsize::new(0);
+        let truncate_calls = AtomicUsize::new(0);
+
+        execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            |_, _, _| {
+                ctas_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            |_, _, _| {
+                truncate_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(()))
+            },
+            &command,
+            "TRUNCATE TABLE ice.db.dst",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("frontend TRUNCATE route");
+
+        assert_eq!(ctas_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(truncate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
