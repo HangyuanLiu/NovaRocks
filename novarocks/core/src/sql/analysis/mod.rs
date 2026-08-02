@@ -200,7 +200,7 @@ pub(crate) struct IcebergMetadataScanRelation {
     /// The underlying iceberg table being inspected.
     pub database: String,
     pub table: TableDef,
-    pub metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    pub metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     /// FROM-clause alias (e.g., `t$snapshots AS s` → `Some("s")`).
     pub alias: Option<String>,
     /// Analyzer-allocated ColumnIds for each metadata column, in schema order.

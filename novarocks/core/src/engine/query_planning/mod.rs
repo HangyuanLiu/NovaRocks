@@ -23,6 +23,7 @@
 
 pub(crate) mod bindings;
 pub(crate) mod catalog_materializer;
+pub(crate) mod catalog_runtime;
 
 use std::{collections::HashMap, sync::Arc};
 

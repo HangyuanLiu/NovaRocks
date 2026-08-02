@@ -155,8 +155,31 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         catalog: &str,
         namespace: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<crate::sql::planner::table::TableDef, String> {
+        let metadata_table_type = match metadata_table_type {
+            crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
+                crate::connector::iceberg::IcebergMetadataTableType::Snapshots
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::History => {
+                crate::connector::iceberg::IcebergMetadataTableType::History
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Refs => {
+                crate::connector::iceberg::IcebergMetadataTableType::Refs
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Files => {
+                crate::connector::iceberg::IcebergMetadataTableType::Files
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
+                crate::connector::iceberg::IcebergMetadataTableType::Manifests
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
+                crate::connector::iceberg::IcebergMetadataTableType::Partitions
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
+                crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
+            }
+        };
         crate::connector::iceberg::provider::load_metadata_table_def(
             self.controls,
             self.connector_context.clone(),

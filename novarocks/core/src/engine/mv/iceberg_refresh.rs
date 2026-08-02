@@ -20041,13 +20041,13 @@ mod tests {
         initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+        state.catalog_service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 catalog,
                 Arc::clone(&state.connector_control)
                     as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
+            ),
+        );
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -20089,13 +20089,13 @@ mod tests {
         initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+        state.catalog_service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 catalog,
                 Arc::clone(&state.connector_control)
                     as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
+            ),
+        );
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),
@@ -20142,13 +20142,13 @@ mod tests {
         initialize_iceberg_mv_test_namespaces(&state, catalog, current_db);
         crate::engine::register_iceberg_control_binding(&state, catalog)
             .expect("register Iceberg connector control binding");
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+        state.catalog_service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 catalog,
                 Arc::clone(&state.connector_control)
                     as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
+            ),
+        );
         IcebergMvTestState {
             state,
             current_db: current_db.to_string(),

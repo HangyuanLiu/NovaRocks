@@ -24,19 +24,19 @@ use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use iceberg::spec::{PrimitiveType, TableMetadata, Type};
 use std::sync::Arc;
 
-use crate::connector::iceberg::IcebergMetadataTableType;
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::SqlMetadataTableKind;
 
 /// Inspect the trailing identifier part of a qualified name and, if it
 /// matches `__nr_meta_<type>__`, return the parts with the suffix stripped
 /// plus the parsed metadata-table type.
-pub fn split_metadata_suffix(parts: &[String]) -> (Vec<String>, Option<IcebergMetadataTableType>) {
+pub fn split_metadata_suffix(parts: &[String]) -> (Vec<String>, Option<SqlMetadataTableKind>) {
     if let Some(last) = parts.last()
         && let Some(inner) = last
             .strip_prefix("__nr_meta_")
             .and_then(|s| s.strip_suffix("__"))
-        && let Ok(ty) = IcebergMetadataTableType::parse(inner)
+        && let Ok(ty) = SqlMetadataTableKind::parse(inner)
     {
         return (parts[..parts.len() - 1].to_vec(), Some(ty));
     }
@@ -226,20 +226,26 @@ fn table_info_from_source(source: &ScanSource) -> Option<&IcebergTableInfo> {
 }
 
 pub fn metadata_table_schema_for_source(
-    ty: IcebergMetadataTableType,
+    ty: SqlMetadataTableKind,
     source: &ScanSource,
 ) -> Result<Vec<MetadataColumn>, String> {
-    let Some(table) = table_info_from_source(source) else {
-        return Err("iceberg metadata table requires iceberg table identity".to_string());
-    };
-    metadata_table_schema_for_table(ty, table)
+    match table_info_from_source(source) {
+        Some(table) => metadata_table_schema_for_table(ty, table),
+        None => match ty {
+            SqlMetadataTableKind::Files | SqlMetadataTableKind::LogicalIcebergMetadata => Err(
+                "iceberg files or entries metadata table requires iceberg table identity"
+                    .to_string(),
+            ),
+            _ => Ok(metadata_table_schema(ty)),
+        },
+    }
 }
 
 pub fn metadata_table_schema_for_table(
-    ty: IcebergMetadataTableType,
+    ty: SqlMetadataTableKind,
     table: &IcebergTableInfo,
 ) -> Result<Vec<MetadataColumn>, String> {
-    use IcebergMetadataTableType as T;
+    use SqlMetadataTableKind as T;
     match ty {
         T::Files => Ok(files_columns_with_partition(partition_struct_type(table)?)),
         T::LogicalIcebergMetadata => {
@@ -262,8 +268,8 @@ pub fn metadata_table_schema_for_table(
 /// `src/connector/iceberg/metadata.rs`. Logical formatting (e.g. converting
 /// the `committed_at` Int64-of-micros into a TIMESTAMPTZ display) is FE's
 /// responsibility; the analyzer surfaces the underlying Arrow type.
-pub fn metadata_table_schema(ty: IcebergMetadataTableType) -> Vec<MetadataColumn> {
-    use IcebergMetadataTableType as T;
+pub fn metadata_table_schema(ty: SqlMetadataTableKind) -> Vec<MetadataColumn> {
+    use SqlMetadataTableKind as T;
     match ty {
         T::Snapshots => vec![
             MetadataColumn::new("committed_at", DataType::Int64, false),
@@ -357,7 +363,7 @@ mod tests {
         ];
         let (stripped, ty) = split_metadata_suffix(&parts);
         assert_eq!(stripped, vec!["db".to_string(), "t".to_string()]);
-        assert_eq!(ty, Some(IcebergMetadataTableType::Snapshots));
+        assert_eq!(ty, Some(SqlMetadataTableKind::Snapshots));
     }
 
     #[test]
@@ -373,17 +379,14 @@ mod tests {
             stripped,
             vec!["ice".to_string(), "db".to_string(), "t".to_string()]
         );
-        assert_eq!(ty, Some(IcebergMetadataTableType::History));
+        assert_eq!(ty, Some(SqlMetadataTableKind::History));
     }
 
     #[test]
     fn refs_and_partitions_round_trip() {
         for (suffix, expected) in [
-            ("__nr_meta_refs__", IcebergMetadataTableType::Refs),
-            (
-                "__nr_meta_partitions__",
-                IcebergMetadataTableType::Partitions,
-            ),
+            ("__nr_meta_refs__", SqlMetadataTableKind::Refs),
+            ("__nr_meta_partitions__", SqlMetadataTableKind::Partitions),
         ] {
             let parts = vec!["t".to_string(), suffix.to_string()];
             let (_, ty) = split_metadata_suffix(&parts);
@@ -409,7 +412,7 @@ mod tests {
 
     #[test]
     fn metadata_table_schema_snapshots_has_expected_columns() {
-        let cols = metadata_table_schema(IcebergMetadataTableType::Snapshots);
+        let cols = metadata_table_schema(SqlMetadataTableKind::Snapshots);
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
@@ -426,7 +429,7 @@ mod tests {
 
     #[test]
     fn metadata_table_schema_history_has_expected_columns() {
-        let cols = metadata_table_schema(IcebergMetadataTableType::History);
+        let cols = metadata_table_schema(SqlMetadataTableKind::History);
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
@@ -441,7 +444,7 @@ mod tests {
 
     #[test]
     fn metadata_table_schema_refs_has_expected_columns() {
-        let cols = metadata_table_schema(IcebergMetadataTableType::Refs);
+        let cols = metadata_table_schema(SqlMetadataTableKind::Refs);
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
@@ -458,7 +461,7 @@ mod tests {
 
     #[test]
     fn metadata_table_schema_partitions_has_expected_columns() {
-        let cols = metadata_table_schema(IcebergMetadataTableType::Partitions);
+        let cols = metadata_table_schema(SqlMetadataTableKind::Partitions);
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"record_count"));
         assert!(names.contains(&"file_count"));
@@ -468,7 +471,7 @@ mod tests {
 
     #[test]
     fn files_schema_has_expected_columns() {
-        let names: Vec<String> = metadata_table_schema(IcebergMetadataTableType::Files)
+        let names: Vec<String> = metadata_table_schema(SqlMetadataTableKind::Files)
             .iter()
             .map(|c| c.name.clone())
             .collect();
@@ -491,7 +494,7 @@ mod tests {
     }
     #[test]
     fn manifests_schema_has_partition_summaries() {
-        let names: Vec<String> = metadata_table_schema(IcebergMetadataTableType::Manifests)
+        let names: Vec<String> = metadata_table_schema(SqlMetadataTableKind::Manifests)
             .iter()
             .map(|c| c.name.clone())
             .collect();
@@ -501,7 +504,7 @@ mod tests {
     #[test]
     fn entries_schema_superset_of_files() {
         let names: Vec<String> =
-            metadata_table_schema(IcebergMetadataTableType::LogicalIcebergMetadata)
+            metadata_table_schema(SqlMetadataTableKind::LogicalIcebergMetadata)
                 .iter()
                 .map(|c| c.name.clone())
                 .collect();

@@ -136,7 +136,7 @@ fn metadata_scan_uses_native_sentinel_range() {
         &mut root,
         ScanSource::IcebergMetadataTable {
             table: iceberg_table(),
-            metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType::Snapshots,
+            metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
             serialized_table: "{}".to_string(),
             cloud_properties: BTreeMap::new(),
             metadata_payload: None,

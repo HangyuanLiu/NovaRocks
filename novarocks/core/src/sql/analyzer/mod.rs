@@ -4010,13 +4010,13 @@ fn sync_output_columns_from_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
         SubqueryKind,
     };
     use crate::sql::catalog::IcebergMetadataTableProvider;
+    use crate::sql::planner::table::SqlMetadataTableKind;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::schema::ColumnDef;
 
@@ -4471,7 +4471,7 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            _metadata_table_type: IcebergMetadataTableType,
+            _metadata_table_type: SqlMetadataTableKind,
         ) -> Result<TableDef, String> {
             let mut table_def = self.get_table(database, table)?;
             table_def.source = ScanSource::IcebergDataFiles {
@@ -6684,7 +6684,7 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            _metadata_table_type: IcebergMetadataTableType,
+            _metadata_table_type: SqlMetadataTableKind,
         ) -> Result<TableDef, String> {
             Ok(Self::iceberg_table_def(catalog, database, table))
         }
@@ -6756,10 +6756,10 @@ mod tests {
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                metadata_table_type: IcebergMetadataTableType,
+                metadata_table_type: SqlMetadataTableKind,
             ) -> Result<TableDef, String> {
                 self.0
-                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6808,13 +6808,13 @@ mod tests {
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                metadata_table_type: IcebergMetadataTableType,
+                metadata_table_type: SqlMetadataTableKind,
             ) -> Result<TableDef, String> {
                 assert_eq!(catalog, Some("ice"));
                 assert_eq!(database, "db");
                 assert_eq!(table, "orders");
                 self.0
-                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6841,7 +6841,7 @@ mod tests {
 
     #[test]
     fn analyzer_resolves_t_dollar_snapshots_to_metadata_scan() {
-        use crate::connector::iceberg::IcebergMetadataTableType;
+        use crate::sql::planner::table::SqlMetadataTableKind;
 
         // The parser rewrites `orders$snapshots` -> `orders.__nr_meta_snapshots__`
         // so we go through `parse_raw_and_analyze` to exercise the full pipeline.
@@ -6853,7 +6853,7 @@ mod tests {
         let from = sel.from.as_ref().expect("FROM clause should be present");
         match from {
             Relation::IcebergMetadataScan(rel) => {
-                assert_eq!(rel.metadata_table_type, IcebergMetadataTableType::Snapshots);
+                assert_eq!(rel.metadata_table_type, SqlMetadataTableKind::Snapshots);
                 assert_eq!(rel.table.name, "orders");
                 assert_eq!(rel.database, "default");
                 assert!(rel.alias.is_none());

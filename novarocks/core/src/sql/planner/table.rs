@@ -47,6 +47,22 @@ pub(crate) enum SqlMetadataTableKind {
     Files,
     Manifests,
     Partitions,
+    LogicalIcebergMetadata,
+}
+
+impl SqlMetadataTableKind {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "snapshots" => Ok(Self::Snapshots),
+            "history" => Ok(Self::History),
+            "refs" => Ok(Self::Refs),
+            "files" => Ok(Self::Files),
+            "manifests" => Ok(Self::Manifests),
+            "partitions" => Ok(Self::Partitions),
+            "entries" | "logical_iceberg_metadata" => Ok(Self::LogicalIcebergMetadata),
+            _ => Err(format!("unsupported Iceberg metadata table type: {value}")),
+        }
+    }
 }
 
 /// Immutable SQL facts that characterize a scan without carrying provider
@@ -248,7 +264,7 @@ pub enum ScanSource {
     /// `src/connector/iceberg/metadata.rs`.
     IcebergMetadataTable {
         table: IcebergTableInfo,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: SqlMetadataTableKind,
         /// JSON-serialized iceberg-rust `TableMetadata` (produced by
         /// `serde_json::to_string` in
         /// `connector/iceberg/catalog/backend.rs`). The metadata-scan

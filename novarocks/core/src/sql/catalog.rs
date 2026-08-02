@@ -15,54 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, RwLock};
-
 use crate::sql::planner::table::TableDef;
 use novarocks_catalog::identifier::TableIdentity;
-use novarocks_catalog::registry::{Catalog, CatalogRegistry};
-use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
-mod conversion;
-mod iceberg;
-mod internal;
 pub(crate) mod local;
-mod metadata;
-
-#[cfg(test)]
-use metadata::CatalogRuntimeBinding;
-use metadata::CatalogRuntimeMetadata;
-
-pub(crate) type StandaloneCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TableLookupMode {
     SchemaOnly,
     ExplainStats,
-}
-
-pub(crate) fn build_internal_catalog(
-    name: &str,
-    local: Arc<RwLock<local::PlannerMemoryCatalog>>,
-) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
-    Arc::new(internal::InternalCatalog::new(name, local))
-}
-
-pub(crate) fn build_iceberg_catalog(
-    name: &str,
-    controls: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-) -> Arc<dyn Catalog<CatalogRuntimeMetadata>> {
-    Arc::new(iceberg::IcebergCatalog::new(name, controls))
-}
-
-pub(crate) fn new_standalone_catalog_service() -> StandaloneCatalogService {
-    let local = Arc::new(RwLock::new(local::PlannerMemoryCatalog::default()));
-    let service = CatalogService::new(Arc::clone(&local), CatalogRegistry::new());
-    service.register_catalog(build_internal_catalog(
-        "default_catalog",
-        Arc::clone(&local),
-    ));
-    service
 }
 
 #[derive(Clone, Debug)]
@@ -114,45 +76,6 @@ pub(crate) trait IcebergMetadataTableProvider {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String>;
-}
-
-#[cfg(test)]
-mod visibility_tests {
-    #[test]
-    fn exposes_canonical_standalone_catalog_service_alias() {
-        let source = include_str!("catalog.rs");
-
-        assert!(
-            source.contains(
-                "pub(crate) type StandaloneCatalogService = CatalogService<TableDef, CatalogRuntimeMetadata>;"
-            ),
-            "sql::catalog must expose the canonical standalone catalog service specialization"
-        );
-    }
-
-    #[test]
-    fn runtime_metadata_module_remains_private_to_sql_catalog() {
-        let source = include_str!("catalog.rs");
-
-        assert!(
-            source.lines().any(|line| line.trim() == "mod metadata;"),
-            "CatalogRuntimeMetadata must remain behind a private sql::catalog module"
-        );
-        assert!(
-            !source
-                .lines()
-                .any(|line| line.trim() == "pub(crate) mod metadata;"),
-            "sql::catalog siblings must not name the runtime metadata module"
-        );
-        assert!(
-            !source.lines().any(|line| {
-                let line = line.trim();
-                (line.starts_with("pub use ") || line.starts_with("pub(crate) use "))
-                    && line.contains("CatalogRuntimeMetadata")
-            }),
-            "sql::catalog must not re-export CatalogRuntimeMetadata"
-        );
-    }
 }

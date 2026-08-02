@@ -75,7 +75,7 @@ impl IcebergMetadataTableProvider for PlannerMemoryCatalog {
         _catalog: Option<&str>,
         database: &str,
         table: &str,
-        _metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        _metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String> {
         self.get(database, table)
     }
@@ -86,9 +86,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::PlannerMemoryCatalog;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::{ScanSource, TableDef};
     use novarocks_catalog::identifier::TableIdentity;
@@ -115,33 +112,12 @@ mod tests {
         }
     }
 
-    fn test_iceberg_table(name: &str) -> TableDef {
+    fn test_metadata_table(name: &str) -> TableDef {
         TableDef {
             name: name.to_string(),
             columns: vec![column("id", DataType::Int64, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: IcebergTableInfo {
-                    catalog: "default_catalog".to_string(),
-                    namespace: DEFAULT_DATABASE.to_string(),
-                    table: name.to_string(),
-                    table_uuid: Some("local-uuid".to_string()),
-                    current_snapshot_id: None,
-                    schema_id: 0,
-                    location: "file:///tmp/local_iceberg".to_string(),
-                    schema: IcebergSchemaDef { fields: vec![] },
-                    serialized_metadata: Some(
-                        serde_json::to_string(
-                            &crate::sql::analyzer::iceberg_ref::test_utils::metadata_empty(),
-                        )
-                        .expect("serialize metadata"),
-                    ),
-                    serialized_metadata_rows: None,
-                },
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding: IcebergDataFileBinding::CurrentSnapshot,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 
@@ -213,7 +189,7 @@ mod tests {
     fn local_metadata_lookup_preserves_analyzer_behavior_and_exact_errors() {
         let mut catalog = PlannerMemoryCatalog::default();
         catalog
-            .register(DEFAULT_DATABASE, test_iceberg_table("local_ice"))
+            .register(DEFAULT_DATABASE, test_metadata_table("local_ice"))
             .expect("register local iceberg table");
 
         let statement = crate::sql::parser::parse_sql_raw("SELECT * FROM local_ice$snapshots")

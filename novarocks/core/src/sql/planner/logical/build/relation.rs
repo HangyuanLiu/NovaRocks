@@ -315,13 +315,13 @@ struct PartitionMetadataAgg {
 }
 
 fn build_iceberg_metadata_payload(
-    metadata_table_type: &crate::connector::iceberg::IcebergMetadataTableType,
+    metadata_table_type: &crate::sql::planner::table::SqlMetadataTableKind,
     storage: &crate::sql::planner::table::ScanSource,
 ) -> Result<Option<String>, String> {
-    use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::sql::planner::table::ScanSource;
+    use crate::sql::planner::table::SqlMetadataTableKind;
     match metadata_table_type {
-        IcebergMetadataTableType::Partitions => {
+        SqlMetadataTableKind::Partitions => {
             let ScanSource::IcebergDataFiles { files, .. } = storage else {
                 return Err(
                     "iceberg partitions metadata table requires catalog-resolved data files"
@@ -330,9 +330,9 @@ fn build_iceberg_metadata_payload(
             };
             build_iceberg_partitions_payload(files).map(Some)
         }
-        IcebergMetadataTableType::Files
-        | IcebergMetadataTableType::Manifests
-        | IcebergMetadataTableType::LogicalIcebergMetadata => {
+        SqlMetadataTableKind::Files
+        | SqlMetadataTableKind::Manifests
+        | SqlMetadataTableKind::LogicalIcebergMetadata => {
             let table_info = iceberg_table_info(storage).ok_or_else(|| {
                 "iceberg files/manifests/entries metadata table requires iceberg table identity"
                     .to_string()
@@ -345,9 +345,9 @@ fn build_iceberg_metadata_payload(
                     "iceberg metadata rows were not resolved at catalog lookup time".to_string()
                 })
         }
-        IcebergMetadataTableType::Snapshots
-        | IcebergMetadataTableType::History
-        | IcebergMetadataTableType::Refs => Ok(None),
+        SqlMetadataTableKind::Snapshots
+        | SqlMetadataTableKind::History
+        | SqlMetadataTableKind::Refs => Ok(None),
     }
 }
 

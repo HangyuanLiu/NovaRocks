@@ -216,28 +216,28 @@ pub(super) fn encode_redistribute_mode(src: &RedistributeMode) -> plan::Redistri
 }
 
 pub(super) fn encode_iceberg_metadata_table_type(
-    src: &crate::connector::iceberg::IcebergMetadataTableType,
+    src: &crate::sql::planner::table::SqlMetadataTableKind,
 ) -> i32 {
     match src {
-        crate::connector::iceberg::IcebergMetadataTableType::Files => {
+        crate::sql::planner::table::SqlMetadataTableKind::Files => {
             plan::IcebergMetadataTableType::Files as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Manifests => {
+        crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
             plan::IcebergMetadataTableType::Manifests as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata => {
+        crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
             plan::IcebergMetadataTableType::LogicalIcebergMetadata as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Snapshots => {
+        crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
             plan::IcebergMetadataTableType::Snapshots as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::History => {
+        crate::sql::planner::table::SqlMetadataTableKind::History => {
             plan::IcebergMetadataTableType::History as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Refs => {
+        crate::sql::planner::table::SqlMetadataTableKind::Refs => {
             plan::IcebergMetadataTableType::Refs as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Partitions => {
+        crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
             plan::IcebergMetadataTableType::Partitions as i32
         }
     }

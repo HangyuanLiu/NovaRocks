@@ -52,7 +52,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
         catalog: &str,
         namespace: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String>;
 }
 
@@ -61,7 +61,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
 /// not expose it.
 pub(crate) struct CatalogServiceMaterializer<'a> {
     current_catalog: Option<&'a str>,
-    service: &'a crate::sql::catalog::StandaloneCatalogService,
+    service: &'a crate::engine::query_planning::catalog_runtime::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
 }
@@ -69,7 +69,7 @@ pub(crate) struct CatalogServiceMaterializer<'a> {
 impl<'a> CatalogServiceMaterializer<'a> {
     pub(crate) fn new(
         current_catalog: Option<&'a str>,
-        service: &'a crate::sql::catalog::StandaloneCatalogService,
+        service: &'a crate::engine::query_planning::catalog_runtime::QueryCatalogService,
         bindings: Arc<QueryTableBindingStore>,
         loader: Box<dyn QueryTableBindingLoader + 'a>,
     ) -> Self {
@@ -179,7 +179,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => self
@@ -247,7 +247,7 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     ) -> Result<TableDef, String> {
         self.metadata_table_def(catalog, database, table, metadata_table_type)
     }

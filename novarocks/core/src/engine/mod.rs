@@ -38,14 +38,15 @@ use crate::runtime::query_result::{
 
 use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRepository};
 use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
+use crate::engine::query_planning::catalog_runtime::QueryCatalogService;
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
 use crate::mv::application::{
     MvApplicationService, MvFirstRefreshWriteActivator, UnavailableMvApplicationService,
 };
 use crate::mv::repository::{MvRepository, UnavailableMvRepository};
+use crate::sql::catalog::TableLookupMode;
 use crate::sql::catalog::local::PlannerMemoryCatalog;
-use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
@@ -102,8 +103,8 @@ pub struct StandaloneOptions {
 
 use novarocks_catalog::partition::LegacyRangePartition;
 
-pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> StandaloneCatalogService {
-    StandaloneCatalogService::new(
+pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> QueryCatalogService {
+    QueryCatalogService::new(
         Arc::new(RwLock::new(state.catalog_service.local_snapshot())),
         state.catalog_service.registry_snapshot(),
     )
@@ -111,7 +112,7 @@ pub(crate) fn catalog_service_snapshot(state: &Arc<StandaloneState>) -> Standalo
 
 pub(crate) fn build_catalog_service_provider<'a>(
     current_catalog: Option<&'a str>,
-    catalog_service: &'a StandaloneCatalogService,
+    catalog_service: &'a QueryCatalogService,
     controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
@@ -284,7 +285,7 @@ pub(crate) struct StandaloneState {
     /// captures it with the same topology snapshot instead of reading config
     /// during a request.
     pub(crate) execution_role: crate::common::app_config::ClusterRole,
-    pub(crate) catalog_service: Arc<StandaloneCatalogService>,
+    pub(crate) catalog_service: Arc<QueryCatalogService>,
     pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) statistics_service: Arc<dyn statistics::StatisticsService>,
     /// Frontend-owned durable application boundary for typed statistics commands.
@@ -341,7 +342,9 @@ impl Default for StandaloneState {
     fn default() -> Self {
         Self {
             execution_role: crate::common::app_config::ClusterRole::AllInOne,
-            catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
+            catalog_service: Arc::new(
+                crate::engine::query_planning::catalog_runtime::new_query_catalog_service(),
+            ),
             iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             statistics_service: Arc::new(statistics::EmptyStatisticsService),
             statistics_application: Arc::new(
@@ -1370,7 +1373,9 @@ impl StandaloneNovaRocks {
         } = services;
         let inner = Arc::new_cyclic(|self_weak| StandaloneState {
             execution_role,
-            catalog_service: Arc::new(crate::sql::catalog::new_standalone_catalog_service()),
+            catalog_service: Arc::new(
+                crate::engine::query_planning::catalog_runtime::new_query_catalog_service(),
+            ),
             mv_refresh_pruning_limits,
             metadata_provider: metadata_provider.clone(),
             mv_repository,
@@ -2864,13 +2869,13 @@ impl StandaloneSession {
             }
             return Err(error);
         }
-        self.inner
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+        self.inner.catalog_service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 &stmt.name,
                 Arc::clone(&self.inner.connector_control)
                     as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
+            ),
+        );
         if let Err(error) = persist_catalog_attachment_if_needed(
             &self.inner,
             &normalized_catalog,
@@ -3783,13 +3788,13 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
                 .drop_catalog(&normalized_catalog)?;
             return Err(error);
         }
-        state
-            .catalog_service
-            .register_catalog(crate::sql::catalog::build_iceberg_catalog(
+        state.catalog_service.register_catalog(
+            crate::engine::query_planning::catalog_runtime::build_iceberg_catalog(
                 &catalog.catalog,
                 Arc::clone(&state.connector_control)
                     as Arc<dyn novarocks_spi::connector::ConnectorControlResolver>,
-            ));
+            ),
+        );
     }
 
     Ok(())
