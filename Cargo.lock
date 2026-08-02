@@ -3294,6 +3294,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-state-store",
  "novarocks-types",
+ "prost 0.13.5",
  "serde",
  "serde_json",
  "sha2",

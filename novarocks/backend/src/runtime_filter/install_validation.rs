@@ -15,24 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-pub(crate) mod decode;
-pub(crate) mod encode;
-pub(crate) mod query_options_contract;
-pub(crate) mod runtime_filter_contract_codec;
-#[cfg(test)]
-mod runtime_filter_install;
-#[cfg(test)]
-pub(crate) mod test_assembly;
-pub(crate) mod type_encode;
-pub(crate) mod type_mapping;
+//! Backend-owned validation entry point for decoded participant installs.
 
-// Narrow Task 4/5 surface: handlers and client adapters need only these DTOs
-// and boundary entry points, not the codec implementation module.
+pub(crate) use crate::native::runtime_filter_install::validate_participant_install;
+
 #[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use runtime_filter_install::{
-    DecodedRuntimeFilterParticipantInstall, RuntimeFilterDeploymentAbort,
-    RuntimeFilterQueryLifecycleOptions, decode_abort_runtime_filter_deployment,
-    decode_participant_install, encode_abort_runtime_filter_deployment, encode_participant_install,
+pub(crate) use crate::native::runtime_filter_install::{
+    validate_channel_contract_for_test, validate_install_view_contract_for_test,
 };

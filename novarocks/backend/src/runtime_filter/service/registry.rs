@@ -20,10 +20,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::runtime_filter::core::channel::RuntimeFilterChannel;
+use crate::runtime_filter::install_validation::validate_participant_install;
 use crate::runtime_filter::router::loopback::LoopbackRouter;
 use crate::runtime_filter::router::role_graph::RoleRouter;
 use novarocks::runtime_filter_transition::codec::contribution::max_encoded_len_for_contribution_budget;
-use novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install;
 use novarocks::runtime_filter_transition::model::contract::{
     BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
     ReductionRequirement, RuntimeFilterLogicalDomain,
@@ -1500,11 +1500,11 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use novarocks::runtime::endpoint::RuntimeEndpoint;
-    use novarocks::runtime_filter_transition::deployment::install_validation::{
+    use crate::runtime_filter::install_validation::{
         validate_channel_contract_for_test as validate_channel_contract,
         validate_install_view_contract_for_test as validate_view,
     };
+    use novarocks::runtime::endpoint::RuntimeEndpoint;
     use novarocks::runtime_filter_transition::materializer::bloom::BloomHashContract;
     use novarocks::runtime_filter_transition::model::contract::*;
     use novarocks::runtime_filter_transition::model::coverage::Coverage;

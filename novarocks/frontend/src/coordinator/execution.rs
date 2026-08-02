@@ -56,6 +56,10 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
+use crate::runtime_filter::compiler::{
+    FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
+};
+use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> QueryId;
@@ -745,7 +749,12 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(|error| failed(error.to_string()))?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
-        let scheduled = parts.artifacts.bind_schedule(schedule)?;
+        let binding_attachment =
+            encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
+        let scheduled = parts
+            .artifacts
+            .attach_runtime_filter_bindings(binding_attachment)?
+            .bind_schedule(schedule)?;
         let scheduled = match parts.connector_write {
             Some(registration) => {
                 let session = registration.session();
@@ -762,6 +771,17 @@ impl FrontendDistributedQueryCoordinator {
             }
             None => scheduled,
         };
+        let deployment = compile_scheduled_runtime_filter_deployment(
+            scheduled.runtime_filter_scheduled_view(),
+            FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
+                parts.options.runtime_filter_lifecycle(),
+                self.runtime_filter_worker_count.get(),
+            )?,
+        )?;
+        let runtime_filter_attachment =
+            scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
+        let runtime_filter_ready =
+            scheduled.attach_runtime_filter_deployment(runtime_filter_attachment)?;
         let timeout_ms = parts
             .statistics_program
             .as_ref()
@@ -807,8 +827,6 @@ impl FrontendDistributedQueryCoordinator {
         let init_options = QueryInitOptions::new(
             execution_id,
             backend_services.live_backends,
-            self.runtime_filter_worker_count.get(),
-            parts.options.runtime_filter_lifecycle(),
             &parts.options,
             query_deadline_unix_ms,
             Duration::from_millis(runtime.query_control_pre_start_timeout_ms),
@@ -822,7 +840,7 @@ impl FrontendDistributedQueryCoordinator {
                 control: Arc::clone(&self.connector_control),
             }),
         );
-        let stage_prepared = scheduled
+        let stage_prepared = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)?
             .prepare_connector_bindings(&connector_bindings)?
             .prepare_stage()?;

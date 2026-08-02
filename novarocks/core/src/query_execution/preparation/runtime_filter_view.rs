@@ -563,6 +563,14 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
             crate::sql::planner::runtime_filter::contract::RuntimeFilterLogicalDomain::OrderedBound(
                 order,
             ) => RuntimeFilterDeploymentLogicalDomainFacts::Ordered {
+                value_type: encode_type(
+                    &order
+                        .keys
+                        .first()
+                        .expect("sealed ordered runtime-filter domain has a key")
+                        .data_type,
+                )
+                .expect("sealed runtime-filter ordered value type is encodable"),
                 keys: order
                     .keys
                     .iter()
@@ -666,6 +674,7 @@ pub enum RuntimeFilterDeploymentLogicalDomainFacts {
         schema_digest: [u8; 32],
     },
     Ordered {
+        value_type: common::TypeDesc,
         keys: Vec<RuntimeFilterOrderKeyFacts>,
         comparator_digest: [u8; 32],
         order_contract_digest: [u8; 32],

@@ -33,6 +33,7 @@ use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
 #[cfg(test)]
 pub(in crate::protocol::native) use runtime_filter::encode_runtime_filter_runtime_producer_target;
+#[cfg(test)]
 pub(in crate::protocol::native) use runtime_filter::{
     encode_runtime_filter_activation, encode_runtime_filter_capability,
     encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
@@ -41,6 +42,7 @@ pub(in crate::protocol::native) use runtime_filter::{
 
 mod output;
 mod relational;
+#[cfg(test)]
 mod runtime_filter;
 mod scan;
 mod topology;

@@ -5633,10 +5633,8 @@ pub(crate) mod tests {
             direct_route,
             RuntimeFilterEnvelopeKind::Contribution,
         );
-        novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install(
-            &direct,
-        )
-        .expect_err("direct delivery rejects contribution-family authority");
+        crate::runtime_filter::install_validation::validate_participant_install(&direct)
+            .expect_err("direct delivery rejects contribution-family authority");
 
         let plan = super::test_support::compiled_three_backend_all_of_plan();
         for (_, install) in RuntimeFilterDeploymentExtension::new()
@@ -5667,10 +5665,8 @@ pub(crate) mod tests {
                 .collect::<BTreeSet<_>>();
             for (route_edge_id, extra) in edges {
                 let mutated = install_with_extra_route_kind(install.clone(), route_edge_id, extra);
-                novarocks::runtime_filter_transition::deployment::install_validation::validate_participant_install(
-                    &mutated,
-                )
-                .expect_err("To/FromAggregator edges reject cross-family authority");
+                crate::runtime_filter::install_validation::validate_participant_install(&mutated)
+                    .expect_err("To/FromAggregator edges reject cross-family authority");
             }
         }
     }
