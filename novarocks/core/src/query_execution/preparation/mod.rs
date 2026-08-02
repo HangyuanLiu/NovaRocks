@@ -36,10 +36,6 @@ pub(crate) use projection::{
     PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedFragmentSet,
     PreparedOutputColumn,
 };
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) use projection::{
-    prepared_fragment_set_for_test, prepared_fragment_set_with_runtime_filter_for_test,
-};
 pub(crate) use scan_preparation::ScanPreparationOptions;
 use scan_preparation::prepare_scan_bindings;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};

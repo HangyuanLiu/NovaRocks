@@ -29,7 +29,6 @@ use novarocks_spi::connector::{
 
 use super::*;
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
-use crate::connector::scan_model::starrocks as connector_scan;
 use crate::protocol::native::encode::plan as native_plan;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;

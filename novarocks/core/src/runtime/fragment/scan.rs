@@ -207,7 +207,7 @@ mod tests {
         }
     }
 
-    fn file_ranges(_count: usize) -> BoundScanRanges {
+    fn static_source_ranges() -> BoundScanRanges {
         BoundScanRanges::None
     }
 
@@ -259,22 +259,31 @@ mod tests {
     }
 
     #[test]
-    fn materializes_op_from_instance_ranges() {
+    fn materializes_op_from_static_source_assignment() {
         let program = scan_program();
-        let instance = instance_with_scan(scan_assignments(file_ranges(3)), UniqueId::new(10, 11));
+        let instance = instance_with_scan(
+            scan_assignments(static_source_ranges()),
+            UniqueId::new(10, 11),
+        );
 
         let bindings = materialize_scan_bindings(&program, &instance).expect("materialize");
         let op = bindings.get(SCAN_NODE_ID).expect("bound op for scan node");
-        assert_eq!(op.build_morsels().expect("morsels").morsels.len(), 3);
+        assert_eq!(op.build_morsels().expect("morsels").morsels.len(), 1);
     }
 
     #[test]
     fn multi_instance_sharing_yields_independent_ops_and_leaves_program_untouched() {
-        // One shared program, two instances with different File range counts.
+        // One shared program, two instances with independent static assignments.
         let program = Arc::new(scan_program());
 
-        let instance_a = instance_with_scan(scan_assignments(file_ranges(2)), UniqueId::new(20, 1));
-        let instance_b = instance_with_scan(scan_assignments(file_ranges(5)), UniqueId::new(20, 2));
+        let instance_a = instance_with_scan(
+            scan_assignments(static_source_ranges()),
+            UniqueId::new(20, 1),
+        );
+        let instance_b = instance_with_scan(
+            scan_assignments(static_source_ranges()),
+            UniqueId::new(20, 2),
+        );
 
         let bindings_a = materialize_scan_bindings(&program, &instance_a).expect("materialize a");
         let bindings_b = materialize_scan_bindings(&program, &instance_b).expect("materialize b");
@@ -282,15 +291,19 @@ mod tests {
         let op_a = bindings_a.get(SCAN_NODE_ID).expect("op a");
         let op_b = bindings_b.get(SCAN_NODE_ID).expect("op b");
 
-        // Independent op sets: each reflects its own instance's ranges.
-        assert_eq!(op_a.build_morsels().expect("a morsels").morsels.len(), 2);
-        assert_eq!(op_b.build_morsels().expect("b morsels").morsels.len(), 5);
+        // Independent op sets remain distinct even when their assignments have
+        // identical provider-neutral shapes.
+        assert_eq!(op_a.build_morsels().expect("a morsels").morsels.len(), 1);
+        assert_eq!(op_b.build_morsels().expect("b morsels").morsels.len(), 1);
 
         // The shared program is untouched: re-binding against a third instance
         // still works and reads only the static source, and the two Arcs above
         // point at distinct ops.
         assert!(!Arc::ptr_eq(&op_a, &op_b));
-        let instance_c = instance_with_scan(scan_assignments(file_ranges(1)), UniqueId::new(20, 3));
+        let instance_c = instance_with_scan(
+            scan_assignments(static_source_ranges()),
+            UniqueId::new(20, 3),
+        );
         let bindings_c = materialize_scan_bindings(&program, &instance_c).expect("materialize c");
         assert_eq!(
             bindings_c
@@ -322,11 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn wrong_range_variant_fails_at_bind() {
+    fn incompatible_range_variant_fails_at_bind() {
         let program = scan_program();
-        // The source expects File ranges; hand it a None assignment instead.
+        // The source expects its provider-neutral static assignment; hand it a
+        // schema-selection assignment instead.
         let instance = instance_with_scan(
-            scan_assignments(BoundScanRanges::None),
+            scan_assignments(BoundScanRanges::SchemaSelection { should_scan: true }),
             UniqueId::new(40, 1),
         );
 

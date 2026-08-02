@@ -22,7 +22,6 @@
 //! locally; neither can cross a native fragment boundary.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use base64::Engine;
@@ -36,9 +35,6 @@ use novarocks_spi::connector::{
     ConnectorStagedReportSummary, ConnectorWriteReceipt, ConnectorWriterHandle,
     ConnectorWriterIdentity, ConnectorWriterTerminalState,
 };
-use novarocks_spi::connector::{
-    ConnectorExecutionBinding, ConnectorOpenWriterRequest, ConnectorRequestContext,
-};
 
 use super::commit::DeletionVector;
 use super::delete_file::{IcebergFileContent, IcebergFileFormat};
@@ -48,8 +44,7 @@ use super::report::{
 };
 use super::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use super::sink_plan::{
-    IcebergSinkFactoryInput, IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan,
-    PositionDeleteDataFilePartition,
+    IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
 use super::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,

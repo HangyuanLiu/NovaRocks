@@ -70,12 +70,10 @@ pub use metadata::{
     plan_native_iceberg_metadata_read_source,
     plan_native_iceberg_metadata_read_source_with_cancellation,
 };
+pub(crate) use schema::build_projected_output_schema_from_scan_model;
 pub use schema::{
     IcebergArrowColumn, IcebergPartitionInfo, IcebergSchemaDescriptor,
     IcebergSchemaFieldDescriptor, IcebergTableColumn, IcebergTableDescriptor,
     apply_field_id_recursive, build_full_output_schema, build_projected_output_schema,
-};
-pub(crate) use schema::{
-    build_projected_output_schema_from_descriptor, build_projected_output_schema_from_scan_model,
 };
 pub use sink_plan::IcebergSinkMode;

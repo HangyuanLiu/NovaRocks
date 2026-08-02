@@ -54,7 +54,7 @@ impl PlannerTableProvider for PlannerMemoryCatalog {
             crate::sql::planner::table::ScanSource::ConnectorPinned
         ) {
             return Err(format!(
-                "StarRocks scan source {DEFAULT_CATALOG}.{database}.{table} requires an external connector binding; native planner catalogs cannot register internal StarRocks tables"
+                "connector-pinned scan source {DEFAULT_CATALOG}.{database}.{table} requires an external connector binding; native planner catalogs cannot register synthetic connector tables"
             ));
         }
         Ok(ResolvedAnalyzerTable::from_planner(
@@ -149,9 +149,9 @@ mod tests {
     fn register_overwrites_planner_table() {
         let mut catalog = PlannerMemoryCatalog::default();
         catalog
-            .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
+            .register(DEFAULT_DATABASE, test_table("connector_tbl"))
             .expect("register table");
-        let mut replacement = test_table("starrocks_tbl");
+        let mut replacement = test_table("connector_tbl");
         replacement.columns[0].nullable = true;
 
         catalog
@@ -160,7 +160,7 @@ mod tests {
 
         assert!(
             catalog
-                .get(DEFAULT_DATABASE, "starrocks_tbl")
+                .get(DEFAULT_DATABASE, "connector_tbl")
                 .expect("overwritten table")
                 .columns[0]
                 .nullable
@@ -168,25 +168,25 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_lookup_rejects_internal_starrocks_table() {
+    fn analyzer_lookup_rejects_internal_connector_pinned_table() {
         let mut catalog = PlannerMemoryCatalog::default();
         catalog
-            .register(DEFAULT_DATABASE, test_table("starrocks_tbl"))
+            .register(DEFAULT_DATABASE, test_table("connector_tbl"))
             .expect("register table");
 
         let error = catalog
-            .resolve_table_for_analysis(None, DEFAULT_DATABASE, "starrocks_tbl")
-            .expect_err("native planner catalog must reject internal StarRocks tables");
+            .resolve_table_for_analysis(None, DEFAULT_DATABASE, "connector_tbl")
+            .expect_err("native planner catalog must reject synthetic connector-pinned tables");
         assert_eq!(
             error,
-            "StarRocks scan source default_catalog.default.starrocks_tbl requires an external connector binding; native planner catalogs cannot register internal StarRocks tables"
+            "connector-pinned scan source default_catalog.default.connector_tbl requires an external connector binding; native planner catalogs cannot register synthetic connector tables"
         );
     }
 
     #[test]
     fn neutral_lookup_uses_default_catalog_and_preserves_schema() {
         let mut catalog = PlannerMemoryCatalog::default();
-        let mut table = test_table("starrocks_tbl");
+        let mut table = test_table("connector_tbl");
         table.iceberg_row_lineage_metadata_columns =
             vec![column("_row_id", DataType::Int64, false)];
         catalog
@@ -197,13 +197,13 @@ mod tests {
             &catalog,
             Some("ignored_override"),
             DEFAULT_DATABASE,
-            "starrocks_tbl",
+            "connector_tbl",
         )
         .expect("resolve neutral table");
 
         assert_eq!(
             table.identity,
-            TableIdentity::new("default_catalog", DEFAULT_DATABASE, "starrocks_tbl")
+            TableIdentity::new("default_catalog", DEFAULT_DATABASE, "connector_tbl")
         );
         assert_eq!(table.columns[0].name, "id");
         assert_eq!(table.hidden_columns[0].name, "_row_id");

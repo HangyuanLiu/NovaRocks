@@ -6622,7 +6622,11 @@ mod tests {
     struct CatalogAwareTestCatalog;
 
     impl CatalogAwareTestCatalog {
-        fn starrocks_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
+        fn connector_pinned_table_def(
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+        ) -> TableDef {
             let catalog_name = catalog.unwrap_or("default_catalog");
             TableDef {
                 name: format!("{catalog_name}_{database}_{table}"),
@@ -6639,7 +6643,7 @@ mod tests {
         }
 
         fn iceberg_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
-            let mut table_def = Self::starrocks_table_def(catalog, database, table);
+            let mut table_def = Self::connector_pinned_table_def(catalog, database, table);
             table_def.source = ScanSource::IcebergDataFiles {
                 table: test_iceberg_table_info_for(
                     catalog.unwrap_or("default_catalog"),
@@ -6665,7 +6669,7 @@ mod tests {
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog,
                 database,
-                Self::starrocks_table_def(catalog, database, table),
+                Self::connector_pinned_table_def(catalog, database, table),
             ))
         }
 

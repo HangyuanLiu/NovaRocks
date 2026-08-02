@@ -43,7 +43,5 @@ pub mod runtime_state;
 pub mod scan_executor;
 pub mod scan_range;
 pub mod sink_commit;
-pub mod starlet_shard_registry;
-pub mod starrocks_fragment_query;
 pub mod start_epoch;
 pub mod thread_cpu_time;

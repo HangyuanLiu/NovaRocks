@@ -23,12 +23,6 @@ pub const ROW_SOURCE_ID_COL: &str = "_row_source_id";
 pub const SCAN_RANGE_ID_COL: &str = "_scan_range_id";
 pub const ROW_ID_COL: &str = "_row_id";
 
-// Lake (PRIMARY KEY cloud-native) virtual column names (with trailing underscore)
-pub const LAKE_SOURCE_ID_COL: &str = "_source_id_";
-pub const LAKE_TABLET_ID_COL: &str = "_tablet_id_";
-pub const LAKE_RSS_ID_COL: &str = "_rss_id_";
-pub const LAKE_ROW_ID_COL: &str = "_row_id_";
-
 pub fn is_row_source_id(name: &str) -> bool {
     name.eq_ignore_ascii_case(ROW_SOURCE_ID_COL)
 }
@@ -39,22 +33,6 @@ pub fn is_scan_range_id(name: &str) -> bool {
 
 pub fn is_row_id(name: &str) -> bool {
     name.eq_ignore_ascii_case(ROW_ID_COL)
-}
-
-pub fn is_lake_source_id(name: &str) -> bool {
-    name.eq_ignore_ascii_case(LAKE_SOURCE_ID_COL)
-}
-
-pub fn is_lake_tablet_id(name: &str) -> bool {
-    name.eq_ignore_ascii_case(LAKE_TABLET_ID_COL)
-}
-
-pub fn is_lake_rss_id(name: &str) -> bool {
-    name.eq_ignore_ascii_case(LAKE_RSS_ID_COL)
-}
-
-pub fn is_lake_row_id(name: &str) -> bool {
-    name.eq_ignore_ascii_case(LAKE_ROW_ID_COL)
 }
 
 // Iceberg v2 row-level DELETE virtual column names used by
@@ -97,7 +75,6 @@ pub fn is_change_op(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RowPositionType {
     Iceberg,
-    Lake,
 }
 
 #[derive(Clone, Debug)]
@@ -119,22 +96,6 @@ pub struct RowPositionSpec {
     pub row_id_field: Field,
 }
 
-/// Row position spec for lake (PRIMARY KEY cloud-native) tables.
-/// Encodes position as (source_id, tablet_id, rss_id, row_id) where
-/// source_id = backend_id, tablet_id = actual tablet, rss_id = synthetic
-/// range index (assigned during scan), row_id = sequential row offset.
-#[derive(Clone, Debug)]
-pub struct LakeRowPositionSpec {
-    pub source_id_slot: SlotId,
-    pub tablet_id_slot: SlotId,
-    pub rss_id_slot: SlotId,
-    pub row_id_slot: SlotId,
-    pub source_id_field: Field,
-    pub tablet_id_field: Field,
-    pub rss_id_field: Field,
-    pub row_id_field: Field,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,22 +103,6 @@ mod tests {
     #[test]
     fn row_position_type_is_thrift_free_domain_enum() {
         assert_eq!(RowPositionType::Iceberg, RowPositionType::Iceberg);
-        assert_ne!(RowPositionType::Iceberg, RowPositionType::Lake);
-    }
-
-    #[test]
-    fn row_position_descriptor_carries_internal_type() {
-        let desc = RowPositionDescriptor {
-            row_position_type: RowPositionType::Lake,
-            row_source_slot: SlotId::new(1),
-            fetch_ref_slots: vec![SlotId::new(2)],
-            lookup_ref_slots: vec![SlotId::new(3)],
-        };
-
-        assert_eq!(desc.row_position_type, RowPositionType::Lake);
-        assert_eq!(desc.row_source_slot, SlotId::new(1));
-        assert_eq!(desc.fetch_ref_slots, vec![SlotId::new(2)]);
-        assert_eq!(desc.lookup_ref_slots, vec![SlotId::new(3)]);
     }
 
     #[test]

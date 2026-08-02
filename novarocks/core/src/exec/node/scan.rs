@@ -21,7 +21,7 @@ use crate::cache::ExternalDataCacheRangeOptions;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
+use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::{ConnectorExecutionBinding, ConnectorSplit};
@@ -35,10 +35,6 @@ pub enum ScanMorsel {
         length: u64,
         scan_range_id: i32,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
-    },
-    StarRocksRange {
-        index: usize,
-        tablet_id: i64,
     },
     JdbcSingle,
     IcebergMetadata {
@@ -71,9 +67,6 @@ impl ScanMorsel {
                 "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
                 path, file_len, offset, length, scan_range_id, external_datacache,
             ),
-            ScanMorsel::StarRocksRange { index, tablet_id } => {
-                format!("starrocks_range_index={index} tablet_id={tablet_id}")
-            }
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
@@ -379,7 +372,6 @@ pub struct ScanNode {
     accept_empty_scan_ranges: bool,
     row_position: Option<RowPositionSpec>,
     connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
-    lake_row_position: Option<LakeRowPositionSpec>,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -408,7 +400,6 @@ impl ScanNode {
             accept_empty_scan_ranges: false,
             row_position: None,
             connector_row_position_lookup: None,
-            lake_row_position: None,
         }
     }
 
@@ -472,11 +463,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_lake_row_position(mut self, spec: Option<LakeRowPositionSpec>) -> Self {
-        self.lake_row_position = spec;
-        self
-    }
-
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -529,10 +515,6 @@ impl ScanNode {
 
     pub(crate) fn connector_row_position_lookup(&self) -> Option<&ConnectorRowPositionLookup> {
         self.connector_row_position_lookup.as_ref()
-    }
-
-    pub fn lake_row_position(&self) -> Option<&LakeRowPositionSpec> {
-        self.lake_row_position.as_ref()
     }
 }
 

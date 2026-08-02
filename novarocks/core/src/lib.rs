@@ -41,7 +41,6 @@ pub use novarocks_version as version;
 pub use common::app_config as novarocks_config;
 pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
-pub use connector::starrocks as novarocks_connector_starrocks;
 
 pub use common::types::FetchResult;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]

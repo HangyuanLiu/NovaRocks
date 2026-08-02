@@ -28,14 +28,11 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::starrocks::scan::read_starrocks_batches;
-use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-use crate::novarocks_connectors::StarRocksScanConfig;
+use crate::runtime::descriptor_snapshot::is_iceberg_v3_row_position;
 use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
-use crate::runtime::descriptor_snapshot::{is_iceberg_v3_row_position, is_lake_row_position};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorCancellation, ConnectorOpenReaderRequest,
+    ConnectorBatchBudget, ConnectorCancellation, ConnectorOpenReaderRequest,
     ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
@@ -343,13 +340,5 @@ pub(crate) fn execute_position_lookup_request(
     tuple_id: i32,
     request_columns: HashMap<SlotId, ArrayRef>,
 ) -> Result<Vec<(SlotId, ArrayRef)>, String> {
-    let row_position_type = query_context_manager()
-        .row_pos_desc(query_id, tuple_id)
-        .ok_or_else(|| format!("row position descriptor missing for tuple_id={}", tuple_id))?
-        .row_position_type;
-    if is_lake_row_position(row_position_type) {
-        return Err("lake late-materialization lookup is retired".to_string());
-    }
-
     execute_lookup_request(query_id, tuple_id, request_columns)
 }

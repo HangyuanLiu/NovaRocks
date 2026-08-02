@@ -211,13 +211,3 @@ fn external_callers_cannot_reach_fragment_kernel_legacy_paths() {
         assert_inaccessible(compile_external(source), capability);
     }
 }
-
-#[test]
-fn external_callers_cannot_reach_concrete_starrocks_sink_factories() {
-    let output = compile_external(
-        "use novarocks::connector::starrocks::sink::OlapTableSinkFactory;\n\
-         fn main() { let _ = core::mem::size_of::<OlapTableSinkFactory>(); }\n",
-    );
-
-    assert_inaccessible(output, "OlapTableSinkFactory");
-}

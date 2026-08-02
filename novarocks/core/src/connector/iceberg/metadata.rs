@@ -25,8 +25,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCancellation,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
+    ConnectorBatchBudget, ConnectorBatchReader, ConnectorCancellation, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
     ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
