@@ -60,13 +60,13 @@ struct ArtifactCacheKey {
     metrics: Vec<StatisticsMetric>,
 }
 
-/// A small in-process cache only for immutable response values. It never
-/// stores connector leases, runtime handles, collection artifacts, or StateStore
-/// values. A query takes a cloned `StatisticsEvidence` into its own
-/// `QueryStatsSnapshot` rather than reading these maps during optimization.
+/// A small in-process cache only for immutable, revision-addressed response
+/// values. The connector read still runs for every query because a metadata-only
+/// statistics publication can change the evidence revision without changing
+/// the table data version. A query takes a cloned `StatisticsEvidence` into its
+/// own `QueryStatsSnapshot` rather than reading this map during optimization.
 #[derive(Default)]
 pub(crate) struct UnifiedStatisticsResolver {
-    resolved: Mutex<HashMap<ResolvedCacheKey, Arc<StatisticsEvidence>>>,
     artifacts: Mutex<HashMap<ArtifactCacheKey, Arc<StatisticsEvidence>>>,
 }
 
@@ -93,16 +93,6 @@ impl UnifiedStatisticsResolver {
             data_version: table.data_version.clone(),
             metrics: metrics.metrics().to_vec(),
         };
-        if let Some(evidence) = self
-            .resolved
-            .lock()
-            .expect("unified statistics resolved cache lock")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(evidence);
-        }
-
         let evidence = statistics.read_statistics(StatisticsReadRequest {
             table: table.table.clone(),
             data_version: table.data_version.clone(),
@@ -133,10 +123,6 @@ impl UnifiedStatisticsResolver {
                 .or_insert_with(|| Arc::new(evidence))
                 .clone()
         };
-        self.resolved
-            .lock()
-            .expect("unified statistics resolved cache lock")
-            .insert(key, Arc::clone(&evidence));
         Ok(evidence)
     }
 
@@ -151,10 +137,7 @@ impl UnifiedStatisticsResolver {
     #[cfg(test)]
     pub(crate) fn cache_sizes(&self) -> (usize, usize) {
         (
-            self.resolved
-                .lock()
-                .expect("unified statistics resolved cache lock")
-                .len(),
+            0,
             self.artifacts
                 .lock()
                 .expect("unified statistics artifact cache lock")

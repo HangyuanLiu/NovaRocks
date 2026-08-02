@@ -94,6 +94,7 @@ const ICEBERG_DECLARATION_V1: u16 = 1;
 const DEFAULT_ACCESS_BINDING: &str = "default";
 const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
+const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
 /// Compat has no NovaRocks catalog instance identity on the wire.  Its
 /// read-only Iceberg binding is therefore composed once per BE process, not
@@ -122,6 +123,167 @@ fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&str> {
         | StatisticsMetric::AverageSize { column }
         | StatisticsMetric::ThetaNdv { column } => Some(column),
     }
+}
+
+fn encode_provider_statistics(evidence: &StatisticsEvidence) -> Result<Vec<u8>, ConnectorError> {
+    if evidence.coverage != StatisticsCoverage::Full
+        || evidence.accuracy != StatisticsAccuracy::Exact
+        || evidence.provenance != StatisticsProvenance::VisibleRows
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg provider statistics require Full Exact visible-row evidence",
+        ));
+    }
+    let metrics = evidence
+        .metrics
+        .iter()
+        .map(|(metric, state)| {
+            let StatisticsMetricState::Available(value) = state else {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg provider statistics cannot persist unavailable metrics",
+                ));
+            };
+            let value = match value {
+                StatisticsMetricValue::U64(value) => IcebergStatisticValueV1::U64(*value),
+                StatisticsMetricValue::I64(value) => IcebergStatisticValueV1::I64(*value),
+                StatisticsMetricValue::F64(value) => IcebergStatisticValueV1::F64(*value),
+                StatisticsMetricValue::Bytes(value) => {
+                    IcebergStatisticValueV1::Bytes(value.to_vec())
+                }
+            };
+            Ok(match metric {
+                StatisticsMetric::RowCount => IcebergProviderStatisticV1::RowCount { value },
+                StatisticsMetric::NullCount { column } => IcebergProviderStatisticV1::NullCount {
+                    column: column.to_string(),
+                    value,
+                },
+                StatisticsMetric::Minimum { column } => IcebergProviderStatisticV1::Minimum {
+                    column: column.to_string(),
+                    value,
+                },
+                StatisticsMetric::Maximum { column } => IcebergProviderStatisticV1::Maximum {
+                    column: column.to_string(),
+                    value,
+                },
+                StatisticsMetric::AverageSize { column } => {
+                    IcebergProviderStatisticV1::AverageSize {
+                        column: column.to_string(),
+                        value,
+                    }
+                }
+                StatisticsMetric::ThetaNdv { column } => IcebergProviderStatisticV1::ThetaNdv {
+                    column: column.to_string(),
+                    value,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_vec(&IcebergProviderStatisticsV1 {
+        version: ICEBERG_PROVIDER_STATISTICS_VERSION,
+        data_version: evidence.data_version.as_bytes().to_vec(),
+        metrics,
+    })
+    .map_err(|error| internal(format!("encode Iceberg provider statistics: {error}")))
+}
+
+fn decode_provider_statistics(
+    payload: &[u8],
+    expected_data_version: &StatisticsDataVersion,
+    requested: &novarocks_spi::connector::StatisticsMetricRequest,
+) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, ConnectorError> {
+    let artifact: IcebergProviderStatisticsV1 =
+        serde_json::from_slice(payload).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg provider statistics: {error}"),
+            )
+        })?;
+    if artifact.version != ICEBERG_PROVIDER_STATISTICS_VERSION
+        || artifact.data_version.as_slice() != expected_data_version.as_bytes().as_ref()
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg provider statistics do not match the pinned table version",
+        ));
+    }
+    let mut available = BTreeMap::new();
+    for metric in artifact.metrics {
+        let (metric, value) = match metric {
+            IcebergProviderStatisticV1::RowCount { value } => (StatisticsMetric::RowCount, value),
+            IcebergProviderStatisticV1::NullCount { column, value } => (
+                StatisticsMetric::NullCount {
+                    column: Arc::from(column),
+                },
+                value,
+            ),
+            IcebergProviderStatisticV1::Minimum { column, value } => (
+                StatisticsMetric::Minimum {
+                    column: Arc::from(column),
+                },
+                value,
+            ),
+            IcebergProviderStatisticV1::Maximum { column, value } => (
+                StatisticsMetric::Maximum {
+                    column: Arc::from(column),
+                },
+                value,
+            ),
+            IcebergProviderStatisticV1::AverageSize { column, value } => (
+                StatisticsMetric::AverageSize {
+                    column: Arc::from(column),
+                },
+                value,
+            ),
+            IcebergProviderStatisticV1::ThetaNdv { column, value } => (
+                StatisticsMetric::ThetaNdv {
+                    column: Arc::from(column),
+                },
+                value,
+            ),
+        };
+        let value = match value {
+            IcebergStatisticValueV1::U64(value) => StatisticsMetricValue::U64(value),
+            IcebergStatisticValueV1::I64(value) => StatisticsMetricValue::I64(value),
+            IcebergStatisticValueV1::F64(value) if value.is_finite() => {
+                StatisticsMetricValue::F64(value)
+            }
+            IcebergStatisticValueV1::F64(_) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg provider statistics contain a non-finite value",
+                ));
+            }
+            IcebergStatisticValueV1::Bytes(value) => {
+                StatisticsMetricValue::try_bytes(Bytes::from(value))?
+            }
+        };
+        if available
+            .insert(metric, StatisticsMetricState::Available(value))
+            .is_some()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg provider statistics contain a duplicate metric",
+            ));
+        }
+    }
+    Ok(requested
+        .metrics()
+        .iter()
+        .map(|metric| {
+            let state = available.get(metric).cloned().unwrap_or_else(|| {
+                StatisticsMetricState::Missing(StatisticsMissing {
+                    kind: StatisticsMissingKind::NotCollected,
+                    message: Arc::from(
+                        "metric was not present in the published statistics artifact",
+                    ),
+                })
+            });
+            (metric.clone(), state)
+        })
+        .collect())
 }
 
 /// Build the physical layout from the metadata serialized into the resolved
@@ -709,6 +871,53 @@ struct IcebergStatisticsEvidenceV1 {
     table: String,
     data_version: Vec<u8>,
     statistics_path: String,
+}
+
+/// Exact scalar evidence collected from visible rows and stored alongside the
+/// standard Theta blobs.  This is provider-private persisted data: Core sees
+/// only the typed `StatisticsEvidence` reconstructed from it.
+#[derive(Deserialize, Serialize)]
+struct IcebergProviderStatisticsV1 {
+    version: u16,
+    data_version: Vec<u8>,
+    metrics: Vec<IcebergProviderStatisticV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "metric", rename_all = "snake_case")]
+enum IcebergProviderStatisticV1 {
+    RowCount {
+        value: IcebergStatisticValueV1,
+    },
+    NullCount {
+        column: String,
+        value: IcebergStatisticValueV1,
+    },
+    Minimum {
+        column: String,
+        value: IcebergStatisticValueV1,
+    },
+    Maximum {
+        column: String,
+        value: IcebergStatisticValueV1,
+    },
+    AverageSize {
+        column: String,
+        value: IcebergStatisticValueV1,
+    },
+    ThetaNdv {
+        column: String,
+        value: IcebergStatisticValueV1,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum IcebergStatisticValueV1 {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2929,19 +3138,6 @@ impl StatisticsReader for IcebergControlProvider {
                 "Iceberg table has no current snapshot for statistics",
             )
         })?;
-        let base = super::stats::read_pinned_table_statistics(
-            &self.registry,
-            self.instance_id.as_str(),
-            &table.namespace,
-            &table.table,
-            Some(snapshot_id),
-        )
-        .map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                format!("read Iceberg statistics: {error:?}"),
-            )
-        })?;
         // A metadata-only `update_statistics` leaves the Iceberg snapshot (and
         // therefore the data-version) unchanged.  Its registered Puffin path
         // is nevertheless a new immutable evidence revision, so derive the
@@ -2958,6 +3154,62 @@ impl StatisticsReader for IcebergControlProvider {
                 "Iceberg table changed while its statistics evidence was loading",
             ));
         }
+        let statistics_path = metadata
+            .statistics_for_snapshot(snapshot_id)
+            .map(|statistics| statistics.statistics_path.as_str());
+        let evidence_path = statistics_path.unwrap_or("none");
+        let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
+            "iceberg/v1/{}/{snapshot_id}/{evidence_path}",
+            table_info
+                .table_uuid
+                .as_deref()
+                .expect("table UUID checked above"),
+        )))?;
+        if let Some(statistics_path) = statistics_path {
+            let artifact = super::catalog::registry::block_on_iceberg(
+                super::stats_assembler::read_provider_statistics_blob(
+                    loaded.table.file_io(),
+                    statistics_path,
+                ),
+            )
+            .map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("read Iceberg provider statistics runtime: {error}"),
+                )
+            })?
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+            if let Some(artifact) = artifact {
+                let metrics = decode_provider_statistics(
+                    &artifact,
+                    &expected_data_version,
+                    &request.metrics,
+                )?;
+                return Ok(StatisticsEvidence {
+                    data_version: expected_data_version,
+                    evidence_revision,
+                    coverage: StatisticsCoverage::Full,
+                    accuracy: StatisticsAccuracy::Exact,
+                    interval: None,
+                    provenance: StatisticsProvenance::ProviderArtifact,
+                    metrics,
+                });
+            }
+        }
+
+        let base = super::stats::read_pinned_table_statistics(
+            &self.registry,
+            self.instance_id.as_str(),
+            &table.namespace,
+            &table.table,
+            Some(snapshot_id),
+        )
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("read Iceberg statistics: {error:?}"),
+            )
+        })?;
         // A manifest summary is authoritative only when it describes every
         // live data file and no delete file can change the visible row set.
         // `read_pinned_table_statistics` deliberately exposes only data-file
@@ -2966,10 +3218,6 @@ impl StatisticsReader for IcebergControlProvider {
         let manifest_files = extract_data_files_with_stats_at(&loaded.table, snapshot_id)
             .map_err(map_iceberg_error)?;
         let manifest_is_complete = manifest_evidence_is_complete(&base.row_count, &manifest_files);
-        let evidence_path = metadata
-            .statistics_for_snapshot(snapshot_id)
-            .map(|statistics| statistics.statistics_path.as_str())
-            .unwrap_or("none");
 
         let mut metrics = BTreeMap::new();
         for metric in request.metrics.metrics() {
@@ -3001,13 +3249,6 @@ impl StatisticsReader for IcebergControlProvider {
             };
             metrics.insert(metric.clone(), state);
         }
-        let evidence_revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
-            "iceberg/v1/{}/{snapshot_id}/{evidence_path}",
-            table_info
-                .table_uuid
-                .as_deref()
-                .expect("table UUID checked above"),
-        )))?;
         Ok(StatisticsEvidence {
             data_version: expected_data_version,
             evidence_revision,
@@ -3208,6 +3449,7 @@ impl StatisticsCollection for IcebergControlProvider {
                 "Iceberg statistics publication requires Full Exact visible-row evidence",
             )));
         }
+        let provider_statistics = encode_provider_statistics(&request.result.evidence)?;
         let (artifact_version, theta) =
             crate::query_execution::statistics::decode_visible_row_artifact(
                 request.result.provider_payload(),
@@ -3223,15 +3465,6 @@ impl StatisticsCollection for IcebergControlProvider {
                 ConnectorErrorKind::InvalidRequest,
                 "Core statistics artifact does not match its resolved table pin",
             )));
-        }
-        if theta.is_empty() {
-            return self.statistics_receipt(
-                request.operation_id,
-                expected_data_version,
-                request.result.evidence.evidence_revision,
-                Bytes::new(),
-                ExternalMutationEffect::NoOp,
-            );
         }
 
         let entry = self.entry(self.instance_id.as_str())?;
@@ -3299,21 +3532,23 @@ impl StatisticsCollection for IcebergControlProvider {
                 "Iceberg statistics publication evidence does not match its pinned operation",
             )));
         }
-        let written =
-            super::catalog::registry::block_on_iceberg(super::stats_assembler::write_puffin(
+        let written = super::catalog::registry::block_on_iceberg(
+            super::stats_assembler::write_puffin_with_provider_statistics(
                 loaded.table.file_io(),
                 &statistics_path,
                 snapshot_id,
                 sequence_number,
                 &sketches,
-            ))
-            .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    format!("write Iceberg statistics runtime: {error}"),
-                )
-            })?
-            .map_err(map_iceberg_error)?;
+                Some(&provider_statistics),
+            ),
+        )
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!("write Iceberg statistics runtime: {error}"),
+            )
+        })?
+        .map_err(map_iceberg_error)?;
         let Some(statistics_file) = written else {
             return self.statistics_receipt(
                 request.operation_id,
@@ -5079,6 +5314,67 @@ mod tests {
                 crate::sql::optimizer::stats_input::StatsSource::IcebergManifest,
             ),
             &files_with_delete
+        ));
+    }
+
+    #[test]
+    fn provider_statistics_artifact_round_trips_requested_metrics() {
+        let data_version =
+            StatisticsDataVersion::try_new(Bytes::from_static(b"table-v1")).expect("version");
+        let theta_metric = StatisticsMetric::ThetaNdv {
+            column: Arc::from("k"),
+        };
+        let evidence = StatisticsEvidence {
+            data_version: data_version.clone(),
+            evidence_revision: StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run-v1"))
+                .expect("revision"),
+            coverage: StatisticsCoverage::Full,
+            accuracy: StatisticsAccuracy::Exact,
+            interval: None,
+            provenance: StatisticsProvenance::VisibleRows,
+            metrics: BTreeMap::from([
+                (
+                    StatisticsMetric::RowCount,
+                    StatisticsMetricState::Available(StatisticsMetricValue::U64(3)),
+                ),
+                (
+                    theta_metric.clone(),
+                    StatisticsMetricState::Available(StatisticsMetricValue::F64(3.0)),
+                ),
+            ]),
+        };
+        let payload = encode_provider_statistics(&evidence).expect("encode artifact");
+        let requested = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            theta_metric.clone(),
+            StatisticsMetric::NullCount {
+                column: Arc::from("k"),
+            },
+        ])
+        .expect("metric request");
+
+        let decoded = decode_provider_statistics(&payload, &data_version, &requested)
+            .expect("decode artifact");
+        assert_eq!(
+            decoded.get(&StatisticsMetric::RowCount),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::U64(3)
+            ))
+        );
+        assert_eq!(
+            decoded.get(&theta_metric),
+            Some(&StatisticsMetricState::Available(
+                StatisticsMetricValue::F64(3.0)
+            ))
+        );
+        assert!(matches!(
+            decoded.get(&StatisticsMetric::NullCount {
+                column: Arc::from("k")
+            }),
+            Some(StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::NotCollected,
+                ..
+            }))
         ));
     }
 

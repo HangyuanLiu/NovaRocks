@@ -2219,6 +2219,15 @@ fn cross_process_three_be_statistics_service() {
         conn.query_drop(format!("INSERT INTO feh5_stats.t VALUES ({value})"))
             .expect("insert one statistics data file");
     }
+    let before_analyze: Vec<String> = conn
+        .query("EXPLAIN COSTS SELECT * FROM feh5_stats.t")
+        .expect("explain before statistics publication");
+    assert!(
+        before_analyze
+            .iter()
+            .any(|line| line.contains("source=IcebergManifest")),
+        "append-only manifest evidence must be available before ANALYZE: {before_analyze:?}"
+    );
     conn.query_drop("ANALYZE TABLE feh5_stats.t")
         .expect("analyze statistics table");
 

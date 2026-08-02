@@ -25,8 +25,19 @@ INSERT INTO probe_5m_wide
     FROM TABLE(generate_series(1, 5000000));
 INSERT INTO build_500k
     SELECT generate_series FROM TABLE(generate_series(1, 500000));
-ANALYZE TABLE probe_5m_wide;
 ANALYZE TABLE build_500k;
+-- @retry_count=120
+-- @retry_interval_ms=500
+-- @result_contains=build_500k
+-- @result_contains=SUCCEEDED
+-- @result_not_contains=SUBMITTED
+-- @result_not_contains=PREPARING
+-- @result_not_contains=RUNNING
+-- @result_not_contains=PUBLISHING
+-- @result_not_contains=FAILED
+-- @result_not_contains=CANCELLED
+-- @skip_result_check=true
+SHOW ANALYZE JOBS;
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible
