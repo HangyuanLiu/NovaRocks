@@ -22,8 +22,9 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver, ConnectorControlBinding,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
     ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceResolver, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -50,6 +51,7 @@ struct ControlGeneration {
     planning_leases: usize,
     mutation_leases: usize,
     data_mutation_leases: usize,
+    metadata_maintenance_leases: usize,
     write_leases: usize,
     statistics_leases: usize,
 }
@@ -59,6 +61,7 @@ impl ControlGeneration {
         self.planning_leases == 0
             && self.mutation_leases == 0
             && self.data_mutation_leases == 0
+            && self.metadata_maintenance_leases == 0
             && self.write_leases == 0
             && self.statistics_leases == 0
     }
@@ -146,6 +149,7 @@ impl ConnectorControlHost {
                 planning_leases: 0,
                 mutation_leases: 0,
                 data_mutation_leases: 0,
+                metadata_maintenance_leases: 0,
                 write_leases: 0,
                 statistics_leases: 0,
             },
@@ -362,6 +366,88 @@ impl ConnectorControlHost {
         })
     }
 
+    fn acquire_current_metadata_maintenance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        let key = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
+        };
+        self.acquire_metadata_maintenance(&key, true)
+    }
+
+    fn acquire_exact_metadata_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        self.acquire_metadata_maintenance(key, false)
+    }
+
+    fn acquire_metadata_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+        require_active: bool,
+    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        let (descriptor, metadata, maintenance) = {
+            let mut state = self.lock_state()?;
+            let generation = state.generations.get_mut(key).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "connector control generation is not registered",
+                )
+            })?;
+            if require_active && generation.state != ControlGenerationState::Active {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
+            }
+            let maintenance = generation
+                .binding
+                .metadata_maintenance()
+                .cloned()
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "connector control generation has no metadata maintenance capability",
+                    )
+                })?;
+            generation.metadata_maintenance_leases =
+                generation.metadata_maintenance_leases.saturating_add(1);
+            (
+                generation.binding.descriptor().clone(),
+                Arc::clone(generation.binding.metadata()),
+                maintenance,
+            )
+        };
+        let state = Arc::downgrade(&self.state);
+        let retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let lease_key = key.clone();
+        ConnectorMetadataMaintenanceLease::new(
+            descriptor,
+            key.clone(),
+            metadata,
+            maintenance,
+            move || {
+                release_lease(
+                    &state,
+                    &retirement_sink,
+                    lease_key,
+                    LeaseKind::MetadataMaintenance,
+                );
+            },
+        )
+    }
+
     fn acquire_write(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -517,6 +603,22 @@ impl ConnectorDataMutationResolver for ConnectorControlHost {
     }
 }
 
+impl ConnectorMetadataMaintenanceResolver for ConnectorControlHost {
+    fn acquire_current_metadata_maintenance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        Self::acquire_current_metadata_maintenance(self, instance_id)
+    }
+
+    fn acquire_exact_metadata_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        Self::acquire_exact_metadata_maintenance(self, key)
+    }
+}
+
 impl ConnectorWriteResolver for ConnectorControlHost {
     fn acquire_current_write(
         &self,
@@ -550,6 +652,7 @@ enum LeaseKind {
     Planning,
     Mutation,
     DataMutation,
+    MetadataMaintenance,
     Write,
     Statistics,
 }
@@ -578,6 +681,10 @@ fn release_lease(
         }
         LeaseKind::DataMutation => {
             generation.data_mutation_leases = generation.data_mutation_leases.saturating_sub(1);
+        }
+        LeaseKind::MetadataMaintenance => {
+            generation.metadata_maintenance_leases =
+                generation.metadata_maintenance_leases.saturating_sub(1);
         }
         LeaseKind::Write => {
             generation.write_leases = generation.write_leases.saturating_sub(1);

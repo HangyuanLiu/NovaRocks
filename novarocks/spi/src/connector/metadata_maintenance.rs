@@ -254,6 +254,7 @@ impl ConnectorMetadataMaintenancePlanSummary {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorMetadataMaintenancePlan {
+    schema_version: u16,
     owner: ConnectorExecutionBindingKey,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
@@ -279,6 +280,7 @@ impl ConnectorMetadataMaintenancePlan {
             &provider_payload,
         );
         Ok(Self {
+            schema_version: CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION,
             owner: request.owner.clone(),
             operation_id: request.operation_id,
             operation_kind: request.operation.kind().into(),
@@ -288,6 +290,45 @@ impl ConnectorMetadataMaintenancePlan {
             provider_payload,
             plan_digest,
         })
+    }
+
+    /// Rebuilds a plan previously persisted by the frontend operation owner.
+    ///
+    /// The caller must already have recovered the exact owner from its durable
+    /// record. This constructor validates every bounded carrier field and the
+    /// semantic plan digest; it deliberately cannot recreate an operation from
+    /// a current connector generation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_restore(
+        owner: ConnectorExecutionBindingKey,
+        operation_id: ConnectorMutationOperationId,
+        operation_kind: impl Into<Arc<str>>,
+        request_digest: [u8; 32],
+        state_digest: [u8; 32],
+        summary: ConnectorMetadataMaintenancePlanSummary,
+        provider_payload: Bytes,
+        plan_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        let operation_kind = operation_kind.into();
+        validate_kind(&operation_kind)?;
+        validate_payload(&provider_payload, "plan")?;
+        let plan = Self {
+            schema_version: CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION,
+            owner,
+            operation_id,
+            operation_kind,
+            request_digest,
+            state_digest,
+            summary,
+            provider_payload,
+            plan_digest,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
     }
     pub fn owner(&self) -> &ConnectorExecutionBindingKey {
         &self.owner
@@ -316,12 +357,13 @@ impl ConnectorMetadataMaintenancePlan {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_kind(&self.operation_kind)?;
         validate_payload(&self.provider_payload, "plan")?;
-        if plan_digest(
-            self.request_digest,
-            self.state_digest,
-            self.summary,
-            &self.provider_payload,
-        ) != self.plan_digest
+        if self.schema_version != CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION
+            || plan_digest(
+                self.request_digest,
+                self.state_digest,
+                self.summary,
+                &self.provider_payload,
+            ) != self.plan_digest
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -334,6 +376,7 @@ impl ConnectorMetadataMaintenancePlan {
 impl fmt::Debug for ConnectorMetadataMaintenancePlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectorMetadataMaintenancePlan")
+            .field("schema_version", &self.schema_version)
             .field("owner", &self.owner)
             .field("operation_id", &self.operation_id)
             .field("operation_kind", &self.operation_kind)
@@ -372,6 +415,7 @@ pub struct ConnectorMetadataMaintenanceReceiptSummary {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorMetadataMaintenanceReceipt {
+    schema_version: u16,
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
     operation_id: ConnectorMutationOperationId,
@@ -401,6 +445,7 @@ impl ConnectorMetadataMaintenanceReceipt {
         validate_payload(&provider_payload, "receipt")?;
         let provider_payload_digest = digest_with_domain(RECEIPT_DOMAIN, &provider_payload);
         Ok(Self {
+            schema_version: CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION,
             descriptor,
             incarnation,
             operation_id,
@@ -415,6 +460,9 @@ impl ConnectorMetadataMaintenanceReceipt {
     }
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
+    }
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
     }
     pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
         self.incarnation
@@ -447,6 +495,7 @@ impl ConnectorMetadataMaintenanceReceipt {
 impl fmt::Debug for ConnectorMetadataMaintenanceReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectorMetadataMaintenanceReceipt")
+            .field("schema_version", &self.schema_version)
             .field("descriptor", &self.descriptor)
             .field("incarnation", &self.incarnation)
             .field("operation_id", &self.operation_id)
@@ -633,6 +682,7 @@ impl ConnectorMetadataMaintenanceLease {
         match outcome {
             ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
                 if receipt.descriptor != self.descriptor
+                    || receipt.schema_version != CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION
                     || receipt.incarnation != self.key.incarnation
                     || receipt.operation_id != plan.operation_id
                     || receipt.operation_kind.as_ref() != plan.operation_kind.as_ref()

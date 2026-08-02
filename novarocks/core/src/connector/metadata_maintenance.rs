@@ -1,0 +1,873 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Provider-neutral application bridge for one FE-only metadata maintenance operation.
+//!
+//! The bridge owns only exact-generation lease lifetime, dispatch certainty and
+//! generic cache finalization. Provider-specific maintenance planning, durable
+//! artifacts, markers and external mutation all remain behind the SPI.
+
+use std::fmt;
+use std::sync::Arc;
+
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
+};
+
+use crate::common::engine_error::EngineError;
+
+/// Statement-level intent before loading a provider-owned table handle on the
+/// exact maintenance lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataMaintenanceIntent {
+    RewriteMetadataLayout,
+    ExpireTableVersions {
+        older_than_ms: Option<i64>,
+        retain_last: Option<u32>,
+    },
+}
+
+impl MetadataMaintenanceIntent {
+    pub(crate) const fn rewrite_metadata_layout() -> Self {
+        Self::RewriteMetadataLayout
+    }
+
+    pub(crate) const fn expire_table_versions(
+        older_than_ms: Option<i64>,
+        retain_last: Option<u32>,
+    ) -> Self {
+        Self::ExpireTableVersions {
+            older_than_ms,
+            retain_last,
+        }
+    }
+
+    fn into_operation(
+        self,
+        table: ConnectorTableHandle,
+    ) -> Result<ConnectorMetadataMaintenanceOperation, ConnectorError> {
+        match self {
+            Self::RewriteMetadataLayout => {
+                ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(table)
+            }
+            Self::ExpireTableVersions {
+                older_than_ms,
+                retain_last,
+            } => ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                table,
+                older_than_ms,
+                retain_last,
+            ),
+        }
+    }
+}
+
+/// Invalidates application-owned catalog state after provider finalization.
+///
+/// Provider cache invalidation is represented by the provider's returned
+/// finalization. This port is deliberately invoked only afterwards, preserving
+/// provider-before-generic invalidation without importing provider state here.
+pub(crate) trait MetadataMaintenanceCacheFinalizer {
+    fn invalidate_generic_table(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Result<(), ConnectorError>;
+}
+
+impl MetadataMaintenanceCacheFinalizer for crate::engine::StandaloneState {
+    fn invalidate_generic_table(
+        &self,
+        table: &ConnectorTableIdentity,
+    ) -> Result<(), ConnectorError> {
+        self.catalog_service
+            .invalidate_table(
+                table.instance_id.as_str(),
+                table.namespace.as_ref(),
+                table.table.as_ref(),
+            )
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletedMetadataMaintenance {
+    #[allow(dead_code)]
+    pub(crate) effect: ExternalMutationEffect,
+    pub(crate) receipt: ConnectorMetadataMaintenanceReceipt,
+    pub(crate) finalization: ExternalMutationFinalization,
+}
+
+/// Planning never crosses the dispatch boundary, whereas an explicit provider
+/// outcome did. Preserve this distinction for the durable operation owner.
+#[derive(Clone, Debug)]
+pub(crate) enum KnownUncommittedMetadataMaintenance {
+    Planning(ConnectorError),
+    Provider(ConnectorMutationFailure),
+}
+
+impl fmt::Display for KnownUncommittedMetadataMaintenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Planning(error) => write!(formatter, "{error}"),
+            Self::Provider(failure) => write!(formatter, "{failure}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataMaintenanceDispatchState {
+    ConfirmedNotDispatched,
+    PossiblyDispatched,
+}
+
+/// Terminal application view after a single execute, or an exact-generation
+/// reconcile. `CommitUnknown` remains durable-operation work; it is not an
+/// invitation to dispatch the maintenance action again.
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedMetadataMaintenance {
+    KnownCommitted(CompletedMetadataMaintenance),
+    KnownUncommitted {
+        failure: KnownUncommittedMetadataMaintenance,
+    },
+    CommitUnknown {
+        failure: ConnectorMutationFailure,
+        evidence: ExternalMutationEvidence,
+    },
+    ContractFailure {
+        error: ConnectorError,
+        dispatch: MetadataMaintenanceDispatchState,
+    },
+}
+
+/// Compatibility projection for a synchronous statement caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_metadata_maintenance(
+    resolver: &dyn ConnectorMetadataMaintenanceResolver,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    instance_id: &ConnectorInstanceId,
+    operation_id: ConnectorMutationOperationId,
+    table: ConnectorTableIdentity,
+    intent: MetadataMaintenanceIntent,
+    context: ConnectorRequestContext,
+) -> Result<CompletedMetadataMaintenance, String> {
+    match resolve_metadata_maintenance(
+        resolver,
+        cache_finalizer,
+        instance_id,
+        operation_id,
+        table,
+        intent,
+        context,
+    ) {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
+                Err(
+                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                        .to_string(),
+                )
+            } else {
+                Ok(completed)
+            }
+        }
+        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
+            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
+        }
+        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+        }
+        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
+    }
+}
+
+/// Plan and execute one operation using a newly acquired current lease.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_metadata_maintenance(
+    resolver: &dyn ConnectorMetadataMaintenanceResolver,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    instance_id: &ConnectorInstanceId,
+    operation_id: ConnectorMutationOperationId,
+    table: ConnectorTableIdentity,
+    intent: MetadataMaintenanceIntent,
+    context: ConnectorRequestContext,
+) -> ResolvedMetadataMaintenance {
+    let session = match MetadataMaintenanceSession::plan(
+        resolver,
+        instance_id,
+        operation_id,
+        table,
+        intent,
+        context,
+    ) {
+        Ok(session) => session,
+        Err(failure) => return failure,
+    };
+    session.execute(cache_finalizer)
+}
+
+pub(crate) struct MetadataMaintenanceSession {
+    lease: ConnectorMetadataMaintenanceLease,
+    table: ConnectorTableIdentity,
+    plan: ConnectorMetadataMaintenancePlan,
+    context: ConnectorRequestContext,
+}
+
+impl MetadataMaintenanceSession {
+    /// Acquire the current exact lease, strictly load the base table, and make
+    /// one immutable provider plan. This is the only entry point that plans.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn plan(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        instance_id: &ConnectorInstanceId,
+        operation_id: ConnectorMutationOperationId,
+        table: ConnectorTableIdentity,
+        intent: MetadataMaintenanceIntent,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedMetadataMaintenance> {
+        if &table.instance_id != instance_id {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector metadata maintenance table does not belong to requested instance",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            ));
+        }
+        let lease = resolver
+            .acquire_current_metadata_maintenance(instance_id)
+            .map_err(|error| {
+                contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                )
+            })?;
+        let metadata = lease
+            .metadata()
+            .load_table(ConnectorTableRequest {
+                table: table.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })
+            .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
+                failure: KnownUncommittedMetadataMaintenance::Planning(error),
+            })?;
+        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
+        {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector metadata returned a table handle for a different exact owner",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            ));
+        }
+        let operation = intent.into_operation(metadata.table).map_err(|error| {
+            ResolvedMetadataMaintenance::KnownUncommitted {
+                failure: KnownUncommittedMetadataMaintenance::Planning(error),
+            }
+        })?;
+        let request = ConnectorMetadataMaintenancePlanningRequest::try_new(
+            operation_id,
+            lease.binding_key().clone(),
+            operation,
+            context.clone(),
+        )
+        .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
+            failure: KnownUncommittedMetadataMaintenance::Planning(error),
+        })?;
+        let plan = lease.plan_maintenance(request).map_err(|error| {
+            ResolvedMetadataMaintenance::KnownUncommitted {
+                failure: KnownUncommittedMetadataMaintenance::Planning(error),
+            }
+        })?;
+        Ok(Self {
+            lease,
+            table,
+            plan,
+            context,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_ref(&self) -> &ConnectorMetadataMaintenancePlan {
+        &self.plan
+    }
+
+    /// Consume the session, so callers cannot execute its immutable plan twice.
+    pub(crate) fn execute(
+        self,
+        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    ) -> ResolvedMetadataMaintenance {
+        let request = match ConnectorMetadataMaintenanceExecuteRequest::try_new(
+            self.plan.clone(),
+            self.context.clone(),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                );
+            }
+        };
+        let outcome = match self.lease.execute(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::PossiblyDispatched,
+                );
+            }
+        };
+        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+    }
+
+    /// Restore an already persisted plan on its recorded exact generation.
+    /// This intentionally never loads metadata, replans, or executes.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn recover(
+        resolver: &dyn ConnectorMetadataMaintenanceResolver,
+        table: ConnectorTableIdentity,
+        plan: ConnectorMetadataMaintenancePlan,
+        evidence: Option<ExternalMutationEvidence>,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ResolvedMetadataMaintenance> {
+        let key = plan.owner().clone();
+        plan.validate().map_err(|error| {
+            contract_failure(
+                error,
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            )
+        })?;
+        if table.instance_id != key.instance_id {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata maintenance recovery table does not match plan owner",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            ));
+        }
+        let lease = resolver
+            .acquire_exact_metadata_maintenance(&key)
+            .map_err(|error| {
+                contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                )
+            })?;
+        if let Some(evidence) = &evidence
+            && (evidence.operation_id() != plan.operation_id()
+                || evidence.operation_kind() != plan.operation_kind())
+        {
+            return Err(contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata maintenance recovery evidence does not match plan",
+                ),
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+            ));
+        }
+        Ok(Self {
+            lease,
+            table,
+            plan,
+            context,
+        })
+    }
+
+    /// Consume a recovered session by reconciling only. An unavailable exact
+    /// generation is propagated as a contract failure for the frontend to mark
+    /// unresolved; it must never be substituted with the current generation.
+    pub(crate) fn reconcile(
+        self,
+        evidence: Option<ExternalMutationEvidence>,
+        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    ) -> ResolvedMetadataMaintenance {
+        let request = match ConnectorMetadataMaintenanceReconcileRequest::try_new(
+            self.plan.clone(),
+            evidence,
+            self.context,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
+                );
+            }
+        };
+        let outcome = match self.lease.reconcile(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return contract_failure(
+                    error,
+                    MetadataMaintenanceDispatchState::PossiblyDispatched,
+                );
+            }
+        };
+        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+    }
+}
+
+fn resolve_terminal_outcome(
+    outcome: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
+    table: &ConnectorTableIdentity,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+) -> ResolvedMetadataMaintenance {
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } => {
+            let generic_finalization = cache_finalizer.invalidate_generic_table(table);
+            ResolvedMetadataMaintenance::KnownCommitted(CompletedMetadataMaintenance {
+                effect,
+                receipt,
+                finalization: merge_finalization(finalization, generic_finalization),
+            })
+        }
+        ExternalMutationOutcome::KnownUncommitted { failure } => {
+            ResolvedMetadataMaintenance::KnownUncommitted {
+                failure: KnownUncommittedMetadataMaintenance::Provider(failure),
+            }
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            ResolvedMetadataMaintenance::CommitUnknown { failure, evidence }
+        }
+    }
+}
+
+fn merge_finalization(
+    provider: ExternalMutationFinalization,
+    generic: Result<(), ConnectorError>,
+) -> ExternalMutationFinalization {
+    match (provider, generic) {
+        (ExternalMutationFinalization::Complete, Ok(())) => ExternalMutationFinalization::Complete,
+        (ExternalMutationFinalization::Failed(failure), Ok(())) => {
+            ExternalMutationFinalization::Failed(failure)
+        }
+        (ExternalMutationFinalization::Complete, Err(error)) => {
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Internal,
+                format!("generic catalog cache invalidation failed: {error}"),
+            ))
+        }
+        (ExternalMutationFinalization::Failed(failure), Err(error)) => {
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                failure.kind(),
+                format!(
+                    "{}; generic catalog cache invalidation also failed: {error}",
+                    failure.message()
+                ),
+            ))
+        }
+    }
+}
+
+fn contract_failure(
+    error: ConnectorError,
+    dispatch: MetadataMaintenanceDispatchState,
+) -> ResolvedMetadataMaintenance {
+    ResolvedMetadataMaintenance::ContractFailure { error, dispatch }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::Schema;
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
+        ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest, ConnectorProviderId,
+        ConnectorTableMetadata,
+    };
+
+    use super::*;
+
+    struct NeverCancelled;
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Committed,
+        UnknownStaysUnknown,
+        PlanningFailure,
+    }
+
+    struct FakeProvider {
+        descriptor: ConnectorInstanceDescriptor,
+        key: ConnectorExecutionBindingKey,
+        mode: Mode,
+        metadata_calls: AtomicUsize,
+        plan_calls: AtomicUsize,
+        execute_calls: AtomicUsize,
+        reconcile_calls: AtomicUsize,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FakeProvider {
+        fn new(mode: Mode) -> Arc<Self> {
+            let instance_id = ConnectorInstanceId::parse("catalog.maintenance").unwrap();
+            Arc::new(Self {
+                descriptor: ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("fake-maintenance").unwrap(),
+                    instance_id: instance_id.clone(),
+                },
+                key: ConnectorExecutionBindingKey {
+                    instance_id,
+                    incarnation: ConnectorInstanceIncarnation::from_bytes([5; 16]),
+                },
+                mode,
+                metadata_calls: AtomicUsize::new(0),
+                plan_calls: AtomicUsize::new(0),
+                execute_calls: AtomicUsize::new(0),
+                reconcile_calls: AtomicUsize::new(0),
+                events: Arc::new(Mutex::new(Vec::new())),
+            })
+        }
+
+        fn receipt(
+            &self,
+            plan: &ConnectorMetadataMaintenancePlan,
+        ) -> ConnectorMetadataMaintenanceReceipt {
+            ConnectorMetadataMaintenanceReceipt::try_new(
+                self.descriptor.clone(),
+                self.key.incarnation,
+                plan.operation_id(),
+                plan.operation_kind(),
+                plan.request_digest(),
+                plan.plan_digest(),
+                plan.state_digest(),
+                ConnectorMetadataMaintenanceReceiptSummary::default(),
+                Bytes::new(),
+            )
+            .unwrap()
+        }
+
+        fn evidence(&self, plan: &ConnectorMetadataMaintenancePlan) -> ExternalMutationEvidence {
+            ExternalMutationEvidence::try_new(
+                1,
+                self.descriptor.clone(),
+                self.key.incarnation,
+                plan.operation_id(),
+                plan.operation_kind(),
+                Bytes::from_static(b"evidence"),
+            )
+            .unwrap()
+        }
+    }
+
+    impl ConnectorMetadata for FakeProvider {
+        fn instance_id(&self) -> &ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+        fn namespace_exists(&self, _: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn table_exists(&self, _: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+            unreachable!()
+        }
+        fn list_tables(
+            &self,
+            _: ConnectorListTablesRequest,
+        ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
+            unreachable!()
+        }
+        fn load_table(
+            &self,
+            request: ConnectorTableRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
+            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ConnectorTableMetadata {
+                identity: request.table,
+                schema: Arc::new(Schema::empty()),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(
+                    self.descriptor.instance_id.clone(),
+                    Bytes::from_static(b"table"),
+                )?,
+            })
+        }
+    }
+
+    impl ConnectorMetadataMaintenance for FakeProvider {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+            &self.key
+        }
+        fn plan_maintenance(
+            &self,
+            request: ConnectorMetadataMaintenancePlanningRequest,
+        ) -> Result<ConnectorMetadataMaintenancePlan, ConnectorError> {
+            self.plan_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, Mode::PlanningFailure) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "planning rejected",
+                ));
+            }
+            ConnectorMetadataMaintenancePlan::try_new(
+                &request,
+                [3; 32],
+                ConnectorMetadataMaintenancePlanSummary::new(1, 2, 3, 4, 5),
+                Bytes::from_static(b"plan"),
+            )
+        }
+        fn execute(
+            &self,
+            request: ConnectorMetadataMaintenanceExecuteRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
+        {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, Mode::UnknownStaysUnknown) {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "response lost",
+                    ),
+                    evidence: self.evidence(&request.plan),
+                });
+            }
+            self.events.lock().unwrap().push("provider");
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: self.receipt(&request.plan),
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+        fn reconcile(
+            &self,
+            request: ConnectorMetadataMaintenanceReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
+        {
+            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, Mode::UnknownStaysUnknown) {
+                return Ok(ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "marker absent",
+                    ),
+                    evidence: request
+                        .evidence
+                        .unwrap_or_else(|| self.evidence(&request.plan)),
+                });
+            }
+            self.events.lock().unwrap().push("provider");
+            Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: self.receipt(&request.plan),
+                finalization: ExternalMutationFinalization::Complete,
+            })
+        }
+    }
+
+    struct Resolver {
+        provider: Arc<FakeProvider>,
+        releases: Arc<AtomicUsize>,
+    }
+    impl Resolver {
+        fn new(provider: Arc<FakeProvider>) -> Self {
+            Self {
+                provider,
+                releases: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn lease(&self) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            let releases = self.releases.clone();
+            ConnectorMetadataMaintenanceLease::new(
+                self.provider.descriptor.clone(),
+                self.provider.key.clone(),
+                self.provider.clone(),
+                self.provider.clone(),
+                move || {
+                    releases.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+        }
+    }
+    impl ConnectorMetadataMaintenanceResolver for Resolver {
+        fn acquire_current_metadata_maintenance(
+            &self,
+            _: &ConnectorInstanceId,
+        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            self.lease()
+        }
+        fn acquire_exact_metadata_maintenance(
+            &self,
+            key: &ConnectorExecutionBindingKey,
+        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+            if key == &self.provider.key {
+                self.lease()
+            } else {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "generation retired",
+                ))
+            }
+        }
+    }
+
+    struct Finalizer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl MetadataMaintenanceCacheFinalizer for Finalizer {
+        fn invalidate_generic_table(
+            &self,
+            _: &ConnectorTableIdentity,
+        ) -> Result<(), ConnectorError> {
+            self.events.lock().unwrap().push("generic");
+            Ok(())
+        }
+    }
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(10),
+            Arc::new(NeverCancelled),
+            1024,
+            1024,
+        )
+        .unwrap()
+    }
+    fn table(instance_id: &ConnectorInstanceId) -> ConnectorTableIdentity {
+        ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: Arc::from("db"),
+            table: Arc::from("orders"),
+        }
+    }
+
+    #[test]
+    fn exact_lease_plans_executes_once_and_finalizes_provider_before_generic() {
+        let provider = FakeProvider::new(Mode::Committed);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let session = MetadataMaintenanceSession::plan(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::from_bytes([9; 16]),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .unwrap();
+        assert_eq!(
+            session.plan_ref().operation_kind(),
+            "rewrite-metadata-layout"
+        );
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            session.execute(&finalizer),
+            ResolvedMetadataMaintenance::KnownCommitted(_)
+        ));
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.events.lock().unwrap().as_slice(),
+            ["provider", "generic"]
+        );
+    }
+
+    #[test]
+    fn unknown_execute_is_not_reexecuted_and_exact_recovery_only_reconciles() {
+        let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        let session = MetadataMaintenanceSession::plan(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::from_bytes([7; 16]),
+            table(&provider.descriptor.instance_id),
+            MetadataMaintenanceIntent::rewrite_metadata_layout(),
+            context(),
+        )
+        .unwrap();
+        let plan = session.plan.clone();
+        assert!(matches!(
+            session.execute(&finalizer),
+            ResolvedMetadataMaintenance::CommitUnknown { .. }
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+        let recovery = MetadataMaintenanceSession::recover(
+            &resolver,
+            table(&provider.descriptor.instance_id),
+            plan,
+            None,
+            context(),
+        )
+        .unwrap();
+        assert!(matches!(
+            recovery.reconcile(None, &finalizer),
+            ResolvedMetadataMaintenance::CommitUnknown { .. }
+        ));
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn planning_failure_is_known_uncommitted_without_dispatch() {
+        let provider = FakeProvider::new(Mode::PlanningFailure);
+        let resolver = Resolver::new(provider.clone());
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+        };
+        assert!(matches!(
+            resolve_metadata_maintenance(
+                &resolver,
+                &finalizer,
+                &provider.descriptor.instance_id,
+                ConnectorMutationOperationId::from_bytes([6; 16]),
+                table(&provider.descriptor.instance_id),
+                MetadataMaintenanceIntent::expire_table_versions(None, Some(1)),
+                context()
+            ),
+            ResolvedMetadataMaintenance::KnownUncommitted {
+                failure: KnownUncommittedMetadataMaintenance::Planning(_)
+            }
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 0);
+    }
+}
