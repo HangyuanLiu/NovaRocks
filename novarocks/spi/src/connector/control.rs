@@ -468,12 +468,9 @@ impl ConnectorControlPlanningLease {
         let distribution = self.binding.execution_distribution().clone();
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
-        Ok(ConnectorWriteLease::new_with_execution_distribution(
-            key,
-            write,
-            distribution,
-            move || drop(retained_planning_lease),
-        )?)
+        ConnectorWriteLease::new_with_execution_distribution(key, write, distribution, move || {
+            drop(retained_planning_lease)
+        })
     }
 
     /// Derive a catalog-mutation lease from this retained planning generation.
