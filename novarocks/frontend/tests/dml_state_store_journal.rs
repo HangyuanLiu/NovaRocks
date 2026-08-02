@@ -22,9 +22,16 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks_frontend::dml::model::{
+    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_LEGACY_OPERATION_SCHEMA_VERSION,
+};
 use novarocks_frontend::dml::{
-    CreatePreparingRequest, DmlErrorKind, IcebergCommitOutcomeRecord, OperationFact,
-    OperationJournal, OperationKind, OperationState, OperationTarget, StateStoreOperationJournal,
+    CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
+    DmlErrorKind, DmlOperationId, DurableExternalFact, ExternalFactOutcome,
+    IcebergCommitOutcomeRecord, OperationFact, OperationJournal, OperationKind,
+    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
+    StateStoreOperationJournal, StatementNextAction, TruncateLifecyclePhase,
+    TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution,
@@ -128,12 +135,16 @@ async fn raw_put(store: &dyn StateStore, key: Key, value: Value) {
 }
 
 fn raw_operation(operation_id: Uuid, schema_version: u8) -> Value {
+    raw_operation_with_kind(operation_id, schema_version, "INSERT_APPEND")
+}
+
+fn raw_operation_with_kind(operation_id: Uuid, schema_version: u8, operation_kind: &str) -> Value {
     let value = json!({
         "schema_version": schema_version,
         "operation_id": operation_id,
         "revision": 1,
         "last_mutation_id": Uuid::now_v7(),
-        "operation_kind": "INSERT_APPEND",
+        "operation_kind": operation_kind,
         "operation_subkind": null,
         "target": {
             "catalog": "cat",
@@ -153,6 +164,14 @@ fn raw_operation(operation_id: Uuid, schema_version: u8) -> Value {
         "created_at_ms": 1,
         "updated_at_ms": 1,
         "finished_at_ms": null
+    });
+    Value::try_from(Bytes::from(serde_json::to_vec(&value).unwrap())).unwrap()
+}
+
+fn raw_unfinished(operation_id: Uuid) -> Value {
+    let value = json!({
+        "schema_version": 1,
+        "operation_id": operation_id,
     });
     Value::try_from(Bytes::from(serde_json::to_vec(&value).unwrap())).unwrap()
 }
@@ -507,4 +526,396 @@ async fn oversized_record_is_rejected_without_truncation() {
     let error = journal.create_preparing(oversized).unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
     assert!(journal.list_unfinished().unwrap().is_empty());
+}
+
+fn ctas_payload(phase: CtasSagaPhase) -> OperationPayload {
+    OperationPayload::CtasSaga(CtasSagaRecord {
+        phase,
+        prepare_operation_id: Uuid::now_v7(),
+        write_operation_id: Uuid::now_v7(),
+        publish_operation_id: Uuid::now_v7(),
+        abort_staging_operation_id: Uuid::now_v7(),
+        create_policy: "FAIL_IF_EXISTS".to_string(),
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some(7),
+        source_plan_digest: Some("source-digest".to_string()),
+        staged_handle_digest: None,
+        aggregate_write_digest: None,
+        prepare_fact: None,
+        publish_fact: None,
+        abort_staging_fact: None,
+        next_action: StatementNextAction::None,
+    })
+}
+
+fn statement_request(
+    operation_id: DmlOperationId,
+    mutation_id: Uuid,
+    operation_kind: OperationKind,
+    payload: OperationPayload,
+) -> CreateStatementOperationRequest {
+    CreateStatementOperationRequest {
+        operation_id,
+        mutation_id,
+        operation_kind,
+        target: OperationTarget {
+            catalog: "cat".to_string(),
+            namespace: "ns".to_string(),
+            table: "tbl".to_string(),
+            ref_name: Some("main".to_string()),
+        },
+        attempt_id: "attempt-statement".to_string(),
+        payload,
+        created_at_ms: 200,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn literal_v1_record_decodes_to_normalized_write_payload() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = Uuid::now_v7();
+    raw_put(
+        store.as_ref(),
+        key(OPERATION_PREFIX, operation_id),
+        raw_operation(operation_id, DML_LEGACY_OPERATION_SCHEMA_VERSION),
+    )
+    .await;
+
+    let stored = journal
+        .load(DmlOperationId::from(operation_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.schema_version, DML_LEGACY_OPERATION_SCHEMA_VERSION);
+    assert_eq!(stored.payload, OperationPayload::WriteV1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn literal_v1_delete_record_decodes_to_normalized_write_payload() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = Uuid::now_v7();
+    raw_put(
+        store.as_ref(),
+        key(OPERATION_PREFIX, operation_id),
+        raw_operation_with_kind(
+            operation_id,
+            DML_LEGACY_OPERATION_SCHEMA_VERSION,
+            "ROW_DELTA",
+        ),
+    )
+    .await;
+
+    let stored = journal
+        .load(DmlOperationId::from(operation_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.operation_kind, OperationKind::RowDelta);
+    assert_eq!(stored.payload, OperationPayload::WriteV1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_v2_mutation_is_revision_cas_and_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let created = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::CreateTableAsSelect,
+            ctas_payload(CtasSagaPhase::PreparingSource),
+        ))
+        .unwrap();
+    assert_eq!(created.revision, 1);
+
+    let mutation_id = Uuid::now_v7();
+    let mutation = OperationMutationRequest {
+        operation_id,
+        expected_revision: created.revision,
+        mutation_id,
+        state: OperationState::Writing,
+        payload: ctas_payload(CtasSagaPhase::Staged),
+    };
+    let applied = journal
+        .mutate_statement_operation(mutation.clone())
+        .unwrap();
+    assert_eq!(applied.revision, 2);
+    assert_eq!(applied.last_mutation_id, mutation_id);
+    assert_eq!(
+        journal.mutate_statement_operation(mutation).unwrap(),
+        applied
+    );
+
+    let stale = OperationMutationRequest {
+        operation_id,
+        expected_revision: 1,
+        mutation_id: Uuid::now_v7(),
+        state: OperationState::Collecting,
+        payload: ctas_payload(CtasSagaPhase::Writing),
+    };
+    assert_eq!(
+        journal
+            .mutate_statement_operation(stale)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalUnresolved
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_create_replay_is_idempotent_and_conflict_is_unresolved() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let request = statement_request(
+        operation_id,
+        Uuid::now_v7(),
+        OperationKind::CreateTableAsSelect,
+        ctas_payload(CtasSagaPhase::PreparingSource),
+    );
+    let created = journal.create_statement_operation(request.clone()).unwrap();
+    assert_eq!(
+        journal.create_statement_operation(request).unwrap(),
+        created
+    );
+
+    let conflict = statement_request(
+        operation_id,
+        Uuid::now_v7(),
+        OperationKind::CreateTableAsSelect,
+        ctas_payload(CtasSagaPhase::PreparingSource),
+    );
+    assert_eq!(
+        journal
+            .create_statement_operation(conflict)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalUnresolved
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn literal_v1_mutation_upgrades_record_to_v2() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_uuid = Uuid::now_v7();
+    raw_put(
+        store.as_ref(),
+        key(OPERATION_PREFIX, operation_uuid),
+        raw_operation(operation_uuid, DML_LEGACY_OPERATION_SCHEMA_VERSION),
+    )
+    .await;
+    raw_put(
+        store.as_ref(),
+        key(UNFINISHED_PREFIX, operation_uuid),
+        raw_unfinished(operation_uuid),
+    )
+    .await;
+    let operation_id = DmlOperationId::from(operation_uuid);
+    let upgraded = journal
+        .mutate_statement_operation(OperationMutationRequest {
+            operation_id,
+            expected_revision: 1,
+            mutation_id: Uuid::now_v7(),
+            state: OperationState::Writing,
+            payload: OperationPayload::WriteV1,
+        })
+        .unwrap();
+    assert_eq!(upgraded.schema_version, 2);
+    assert_eq!(journal.load(operation_id).unwrap().unwrap(), upgraded);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_commit_unknown_is_resolved_by_authoritative_mutation_id() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, direct) = open_store(&temp.path().join("state.sqlite")).await;
+    drop(direct);
+    let wrapped: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
+        inner: Arc::clone(&store),
+        mode: CommitUnknownMode::AfterCommit,
+    });
+    let journal = StateStoreOperationJournal::open(wrapped, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let operation_id = DmlOperationId::new_v7();
+    let create_mutation_id = Uuid::now_v7();
+    let created = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            create_mutation_id,
+            OperationKind::CreateTableAsSelect,
+            ctas_payload(CtasSagaPhase::PreparingSource),
+        ))
+        .unwrap();
+    assert_eq!(created.last_mutation_id, create_mutation_id);
+
+    let mutation_id = Uuid::now_v7();
+    let applied = journal
+        .mutate_statement_operation(OperationMutationRequest {
+            operation_id,
+            expected_revision: created.revision,
+            mutation_id,
+            state: OperationState::Writing,
+            payload: ctas_payload(CtasSagaPhase::Staged),
+        })
+        .unwrap();
+    assert_eq!(applied.revision, 2);
+    assert_eq!(applied.last_mutation_id, mutation_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_create_unknown_without_authoritative_record_is_unresolved() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, direct) = open_store(&temp.path().join("state.sqlite")).await;
+    drop(direct);
+    let wrapped: Arc<dyn StateStore> = Arc::new(CommitUnknownStore {
+        inner: Arc::clone(&store),
+        mode: CommitUnknownMode::BeforeCommit,
+    });
+    let journal = StateStoreOperationJournal::open(wrapped, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let error = journal
+        .create_statement_operation(statement_request(
+            DmlOperationId::new_v7(),
+            Uuid::now_v7(),
+            OperationKind::Truncate,
+            OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+                phase: TruncateLifecyclePhase::Preparing,
+                connector_operation_id: Uuid::now_v7(),
+                connector_instance_id: None,
+                connector_incarnation: None,
+                target_ref: "main".to_string(),
+                request_digest: None,
+                plan_digest: None,
+                state_digest: None,
+                outcome: None,
+                next_action: StatementNextAction::None,
+            }),
+        ))
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnresolved);
+    let clean = StateStoreOperationJournal::open(store, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    assert!(clean.list_operations().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncate_v2_payload_round_trips_and_terminal_removes_index() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let payload = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+        phase: TruncateLifecyclePhase::Preparing,
+        connector_operation_id: Uuid::now_v7(),
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some(9),
+        target_ref: "main".to_string(),
+        request_digest: Some("request".to_string()),
+        plan_digest: None,
+        state_digest: None,
+        outcome: None,
+        next_action: StatementNextAction::None,
+    });
+    let created = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::Truncate,
+            payload,
+        ))
+        .unwrap();
+    let terminal_payload = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+        phase: TruncateLifecyclePhase::Failed,
+        connector_operation_id: match &created.payload {
+            OperationPayload::TruncateLifecycle(record) => record.connector_operation_id,
+            _ => unreachable!(),
+        },
+        connector_instance_id: Some("iceberg-rest".to_string()),
+        connector_incarnation: Some(9),
+        target_ref: "main".to_string(),
+        request_digest: Some("request".to_string()),
+        plan_digest: None,
+        state_digest: None,
+        outcome: Some(DurableExternalFact {
+            outcome: ExternalFactOutcome::KnownUncommitted,
+            receipt: None,
+            evidence: None,
+            finalization_failure: None,
+            failure: Some("planned failure".to_string()),
+        }),
+        next_action: StatementNextAction::None,
+    });
+    let terminal = journal
+        .mutate_statement_operation(OperationMutationRequest {
+            operation_id,
+            expected_revision: 1,
+            mutation_id: Uuid::now_v7(),
+            state: OperationState::FailedKnownUncommitted,
+            payload: terminal_payload.clone(),
+        })
+        .unwrap();
+    assert_eq!(terminal.payload, terminal_payload);
+    assert!(journal.list_unfinished().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_external_fact_budget_is_enforced_before_create() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let mut payload = ctas_payload(CtasSagaPhase::PreparingStagedTable);
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    record.prepare_fact = Some(DurableExternalFact {
+        outcome: ExternalFactOutcome::CommitUnknown,
+        receipt: None,
+        evidence: Some("e".repeat(DML_EXTERNAL_FACT_ENCODED_LIMIT + 1)),
+        finalization_failure: None,
+        failure: Some("unknown".to_string()),
+    });
+    let error = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::CreateTableAsSelect,
+            payload,
+        ))
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+    assert!(journal.list_operations().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_external_fact_at_encoded_limit_is_preserved() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = DmlOperationId::new_v7();
+    let evidence = "e".repeat(DML_EXTERNAL_FACT_ENCODED_LIMIT);
+    let mut payload = ctas_payload(CtasSagaPhase::PreparingStagedTable);
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    record.prepare_fact = Some(DurableExternalFact {
+        outcome: ExternalFactOutcome::CommitUnknown,
+        receipt: None,
+        evidence: Some(evidence.clone()),
+        finalization_failure: None,
+        failure: Some("unknown".to_string()),
+    });
+    let stored = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::CreateTableAsSelect,
+            payload,
+        ))
+        .unwrap();
+    let OperationPayload::CtasSaga(record) = stored.payload else {
+        unreachable!();
+    };
+    assert_eq!(record.prepare_fact.unwrap().evidence.unwrap(), evidence);
 }

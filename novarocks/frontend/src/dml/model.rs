@@ -25,7 +25,10 @@ pub use novarocks::connector::iceberg::commit::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, RecoveryEvidence,
 };
 
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 1;
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 2;
+pub const DML_LEGACY_OPERATION_SCHEMA_VERSION: u8 = 1;
+pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
+pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -61,6 +64,8 @@ pub enum OperationKind {
     RowDelta,
     MvRefresh,
     Maintenance,
+    CreateTableAsSelect,
+    Truncate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -239,6 +244,121 @@ pub struct OperationFact {
     pub failure: Option<IcebergOperationFailureRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExternalFactOutcome {
+    KnownCommitted,
+    KnownUncommitted,
+    CommitUnknown,
+    Unsupported,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StatementNextAction {
+    None,
+    Reconcile,
+    AbortStaging,
+    RetryFinalize,
+    ManualInspect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableExternalFact {
+    pub outcome: ExternalFactOutcome,
+    #[serde(default)]
+    pub receipt: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub finalization_failure: Option<String>,
+    #[serde(default)]
+    pub failure: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CtasSagaPhase {
+    PreparingSource,
+    PreparingStagedTable,
+    Staged,
+    Writing,
+    Publishing,
+    PublishUnknown,
+    AbortingStaging,
+    Committed,
+    Failed,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CtasSagaRecord {
+    pub phase: CtasSagaPhase,
+    pub prepare_operation_id: Uuid,
+    pub write_operation_id: Uuid,
+    pub publish_operation_id: Uuid,
+    pub abort_staging_operation_id: Uuid,
+    pub create_policy: String,
+    #[serde(default)]
+    pub connector_instance_id: Option<String>,
+    #[serde(default)]
+    pub connector_incarnation: Option<u64>,
+    #[serde(default)]
+    pub source_plan_digest: Option<String>,
+    #[serde(default)]
+    pub staged_handle_digest: Option<String>,
+    #[serde(default)]
+    pub aggregate_write_digest: Option<String>,
+    #[serde(default)]
+    pub prepare_fact: Option<DurableExternalFact>,
+    #[serde(default)]
+    pub publish_fact: Option<DurableExternalFact>,
+    #[serde(default)]
+    pub abort_staging_fact: Option<DurableExternalFact>,
+    pub next_action: StatementNextAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TruncateLifecyclePhase {
+    Preparing,
+    Planned,
+    Executing,
+    CommitUnknown,
+    Reconciling,
+    Committed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TruncateLifecycleRecord {
+    pub phase: TruncateLifecyclePhase,
+    pub connector_operation_id: Uuid,
+    #[serde(default)]
+    pub connector_instance_id: Option<String>,
+    #[serde(default)]
+    pub connector_incarnation: Option<u64>,
+    pub target_ref: String,
+    #[serde(default)]
+    pub request_digest: Option<String>,
+    #[serde(default)]
+    pub plan_digest: Option<String>,
+    #[serde(default)]
+    pub state_digest: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<DurableExternalFact>,
+    pub next_action: StatementNextAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OperationPayload {
+    WriteV1,
+    CtasSaga(CtasSagaRecord),
+    TruncateLifecycle(TruncateLifecycleRecord),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePreparingRequest {
     pub operation_kind: OperationKind,
@@ -274,9 +394,30 @@ pub struct StoredOperation {
     pub recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
     #[serde(default)]
     pub failure: Option<IcebergOperationFailureRecord>,
+    pub payload: OperationPayload,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateStatementOperationRequest {
+    pub operation_id: DmlOperationId,
+    pub mutation_id: Uuid,
+    pub operation_kind: OperationKind,
+    pub target: OperationTarget,
+    pub attempt_id: String,
+    pub payload: OperationPayload,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationMutationRequest {
+    pub operation_id: DmlOperationId,
+    pub expected_revision: u64,
+    pub mutation_id: Uuid,
+    pub state: OperationState,
+    pub payload: OperationPayload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -293,4 +434,76 @@ pub struct WriteTransactionSpec {
 pub struct WriteTransactionOutcome {
     pub operation_id: Option<DmlOperationId>,
     pub committed_snapshot_id: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statement_payload_json_round_trips() {
+        let ctas = OperationPayload::CtasSaga(CtasSagaRecord {
+            phase: CtasSagaPhase::PublishUnknown,
+            prepare_operation_id: Uuid::now_v7(),
+            write_operation_id: Uuid::now_v7(),
+            publish_operation_id: Uuid::now_v7(),
+            abort_staging_operation_id: Uuid::now_v7(),
+            create_policy: "FAIL_IF_EXISTS".to_string(),
+            connector_instance_id: Some("rest".to_string()),
+            connector_incarnation: Some(3),
+            source_plan_digest: Some("source".to_string()),
+            staged_handle_digest: Some("staged".to_string()),
+            aggregate_write_digest: Some("write".to_string()),
+            prepare_fact: None,
+            publish_fact: Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::CommitUnknown,
+                receipt: None,
+                evidence: Some("evidence".to_string()),
+                finalization_failure: None,
+                failure: Some("unknown".to_string()),
+            }),
+            abort_staging_fact: None,
+            next_action: StatementNextAction::Reconcile,
+        });
+        let encoded = serde_json::to_vec(&ctas).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<OperationPayload>(&encoded).unwrap(),
+            ctas
+        );
+
+        let truncate = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+            phase: TruncateLifecyclePhase::Executing,
+            connector_operation_id: Uuid::now_v7(),
+            connector_instance_id: Some("rest".to_string()),
+            connector_incarnation: Some(4),
+            target_ref: "main".to_string(),
+            request_digest: Some("request".to_string()),
+            plan_digest: Some("plan".to_string()),
+            state_digest: Some("state".to_string()),
+            outcome: None,
+            next_action: StatementNextAction::None,
+        });
+        let encoded = serde_json::to_vec(&truncate).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<OperationPayload>(&encoded).unwrap(),
+            truncate
+        );
+    }
+
+    #[test]
+    fn unsafe_statement_state_shortcuts_are_rejected() {
+        assert!(
+            validate_operation_transition(OperationState::Preparing, OperationState::Finalized)
+                .is_err()
+        );
+        assert!(
+            validate_operation_transition(
+                OperationState::CommitUnknown,
+                OperationState::FailedKnownUncommitted,
+            )
+            .is_ok()
+        );
+        assert!(OperationState::Aborted.is_finished());
+        assert!(!OperationState::CommitUnknown.is_finished());
+    }
 }

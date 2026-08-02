@@ -38,10 +38,13 @@ pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reo
 pub use journal::OperationJournal;
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-    DmlOperationId, IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord,
-    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationNextAction,
-    IcebergRecoveryEvidenceRecord, OperationFact, OperationKind, OperationState, OperationTarget,
-    RecoveryEvidence, StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
+    DurableExternalFact, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
+    IcebergCommitOutcomeRecord, IcebergOperationFailureKind, IcebergOperationFailureRecord,
+    IcebergOperationNextAction, IcebergRecoveryEvidenceRecord, OperationFact, OperationKind,
+    OperationMutationRequest, OperationPayload, OperationState, OperationTarget, RecoveryEvidence,
+    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
+    WriteTransactionOutcome, WriteTransactionSpec,
 };
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,

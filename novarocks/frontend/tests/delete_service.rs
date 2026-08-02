@@ -175,6 +175,7 @@ impl OperationJournal for FakeJournal {
                 cleanup_outcome: None,
                 recovery_evidence: None,
                 failure: None,
+                payload: novarocks_frontend::dml::model::OperationPayload::WriteV1,
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,

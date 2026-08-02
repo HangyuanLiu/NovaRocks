@@ -17,7 +17,8 @@
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{
-    CreatePreparingRequest, DmlOperationId, OperationFact, OperationState, StoredOperation,
+    CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, OperationFact,
+    OperationMutationRequest, OperationState, StoredOperation,
 };
 
 pub trait OperationJournal: Send + Sync {
@@ -32,6 +33,24 @@ pub trait OperationJournal: Send + Sync {
     fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError>;
     fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError>;
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError>;
+
+    fn create_statement_operation(
+        &self,
+        _request: CreateStatementOperationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "statement-specific DML operation payloads are not supported by this journal",
+        ))
+    }
+
+    fn mutate_statement_operation(
+        &self,
+        _request: OperationMutationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "statement-specific DML operation mutation is not supported by this journal",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -42,7 +61,9 @@ pub(crate) mod testing {
     use uuid::Uuid;
 
     use super::*;
-    use crate::dml::model::{DML_OPERATION_SCHEMA_VERSION, validate_operation_transition};
+    use crate::dml::model::{
+        DML_OPERATION_SCHEMA_VERSION, OperationPayload, validate_operation_transition,
+    };
     use crate::dml::now_unix_millis;
 
     #[derive(Default)]
@@ -82,6 +103,7 @@ pub(crate) mod testing {
                 cleanup_outcome: None,
                 recovery_evidence: None,
                 failure: None,
+                payload: OperationPayload::WriteV1,
                 created_at_ms: request.created_at_ms,
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
@@ -178,6 +200,93 @@ pub(crate) mod testing {
                 .filter(|operation| !operation.state.is_finished())
                 .cloned()
                 .collect())
+        }
+
+        fn create_statement_operation(
+            &self,
+            request: CreateStatementOperationRequest,
+        ) -> Result<StoredOperation, DmlError> {
+            let stored = StoredOperation {
+                schema_version: DML_OPERATION_SCHEMA_VERSION,
+                operation_id: request.operation_id,
+                revision: 1,
+                last_mutation_id: request.mutation_id,
+                operation_kind: request.operation_kind,
+                operation_subkind: None,
+                target: request.target,
+                state: OperationState::Preparing,
+                attempt_id: request.attempt_id,
+                base_snapshot_id: None,
+                base_snapshot_map: BTreeMap::new(),
+                staged_artifacts: Vec::new(),
+                commit_outcome: None,
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: None,
+                payload: request.payload,
+                created_at_ms: request.created_at_ms,
+                updated_at_ms: request.created_at_ms,
+                finished_at_ms: None,
+            };
+            let mut guard = self.inner.lock().unwrap();
+            match guard.get(stored.operation_id.as_uuid()) {
+                Some(existing) if existing == &stored => Ok(existing.clone()),
+                Some(_) => Err(DmlError::journal_unresolved(format!(
+                    "conflicting DML statement create replay for operation {}",
+                    stored.operation_id
+                ))),
+                None => {
+                    guard.insert(*stored.operation_id.as_uuid(), stored.clone());
+                    Ok(stored)
+                }
+            }
+        }
+
+        fn mutate_statement_operation(
+            &self,
+            request: OperationMutationRequest,
+        ) -> Result<StoredOperation, DmlError> {
+            let mut guard = self.inner.lock().unwrap();
+            let operation = guard
+                .get_mut(request.operation_id.as_uuid())
+                .ok_or_else(|| DmlError::journal_unavailable("DML operation not found"))?;
+            if operation.last_mutation_id == request.mutation_id {
+                let applied_revision =
+                    request.expected_revision.checked_add(1).ok_or_else(|| {
+                        DmlError::journal_unavailable("DML operation revision overflow")
+                    })?;
+                if operation.revision == applied_revision
+                    && operation.state == request.state
+                    && operation.payload == request.payload
+                {
+                    return Ok(operation.clone());
+                }
+                return Err(DmlError::journal_unresolved(format!(
+                    "conflicting DML statement mutation replay for operation {}",
+                    request.operation_id
+                )));
+            }
+            if operation.revision != request.expected_revision {
+                return Err(DmlError::journal_unresolved(format!(
+                    "DML operation {} revision changed from expected {} to {}",
+                    request.operation_id, request.expected_revision, operation.revision
+                )));
+            }
+            validate_operation_transition(operation.state, request.state)
+                .map_err(DmlError::journal_unavailable)?;
+            operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
+            operation.revision = operation
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| DmlError::journal_unavailable("DML operation revision overflow"))?;
+            operation.last_mutation_id = request.mutation_id;
+            operation.state = request.state;
+            operation.payload = request.payload;
+            operation.updated_at_ms = now_unix_millis();
+            if operation.state.is_finished() {
+                operation.finished_at_ms = Some(operation.updated_at_ms);
+            }
+            Ok(operation.clone())
         }
     }
 }
