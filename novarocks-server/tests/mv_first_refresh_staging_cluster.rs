@@ -278,6 +278,7 @@ fn clear_query_lifecycle_fault(root: &Path, kind: QueryLifecycleFaultKind) {
         for path in [
             arm_path(root, backend_index, kind),
             trigger_path(root, backend_index, kind),
+            trigger_path(root, backend_index, kind).with_extension("release"),
         ] {
             if let Err(error) = std::fs::remove_file(path)
                 && error.kind() != std::io::ErrorKind::NotFound
@@ -758,6 +759,72 @@ query_lifecycle_fault_dir = "{}"
     assert!(
         backend_loss_main_rows.is_empty(),
         "a lost admitted BE must never publish the MV main ref"
+    );
+
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_kill_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create KILL QUERY MV target");
+    const KILL_QUERY_TOKEN: &str = "mvx2w-kill-query";
+    arm_query_lifecycle_fault_for_any_backend(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::RestartAfterInitAck,
+        KILL_QUERY_TOKEN,
+    );
+    let (kill_target_ready_tx, kill_target_ready_rx) = mpsc::sync_channel(1);
+    let (kill_target_done_tx, kill_target_done_rx) = mpsc::sync_channel(1);
+    let kill_target = std::thread::spawn(move || {
+        let mut target = connect_mysql(fe_mysql_port);
+        target
+            .query_drop("SET CATALOG staging_ice")
+            .expect("select KILL QUERY target catalog");
+        target
+            .query_drop("USE ns")
+            .expect("select KILL QUERY target database");
+        kill_target_ready_tx
+            .send(target.connection_id())
+            .expect("publish KILL QUERY target connection id");
+        let result = target.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_kill_mv");
+        kill_target_done_tx
+            .send(result)
+            .expect("publish KILL QUERY target result");
+    });
+    let kill_target_connection_id = kill_target_ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("receive KILL QUERY target connection id");
+    let kill_admitted_backend = backends.wait_for_init_ack_marker(KILL_QUERY_TOKEN);
+    if let Ok(result) = kill_target_done_rx.try_recv() {
+        panic!("native MV first refresh completed before KILL QUERY: {result:?}");
+    }
+    conn.query_drop(format!("KILL QUERY {kill_target_connection_id}"))
+        .expect("KILL QUERY must acknowledge the staged MV attempt");
+    let kill_release = trigger_path(
+        query_lifecycle_fault_dir.path(),
+        kill_admitted_backend,
+        QueryLifecycleFaultKind::RestartAfterInitAck,
+    )
+    .with_extension("release");
+    std::fs::write(&kill_release, KILL_QUERY_TOKEN)
+        .expect("release native Init rendezvous after KILL QUERY");
+    let kill_target_error = kill_target_done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("KILL QUERY target must terminate")
+        .expect_err("KILL QUERY must not allow native MV staging to succeed");
+    assert!(
+        !kill_target_error.to_string().is_empty(),
+        "KILL QUERY must preserve an explanatory target error"
+    );
+    kill_target.join().expect("join KILL QUERY target thread");
+    let kill_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_kill_mv ORDER BY k1")
+        .expect("read KILL QUERY MV main ref");
+    assert!(
+        kill_main_rows.is_empty(),
+        "KILL QUERY must never publish the MV main ref"
+    );
+    clear_query_lifecycle_fault(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::RestartAfterInitAck,
     );
 
     drop(engine);

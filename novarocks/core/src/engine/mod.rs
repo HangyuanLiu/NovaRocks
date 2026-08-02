@@ -1224,12 +1224,31 @@ impl StandaloneNovaRocks {
             cancellation.view(),
             crate::sql::optimizer::options::SessionOptimizerSettings::default(),
         ));
+        self.stage_iceberg_mv_first_refresh_with_execution_for_test(
+            current_catalog,
+            current_database,
+            mv_name,
+            request.execution(),
+        )
+    }
+
+    /// Feature-gated test seam that reuses an already admitted frontend
+    /// execution context.  The native fixture uses this through an ordinary
+    /// MySQL query session so `KILL QUERY` cancels the same attempt.
+    #[cfg(feature = "mv-first-refresh-staging-test-support")]
+    pub fn stage_iceberg_mv_first_refresh_with_execution_for_test(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_name: &str,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
         crate::engine::mv::iceberg_refresh::execute_iceberg_mv_first_refresh_staging_test(
             &self.inner,
             current_catalog,
             current_database,
             mv_name,
-            request.execution(),
+            execution,
         )
     }
 
