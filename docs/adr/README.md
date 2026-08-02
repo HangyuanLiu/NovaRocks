@@ -86,7 +86,8 @@ code-anchors:
 - ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（active）
 - ADR-0023 — distributed writer 为何以 operation/cohort/execution/writer 分层，并由 FE 聚合外部提交（active）
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
-- ADR-0025 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
+- ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
+- ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 
 ### distributed-query-lifecycle
 
