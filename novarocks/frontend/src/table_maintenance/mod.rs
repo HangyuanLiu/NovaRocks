@@ -27,7 +27,11 @@ use novarocks::engine::table_maintenance::{
     MaintenanceStatementResult, MaintenanceTarget, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
-use novarocks_spi::connector::ConnectorMutationOperationId;
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
+    ConnectorMutationOperationId,
+};
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
@@ -399,10 +403,91 @@ impl FrontendTableMaintenanceService {
         }
         Ok(())
     }
+
+    fn recover_metadata_operations(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+    ) -> Result<(), String> {
+        let Some(repository) = &self.metadata_repository else {
+            return Ok(());
+        };
+        for operation in self
+            .block_on(repository.list_reconcile_candidates())
+            .map_err(|error| {
+                format!("list metadata maintenance recovery candidates failed: {error}")
+            })?
+        {
+            let result = (|| -> Result<(), String> {
+                let stored = self
+                    .block_on(repository.load_plan(operation.operation_id))
+                    .map_err(|error| {
+                        format!("load metadata maintenance recovery plan failed: {error}")
+                    })?
+                    .ok_or_else(|| "metadata maintenance recovery plan is missing".to_string())?;
+                let kind = match operation.kind {
+                    MetadataMaintenanceOperationKind::RewriteMetadataLayout => {
+                        novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND
+                    }
+                    MetadataMaintenanceOperationKind::ExpireTableVersions => {
+                        novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND
+                    }
+                };
+                let plan = ConnectorMetadataMaintenancePlan::try_restore(
+                    ConnectorExecutionBindingKey {
+                        instance_id: ConnectorInstanceId::parse(&operation.owner.instance_id)
+                            .map_err(|error| error.to_string())?,
+                        incarnation: ConnectorInstanceIncarnation::from_bytes(
+                            *operation.owner.incarnation_id.as_bytes(),
+                        ),
+                    },
+                    ConnectorMutationOperationId::from_bytes(*operation.operation_id.as_bytes()),
+                    kind,
+                    operation.request_digest,
+                    operation.base_state_digest,
+                    ConnectorMetadataMaintenancePlanSummary::new(
+                        stored.summary[0],
+                        stored.summary[1],
+                        stored.summary[2],
+                        stored.summary[3],
+                        stored.summary[4],
+                    ),
+                    bytes::Bytes::from(stored.payload),
+                    stored.plan_digest,
+                )
+                .map_err(|error| error.to_string())?;
+                let completed = engine.reconcile_metadata_maintenance(&operation.target, plan)?;
+                let receipt = completed.receipt;
+                self.block_on(repository.finish(
+                    operation.operation_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(receipt.provider_payload()),
+                        payload: receipt.provider_payload().to_vec(),
+                    },
+                    now_unix_millis(),
+                ))
+                .map_err(|error| {
+                    format!("persist recovered metadata maintenance receipt failed: {error}")
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.block_on(repository.mark_unresolved(
+                    operation.operation_id,
+                    error,
+                    now_unix_millis(),
+                ))
+                .map_err(|store| {
+                    format!("mark metadata maintenance operation unresolved failed: {store}")
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
+        self.recover_metadata_operations(engine.as_ref())?;
         let mut worker = self
             .worker
             .lock()

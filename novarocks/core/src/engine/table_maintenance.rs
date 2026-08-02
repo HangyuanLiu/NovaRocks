@@ -32,6 +32,7 @@ use crate::connector::metadata_maintenance::{
 };
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::dialect::StarRocksDialect;
+use novarocks_spi::connector::ConnectorMetadataMaintenancePlan;
 use novarocks_spi::connector::ConnectorMutationOperationId;
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -174,6 +175,14 @@ pub trait TableMaintenanceEngine: Send + Sync {
     fn execute_planned_metadata_maintenance(
         &self,
         _session: MetadataMaintenanceSession,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn reconcile_metadata_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        _plan: ConnectorMetadataMaintenancePlan,
     ) -> Result<CompletedMetadataMaintenance, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
@@ -343,6 +352,29 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         session: MetadataMaintenanceSession,
     ) -> Result<CompletedMetadataMaintenance, String> {
         crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
+    }
+
+    fn reconcile_metadata_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorMetadataMaintenancePlan,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        let state = self.shared_for_table_maintenance()?;
+        crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
+            state.connector_control.as_ref(),
+            self,
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+                    .map_err(|error| error.to_string())?,
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            plan,
+            crate::connector::connector_request_context(
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+        )
     }
 }
 

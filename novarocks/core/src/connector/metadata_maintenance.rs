@@ -88,7 +88,7 @@ impl MetadataMaintenanceIntent {
 /// Provider cache invalidation is represented by the provider's returned
 /// finalization. This port is deliberately invoked only afterwards, preserving
 /// provider-before-generic invalidation without importing provider state here.
-pub(crate) trait MetadataMaintenanceCacheFinalizer {
+pub trait MetadataMaintenanceCacheFinalizer {
     fn invalidate_generic_table(
         &self,
         table: &ConnectorTableIdentity,
@@ -239,6 +239,36 @@ pub fn plan_metadata_maintenance_session(
 ) -> Result<MetadataMaintenanceSession, String> {
     MetadataMaintenanceSession::plan(resolver, instance_id, operation_id, table, intent, context)
         .map_err(resolved_error_message)
+}
+
+pub fn reconcile_metadata_maintenance_session(
+    resolver: &dyn ConnectorMetadataMaintenanceResolver,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    table: ConnectorTableIdentity,
+    plan: ConnectorMetadataMaintenancePlan,
+    context: ConnectorRequestContext,
+) -> Result<CompletedMetadataMaintenance, String> {
+    let session = MetadataMaintenanceSession::recover(resolver, table, plan, None, context)
+        .map_err(resolved_error_message)?;
+    match session.reconcile(None, cache_finalizer) {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
+                Err(
+                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                        .to_string(),
+                )
+            } else {
+                Ok(completed)
+            }
+        }
+        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
+            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
+        }
+        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+            Err(EngineError::commit_unknown(failure.to_string()).to_string())
+        }
+        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
+    }
 }
 
 fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
@@ -879,18 +909,16 @@ mod tests {
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
-        let recovery = MetadataMaintenanceSession::recover(
-            &resolver,
-            table(&provider.descriptor.instance_id),
-            plan,
-            None,
-            context(),
-        )
-        .unwrap();
-        assert!(matches!(
-            recovery.reconcile(None, &finalizer),
-            ResolvedMetadataMaintenance::CommitUnknown { .. }
-        ));
+        assert!(
+            reconcile_metadata_maintenance_session(
+                &resolver,
+                &finalizer,
+                table(&provider.descriptor.instance_id),
+                plan,
+                context(),
+            )
+            .is_err()
+        );
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
