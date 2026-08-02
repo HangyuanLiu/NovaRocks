@@ -838,14 +838,16 @@ query_lifecycle_fault_dir = "{}"
     server_result.expect("shutdown frontend server");
     if let Err(error) = runtime.block_on(frontend.shutdown()) {
         // RestartAfterInitAck deliberately replaces a BE while the frontend's
-        // background statistics worker can be between its stop check and lease
-        // acquisition.  `release_resources` still tears down the host and
-        // StateStore; this known worker-stop race is unrelated to the staged
-        // write attempt proved above.  Do not mask any other teardown error.
+        // background statistics worker can be either acquiring or releasing
+        // its lease after its stop check. `release_resources` still tears down
+        // the host and StateStore; this known worker-stop race is unrelated to
+        // the staged write attempt proved above. Do not mask any other
+        // teardown error.
         let message = error.to_string();
         assert!(
             message.contains("shutdown statistics analyze worker failed")
-                && message.contains("acquire statistics worker lease failed")
+                && (message.contains("acquire statistics worker lease failed")
+                    || message.contains("release statistics worker lease failed"))
                 && message.contains("OperationNotCommitted")
                 && !message.contains("; cleanup failed:"),
             "unexpected frontend shutdown failure after BE restart: {message}"
