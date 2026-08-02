@@ -23,6 +23,7 @@ mod connector_binding;
 pub(crate) mod connector_write_transaction;
 pub mod contract;
 pub mod control;
+pub mod distributed_rewrite;
 pub mod fragment_transport;
 #[cfg(test)]
 pub(crate) mod in_process_test;

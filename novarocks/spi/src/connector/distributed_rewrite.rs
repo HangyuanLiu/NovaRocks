@@ -18,7 +18,8 @@ use super::{
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorMetadata, ConnectorRequestContext, ConnectorTableHandle,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWriteReceipt,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -190,6 +191,7 @@ pub struct ConnectorDistributedRewriteCohortPlan {
     source: ConnectorTableHandle,
     intent: ConnectorWriteIntent,
     input_schema: SchemaRef,
+    input_schema_digest: [u8; 32],
     provider_payload: Bytes,
     group_digest: [u8; 32],
 }
@@ -201,6 +203,7 @@ impl ConnectorDistributedRewriteCohortPlan {
         source: ConnectorTableHandle,
         intent: ConnectorWriteIntent,
         input_schema: SchemaRef,
+        input_schema_digest: [u8; 32],
         provider_payload: Bytes,
         group_digest: [u8; 32],
     ) -> Result<Self, ConnectorError> {
@@ -210,6 +213,7 @@ impl ConnectorDistributedRewriteCohortPlan {
             source,
             intent,
             input_schema,
+            input_schema_digest,
             provider_payload,
             group_digest,
         })
@@ -226,6 +230,12 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub fn input_schema(&self) -> &SchemaRef {
         &self.input_schema
     }
+    /// Provider-owned canonical digest of the Arrow input schema.  The SPI
+    /// carries the concrete schema for C1 planning, while this digest makes
+    /// that schema an immutable part of the durable rewrite plan.
+    pub const fn input_schema_digest(&self) -> [u8; 32] {
+        self.input_schema_digest
+    }
     pub fn provider_payload(&self) -> &Bytes {
         &self.provider_payload
     }
@@ -236,6 +246,7 @@ impl ConnectorDistributedRewriteCohortPlan {
         hash.update(self.cohort_id.to_bytes());
         hash.update(self.group_digest);
         hash.update([self.intent as u8]);
+        hash.update(self.input_schema_digest);
         digest_bytes(hash, self.source.owner().as_str().as_bytes());
         digest_bytes(hash, self.source.payload());
         digest_bytes(hash, &self.provider_payload);
@@ -258,6 +269,7 @@ pub struct ConnectorDistributedRewritePlan {
     owner: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
     operation_kind: Arc<str>,
+    target: ConnectorTableHandle,
     request_digest: [u8; 32],
     state_digest: [u8; 32],
     manifest_digest: [u8; 32],
@@ -296,6 +308,7 @@ impl ConnectorDistributedRewritePlan {
         }
         let plan_digest = plan_digest(
             request.request_digest,
+            request.operation.table(),
             state_digest,
             manifest_digest,
             summary,
@@ -306,6 +319,7 @@ impl ConnectorDistributedRewritePlan {
             owner: request.owner.clone(),
             operation_id: request.operation_id,
             operation_kind: request.operation.kind().into(),
+            target: request.operation.table().clone(),
             request_digest: request.request_digest,
             state_digest,
             manifest_digest,
@@ -323,6 +337,12 @@ impl ConnectorDistributedRewritePlan {
     }
     pub fn operation_kind(&self) -> &str {
         &self.operation_kind
+    }
+    /// Table that receives the C1 staged output.  Cohort sources may differ
+    /// from this table in future providers, so callers must not substitute a
+    /// source handle here.
+    pub fn target(&self) -> &ConnectorTableHandle {
+        &self.target
     }
     pub const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
@@ -358,16 +378,18 @@ impl ConnectorDistributedRewritePlan {
         {
             return Err(invalid("distributed rewrite plan is invalid"));
         }
-        if self
-            .cohorts
-            .iter()
-            .any(|cohort| cohort.source.owner() != &self.owner.instance_id)
+        if self.target.owner() != &self.owner.instance_id
+            || self
+                .cohorts
+                .iter()
+                .any(|cohort| cohort.source.owner() != &self.owner.instance_id)
         {
             return Err(invalid("distributed rewrite plan contains foreign cohort"));
         }
         if self.plan_digest
             != plan_digest(
                 self.request_digest,
+                &self.target,
                 self.state_digest,
                 self.manifest_digest,
                 self.summary,
@@ -387,6 +409,7 @@ impl fmt::Debug for ConnectorDistributedRewritePlan {
             .field("owner", &self.owner)
             .field("operation_id", &self.operation_id)
             .field("operation_kind", &self.operation_kind)
+            .field("target_owner", self.target.owner())
             .field("manifest_digest", &self.manifest_digest)
             .field("cohort_count", &self.cohorts.len())
             .field("provider_payload_len", &self.provider_payload.len())
@@ -404,6 +427,7 @@ pub enum ConnectorDistributedRewriteAttemptDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorDistributedRewriteAttemptCheckpoint {
     pub cohort_id: ConnectorWriteCohortId,
+    pub execution_id: ConnectorWriteExecutionId,
     pub disposition: ConnectorDistributedRewriteAttemptDisposition,
     pub attempt_digest: [u8; 32],
     pub artifact_digest: [u8; 32],
@@ -414,6 +438,7 @@ pub struct ConnectorDistributedRewriteAttemptCheckpoint {
 impl ConnectorDistributedRewriteAttemptCheckpoint {
     pub fn try_new(
         cohort_id: ConnectorWriteCohortId,
+        execution_id: ConnectorWriteExecutionId,
         disposition: ConnectorDistributedRewriteAttemptDisposition,
         attempt_digest: [u8; 32],
         artifact_digest: [u8; 32],
@@ -422,6 +447,7 @@ impl ConnectorDistributedRewriteAttemptCheckpoint {
         validate_payload(&artifact_handle, "attempt checkpoint")?;
         let checkpoint_digest = checkpoint_digest(
             cohort_id,
+            &execution_id,
             disposition,
             attempt_digest,
             artifact_digest,
@@ -429,6 +455,7 @@ impl ConnectorDistributedRewriteAttemptCheckpoint {
         );
         Ok(Self {
             cohort_id,
+            execution_id,
             disposition,
             attempt_digest,
             artifact_digest,
@@ -440,6 +467,7 @@ impl ConnectorDistributedRewriteAttemptCheckpoint {
         validate_payload(&self.artifact_handle, "attempt checkpoint")?;
         let expected = checkpoint_digest(
             self.cohort_id,
+            &self.execution_id,
             self.disposition,
             self.attempt_digest,
             self.artifact_digest,
@@ -638,6 +666,7 @@ impl ConnectorDistributedRewriteLease {
             .checkpoint_attempt(plan, disposition, completion)?;
         checkpoint.validate()?;
         if checkpoint.cohort_id != completion.cohort_id()
+            || checkpoint.execution_id != completion.execution_id()
             || checkpoint.attempt_digest != completion.digest()
         {
             return Err(invalid(
@@ -664,7 +693,9 @@ impl ConnectorDistributedRewriteLease {
         }
         let completion = self.rewrite.restore_attempt(plan, checkpoint)?;
         self.validate_attempt(plan, &completion)?;
-        if completion.digest() != checkpoint.attempt_digest {
+        if completion.execution_id() != checkpoint.execution_id
+            || completion.digest() != checkpoint.attempt_digest
+        {
             return Err(invalid(
                 "distributed rewrite restored attempt digest does not match checkpoint",
             ));
@@ -760,6 +791,7 @@ fn request_digest(
 }
 fn plan_digest(
     request: [u8; 32],
+    target: &ConnectorTableHandle,
     state: [u8; 32],
     manifest: [u8; 32],
     summary: ConnectorDistributedRewritePlanSummary,
@@ -770,6 +802,8 @@ fn plan_digest(
     hash.update(PLAN_DOMAIN);
     hash.update(CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION.to_be_bytes());
     hash.update(request);
+    digest_bytes(&mut hash, target.owner().as_str().as_bytes());
+    digest_bytes(&mut hash, target.payload());
     hash.update(state);
     hash.update(manifest);
     summary.digest_into(&mut hash);
@@ -782,16 +816,20 @@ fn plan_digest(
 }
 fn checkpoint_digest(
     cohort: ConnectorWriteCohortId,
+    execution: &ConnectorWriteExecutionId,
     disposition: ConnectorDistributedRewriteAttemptDisposition,
     attempt: [u8; 32],
-    _artifact: [u8; 32],
+    artifact: [u8; 32],
     handle: &Bytes,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(CHECKPOINT_DOMAIN);
     hash.update(cohort.to_bytes());
+    hash.update(execution.query_id());
+    hash.update(execution.attempt_id().to_be_bytes());
     hash.update([disposition as u8]);
     hash.update(attempt);
+    hash.update(artifact);
     digest_bytes(&mut hash, handle);
     hash.finalize().into()
 }
@@ -813,4 +851,112 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 }
 fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    struct NotCancelled;
+
+    impl super::super::ConnectorCancellation for NotCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request() -> ConnectorDistributedRewritePlanningRequest {
+        let instance = ConnectorInstanceId::parse("rewrite-contract-test").unwrap();
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: instance.clone(),
+            incarnation: super::super::ConnectorInstanceIncarnation::from_bytes([9; 16]),
+        };
+        let table = ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap();
+        ConnectorDistributedRewritePlanningRequest::try_new(
+            ConnectorWriteOperationId::new(),
+            owner,
+            ConnectorDistributedRewriteOperation::RewriteDataFiles {
+                table,
+                rewrite_all: true,
+            },
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(NotCancelled),
+                1024,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cohort_schema_digest_is_part_of_the_frozen_plan_digest() {
+        let request = request();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let cohort_id =
+            ConnectorWriteCohortId::derive(request.operation_id(), b"test", [7; 32]).unwrap();
+        let cohort = |schema_digest| {
+            ConnectorDistributedRewriteCohortPlan::try_new(
+                cohort_id,
+                request.operation().table().clone(),
+                ConnectorWriteIntent::RowDelta,
+                Arc::clone(&schema),
+                schema_digest,
+                Bytes::from_static(b"group"),
+                [7; 32],
+            )
+            .unwrap()
+        };
+        let first = ConnectorDistributedRewritePlan::try_new(
+            &request,
+            [1; 32],
+            [2; 32],
+            ConnectorDistributedRewritePlanSummary::default(),
+            Bytes::new(),
+            vec![cohort([3; 32])],
+        )
+        .unwrap();
+        let second = ConnectorDistributedRewritePlan::try_new(
+            &request,
+            [1; 32],
+            [2; 32],
+            ConnectorDistributedRewritePlanSummary::default(),
+            Bytes::new(),
+            vec![cohort([4; 32])],
+        )
+        .unwrap();
+
+        assert_ne!(first.plan_digest(), second.plan_digest());
+    }
+
+    #[test]
+    fn checkpoint_digest_binds_the_execution_attempt_and_artifact() {
+        let cohort = ConnectorWriteCohortId::from_bytes([4; 32]);
+        let execution = ConnectorWriteExecutionId::new([5; 16], 6);
+        let checkpoint = ConnectorDistributedRewriteAttemptCheckpoint::try_new(
+            cohort,
+            execution,
+            ConnectorDistributedRewriteAttemptDisposition::Accepted,
+            [7; 32],
+            [8; 32],
+            Bytes::from_static(b"artifact"),
+        )
+        .unwrap();
+        let mut changed = checkpoint.clone();
+        changed.execution_id = ConnectorWriteExecutionId::new([5; 16], 9);
+        assert!(changed.validate().is_err());
+        let mut changed = checkpoint;
+        changed.artifact_digest = [9; 32];
+        assert!(changed.validate().is_err());
+    }
 }
