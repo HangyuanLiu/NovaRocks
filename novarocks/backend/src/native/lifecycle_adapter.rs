@@ -61,6 +61,7 @@ pub fn handle_init_query(
                 scope.start_epoch,
                 scope.token
             );
+            wait_for_runner_owned_restart(&scope);
         }
         if let Some(scope) =
             claim_backend_fault(QueryLifecycleFaultKind::InitAckDrop, execution_id)?
@@ -434,10 +435,10 @@ async fn run_attached_control_stream(
 }
 
 #[cfg(debug_assertions)]
-use novarocks::common::query_lifecycle_fault::claim_matching_fault;
-#[cfg(debug_assertions)]
 use novarocks::common::query_lifecycle_fault::observe_matching_fault;
 use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
+#[cfg(debug_assertions)]
+use novarocks::common::query_lifecycle_fault::{claim_matching_fault, trigger_path};
 
 #[cfg(debug_assertions)]
 fn staged_heartbeat_stops() -> &'static Mutex<
@@ -512,6 +513,39 @@ fn claim_backend_fault(
     )
     .map_err(tonic::Status::failed_precondition)
 }
+
+/// `RestartAfterInitAck` is a runner-owned rendezvous: the BE emits its
+/// token-scoped marker, then waits for the runner to terminate that exact
+/// process.  Without the wait, a small query can finish between the marker
+/// write and the parent's kill, which does not prove loss after admission.
+#[cfg(debug_assertions)]
+fn wait_for_runner_owned_restart(scope: &QueryLifecycleFaultScope) {
+    let Some(root) = novarocks::common::config::sql_test_query_lifecycle_fault_dir() else {
+        return;
+    };
+    let release = trigger_path(
+        &root,
+        scope.backend_index,
+        QueryLifecycleFaultKind::RestartAfterInitAck,
+    )
+    .with_extension("release");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match std::fs::read_to_string(&release) {
+            Ok(token) if token.trim() == scope.token => {
+                let _ = std::fs::remove_file(&release);
+                return;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_runner_owned_restart(_scope: &QueryLifecycleFaultScope) {}
 
 #[cfg(debug_assertions)]
 fn observe_backend_fault(

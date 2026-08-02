@@ -160,6 +160,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_sql_raw_repairs_rendered_version_clause_after_table_alias() {
+        let stmt = parse_sql_raw(
+            "SELECT f.id FROM catalog.db.fact AS f VERSION AS OF 42 \
+             JOIN catalog.db.dim AS d VERSION AS OF 43 ON f.id = d.id",
+        )
+        .expect("rendered table versions after aliases must parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::TableFactor::Table { version: left, .. } = &select.from[0].relation
+        else {
+            panic!("expected left table");
+        };
+        let sqlparser::ast::TableFactor::Table { version: right, .. } =
+            &select.from[0].joins[0].relation
+        else {
+            panic!("expected right table");
+        };
+        assert!(matches!(
+            left,
+            Some(sqlparser::ast::TableVersion::VersionAsOf(_))
+        ));
+        assert!(matches!(
+            right,
+            Some(sqlparser::ast::TableVersion::VersionAsOf(_))
+        ));
+    }
+
+    #[test]
     fn parse_sql_raw_preserves_escaped_backslash_before_f() {
         let stmt = parse_sql_raw(r"SELECT 'e\\f'").expect("parse should succeed");
         let sqlparser::ast::Statement::Query(query) = stmt else {

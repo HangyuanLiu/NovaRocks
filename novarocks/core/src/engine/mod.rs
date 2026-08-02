@@ -62,6 +62,7 @@ pub(crate) mod information_schema;
 pub mod insert_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
+pub(crate) mod mv_first_refresh_staging;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
@@ -77,6 +78,8 @@ pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+pub use mv_first_refresh_staging::MvFirstRefreshStagingTestOutcome;
 pub(crate) use write_transaction::IcebergWriteCommitExecutor;
 
 use self::statement::{
@@ -1188,6 +1191,65 @@ impl StandaloneNovaRocks {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// Feature-gated test seam for the native MVX-2W data-plane fixture.
+    ///
+    /// It admits one real frontend execution context from the live topology
+    /// and invokes only the result-free first-refresh staging consumer. The
+    /// default REFRESH route remains untouched.
+    #[cfg(feature = "mv-first-refresh-staging-test-support")]
+    pub fn stage_iceberg_mv_first_refresh_for_test(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_name: &str,
+    ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
+        use crate::query_execution::backend::BackendTopologyPort;
+        use crate::query_execution::cancellation::QueryCancellationSource;
+        use crate::query_execution::request_context::{RequestAdmission, RequestContext};
+
+        let topology = self
+            .inner
+            .backend_topology
+            .snapshot()
+            .map_err(|error| format!("capture MV first-refresh test topology: {error}"))?;
+        let cancellation = QueryCancellationSource::new();
+        let request = RequestContext::admit(RequestAdmission::new(
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            self.inner.execution_role,
+            topology,
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        ));
+        self.stage_iceberg_mv_first_refresh_with_execution_for_test(
+            current_catalog,
+            current_database,
+            mv_name,
+            request.execution(),
+        )
+    }
+
+    /// Feature-gated test seam that reuses an already admitted frontend
+    /// execution context.  The native fixture uses this through an ordinary
+    /// MySQL query session so `KILL QUERY` cancels the same attempt.
+    #[cfg(feature = "mv-first-refresh-staging-test-support")]
+    pub fn stage_iceberg_mv_first_refresh_with_execution_for_test(
+        &self,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_name: &str,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
+        crate::engine::mv::iceberg_refresh::execute_iceberg_mv_first_refresh_staging_test(
+            &self.inner,
+            current_catalog,
+            current_database,
+            mv_name,
+            execution,
+        )
     }
 
     pub fn query_compiler(&self) -> StandaloneQueryCompiler {
@@ -4210,6 +4272,180 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
     )
+}
+
+/// Execute an admitted connector write as a result-free staging operation.
+///
+/// This is the native consumer used by MV first-refresh staging: callers get
+/// only the bounded SPI completion/summary, never a `QueryResult`, `Chunk` or
+/// `RecordBatch`. The existing generic writer remains responsible for BE-side
+/// scan, exchange, shuffle and connector writer execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_context(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    let result = execute_query_as_iceberg_write_in_operation_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink_spec,
+        query_opts,
+        root_distribution,
+        execution,
+        connector_context,
+        connector_write,
+    )?;
+    connector_staging_completion_from_result(result)
+}
+
+/// Execute an already-analyzed MV logical plan into the same result-free
+/// connector staging terminal as a parsed query.  Join first-refresh plans
+/// use this path because their append projection is represented by canonical
+/// typed expressions rather than a SQL string.  It deliberately receives an
+/// admitted request and sealed write registration, never a frontend row sink.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
+    state: &Arc<StandaloneState>,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    crate::connector::validate_request_context(connector_context)?;
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let output_columns = crate::sql::planner::plan_output_columns(&logical_plan)?;
+    let mut matching_columns = output_columns
+        .iter()
+        .filter(|column| column.name == root_distribution_output_name(&root_distribution));
+    let root_column = matching_columns.next().ok_or_else(|| {
+        format!(
+            "MV first-refresh logical writer is missing root hash output '{}'",
+            root_distribution_output_name(&root_distribution)
+        )
+    })?;
+    if matching_columns.next().is_some()
+        || root_column.column_id == crate::sql::column_id::ColumnId::UNSET
+    {
+        return Err(
+            "MV first-refresh logical writer has an ambiguous or unbound root hash output"
+                .to_string(),
+        );
+    }
+    let root_distribution =
+        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([root_column.column_id]);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatisticsContext::unavailable();
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimized_tree = crate::sql::optimizer::optimize_with_root_distribution(
+        optimizer_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        root_distribution,
+        &optimizer_settings,
+    )?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        None,
+        Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let result = execute_distributed_write_with_execution(
+        &state.query_execution,
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+    )?;
+    connector_staging_completion_from_result(result)
+}
+
+fn root_distribution_output_name(
+    requirement: &crate::sql::compiler::RootDistributionRequirement,
+) -> &str {
+    match requirement {
+        crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(name) => name,
+        crate::sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(_) => {
+            unreachable!("MV first-refresh logical artifacts use a named hidden hash column")
+        }
+        crate::sql::compiler::RootDistributionRequirement::Any => {
+            unreachable!("MV first-refresh logical artifacts require a root hash column")
+        }
+    }
+}
+
+fn connector_staging_completion_from_result(
+    result: crate::query_execution::outcome::QueryExecutionResult,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    if !result.query_result.columns.is_empty() || !result.query_result.chunks.is_empty() {
+        return Err("connector staging terminal returned a result payload".to_string());
+    }
+    if let Some(abort) = result.write_abort {
+        return Err(format!(
+            "connector staging terminal aborted: {}",
+            abort.reason
+        ));
+    }
+    let completion = result.connector_completion.ok_or_else(|| {
+        "connector staging terminal has no accepted connector completion".to_string()
+    })?;
+    let summary = completion
+        .staging_summary()
+        .map_err(|error| error.to_string())?;
+    Ok((completion, summary))
 }
 
 enum DistributedConnectorWrite {

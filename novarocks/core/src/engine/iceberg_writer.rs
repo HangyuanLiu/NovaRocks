@@ -29,6 +29,7 @@ use bytes::Bytes;
 use iceberg::Catalog;
 use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
+use sha2::{Digest, Sha256};
 
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::backend::{
@@ -54,9 +55,12 @@ use crate::connector::iceberg::scan_model::{
 use crate::connector::iceberg::write_contract::{
     decode_write_receipt, encode_data_sink_spec_handle_payload,
 };
-use crate::connector::iceberg::write_control::IcebergWritePlanPayloadV1;
+use crate::connector::iceberg::write_control::{
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
+};
 use crate::connector::iceberg::write_service::{
-    IcebergWriteControlService, IcebergWriteControlServiceContext,
+    IcebergFirstRefreshWriteReportCommitter, IcebergWriteControlService,
+    IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
@@ -79,8 +83,8 @@ use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableHandle, ConnectorWriteIntent, ConnectorWriteOperationId,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorInstanceId, ConnectorTableHandle, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -363,6 +367,100 @@ pub(crate) fn register_iceberg_connector_write(
     )
 }
 
+/// Activates one first-refresh primary append cohort only after the caller has
+/// retained the exact write generation it will use to stage.  Unlike legacy
+/// DML registration, this reserves a lazy provider service: the service is
+/// materialized by the first SPI planning request and never during SQL
+/// preparation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_iceberg_first_refresh_connector_write(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    target_ref: &str,
+    input_schema: Arc<Schema>,
+    writer_handle_payload: Bytes,
+    payload: IcebergFirstRefreshWritePlanPayloadV2,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    operation_id: ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err(
+            "first-refresh write lease does not match the target connector instance".to_string(),
+        );
+    }
+    let expected_target = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    let observed_snapshot_id = if target_ref == "main" {
+        commit_executor
+            .table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+    } else {
+        commit_executor
+            .table
+            .metadata()
+            .refs()
+            .get(target_ref)
+            .map(|reference| reference.snapshot_id)
+    };
+    if payload.target != expected_target
+        || payload.target_ref != target_ref
+        || payload.expected_snapshot_id != observed_snapshot_id
+        || payload.staging_path != commit_executor.collector.staging_dir
+    {
+        return Err("first-refresh provider payload drifted from frozen target facts".to_string());
+    }
+    let provider_payload = payload
+        .encode()
+        .map_err(|error| format!("encode Iceberg first-refresh plan payload: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(operation_id.to_bytes());
+    hasher.update(provider_payload.as_ref());
+    let activation_digest: [u8; 32] = hasher.finalize().into();
+    let committer: Arc<dyn IcebergWriteReportCommitter> = Arc::new(
+        IcebergFirstRefreshWriteReportCommitter::new(
+            commit_executor,
+            payload.provenance_properties.clone(),
+        )
+        .map_err(|error| format!("build Iceberg first-refresh committer: {error}"))?,
+    );
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    services
+        .register_lazy(operation_id, activation_digest, move || {
+            let context = IcebergWriteControlServiceContext::new_with_first_refresh_handle_payload(
+                writer_handle_payload.clone(),
+                payload.clone(),
+                Arc::clone(&committer),
+            )?;
+            Ok(Arc::new(IcebergWriteControlService::new(context)))
+        })
+        .map_err(|error| format!("reserve Iceberg first-refresh write service: {error}"))?;
+    let cohort_id = novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id);
+    let mut templates = build_iceberg_connector_write_templates(
+        target,
+        target_ref,
+        operation_id,
+        vec![(
+            cohort_id,
+            ConnectorWriteIntent::Append,
+            input_schema,
+            provider_payload,
+            context,
+        )],
+    )?;
+    Ok(templates
+        .pop()
+        .expect("single Iceberg first-refresh cohort registration returns one template"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn register_iceberg_connector_write_service<S>(
     state: &Arc<StandaloneState>,
@@ -427,18 +525,23 @@ where
         .register(operation_id, service)
         .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
 
-    let table_payload = Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "catalog": target.catalog,
-            "namespace": target.namespace,
-            "table": target.table,
-            "ref": target_ref,
-        }))
-        .map_err(|error| format!("encode connector table identity: {error}"))?,
-    );
-    let table = ConnectorTableHandle::try_new(instance_id, table_payload)
-        .map_err(|error| format!("build connector table handle: {error}"))?;
+    build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
+}
+
+#[allow(clippy::type_complexity)]
+fn build_iceberg_connector_write_templates(
+    target: &TargetBackend,
+    target_ref: &str,
+    operation_id: ConnectorWriteOperationId,
+    cohorts: Vec<(
+        novarocks_spi::connector::ConnectorWriteCohortId,
+        ConnectorWriteIntent,
+        Arc<Schema>,
+        Bytes,
+        novarocks_spi::connector::ConnectorRequestContext,
+    )>,
+) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String> {
+    let table = iceberg_connector_table_handle(target, target_ref)?;
     cohorts
         .into_iter()
         .map(
@@ -457,6 +560,29 @@ where
             },
         )
         .collect()
+}
+
+/// Construct the provider-neutral SPI table identity used by an Iceberg
+/// writer. Callers may freeze it during SQL/application preparation, but the
+/// payload contains no catalog client or provider receipt decoder.
+pub(crate) fn iceberg_connector_table_handle(
+    target: &TargetBackend,
+    target_ref: &str,
+) -> Result<ConnectorTableHandle, String> {
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    let table_payload = Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "catalog": target.catalog,
+            "namespace": target.namespace,
+            "table": target.table,
+            "ref": target_ref,
+        }))
+        .map_err(|error| format!("encode connector table identity: {error}"))?,
+    );
+    ConnectorTableHandle::try_new(instance_id, table_payload)
+        .map_err(|error| format!("build connector table handle: {error}"))
 }
 
 pub(crate) fn commit_iceberg_connector_write(

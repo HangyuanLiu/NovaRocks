@@ -252,6 +252,95 @@ impl From<String> for IcebergMvRefreshExecutionError {
     }
 }
 
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+#[derive(Clone)]
+struct FirstRefreshStagingTestRuntime {
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+    outcome: Arc<Mutex<Option<Result<crate::engine::MvFirstRefreshStagingTestOutcome, String>>>>,
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+thread_local! {
+    static FIRST_REFRESH_STAGING_TEST_RUNTIME: std::cell::RefCell<Option<FirstRefreshStagingTestRuntime>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+struct FirstRefreshStagingTestRuntimeGuard;
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+impl FirstRefreshStagingTestRuntimeGuard {
+    fn install(runtime: FirstRefreshStagingTestRuntime) -> Self {
+        FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "MV first-refresh test runtime already installed"
+            );
+            *slot.borrow_mut() = Some(runtime);
+        });
+        Self
+    }
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+impl Drop for FirstRefreshStagingTestRuntimeGuard {
+    fn drop(&mut self) {
+        FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+fn try_stage_sql_first_refresh_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape,
+    physical_sql: crate::sql::mv_refresh::first_refresh::MvFirstRefreshPhysicalSql,
+    staging_branch: String,
+) -> Option<Result<StatementResult, IcebergMvRefreshExecutionError>> {
+    FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+        let runtime = slot.borrow().clone()?;
+        let outcome =
+            crate::engine::mv_first_refresh_staging::execute_mv_first_refresh_staging_for_test(
+                state,
+                ctx,
+                shape,
+                physical_sql,
+                staging_branch,
+                &runtime.execution,
+            );
+        *runtime
+            .outcome
+            .lock()
+            .expect("MV first-refresh test outcome lock poisoned") = Some(outcome.clone());
+        Some(outcome.map(|_| StatementResult::Ok).map_err(Into::into))
+    })
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+fn try_stage_join_first_refresh_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    staging_branch: String,
+) -> Option<Result<StatementResult, IcebergMvRefreshExecutionError>> {
+    FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+        let runtime = slot.borrow().clone()?;
+        let outcome =
+            crate::engine::mv_first_refresh_staging::execute_mv_first_refresh_join_staging_for_test(
+                state,
+                ctx,
+                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
+                append,
+                staging_branch,
+                &runtime.execution,
+            );
+        *runtime
+            .outcome
+            .lock()
+            .expect("MV first-refresh test outcome lock poisoned") = Some(outcome.clone());
+        Some(outcome.map(|_| StatementResult::Ok).map_err(Into::into))
+    })
+}
+
 /// Core adapter used by the frontend-owned MV application service. It keeps
 /// connector/analyzer state in core while exposing CREATE as auditable,
 /// side-effect-sized primitives.
@@ -383,48 +472,102 @@ impl MvEngine for StandaloneMvEngine {
     fn create_target(
         &self,
         plan: &PreparedMvCreate,
-        _operation_id: uuid::Uuid,
+        operation_id: uuid::Uuid,
     ) -> Result<CreatedMvTarget, MvEngineError> {
         let prepared = self.preparation(plan)?;
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
                 .map_err(|error| engine_target_error(error.to_string()))?;
-        let created = crate::connector::mutation::execute_catalog_mutation(
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
             self.state.connector_control.as_ref(),
             &instance_id,
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
-                table: novarocks_spi::connector::ConnectorTableIdentity {
-                    instance_id: instance_id.clone(),
-                    namespace: Arc::from(prepared.target.namespace.as_str()),
-                    table: Arc::from(prepared.target.table.as_str()),
-                },
-                columns: prepared
-                    .columns
-                    .iter()
-                    .map(crate::engine::statement::connector_column)
-                    .collect::<Result<_, _>>()
-                    .map_err(engine_target_error)?,
-                key: None,
-                partitioning: prepared
-                    .partition_fields
-                    .iter()
-                    .map(crate::engine::statement::connector_partition_transform)
-                    .collect(),
-                properties: prepared
-                    .target_properties
-                    .iter()
-                    .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
-                    .collect(),
-                policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
-            },
-            self.connector_context.clone(),
         )
-        .map_err(engine_target_error)?;
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        let mutation_lease = planning_lease
+            .derive_mutation_lease()
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: Arc::from(prepared.target.namespace.as_str()),
+            table: Arc::from(prepared.target.table.as_str()),
+        };
+        let created = require_known_committed_target_mutation(
+            crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                &mutation_lease,
+                novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+                    *operation_id.as_bytes(),
+                ),
+                novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
+                    table: table.clone(),
+                    columns: prepared
+                        .columns
+                        .iter()
+                        .map(crate::engine::statement::connector_column)
+                        .collect::<Result<_, _>>()
+                        .map_err(engine_target_error)?,
+                    key: None,
+                    partitioning: prepared
+                        .partition_fields
+                        .iter()
+                        .map(crate::engine::statement::connector_partition_transform)
+                        .collect(),
+                    properties: prepared
+                        .target_properties
+                        .iter()
+                        .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                        .collect(),
+                    policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
+                },
+                self.connector_context.clone(),
+            ),
+            "materialized view target create",
+        )?;
         if created.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
             return Err(engine_target_error(
                 "materialized view target create unexpectedly returned NoOp".to_string(),
             ));
         }
+        let bootstrap = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+            &mutation_lease,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
+                table: table.clone(),
+                expected_current_snapshot: None,
+                properties: vec![(
+                    Arc::from("novarocks.mv.bootstrap"),
+                    Arc::from("true"),
+                )],
+            },
+            self.connector_context.clone(),
+        );
+        match bootstrap {
+            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+                let cleanup = require_known_committed_target_mutation(
+                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                        &mutation_lease,
+                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
+                            table,
+                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
+                            data_disposition:
+                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
+                        },
+                        self.connector_context.clone(),
+                    ),
+                    "materialized view target bootstrap cleanup",
+                );
+                return Err(engine_target_error(format!(
+                    "{}; target cleanup={cleanup:?}",
+                    EngineError::commit_known_uncommitted(format!(
+                        "materialized view target empty-snapshot bootstrap: {failure}"
+                    ))
+                )));
+            }
+            bootstrap => require_known_committed_target_mutation(
+                bootstrap,
+                "materialized view target empty-snapshot bootstrap",
+            )?,
+        };
         prepared
             .entry
             .invalidate_table_cache(&prepared.target.namespace, &prepared.target.table);
@@ -569,6 +712,47 @@ fn engine_prepare_error(error: String) -> MvEngineError {
 
 fn engine_target_error(error: String) -> MvEngineError {
     MvEngineError::new(MvEngineErrorKind::TargetOperation, error)
+}
+
+/// Converts a typed external-mutation outcome into the CREATE target boundary.
+///
+/// A bootstrap that is known committed but cannot finalize remains an error:
+/// callers must not persist an MV definition unless every required target fact
+/// has been re-read successfully. Commit-unknown is likewise propagated as
+/// such, so no cleanup can erase a target whose external truth is unresolved.
+fn require_known_committed_target_mutation(
+    resolution: crate::connector::mutation::ResolvedCatalogMutation,
+    operation: &str,
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvEngineError> {
+    match resolution {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
+                &completed.finalization
+            {
+                return Err(engine_target_error(
+                    EngineError::commit_known_committed_finalize_failed(format!(
+                        "{operation}: {failure}"
+                    ))
+                    .to_string(),
+                ));
+            }
+            Ok(completed)
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+            Err(engine_target_error(
+                EngineError::commit_known_uncommitted(format!("{operation}: {failure}"))
+                    .to_string(),
+            ))
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            Err(engine_target_error(
+                EngineError::commit_unknown(format!("{operation}: {failure}")).to_string(),
+            ))
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
+            Err(engine_target_error(format!("{operation}: {error}")))
+        }
+    }
 }
 
 fn initial_refresh_configuration_for_create(
@@ -3413,13 +3597,33 @@ fn validate_target_snapshot(
 ) -> Result<(), String> {
     let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
-    if actual != expected {
+    if actual != expected && !(expected.is_none() && is_empty_target_bootstrap_snapshot(table)) {
         return Err(format!(
             "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
             target.catalog, target.namespace, target.table, expected, actual
         ));
     }
     Ok(())
+}
+
+/// CREATE MV establishes this provider-owned initial snapshot before any MV
+/// definition is durable. It is a staging-branch base, not a completed MV
+/// refresh, so the definition deliberately continues to record no refreshed
+/// target snapshot until first refresh publishes data.
+fn is_empty_target_bootstrap_snapshot(table: &iceberg::table::Table) -> bool {
+    table.metadata().current_snapshot().is_some_and(|snapshot| {
+        snapshot.parent_snapshot_id().is_none()
+            && snapshot
+                .summary()
+                .additional_properties
+                .get("novarocks.mv.bootstrap")
+                .map(String::as_str)
+                == Some("true")
+            && snapshot
+                .summary()
+                .additional_properties
+                .contains_key("novarocks.bootstrap.empty.operation-id")
+    })
 }
 
 fn recorded_target_snapshot_id(
@@ -4233,6 +4437,24 @@ fn refresh_iceberg_mv_with_planned_partitions(
                     .to_string()
                     .into());
             };
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let physical_sql = crate::sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                )?;
+                if let Some(result) = try_stage_sql_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
+                    physical_sql,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 &target,
@@ -4493,6 +4715,25 @@ fn refresh_iceberg_union_projection_mv(
                 mv_definition.mv_id,
                 uuid::Uuid::new_v4().simple()
             );
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let physical_sql = crate::sql::mv_refresh::first_refresh::prepare_union_projection_first_refresh_write_sql(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    branch_count,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                )?;
+                if let Some(result) = try_stage_sql_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::UnionProjection,
+                    physical_sql,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 target,
@@ -4822,6 +5063,25 @@ fn refresh_single_aggregate_iceberg_mv(
                 mv_definition.mv_id,
                 uuid::Uuid::new_v4().simple()
             );
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let physical_sql = crate::sql::mv_refresh::first_refresh::prepare_aggregate_first_refresh_write_sql(
+                    &mv_definition.select_sql,
+                    aggregate_calls,
+                    pin,
+                    current_catalog,
+                    current_database,
+                )?;
+                if let Some(result) = try_stage_sql_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Aggregate,
+                    physical_sql,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 target,
@@ -7288,6 +7548,68 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
     Ok(IcebergRefreshOutcome {
         completed_inside_execute: true,
     })
+}
+
+/// Native fixture-only entrypoint for the MVX-2W result-free first-refresh
+/// consumer. It plans with the ordinary MV planner, installs a thread-local
+/// test runtime for this synchronous attempt, and never enters the legacy
+/// operation repository/write-chunk path.
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+pub(crate) fn execute_iceberg_mv_first_refresh_staging_test(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_name: &str,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::engine::MvFirstRefreshStagingTestOutcome, String> {
+    let statement = RefreshMaterializedViewStmt {
+        name: crate::sql::parser::ast::ObjectName {
+            parts: vec![mv_name.to_string()],
+        },
+        full: false,
+    };
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
+    let iceberg_target =
+        resolve_refresh_target(current_catalog, current_database, &statement.name)?;
+    let target = MvTarget {
+        catalog: Some(iceberg_target.catalog),
+        database: iceberg_target.namespace,
+        name: iceberg_target.table,
+    };
+    let plan = plan_iceberg_mv_refresh_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        &statement,
+        target,
+        &connector_context,
+    )
+    .map_err(|error| error.message)?;
+    let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+        return Err("MV first-refresh test planner returned a non-Iceberg payload".to_string());
+    };
+    let outcome = Arc::new(Mutex::new(None));
+    let _runtime_guard =
+        FirstRefreshStagingTestRuntimeGuard::install(FirstRefreshStagingTestRuntime {
+            execution: execution.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+    execute_iceberg_mv_refresh_with_connector_context(
+        state,
+        payload,
+        &plan.contract,
+        &connector_context,
+    )
+    .map_err(|error| error.message)?;
+    outcome
+        .lock()
+        .expect("MV first-refresh test outcome lock poisoned")
+        .take()
+        .ok_or_else(|| {
+            "MV first-refresh test did not reach the feature-gated first-refresh consumer"
+                .to_string()
+        })?
 }
 
 fn load_iceberg_mv_definition_by_target(
@@ -11328,6 +11650,25 @@ fn refresh_iceberg_join_mv(
                 mv_definition.mv_id,
                 uuid::Uuid::new_v4().simple()
             );
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let (plan, factory) = plan_canonical_select_for_imv(state, &ctx)
+                    .map_err(|error| IcebergMvRefreshExecutionError::from(error.message))?;
+                let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
+                    &ctx.rewrite,
+                    left_ref,
+                    right_ref,
+                    crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory },
+                )?;
+                if let Some(result) = try_stage_join_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    append,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 target,
@@ -23420,6 +23761,31 @@ mod tests {
         let target =
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
                 .expect("created and inspected target");
+        let bootstrap = target
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("CREATE MV must establish a provider-owned empty snapshot");
+        assert!(
+            bootstrap.parent_snapshot_id().is_none(),
+            "the MV bootstrap snapshot must be the target table's first snapshot"
+        );
+        assert_eq!(
+            bootstrap
+                .summary()
+                .additional_properties
+                .get("novarocks.mv.bootstrap")
+                .map(String::as_str),
+            Some("true"),
+            "the bootstrap request properties must be committed by the provider"
+        );
+        assert!(
+            bootstrap
+                .summary()
+                .additional_properties
+                .contains_key("novarocks.bootstrap.empty.operation-id"),
+            "the provider must retain its idempotency marker on the bootstrap snapshot"
+        );
         let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("repository definition");
         assert!(definition.schema_contract.is_some());

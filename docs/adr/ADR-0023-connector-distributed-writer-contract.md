@@ -40,6 +40,15 @@ Adopt a provider-neutral distributed writer contract.
   superseded attempt remain isolated cleanup evidence and never mix with the accepted attempt.
 - Generic native wire and core only validate version, owner, identity, framing, bounds and digests.
   Provider data-file, delete-file, partition, credential and commit details remain opaque.
+- A distributed staging consumer terminates on a result-free write outcome: it accepts no
+  `QueryResult` payload and no abort payload, and consumes only the typed accepted connector
+  completion. Its observable counters are the checked aggregate of the complete accepted report
+  set (`input_rows`, `staged_bytes`, `artifact_count`, `writer_count`); it never decodes report
+  payloads to derive rows or files.
+- SQL preparation may retain prepared fragments, native bundle, options and the complete write
+  registration, but it cannot capture topology, acquire a current generation, or start a writer.
+  The application owner binds those artifacts only after admission and through an already sealed
+  operation session from its retained exact lease.
 - Commit and reconcile reuse the SPI-4B external outcome. Abort has a dedicated outcome because
   successful abort means known-uncommitted cleanup, not a failed commit.
 - The production migration is atomic: no old/new report double-write, feature fallback or second

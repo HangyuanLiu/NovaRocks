@@ -71,6 +71,61 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     )
 }
 
+/// Build the fresh-data projection used by a join MV's first refresh.
+///
+/// A first refresh appends into an empty staging target, so the change-stream
+/// action column has no meaning and must not cross the connector writer
+/// boundary. The descriptor is still used to preserve the canonical payload
+/// and join apply-key expressions shared with incremental refresh.
+pub(crate) fn build_join_apply_key_append_project(
+    input: LogicalPlanNode,
+    desc: &JoinRefreshDescriptor,
+    left_uuid: &str,
+    right_uuid: &str,
+    apply_key_column_id: u32,
+) -> Result<LogicalPlanNode, String> {
+    desc.validate()?;
+    let input_columns = crate::sql::planner::plan_output_columns(&input).map_err(|err| {
+        format!("join first-refresh append project cannot derive input columns: {err}")
+    })?;
+    let expected_apply_key = ColumnId(apply_key_column_id);
+    if desc.join_apply_key_column.column_id != expected_apply_key {
+        return Err(format!(
+            "join first-refresh append project apply-key output id mismatch: descriptor has {}, builder requested {expected_apply_key}",
+            desc.join_apply_key_column.column_id
+        ));
+    }
+    let items = desc
+        .output_mappings
+        .iter()
+        .filter(|mapping| !matches!(mapping.source, JoinRefreshOutputSource::Action(_)))
+        .map(|mapping| {
+            project_item_for_mapping(
+                mapping,
+                desc,
+                &input_columns,
+                left_uuid,
+                right_uuid,
+                JoinApplyActionProjection::InputColumn,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if items.len() != desc.payload_columns.len() + 1 {
+        return Err(
+            "join first-refresh append project requires every payload and exactly one apply-key output"
+                .to_string(),
+        );
+    }
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Project(PlanProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![input],
+        None,
+    ))
+}
+
 fn build_join_apply_key_project_with_action(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,

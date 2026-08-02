@@ -45,8 +45,8 @@ use super::write_contract::{
     decode_sink_plan_handle_payload, decode_writer_reports, encode_sink_plan_handle_payload,
 };
 use super::write_control::{
-    IcebergWriteControlBackend, IcebergWriteControlPlan, IcebergWritePlanPayloadV1,
-    IcebergWriteReconcileEvidenceV1,
+    IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlBackend, IcebergWriteControlPlan,
+    IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
 };
 use crate::engine::IcebergWriteCommitExecutor;
 
@@ -56,7 +56,18 @@ use crate::engine::IcebergWriteCommitExecutor;
 /// or a provider payload fallback.
 #[derive(Clone, Default)]
 pub(crate) struct IcebergWriteServiceRegistry {
-    services: Arc<Mutex<HashMap<ConnectorWriteOperationId, Arc<dyn IcebergWriteControlBackend>>>>,
+    services: Arc<Mutex<HashMap<ConnectorWriteOperationId, IcebergWriteServiceEntry>>>,
+}
+
+#[derive(Clone)]
+enum IcebergWriteServiceEntry {
+    Ready(Arc<dyn IcebergWriteControlBackend>),
+    Lazy {
+        activation_digest: [u8; 32],
+        factory: Arc<
+            dyn Fn() -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError> + Send + Sync,
+        >,
+    },
 }
 
 impl IcebergWriteServiceRegistry {
@@ -72,7 +83,13 @@ impl IcebergWriteServiceRegistry {
             .services
             .lock()
             .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
-        if services.insert(operation_id, Arc::new(service)).is_some() {
+        if services
+            .insert(
+                operation_id,
+                IcebergWriteServiceEntry::Ready(Arc::new(service)),
+            )
+            .is_some()
+        {
             return Err(invalid(
                 "Iceberg write service already exists for connector operation ID",
             ));
@@ -80,21 +97,75 @@ impl IcebergWriteServiceRegistry {
         Ok(())
     }
 
+    /// Reserves an operation after exact-lease admission.  It intentionally
+    /// does not construct the provider service: the first SPI `plan` request
+    /// creates and caches it under this operation ID.
+    pub(crate) fn register_lazy<F>(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        activation_digest: [u8; 32],
+        factory: F,
+    ) -> Result<(), ConnectorError>
+    where
+        F: Fn() -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut services = self
+            .services
+            .lock()
+            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
+        match services.get(&operation_id) {
+            Some(IcebergWriteServiceEntry::Lazy {
+                activation_digest: existing,
+                ..
+            }) if existing == &activation_digest => return Ok(()),
+            Some(_) => {
+                return Err(invalid(
+                    "Iceberg write operation already has a conflicting service activation",
+                ));
+            }
+            None => {}
+        }
+        services.insert(
+            operation_id,
+            IcebergWriteServiceEntry::Lazy {
+                activation_digest,
+                factory: Arc::new(factory),
+            },
+        );
+        Ok(())
+    }
+
     fn resolve(
         &self,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Arc<dyn IcebergWriteControlBackend>, ConnectorError> {
-        self.services
+        let mut services = self
+            .services
             .lock()
-            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?
-            .get(&operation_id)
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "Iceberg connector write operation has no FE control service",
-                )
-            })
+            .map_err(|error| internal(format!("Iceberg write service registry lock: {error}")))?;
+        let entry = services.get(&operation_id).cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "Iceberg connector write operation has no FE control service",
+            )
+        })?;
+        match entry {
+            IcebergWriteServiceEntry::Ready(service) => Ok(service),
+            IcebergWriteServiceEntry::Lazy {
+                activation_digest: _,
+                factory,
+            } => {
+                let service = factory()?;
+                services.insert(
+                    operation_id,
+                    IcebergWriteServiceEntry::Ready(Arc::clone(&service)),
+                );
+                Ok(service)
+            }
+        }
     }
 }
 
@@ -212,6 +283,118 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     ) -> Result<CleanupAttempt, String>;
 
     fn recovery_evidence(&self) -> RecoveryEvidence;
+}
+
+/// First-refresh committer. It is the only place where the opaque provider
+/// payload becomes Iceberg snapshot provenance, and it derives row count from
+/// the complete accepted report set rather than any frontend result carrier.
+pub(crate) struct IcebergFirstRefreshWriteReportCommitter {
+    executor: Arc<IcebergWriteCommitExecutor>,
+    provenance_properties: BTreeMap<String, String>,
+}
+
+impl IcebergFirstRefreshWriteReportCommitter {
+    pub(crate) fn new(
+        executor: Arc<IcebergWriteCommitExecutor>,
+        provenance_properties: BTreeMap<String, String>,
+    ) -> Result<Self, ConnectorError> {
+        if provenance_properties.contains_key("novarocks.mv.refresh.row_count") {
+            return Err(invalid(
+                "first-refresh provenance template must not predeclare row count",
+            ));
+        }
+        Ok(Self {
+            executor,
+            provenance_properties,
+        })
+    }
+
+    fn decode_primary_reports(
+        &self,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<Vec<IcebergWriterReport>, CommitServiceError> {
+        if cohorts.len() != 1 || cohorts[0].role != IcebergWriteCohortRole::Primary {
+            return Err(CommitServiceError::invalid_input(
+                "first-refresh write must contain exactly one primary append cohort".to_string(),
+            ));
+        }
+        let mut reports = Vec::new();
+        for staged in &cohorts[0].reports {
+            staged.validate().map_err(|error| {
+                CommitServiceError::invalid_input(format!(
+                    "validate first-refresh connector staged report: {error}"
+                ))
+            })?;
+            reports.extend(
+                decode_writer_reports(staged.payload(), self.executor.table.metadata())
+                    .map_err(CommitServiceError::invalid_input)?,
+            );
+        }
+        Ok(reports)
+    }
+}
+
+impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
+    fn table_metadata(&self) -> &TableMetadata {
+        self.executor.table.metadata()
+    }
+
+    fn commit_connector_operation(
+        &self,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let reports = self.decode_primary_reports(cohorts)?;
+        let row_count = reports.iter().try_fold(0_i64, |total, report| {
+            if report.file.record_count < 0 {
+                return Err(CommitServiceError::invalid_input(
+                    "first-refresh report has a negative row count".to_string(),
+                ));
+            }
+            total.checked_add(report.file.record_count).ok_or_else(|| {
+                CommitServiceError::invalid_input("first-refresh row count overflow".to_string())
+            })
+        })?;
+        // A first refresh targets an empty staging ref.  Empty input is an
+        // explicit no-op: do not manufacture an empty Iceberg snapshot.  The
+        // provider owns cleanup because it is the only layer that can decode
+        // the staged report payloads into object-store paths.
+        if row_count == 0 {
+            let cleanup = self
+                .executor
+                .abort_iceberg_writer_reports(reports)
+                .unwrap_or_else(|error| CleanupAttempt::completed(vec![error]));
+            return Err(CommitServiceError::known_uncommitted(
+                "first-refresh produced zero rows; staging was aborted without a snapshot"
+                    .to_string(),
+                cleanup,
+            ));
+        }
+        let mut provenance = self.provenance_properties.clone();
+        provenance.insert(
+            "novarocks.mv.refresh.row_count".to_string(),
+            row_count.to_string(),
+        );
+        self.executor
+            .commit_iceberg_writer_reports_with_snapshot_properties(reports, provenance)
+    }
+
+    fn commit_iceberg_writer_reports(
+        &self,
+        reports: Vec<IcebergWriterReport>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.executor.commit_iceberg_writer_reports(reports)
+    }
+
+    fn abort_iceberg_writer_reports(
+        &self,
+        reports: Vec<IcebergWriterReport>,
+    ) -> Result<CleanupAttempt, String> {
+        self.executor.abort_iceberg_writer_reports(reports)
+    }
+
+    fn recovery_evidence(&self) -> RecoveryEvidence {
+        RecoveryEvidence::from_collector(&self.executor.collector)
+    }
 }
 
 #[derive(Clone)]
@@ -593,6 +776,18 @@ impl IcebergWriteCohortContext {
         })
     }
 
+    fn first_refresh_primary(
+        writer_handle_payloads: IcebergWriterHandlePayloads,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+    ) -> Result<Self, ConnectorError> {
+        validate_writer_handle_payloads(&writer_handle_payloads)?;
+        Ok(Self {
+            writer_handle_payloads,
+            control_payload: plan_payload.encode()?,
+            role: IcebergWriteCohortRole::Primary,
+        })
+    }
+
     pub(crate) fn cow_rewrite(
         writer_handle_payload: bytes::Bytes,
         plan_payload: &IcebergWritePlanPayloadV1,
@@ -716,6 +911,22 @@ impl IcebergWriteControlServiceContext {
         Ok(Self {
             cohorts: IcebergWriteCohortContexts::PrimaryTemplate(
                 IcebergWriteCohortContext::primary(
+                    IcebergWriterHandlePayloads::Uniform(writer_handle_payload),
+                    plan_payload,
+                )?,
+            ),
+            commit_executor,
+        })
+    }
+
+    pub(crate) fn new_with_first_refresh_handle_payload(
+        writer_handle_payload: bytes::Bytes,
+        plan_payload: IcebergFirstRefreshWritePlanPayloadV2,
+        commit_executor: Arc<dyn IcebergWriteReportCommitter>,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            cohorts: IcebergWriteCohortContexts::PrimaryTemplate(
+                IcebergWriteCohortContext::first_refresh_primary(
                     IcebergWriterHandlePayloads::Uniform(writer_handle_payload),
                     plan_payload,
                 )?,
@@ -1022,7 +1233,8 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
@@ -1054,10 +1266,78 @@ mod tests {
         }
     }
 
+    struct LazyBackend;
+
+    impl IcebergWriteControlBackend for LazyBackend {
+        fn plan(
+            &self,
+            _: &ConnectorWritePlanningRequest,
+        ) -> Result<IcebergWriteControlPlan, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test lazy backend does not plan writes",
+            ))
+        }
+
+        fn commit(
+            &self,
+            _: &ConnectorWriteCommitRequest,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            Err(CommitServiceError::invalid_input(
+                "test lazy backend does not commit writes".to_string(),
+            ))
+        }
+
+        fn abort(
+            &self,
+            _: &ConnectorWriteAbortRequest,
+        ) -> Result<ExternalMutationFinalization, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test lazy backend does not abort writes",
+            ))
+        }
+
+        fn reconcile(
+            &self,
+            _: &IcebergWriteReconcileEvidenceV1,
+        ) -> Result<Option<CommitOutcome>, CommitServiceError> {
+            Err(CommitServiceError::invalid_input(
+                "test lazy backend does not reconcile writes".to_string(),
+            ))
+        }
+    }
+
     struct FakeCommitter {
         metadata: TableMetadata,
         committed: Mutex<Vec<Vec<IcebergWriterReport>>>,
         aborted: Mutex<Vec<Vec<IcebergWriterReport>>>,
+    }
+
+    #[test]
+    fn lazy_service_activation_is_idempotent_and_constructed_once() {
+        let registry = IcebergWriteServiceRegistry::default();
+        let operation_id = ConnectorWriteOperationId::from_bytes([91; 16]);
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&constructions);
+        registry
+            .register_lazy(operation_id, [7; 32], move || {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(LazyBackend))
+            })
+            .expect("reserve lazy operation");
+        registry
+            .register_lazy(operation_id, [7; 32], || Ok(Arc::new(LazyBackend)))
+            .expect("same activation is idempotent");
+        assert!(
+            registry
+                .register_lazy(operation_id, [8; 32], || Ok(Arc::new(LazyBackend)))
+                .is_err(),
+            "different activation facts must fail closed"
+        );
+        let _first = registry.resolve(operation_id).expect("first resolve");
+        let _second = registry.resolve(operation_id).expect("cached resolve");
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
     }
 
     impl IcebergWriteReportCommitter for FakeCommitter {

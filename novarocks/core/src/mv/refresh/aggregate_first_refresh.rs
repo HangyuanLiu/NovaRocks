@@ -75,6 +75,29 @@ fn read_aggregate_state<F>(
 where
     F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
 {
+    let state_sql = prepare_aggregate_first_refresh_state_sql(
+        select_sql,
+        calls,
+        pin,
+        current_catalog,
+        current_database,
+    )?;
+    let state_query = parse_stored_select_query(&state_sql)?;
+    read(select_sql, calls, state_query)
+}
+
+/// Build the pinned, state-shaped query used by an aggregate first refresh.
+///
+/// The returned SQL is still a pure planning artifact. It contains neither a
+/// result-materialization callback nor a connector-side effect, so callers can
+/// attach it directly to a distributed writer sink.
+pub(crate) fn prepare_aggregate_first_refresh_state_sql(
+    select_sql: &str,
+    calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<String, String> {
     let state_sql =
         crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
@@ -85,7 +108,44 @@ where
         current_catalog,
         current_database,
     )?;
-    read(select_sql, calls, state_query)
+    Ok(state_query.to_string())
+}
+
+/// Return each pinned state-shaped branch of a branch-UNION aggregate first
+/// refresh. The caller owns the common physical projection and final UNION ALL.
+pub(crate) fn prepare_branch_union_aggregate_first_refresh_state_sqls(
+    select_sql: &str,
+    branch_count: usize,
+    first_branch_calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<Vec<(AggregateSqlCalls, String)>, String> {
+    let branches = branch_union_first_refresh_branch_queries(select_sql, branch_count)?;
+    branches
+        .into_iter()
+        .enumerate()
+        .map(|(branch_index, (branch_query, branch_sql))| {
+            let branch_calls =
+                crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(
+                    &branch_query,
+                )?;
+            if branch_index == 0 && &branch_calls != first_branch_calls {
+                return Err(
+                    "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                        .to_string(),
+                );
+            }
+            let state_sql = prepare_aggregate_first_refresh_state_sql(
+                &branch_sql,
+                &branch_calls,
+                pin,
+                current_catalog,
+                current_database,
+            )?;
+            Ok((branch_calls, state_sql))
+        })
+        .collect()
 }
 
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_chunks<F>(

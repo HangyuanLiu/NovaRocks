@@ -416,6 +416,100 @@ fn iceberg_control_mutation_honors_create_policy_without_implicit_namespace_crea
 }
 
 #[test]
+fn iceberg_control_bootstraps_empty_table_once_with_an_operation_marker() {
+    let (registry, _warehouse) = registry_with_table();
+    let entry = registry
+        .read()
+        .expect("catalog registry read")
+        .get("ice")
+        .expect("catalog entry");
+    create_table(
+        &entry,
+        "db",
+        "mv_empty",
+        &[TableColumnDef {
+            name: "id".to_string(),
+            data_type: SqlType::Int,
+            nullable: false,
+            aggregation: None,
+            default: None,
+        }],
+        None,
+        &[],
+        &[],
+    )
+    .expect("create empty MV target");
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let control = IcebergControlProvider::new_control(instance_id.clone(), Arc::clone(&registry))
+        .expect("Iceberg control binding");
+    let mutation = control.mutation().expect("mutation capability");
+    let target = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: control.incarnation(),
+    };
+    let table = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from("db"),
+        table: Arc::from("mv_empty"),
+    };
+    let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+    let request = ConnectorCatalogMutationRequest {
+        operation_id,
+        target: target.clone(),
+        operation: ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
+            table: table.clone(),
+            expected_current_snapshot: None,
+            properties: vec![(Arc::from("novarocks.mv.bootstrap"), Arc::from("true"))],
+        },
+        context: context(),
+    };
+    let first = mutation
+        .execute(request.clone())
+        .expect("bootstrap mutation");
+    assert!(matches!(
+        first,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            finalization: ExternalMutationFinalization::Complete,
+            ..
+        }
+    ));
+    let loaded = load_table(&entry, "db", "mv_empty").expect("load bootstrapped target");
+    let snapshot = loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .expect("bootstrap snapshot");
+    assert!(snapshot.parent_snapshot_id().is_none());
+    assert_eq!(
+        snapshot
+            .summary()
+            .additional_properties
+            .get("novarocks.mv.bootstrap")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        snapshot
+            .summary()
+            .additional_properties
+            .contains_key("novarocks.bootstrap.empty.operation-id")
+    );
+
+    let replay = mutation
+        .execute(request)
+        .expect("idempotent bootstrap replay");
+    assert!(matches!(
+        replay,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            finalization: ExternalMutationFinalization::Complete,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
     let (registry, _warehouse) = registry_with_table();
     let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");

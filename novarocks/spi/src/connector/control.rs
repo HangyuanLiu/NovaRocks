@@ -25,7 +25,7 @@ use super::{
     ConnectorMetadataMaintenanceResolver, ConnectorRequestContext, ConnectorScan,
     ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorWriteControl,
-    ConnectorWriteResolver,
+    ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -396,6 +396,54 @@ impl ConnectorControlPlanningLease {
 
     pub fn binding(&self) -> &Arc<ConnectorControlBinding> {
         &self.binding
+    }
+
+    /// Derive a writer lease from this retained planning generation.
+    ///
+    /// A refresh preparation may observe and retain a connector generation
+    /// while resolving scans. The later write must use that exact generation,
+    /// not acquire whichever incarnation happens to be current at execution
+    /// time. Retaining this lease inside the derived writer lease keeps the
+    /// generation alive through staging without a second registry lookup.
+    pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, ConnectorError> {
+        let write = self.binding.write().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no distributed write capability",
+            )
+        })?;
+        let distribution = self.binding.execution_distribution().clone();
+        let key = write.binding_key().clone();
+        let retained_planning_lease = self.clone();
+        Ok(ConnectorWriteLease::new_with_execution_distribution(
+            key,
+            write,
+            distribution,
+            move || drop(retained_planning_lease),
+        )?)
+    }
+
+    /// Derive a catalog-mutation lease from this retained planning generation.
+    ///
+    /// CREATE-adjacent operations which first inspect or prepare against a
+    /// binding must not reacquire whichever mutation generation is current
+    /// later. Keeping the parent planning lease alive makes the mutation and
+    /// any subsequent writer lease generation-identical by construction.
+    pub fn derive_mutation_lease(
+        &self,
+    ) -> Result<super::ConnectorCatalogMutationLease, ConnectorError> {
+        let mutation = self.binding.mutation().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no catalog mutation capability",
+            )
+        })?;
+        let descriptor = self.binding.descriptor().clone();
+        let incarnation = self.binding.incarnation();
+        let retained_planning_lease = self.clone();
+        super::ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
+            drop(retained_planning_lease)
+        })
     }
 }
 
