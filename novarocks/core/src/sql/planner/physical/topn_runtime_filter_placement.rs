@@ -21,7 +21,6 @@ use std::num::NonZeroU32;
 
 use arrow::datatypes::DataType;
 
-use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::planner::physical::runtime_filter::{
     AggregateTopNRuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
@@ -29,6 +28,7 @@ use crate::sql::planner::physical::runtime_filter::{
 use crate::sql::planner::physical::{
     AggMode, PhysicalPlanKind, PhysicalPlanNode, PlanSetOpKind, TopNPhase,
 };
+use crate::sql::planner::runtime_filter::contract::{NullOrder, SortDirection};
 
 struct TopNPlacementProof {
     producer_path: Vec<usize>,
@@ -367,7 +367,6 @@ mod tests {
     use arrow::datatypes::{DataType, TimeUnit};
 
     use super::{is_exact_column_ref, place_aggregate_topn_runtime_filters};
-    use crate::runtime_filter::model::contract::{NullOrder, SortDirection};
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::JoinKind;
@@ -387,6 +386,7 @@ mod tests {
         RedistributeNode, TopNPhase,
     };
     use crate::sql::planner::physical::{JoinDistribution, JoinExecutionMode};
+    use crate::sql::planner::runtime_filter::contract::{NullOrder, SortDirection};
 
     #[test]
     fn places_single_key_partial_topn_on_local_aggregate_atomically() {

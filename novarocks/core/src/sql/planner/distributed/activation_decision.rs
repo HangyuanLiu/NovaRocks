@@ -22,21 +22,25 @@ use std::fmt;
 use std::cell::Cell;
 
 use crate::novarocks_logging::debug;
-use crate::runtime_filter::model::contract::{
+use crate::sql::planner::runtime_filter::activation::{
+    ActivationConstraint, ActivationDecision, ActivationDecisionCatalog, ActivationDecisionReason,
+    ActivationFallback, RequiredLiveReason,
+};
+use crate::sql::planner::runtime_filter::contract::{
     BindingId, ChannelId, ConsumerActivation, ContributionKind, LateApplyGranularity,
     RuntimeFilterLogicalDomain,
 };
 #[cfg(test)]
-use crate::runtime_filter::model::graph::PlanLocation;
-use crate::runtime_filter::model::graph::{
+use crate::sql::planner::runtime_filter::graph::PlanLocation;
+use crate::sql::planner::runtime_filter::graph::{
     RuntimeFilterBindingRoleData, RuntimeFilterGraph, RuntimeFilterGraphData,
 };
-use crate::runtime_filter::model::join_progress::JoinBuildProgressCatalog;
-use crate::runtime_filter::model::refined_wait_graph::{
+use crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog;
+use crate::sql::planner::runtime_filter::validation::{ActivationContract, GraphValidationError};
+use crate::sql::planner::runtime_filter::wait_graph::{
     ConsumerWaitBehavior, CycleStep, RefinedFragmentEdge, RefinedWaitGraphBuildError,
     build_refined_wait_graph, project_consumer_waits,
 };
-use crate::runtime_filter::model::validation::{ActivationContract, GraphValidationError};
 
 use super::fragment::PlanFragment;
 use super::runtime_filter_progress::build_join_progress_proof_catalog;
@@ -45,28 +49,6 @@ use super::validation::{
 };
 
 pub(crate) type DraftRuntimeFilterGraph = RuntimeFilterGraphData<ActivationConstraint>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ActivationConstraint {
-    LiveOnly {
-        late_apply: LateApplyGranularity,
-        reason: RequiredLiveReason,
-    },
-    BlockingOrBatchLive {
-        fallback: ActivationFallback,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ActivationFallback {
-    BlockingSnapshot,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequiredLiveReason {
-    OrderedBoundContract,
-    FencedFinalDomainContract,
-}
 
 impl ActivationContract for ActivationConstraint {
     fn satisfies_required_non_blocking(&self) -> bool {
@@ -79,29 +61,6 @@ pub(super) struct ActivationDecisionOutput {
     pub(super) graph: RuntimeFilterGraph,
     pub(super) decisions: ActivationDecisionCatalog,
     pub(super) join_progress: JoinBuildProgressCatalog,
-}
-
-pub(super) type ActivationDecisionCatalog = BTreeMap<BindingId, ActivationDecision>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ActivationDecision {
-    pub(super) channel: ChannelId,
-    pub(super) consumer_binding: BindingId,
-    pub(super) consumer_fragment: u32,
-    pub(super) activation: ConsumerActivation,
-    pub(super) reason: ActivationDecisionReason,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ActivationDecisionReason {
-    RequiredByContract {
-        reason: RequiredLiveReason,
-    },
-    CycleForced {
-        producer_bindings: Vec<BindingId>,
-        witness: Vec<CycleStep>,
-    },
-    ConservativeFallback,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -368,7 +327,7 @@ impl ActivationDecisionPass {
                 .expect("decision binding remains in materialized graph")
                 .location = PlanLocation {
                 fragment_id,
-                node_id: crate::runtime_filter::model::contract::PlanNodeId::new(i32::MAX),
+                node_id: crate::sql::planner::runtime_filter::contract::PlanNodeId::new(i32::MAX),
             };
         }
 
@@ -444,31 +403,31 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionFenceKind,
-        CompletionRequirement, ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder,
-        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
-        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement, SortDirection,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
-        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
-        RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
-    };
-    use crate::runtime_filter::model::join_progress::{
-        FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
-        JoinBuildProgressSkip,
-    };
-    use crate::runtime_filter::model::refined_wait_graph::RefinedFragmentEdge;
-    use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::fragment::{DataPartition, DataSink, PlanFragment};
     use crate::sql::planner::distributed::node::{DistributedNode, DistributedNodeKind};
     use crate::sql::planner::distributed::validation::RuntimeFilterPlanValidationError;
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::runtime_filter::contract::{
+        ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionFenceKind,
+        CompletionRequirement, ConsumerActivation, ContributionKind, CoverageWitnessId, NullOrder,
+        NullSemantics, OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement, SortDirection,
+    };
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
+        ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
+        RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec,
+    };
+    use crate::sql::planner::runtime_filter::progress::{
+        FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
+        JoinBuildProgressSkip,
+    };
+    use crate::sql::planner::runtime_filter::validation::GraphValidationErrorKind;
+    use crate::sql::planner::runtime_filter::wait_graph::RefinedFragmentEdge;
 
     fn expression() -> TypedExpr {
         TypedExpr {

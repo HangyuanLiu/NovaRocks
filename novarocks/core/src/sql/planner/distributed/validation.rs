@@ -27,13 +27,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
-use crate::runtime_filter::model::contract::{
-    BindingId, PlanFragmentId, PlanNodeId, RuntimeFilterLogicalDomain,
-};
-use crate::runtime_filter::model::graph::RuntimeFilterGraphData;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
+use crate::sql::planner::runtime_filter::contract::{
+    BindingId, PlanFragmentId, PlanNodeId, RuntimeFilterLogicalDomain,
+};
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraphData;
 
 use super::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,

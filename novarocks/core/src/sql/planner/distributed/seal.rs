@@ -17,11 +17,10 @@
 
 use std::fmt;
 
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraph;
+use crate::sql::planner::runtime_filter::sealed::SealedRuntimeFilterPlan;
 
-use super::activation_decision::{
-    ActivationDecisionCatalog, ActivationDecisionError, ActivationDecisionPass,
-};
+use super::activation_decision::{ActivationDecisionError, ActivationDecisionPass};
 use super::boundary::{
     BoundaryCatalog, BoundaryError, ExecutionColumnIdAllocator, build_boundary_catalog,
 };
@@ -31,7 +30,6 @@ use super::output::{
     WriteContractError, build_fragment_edge_output_catalog, build_node_output_catalog,
     build_write_contract_catalog,
 };
-use super::runtime_filter_progress::JoinBuildProgressCatalog;
 use super::topology::{TopologyContract, TopologyError, build_topology_contract};
 use super::validation::{self, DistributedPlanValidationError};
 
@@ -40,12 +38,10 @@ struct DistributedPlanData {
     fragments: Vec<PlanFragment>,
     root_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
-    runtime_filter_graph: RuntimeFilterGraph,
-    // Deterministic provenance for every sealed consumer activation.
-    activation_decisions: ActivationDecisionCatalog,
-    // Authoritative planner-sealed proofs for hash-join
-    // build-before-probe progress. The coordinator only projects this catalog.
-    runtime_filter_join_progress: JoinBuildProgressCatalog,
+    // The one immutable SQL-owner carrier for the sealed graph, activation
+    // provenance and build-before-probe proofs. Downstream stages may retain
+    // this handle but never rebuild the planning facts it contains.
+    runtime_filter_plan: SealedRuntimeFilterPlan,
     // Authoritative boundary membership catalog derived at seal time.
     boundaries: BoundaryCatalog,
     // Final state of the single query-scoped occurrence allocator. Preserved so
@@ -83,18 +79,27 @@ impl DistributedPlan {
         &self.data.edges
     }
 
-    pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
-        &self.data.runtime_filter_graph
+    /// The immutable SQL planning facts sealed with this distributed plan.
+    /// Preparation retains a clone of this handle rather than a reconstructed
+    /// runtime-filter graph.
+    pub(crate) fn sealed_runtime_filter_plan(&self) -> &SealedRuntimeFilterPlan {
+        &self.data.runtime_filter_plan
     }
 
-    pub(crate) fn runtime_filter_join_progress(&self) -> &JoinBuildProgressCatalog {
-        &self.data.runtime_filter_join_progress
+    pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
+        self.data.runtime_filter_plan.graph()
+    }
+
+    pub(crate) fn runtime_filter_join_progress(
+        &self,
+    ) -> &crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog {
+        self.data.runtime_filter_plan.join_progress()
     }
 
     pub(in crate::sql::planner::distributed) fn activation_decisions(
         &self,
-    ) -> &ActivationDecisionCatalog {
-        &self.data.activation_decisions
+    ) -> &crate::sql::planner::runtime_filter::activation::ActivationDecisionCatalog {
+        self.data.runtime_filter_plan.activation_decisions()
     }
 
     // Consumed by coordinator preparation for production boundary validation.
@@ -260,9 +265,11 @@ pub(in crate::sql::planner::distributed) fn seal_draft(
             fragments,
             root_fragment_id,
             edges,
-            runtime_filter_graph: activation.graph,
-            activation_decisions: activation.decisions,
-            runtime_filter_join_progress: activation.join_progress,
+            runtime_filter_plan: SealedRuntimeFilterPlan::new(
+                activation.graph,
+                activation.decisions,
+                activation.join_progress,
+            ),
             boundaries,
             execution_column_id_allocator,
             topology,
@@ -335,19 +342,6 @@ mod tests {
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::deployment::compiler::compile_with_join_progress;
     use crate::runtime_filter::deployment::{DeploymentError, RuntimeFilterDeploymentPolicy};
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
-        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
-        RuntimeFilterPolicyRequirement,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirementData, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
-        RuntimeFilterChannelSpec,
-    };
-    use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::runtime_filter::port::identity::DeploymentEpoch;
     use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
@@ -365,11 +359,25 @@ mod tests {
     use crate::sql::planner::physical::{
         JoinDistribution, PhysicalHashJoinNode, PhysicalPlanStats, PlannerConfidence,
     };
-
-    use super::super::activation_decision::{
-        ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph,
+    use crate::sql::planner::runtime_filter::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
+        ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+        RuntimeFilterPolicyRequirement,
     };
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, ConsumerRequirementData, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingRoleData, RuntimeFilterBindingSpecData,
+        RuntimeFilterChannelSpec,
+    };
+    use crate::sql::planner::runtime_filter::validation::GraphValidationErrorKind;
+
+    use super::super::activation_decision::DraftRuntimeFilterGraph;
     use super::{DistributedPlanSealError, seal_draft};
+    use crate::sql::planner::runtime_filter::activation::{
+        ActivationConstraint, ActivationFallback,
+    };
 
     /// Minimal `TypedExpr` used to populate binding expressions. The seal only
     /// inspects the graph's structural contract, never the bound expression.
@@ -431,7 +439,7 @@ mod tests {
                     ContributionKind::ProducerClosed,
                 ]),
                 completion_requirement: CompletionRequirement::ProducerClosed,
-                target: crate::runtime_filter::model::graph::ProducerBindingTarget::JoinBuildKey {
+                target: crate::sql::planner::runtime_filter::graph::ProducerBindingTarget::JoinBuildKey {
                     ordinal: 0,
                 },
             }),
@@ -460,7 +468,7 @@ mod tests {
                 activation: ActivationConstraint::BlockingOrBatchLive {
                     fallback: ActivationFallback::BlockingSnapshot,
                 },
-                target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
+                target: crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
@@ -846,14 +854,15 @@ mod tests {
         assert_eq!(
             sealed_consumer_activation(&plan),
             ConsumerActivation::NonBlockingLive {
-                late_apply: crate::runtime_filter::model::contract::LateApplyGranularity::Batch,
+                late_apply:
+                    crate::sql::planner::runtime_filter::contract::LateApplyGranularity::Batch,
             }
         );
         let decisions = plan.activation_decisions();
         assert_eq!(decisions.len(), 1);
         assert!(matches!(
             &decisions[&BindingId::new(2)].reason,
-            super::super::activation_decision::ActivationDecisionReason::CycleForced { .. }
+            crate::sql::planner::runtime_filter::activation::ActivationDecisionReason::CycleForced { .. }
         ));
         let producer_node = &plan
             .fragments()
@@ -1008,7 +1017,7 @@ mod tests {
             assert_eq!(decision.activation, ConsumerActivation::BlockingSnapshot);
             assert!(matches!(
                 &decision.reason,
-                super::super::activation_decision::ActivationDecisionReason::ConservativeFallback
+                crate::sql::planner::runtime_filter::activation::ActivationDecisionReason::ConservativeFallback
             ));
         }
     }

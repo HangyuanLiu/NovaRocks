@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod artifact;
-pub(crate) mod binding;
-pub(crate) mod events;
-pub(crate) mod final_domain;
-pub(crate) mod identity;
-pub(crate) mod install;
-pub(crate) mod ordered_bound;
-pub(crate) mod producer;
-pub(crate) mod routing;
-pub(crate) mod subscription;
-pub(crate) mod support;
-pub(crate) mod topk_summary;
-pub(crate) mod transport;
-pub(crate) mod value_domain;
+//! Runtime-local producer target facts decoded from native plan wire data.
+
+use std::num::NonZeroU32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterProducerTarget {
+    JoinBuildKey {
+        ordinal: usize,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: usize,
+        limit: NonZeroU32,
+    },
+}

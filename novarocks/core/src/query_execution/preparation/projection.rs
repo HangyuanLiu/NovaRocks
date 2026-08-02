@@ -22,10 +22,11 @@ use arrow::datatypes::DataType;
 use super::runtime_filter_binding::RuntimeFilterBindingTable;
 use super::scan::ScanExecutionBindings;
 use crate::runtime::scan_range::ScanRangeParams;
-use crate::runtime_filter::model::graph::RuntimeFilterGraph;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{BoundaryContract, FragmentEdge, FragmentId};
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraph;
+use crate::sql::planner::runtime_filter::sealed::SealedRuntimeFilterPlan;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedOutputColumn {
@@ -122,16 +123,15 @@ struct PreparedPlanProjection {
     topological_fragment_order: Vec<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
-    runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
 }
 
 pub(crate) struct PreparedFragmentSet {
     by_fragment: BTreeMap<FragmentId, PreparedFragment>,
     scan_bindings: ScanExecutionBindings,
     projection: PreparedPlanProjection,
-    // Task 4 consumes the sealed graph at the pre-submit compiler boundary.
-    #[allow(dead_code)]
-    runtime_filter_graph: RuntimeFilterGraph,
+    // The SQL-owned sealed facts are shared with DistributedPlan. This carrier
+    // cannot mutate or reconstruct the query-global graph.
+    runtime_filter_plan: SealedRuntimeFilterPlan,
 }
 
 impl PreparedFragmentSet {
@@ -141,8 +141,7 @@ impl PreparedFragmentSet {
         topological_fragment_order: Vec<FragmentId>,
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
-        runtime_filter_graph: RuntimeFilterGraph,
-        runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
+        runtime_filter_plan: SealedRuntimeFilterPlan,
     ) -> Self {
         Self {
             by_fragment,
@@ -151,9 +150,8 @@ impl PreparedFragmentSet {
                 topological_fragment_order,
                 execution_anchor_fragment_id,
                 edges,
-                runtime_filter_join_progress,
             },
-            runtime_filter_graph,
+            runtime_filter_plan,
         }
     }
 
@@ -178,13 +176,13 @@ impl PreparedFragmentSet {
     }
 
     pub(crate) fn runtime_filter_graph(&self) -> &RuntimeFilterGraph {
-        &self.runtime_filter_graph
+        self.runtime_filter_plan.graph()
     }
 
     pub(crate) fn runtime_filter_join_progress(
         &self,
-    ) -> &crate::sql::planner::distributed::JoinBuildProgressCatalog {
-        &self.projection.runtime_filter_join_progress
+    ) -> &crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog {
+        self.runtime_filter_plan.join_progress()
     }
 }
 
@@ -311,8 +309,11 @@ pub(crate) fn prepared_fragment_set_for_test(
         topological_fragment_order,
         execution_anchor_fragment_id,
         edges,
-        RuntimeFilterGraph::default(),
-        Default::default(),
+        SealedRuntimeFilterPlan::new(
+            RuntimeFilterGraph::default(),
+            Default::default(),
+            Default::default(),
+        ),
     )
 }
 
@@ -327,7 +328,7 @@ pub(crate) fn prepared_fragment_set_with_runtime_filter_for_test(
     execution_anchor_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
     runtime_filter_graph: RuntimeFilterGraph,
-    runtime_filter_join_progress: crate::sql::planner::distributed::JoinBuildProgressCatalog,
+    runtime_filter_join_progress: crate::sql::planner::runtime_filter::progress::JoinBuildProgressCatalog,
 ) -> PreparedFragmentSet {
     let mut prepared = prepared_fragment_set_for_test(
         fragments,
@@ -335,7 +336,10 @@ pub(crate) fn prepared_fragment_set_with_runtime_filter_for_test(
         execution_anchor_fragment_id,
         edges,
     );
-    prepared.runtime_filter_graph = runtime_filter_graph;
-    prepared.projection.runtime_filter_join_progress = runtime_filter_join_progress;
+    prepared.runtime_filter_plan = SealedRuntimeFilterPlan::new(
+        runtime_filter_graph,
+        Default::default(),
+        runtime_filter_join_progress,
+    );
     prepared
 }

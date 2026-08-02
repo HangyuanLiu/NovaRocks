@@ -19,15 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crate::runtime_filter::model::contract::{
-    ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionRequirement,
-    ConsumerActivation, ContributionKind, PlanNodeId, ReductionRequirement,
-    RuntimeFilterLogicalDomain,
-};
-use crate::runtime_filter::model::graph::{
-    ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
-    RuntimeFilterBindingSpec, RuntimeFilterGraph,
-};
+use crate::runtime_filter::deployment::planning_adapter;
 use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ArtifactSchemaDigest};
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, RuntimeOrderContract, RuntimeOrderKey,
@@ -37,6 +29,15 @@ use crate::runtime_filter::port::topk_summary::{
 };
 use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::distributed::{FragmentId, PlanFragment};
+use crate::sql::planner::runtime_filter::contract::{
+    ArtifactCapability, BindingId, ChannelId, ComparatorDigest, CompletionRequirement,
+    ConsumerActivation, ContributionKind, PlanNodeId, ReductionRequirement,
+    RuntimeFilterLogicalDomain,
+};
+use crate::sql::planner::runtime_filter::graph::{
+    ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
+    RuntimeFilterBindingSpec, RuntimeFilterGraph,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterBindingTable {
@@ -329,24 +330,24 @@ fn validate_expression_type(
 fn materialize_contract(
     domain: &RuntimeFilterLogicalDomain,
 ) -> Result<PreparedRuntimeFilterContract, String> {
-    match domain {
-        RuntimeFilterLogicalDomain::Membership {
+    match planning_adapter::logical_domain(domain) {
+        crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::Membership {
             value_type,
             null_semantics,
         } => {
-            let schema = ArtifactMembershipSchema::new(value_type, *null_semantics)
+            let schema = ArtifactMembershipSchema::new(&value_type, null_semantics)
                 .map_err(|error| format!("membership schema error: {error}"))?;
             Ok(PreparedRuntimeFilterContract::Membership {
                 canonical_schema: Arc::from(schema.canonical_bytes()),
                 schema_digest: schema.digest(),
             })
         }
-        RuntimeFilterLogicalDomain::OrderedBound(plan) => {
-            let contract = RuntimeOrderContract::try_from_plan(plan)
+        crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound(plan) => {
+            let contract = RuntimeOrderContract::try_from_plan(&plan)
                 .map_err(|error| format!("order contract error: {error:?}"))?;
             Ok(PreparedRuntimeFilterContract::Ordered {
                 keys: Arc::from(contract.keys()),
-                comparator_digest: contract.plan_comparator_digest(),
+                comparator_digest: ComparatorDigest::new(contract.plan_comparator_digest().get()),
                 order_contract_digest: contract.digest(),
             })
         }
@@ -357,16 +358,23 @@ fn materialize_reduction(
     domain: &RuntimeFilterLogicalDomain,
     reduction: ReductionRequirement,
 ) -> Result<PreparedReductionContract, String> {
-    match reduction {
-        ReductionRequirement::SetUnion => Ok(PreparedReductionContract::SetUnion),
-        ReductionRequirement::TightenOrderedBound => {
+    match planning_adapter::reduction(reduction) {
+        crate::runtime_filter::model::contract::ReductionRequirement::SetUnion => {
+            Ok(PreparedReductionContract::SetUnion)
+        }
+        crate::runtime_filter::model::contract::ReductionRequirement::TightenOrderedBound => {
             Ok(PreparedReductionContract::TightenOrderedBound)
         }
-        ReductionRequirement::MergeTopKSummary(requirement) => {
-            let RuntimeFilterLogicalDomain::OrderedBound(order) = domain else {
+        crate::runtime_filter::model::contract::ReductionRequirement::MergeTopKSummary(
+            requirement,
+        ) => {
+            let crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound(
+                order,
+            ) = planning_adapter::logical_domain(domain)
+            else {
                 return Err("MergeTopKSummary requires an ordered domain".to_string());
             };
-            let contract = RuntimeTopKSummaryContract::try_from_plan(order, requirement)
+            let contract = RuntimeTopKSummaryContract::try_from_plan(&order, requirement)
                 .map_err(|error| format!("TopK summary contract error: {error:?}"))?;
             Ok(PreparedReductionContract::MergeTopKSummary {
                 k: contract.k(),
@@ -383,23 +391,8 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::runtime_filter::model::contract::{
-        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
-        ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
-        OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
-        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
-        SortDirection, TopKSummaryRequirement,
-    };
-    use crate::runtime_filter::model::coverage::Coverage;
-    use crate::runtime_filter::model::graph::{
-        ApplyPoint, ConsumerRequirement, PlanLocation, ProducerRequirement,
-        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
-    };
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
-    use crate::runtime_filter::port::ordered_bound::{
-        COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
-    };
+    use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
     use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
     use crate::sql::analysis::{ExprKind, LiteralValue};
     use crate::sql::planner::distributed::{
@@ -407,6 +400,20 @@ mod tests {
     };
     use crate::sql::planner::payload::PlanValuesNode;
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
+    use crate::sql::planner::runtime_filter::comparator::comparator_digest_for_plan;
+    use crate::sql::planner::runtime_filter::contract::{
+        ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
+        ContributionKind, CoverageWitnessId, LateApplyGranularity, NullOrder, NullSemantics,
+        OrderContract, OrderKeyContract, PlanFragmentId, PlanNodeId, ReductionRequirement,
+        RuntimeFilterLifecycle, RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+        SortDirection, TopKSummaryRequirement,
+    };
+    use crate::sql::planner::runtime_filter::coverage::Coverage;
+    use crate::sql::planner::runtime_filter::graph::{
+        ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
+        RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
+        RuntimeFilterGraph,
+    };
 
     fn expression(value: i64) -> TypedExpr {
         TypedExpr {
@@ -544,7 +551,7 @@ mod tests {
             null_order: NullOrder::First,
         }];
         OrderContract {
-            comparator_digest: comparator_digest_for_test(&keys, COMPARATOR_ALGORITHM_VERSION),
+            comparator_digest: comparator_digest_for_plan(&keys).expect("supported order"),
             keys,
             inclusive: true,
         }
@@ -617,7 +624,7 @@ mod tests {
                 activation: ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                target: crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary,
+                target: ConsumerBindingTarget::SourceBoundary,
             }),
         }
     }
@@ -834,8 +841,11 @@ mod tests {
             &[fragment(1, node(1, 10, vec![binding_id]))],
         )
         .unwrap();
-        let expected =
-            ArtifactMembershipSchema::new(&DataType::Int64, NullSemantics::NeverMatches).unwrap();
+        let expected = ArtifactMembershipSchema::new(
+            &DataType::Int64,
+            crate::runtime_filter::model::contract::NullSemantics::NeverMatches,
+        )
+        .unwrap();
         let PreparedRuntimeFilterContract::Membership {
             canonical_schema,
             schema_digest,
@@ -852,7 +862,16 @@ mod tests {
         let channel_id = ChannelId::new(9);
         let binding_id = BindingId::new(7);
         let order = order_contract();
-        let expected = RuntimeOrderContract::try_from_plan(&order).unwrap();
+        let runtime_order = planning_adapter::logical_domain(
+            &RuntimeFilterLogicalDomain::OrderedBound(order.clone()),
+        );
+        let crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound(
+            runtime_order,
+        ) = runtime_order
+        else {
+            unreachable!("fixture creates an ordered contract")
+        };
+        let expected = RuntimeOrderContract::try_from_plan(&runtime_order).unwrap();
         let graph = graph_with(
             vec![channel(
                 channel_id,
@@ -875,7 +894,10 @@ mod tests {
             panic!("ordered channel must materialize an ordered contract");
         };
         assert_eq!(keys.as_ref(), expected.keys());
-        assert_eq!(*comparator_digest, expected.plan_comparator_digest());
+        assert_eq!(
+            *comparator_digest,
+            ComparatorDigest::new(expected.plan_comparator_digest().get())
+        );
         assert_eq!(*order_contract_digest, expected.digest());
     }
 
@@ -883,8 +905,20 @@ mod tests {
     fn preparation_preserves_set_union_tighten_and_topk_k_plus_digest() {
         let order = order_contract();
         let topk_requirement = TopKSummaryRequirement::try_new(13).unwrap();
-        let expected_topk =
-            RuntimeTopKSummaryContract::try_from_plan(&order, topk_requirement).unwrap();
+        let runtime_order = planning_adapter::logical_domain(
+            &RuntimeFilterLogicalDomain::OrderedBound(order.clone()),
+        );
+        let crate::runtime_filter::model::contract::RuntimeFilterLogicalDomain::OrderedBound(
+            runtime_order,
+        ) = runtime_order
+        else {
+            unreachable!("fixture creates an ordered contract")
+        };
+        let expected_topk = RuntimeTopKSummaryContract::try_from_plan(
+            &runtime_order,
+            crate::runtime_filter::model::contract::TopKSummaryRequirement::try_new(13).unwrap(),
+        )
+        .unwrap();
         let channel_ids = [ChannelId::new(1), ChannelId::new(2), ChannelId::new(3)];
         let binding_ids = [BindingId::new(1), BindingId::new(2), BindingId::new(3)];
         let graph = graph_with(

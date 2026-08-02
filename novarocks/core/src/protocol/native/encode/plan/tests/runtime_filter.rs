@@ -23,10 +23,10 @@ use super::super::runtime_filter::{
     encode_runtime_filter_producer_target, encode_runtime_filter_topk_reduction,
 };
 use super::*;
+use crate::runtime_filter::deployment::planning_adapter;
 use crate::runtime_filter::model::contract::{
     NullOrder, OrderContract, OrderKeyContract, SortDirection, TopKSummaryRequirement,
 };
-use crate::runtime_filter::model::graph::ProducerBindingTarget;
 use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
 use crate::sql::analysis::{ExprKind, TypedExpr};
@@ -35,6 +35,8 @@ use crate::sql::planner::physical::runtime_filter::{
     RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
 use crate::sql::planner::physical::{JoinExecutionMode, PhysicalPlanKind};
+use crate::sql::planner::runtime_filter::contract::BindingId;
+use crate::sql::planner::runtime_filter::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
 
 #[test]
 fn full_plan_encoding_requires_prepared_runtime_filter_binding_tables() {
@@ -250,9 +252,7 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
     for binding in &encoded_bindings {
         let source = distributed
             .runtime_filter_graph()
-            .binding(crate::runtime_filter::model::contract::BindingId::new(
-                binding.binding_id,
-            ))
+            .binding(BindingId::new(binding.binding_id))
             .expect("encoded binding originates in the sealed graph");
         assert_eq!(binding.channel_id, source.channel_id.get());
         assert_eq!(binding.node_id, source.location.node_id.get());
@@ -282,9 +282,7 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
         match (binding.role.as_ref().expect("binding role"), &source.role) {
             (
                 plan::runtime_filter_binding::Role::Producer(role),
-                crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Producer(
-                    source_role,
-                ),
+                RuntimeFilterBindingRole::Producer(source_role),
             ) => {
                 producer_count += 1;
                 assert_eq!(
@@ -293,19 +291,23 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
                         .contribution_kinds
                         .iter()
                         .copied()
+                        .map(|kind| planning_adapter::contribution_kinds(
+                            &std::collections::BTreeSet::from([kind])
+                        ))
+                        .flat_map(|kinds| kinds.into_iter())
                         .map(encode_runtime_filter_contribution_kind)
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
                     role.completion_requirement,
-                    encode_runtime_filter_completion(source_role.completion_requirement)
+                    encode_runtime_filter_completion(planning_adapter::completion(
+                        source_role.completion_requirement,
+                    ))
                 );
             }
             (
                 plan::runtime_filter_binding::Role::Consumer(role),
-                crate::runtime_filter::model::graph::RuntimeFilterBindingRole::Consumer(
-                    source_role,
-                ),
+                RuntimeFilterBindingRole::Consumer(source_role),
             ) => {
                 consumer_count += 1;
                 assert_eq!(
@@ -314,12 +316,18 @@ fn native_encoder_round_trips_all_binding_roles_contracts_and_locations() {
                         .capabilities
                         .iter()
                         .copied()
+                        .map(|capability| planning_adapter::capabilities(
+                            &std::collections::BTreeSet::from([capability])
+                        ))
+                        .flat_map(|capabilities| capabilities.into_iter())
                         .map(encode_runtime_filter_capability)
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
                     role.activation,
-                    Some(encode_runtime_filter_activation(source_role.activation))
+                    Some(encode_runtime_filter_activation(
+                        planning_adapter::activation(source_role.activation,)
+                    ))
                 );
             }
             _ => panic!("encoded binding role must match the sealed graph role"),

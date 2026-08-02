@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::novarocks_logging::debug;
 use crate::sql::planner::runtime_filter::contract::{BindingId, ChannelId, CompletionRequirement};
-use crate::sql::planner::runtime_filter::graph::{RuntimeFilterBindingRoleData, RuntimeFilterGraphData};
+use crate::sql::planner::runtime_filter::graph::{
+    RuntimeFilterBindingRoleData, RuntimeFilterGraphData,
+};
 use crate::sql::planner::runtime_filter::progress::{
     JoinBuildProgressCatalog, JoinBuildProgressProof, JoinBuildProgressSkip,
 };
@@ -778,6 +780,7 @@ mod tests {
         RefinedFragmentEdge, RefinedWaitGraph, WaitEdgeKind, WaitGraph, WaitNode, WaitProvenance,
         add_wait_edge, build_refined_wait_graph,
     };
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::planner::runtime_filter::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ConsumerActivation,
         ContributionKind, CoverageWitnessId, NullSemantics, PlanFragmentId, PlanNodeId,
@@ -794,7 +797,6 @@ mod tests {
         FrontierEdge, FrontierSkip, JoinBuildProgressCatalog, JoinBuildProgressProof,
         JoinBuildProgressSkip,
     };
-    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
     fn edge(
         source_fragment: u32,

@@ -122,7 +122,11 @@ mod tests {
 
     use super::*;
 
-    fn key(data_type: DataType, direction: SortDirection, null_order: NullOrder) -> OrderKeyContract {
+    fn key(
+        data_type: DataType,
+        direction: SortDirection,
+        null_order: NullOrder,
+    ) -> OrderKeyContract {
         OrderKeyContract {
             data_type,
             direction,

@@ -20,11 +20,6 @@ use std::{collections::HashMap, fmt::Write};
 use arrow::datatypes::DataType;
 
 use crate::query_execution::profile::{ActualMetrics, DistributedProfileSummary};
-use crate::runtime_filter::model::contract::{
-    ConsumerActivation, LateApplyGranularity, NullOrder, NullSemantics, RuntimeFilterLogicalDomain,
-    SortDirection,
-};
-use crate::runtime_filter::model::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ScanVariantColumn;
@@ -51,6 +46,11 @@ use crate::sql::planner::physical::{
     PhysicalPlanStats, PhysicalSetOpNode, PhysicalTopNNode, PlanSetOpKind as SetOpKind,
     PlannerBroadcastDecision, PlannerConfidence, PlannerCostEstimate, TopNPhase,
 };
+use crate::sql::planner::runtime_filter::contract::{
+    ConsumerActivation, LateApplyGranularity, NullOrder, NullSemantics, RuntimeFilterLogicalDomain,
+    SortDirection,
+};
+use crate::sql::planner::runtime_filter::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
 use crate::sql::planner::table::{ScanSource, TableDef};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {

@@ -17,26 +17,23 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::runtime_filter::model::contract::{
+use crate::sql::analysis::expr_display::typed_expr_display_name;
+use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::planner::runtime_filter::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
     CoverageWitnessId, LateApplyGranularity, NullSemantics, OrderContract, OrderKeyContract,
     PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
     RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
 };
-use crate::runtime_filter::model::coverage::Coverage;
-use crate::runtime_filter::model::graph::{
+use crate::sql::planner::runtime_filter::coverage::Coverage;
+use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
     ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
     RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
 };
-use crate::sql::analysis::expr_display::typed_expr_display_name;
-use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
-use crate::sql::column_id::ColumnId;
 
-use crate::runtime_filter::port::ordered_bound::comparator_digest_for_plan;
-use crate::sql::planner::distributed::activation_decision::{
-    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph, RequiredLiveReason,
-};
+use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
 use crate::sql::planner::distributed::{
     DistributedNode, DistributedNodeKind, FragmentId, PlanFragment,
 };
@@ -45,6 +42,10 @@ use crate::sql::planner::physical::runtime_filter::{
     RuntimeFilterProbeIntent,
 };
 use crate::sql::planner::physical::{PhysicalPlanKind, PhysicalPlanNode};
+use crate::sql::planner::runtime_filter::activation::{
+    ActivationConstraint, ActivationFallback, RequiredLiveReason,
+};
+use crate::sql::planner::runtime_filter::comparator::comparator_digest_for_plan;
 
 #[derive(Clone)]
 pub(super) struct RuntimeFilterBuildBinding {
@@ -1020,16 +1021,11 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
+    use crate::runtime_filter::deployment::planning_adapter as planning;
     use crate::runtime_filter::deployment::role_graph::{
         ChannelRoleGraph, ChannelRoleInputs, ConsumerPlacement, ProducerPlacement,
         RouteEdgeAllocator, RouteKind, build_channel_role_graph,
     };
-    use crate::runtime_filter::model::contract::{
-        ComparatorDigest, CompletionFenceKind, ConsumerActivation, LateApplyGranularity, NullOrder,
-        OrderContract, OrderKeyContract, SortDirection,
-    };
-    use crate::runtime_filter::model::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
-    use crate::runtime_filter::model::validation::GraphValidationErrorKind;
     use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
     use crate::sql::analysis::{ExprKind, LiteralValue};
     use crate::sql::planner::distributed::{
@@ -1040,6 +1036,14 @@ mod tests {
         AggMode, AggregateOutputLayout, PhysicalHashAggregateNode, PhysicalPlanStats,
         PhysicalSetOpNode, PlanSetOpKind, PlannerConfidence,
     };
+    use crate::sql::planner::runtime_filter::contract::{
+        ComparatorDigest, CompletionFenceKind, ConsumerActivation, LateApplyGranularity, NullOrder,
+        OrderContract, OrderKeyContract, SortDirection,
+    };
+    use crate::sql::planner::runtime_filter::graph::{
+        RuntimeFilterBindingRole, RuntimeFilterGraph,
+    };
+    use crate::sql::planner::runtime_filter::validation::GraphValidationErrorKind;
 
     use super::*;
 
@@ -1213,17 +1217,17 @@ mod tests {
             .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Consumer(_)))
             .expect("consumer binding");
         let inputs = ChannelRoleInputs {
-            channel_id: channel.channel_id,
-            availability_coverage: channel.availability_coverage.clone(),
+            channel_id: planning::channel_id(channel.channel_id),
+            availability_coverage: planning::coverage(&channel.availability_coverage),
             producers: vec![ProducerPlacement {
-                binding: producer.binding_id,
+                binding: planning::binding_id(producer.binding_id),
                 participants: BTreeSet::from([
                     RuntimeFilterParticipantId::new(1),
                     RuntimeFilterParticipantId::new(3),
                 ]),
             }],
             consumers: vec![ConsumerPlacement {
-                binding: consumer.binding_id,
+                binding: planning::binding_id(consumer.binding_id),
                 participants: BTreeSet::from([RuntimeFilterParticipantId::new(2)]),
             }],
         };

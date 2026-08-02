@@ -18,6 +18,7 @@
 pub(crate) mod compiler;
 pub(crate) mod extension;
 pub(crate) mod install_validation;
+pub(crate) mod planning_adapter;
 pub(crate) mod role_graph;
 pub(crate) mod routing_shard;
 pub(crate) mod shard;
@@ -30,7 +31,6 @@ use std::time::Duration;
 use crate::common::types::UniqueId;
 use crate::runtime_filter::deployment::role_graph::RoleGraph;
 use crate::runtime_filter::model::contract::{BindingId, ChannelId, PlanFragmentId};
-use crate::runtime_filter::model::validation::GraphValidationError;
 use crate::runtime_filter::port::artifact::ArtifactContractError;
 use crate::runtime_filter::port::identity::{
     DeploymentEpoch, RouteEdgeId, RuntimeFilterParticipantId,
@@ -39,6 +39,7 @@ use crate::runtime_filter::port::install::{
     MaterializationPolicy, RuntimeFilterCoreBudget, RuntimeFilterInstallView,
 };
 use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+use crate::sql::planner::runtime_filter::validation::GraphValidationError;
 
 /// Deployment-time resource / routing policy. Read-only input to the compiler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

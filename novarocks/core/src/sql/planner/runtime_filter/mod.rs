@@ -16,6 +16,7 @@
 // under the License.
 
 //! SQL-private runtime-filter planning algebra.
+// Design: ADR-0027 (docs/adr/ADR-0027-sql-runtime-filter-planning-ownership.md)
 //!
 //! This module owns the planner's declarative graph, activation and progress
 //! proofs. Runtime installation, transport and execution consume only typed

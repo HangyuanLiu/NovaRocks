@@ -30,7 +30,6 @@ use crate::runtime_filter::model::contract::{
     OrderKeyContract, ReductionRequirement, RuntimeFilterLogicalDomain, SortDirection,
     TopKSummaryRequirement,
 };
-use crate::runtime_filter::model::graph::{ApplyPoint, ProducerBindingTarget};
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::ordered_bound::{
     OrderContractDigest, RuntimeOrderContract, RuntimeOrderKey,
@@ -38,6 +37,8 @@ use crate::runtime_filter::port::ordered_bound::{
 use crate::runtime_filter::port::topk_summary::{
     RuntimeTopKSummaryContract, TopKSummaryContractDigest,
 };
+use crate::sql::planner::runtime_filter::contract as sql_contract;
+use crate::sql::planner::runtime_filter::graph::{ApplyPoint, ProducerBindingTarget};
 
 pub(super) fn encode_runtime_filter_binding_table(
     enclosing_fragment_id: crate::sql::planner::distributed::FragmentId,
@@ -81,9 +82,9 @@ fn encode_runtime_filter_binding(
             contribution_kinds: contribution_kinds
                 .iter()
                 .copied()
-                .map(encode_runtime_filter_contribution_kind)
+                .map(encode_sql_runtime_filter_contribution_kind)
                 .collect(),
-            completion_requirement: encode_runtime_filter_completion(*completion_requirement),
+            completion_requirement: encode_sql_runtime_filter_completion(*completion_requirement),
             target: Some(encode_runtime_filter_producer_target(
                 binding.binding_id().get(),
                 *target,
@@ -97,11 +98,11 @@ fn encode_runtime_filter_binding(
             capabilities: capabilities
                 .iter()
                 .copied()
-                .map(encode_runtime_filter_capability)
+                .map(encode_sql_runtime_filter_capability)
                 .collect(),
-            activation: Some(encode_runtime_filter_activation(*activation)),
+            activation: Some(encode_sql_runtime_filter_activation(*activation)),
             target: Some(match target {
-                crate::runtime_filter::model::graph::ConsumerBindingTarget::DirectInput {
+                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::DirectInput {
                     input_ordinal,
                 } => plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(
                     u32::try_from(*input_ordinal).map_err(|_| {
@@ -111,7 +112,7 @@ fn encode_runtime_filter_binding(
                         )
                     })?,
                 ),
-                crate::runtime_filter::model::graph::ConsumerBindingTarget::SourceBoundary => {
+                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary => {
                     plan::runtime_filter_consumer_role::Target::SourceBoundary(true)
                 }
             }),
@@ -161,6 +162,26 @@ pub(in crate::protocol::native) fn encode_runtime_filter_producer_target(
     })
 }
 
+#[cfg(test)]
+pub(in crate::protocol::native) fn encode_runtime_filter_runtime_producer_target(
+    binding_id: u32,
+    target: crate::runtime_filter::port::binding::RuntimeFilterProducerTarget,
+) -> Result<plan::runtime_filter_producer_role::Target, String> {
+    let target = match target {
+        crate::runtime_filter::port::binding::RuntimeFilterProducerTarget::JoinBuildKey {
+            ordinal,
+        } => ProducerBindingTarget::JoinBuildKey { ordinal },
+        crate::runtime_filter::port::binding::RuntimeFilterProducerTarget::AggregateTopNKey {
+            group_key_ordinal,
+            limit,
+        } => ProducerBindingTarget::AggregateTopNKey {
+            group_key_ordinal,
+            limit,
+        },
+    };
+    encode_runtime_filter_producer_target(binding_id, target)
+}
+
 fn encode_runtime_filter_contract(
     binding: &PreparedRuntimeFilterBinding,
 ) -> Result<plan::RuntimeFilterContract, String> {
@@ -182,7 +203,7 @@ fn encode_runtime_filter_contract(
         } => Kind::Ordered(encode_runtime_filter_ordered_contract(
             binding.binding_id().get(),
             keys,
-            *comparator_digest,
+            ComparatorDigest::new(comparator_digest.get()),
             *order_contract_digest,
         )?),
     };
@@ -364,7 +385,7 @@ fn encode_runtime_filter_reduction(
             Kind::MergeTopkSummary(encode_runtime_filter_topk_reduction(
                 binding.binding_id().get(),
                 keys,
-                *comparator_digest,
+                ComparatorDigest::new(comparator_digest.get()),
                 *k,
                 *contract_digest,
             )?)
@@ -417,6 +438,54 @@ pub(super) fn encode_runtime_filter_apply_point(value: ApplyPoint) -> i32 {
         ApplyPoint::NodeInput => i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
         ApplyPoint::NodeOutput => i32::from(plan::RuntimeFilterApplyPoint::NodeOutput),
     }
+}
+
+fn encode_sql_runtime_filter_contribution_kind(value: sql_contract::ContributionKind) -> i32 {
+    encode_runtime_filter_contribution_kind(match value {
+        sql_contract::ContributionKind::ValueDomainDelta => ContributionKind::ValueDomainDelta,
+        sql_contract::ContributionKind::FinalDomainShard => ContributionKind::FinalDomainShard,
+        sql_contract::ContributionKind::OrderedBoundUpdate => ContributionKind::OrderedBoundUpdate,
+        sql_contract::ContributionKind::TopKSummary => ContributionKind::TopKSummary,
+        sql_contract::ContributionKind::ProducerClosed => ContributionKind::ProducerClosed,
+    })
+}
+
+fn encode_sql_runtime_filter_completion(value: sql_contract::CompletionRequirement) -> i32 {
+    encode_runtime_filter_completion(match value {
+        sql_contract::CompletionRequirement::ProducerClosed => {
+            CompletionRequirement::ProducerClosed
+        }
+        sql_contract::CompletionRequirement::FencedFinalDomain(
+            sql_contract::CompletionFenceKind::CommittedDomainFrozen,
+        ) => CompletionRequirement::FencedFinalDomain(CompletionFenceKind::CommittedDomainFrozen),
+    })
+}
+
+fn encode_sql_runtime_filter_capability(value: sql_contract::ArtifactCapability) -> i32 {
+    encode_runtime_filter_capability(match value {
+        sql_contract::ArtifactCapability::Membership => ArtifactCapability::Membership,
+        sql_contract::ArtifactCapability::OrderedRange => ArtifactCapability::OrderedRange,
+        sql_contract::ArtifactCapability::EmptyDomain => ArtifactCapability::EmptyDomain,
+    })
+}
+
+fn encode_sql_runtime_filter_activation(
+    value: sql_contract::ConsumerActivation,
+) -> plan::RuntimeFilterConsumerActivation {
+    encode_runtime_filter_activation(match value {
+        sql_contract::ConsumerActivation::BlockingSnapshot => ConsumerActivation::BlockingSnapshot,
+        sql_contract::ConsumerActivation::NonBlockingLive { late_apply } => {
+            ConsumerActivation::NonBlockingLive {
+                late_apply: match late_apply {
+                    sql_contract::LateApplyGranularity::Row => LateApplyGranularity::Row,
+                    sql_contract::LateApplyGranularity::Batch => LateApplyGranularity::Batch,
+                    sql_contract::LateApplyGranularity::RowGroup => LateApplyGranularity::RowGroup,
+                    sql_contract::LateApplyGranularity::Split => LateApplyGranularity::Split,
+                    sql_contract::LateApplyGranularity::File => LateApplyGranularity::File,
+                },
+            }
+        }
+    })
 }
 
 pub(in crate::protocol::native) fn encode_runtime_filter_contribution_kind(

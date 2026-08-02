@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::runtime_filter::model::graph::RuntimeFilterBindingRole;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind, OutputColumn};
@@ -34,6 +33,7 @@ use crate::sql::planner::physical::{
     DistributedChangeEventExpandNode, DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
     PhysicalPlanKind, PhysicalPlanStats, PlannerConfidence, PreExpandKeyedAssertSpec,
 };
+use crate::sql::planner::runtime_filter::graph::RuntimeFilterBindingRole;
 use arrow::datatypes::DataType;
 use std::collections::HashMap;
 use std::sync::Arc;

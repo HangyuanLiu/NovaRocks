@@ -17,9 +17,11 @@
 
 mod activation_decision;
 #[cfg(test)]
-pub(crate) use activation_decision::{
-    ActivationConstraint, ActivationFallback, DraftRuntimeFilterGraph, RequiredLiveReason,
+pub(crate) use crate::sql::planner::runtime_filter::activation::{
+    ActivationConstraint, ActivationFallback, RequiredLiveReason,
 };
+#[cfg(test)]
+pub(crate) use activation_decision::DraftRuntimeFilterGraph;
 pub(crate) mod boundary;
 pub(crate) mod build;
 mod fragment;
