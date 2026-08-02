@@ -261,10 +261,21 @@ impl FrontendTableMaintenanceService {
                 })
             }
             Err(error) => {
-                self.block_on(repository.fail(durable_id, error.clone(), now_unix_millis()))
-                    .map_err(|store| {
-                        format!("record metadata maintenance failure failed: {store}")
-                    })?;
+                // The engine-facing compatibility port deliberately does not
+                // claim that a provider error happened before dispatch.
+                // Preserve the operation fence and opaque evidence for an
+                // exact-generation reconcile owner.
+                let evidence = error.as_bytes().to_vec();
+                self.block_on(repository.mark_reconcile_pending(
+                    durable_id,
+                    MetadataMaintenanceOpaquePayload {
+                        digest: metadata_maintenance_payload_digest(&evidence),
+                        payload: evidence,
+                    },
+                ))
+                .map_err(|store| {
+                    format!("record metadata maintenance reconcile state failed: {store}")
+                })?;
                 Err(error)
             }
         }
