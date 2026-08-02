@@ -67,6 +67,7 @@ pub(crate) mod mv_first_refresh_staging;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
 pub(crate) mod mv_rewrite_prep;
+pub(crate) mod query_planning;
 pub(crate) mod query_prep;
 mod query_stats;
 pub(crate) mod statement;
@@ -4995,7 +4996,9 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            execution.cancellation().clone(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
         ),
     );
     let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
@@ -5112,7 +5115,9 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            execution.cancellation().clone(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
         ),
     );
     let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
@@ -5794,7 +5799,9 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            execution.cancellation().clone(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
         ),
     );
     let request = match imv_rewrite {
@@ -5959,12 +5966,14 @@ fn prepare_query_with_sql_compiler_kernel(
             .map(|snapshot| snapshot as &dyn crate::sql::compiler::SqlMvRewriteSnapshot),
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            execution.cancellation().clone(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
         ),
     );
-    let planning_inputs = crate::sql::compiler::QueryPlanningInputs {
+    let planning_inputs = crate::engine::query_planning::QueryPlanningInputs {
         compile_request: compiler_request,
-        post_compile: crate::sql::compiler::PostCompilePlanningContext {
+        post_compile: crate::engine::query_planning::PostCompilePlanningContext {
             table_bindings,
             connector_controls: state.connector_control.as_ref(),
             connector_context,
@@ -6045,7 +6054,7 @@ fn explain_query_with_sql_compiler_kernel(
             analyze: false,
         }
     };
-    let planning_inputs = crate::sql::compiler::QueryPlanningInputs {
+    let planning_inputs = crate::engine::query_planning::QueryPlanningInputs {
         compile_request: crate::sql::compiler::SqlCompileRequest::new(
             crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
             intent,
@@ -6061,10 +6070,12 @@ fn explain_query_with_sql_compiler_kernel(
             Some(&mv_definitions),
             crate::sql::compiler::SqlCompileControl::new(
                 execution.deadline(),
-                execution.cancellation().clone(),
+                crate::engine::query_planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
             ),
         ),
-        post_compile: crate::sql::compiler::PostCompilePlanningContext {
+        post_compile: crate::engine::query_planning::PostCompilePlanningContext {
             table_bindings,
             connector_controls: state.connector_control.as_ref(),
             connector_context,

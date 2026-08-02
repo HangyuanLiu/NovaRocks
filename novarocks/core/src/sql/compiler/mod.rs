@@ -26,9 +26,17 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::query_execution::cancellation::QueryCancellationView;
 use crate::sql::explain::ExplainLevel;
 use crate::sql::optimizer::options::SessionOptimizerSettings;
+
+/// SQL's read-only observation of statement cancellation.
+///
+/// The application owns cancellation reasons and sources.  Compiler phases
+/// only need this single immutable fact, so the SQL boundary never imports
+/// query-lifecycle cancellation state.
+pub(crate) trait SqlCancellationObservation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
 
 /// A narrow catalog capability available to one compiler request.
 ///
@@ -200,11 +208,14 @@ pub(crate) enum SqlPlanningEnvironment {
 #[derive(Clone)]
 pub(crate) struct SqlCompileControl {
     deadline: Option<Instant>,
-    cancellation: QueryCancellationView,
+    cancellation: Arc<dyn SqlCancellationObservation>,
 }
 
 impl SqlCompileControl {
-    pub(crate) fn new(deadline: Option<Instant>, cancellation: QueryCancellationView) -> Self {
+    pub(crate) fn new(
+        deadline: Option<Instant>,
+        cancellation: Arc<dyn SqlCancellationObservation>,
+    ) -> Self {
         Self {
             deadline,
             cancellation,
@@ -274,23 +285,6 @@ impl<'a> SqlCompileRequest<'a> {
         self.imv_rewrite = Some(input);
         self
     }
-}
-
-/// Application-owned facts used only after SQL has produced a plan.  Keeping
-/// this separate makes it impossible for parse/analyze/optimize to reach a
-/// connector registry, native encoder, or query lifecycle object.
-pub(crate) struct PostCompilePlanningContext<'a> {
-    pub(crate) table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
-    pub(crate) connector_controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
-    pub(crate) connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
-}
-
-/// One application admission's complete planning input.  The exact binding
-/// store is deliberately shared by compiler catalog/statistics input and
-/// post-compile scan preparation.
-pub(crate) struct QueryPlanningInputs<'a> {
-    pub(crate) compile_request: SqlCompileRequest<'a>,
-    pub(crate) post_compile: PostCompilePlanningContext<'a>,
 }
 
 pub(crate) struct SqlAnalysisOutput {
@@ -596,9 +590,9 @@ fn apply_planning_environment(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-
-    use crate::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 
     use super::*;
 
@@ -643,6 +637,28 @@ mod tests {
     static STATISTICS: Statistics = Statistics;
     static FUNCTIONS: Functions = Functions;
 
+    #[derive(Default)]
+    struct Cancellation(AtomicBool);
+
+    impl Cancellation {
+        fn request(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    impl SqlCancellationObservation for Cancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    fn control(deadline: Option<Instant>, cancellation: &Arc<Cancellation>) -> SqlCompileControl {
+        SqlCompileControl::new(
+            deadline,
+            Arc::clone(cancellation) as Arc<dyn SqlCancellationObservation>,
+        )
+    }
+
     fn request(control: SqlCompileControl) -> SqlCompileRequest<'static> {
         SqlCompileRequest::new(
             SqlStatementInput::Sql("select 1".to_string()),
@@ -664,9 +680,9 @@ mod tests {
     }
 
     #[test]
-    fn sqlx1_request_keeps_named_capabilities_without_application_context() {
-        let cancellation = QueryCancellationSource::new();
-        let request = request(SqlCompileControl::new(None, cancellation.view()));
+    fn sqlx2_request_keeps_sql_owned_cancellation_observation() {
+        let cancellation = Arc::new(Cancellation::default());
+        let request = request(control(None, &cancellation));
         assert_eq!(request.check_control(), Ok(()));
         assert!(matches!(
             request.environment,
@@ -675,32 +691,29 @@ mod tests {
     }
 
     #[test]
-    fn sqlx1_request_rejects_cancelled_control_before_compilation() {
-        let cancellation = QueryCancellationSource::new();
-        cancellation.request(QueryCancellationReason::ServerShutdown);
+    fn sqlx2_request_rejects_cancelled_control_before_compilation() {
+        let cancellation = Arc::new(Cancellation::default());
+        cancellation.request();
         assert!(matches!(
-            SqlCompiler::compile(request(SqlCompileControl::new(None, cancellation.view()))),
+            SqlCompiler::compile(request(control(None, &cancellation))),
             Err(SqlCompileError::Cancelled)
         ));
     }
 
     #[test]
-    fn sqlx1_request_rejects_expired_deadline_before_compilation() {
-        let cancellation = QueryCancellationSource::new();
+    fn sqlx2_request_rejects_expired_deadline_before_compilation() {
+        let cancellation = Arc::new(Cancellation::default());
         let deadline = Instant::now() - Duration::from_millis(1);
         assert!(matches!(
-            SqlCompiler::compile(request(SqlCompileControl::new(
-                Some(deadline),
-                cancellation.view(),
-            ))),
+            SqlCompiler::compile(request(control(Some(deadline), &cancellation))),
             Err(SqlCompileError::DeadlineExceeded)
         ));
     }
 
     #[test]
-    fn sqlx1_request_models_metadata_planning_without_a_fake_backend() {
-        let cancellation = QueryCancellationSource::new();
-        let mut request = request(SqlCompileControl::new(None, cancellation.view()));
+    fn sqlx2_request_models_metadata_planning_without_a_fake_backend() {
+        let cancellation = Arc::new(Cancellation::default());
+        let mut request = request(control(None, &cancellation));
         request.environment = SqlPlanningEnvironment::NotApplicable;
         assert_eq!(request.check_control(), Ok(()));
     }
@@ -709,7 +722,7 @@ mod tests {
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
         let catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = Arc::new(Cancellation::default());
         let request = SqlCompileRequest::new(
             SqlStatementInput::Sql("select 1".to_string()),
             SqlCompileIntent::Query,
@@ -725,7 +738,7 @@ mod tests {
             &STATISTICS,
             crate::sql::functions::builtin_sql_function_catalog(),
             None,
-            SqlCompileControl::new(None, cancellation.view()),
+            control(None, &cancellation),
         );
 
         assert!(matches!(
@@ -753,7 +766,7 @@ mod tests {
     fn sqlx1_kernel_write_root_requirement_is_validated_in_sql() {
         let catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
-        let cancellation = QueryCancellationSource::new();
+        let cancellation = Arc::new(Cancellation::default());
         let request = SqlCompileRequest::new(
             SqlStatementInput::Sql("select 1 as payload".to_string()),
             SqlCompileIntent::IcebergWrite {
@@ -773,7 +786,7 @@ mod tests {
             &STATISTICS,
             crate::sql::functions::builtin_sql_function_catalog(),
             None,
-            SqlCompileControl::new(None, cancellation.view()),
+            control(None, &cancellation),
         );
         assert!(matches!(
             SqlCompiler::compile(request),
