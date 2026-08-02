@@ -23,7 +23,12 @@ use std::sync::Arc;
 
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_table_target;
-use crate::sql::analyzer::iceberg_ref::resolve_read_binding;
+use crate::engine::statement::parse_add_files_sql;
+use crate::runtime::query_result::build_string_query_result;
+use crate::sql::analyzer::iceberg_ref::{
+    IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
+    resolve_read_binding,
+};
 use crate::sql::parser::ast::ObjectName;
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
@@ -60,6 +65,109 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
     }
 }
 
+/// Project provider metadata into the immutable facts required by SQL
+/// time-travel analysis.  This conversion is intentionally application-owned:
+/// the compiler never receives an Iceberg `TableMetadata` object.
+fn project_iceberg_ref_metadata(metadata: &iceberg::spec::TableMetadata) -> SqlIcebergRefMetadata {
+    let refs = metadata
+        .refs()
+        .iter()
+        .map(|(name, reference)| {
+            let kind = match reference.retention {
+                iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
+                iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
+            };
+            (
+                name.clone(),
+                SqlIcebergNamedRef {
+                    snapshot_id: reference.snapshot_id,
+                    kind,
+                },
+            )
+        })
+        .collect();
+    SqlIcebergRefMetadata::new(
+        metadata.snapshots().map(|snapshot| snapshot.snapshot_id()),
+        metadata
+            .history()
+            .iter()
+            .map(|entry| SqlIcebergSnapshotLog {
+                snapshot_id: entry.snapshot_id,
+                timestamp_ms: entry.timestamp_ms,
+            })
+            .collect(),
+        refs,
+        metadata
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id()),
+    )
+}
+
+pub(crate) fn add_files(
+    state: &Arc<StandaloneState>,
+    sql: &str,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let (table_parts, s3_path) = parse_add_files_sql(sql)?;
+
+    let (catalog_name, namespace, table_name) = match table_parts.len() {
+        1 => {
+            let cat =
+                current_catalog.ok_or("ADD FILES requires a catalog context (use SET catalog)")?;
+            (
+                cat.to_string(),
+                current_database.to_string(),
+                table_parts[0].clone(),
+            )
+        }
+        2 => {
+            let cat = current_catalog.ok_or("ADD FILES requires a catalog context")?;
+            (
+                cat.to_string(),
+                table_parts[0].clone(),
+                table_parts[1].clone(),
+            )
+        }
+        3 => (
+            table_parts[0].clone(),
+            table_parts[1].clone(),
+            table_parts[2].clone(),
+        ),
+        _ => return Err("invalid table name in ADD FILES".to_string()),
+    };
+
+    let target = crate::engine::backend_resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: catalog_name.clone(),
+        namespace: namespace.clone(),
+        table: table_name.clone(),
+    };
+    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
+        state,
+        &target,
+        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
+    )?;
+    let completed = crate::connector::data_mutation::execute_data_mutation(
+        state.connector_control.as_ref(),
+        state.as_ref(),
+        &novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
+            .map_err(|error| error.to_string())?,
+        novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
+                .map_err(|error| error.to_string())?,
+            namespace: namespace.clone().into(),
+            table: table_name.clone().into(),
+        },
+        crate::connector::data_mutation::DataMutationIntent::register_existing_files(s3_path),
+        connector_context.clone(),
+    )?;
+    let count = completed.receipt.summary().file_count();
+    let msg = format!("Added {count} file(s)");
+    build_string_query_result("status", vec![msg]).map(StatementResult::Query)
+}
 // ---------------------------------------------------------------------------
 // Time-travel (FOR VERSION/TIMESTAMP AS OF) AST rewrite
 // ---------------------------------------------------------------------------
@@ -282,6 +390,7 @@ fn rewrite_time_travel_in_factor(
             };
 
             let fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+            let metadata = project_iceberg_ref_metadata(&metadata);
             let binding = resolve_read_binding(&version_clause, &metadata, &fqn)?;
             let snapshot_id = binding.snapshot_id;
 

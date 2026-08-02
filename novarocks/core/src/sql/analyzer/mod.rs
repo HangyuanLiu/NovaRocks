@@ -4037,10 +4037,8 @@ mod tests {
             location: format!("file:///tmp/{catalog}/{namespace}/{table}"),
             schema: IcebergSchemaDef { fields: vec![] },
             serialized_metadata: Some(
-                serde_json::to_string(
-                    &crate::sql::analyzer::iceberg_ref::test_utils::metadata_empty(),
-                )
-                .expect("serialize test iceberg metadata"),
+                serde_json::to_string(&crate::connector::iceberg::test_metadata::metadata_empty())
+                    .expect("serialize test iceberg metadata"),
             ),
             serialized_metadata_rows: None,
         }

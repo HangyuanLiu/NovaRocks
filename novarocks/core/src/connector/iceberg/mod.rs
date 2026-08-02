@@ -60,6 +60,8 @@ pub(crate) mod staged_create;
 pub(crate) mod stats;
 pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
+#[cfg(test)]
+pub(crate) mod test_metadata;
 pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
 pub(crate) mod write_commit;

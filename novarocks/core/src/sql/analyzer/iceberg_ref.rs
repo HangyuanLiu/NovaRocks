@@ -20,12 +20,73 @@
 
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IcebergRefKind {
     Branch,
     Tag,
+}
+
+/// Immutable ref and snapshot facts projected by the application from a
+/// provider table metadata object.  Time-travel analysis needs neither a
+/// catalog handle nor Iceberg's metadata representation, so those remain on
+/// the application side of the compiler boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SqlIcebergRefMetadata {
+    snapshot_ids: BTreeSet<i64>,
+    history: Vec<SqlIcebergSnapshotLog>,
+    refs: BTreeMap<String, SqlIcebergNamedRef>,
+    current_snapshot_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SqlIcebergSnapshotLog {
+    pub(crate) snapshot_id: i64,
+    pub(crate) timestamp_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SqlIcebergNamedRef {
+    pub(crate) snapshot_id: i64,
+    pub(crate) kind: IcebergRefKind,
+}
+
+impl SqlIcebergRefMetadata {
+    pub(crate) fn new(
+        snapshot_ids: impl IntoIterator<Item = i64>,
+        history: Vec<SqlIcebergSnapshotLog>,
+        refs: BTreeMap<String, SqlIcebergNamedRef>,
+        current_snapshot_id: Option<i64>,
+    ) -> Self {
+        Self {
+            snapshot_ids: snapshot_ids.into_iter().collect(),
+            history,
+            refs,
+            current_snapshot_id,
+        }
+    }
+
+    pub(crate) fn has_snapshot(&self, snapshot_id: i64) -> bool {
+        self.snapshot_ids.contains(&snapshot_id)
+    }
+
+    pub(crate) fn named_ref(&self, name: &str) -> Option<&SqlIcebergNamedRef> {
+        self.refs.get(name)
+    }
+
+    pub(crate) fn snapshot_at_or_before(&self, timestamp_ms: i64) -> Option<i64> {
+        self.history
+            .iter()
+            .filter(|entry| entry.timestamp_ms <= timestamp_ms)
+            .max_by_key(|entry| entry.timestamp_ms)
+            .map(|entry| entry.snapshot_id)
+    }
+
+    pub(crate) fn current_snapshot_id(&self) -> Option<i64> {
+        self.current_snapshot_id
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +179,7 @@ pub struct IcebergDmlTarget {
 /// Expression-level timestamps (e.g. `CURRENT_TIMESTAMP() - INTERVAL 1 HOUR`) are rejected.
 pub fn resolve_read_binding(
     version: &sqlparser::ast::TableVersion,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &SqlIcebergRefMetadata,
     fully_qualified_name: &str,
 ) -> Result<IcebergRefBinding, String> {
     use sqlparser::ast::{Expr, TableVersion, Value};
@@ -130,7 +191,7 @@ pub fn resolve_read_binding(
                     let snapshot_id: i64 = n.parse().map_err(|_| {
                         format!("iceberg time travel: invalid snapshot id '{n}' for {fully_qualified_name}")
                     })?;
-                    if metadata.snapshot_by_id(snapshot_id).is_none() {
+                    if !metadata.has_snapshot(snapshot_id) {
                         return Err(format!(
                             "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
                         ));
@@ -142,20 +203,15 @@ pub fn resolve_read_binding(
                     })
                 }
                 Value::SingleQuotedString(s) => {
-                    let refs = metadata.refs();
-                    let entry = refs.get(s.as_str()).ok_or_else(|| {
+                    let entry = metadata.named_ref(s).ok_or_else(|| {
                         format!(
                             "iceberg time travel: ref '{s}' not found in {fully_qualified_name}"
                         )
                     })?;
-                    let ref_kind = match &entry.retention {
-                        iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
-                        iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
-                    };
                     Ok(IcebergRefBinding {
                         snapshot_id: entry.snapshot_id,
                         ref_name: Some(s.clone()),
-                        ref_kind: Some(ref_kind),
+                        ref_kind: Some(entry.kind.clone()),
                     })
                 }
                 other => Err(format!(
@@ -177,20 +233,15 @@ pub fn resolve_read_binding(
                 && let sqlparser::ast::Value::SingleQuotedString(s) = &v.value
                 && let Some(ref_name) = s.strip_prefix("__nr_ref:")
             {
-                let refs = metadata.refs();
-                let entry = refs.get(ref_name).ok_or_else(|| {
+                let entry = metadata.named_ref(ref_name).ok_or_else(|| {
                     format!(
                         "iceberg time travel: ref '{ref_name}' not found in {fully_qualified_name}"
                     )
                 })?;
-                let ref_kind = match &entry.retention {
-                    iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
-                    iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
-                };
                 return Ok(IcebergRefBinding {
                     snapshot_id: entry.snapshot_id,
                     ref_name: Some(ref_name.to_string()),
-                    ref_kind: Some(ref_kind),
+                    ref_kind: Some(entry.kind.clone()),
                 });
             }
             let ts_ms = resolve_timestamp_expr(expr, fully_qualified_name)?;
@@ -249,19 +300,13 @@ fn parse_timestamp_string(s: &str, fully_qualified_name: &str) -> Result<i64, St
 
 /// Find the latest snapshot whose `timestamp_ms` ≤ `ts_ms` in the snapshot log.
 fn find_snapshot_at_or_before(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &SqlIcebergRefMetadata,
     ts_ms: i64,
     fully_qualified_name: &str,
 ) -> Result<IcebergRefBinding, String> {
-    let history = metadata.history();
-    // history is ordered chronologically; find last entry with timestamp_ms <= ts_ms
-    let best = history
-        .iter()
-        .filter(|log| log.timestamp_ms <= ts_ms)
-        .max_by_key(|log| log.timestamp_ms);
-    match best {
-        Some(log) => Ok(IcebergRefBinding {
-            snapshot_id: log.snapshot_id,
+    match metadata.snapshot_at_or_before(ts_ms) {
+        Some(snapshot_id) => Ok(IcebergRefBinding {
+            snapshot_id,
             ref_name: None,
             ref_kind: None,
         }),
@@ -310,202 +355,48 @@ mod split_ref_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod test_utils {
-    use iceberg::spec::{
-        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
-        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
-    };
-    use std::collections::HashMap;
-
-    pub(crate) fn base_builder() -> TableMetadataBuilder {
-        let schema = Schema::builder()
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            ])
-            .build()
-            .unwrap();
-
-        TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec().into_unbound(),
-            SortOrder::unsorted_order(),
-            "file:///novarocks-test/table".to_string(),
-            FormatVersion::V2,
-            HashMap::new(),
-        )
-        .unwrap()
-    }
-
-    /// Build a minimal V2 TableMetadata with no snapshots.
-    pub(crate) fn metadata_empty() -> iceberg::spec::TableMetadata {
-        base_builder().build().unwrap().metadata
-    }
-
-    /// Build a TableMetadata with two snapshots; `snapshot_log` will contain both entries.
-    ///
-    /// Uses two separate builder phases (one per snapshot commit) so the iceberg builder
-    /// does not classify the first snapshot as "intermediate" and strip it from the log.
-    pub(crate) fn metadata_with_two_snapshots() -> iceberg::spec::TableMetadata {
-        let snap1 = Snapshot::builder()
-            .with_snapshot_id(1)
-            .with_timestamp_ms(1_700_000_000_000)
-            .with_sequence_number(1)
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
-            .with_schema_id(0)
-            .build();
-
-        // Phase 1: commit snap1 as current.
-        let meta1 = base_builder()
-            .add_snapshot(snap1)
-            .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference::new(
-                    1,
-                    SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                ),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
-
-        // Phase 2: continue from meta1, adding snap2 as the new current.
-        let snap2 = Snapshot::builder()
-            .with_snapshot_id(2)
-            .with_timestamp_ms(1_700_000_001_000)
-            .with_sequence_number(2)
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_manifest_list("file:///novarocks-test/table/metadata/snap-2.avro".to_string())
-            .with_schema_id(0)
-            .build();
-
-        meta1
-            .into_builder(None)
-            .add_snapshot(snap2)
-            .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference::new(
-                    2,
-                    SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                ),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
-    }
-
-    /// Build a TableMetadata with one snapshot and a named branch.
-    pub(crate) fn metadata_with_branch(branch_name: &str) -> iceberg::spec::TableMetadata {
-        let snapshot_id = 1_i64;
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(snapshot_id)
-            .with_timestamp_ms(1_700_000_000_000)
-            .with_sequence_number(1)
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
-            .with_schema_id(0)
-            .build();
-
-        let branch_ref = SnapshotReference::new(
-            snapshot_id,
-            SnapshotRetention::Branch {
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-                max_ref_age_ms: None,
-            },
-        );
-
-        base_builder()
-            .add_snapshot(snapshot)
-            .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                ),
-            )
-            .unwrap()
-            .set_ref(branch_name, branch_ref)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
-    }
-
-    /// Build a TableMetadata with one snapshot and a named tag.
-    pub(crate) fn metadata_with_tag(tag_name: &str) -> iceberg::spec::TableMetadata {
-        let snapshot_id = 1_i64;
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(snapshot_id)
-            .with_timestamp_ms(1_700_000_000_000)
-            .with_sequence_number(1)
-            .with_summary(Summary {
-                operation: Operation::Append,
-                additional_properties: HashMap::new(),
-            })
-            .with_manifest_list("file:///novarocks-test/table/metadata/snap-1.avro".to_string())
-            .with_schema_id(0)
-            .build();
-
-        let tag_ref = SnapshotReference::new(
-            snapshot_id,
-            SnapshotRetention::Tag {
-                max_ref_age_ms: None,
-            },
-        );
-
-        base_builder()
-            .add_snapshot(snapshot)
-            .unwrap()
-            .set_ref(
-                "main",
-                SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                ),
-            )
-            .unwrap()
-            .set_ref(tag_name, tag_ref)
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_empty() -> SqlIcebergRefMetadata {
+        SqlIcebergRefMetadata::default()
+    }
+
+    fn metadata_with_two_snapshots() -> SqlIcebergRefMetadata {
+        SqlIcebergRefMetadata::new(
+            [1, 2],
+            vec![
+                SqlIcebergSnapshotLog {
+                    snapshot_id: 1,
+                    timestamp_ms: 1_700_000_000_000,
+                },
+                SqlIcebergSnapshotLog {
+                    snapshot_id: 2,
+                    timestamp_ms: 1_700_000_001_000,
+                },
+            ],
+            BTreeMap::new(),
+            Some(2),
+        )
+    }
+
+    fn metadata_with_ref(name: &str, kind: IcebergRefKind) -> SqlIcebergRefMetadata {
+        SqlIcebergRefMetadata::new(
+            [1],
+            vec![SqlIcebergSnapshotLog {
+                snapshot_id: 1,
+                timestamp_ms: 1_700_000_000_000,
+            }],
+            BTreeMap::from([(
+                name.to_string(),
+                SqlIcebergNamedRef {
+                    snapshot_id: 1,
+                    kind,
+                },
+            )]),
+            Some(1),
+        )
+    }
 
     fn val_num(n: &str) -> sqlparser::ast::Expr {
         sqlparser::ast::Expr::Value(
@@ -565,7 +456,7 @@ mod tests {
 
     #[test]
     fn version_as_of_int_resolves_snapshot() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         let version = sqlparser::ast::TableVersion::VersionAsOf(val_num("2"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 2);
@@ -574,8 +465,18 @@ mod tests {
     }
 
     #[test]
+    fn sqlx2_resolution_iceberg_ref_input_is_provider_neutral() {
+        let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
+        let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("dev"));
+        let binding = resolve_read_binding(&version, &metadata, "cat.ns.t")
+            .expect("resolve frozen SQL ref facts");
+        assert_eq!(binding.snapshot_id, 1);
+        assert_eq!(binding.ref_kind, Some(IcebergRefKind::Branch));
+    }
+
+    #[test]
     fn version_as_of_string_resolves_branch() {
-        let metadata = test_utils::metadata_with_branch("dev");
+        let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
         let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("dev"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
@@ -585,7 +486,7 @@ mod tests {
 
     #[test]
     fn version_as_of_string_resolves_tag() {
-        let metadata = test_utils::metadata_with_tag("v1.0");
+        let metadata = metadata_with_ref("v1.0", IcebergRefKind::Tag);
         let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("v1.0"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
         assert_eq!(binding.snapshot_id, 1);
@@ -595,7 +496,7 @@ mod tests {
 
     #[test]
     fn unknown_ref_errors() {
-        let metadata = test_utils::metadata_with_branch("dev");
+        let metadata = metadata_with_ref("dev", IcebergRefKind::Branch);
         let version = sqlparser::ast::TableVersion::VersionAsOf(val_str("nope"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
@@ -606,7 +507,7 @@ mod tests {
 
     #[test]
     fn version_as_of_unknown_snapshot_id_errors() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         let version = sqlparser::ast::TableVersion::VersionAsOf(val_num("99999"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
         assert!(
@@ -617,7 +518,7 @@ mod tests {
 
     #[test]
     fn timestamp_as_of_epoch_ms_resolves() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         // snapshot 1 is at 1_700_000_000_000 ms, snapshot 2 at 1_700_000_001_000 ms
         // requesting at 1_700_000_000_500 should give snapshot 1
         let version = sqlparser::ast::TableVersion::TimestampAsOf(val_num("1700000000500"));
@@ -627,7 +528,7 @@ mod tests {
 
     #[test]
     fn timestamp_as_of_too_early_errors() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         // before any snapshot
         let version = sqlparser::ast::TableVersion::TimestampAsOf(val_num("1000000000000"));
         let err = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap_err();
@@ -639,7 +540,7 @@ mod tests {
 
     #[test]
     fn timestamp_as_of_rfc3339_string_resolves() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         // 2023-11-14T22:13:20Z = 1700000000 seconds = 1_700_000_000_000 ms (exactly snap1)
         let version = sqlparser::ast::TableVersion::TimestampAsOf(val_str("2023-11-14T22:13:20Z"));
         let binding = resolve_read_binding(&version, &metadata, "cat.ns.t").unwrap();
@@ -648,7 +549,7 @@ mod tests {
 
     #[test]
     fn expression_timestamp_rejected() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         // Use an identifier expression (not a literal) to trigger the fail-fast path
         let version = sqlparser::ast::TableVersion::TimestampAsOf(
             sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new("some_var")),
@@ -662,7 +563,7 @@ mod tests {
 
     #[test]
     fn bigquery_function_syntax_rejected() {
-        let metadata = test_utils::metadata_with_two_snapshots();
+        let metadata = metadata_with_two_snapshots();
         // Use a nested value expression to represent the unsupported Function-style AT(...)
         let version = sqlparser::ast::TableVersion::Function(sqlparser::ast::Expr::Identifier(
             sqlparser::ast::Ident::new("AT"),

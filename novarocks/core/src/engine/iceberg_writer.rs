@@ -2096,7 +2096,7 @@ mod tests {
 
     #[test]
     fn branch_write_uses_the_branch_head_as_its_base_snapshot() {
-        let metadata = crate::sql::analyzer::iceberg_ref::test_utils::metadata_with_two_snapshots()
+        let metadata = crate::connector::iceberg::test_metadata::metadata_with_two_snapshots()
             .into_builder(None)
             .set_ref(
                 "dev",
