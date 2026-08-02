@@ -326,6 +326,7 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_set_user_variables(sql)?;
     let sql = rewrite_from_dual(&sql)?;
     let sql = normalize_function_syntax(&sql)?;
+    let sql = rewrite_table_version_after_alias(&sql)?;
     let sql = rewrite_version_as_of_string(&sql)?;
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
     let sql = rewrite_starrocks_meta_table_suffix(&sql);
@@ -335,6 +336,134 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_cross_join_with_on(&sql);
     let sql = rewrite_interval_value_parens(&sql);
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Repair the SQL emitted by sqlparser when a table has both an alias and a
+/// `TableVersion::VersionAsOf`. Its formatter emits
+/// `table AS alias VERSION AS OF snapshot`, while its parser accepts the
+/// version clause only before the alias. This is an AST round-trip repair:
+/// `table VERSION AS OF snapshot AS alias` preserves the same table identity,
+/// snapshot pin, and alias binding.
+fn rewrite_table_version_after_alias(sql: &str) -> Result<String, String> {
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if in_single_quote {
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                in_double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if starts_with_keyword(bytes, idx, "as")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+            && !is_identifier_byte(bytes.get(idx + 2).copied())
+            && let Some((alias_start, alias_end, version_start, version_end)) =
+                table_version_after_alias_ranges(bytes, idx + 2)
+        {
+            output.push(' ');
+            output.push_str(&sql[version_start..version_end]);
+            output.push_str(" AS ");
+            output.push_str(&sql[alias_start..alias_end]);
+            idx = version_end;
+            continue;
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    Ok(output)
+}
+
+fn table_version_after_alias_ranges(
+    bytes: &[u8],
+    after_as: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let alias_start = skip_ascii_whitespace(bytes, after_as);
+    let alias_end = if bytes.get(alias_start) == Some(&b'`') {
+        let end = bytes[alias_start + 1..]
+            .iter()
+            .position(|byte| *byte == b'`')?;
+        alias_start + end + 2
+    } else {
+        let end = bytes[alias_start..]
+            .iter()
+            .position(|byte| !is_identifier_byte(Some(*byte)))
+            .map(|offset| alias_start + offset)
+            .unwrap_or(bytes.len());
+        (end > alias_start).then_some(end)?
+    };
+    let version_start = skip_ascii_whitespace(bytes, alias_end);
+    if !starts_with_keyword(bytes, version_start, "version")
+        || is_identifier_byte(bytes.get(version_start + "version".len()).copied())
+    {
+        return None;
+    }
+    let as_start = skip_ascii_whitespace(bytes, version_start + "version".len());
+    if !starts_with_keyword(bytes, as_start, "as")
+        || is_identifier_byte(bytes.get(as_start + "as".len()).copied())
+    {
+        return None;
+    }
+    let of_start = skip_ascii_whitespace(bytes, as_start + "as".len());
+    if !starts_with_keyword(bytes, of_start, "of")
+        || is_identifier_byte(bytes.get(of_start + "of".len()).copied())
+    {
+        return None;
+    }
+    let snapshot_start = skip_ascii_whitespace(bytes, of_start + "of".len());
+    let snapshot_end = bytes[snapshot_start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .map(|offset| snapshot_start + offset)
+        .unwrap_or(bytes.len());
+    (snapshot_end > snapshot_start).then_some((alias_start, alias_end, version_start, snapshot_end))
 }
 
 /// Strip StarRocks-style join hints written as `JOIN [broadcast]`,
