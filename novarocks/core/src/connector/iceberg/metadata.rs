@@ -427,24 +427,6 @@ pub fn plan_native_iceberg_metadata_read_source_with_cancellation(
     )
 }
 
-pub fn plan_compat_iceberg_metadata_read_source(
-    query_id: Option<QueryId>,
-    node_id: i32,
-    config: IcebergMetadataScanConfig,
-    query_options: &QueryOptions,
-) -> Result<Arc<dyn ScanSource>, ConnectorError> {
-    let (batch, context) = metadata_budget_and_context(query_id, query_options)?;
-    let query_label = query_id
-        .map(|query_id| query_id.to_string())
-        .unwrap_or_else(|| "unidentified".to_string());
-    plan_iceberg_metadata_read_source(
-        ConnectorInstanceId::parse(&format!("iceberg.metadata.compat.{query_label}.{node_id}"))?,
-        config,
-        batch,
-        context,
-    )
-}
-
 #[derive(Clone, Debug)]
 struct IcebergMetadataReader {
     cfg: IcebergMetadataScanConfig,

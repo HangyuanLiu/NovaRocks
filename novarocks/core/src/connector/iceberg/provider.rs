@@ -98,12 +98,6 @@ const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 const ICEBERG_PROVIDER_STATISTICS_VERSION: u16 = 1;
 const ICEBERG_STATISTICS_OPERATION_KIND: &str = "statistics-publish";
-/// Compat has no NovaRocks catalog instance identity on the wire.  Its
-/// read-only Iceberg binding is therefore composed once per BE process, not
-/// synthesized for each query or inferred from an HDFS path.
-pub const COMPAT_ICEBERG_INSTANCE_ID: &str = "iceberg.compat.default";
-const COMPAT_ICEBERG_INCARNATION: [u8; 16] = [0; 16];
-
 fn statistics_data_version(
     table_uuid: &str,
     snapshot_id: Option<i64>,
@@ -577,133 +571,6 @@ impl IcebergConnectorInstaller {
             binding,
         }
     }
-}
-
-/// Build the stable compat-only Iceberg reader instance from the same startup
-/// access binding used by distributed instance installation.  The identity is
-/// intentionally not query-local and carries no catalog client or credential
-/// in a fragment payload.
-/// Compose the compat Iceberg reader as a BE-only execution binding. Compat
-/// has no catalog metadata capability and must never manufacture one.
-pub(crate) fn compose_compat_execution_binding(
-    binding: IcebergReadBinding,
-) -> Result<ConnectorExecutionBinding, ConnectorError> {
-    let instance_id = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
-    let key = ConnectorExecutionBindingKey {
-        instance_id,
-        incarnation: ConnectorInstanceIncarnation::from_bytes(COMPAT_ICEBERG_INCARNATION),
-    };
-    ConnectorExecutionBinding::try_new_capabilities(
-        ConnectorProviderId::parse(PROVIDER_ID)?,
-        key.clone(),
-        Some(Arc::new(IcebergReadOnlyConnectorInstance {
-            key: key.clone(),
-            binding: binding.clone(),
-        })),
-        Some(Arc::new(IcebergDataWriteExecution::new(key, binding))),
-    )
-}
-
-/// Encode compat-normalized data-file facts as provider-owned opaque splits.
-/// The caller cannot alter provider identity, incarnation, or payload layout.
-pub fn build_compat_read_splits(
-    files: impl IntoIterator<Item = IcebergDataFileInfo>,
-) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-    let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
-    files
-        .into_iter()
-        .enumerate()
-        .map(|(index, data_file)| {
-            let estimated_bytes = u64::try_from(data_file.size).ok();
-            let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V1,
-                owner_instance_id: owner.as_str().to_string(),
-                incarnation: COMPAT_ICEBERG_INCARNATION,
-                namespace: "compat".to_string(),
-                table: "iceberg".to_string(),
-                snapshot_id: None,
-                table_uuid: None,
-                schema_id: None,
-                data_file,
-                projection: Vec::new(),
-                limit: None,
-                physical_predicates: Vec::new(),
-                name_mapping: None,
-                delta: None,
-            };
-            ConnectorSplit::try_new(
-                owner.clone(),
-                format!("compat-iceberg-{index}"),
-                encode_payload(
-                    &payload,
-                    "compat Iceberg split",
-                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                )?,
-                estimated_bytes,
-            )
-        })
-        .collect()
-}
-
-/// Encode compat-normalized snapshot-delta facts as ordinary provider-owned
-/// splits.  The stable compat instance owns the startup access binding; the
-/// Thrift plan contributes no object-store configuration or runtime handle.
-pub fn build_compat_delta_read_splits(
-    sources: impl IntoIterator<Item = super::delta::DeltaSourceFile>,
-    delete_side: Option<super::delta::DeltaScanDeleteSide>,
-) -> Result<Vec<ConnectorSplit>, ConnectorError> {
-    let owner = ConnectorInstanceId::parse(COMPAT_ICEBERG_INSTANCE_ID)?;
-    sources
-        .into_iter()
-        .enumerate()
-        .map(|(index, source)| {
-            let estimated_bytes = u64::try_from(source.size).ok();
-            let data_file = IcebergDataFileInfo {
-                path: source.path.clone(),
-                size: source.size,
-                row_count: None,
-                column_stats: None,
-                partition_spec_id: source.partition_spec_id,
-                partition_key: source.partition_key.clone(),
-                first_row_id: source.first_row_id,
-                data_sequence_number: source.data_sequence_number,
-                ivm_change_op: None,
-                included_positions: None,
-                delete_files: Vec::new(),
-                manifest_path: None,
-                partition_values: Vec::new(),
-            };
-            let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V1,
-                owner_instance_id: owner.as_str().to_string(),
-                incarnation: COMPAT_ICEBERG_INCARNATION,
-                namespace: "compat".to_string(),
-                table: "iceberg-delta".to_string(),
-                snapshot_id: None,
-                table_uuid: None,
-                schema_id: None,
-                data_file,
-                projection: Vec::new(),
-                limit: None,
-                physical_predicates: Vec::new(),
-                name_mapping: None,
-                delta: Some(IcebergDeltaSplitPayload {
-                    source,
-                    delete_side: delete_side.clone(),
-                }),
-            };
-            ConnectorSplit::try_new(
-                owner.clone(),
-                format!("compat-iceberg-delta-{index}"),
-                encode_payload(
-                    &payload,
-                    "compat Iceberg delta split",
-                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                )?,
-                estimated_bytes,
-            )
-        })
-        .collect()
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
@@ -6038,54 +5905,6 @@ mod tests {
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
         assert_eq!(splits.len(), 1, "rejected split must not be pushed");
         assert_eq!(total, admitted_total, "rejection must not consume budget");
-    }
-
-    #[test]
-    fn compat_splits_are_owned_by_the_startup_iceberg_instance() {
-        let instance = compose_compat_execution_binding(
-            IcebergReadBinding::default_binding(None).expect("compose compat Iceberg binding"),
-        )
-        .expect("compose compat Iceberg instance");
-        assert_eq!(
-            instance.key().instance_id.as_str(),
-            COMPAT_ICEBERG_INSTANCE_ID
-        );
-        assert_eq!(instance.provider_id().as_str(), PROVIDER_ID);
-
-        let splits = build_compat_read_splits(vec![IcebergDataFileInfo::for_test(
-            "file:///tmp/compat.parquet",
-            64,
-            2,
-        )])
-        .expect("encode compat split");
-        assert_eq!(splits.len(), 1);
-        assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
-        let payload: SplitPayload =
-            decode_payload(splits[0].payload(), "compat split").expect("decode provider split");
-        assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
-        assert_eq!(payload.data_file.path, "file:///tmp/compat.parquet");
-    }
-
-    #[test]
-    fn compat_delta_splits_keep_delete_facts_in_the_provider_payload() {
-        let source = super::super::delta::DeltaSourceFile {
-            path: "file:///tmp/compat-delta.parquet".to_string(),
-            size: 64,
-            role: super::super::delta::DeltaSourceRole::DataFile,
-            partition_spec_id: None,
-            partition_key: None,
-            first_row_id: Some(10),
-            data_sequence_number: Some(20),
-            row_id_allow_list: None,
-        };
-        let splits = build_compat_delta_read_splits(vec![source.clone()], None)
-            .expect("encode compat delta split");
-        assert_eq!(splits.len(), 1);
-        assert_eq!(splits[0].owner().as_str(), COMPAT_ICEBERG_INSTANCE_ID);
-        let payload: SplitPayload =
-            decode_payload(splits[0].payload(), "compat delta split").expect("decode split");
-        assert_eq!(payload.incarnation, COMPAT_ICEBERG_INCARNATION);
-        assert_eq!(payload.delta.expect("delta payload").source, source);
     }
 
     #[test]
