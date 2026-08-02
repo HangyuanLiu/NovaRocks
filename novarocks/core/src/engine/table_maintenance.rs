@@ -27,8 +27,12 @@ use std::sync::Arc;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
+use crate::connector::metadata_maintenance::{
+    CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
+};
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::dialect::StarRocksDialect;
+use novarocks_spi::connector::ConnectorMutationOperationId;
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
@@ -157,6 +161,22 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
+
+    fn plan_metadata_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        _operation_id: ConnectorMutationOperationId,
+        _intent: MetadataMaintenanceIntent,
+    ) -> Result<MetadataMaintenanceSession, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn execute_planned_metadata_maintenance(
+        &self,
+        _session: MetadataMaintenanceSession,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
 }
 
 pub trait TableMaintenanceService: Send + Sync {
@@ -290,6 +310,39 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
             &self.shared_for_table_maintenance()?,
             request,
         )
+    }
+
+    fn plan_metadata_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorMutationOperationId,
+        intent: MetadataMaintenanceIntent,
+    ) -> Result<MetadataMaintenanceSession, String> {
+        let state = self.shared_for_table_maintenance()?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::metadata_maintenance::plan_metadata_maintenance_session(
+            state.connector_control.as_ref(),
+            &instance_id,
+            operation_id,
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            intent,
+            crate::connector::connector_request_context(
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+        )
+    }
+
+    fn execute_planned_metadata_maintenance(
+        &self,
+        session: MetadataMaintenanceSession,
+    ) -> Result<CompletedMetadataMaintenance, String> {
+        crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
     }
 }
 

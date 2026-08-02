@@ -18,7 +18,7 @@ pub(crate) mod backend;
 pub(crate) mod data_mutation;
 pub mod file_execution;
 pub mod iceberg;
-pub(crate) mod metadata_maintenance;
+pub mod metadata_maintenance;
 pub(crate) mod mutation;
 pub mod runtime;
 pub(crate) mod scan_model;
