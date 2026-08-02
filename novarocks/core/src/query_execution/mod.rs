@@ -30,10 +30,26 @@ pub mod lifecycle;
 pub(crate) mod outcome;
 pub use outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary, WriteExecutionOutcome};
 pub(crate) mod preparation;
+pub use preparation::runtime_filter_view::{
+    RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
+    RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,
+    RuntimeFilterBindingRoleFacts, RuntimeFilterCompletionRequirement,
+    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContractFacts,
+    RuntimeFilterContributionKind, RuntimeFilterCoverageFacts, RuntimeFilterDeploymentBindingFacts,
+    RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
+    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterDeploymentLogicalDomainFacts,
+    RuntimeFilterDeploymentReductionFacts, RuntimeFilterFragmentEdgeFacts,
+    RuntimeFilterFrontierEdgeFacts, RuntimeFilterJoinProgressFacts,
+    RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity, RuntimeFilterNullOrder,
+    RuntimeFilterNullSemantics, RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts,
+    RuntimeFilterProducerTarget, RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
+    RuntimeFilterValidatedPlacementFacts,
+};
 pub mod prepared_write;
 pub(crate) mod profile;
 pub mod read_session;
 pub mod request_context;
+#[cfg(test)]
 mod runtime_filter;
 #[cfg(feature = "runtime-filter-test-support")]
 pub mod schedule;

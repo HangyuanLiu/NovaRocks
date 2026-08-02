@@ -18,13 +18,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use prost::Message;
-use sha2::{Digest, Sha256};
-
 use crate::common::types::UniqueId;
 use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::runtime::query_options::QueryOptions;
-use crate::runtime_filter::port::install::RuntimeFilterParticipantInstall;
 
 use super::contract::{QueryLifecycleError, QueryLifecycleErrorCode};
 use super::digest::digest_v1;
@@ -207,121 +203,84 @@ impl ExchangeRouteManifest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeFilterContribution {
-    participant_id: u32,
-    lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-    install: RuntimeFilterParticipantInstall,
-    digest: [u8; 32],
+    wire: crate::proto::novarocks::RuntimeFilterContribution,
 }
 
 impl RuntimeFilterContribution {
-    pub(crate) fn new(
-        participant_id: u32,
-        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-        install: RuntimeFilterParticipantInstall,
-        digest: [u8; 32],
+    /// Core carries a ready Protocol DTO without interpreting runtime-filter
+    /// lifecycle, install, routing, epoch, or digest semantics. The Backend is
+    /// the only owner that decodes and validates those facts.
+    pub fn from_wire(
+        wire: crate::proto::novarocks::RuntimeFilterContribution,
     ) -> Result<Self, QueryLifecycleError> {
-        if participant_id == 0 {
+        if wire.participant_id == 0 {
             return Err(QueryLifecycleError::invalid_manifest(
                 "runtime filter participant id must be nonzero",
             ));
         }
-        if participant_id != install.local_participant_id().get() {
+        if wire.contribution_digest.len() != 32 {
             return Err(QueryLifecycleError::invalid_manifest(
-                "runtime filter participant id does not match typed install",
+                "runtime filter contribution digest must be 32 bytes",
             ));
         }
-        Ok(Self {
-            participant_id,
-            lifecycle,
-            install,
-            digest,
-        })
+        Ok(Self { wire })
     }
 
     pub const fn participant_id(&self) -> u32 {
-        self.participant_id
+        self.wire.participant_id
     }
 
-    pub(crate) const fn lifecycle(
-        &self,
-    ) -> crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-        self.lifecycle
+    pub fn wire(&self) -> &crate::proto::novarocks::RuntimeFilterContribution {
+        &self.wire
     }
 
-    /// Returns the immutable participant install carried by the lifecycle
-    /// manifest. Backend role owners consume this contract to construct their
-    /// attempt-scoped participant; it contains no mutable service state.
-    pub const fn install(&self) -> &RuntimeFilterParticipantInstall {
-        &self.install
+    pub fn digest(&self) -> &[u8] {
+        &self.wire.contribution_digest
     }
 
-    pub const fn digest(&self) -> &[u8; 32] {
-        &self.digest
-    }
-
+    #[cfg(test)]
     pub(crate) fn from_compiled(
         execution_id: QueryExecutionId,
         participant_id: u32,
         lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-        install: RuntimeFilterParticipantInstall,
+        install: crate::runtime_filter::port::install::RuntimeFilterParticipantInstall,
     ) -> Result<Self, QueryLifecycleError> {
-        let digest = Self::canonical_digest(execution_id, lifecycle, &install)?;
-        Self::new(participant_id, lifecycle, install, digest)
-    }
-
-    pub(crate) fn canonical_digest(
-        execution_id: QueryExecutionId,
-        lifecycle: crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-        install: &RuntimeFilterParticipantInstall,
-    ) -> Result<[u8; 32], QueryLifecycleError> {
         let envelope = crate::protocol::native::encode_participant_install(
             UniqueId::new(
                 execution_id.query_id().high(),
                 execution_id.query_id().low(),
             ),
             lifecycle,
-            install,
+            &install,
         )
         .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
-        let mut digest = Sha256::new();
+        let mut digest = sha2::Sha256::new();
+        use sha2::Digest;
         digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
-        digest.update(envelope.encode_to_vec());
-        Ok(digest.finalize().into())
+        digest.update(prost::Message::encode_to_vec(&envelope));
+        Self::from_wire(crate::proto::novarocks::RuntimeFilterContribution {
+            participant_id,
+            lifecycle: envelope.lifecycle,
+            install: envelope.install,
+            contribution_digest: digest.finalize().to_vec(),
+        })
     }
 
-    /// Construct an empty lifecycle contribution for an owner-level contract
-    /// fixture. This contains no fragment DTO decoding or runtime installation.
+    /// Construct an opaque owner-level contract fixture. It deliberately has no
+    /// typed install: Core only verifies carrier shape.
     pub fn empty_for_contract_test(
         execution_id: QueryExecutionId,
         participant_id: u32,
     ) -> Result<Self, QueryLifecycleError> {
-        use std::collections::BTreeMap;
-
-        use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-        use crate::runtime_filter::port::install::{
-            RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
-        };
-        use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
-
-        let epoch = DeploymentEpoch::new(execution_id.attempt_id().get());
-        let participant = RuntimeFilterParticipantId::new(participant_id);
-        let install = RuntimeFilterParticipantInstall::new(
-            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
-            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
-                .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?,
-        );
-        let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(5),
-            query_expire: Duration::from_secs(30),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(2),
-            transport_max_pending_entries: 1024,
-            transport_max_pending_bytes: 1 << 20,
-        };
-        Self::from_compiled(execution_id, participant_id, lifecycle, install)
+        let _ = execution_id;
+        Self::from_wire(crate::proto::novarocks::RuntimeFilterContribution {
+            participant_id,
+            lifecycle: None,
+            install: None,
+            contribution_digest: vec![0; 32],
+        })
     }
 }
 
@@ -399,13 +358,6 @@ impl ParticipantManifest {
         if runtime_filter.is_some() != roles.contains(&ParticipantRole::RuntimeFilterService) {
             return Err(QueryLifecycleError::invalid_manifest(
                 "runtime filter contribution and participant role must be present together",
-            ));
-        }
-        if runtime_filter.as_ref().is_some_and(|contribution| {
-            contribution.install().epoch().get() != execution_id.attempt_id().get()
-        }) {
-            return Err(QueryLifecycleError::invalid_manifest(
-                "runtime filter deployment epoch must equal query attempt id",
             ));
         }
         if query_deadline_unix_ms == 0 {
@@ -493,13 +445,6 @@ impl ParticipantManifest {
         &self,
         execution_id: QueryExecutionId,
     ) -> Result<Self, QueryLifecycleError> {
-        if self.runtime_filter.as_ref().is_some_and(|contribution| {
-            contribution.install().epoch().get() != execution_id.attempt_id().get()
-        }) {
-            return Err(QueryLifecycleError::invalid_manifest(
-                "runtime filter deployment epoch must equal query attempt id",
-            ));
-        }
         let mut next = self.clone();
         next.execution_id = execution_id;
         Ok(next)
@@ -531,7 +476,6 @@ const fn is_missing_unique_id(id: UniqueId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::{
@@ -543,11 +487,6 @@ mod tests {
     use crate::query_execution::lifecycle::contract::QueryLifecycleErrorCode;
     use crate::query_execution::lifecycle::identity::{AttemptId, QueryExecutionId};
     use crate::runtime::query_options::QueryOptions;
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::{
-        RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
-    };
-    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -605,23 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn participant_manifest_execution_id_change_rejects_runtime_filter_epoch_mismatch() {
-        let participant = RuntimeFilterParticipantId::new(3);
-        let epoch = DeploymentEpoch::new(1);
-        let install = RuntimeFilterParticipantInstall::new(
-            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
-            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
-                .expect("empty routing shard is structurally valid"),
-        );
-        let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(5),
-            query_expire: Duration::from_secs(30),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(2),
-            transport_max_pending_entries: 1024,
-            transport_max_pending_bytes: 1 << 20,
-        };
+    fn participant_manifest_execution_id_change_preserves_opaque_runtime_filter_wire() {
+        let contribution = RuntimeFilterContribution::empty_for_contract_test(execution_id(), 3)
+            .expect("valid opaque contribution");
+        let expected_wire = contribution.wire().clone();
         let manifest = ParticipantManifest::new(
             execution_id(),
             backend(),
@@ -630,10 +556,7 @@ mod tests {
             ParticipantQueryOptions::new(QueryOptions::default()),
             1_000,
             [],
-            Some(
-                RuntimeFilterContribution::new(3, lifecycle, install, [0x5a; 32])
-                    .expect("valid contribution"),
-            ),
+            Some(contribution),
             Duration::from_secs(30),
             endpoint(9031),
         )
@@ -644,10 +567,17 @@ mod tests {
         )
         .expect("valid execution id");
 
-        let error = manifest
+        let changed = manifest
             .with_execution_id(next_execution_id)
-            .expect_err("runtime filter epoch must remain bound to the attempt");
+            .expect("Core does not reinterpret opaque runtime-filter wire facts");
 
-        assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+        assert_eq!(changed.execution_id(), next_execution_id);
+        assert_eq!(
+            changed
+                .runtime_filter()
+                .expect("runtime-filter contribution")
+                .wire(),
+            &expected_wire
+        );
     }
 }

@@ -30,6 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::proto::plan::RuntimeFilterBindingTable;
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
@@ -49,6 +50,7 @@ use crate::query_execution::schedule::{
     FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
 };
 use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
+use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::sql::analysis::cte::CteId;
@@ -71,6 +73,31 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 }
 
 static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque identity minted with a sealed prepared handoff. Role crates can
+/// compare it and pass it back to Core, but cannot construct a replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterArtifactId(u64);
+
+/// A sealed Frontend binding attachment. The constructor is intentionally
+/// unavailable: only the borrow view for the originating artifact can seal it.
+pub struct RuntimeFilterBindingAttachment {
+    artifact_id: RuntimeFilterArtifactId,
+    tables: BTreeMap<FragmentId, RuntimeFilterBindingTable>,
+}
+
+/// Opaque ready install contributions sealed by the Frontend after one
+/// validated schedule. Core validates only artifact/topology membership.
+pub struct RuntimeFilterDeploymentAttachment {
+    artifact_id: RuntimeFilterArtifactId,
+    contributions: BTreeMap<usize, crate::proto::novarocks::RuntimeFilterContribution>,
+}
+
+impl RuntimeFilterBindingAttachment {
+    pub fn artifact_id(&self) -> RuntimeFilterArtifactId {
+        self.artifact_id
+    }
+}
 
 /// The owned prepared/native pair. It has no public constructor, `Clone`, or
 /// inverse `from_parts`, so artifacts from different sealed plans cannot be
@@ -97,6 +124,50 @@ impl PreparedDistributedQuery {
         }
     }
 
+    pub fn runtime_filter_artifact_id(&self) -> RuntimeFilterArtifactId {
+        RuntimeFilterArtifactId(self.handoff_id)
+    }
+
+    /// Borrow-only identity and fragment-set view used by the Frontend RF
+    /// encoder. SQL-private binding facts are intentionally added by the
+    /// dedicated view in the next owner-local layer.
+    pub fn runtime_filter_binding_view(&self) -> RuntimeFilterBindingEncodingView<'_> {
+        RuntimeFilterBindingEncodingView {
+            artifact_id: self.runtime_filter_artifact_id(),
+            facts: RuntimeFilterBindingFactsView::new(&self.prepared),
+        }
+    }
+
+    pub fn attach_runtime_filter_bindings(
+        self,
+        attachment: RuntimeFilterBindingAttachment,
+    ) -> Result<RuntimeFilterBoundPreparedDistributedQuery, DistributedQueryError> {
+        if attachment.artifact_id != self.runtime_filter_artifact_id() {
+            return Err(contract_error(
+                "runtime filter binding attachment belongs to a different prepared query handoff",
+            ));
+        }
+        let native_bundle = self
+            .native_bundle
+            .bind_runtime_filter_tables(attachment.tables)
+            .map_err(contract_error)?;
+        Ok(RuntimeFilterBoundPreparedDistributedQuery {
+            handoff_id: self.handoff_id,
+            prepared: self.prepared,
+            native_bundle,
+        })
+    }
+}
+
+/// A binding attachment can only be consumed once. It is the first RF-bound
+/// distributed-query typestate and the only state that may bind a schedule.
+pub struct RuntimeFilterBoundPreparedDistributedQuery {
+    handoff_id: u64,
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+}
+
+impl RuntimeFilterBoundPreparedDistributedQuery {
     pub fn bind_schedule(
         self,
         schedule: ValidatedFragmentSchedule,
@@ -111,6 +182,64 @@ impl PreparedDistributedQuery {
             native_bundle: self.native_bundle,
             schedule,
             connector_write_plan: None,
+        })
+    }
+}
+
+/// A sealed, borrow-only RF attachment boundary. Its table payload is opaque to
+/// Core once sealed; the Frontend owns RF semantic DTO construction.
+#[derive(Clone, Copy)]
+pub struct RuntimeFilterBindingEncodingView<'a> {
+    artifact_id: RuntimeFilterArtifactId,
+    facts: RuntimeFilterBindingFactsView<'a>,
+}
+
+impl<'a> RuntimeFilterBindingEncodingView<'a> {
+    pub fn artifact_id(self) -> RuntimeFilterArtifactId {
+        self.artifact_id
+    }
+
+    pub fn facts(self) -> RuntimeFilterBindingFactsView<'a> {
+        self.facts
+    }
+
+    pub fn seal(
+        self,
+        tables: impl IntoIterator<Item = RuntimeFilterBindingTable>,
+    ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
+        let mut by_fragment = BTreeMap::new();
+        for table in tables {
+            let fragment_id = table.fragment_id;
+            if by_fragment.insert(fragment_id, table).is_some() {
+                return Err(contract_error(format!(
+                    "runtime filter binding attachment repeats fragment {fragment_id}"
+                )));
+            }
+        }
+        let expected = self
+            .facts
+            .fragments()
+            .map(|fragment| fragment.fragment_id())
+            .collect::<BTreeSet<_>>();
+        let actual = by_fragment.keys().copied().collect::<BTreeSet<_>>();
+        if actual != expected {
+            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+            let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+            return Err(contract_error(format!(
+                "runtime filter binding attachment fragment set mismatch: missing={missing:?} unknown={unknown:?}"
+            )));
+        }
+        for (&fragment_id, table) in &by_fragment {
+            if table.fragment_id != fragment_id {
+                return Err(contract_error(format!(
+                    "runtime filter binding attachment table fragment mismatch: key={fragment_id} table_fragment_id={}",
+                    table.fragment_id
+                )));
+            }
+        }
+        Ok(RuntimeFilterBindingAttachment {
+            artifact_id: self.artifact_id,
+            tables: by_fragment,
         })
     }
 }
@@ -136,6 +265,64 @@ pub struct ScheduleBoundDistributedQuery {
 }
 
 impl ScheduleBoundDistributedQuery {
+    pub fn runtime_filter_scheduled_view(&self) -> RuntimeFilterScheduledView<'_> {
+        RuntimeFilterScheduledView {
+            artifact_id: RuntimeFilterArtifactId(self.schedule.handoff_id),
+            execution_id: self.schedule.execution_id,
+            scheduled_backend_ids: self.schedule.backend_ids(),
+            frozen_live_backend_ids: self
+                .schedule
+                .lifecycle
+                .frozen_live_backends
+                .keys()
+                .copied()
+                .collect(),
+            frozen_live_backends: self
+                .schedule
+                .lifecycle
+                .frozen_live_backends
+                .values()
+                .map(|target| RuntimeFilterBackendTopologyEntry {
+                    backend_idx: target.backend_idx(),
+                    endpoint: target.endpoint(),
+                    start_epoch: target.start_epoch(),
+                })
+                .collect(),
+            has_runtime_filter_channels: !self.prepared.runtime_filter_graph().is_empty(),
+            deployment_facts: RuntimeFilterDeploymentFactsView::new(
+                &self.prepared,
+                self.schedule.planning_schedule(),
+            ),
+            _private: std::marker::PhantomData,
+        }
+    }
+
+    pub fn seal_runtime_filter_deployment(
+        &self,
+        contributions: impl IntoIterator<
+            Item = (usize, crate::proto::novarocks::RuntimeFilterContribution),
+        >,
+    ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
+        self.runtime_filter_scheduled_view().seal(contributions)
+    }
+
+    pub fn attach_runtime_filter_deployment(
+        self,
+        attachment: RuntimeFilterDeploymentAttachment,
+    ) -> Result<RuntimeFilterDeploymentReadyDistributedQuery, DistributedQueryError> {
+        if attachment.artifact_id != RuntimeFilterArtifactId(self.schedule.handoff_id) {
+            return Err(contract_error(
+                "runtime filter deployment attachment belongs to a different prepared query handoff",
+            ));
+        }
+        Ok(RuntimeFilterDeploymentReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            connector_write_plan: self.connector_write_plan,
+            runtime_filter_contributions: attachment.contributions,
+        })
+    }
     /// Terminal write fragments derived from the same prepared artifact that
     /// was sealed before scheduling.  Callers cannot nominate an arbitrary
     /// fragment set when creating a connector writer manifest.
@@ -184,47 +371,6 @@ impl ScheduleBoundDistributedQuery {
             attachment,
         )?;
         Ok(self)
-    }
-
-    pub fn initialize_query(
-        self,
-        options: QueryInitOptions,
-        barrier: &dyn QueryInitBarrier,
-    ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
-        if options.execution_id() != self.schedule.execution_id {
-            return Err(contract_error(
-                "query initialization execution id does not match validated schedule",
-            ));
-        }
-        let runtime_filters = crate::query_execution::runtime_filter::compile_contribution_plan(
-            options.execution_id(),
-            self.prepared.runtime_filter_graph(),
-            self.prepared.runtime_filter_join_progress(),
-            self.prepared.scheduling_view().edges(),
-            &self.schedule.inner,
-            options.live_backends(),
-            options.runtime_filter_worker_count(),
-            options.runtime_filter_lifecycle(),
-        )?;
-        let plan = crate::query_execution::lifecycle::init_plan::compile_query_init_plan(
-            self.schedule.lifecycle_projection(),
-            runtime_filters,
-            &options,
-        )?;
-        // Freeze every Stage target and exact fragment set from the same
-        // manifest that InitQuery consumes.  No later lifecycle phase may
-        // consult live topology again.
-        let stage_bindings = plan.stage_participant_bindings()?;
-        let query_lifecycle_lease = barrier.initialize_all(plan)?;
-        Ok(ControlReadyDistributedQuery {
-            prepared: self.prepared,
-            native_bundle: self.native_bundle,
-            schedule: self.schedule,
-            options,
-            query_lifecycle_lease,
-            stage_bindings,
-            connector_write_plan: self.connector_write_plan,
-        })
     }
 
     /// Assemble the sealed request for the core-only semantic test runtime.
@@ -297,6 +443,178 @@ impl ScheduleBoundDistributedQuery {
             expected_output: assembled.expected_output,
             declarations,
             runtime_filters,
+        })
+    }
+}
+
+/// Frontend-only schedule/topology facts. It has no constructor and exposes no
+/// mutable schedule, graph, or SQL planner type.
+#[derive(Clone)]
+pub struct RuntimeFilterScheduledView<'a> {
+    artifact_id: RuntimeFilterArtifactId,
+    execution_id: QueryExecutionId,
+    scheduled_backend_ids: Vec<usize>,
+    frozen_live_backend_ids: Vec<usize>,
+    frozen_live_backends: Vec<RuntimeFilterBackendTopologyEntry>,
+    has_runtime_filter_channels: bool,
+    deployment_facts: RuntimeFilterDeploymentFactsView<'a>,
+    _private: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> RuntimeFilterScheduledView<'a> {
+    pub fn artifact_id(self) -> RuntimeFilterArtifactId {
+        self.artifact_id
+    }
+
+    pub fn execution_id(self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub fn query_id_wire(self) -> crate::proto::common::UniqueId {
+        crate::proto::common::UniqueId {
+            hi: self.execution_id.query_id().high(),
+            lo: self.execution_id.query_id().low(),
+        }
+    }
+
+    pub fn deployment_epoch(self) -> u64 {
+        self.execution_id.attempt_id().get()
+    }
+
+    pub fn scheduled_backend_ids(self) -> impl ExactSizeIterator<Item = usize> + 'a {
+        self.scheduled_backend_ids.into_iter()
+    }
+
+    pub fn frozen_live_backend_ids(self) -> impl ExactSizeIterator<Item = usize> + 'a {
+        self.frozen_live_backend_ids.into_iter()
+    }
+
+    pub fn frozen_live_backends(
+        self,
+    ) -> impl ExactSizeIterator<Item = RuntimeFilterBackendTopologyEntry> + 'a {
+        self.frozen_live_backends.into_iter()
+    }
+
+    /// A sealed graph-level fact only. It deliberately exposes neither the
+    /// SQL graph nor a reconstruction handle; Frontend uses it to preserve
+    /// the distinct empty-graph lifecycle contract.
+    pub fn has_runtime_filter_channels(&self) -> bool {
+        self.has_runtime_filter_channels
+    }
+
+    /// The deployment owner receives immutable planner and schedule facts,
+    /// never a SQL graph, placement draft, or compiler handle.
+    pub fn deployment_facts(&self) -> RuntimeFilterDeploymentFactsView<'a> {
+        self.deployment_facts
+    }
+
+    pub fn seal(
+        self,
+        contributions: impl IntoIterator<
+            Item = (usize, crate::proto::novarocks::RuntimeFilterContribution),
+        >,
+    ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
+        let mut by_backend = BTreeMap::new();
+        for (backend_idx, contribution) in contributions {
+            if by_backend.insert(backend_idx, contribution).is_some() {
+                return Err(contract_error(format!(
+                    "runtime filter deployment attachment repeats backend {backend_idx}"
+                )));
+            }
+        }
+        if !by_backend.is_empty() {
+            let expected = self
+                .frozen_live_backend_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let actual = by_backend.keys().copied().collect::<BTreeSet<_>>();
+            if actual != expected {
+                let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+                let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+                return Err(contract_error(format!(
+                    "runtime filter deployment attachment backend set mismatch: missing={missing:?} unknown={unknown:?}"
+                )));
+            }
+        }
+        Ok(RuntimeFilterDeploymentAttachment {
+            artifact_id: self.artifact_id,
+            contributions: by_backend,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterBackendTopologyEntry {
+    backend_idx: usize,
+    endpoint: SocketAddr,
+    start_epoch: u64,
+}
+
+impl RuntimeFilterBackendTopologyEntry {
+    pub const fn backend_idx(self) -> usize {
+        self.backend_idx
+    }
+
+    pub const fn endpoint(self) -> SocketAddr {
+        self.endpoint
+    }
+
+    pub const fn start_epoch(self) -> u64 {
+        self.start_epoch
+    }
+}
+
+/// Only this typestate represents a fully bound RF query. Its generic Init
+/// entrypoint is intentionally introduced separately from the legacy
+/// transition entrypoint while owner-local deployment compilation migrates.
+pub struct RuntimeFilterDeploymentReadyDistributedQuery {
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentBundle,
+    schedule: ValidatedFragmentSchedule,
+    connector_write_plan: Option<ConnectorWritePlanAttachment>,
+    runtime_filter_contributions:
+        BTreeMap<usize, crate::proto::novarocks::RuntimeFilterContribution>,
+}
+
+impl RuntimeFilterDeploymentReadyDistributedQuery {
+    /// Enter the generic Init + ControlReady barrier only after the Frontend
+    /// has sealed the opaque runtime-filter contributions for this schedule.
+    /// Core deliberately validates no runtime-filter semantics here.
+    pub fn initialize_query(
+        self,
+        options: QueryInitOptions,
+        barrier: &dyn QueryInitBarrier,
+    ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
+        if options.execution_id() != self.schedule.execution_id {
+            return Err(contract_error(
+                "query initialization execution id does not match validated schedule",
+            ));
+        }
+        let runtime_filters = self
+            .runtime_filter_contributions
+            .into_iter()
+            .map(|(backend_idx, contribution)| {
+                RuntimeFilterContribution::from_wire(contribution)
+                    .map(|contribution| (backend_idx, contribution))
+                    .map_err(|error| contract_error(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = crate::query_execution::lifecycle::init_plan::compile_query_init_plan(
+            self.schedule.lifecycle_projection(),
+            runtime_filters,
+            &options,
+        )?;
+        let stage_bindings = plan.stage_participant_bindings()?;
+        let query_lifecycle_lease = barrier.initialize_all(plan)?;
+        Ok(ControlReadyDistributedQuery {
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options,
+            query_lifecycle_lease,
+            stage_bindings,
+            connector_write_plan: self.connector_write_plan,
         })
     }
 }

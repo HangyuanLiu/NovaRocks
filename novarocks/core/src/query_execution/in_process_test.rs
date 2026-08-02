@@ -35,7 +35,8 @@ use novarocks_spi::connector::{
 
 use crate::cache::CacheOptions;
 use crate::query_execution::artifact::{
-    BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule,
+    BackendPlacement, FragmentScheduleDraft, PreparedDistributedQuery,
+    RuntimeFilterBoundPreparedDistributedQuery, ValidatedFragmentSchedule,
 };
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
@@ -59,6 +60,29 @@ const TEST_QUERY_ID_HIGH: i64 = i64::MIN + 0x4e52;
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+pub(crate) fn bind_empty_runtime_filter_tables_for_test(
+    artifacts: PreparedDistributedQuery,
+) -> Result<RuntimeFilterBoundPreparedDistributedQuery, DistributedQueryError> {
+    let view = artifacts.runtime_filter_binding_view();
+    let tables = view
+        .facts()
+        .fragments()
+        .map(|fragment| {
+            if fragment.bindings().len() != 0 {
+                return Err(failed(
+                    "in-process native test execution does not support runtime-filter bindings",
+                ));
+            }
+            Ok(crate::proto::plan::RuntimeFilterBindingTable {
+                fragment_id: fragment.fragment_id(),
+                bindings: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let attachment = view.seal(tables)?;
+    artifacts.attach_runtime_filter_bindings(attachment)
 }
 
 #[derive(Default)]
@@ -135,8 +159,7 @@ pub(crate) fn execute(
         draft.assign_fragment(fragment_id, vec![BackendPlacement::new(0, endpoint)])?;
     }
     let schedule = ValidatedFragmentSchedule::validate(view, execution_id, draft)?;
-    let artifact = parts
-        .artifacts
+    let artifact = bind_empty_runtime_filter_tables_for_test(parts.artifacts)?
         .bind_schedule(schedule)?
         .assemble_for_in_process_test(query_id, &parts.options, &live_backends)?;
     let resolver = install_connector_bindings(&artifact.declarations)?;

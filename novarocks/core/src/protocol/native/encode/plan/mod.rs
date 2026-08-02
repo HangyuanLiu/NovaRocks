@@ -31,14 +31,12 @@ use crate::sql::planner::distributed::{
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
-use runtime_filter::encode_runtime_filter_binding_table;
 #[cfg(test)]
 pub(in crate::protocol::native) use runtime_filter::encode_runtime_filter_runtime_producer_target;
 pub(in crate::protocol::native) use runtime_filter::{
     encode_runtime_filter_activation, encode_runtime_filter_capability,
     encode_runtime_filter_completion, encode_runtime_filter_contribution_kind,
-    encode_runtime_filter_logical_domain, encode_runtime_filter_producer_target,
-    encode_runtime_filter_reduction_requirement,
+    encode_runtime_filter_logical_domain, encode_runtime_filter_reduction_requirement,
 };
 
 mod output;
@@ -49,9 +47,6 @@ mod topology;
 mod type_mapping;
 mod write;
 
-#[cfg(not(test))]
-type ContextRef<'a, T> = &'a T;
-#[cfg(test)]
 type ContextRef<'a, T> = Option<&'a T>;
 
 pub(super) struct NativePlanEncodeContext<'a> {
@@ -86,50 +81,24 @@ impl<'a> NativePlanEncodeContext<'a> {
         runtime_filter_bindings: ContextRef<'a, PreparedFragmentSet>,
     ) -> Self {
         Self {
-            #[cfg(not(test))]
-            scan_bindings,
-            #[cfg(test)]
             scan_bindings: Some(scan_bindings),
-            #[cfg(not(test))]
-            node_outputs: src.node_outputs(),
-            #[cfg(test)]
             node_outputs: Some(src.node_outputs()),
-            #[cfg(not(test))]
-            fragment_edge_outputs: src.fragment_edge_outputs(),
-            #[cfg(test)]
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
-            #[cfg(not(test))]
-            write_contracts: src.write_contracts(),
-            #[cfg(test)]
             write_contracts: Some(src.write_contracts()),
             runtime_filter_bindings,
         }
     }
 }
 
-#[cfg(not(test))]
-fn optional_context_ref<T>(value: &T) -> Option<&T> {
-    Some(value)
-}
-
-#[cfg(test)]
-fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
-    value
-}
-
 fn required_context_ref<'a, T>(
     value: ContextRef<'a, T>,
     missing: impl FnOnce() -> String,
 ) -> Result<&'a T, String> {
-    #[cfg(not(test))]
-    {
-        let _ = missing;
-        Ok(value)
-    }
-    #[cfg(test)]
-    {
-        value.ok_or_else(missing)
-    }
+    value.ok_or_else(missing)
+}
+
+fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
+    value
 }
 
 #[cfg(test)]
@@ -147,10 +116,8 @@ pub(super) fn encode_distributed_plan_from_prepared(
     scan_bindings: &ScanExecutionBindings,
     prepared: &PreparedFragmentSet,
 ) -> Result<plan::DistributedPlan, String> {
-    #[cfg(not(test))]
-    let runtime_filter_bindings = prepared;
-    #[cfg(test)]
-    let runtime_filter_bindings = Some(prepared);
+    let _ = prepared;
+    let runtime_filter_bindings = None;
     encode_distributed_plan_with_context_inner(
         src,
         NativePlanEncodeContext::complete(src, scan_bindings, runtime_filter_bindings),

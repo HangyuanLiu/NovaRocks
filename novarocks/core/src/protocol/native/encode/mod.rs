@@ -22,7 +22,7 @@ mod boundary_schema;
 #[cfg(test)]
 mod build;
 mod bundle;
-mod expr;
+pub(crate) mod expr;
 mod iceberg_literal_json;
 pub(crate) mod instance;
 pub(crate) mod plan;
