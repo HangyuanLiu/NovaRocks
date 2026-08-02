@@ -816,7 +816,15 @@ fn find_or_create_slot_on_scan(
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
 ) -> Option<ScalarId> {
-    if !matches!(scan.table.source, ScanSource::IcebergDataFiles { .. }) {
+    if !matches!(
+        scan.table.source,
+        ScanSource::IcebergDataFiles { .. }
+            | ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+                kind: crate::sql::planner::table::SqlScanKind::Data { .. }
+                    | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. },
+                ..
+            })
+    ) {
         return None;
     }
 

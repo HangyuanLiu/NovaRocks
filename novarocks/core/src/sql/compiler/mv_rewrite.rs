@@ -218,10 +218,9 @@ fn build_candidate(
     if mv.joins.is_some() {
         return Ok(None);
     }
-    let ScanSource::IcebergDataFiles { table, .. } = &mv.table.source else {
+    let Some(scan_fqn) = scan_fqn(&mv.table.source) else {
         return Ok(None);
     };
-    let scan_fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
     if !definition.base_table_refs.contains(&scan_fqn) {
         return Err(format!(
             "mv select resolved to {scan_fqn}, not in recorded base refs"
@@ -297,15 +296,32 @@ fn definition_is_fresh(definition: &MvRewriteDefinition) -> Result<bool, String>
 
 fn collect_iceberg_fqns(plan: &LogicalPlanNode, output: &mut Vec<String>) {
     if let crate::sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
-        && let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source
+        && let Some(fqn) = scan_fqn(&scan.table.source)
     {
-        let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
         if !output.contains(&fqn) {
             output.push(fqn);
         }
     }
     for child in &plan.children {
         collect_iceberg_fqns(child, output);
+    }
+}
+
+fn scan_fqn(source: &ScanSource) -> Option<String> {
+    match source {
+        ScanSource::Sql(source) => match source.kind {
+            crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => Some(format!(
+                "{}.{}.{}",
+                source.table.catalog, source.table.namespace, source.table.table
+            )),
+            _ => None,
+        },
+        ScanSource::IcebergDataFiles { table, .. } => Some(format!(
+            "{}.{}.{}",
+            table.catalog, table.namespace, table.table
+        )),
+        _ => None,
     }
 }
 

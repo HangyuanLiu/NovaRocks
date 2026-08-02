@@ -653,6 +653,11 @@ fn same_iceberg_table(
 ) -> bool {
     use crate::sql::planner::table::ScanSource;
     match (&a.source, &b.source) {
+        (ScanSource::Sql(ta), ScanSource::Sql(tb)) => {
+            ta.table.catalog == tb.table.catalog
+                && ta.table.namespace == tb.table.namespace
+                && ta.table.table == tb.table.table
+        }
         (
             ScanSource::IcebergDataFiles { table: ta, .. },
             ScanSource::IcebergDataFiles { table: tb, .. },
