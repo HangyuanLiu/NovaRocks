@@ -11,17 +11,21 @@
 use std::sync::Arc;
 
 use iceberg::{NamespaceIdent, TableIdent};
-use novarocks_spi::connector::{ConnectorWriteLease, ConnectorWriteOperationId};
+use novarocks_spi::connector::{
+    ConnectorCatalogMutationOperation, ConnectorControlResolver, ConnectorExecutionBindingKey,
+    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorRefAction, ConnectorRefKind,
+    ConnectorTableIdentity, ConnectorWriteLease, ConnectorWriteOperationId, CreateOrReplacePolicy,
+};
 
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
 use crate::engine::{
-    IcebergWriteRootDistributionResolver, StandaloneState,
-    execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context,
+    StandaloneState, execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context,
     execute_query_as_iceberg_staging_in_operation_with_connector_context,
     iceberg_write_shuffle_by_output_name,
 };
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
+use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
 use crate::sql::mv_refresh::first_refresh::{
@@ -30,6 +34,192 @@ use crate::sql::mv_refresh::first_refresh::{
     PreparedMvFirstRefreshWrite,
 };
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
+
+/// Bounded facts emitted by the feature-gated native fixture.  This deliberately
+/// contains no report frame, provider receipt, Arrow batch, or query result.
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvFirstRefreshStagingTestOutcome {
+    pub staging_branch: String,
+    pub input_rows: u64,
+    pub staged_bytes: u64,
+    pub artifact_count: u64,
+    pub writer_count: u32,
+}
+
+/// Execute one already prepared SQL-shaped first refresh through the real
+/// frontend coordinator and commit only its isolated staging branch.  This is
+/// compiled exclusively for the native cross-process fixture; the default
+/// REFRESH application route does not call it.
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_mv_first_refresh_staging_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: MvFirstRefreshShape,
+    physical_sql: MvFirstRefreshPhysicalSql,
+    staging_branch: String,
+    execution: &QueryExecutionContext,
+) -> Result<MvFirstRefreshStagingTestOutcome, String> {
+    let catalog_instance = ConnectorInstanceId::parse(&ctx.rewrite.target.catalog)
+        .map_err(|error| format!("MV first-refresh test catalog identity: {error}"))?;
+    let planning_lease = state
+        .connector_control
+        .acquire_current(&catalog_instance)
+        .map_err(|error| format!("acquire MV first-refresh test control lease: {error}"))?;
+    let observed_binding = ConnectorExecutionBindingKey {
+        instance_id: catalog_instance.clone(),
+        incarnation: planning_lease.binding().incarnation(),
+    };
+    let operation_id = ConnectorWriteOperationId::new();
+    let connector_context = ctx
+        .connector_context
+        .as_ref()
+        .ok_or_else(|| {
+            "MV first-refresh test is missing its connector request context".to_string()
+        })?
+        .clone();
+
+    // Preparation is intentionally complete before the staging-ref mutation.
+    let prepared = prepare_mv_first_refresh_sql_write(
+        ctx,
+        shape,
+        physical_sql,
+        &staging_branch,
+        operation_id,
+        observed_binding,
+        connector_context.clone(),
+    )?;
+    let mutation_lease = planning_lease
+        .derive_mutation_lease()
+        .map_err(|error| format!("derive MV first-refresh test mutation lease: {error}"))?;
+    let expected_snapshot_id = ctx.rewrite.target_snapshot_id.ok_or_else(|| {
+        "MV first-refresh test requires a bootstrap snapshot before staging".to_string()
+    })?;
+    let staging_ref = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+        &mutation_lease,
+        ConnectorMutationOperationId::new(),
+        ConnectorCatalogMutationOperation::AlterRef {
+            table: ConnectorTableIdentity {
+                instance_id: catalog_instance,
+                namespace: Arc::from(ctx.rewrite.target.namespace.as_str()),
+                table: Arc::from(ctx.rewrite.target.table.as_str()),
+            },
+            action: ConnectorRefAction::Create {
+                kind: ConnectorRefKind::Branch,
+                name: Arc::from(staging_branch.as_str()),
+                snapshot_id: Some(expected_snapshot_id),
+                policy: CreateOrReplacePolicy::FailIfExists,
+            },
+        },
+        connector_context.clone(),
+    );
+    match staging_ref {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed)
+            if matches!(
+                completed.finalization,
+                novarocks_spi::connector::ExternalMutationFinalization::Complete
+            ) => {}
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
+            return Err(format!(
+                "MV first-refresh test staging-ref finalization failed: {:?}",
+                completed.finalization
+            ));
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
+            return Err(format!(
+                "MV first-refresh test staging ref is known uncommitted: {failure}"
+            ));
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            return Err(format!(
+                "MV first-refresh test staging ref remains commit unknown: {failure}"
+            ));
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
+            return Err(format!(
+                "MV first-refresh test staging-ref contract failure: {error}"
+            ));
+        }
+    }
+
+    let write_lease = planning_lease
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV first-refresh test write lease: {error}"))?;
+    let (sink_spec, template) = activate_mv_first_refresh_connector_write(
+        state,
+        ctx,
+        &prepared,
+        &staging_branch,
+        std::collections::BTreeMap::from([
+            (
+                "novarocks.mv.first-refresh-test".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "novarocks.mv.first-refresh-operation".to_string(),
+                operation_id.to_string(),
+            ),
+        ]),
+        &write_lease,
+    )?;
+    let registration = ConnectorWriteOperationRegistration::single(template);
+    let session = state
+        .query_execution
+        .begin_write_operation_with_lease(registration, write_lease)
+        .map_err(|error| format!("seal MV first-refresh test write operation: {error}"))?;
+    let write_registration =
+        ConnectorWriteExecutionRegistration::try_new(session, prepared.primary_cohort())
+            .map_err(|error| format!("register MV first-refresh test cohort: {error}"))?;
+    let (completion, summary) = execute_prepared_mv_first_refresh_staging(
+        state,
+        ctx.rewrite.current_catalog.as_deref(),
+        &ctx.rewrite.current_database,
+        prepared,
+        sink_spec,
+        execution,
+        write_registration,
+        Some(ctx),
+    )?;
+    if summary.artifact_count() == 0 {
+        completion
+            .session()
+            .abort(connector_context)
+            .map_err(|error| format!("abort empty MV first-refresh test staging: {error}"))?;
+        return Ok(MvFirstRefreshStagingTestOutcome {
+            staging_branch,
+            input_rows: summary.input_rows(),
+            staged_bytes: summary.staged_bytes(),
+            artifact_count: 0,
+            writer_count: summary.writer_count(),
+        });
+    }
+    match crate::query_execution::connector_write_transaction::commit(&completion)
+        .map_err(|error| format!("commit MV first-refresh test staging: {error}"))?
+    {
+        novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ..
+        } => Ok(MvFirstRefreshStagingTestOutcome {
+            staging_branch,
+            input_rows: summary.input_rows(),
+            staged_bytes: summary.staged_bytes(),
+            artifact_count: summary.artifact_count(),
+            writer_count: summary.writer_count(),
+        }),
+        novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+            finalization, ..
+        } => Err(format!(
+            "MV first-refresh test staging commit finalized with failure: {finalization:?}"
+        )),
+        novarocks_spi::connector::ExternalMutationOutcome::KnownUncommitted { failure } => Err(
+            format!("MV first-refresh test staging commit is known uncommitted: {failure}"),
+        ),
+        novarocks_spi::connector::ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(
+            format!("MV first-refresh test staging commit remains unknown: {failure}"),
+        ),
+    }
+}
 
 /// Build the ordinary data-writer sink from the target frozen by the MV
 /// refresh context.  This adapter owns concrete Iceberg table metadata; the
@@ -212,7 +402,6 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     if prepared.observed_binding() != exact_lease.binding_key() {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
     }
-    let sink_spec = build_mv_first_refresh_sink_spec(ctx)?;
     let operation_id: ConnectorWriteOperationId = prepared.operation_id();
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
@@ -220,18 +409,45 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         namespace: ctx.rewrite.target.namespace.clone(),
         table: ctx.rewrite.target.table.clone(),
     };
-    let target_table = ctx.target_bindings.runtime().target_table();
+    // The staging branch was just created through the provider mutation
+    // contract.  The refresh context intentionally remains immutable, so its
+    // table handle predates that mutation.  Reload only in this provider
+    // activation adapter: this is the authoritative read used to validate the
+    // ref CAS facts and construct the writer, never a SQL-preparation side
+    // effect.
+    let entry = ctx.target_bindings.runtime().target_entry();
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+    let target_table =
+        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
+            .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
+            .table;
+    let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
+        target_table.metadata().current_schema(),
+    )?;
+    let resolved = crate::connector::backend::ResolvedTable {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+        columns,
+        statistics_pin: None,
+    };
+    let sink_spec = crate::engine::iceberg_writer::build_insert_write_sink_spec(
+        &target,
+        &resolved,
+        &target_table,
+        entry,
+        &resolved.columns,
+    )?;
     let ident = TableIdent::new(
         NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
-        target_table,
+        &target_table,
         &ident,
         staging_branch,
         CommitOpKind::FastAppend,
     );
-    let entry = ctx.target_bindings.runtime().target_entry();
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)?;
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)?;
@@ -299,8 +515,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let query = parse_query_from_sql(physical_sql.sql())?;
-            let root_distribution: IcebergWriteRootDistributionResolver =
-                iceberg_write_shuffle_by_output_name(root_hash_column);
+            let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column);
             execute_query_as_iceberg_staging_in_operation_with_connector_context(
                 state,
                 current_catalog,
@@ -308,7 +523,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
                 &query,
                 sink_spec,
                 None,
-                Some(root_distribution),
+                root_distribution,
                 Some(execution),
                 &connector_context,
                 registration,

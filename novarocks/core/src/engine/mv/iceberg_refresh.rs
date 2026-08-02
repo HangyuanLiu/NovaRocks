@@ -252,6 +252,69 @@ impl From<String> for IcebergMvRefreshExecutionError {
     }
 }
 
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+#[derive(Clone)]
+struct FirstRefreshStagingTestRuntime {
+    execution: crate::query_execution::request_context::QueryExecutionContext,
+    outcome: Arc<Mutex<Option<Result<crate::engine::MvFirstRefreshStagingTestOutcome, String>>>>,
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+thread_local! {
+    static FIRST_REFRESH_STAGING_TEST_RUNTIME: std::cell::RefCell<Option<FirstRefreshStagingTestRuntime>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+struct FirstRefreshStagingTestRuntimeGuard;
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+impl FirstRefreshStagingTestRuntimeGuard {
+    fn install(runtime: FirstRefreshStagingTestRuntime) -> Self {
+        FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "MV first-refresh test runtime already installed"
+            );
+            *slot.borrow_mut() = Some(runtime);
+        });
+        Self
+    }
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+impl Drop for FirstRefreshStagingTestRuntimeGuard {
+    fn drop(&mut self) {
+        FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+fn try_stage_sql_first_refresh_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape,
+    physical_sql: crate::sql::mv_refresh::first_refresh::MvFirstRefreshPhysicalSql,
+    staging_branch: String,
+) -> Option<Result<StatementResult, IcebergMvRefreshExecutionError>> {
+    FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+        let runtime = slot.borrow().clone()?;
+        let outcome =
+            crate::engine::mv_first_refresh_staging::execute_mv_first_refresh_staging_for_test(
+                state,
+                ctx,
+                shape,
+                physical_sql,
+                staging_branch,
+                &runtime.execution,
+            );
+        *runtime
+            .outcome
+            .lock()
+            .expect("MV first-refresh test outcome lock poisoned") = Some(outcome.clone());
+        Some(outcome.map(|_| StatementResult::Ok).map_err(Into::into))
+    })
+}
+
 /// Core adapter used by the frontend-owned MV application service. It keeps
 /// connector/analyzer state in core while exposing CREATE as auditable,
 /// side-effect-sized primitives.
@@ -4348,6 +4411,24 @@ fn refresh_iceberg_mv_with_planned_partitions(
                     .to_string()
                     .into());
             };
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let physical_sql = crate::sql::mv_refresh::first_refresh::prepare_projection_first_refresh_write_sql(
+                    &ctx.rewrite.mv_definition.select_sql,
+                    &ctx.rewrite.pin,
+                    current_catalog,
+                    current_database,
+                )?;
+                if let Some(result) = try_stage_sql_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Projection,
+                    physical_sql,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 &target,
@@ -7403,6 +7484,68 @@ pub(crate) fn execute_iceberg_mv_refresh_with_connector_context(
     Ok(IcebergRefreshOutcome {
         completed_inside_execute: true,
     })
+}
+
+/// Native fixture-only entrypoint for the MVX-2W result-free first-refresh
+/// consumer. It plans with the ordinary MV planner, installs a thread-local
+/// test runtime for this synchronous attempt, and never enters the legacy
+/// operation repository/write-chunk path.
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+pub(crate) fn execute_iceberg_mv_first_refresh_staging_test(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_name: &str,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::engine::MvFirstRefreshStagingTestOutcome, String> {
+    let statement = RefreshMaterializedViewStmt {
+        name: crate::sql::parser::ast::ObjectName {
+            parts: vec![mv_name.to_string()],
+        },
+        full: false,
+    };
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
+    let iceberg_target =
+        resolve_refresh_target(current_catalog, current_database, &statement.name)?;
+    let target = MvTarget {
+        catalog: Some(iceberg_target.catalog),
+        database: iceberg_target.namespace,
+        name: iceberg_target.table,
+    };
+    let plan = plan_iceberg_mv_refresh_with_connector_context(
+        state,
+        current_catalog,
+        current_database,
+        &statement,
+        target,
+        &connector_context,
+    )
+    .map_err(|error| error.message)?;
+    let BackendRefreshPlan::Iceberg(payload) = &plan.backend_plan else {
+        return Err("MV first-refresh test planner returned a non-Iceberg payload".to_string());
+    };
+    let outcome = Arc::new(Mutex::new(None));
+    let _runtime_guard =
+        FirstRefreshStagingTestRuntimeGuard::install(FirstRefreshStagingTestRuntime {
+            execution: execution.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+    execute_iceberg_mv_refresh_with_connector_context(
+        state,
+        payload,
+        &plan.contract,
+        &connector_context,
+    )
+    .map_err(|error| error.message)?;
+    outcome
+        .lock()
+        .expect("MV first-refresh test outcome lock poisoned")
+        .take()
+        .ok_or_else(|| {
+            "MV first-refresh test did not reach the feature-gated first-refresh consumer"
+                .to_string()
+        })?
 }
 
 fn load_iceberg_mv_definition_by_target(
