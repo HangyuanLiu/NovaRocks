@@ -1060,14 +1060,58 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
     match &operation.payload {
         OperationPayload::WriteV1 => Ok(()),
         OperationPayload::CtasSaga(record) => {
+            validate_exact_connector_owner(
+                record.provider_id.as_deref(),
+                record.connector_instance_id.as_deref(),
+                record.connector_incarnation.as_deref(),
+            )?;
             validate_external_fact(record.prepare_fact.as_ref())?;
             validate_external_fact(record.publish_fact.as_ref())?;
             validate_external_fact(record.abort_staging_fact.as_ref())
         }
         OperationPayload::TruncateLifecycle(record) => {
+            validate_exact_connector_owner(
+                record.provider_id.as_deref(),
+                record.connector_instance_id.as_deref(),
+                record.connector_incarnation.as_deref(),
+            )?;
             validate_external_fact(record.outcome.as_ref())
         }
     }
+}
+
+fn validate_exact_connector_owner(
+    provider_id: Option<&str>,
+    instance_id: Option<&str>,
+    incarnation_hex: Option<&str>,
+) -> Result<(), DmlError> {
+    let present = [
+        provider_id.is_some(),
+        instance_id.is_some(),
+        incarnation_hex.is_some(),
+    ];
+    if present.iter().any(|present| *present) && !present.iter().all(|present| *present) {
+        return Err(DmlError::journal_corruption(
+            "DML connector owner must include provider, instance, and incarnation together",
+        ));
+    }
+    if provider_id.is_some_and(str::is_empty) || instance_id.is_some_and(str::is_empty) {
+        return Err(DmlError::journal_corruption(
+            "DML connector provider and instance IDs must not be empty",
+        ));
+    }
+    if incarnation_hex.is_some_and(|value| {
+        value.len() != 32
+            || !value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+    }) {
+        return Err(DmlError::journal_corruption(
+            "DML connector incarnation must be 32 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_external_fact(fact: Option<&DurableExternalFact>) -> Result<(), DmlError> {

@@ -27,7 +27,7 @@ use novarocks_frontend::dml::model::{
 };
 use novarocks_frontend::dml::{
     CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
-    DmlErrorKind, DmlOperationId, DurableExternalFact, ExternalFactOutcome,
+    DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
     IcebergCommitOutcomeRecord, OperationFact, OperationJournal, OperationKind,
     OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
     StateStoreOperationJournal, StatementNextAction, TruncateLifecyclePhase,
@@ -536,8 +536,9 @@ fn ctas_payload(phase: CtasSagaPhase) -> OperationPayload {
         publish_operation_id: Uuid::now_v7(),
         abort_staging_operation_id: Uuid::now_v7(),
         create_policy: "FAIL_IF_EXISTS".to_string(),
+        provider_id: Some("iceberg".to_string()),
         connector_instance_id: Some("iceberg-rest".to_string()),
-        connector_incarnation: Some(7),
+        connector_incarnation: Some("07".repeat(16)),
         source_plan_digest: Some("source-digest".to_string()),
         staged_handle_digest: None,
         aggregate_write_digest: None,
@@ -784,12 +785,14 @@ async fn statement_create_unknown_without_authoritative_record_is_unresolved() {
             OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
                 phase: TruncateLifecyclePhase::Preparing,
                 connector_operation_id: Uuid::now_v7(),
+                provider_id: None,
                 connector_instance_id: None,
                 connector_incarnation: None,
                 target_ref: "main".to_string(),
                 request_digest: None,
                 plan_digest: None,
                 state_digest: None,
+                plan_summary: None,
                 outcome: None,
                 next_action: StatementNextAction::None,
             }),
@@ -810,12 +813,18 @@ async fn truncate_v2_payload_round_trips_and_terminal_removes_index() {
     let payload = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
         phase: TruncateLifecyclePhase::Preparing,
         connector_operation_id: Uuid::now_v7(),
+        provider_id: Some("iceberg".to_string()),
         connector_instance_id: Some("iceberg-rest".to_string()),
-        connector_incarnation: Some(9),
+        connector_incarnation: Some("09".repeat(16)),
         target_ref: "main".to_string(),
         request_digest: Some("request".to_string()),
         plan_digest: None,
         state_digest: None,
+        plan_summary: Some(DurableMutationSummary {
+            file_count: 0,
+            row_count: 0,
+            total_bytes: 0,
+        }),
         outcome: None,
         next_action: StatementNextAction::None,
     });
@@ -833,12 +842,18 @@ async fn truncate_v2_payload_round_trips_and_terminal_removes_index() {
             OperationPayload::TruncateLifecycle(record) => record.connector_operation_id,
             _ => unreachable!(),
         },
+        provider_id: Some("iceberg".to_string()),
         connector_instance_id: Some("iceberg-rest".to_string()),
-        connector_incarnation: Some(9),
+        connector_incarnation: Some("09".repeat(16)),
         target_ref: "main".to_string(),
         request_digest: Some("request".to_string()),
         plan_digest: None,
         state_digest: None,
+        plan_summary: Some(DurableMutationSummary {
+            file_count: 0,
+            row_count: 0,
+            total_bytes: 0,
+        }),
         outcome: Some(DurableExternalFact {
             outcome: ExternalFactOutcome::KnownUncommitted,
             receipt: None,
@@ -918,4 +933,40 @@ async fn statement_external_fact_at_encoded_limit_is_preserved() {
         unreachable!();
     };
     assert_eq!(record.prepare_fact.unwrap().evidence.unwrap(), evidence);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_connector_owner_requires_lossless_lowercase_incarnation() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let mut payload = ctas_payload(CtasSagaPhase::PreparingStagedTable);
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    record.connector_incarnation = Some("AA".repeat(16));
+    let error = journal
+        .create_statement_operation(statement_request(
+            DmlOperationId::new_v7(),
+            Uuid::now_v7(),
+            OperationKind::CreateTableAsSelect,
+            payload,
+        ))
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+
+    let mut partial = ctas_payload(CtasSagaPhase::PreparingSource);
+    let OperationPayload::CtasSaga(record) = &mut partial else {
+        unreachable!();
+    };
+    record.provider_id = None;
+    let error = journal
+        .create_statement_operation(statement_request(
+            DmlOperationId::new_v7(),
+            Uuid::now_v7(),
+            OperationKind::CreateTableAsSelect,
+            partial,
+        ))
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
+    assert!(journal.list_operations().unwrap().is_empty());
 }

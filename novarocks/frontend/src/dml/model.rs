@@ -278,6 +278,13 @@ pub struct DurableExternalFact {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableMutationSummary {
+    pub file_count: u32,
+    pub row_count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CtasSagaPhase {
     PreparingSource,
@@ -301,9 +308,11 @@ pub struct CtasSagaRecord {
     pub abort_staging_operation_id: Uuid,
     pub create_policy: String,
     #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
     pub connector_instance_id: Option<String>,
     #[serde(default)]
-    pub connector_incarnation: Option<u64>,
+    pub connector_incarnation: Option<String>,
     #[serde(default)]
     pub source_plan_digest: Option<String>,
     #[serde(default)]
@@ -336,9 +345,11 @@ pub struct TruncateLifecycleRecord {
     pub phase: TruncateLifecyclePhase,
     pub connector_operation_id: Uuid,
     #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
     pub connector_instance_id: Option<String>,
     #[serde(default)]
-    pub connector_incarnation: Option<u64>,
+    pub connector_incarnation: Option<String>,
     pub target_ref: String,
     #[serde(default)]
     pub request_digest: Option<String>,
@@ -346,6 +357,8 @@ pub struct TruncateLifecycleRecord {
     pub plan_digest: Option<String>,
     #[serde(default)]
     pub state_digest: Option<String>,
+    #[serde(default)]
+    pub plan_summary: Option<DurableMutationSummary>,
     #[serde(default)]
     pub outcome: Option<DurableExternalFact>,
     pub next_action: StatementNextAction,
@@ -449,8 +462,9 @@ mod tests {
             publish_operation_id: Uuid::now_v7(),
             abort_staging_operation_id: Uuid::now_v7(),
             create_policy: "FAIL_IF_EXISTS".to_string(),
+            provider_id: Some("iceberg".to_string()),
             connector_instance_id: Some("rest".to_string()),
-            connector_incarnation: Some(3),
+            connector_incarnation: Some("03".repeat(16)),
             source_plan_digest: Some("source".to_string()),
             staged_handle_digest: Some("staged".to_string()),
             aggregate_write_digest: Some("write".to_string()),
@@ -474,12 +488,18 @@ mod tests {
         let truncate = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
             phase: TruncateLifecyclePhase::Executing,
             connector_operation_id: Uuid::now_v7(),
+            provider_id: Some("iceberg".to_string()),
             connector_instance_id: Some("rest".to_string()),
-            connector_incarnation: Some(4),
+            connector_incarnation: Some("04".repeat(16)),
             target_ref: "main".to_string(),
             request_digest: Some("request".to_string()),
             plan_digest: Some("plan".to_string()),
             state_digest: Some("state".to_string()),
+            plan_summary: Some(DurableMutationSummary {
+                file_count: 3,
+                row_count: 4,
+                total_bytes: 5,
+            }),
             outcome: None,
             next_action: StatementNextAction::None,
         });

@@ -39,7 +39,7 @@ pub use journal::OperationJournal;
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
-    DurableExternalFact, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
+    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
     IcebergCommitOutcomeRecord, IcebergOperationFailureKind, IcebergOperationFailureRecord,
     IcebergOperationNextAction, IcebergRecoveryEvidenceRecord, OperationFact, OperationKind,
     OperationMutationRequest, OperationPayload, OperationState, OperationTarget, RecoveryEvidence,
