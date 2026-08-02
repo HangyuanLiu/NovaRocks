@@ -61,6 +61,69 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
     staging_branch: String,
     execution: &QueryExecutionContext,
 ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
+    execute_mv_first_refresh_staging_with_preparer_for_test(
+        state,
+        ctx,
+        staging_branch.clone(),
+        execution,
+        move |operation_id, observed_binding, connector_context| {
+            prepare_mv_first_refresh_sql_write(
+                ctx,
+                shape,
+                physical_sql,
+                &staging_branch,
+                operation_id,
+                observed_binding,
+                connector_context,
+            )
+        },
+    )
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_mv_first_refresh_join_staging_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    shape: MvFirstRefreshShape,
+    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    staging_branch: String,
+    execution: &QueryExecutionContext,
+) -> Result<MvFirstRefreshStagingTestOutcome, String> {
+    execute_mv_first_refresh_staging_with_preparer_for_test(
+        state,
+        ctx,
+        staging_branch.clone(),
+        execution,
+        move |operation_id, observed_binding, connector_context| {
+            prepare_mv_first_refresh_join_write(
+                ctx,
+                shape,
+                append,
+                &staging_branch,
+                operation_id,
+                observed_binding,
+                connector_context,
+            )
+        },
+    )
+}
+
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+fn execute_mv_first_refresh_staging_with_preparer_for_test<F>(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    staging_branch: String,
+    execution: &QueryExecutionContext,
+    prepare: F,
+) -> Result<MvFirstRefreshStagingTestOutcome, String>
+where
+    F: FnOnce(
+        ConnectorWriteOperationId,
+        ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<PreparedMvFirstRefreshWrite, String>,
+{
     let catalog_instance = ConnectorInstanceId::parse(&ctx.rewrite.target.catalog)
         .map_err(|error| format!("MV first-refresh test catalog identity: {error}"))?;
     let planning_lease = state
@@ -81,15 +144,7 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
         .clone();
 
     // Preparation is intentionally complete before the staging-ref mutation.
-    let prepared = prepare_mv_first_refresh_sql_write(
-        ctx,
-        shape,
-        physical_sql,
-        &staging_branch,
-        operation_id,
-        observed_binding,
-        connector_context.clone(),
-    )?;
+    let prepared = prepare(operation_id, observed_binding, connector_context.clone())?;
     let mutation_lease = planning_lease
         .derive_mutation_lease()
         .map_err(|error| format!("derive MV first-refresh test mutation lease: {error}"))?;
