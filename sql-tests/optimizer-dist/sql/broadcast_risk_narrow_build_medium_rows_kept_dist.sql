@@ -45,6 +45,17 @@ SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 SELECT COUNT(p.pad1) AS cnt
 FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
 
+-- Physical Iceberg file sizes can vary slightly between equivalent writes,
+-- which changes only the final decimal places of scan-derived costs. Keep the
+-- distributed planning contract strict without pinning those incidental bytes.
+-- @result_contains=TABLE STATS ref=0
+-- @result_contains=rows=5000000 confidence=Exact source=IcebergManifest
+-- @result_contains=TABLE STATS ref=1
+-- @result_contains=rows=500000 confidence=Exact source=IcebergPuffin
+-- @result_contains=HASH JOIN (BROADCAST, INNER
+-- @result_contains=bcast={build=8.6MB ht=18.3MB be=3 fanout=51.6MB budget=256MB risk_mult=2.0x}
+-- @result_not_contains=HASH JOIN (PARTITIONED
+-- @skip_result_check=true
 EXPLAIN COSTS
 SELECT COUNT(p.pad1) AS cnt
 FROM probe_5m_wide p JOIN build_500k b ON p.k = b.k;
