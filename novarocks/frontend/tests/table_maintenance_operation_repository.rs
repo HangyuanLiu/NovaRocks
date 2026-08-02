@@ -132,6 +132,7 @@ async fn persists_plan_before_running_and_releases_terminal_fence() {
                 plan_digest: [4; 32],
                 payload_digest: metadata_maintenance_payload_digest(&plan_payload),
                 payload: plan_payload.clone(),
+                summary: [1, 2, 3, 4, 5],
             },
             11,
         )
@@ -195,6 +196,7 @@ async fn unresolved_operation_retains_the_table_fence() {
                 plan_digest: [4; 32],
                 payload_digest: metadata_maintenance_payload_digest(&plan),
                 payload: plan,
+                summary: [1, 2, 3, 4, 5],
             },
             11,
         )

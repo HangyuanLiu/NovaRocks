@@ -219,6 +219,13 @@ impl FrontendTableMaintenanceService {
                 plan_digest: plan.plan_digest(),
                 payload_digest: metadata_maintenance_payload_digest(&plan_payload),
                 payload: plan_payload,
+                summary: [
+                    plan.summary().source_items(),
+                    plan.summary().replacement_items(),
+                    plan.summary().candidate_versions(),
+                    plan.summary().cleanup_candidates(),
+                    plan.summary().total_bytes(),
+                ],
             },
             now_unix_millis(),
         ))

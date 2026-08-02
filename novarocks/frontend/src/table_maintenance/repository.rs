@@ -1811,6 +1811,9 @@ impl MetadataMaintenanceOperationRepository {
             plan_digest,
             payload_digest: payload.digest,
             payload: payload.payload,
+            summary: operation.plan_summary.ok_or_else(|| {
+                RepositoryError::corruption("metadata maintenance operation has no plan summary")
+            })?,
         }))
     }
 
@@ -2209,6 +2212,7 @@ async fn apply_metadata_create(
         request_payload_digest: request.request_payload_digest,
         base_state_digest: request.base_state_digest,
         plan_digest: None,
+        plan_summary: None,
         state: MetadataMaintenanceOperationState::Pending,
         error_message: None,
         created_at_ms: request.created_at_ms,
@@ -2325,6 +2329,7 @@ async fn apply_metadata_start(
     }
     operation.stored.state = MetadataMaintenanceOperationState::Running;
     operation.stored.plan_digest = Some(plan.plan_digest);
+    operation.stored.plan_summary = Some(plan.summary);
     operation.stored.started_at_ms = Some(now_ms);
     let plan_key =
         match metadata_payload_key(operation_id, StoredMetadataMaintenancePayloadKindV2::Plan) {

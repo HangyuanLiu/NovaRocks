@@ -272,6 +272,7 @@ pub struct MetadataMaintenancePlanPayload {
     pub plan_digest: [u8; 32],
     pub payload_digest: [u8; 32],
     pub payload: Vec<u8>,
+    pub summary: [u64; 5],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +291,7 @@ pub struct MetadataMaintenanceOperation {
     pub request_payload_digest: [u8; 32],
     pub base_state_digest: [u8; 32],
     pub plan_digest: Option<[u8; 32]>,
+    pub plan_summary: Option<[u64; 5]>,
     pub state: MetadataMaintenanceOperationState,
     pub error_message: Option<String>,
     pub created_at_ms: i64,
@@ -308,6 +310,8 @@ pub(crate) struct StoredMetadataMaintenanceOperationV2 {
     pub request_payload_digest: [u8; 32],
     pub base_state_digest: [u8; 32],
     pub plan_digest: Option<[u8; 32]>,
+    #[serde(default)]
+    pub plan_summary: Option<[u64; 5]>,
     pub state: MetadataMaintenanceOperationState,
     pub error_message: Option<String>,
     pub created_at_ms: i64,
@@ -363,6 +367,7 @@ impl From<&StoredMetadataMaintenanceOperationV2> for MetadataMaintenanceOperatio
             request_payload_digest: value.request_payload_digest,
             base_state_digest: value.base_state_digest,
             plan_digest: value.plan_digest,
+            plan_summary: value.plan_summary,
             state: value.state,
             error_message: value.error_message.clone(),
             created_at_ms: value.created_at_ms,
