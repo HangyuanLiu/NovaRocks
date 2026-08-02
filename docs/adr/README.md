@@ -136,6 +136,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
+- ADR-0029 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
 
 ### frontend-mv
 
