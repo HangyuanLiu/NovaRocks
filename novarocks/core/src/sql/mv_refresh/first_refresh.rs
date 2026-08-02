@@ -121,32 +121,6 @@ pub(crate) struct MvFirstRefreshTargetContract {
 }
 
 impl MvFirstRefreshTargetContract {
-    pub(crate) fn from_iceberg_schema(
-        schema: &iceberg::spec::Schema,
-        partition_spec_id: i32,
-        hidden_hash_key: String,
-    ) -> Result<Self, String> {
-        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema)
-            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
-        let field_ids = schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| field.id)
-            .collect();
-        if schema.field_by_name(&hidden_hash_key).is_none() {
-            return Err(format!(
-                "MV first-refresh target schema is missing hidden hash key {hidden_hash_key}"
-            ));
-        }
-        Self::try_new(
-            std::sync::Arc::new(arrow_schema),
-            field_ids,
-            partition_spec_id,
-            hidden_hash_key,
-        )
-    }
-
     pub(crate) fn try_new(
         schema: SchemaRef,
         field_ids: Vec<i32>,

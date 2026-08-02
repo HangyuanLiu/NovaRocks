@@ -412,15 +412,32 @@ fn mv_first_refresh_request(
                 .to_string(),
         );
     }
-    let target_contract = MvFirstRefreshTargetContract::from_iceberg_schema(
-        ctx.rewrite.target_schema.as_ref(),
+    let hidden_hash_key = ctx
+        .rewrite
+        .schema_contract
+        .target
+        .hidden_apply_key
+        .column_name
+        .clone();
+    let target_schema = ctx.rewrite.target_schema.as_ref();
+    let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
+        .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
+    let target_field_ids = target_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    if target_schema.field_by_name(&hidden_hash_key).is_none() {
+        return Err(format!(
+            "MV first-refresh target schema is missing hidden hash key {hidden_hash_key}"
+        ));
+    }
+    let target_contract = MvFirstRefreshTargetContract::try_new(
+        std::sync::Arc::new(target_arrow_schema),
+        target_field_ids,
         persisted_partition_spec_id,
-        ctx.rewrite
-            .schema_contract
-            .target
-            .hidden_apply_key
-            .column_name
-            .clone(),
+        hidden_hash_key,
     )?;
     let table =
         crate::engine::iceberg_writer::iceberg_connector_table_handle(&target, staging_branch)?;
