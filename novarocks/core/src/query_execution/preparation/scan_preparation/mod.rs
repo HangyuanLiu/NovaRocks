@@ -157,6 +157,64 @@ fn prepare_scan_node(
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
     let execution = match &scan.table.source {
+        ScanSource::Sql(source) => match source.kind {
+            crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                let query_table_bindings = query_table_bindings.ok_or_else(|| {
+                    format!(
+                        "SQL scan node_id={node_id} has binding token but no query-local binding store"
+                    )
+                })?;
+                let materialization = query_table_bindings
+                    .scan_materialization(source.binding)?
+                    .ok_or_else(|| {
+                        format!(
+                            "SQL scan binding for '{}.{}.{}' has no scan materialization",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        )
+                    })?;
+                let QueryScanMaterialization::IcebergDataFiles {
+                    table,
+                    files,
+                    binding,
+                } = materialization;
+                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                    table,
+                    files,
+                    binding,
+                })
+            }
+            crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
+                return bindings.insert_scan_ranges(
+                    fragment_id,
+                    node_id,
+                    vec![build_iceberg_metadata_scan_range_params()],
+                );
+            }
+            crate::sql::planner::table::SqlScanKind::ConnectorRead
+            | crate::sql::planner::table::SqlScanKind::Delta { .. }
+            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+                let source_context = scan_source_context(&scan.table.source);
+                let resolver = resolver.ok_or_else(|| {
+                    format!(
+                        "scan source {source_context} node_id={node_id} requires scan binding resolver"
+                    )
+                })?;
+                resolver
+                    .resolve_scan(node_id, scan)
+                    .map_err(|err| {
+                        format!(
+                            "scan binding resolver failed for required source {source_context} node_id={node_id}: {err}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
+                        )
+                    })?
+            }
+        },
         ScanSource::IcebergDataFiles {
             table,
             files,
@@ -332,6 +390,14 @@ fn exact_query_binding_lease_for_source(
     source: &ScanSource,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
     let (binding_id, expected_catalog, source_name) = match source {
+        ScanSource::Sql(source) => (
+            Some(source.binding),
+            source.table.catalog.as_str(),
+            format!(
+                "'{}.{}.{}'",
+                source.table.catalog, source.table.namespace, source.table.table
+            ),
+        ),
         ScanSource::IcebergDataFiles { table, binding, .. } => (
             bindings.iceberg_data_file_binding_id(table, *binding),
             table.catalog.as_str(),
@@ -373,6 +439,21 @@ fn validate_resolved_execution_kind(
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
     let valid = match source {
+        ScanSource::Sql(source) => match source.kind {
+            crate::sql::planner::table::SqlScanKind::ConnectorRead => {
+                matches!(execution, ResolvedScanExecution::ConnectorRead)
+            }
+            crate::sql::planner::table::SqlScanKind::Delta { .. } => {
+                matches!(execution, ResolvedScanExecution::IcebergDelta(_))
+            }
+            crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+                matches!(execution, ResolvedScanExecution::IcebergFiles(_))
+            }
+            crate::sql::planner::table::SqlScanKind::Metadata { .. } => true,
+        },
         ScanSource::ConnectorPinned => matches!(execution, ResolvedScanExecution::ConnectorRead),
         ScanSource::IcebergDeltaTable { .. } => {
             matches!(execution, ResolvedScanExecution::IcebergDelta(_))
@@ -442,6 +523,15 @@ fn scan_source_requires_resolver(source: &ScanSource) -> bool {
 
 fn scan_source_kind(source: &ScanSource) -> &'static str {
     match source {
+        ScanSource::Sql(source) => match source.kind {
+            crate::sql::planner::table::SqlScanKind::ConnectorRead => "SqlConnectorRead",
+            crate::sql::planner::table::SqlScanKind::Data { .. } => "SqlData",
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => "SqlFrozenInputSet",
+            crate::sql::planner::table::SqlScanKind::Metadata { .. } => "SqlMetadata",
+            crate::sql::planner::table::SqlScanKind::Delta { .. } => "SqlDelta",
+            crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => "SqlMvTargetState",
+            crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => "SqlMvTargetLocator",
+        },
         ScanSource::ConnectorPinned => "ConnectorPinned",
         ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",

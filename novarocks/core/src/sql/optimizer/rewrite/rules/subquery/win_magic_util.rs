@@ -50,6 +50,12 @@ impl TableIdentity {
     #[allow(dead_code)]
     pub(super) fn from_scan(scan: &ScanOp) -> Self {
         match &scan.table.source {
+            ScanSource::Sql(source) => TableIdentity::Iceberg {
+                catalog: source.table.catalog.clone(),
+                namespace: source.table.namespace.clone(),
+                table: source.table.table.clone(),
+                table_uuid: None,
+            },
             ScanSource::ConnectorPinned => TableIdentity::Connector {
                 database: scan.database.clone(),
                 table: scan.table.name.clone(),

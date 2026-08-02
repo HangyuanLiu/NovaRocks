@@ -580,6 +580,21 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
+        table_model::ScanSource::Sql(source) => match source.kind {
+            table_model::SqlScanKind::ConnectorRead => {
+                matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
+            }
+            table_model::SqlScanKind::Delta { .. } => {
+                matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
+            }
+            table_model::SqlScanKind::Data { .. }
+            | table_model::SqlScanKind::FrozenInputSet { .. }
+            | table_model::SqlScanKind::MvTargetState { .. }
+            | table_model::SqlScanKind::MvTargetLocator { .. } => {
+                matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
+            }
+            table_model::SqlScanKind::Metadata { .. } => false,
+        },
         table_model::ScanSource::ConnectorPinned => {
             matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
         }
@@ -606,6 +621,15 @@ fn scan_binding_for_source<'a>(
 
 fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
     match source {
+        table_model::ScanSource::Sql(source) => match source.kind {
+            table_model::SqlScanKind::ConnectorRead => "SqlConnectorRead",
+            table_model::SqlScanKind::Data { .. } => "SqlData",
+            table_model::SqlScanKind::FrozenInputSet { .. } => "SqlFrozenInputSet",
+            table_model::SqlScanKind::Metadata { .. } => "SqlMetadata",
+            table_model::SqlScanKind::Delta { .. } => "SqlDelta",
+            table_model::SqlScanKind::MvTargetState { .. } => "SqlMvTargetState",
+            table_model::SqlScanKind::MvTargetLocator { .. } => "SqlMvTargetLocator",
+        },
         table_model::ScanSource::ConnectorPinned => "ConnectorPinned",
         table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         table_model::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
@@ -677,6 +701,14 @@ fn encode_scan_source(
 
     Ok(plan::ScanSource {
         kind: Some(match src {
+            table_model::ScanSource::Sql(_) => {
+                return Err(format!(
+                    "native SQL scan node_id={} must be materialized as ConnectorReadSource before encoding",
+                    scan_node_id
+                        .map(|node_id| node_id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
+            }
             table_model::ScanSource::ConnectorPinned => {
                 return Err(format!(
                     "native ConnectorPinned node_id={} must be materialized as ConnectorReadSource before encoding",
@@ -779,6 +811,7 @@ fn iceberg_schema_for_connector_source(
     source: &table_model::ScanSource,
 ) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
     match source {
+        table_model::ScanSource::Sql(_) => None,
         table_model::ScanSource::ConnectorPinned => None,
         table_model::ScanSource::IcebergDataFiles { table, .. }
         | table_model::ScanSource::IcebergDeltaTable { table, .. }

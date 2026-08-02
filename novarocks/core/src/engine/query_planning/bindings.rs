@@ -34,6 +34,9 @@ use crate::connector::iceberg::scan_model::{
 };
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
+use crate::sql::planner::table::{
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+};
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
 
@@ -156,6 +159,78 @@ impl QueryTableBinding {
             planning_lease: None,
             scan_materialization: None,
         }
+    }
+
+    /// Project one application-resolved Iceberg file scan into the SQL-owned
+    /// source vocabulary. Concrete table/file facts remain in
+    /// `scan_materialization`, paired with this exact request-local token.
+    pub(crate) fn project_legacy_scan_for_sql(
+        &mut self,
+        binding: SqlTableBindingId,
+    ) -> Result<(), String> {
+        let (source, materialization) = match &self.resolved.planner.source {
+            ScanSource::IcebergDataFiles {
+                table,
+                files,
+                binding: file_binding,
+                ..
+            } => {
+                let version = match file_binding {
+                    IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
+                    IcebergDataFileBinding::ExplicitFiles => SqlTableVersionSelector::Snapshot(
+                        table.current_snapshot_id.ok_or_else(|| {
+                            format!(
+                                "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
+                                table.catalog, table.namespace, table.table
+                            )
+                        })?,
+                    ),
+                };
+                let kind = match file_binding {
+                    IcebergDataFileBinding::CurrentSnapshot => SqlScanKind::Data { version },
+                    IcebergDataFileBinding::ExplicitFiles => {
+                        SqlScanKind::FrozenInputSet { version }
+                    }
+                };
+                (
+                    SqlScanSource::new(
+                        binding,
+                        SqlTableIdentity {
+                            catalog: table.catalog.clone(),
+                            namespace: table.namespace.clone(),
+                            table: table.table.clone(),
+                        },
+                        kind,
+                    ),
+                    Some(QueryScanMaterialization::IcebergDataFiles {
+                        table: table.clone(),
+                        files: files.clone(),
+                        binding: *file_binding,
+                    }),
+                )
+            }
+            ScanSource::ConnectorPinned => (
+                SqlScanSource::new(
+                    binding,
+                    SqlTableIdentity {
+                        catalog: self.resolved.catalog.identity.catalog.clone(),
+                        namespace: self.resolved.catalog.identity.namespace.clone(),
+                        table: self.resolved.catalog.identity.table.clone(),
+                    },
+                    SqlScanKind::ConnectorRead,
+                ),
+                None,
+            ),
+            ScanSource::Sql(_) => return Ok(()),
+            source => {
+                return Err(format!(
+                    "catalog base-table resolution returned unsupported application scan source {source:?}"
+                ));
+            }
+        };
+        self.resolved.planner.source = ScanSource::Sql(source);
+        self.scan_materialization = materialization;
+        Ok(())
     }
 }
 

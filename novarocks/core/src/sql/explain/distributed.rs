@@ -1680,6 +1680,11 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
 
 fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
     match &table.source {
+        ScanSource::Sql(source) => match source.kind {
+            crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {}
+            _ => return false,
+        },
         ScanSource::ConnectorPinned => return false,
         ScanSource::IcebergDataFiles { .. } | ScanSource::ConnectorPinned => {}
         ScanSource::IcebergMetadataTable { .. } => return false,

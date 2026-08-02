@@ -214,6 +214,7 @@ fn partition_struct_type(table: &IcebergTableInfo) -> Result<DataType, String> {
 
 fn table_info_from_source(source: &ScanSource) -> Option<&IcebergTableInfo> {
     match source {
+        ScanSource::Sql(_) => None,
         ScanSource::IcebergDataFiles { table, .. }
         | ScanSource::IcebergMetadataTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. }

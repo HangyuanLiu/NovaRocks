@@ -524,6 +524,7 @@ fn iceberg_table_info(
     source: &crate::sql::planner::table::ScanSource,
 ) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
     match source {
+        crate::sql::planner::table::ScanSource::Sql(_) => None,
         crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }

@@ -26,9 +26,7 @@ use novarocks_spi::connector::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
-use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
-};
+use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingStore};
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;
@@ -226,6 +224,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         catalog: &str,
         namespace: &str,
         table: &str,
+        binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
         if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
             let (mut planner, statistics_pin, planning_lease) =
@@ -238,13 +237,14 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                     snapshot_id,
                 )?;
             planner.name = table.to_string();
-            let scan_materialization = scan_materialization_from_planner(&planner)?;
-            return Ok(QueryTableBinding {
+            let mut binding = QueryTableBinding {
                 resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
                 statistics_pin,
                 planning_lease: Some(planning_lease),
-                scan_materialization,
-            });
+                scan_materialization: None,
+            };
+            binding.project_legacy_scan_for_sql(binding_id)?;
+            return Ok(binding);
         }
         let (planner, _schema_id, statistics_pin, planning_lease) =
             crate::connector::iceberg::provider::load_schema_table_def_with_lease(
@@ -254,13 +254,14 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 namespace,
                 table,
             )?;
-        let scan_materialization = scan_materialization_from_planner(&planner)?;
-        Ok(QueryTableBinding {
+        let mut binding = QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
             statistics_pin,
             planning_lease: Some(planning_lease),
-            scan_materialization,
-        })
+            scan_materialization: None,
+        };
+        binding.project_legacy_scan_for_sql(binding_id)?;
+        Ok(binding)
     }
 
     fn load_metadata_table(
@@ -301,27 +302,6 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             table,
             metadata_table_type,
         )
-    }
-}
-
-fn scan_materialization_from_planner(
-    planner: &crate::sql::planner::table::TableDef,
-) -> Result<Option<QueryScanMaterialization>, String> {
-    match &planner.source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table,
-            files,
-            binding,
-            ..
-        } => Ok(Some(QueryScanMaterialization::IcebergDataFiles {
-            table: table.clone(),
-            files: files.clone(),
-            binding: *binding,
-        })),
-        crate::sql::planner::table::ScanSource::ConnectorPinned => Ok(None),
-        source => Err(format!(
-            "catalog base-table resolution returned unsupported application scan source {source:?}"
-        )),
     }
 }
 
@@ -391,27 +371,41 @@ pub(super) fn collect_table_stats(
     table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
-    let ScanSource::IcebergDataFiles { table, binding, .. } = &table_def.source else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "scan source does not expose connector statistics".to_string(),
-            )),
-        );
+    let binding_id = match &table_def.source {
+        ScanSource::Sql(source) => source.binding,
+        ScanSource::IcebergDataFiles { table, binding, .. } => {
+            let Some(bindings) = context.bindings.as_ref() else {
+                return (
+                    label,
+                    BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
+                        "query table bindings are not available".to_string(),
+                    )),
+                );
+            };
+            let Some(binding_id) = bindings.iceberg_data_file_binding_id(table, *binding) else {
+                return (
+                    label,
+                    BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                        "table resolution did not retain an exact query binding".to_string(),
+                    )),
+                );
+            };
+            binding_id
+        }
+        _ => {
+            return (
+                label,
+                BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
+                    "scan source does not expose connector statistics".to_string(),
+                )),
+            );
+        }
     };
     let Some(bindings) = context.bindings.as_ref() else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
                 "query table bindings are not available".to_string(),
-            )),
-        );
-    };
-    let Some(binding_id) = bindings.iceberg_data_file_binding_id(table, *binding) else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain an exact query binding".to_string(),
             )),
         );
     };
@@ -557,6 +551,10 @@ fn metric_f64(state: Option<&StatisticsMetricState>) -> Option<f64> {
 
 fn table_label(database: &str, table_def: &crate::sql::planner::table::TableDef) -> String {
     match &table_def.source {
+        ScanSource::Sql(source) => format!(
+            "{}.{}.{}",
+            source.table.catalog, source.table.namespace, source.table.table
+        ),
         ScanSource::IcebergDataFiles { table, .. }
         | ScanSource::IcebergVersionTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. } => {

@@ -31,6 +31,7 @@ use novarocks_catalog::table::CatalogTable;
 use crate::engine::query_planning::bindings::{
     QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
 };
+use crate::sql::binding::SqlTableBindingId;
 use crate::sql::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
 };
@@ -45,6 +46,7 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
         catalog: &str,
         namespace: &str,
         table: &str,
+        binding: SqlTableBindingId,
     ) -> Result<QueryTableBinding, String>;
 
     fn load_metadata_table(
@@ -136,24 +138,26 @@ impl<'a> CatalogServiceMaterializer<'a> {
                                 )
                             }
                         };
-                        let token = self.bindings.resolve_or_insert(key, || {
+                        let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
                             let mut binding = self.loader.load_strict_base_table(
                                 &catalog,
                                 &namespace,
                                 &table_name,
+                                binding_id,
                             )?;
                             binding.resolved = ResolvedAnalyzerTable::from_planner(
                                 Some("default_catalog"),
                                 database,
                                 planner,
                             );
+                            binding.project_legacy_scan_for_sql(binding_id)?;
                             Ok(binding)
                         })?;
                         return Ok(self.bindings.binding(token)?.resolved.clone());
                     }
                 }
                 let key = QueryTableBindingKey::analysis_lookup("default_catalog", database, table);
-                let token = self.bindings.resolve_or_insert(key, || {
+                let token = self.bindings.resolve_or_insert_with_id(key, |_| {
                     Ok(QueryTableBinding::local(
                         ResolvedAnalyzerTable::from_planner(
                             Some("default_catalog"),
@@ -166,8 +170,9 @@ impl<'a> CatalogServiceMaterializer<'a> {
             }
             Some(catalog) => {
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
-                let token = self.bindings.resolve_or_insert(key, || {
-                    self.loader.load_strict_base_table(catalog, database, table)
+                let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
+                    self.loader
+                        .load_strict_base_table(catalog, database, table, binding_id)
                 })?;
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }

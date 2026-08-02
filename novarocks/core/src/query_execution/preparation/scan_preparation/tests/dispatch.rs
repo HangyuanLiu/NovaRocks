@@ -88,18 +88,11 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     let DistributedNodeKind::Scan(scan) = &root.payload else {
         panic!("fixture root must be a scan");
     };
-    let ScanSource::IcebergDataFiles {
-        table,
-        files,
-        binding,
-        ..
-    } = &scan.table.source
-    else {
+    let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source else {
         panic!("fixture scan must use IcebergDataFiles");
     };
     let table = table.clone();
-    let files = files.clone();
-    let binding = *binding;
+    let source_table = scan.table.clone();
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("fixture root must be a scan");
     };
@@ -121,27 +114,43 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         .expect("fixture planning lease");
     let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
-    bindings.insert_strict_base_binding_for_test(
-        &table.catalog,
-        &table.namespace,
-        &table.table,
-        crate::engine::query_planning::bindings::QueryTableBinding {
-            resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
-                Some(&table.catalog),
-                "default",
-                scan.table.clone(),
+    let binding_id = bindings
+        .resolve_or_insert_with_id(
+            crate::engine::query_planning::bindings::QueryTableBindingKey::strict_base(
+                &table.catalog,
+                &table.namespace,
+                &table.table,
             ),
-            statistics_pin: None,
-            planning_lease: Some(lease.clone()),
-            scan_materialization: Some(
-                crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
-                    table: table.clone(),
-                    files,
-                    binding,
-                },
-            ),
+            |id| {
+                let mut binding = crate::engine::query_planning::bindings::QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some(&table.catalog),
+                        "default",
+                        source_table.clone(),
+                    ),
+                    statistics_pin: None,
+                    planning_lease: Some(lease.clone()),
+                    scan_materialization: None,
+                };
+                binding.project_legacy_scan_for_sql(id)?;
+                Ok(binding)
+            },
+        )
+        .expect("binding token");
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    scan.table.source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+        binding_id,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: table.catalog.clone(),
+            namespace: table.namespace.clone(),
+            table: table.table.clone(),
         },
-    );
+        crate::sql::planner::table::SqlScanKind::Data {
+            version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+        },
+    ));
 
     let prepared = super::super::prepare_scan_bindings(
         &plan(root),

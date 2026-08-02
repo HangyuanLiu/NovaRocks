@@ -69,6 +69,9 @@ impl SqlMetadataTableKind {
 /// metadata, files, credentials, or an executable connector handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SqlScanKind {
+    /// A connector-neutral external scan. Its exact execution authority is
+    /// recovered by `binding` at the application preparation boundary.
+    ConnectorRead,
     Data {
         version: SqlTableVersionSelector,
     },
@@ -243,6 +246,10 @@ impl IcebergMvTargetLocatorScan {
 ///   scans; codegen expands it into an explicit change-file payload.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
+    /// Transitional carrier for a source already projected into the SQL-owned
+    /// vocabulary. Production admission moves to this variant before the
+    /// remaining legacy concrete variants are deleted in the SQLX-2 cutover.
+    Sql(SqlScanSource),
     /// A provider-neutral, already pinned connector read. Preparation obtains
     /// execution declarations and opaque scan/split handles only from its
     /// injected resolver, never by resolving latest metadata again.

@@ -167,6 +167,9 @@ fn is_action_column_name(name: &str) -> bool {
 
 fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableInfo, String> {
     match source {
+        ScanSource::Sql(_) => {
+            Err("BindIcebergScan requires immutable Iceberg snapshot facts".to_string())
+        }
         ScanSource::IcebergDataFiles { table, .. }
         | ScanSource::IcebergMetadataTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. }

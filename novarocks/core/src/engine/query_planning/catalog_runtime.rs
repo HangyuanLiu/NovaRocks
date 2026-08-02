@@ -74,7 +74,8 @@ impl CatalogRuntimeMetadata {
                     },
                 })
             }
-            ScanSource::ConnectorPinned
+            ScanSource::Sql(_)
+            | ScanSource::ConnectorPinned
             | ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
