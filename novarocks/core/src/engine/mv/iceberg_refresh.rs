@@ -3508,13 +3508,33 @@ fn validate_target_snapshot(
 ) -> Result<(), String> {
     let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
-    if actual != expected {
+    if actual != expected && !(expected.is_none() && is_empty_target_bootstrap_snapshot(table)) {
         return Err(format!(
             "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
             target.catalog, target.namespace, target.table, expected, actual
         ));
     }
     Ok(())
+}
+
+/// CREATE MV establishes this provider-owned initial snapshot before any MV
+/// definition is durable. It is a staging-branch base, not a completed MV
+/// refresh, so the definition deliberately continues to record no refreshed
+/// target snapshot until first refresh publishes data.
+fn is_empty_target_bootstrap_snapshot(table: &iceberg::table::Table) -> bool {
+    table.metadata().current_snapshot().is_some_and(|snapshot| {
+        snapshot.parent_snapshot_id().is_none()
+            && snapshot
+                .summary()
+                .additional_properties
+                .get("novarocks.mv.bootstrap")
+                .map(String::as_str)
+                == Some("true")
+            && snapshot
+                .summary()
+                .additional_properties
+                .contains_key("novarocks.bootstrap.empty.operation-id")
+    })
 }
 
 fn recorded_target_snapshot_id(
