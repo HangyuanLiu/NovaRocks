@@ -29,6 +29,13 @@ pub const DML_OPERATION_SCHEMA_VERSION: u8 = 2;
 pub const DML_LEGACY_OPERATION_SCHEMA_VERSION: u8 = 1;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
 pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
+/// CTAS retains four phase facts in one StateStore value. Bound each complete
+/// fact envelope, not each individual string, so the four-fact maximum leaves
+/// room for operation identity, target facts, digests, and JSON framing.
+pub const DML_CTAS_FACT_ENCODED_LIMIT: usize = 8 * 1024;
+pub const DML_CTAS_TOTAL_FACT_ENCODED_LIMIT: usize = 4 * DML_CTAS_FACT_ENCODED_LIMIT;
+pub const CTAS_CREATE_POLICY_FAIL_IF_EXISTS: &str = "FAIL_IF_EXISTS";
+pub const CTAS_CREATE_POLICY_NO_OP_IF_EXISTS: &str = "NO_OP_IF_EXISTS";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -180,6 +187,43 @@ pub fn validate_operation_transition(
     }
 }
 
+/// Validate a statement-payload transition without widening the lifecycle of
+/// existing INSERT, DELETE, MV, or maintenance operations.
+///
+/// CTAS is a multi-effect saga. Its prepare, writer, publish, and staged-abort
+/// effects can each become unknown, and a failed/conflicting publish must move
+/// from publication into handle-scoped staging cleanup. Those edges are not
+/// valid for the ordinary single-write transaction runner.
+pub fn validate_statement_operation_transition(
+    operation_kind: OperationKind,
+    from: OperationState,
+    to: OperationState,
+) -> Result<(), String> {
+    if validate_operation_transition(from, to).is_ok() {
+        return Ok(());
+    }
+    let ctas_allowed = operation_kind == OperationKind::CreateTableAsSelect
+        && matches!(
+            (from, to),
+            (OperationState::Preparing, OperationState::CommitUnknown)
+                | (OperationState::Writing, OperationState::CommitUnknown)
+                | (OperationState::Committing, OperationState::Aborting)
+                | (OperationState::Aborting, OperationState::CommitUnknown)
+                | (OperationState::CommitUnknown, OperationState::Aborting)
+                | (OperationState::CommitUnknown, OperationState::Writing)
+                | (OperationState::CommitUnknown, OperationState::Committing)
+        );
+    if ctas_allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid DML operation state transition from {} to {}",
+            from.as_str(),
+            to.as_str()
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationTarget {
     pub catalog: String,
@@ -248,6 +292,7 @@ pub struct OperationFact {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExternalFactOutcome {
     KnownCommitted,
+    NoOp,
     KnownUncommitted,
     CommitUnknown,
     Unsupported,
@@ -289,12 +334,17 @@ pub struct DurableMutationSummary {
 pub enum CtasSagaPhase {
     PreparingSource,
     PreparingStagedTable,
+    PrepareUnknown,
     Staged,
     Writing,
+    WriteUnknown,
     Publishing,
     PublishUnknown,
     AbortingStaging,
+    AbortUnknown,
     Committed,
+    NoOp,
+    Conflict,
     Failed,
     Unsupported,
 }
@@ -316,11 +366,19 @@ pub struct CtasSagaRecord {
     #[serde(default)]
     pub source_plan_digest: Option<String>,
     #[serde(default)]
+    pub source_schema_digest: Option<String>,
+    #[serde(default)]
+    pub source_execution_identity: Option<String>,
+    #[serde(default)]
+    pub write_cohort_id: Option<String>,
+    #[serde(default)]
     pub staged_handle_digest: Option<String>,
     #[serde(default)]
     pub aggregate_write_digest: Option<String>,
     #[serde(default)]
     pub prepare_fact: Option<DurableExternalFact>,
+    #[serde(default)]
+    pub write_fact: Option<DurableExternalFact>,
     #[serde(default)]
     pub publish_fact: Option<DurableExternalFact>,
     #[serde(default)]
@@ -466,9 +524,13 @@ mod tests {
             connector_instance_id: Some("rest".to_string()),
             connector_incarnation: Some("03".repeat(16)),
             source_plan_digest: Some("source".to_string()),
+            source_schema_digest: Some("schema".to_string()),
+            source_execution_identity: Some("execution".to_string()),
+            write_cohort_id: Some("cohort".to_string()),
             staged_handle_digest: Some("staged".to_string()),
             aggregate_write_digest: Some("write".to_string()),
             prepare_fact: None,
+            write_fact: None,
             publish_fact: Some(DurableExternalFact {
                 outcome: ExternalFactOutcome::CommitUnknown,
                 receipt: None,
@@ -525,5 +587,33 @@ mod tests {
         );
         assert!(OperationState::Aborted.is_finished());
         assert!(!OperationState::CommitUnknown.is_finished());
+    }
+
+    #[test]
+    fn ctas_unknown_and_cleanup_edges_do_not_widen_other_dml() {
+        let ctas_edges = [
+            (OperationState::Preparing, OperationState::CommitUnknown),
+            (OperationState::Writing, OperationState::CommitUnknown),
+            (OperationState::Committing, OperationState::Aborting),
+            (OperationState::Aborting, OperationState::CommitUnknown),
+            (OperationState::CommitUnknown, OperationState::Aborting),
+            (OperationState::CommitUnknown, OperationState::Writing),
+            (OperationState::CommitUnknown, OperationState::Committing),
+        ];
+        for (from, to) in ctas_edges {
+            assert!(
+                validate_statement_operation_transition(
+                    OperationKind::CreateTableAsSelect,
+                    from,
+                    to,
+                )
+                .is_ok()
+            );
+            assert!(
+                validate_statement_operation_transition(OperationKind::InsertAppend, from, to)
+                    .is_err()
+            );
+            assert!(validate_operation_transition(from, to).is_err());
+        }
     }
 }

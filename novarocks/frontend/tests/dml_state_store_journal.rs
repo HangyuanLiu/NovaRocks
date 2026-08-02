@@ -23,14 +23,17 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_frontend::dml::model::{
+    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
+    DML_CTAS_FACT_ENCODED_LIMIT, DML_CTAS_TOTAL_FACT_ENCODED_LIMIT,
     DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_LEGACY_OPERATION_SCHEMA_VERSION,
+    DML_OPERATION_SCHEMA_VERSION,
 };
 use novarocks_frontend::dml::{
     CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
     DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
     IcebergCommitOutcomeRecord, OperationFact, OperationJournal, OperationKind,
     OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    StateStoreOperationJournal, StatementNextAction, TruncateLifecyclePhase,
+    StateStoreOperationJournal, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
     TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
@@ -642,22 +645,90 @@ async fn statement_preflight_uses_real_state_store_value_limit_at_exact_boundary
 }
 
 fn ctas_payload(phase: CtasSagaPhase) -> OperationPayload {
+    let committed_fact = || DurableExternalFact {
+        outcome: ExternalFactOutcome::KnownCommitted,
+        receipt: Some("receipt".to_string()),
+        evidence: None,
+        finalization_failure: None,
+        failure: None,
+    };
+    let unknown_fact = || DurableExternalFact {
+        outcome: ExternalFactOutcome::CommitUnknown,
+        receipt: None,
+        evidence: Some("evidence".to_string()),
+        finalization_failure: None,
+        failure: Some("unknown".to_string()),
+    };
+    let (prepare_fact, write_fact, publish_fact, abort_staging_fact) = match phase {
+        CtasSagaPhase::PreparingSource | CtasSagaPhase::PreparingStagedTable => {
+            (None, None, None, None)
+        }
+        CtasSagaPhase::PrepareUnknown => (Some(unknown_fact()), None, None, None),
+        CtasSagaPhase::Staged | CtasSagaPhase::Writing => {
+            (Some(committed_fact()), None, None, None)
+        }
+        CtasSagaPhase::WriteUnknown => (Some(committed_fact()), Some(unknown_fact()), None, None),
+        CtasSagaPhase::Publishing => (Some(committed_fact()), Some(committed_fact()), None, None),
+        CtasSagaPhase::PublishUnknown => (
+            Some(committed_fact()),
+            Some(committed_fact()),
+            Some(unknown_fact()),
+            None,
+        ),
+        CtasSagaPhase::AbortingStaging => (Some(committed_fact()), None, None, None),
+        CtasSagaPhase::AbortUnknown => (Some(committed_fact()), None, None, Some(unknown_fact())),
+        CtasSagaPhase::Committed => (
+            Some(committed_fact()),
+            Some(committed_fact()),
+            Some(committed_fact()),
+            None,
+        ),
+        CtasSagaPhase::NoOp => (
+            Some(committed_fact()),
+            Some(committed_fact()),
+            Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::NoOp,
+                receipt: Some("receipt".to_string()),
+                evidence: None,
+                finalization_failure: None,
+                failure: None,
+            }),
+            None,
+        ),
+        CtasSagaPhase::Conflict => (
+            Some(committed_fact()),
+            Some(committed_fact()),
+            Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::Conflict,
+                receipt: None,
+                evidence: None,
+                finalization_failure: None,
+                failure: Some("conflict".to_string()),
+            }),
+            None,
+        ),
+        CtasSagaPhase::Failed | CtasSagaPhase::Unsupported => (None, None, None, None),
+    };
     OperationPayload::CtasSaga(CtasSagaRecord {
         phase,
         prepare_operation_id: Uuid::now_v7(),
         write_operation_id: Uuid::now_v7(),
         publish_operation_id: Uuid::now_v7(),
         abort_staging_operation_id: Uuid::now_v7(),
-        create_policy: "FAIL_IF_EXISTS".to_string(),
+        create_policy: CTAS_CREATE_POLICY_FAIL_IF_EXISTS.to_string(),
         provider_id: Some("iceberg".to_string()),
         connector_instance_id: Some("iceberg-rest".to_string()),
         connector_incarnation: Some("07".repeat(16)),
         source_plan_digest: Some("source-digest".to_string()),
+        source_schema_digest: Some("schema-digest".to_string()),
+        source_execution_identity: Some("execution-identity".to_string()),
+        write_cohort_id: Some("write-cohort".to_string()),
         staged_handle_digest: None,
         aggregate_write_digest: None,
-        prepare_fact: None,
-        publish_fact: None,
-        abort_staging_fact: None,
+        prepare_fact,
+        write_fact,
+        publish_fact,
+        abort_staging_fact,
         next_action: StatementNextAction::None,
     })
 }
@@ -681,6 +752,40 @@ fn statement_request(
         attempt_id: "attempt-statement".to_string(),
         payload,
         created_at_ms: 200,
+    }
+}
+
+fn stored_statement_operation(
+    operation_id: DmlOperationId,
+    operation_kind: OperationKind,
+    payload: OperationPayload,
+) -> StoredOperation {
+    StoredOperation {
+        schema_version: DML_OPERATION_SCHEMA_VERSION,
+        operation_id,
+        revision: 1,
+        last_mutation_id: Uuid::now_v7(),
+        operation_kind,
+        operation_subkind: None,
+        target: OperationTarget {
+            catalog: "cat".to_string(),
+            namespace: "ns".to_string(),
+            table: "tbl".to_string(),
+            ref_name: Some("main".to_string()),
+        },
+        state: OperationState::Preparing,
+        attempt_id: "attempt-statement".to_string(),
+        base_snapshot_id: None,
+        base_snapshot_map: BTreeMap::new(),
+        staged_artifacts: Vec::new(),
+        commit_outcome: None,
+        cleanup_outcome: None,
+        recovery_evidence: None,
+        failure: None,
+        payload,
+        created_at_ms: 200,
+        updated_at_ms: 200,
+        finished_at_ms: None,
     }
 }
 
@@ -774,6 +879,83 @@ async fn ctas_v2_mutation_is_revision_cas_and_idempotent() {
             .unwrap_err()
             .kind(),
         DmlErrorKind::JournalUnresolved
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_reconcile_transitions_are_statement_specific() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+
+    for (resolved_state, resolved_phase) in [
+        (OperationState::Writing, CtasSagaPhase::Staged),
+        (OperationState::Committing, CtasSagaPhase::Publishing),
+    ] {
+        let operation_id = DmlOperationId::new_v7();
+        let created = journal
+            .create_statement_operation(statement_request(
+                operation_id,
+                Uuid::now_v7(),
+                OperationKind::CreateTableAsSelect,
+                ctas_payload(CtasSagaPhase::PreparingSource),
+            ))
+            .unwrap();
+        let unknown = journal
+            .mutate_statement_operation(OperationMutationRequest {
+                operation_id,
+                expected_revision: created.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::CommitUnknown,
+                payload: ctas_payload(CtasSagaPhase::PrepareUnknown),
+            })
+            .unwrap();
+        journal
+            .mutate_statement_operation(OperationMutationRequest {
+                operation_id,
+                expected_revision: unknown.revision,
+                mutation_id: Uuid::now_v7(),
+                state: resolved_state,
+                payload: ctas_payload(resolved_phase),
+            })
+            .unwrap();
+    }
+
+    let operation_id = DmlOperationId::new_v7();
+    let created = journal
+        .create_statement_operation(statement_request(
+            operation_id,
+            Uuid::now_v7(),
+            OperationKind::Truncate,
+            OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+                phase: TruncateLifecyclePhase::Preparing,
+                connector_operation_id: Uuid::now_v7(),
+                provider_id: None,
+                connector_instance_id: None,
+                connector_incarnation: None,
+                target_ref: "main".to_string(),
+                request_digest: None,
+                plan_digest: None,
+                state_digest: None,
+                plan_summary: None,
+                outcome: None,
+                next_action: StatementNextAction::None,
+            }),
+        ))
+        .unwrap();
+    let error = journal
+        .mutate_statement_operation(OperationMutationRequest {
+            operation_id,
+            expected_revision: created.revision,
+            mutation_id: Uuid::now_v7(),
+            state: OperationState::CommitUnknown,
+            payload: created.payload,
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+    assert!(
+        error
+            .to_string()
+            .contains("invalid DML operation state transition")
     );
 }
 
@@ -1001,7 +1183,7 @@ async fn statement_external_fact_budget_is_enforced_before_create() {
     record.prepare_fact = Some(DurableExternalFact {
         outcome: ExternalFactOutcome::CommitUnknown,
         receipt: None,
-        evidence: Some("e".repeat(DML_EXTERNAL_FACT_ENCODED_LIMIT + 1)),
+        evidence: Some("e".repeat(DML_CTAS_FACT_ENCODED_LIMIT + 1)),
         finalization_failure: None,
         failure: Some("unknown".to_string()),
     });
@@ -1018,11 +1200,11 @@ async fn statement_external_fact_budget_is_enforced_before_create() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn statement_external_fact_at_encoded_limit_is_preserved() {
+async fn statement_ctas_fact_below_encoded_limit_is_preserved() {
     let temp = TempDir::new().unwrap();
     let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
     let operation_id = DmlOperationId::new_v7();
-    let evidence = "e".repeat(DML_EXTERNAL_FACT_ENCODED_LIMIT);
+    let evidence = "e".repeat(DML_CTAS_FACT_ENCODED_LIMIT - 512);
     let mut payload = ctas_payload(CtasSagaPhase::PreparingStagedTable);
     let OperationPayload::CtasSaga(record) = &mut payload else {
         unreachable!();
@@ -1046,6 +1228,261 @@ async fn statement_external_fact_at_encoded_limit_is_preserved() {
         unreachable!();
     };
     assert_eq!(record.prepare_fact.unwrap().evidence.unwrap(), evidence);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_shape_rejects_invalid_child_ids_and_phase_fact_mismatch() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+
+    let mut nil_payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    let OperationPayload::CtasSaga(record) = &mut nil_payload else {
+        unreachable!();
+    };
+    record.prepare_operation_id = Uuid::nil();
+    let nil = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        nil_payload,
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&nil)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+
+    let mut duplicate_payload = ctas_payload(CtasSagaPhase::PreparingSource);
+    let OperationPayload::CtasSaga(record) = &mut duplicate_payload else {
+        unreachable!();
+    };
+    record.write_operation_id = record.prepare_operation_id;
+    let duplicate = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        duplicate_payload,
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&duplicate)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+
+    let mut mismatched_payload = ctas_payload(CtasSagaPhase::WriteUnknown);
+    let OperationPayload::CtasSaga(record) = &mut mismatched_payload else {
+        unreachable!();
+    };
+    record.write_fact = None;
+    let mismatched = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        mismatched_payload,
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&mismatched)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_unknown_without_provider_evidence_requires_manual_inspect() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let mut payload = ctas_payload(CtasSagaPhase::PrepareUnknown);
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    let fact = record.prepare_fact.as_mut().unwrap();
+    fact.evidence = None;
+    fact.failure = Some("possibly dispatched contract failure".to_string());
+    record.next_action = StatementNextAction::Reconcile;
+    let operation = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        payload.clone(),
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&operation)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    record.next_action = StatementNextAction::ManualInspect;
+    let manual = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        payload,
+    );
+    journal.preflight_statement_operation(&manual).unwrap();
+
+    let mut evidenced_payload = ctas_payload(CtasSagaPhase::PrepareUnknown);
+    let OperationPayload::CtasSaga(record) = &mut evidenced_payload else {
+        unreachable!();
+    };
+    record.next_action = StatementNextAction::Reconcile;
+    let evidenced = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        evidenced_payload,
+    );
+    journal.preflight_statement_operation(&evidenced).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_prepare_conflict_respects_canonical_create_policy() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let conflict_fact = DurableExternalFact {
+        outcome: ExternalFactOutcome::Conflict,
+        receipt: None,
+        evidence: None,
+        finalization_failure: None,
+        failure: Some("target already exists".to_string()),
+    };
+
+    let mut no_op_payload = ctas_payload(CtasSagaPhase::NoOp);
+    let OperationPayload::CtasSaga(record) = &mut no_op_payload else {
+        unreachable!();
+    };
+    record.create_policy = CTAS_CREATE_POLICY_NO_OP_IF_EXISTS.to_string();
+    record.prepare_fact = Some(conflict_fact.clone());
+    record.publish_fact = None;
+    let no_op = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        no_op_payload.clone(),
+    );
+    journal.preflight_statement_operation(&no_op).unwrap();
+
+    let OperationPayload::CtasSaga(record) = &mut no_op_payload else {
+        unreachable!();
+    };
+    record.create_policy = CTAS_CREATE_POLICY_FAIL_IF_EXISTS.to_string();
+    let strict_no_op = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        no_op_payload,
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&strict_no_op)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+
+    let mut conflict_payload = ctas_payload(CtasSagaPhase::Conflict);
+    let OperationPayload::CtasSaga(record) = &mut conflict_payload else {
+        unreachable!();
+    };
+    record.prepare_fact = Some(conflict_fact);
+    record.publish_fact = None;
+    let strict_conflict = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        conflict_payload.clone(),
+    );
+    journal
+        .preflight_statement_operation(&strict_conflict)
+        .unwrap();
+
+    let OperationPayload::CtasSaga(record) = &mut conflict_payload else {
+        unreachable!();
+    };
+    record.create_policy = "BEST_EFFORT".to_string();
+    let malformed = stored_statement_operation(
+        DmlOperationId::new_v7(),
+        OperationKind::CreateTableAsSelect,
+        conflict_payload,
+    );
+    assert_eq!(
+        journal
+            .preflight_statement_operation(&malformed)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalCorruption
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctas_four_maximum_facts_fit_one_real_state_store_record() {
+    fn maximum_fact() -> DurableExternalFact {
+        let mut fact = DurableExternalFact {
+            outcome: ExternalFactOutcome::KnownCommitted,
+            receipt: Some(String::new()),
+            evidence: None,
+            finalization_failure: None,
+            failure: None,
+        };
+        let framing = serde_json::to_vec(&fact).unwrap().len();
+        fact.receipt = Some("r".repeat(DML_CTAS_FACT_ENCODED_LIMIT - framing));
+        assert_eq!(
+            serde_json::to_vec(&fact).unwrap().len(),
+            DML_CTAS_FACT_ENCODED_LIMIT
+        );
+        fact
+    }
+
+    let operation_id = DmlOperationId::new_v7();
+    let mut payload = ctas_payload(CtasSagaPhase::Committed);
+    let OperationPayload::CtasSaga(record) = &mut payload else {
+        unreachable!();
+    };
+    record.prepare_fact = Some(maximum_fact());
+    record.write_fact = Some(maximum_fact());
+    record.publish_fact = Some(maximum_fact());
+    record.abort_staging_fact = Some(maximum_fact());
+    let operation = stored_statement_operation(
+        operation_id,
+        OperationKind::CreateTableAsSelect,
+        payload.clone(),
+    );
+    let fact_bytes = match &payload {
+        OperationPayload::CtasSaga(record) => [
+            record.prepare_fact.as_ref().unwrap(),
+            record.write_fact.as_ref().unwrap(),
+            record.publish_fact.as_ref().unwrap(),
+            record.abort_staging_fact.as_ref().unwrap(),
+        ]
+        .iter()
+        .map(|fact| serde_json::to_vec(fact).unwrap().len())
+        .sum::<usize>(),
+        _ => unreachable!(),
+    };
+    assert_eq!(fact_bytes, DML_CTAS_TOTAL_FACT_ENCODED_LIMIT);
+
+    let encoded_len = serde_json::to_vec(&operation).unwrap().len();
+    assert!(encoded_len < 64 * 1024);
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) =
+        open_store_with_max_value_bytes(&temp.path().join("ctas-max.sqlite"), Some(encoded_len))
+            .await;
+    assert_eq!(store.limits().max_value_bytes, encoded_len);
+    journal.preflight_statement_operation(&operation).unwrap();
+
+    let (_short_host, _short_store, short_journal) = open_store_with_max_value_bytes(
+        &temp.path().join("ctas-max-short.sqlite"),
+        Some(encoded_len - 1),
+    )
+    .await;
+    assert_eq!(
+        short_journal
+            .preflight_statement_operation(&operation)
+            .unwrap_err()
+            .kind(),
+        DmlErrorKind::JournalUnavailable
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

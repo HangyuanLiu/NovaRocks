@@ -32,13 +32,15 @@ use uuid::Uuid;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    CreatePreparingRequest, CreateStatementOperationRequest, DML_EXTERNAL_FACT_ENCODED_LIMIT,
+    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS, CreatePreparingRequest,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
+    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
     DML_LEGACY_OPERATION_SCHEMA_VERSION, DML_OPERATION_SCHEMA_VERSION,
-    DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId, DurableExternalFact,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId, DurableExternalFact, ExternalFactOutcome,
     IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord, IcebergOperationFailureRecord,
     IcebergRecoveryEvidenceRecord, OperationFact, OperationKind, OperationMutationRequest,
-    OperationPayload, OperationState, OperationTarget, StoredOperation,
-    validate_operation_transition,
+    OperationPayload, OperationState, OperationTarget, StatementNextAction, StoredOperation,
+    validate_operation_transition, validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
 
@@ -421,8 +423,12 @@ impl StateStoreOperationJournal {
                             request.expected_revision, operation.revision
                         ))));
                     }
-                    if let Err(error) = validate_operation_transition(operation.state, request.state)
-                        .map_err(DmlError::journal_unavailable)
+                    if let Err(error) = validate_statement_operation_transition(
+                        operation.operation_kind,
+                        operation.state,
+                        request.state,
+                    )
+                    .map_err(DmlError::journal_unavailable)
                     {
                         return Ok(Err(error));
                     }
@@ -1069,9 +1075,7 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
                 record.connector_instance_id.as_deref(),
                 record.connector_incarnation.as_deref(),
             )?;
-            validate_external_fact(record.prepare_fact.as_ref())?;
-            validate_external_fact(record.publish_fact.as_ref())?;
-            validate_external_fact(record.abort_staging_fact.as_ref())
+            validate_ctas_record(record)
         }
         OperationPayload::TruncateLifecycle(record) => {
             validate_exact_connector_owner(
@@ -1081,6 +1085,238 @@ fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
             )?;
             validate_external_fact(record.outcome.as_ref())
         }
+    }
+}
+
+fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
+    let child_ids = [
+        record.prepare_operation_id,
+        record.write_operation_id,
+        record.publish_operation_id,
+        record.abort_staging_operation_id,
+    ];
+    if child_ids.iter().any(Uuid::is_nil)
+        || child_ids.iter().copied().collect::<BTreeSet<_>>().len() != child_ids.len()
+    {
+        return Err(DmlError::journal_corruption(
+            "CTAS child operation IDs must be non-nil and pairwise distinct",
+        ));
+    }
+    if !matches!(
+        record.create_policy.as_str(),
+        CTAS_CREATE_POLICY_FAIL_IF_EXISTS | CTAS_CREATE_POLICY_NO_OP_IF_EXISTS
+    ) {
+        return Err(DmlError::journal_corruption(
+            "CTAS create policy must be FAIL_IF_EXISTS or NO_OP_IF_EXISTS",
+        ));
+    }
+    for (label, value) in [
+        ("source plan digest", record.source_plan_digest.as_deref()),
+        (
+            "source schema digest",
+            record.source_schema_digest.as_deref(),
+        ),
+        (
+            "source execution identity",
+            record.source_execution_identity.as_deref(),
+        ),
+        ("write cohort ID", record.write_cohort_id.as_deref()),
+        (
+            "staged handle digest",
+            record.staged_handle_digest.as_deref(),
+        ),
+        (
+            "aggregate write digest",
+            record.aggregate_write_digest.as_deref(),
+        ),
+    ] {
+        if value.is_some_and(str::is_empty) {
+            return Err(DmlError::journal_corruption(format!(
+                "CTAS {label} must not be empty"
+            )));
+        }
+    }
+
+    let facts = [
+        ("prepare", record.prepare_fact.as_ref()),
+        ("write", record.write_fact.as_ref()),
+        ("publish", record.publish_fact.as_ref()),
+        ("abort staging", record.abort_staging_fact.as_ref()),
+    ];
+    let mut total_fact_bytes = 0usize;
+    for (label, fact) in facts {
+        validate_external_fact(fact)?;
+        let Some(fact) = fact else {
+            continue;
+        };
+        validate_ctas_external_fact_shape(label, fact)?;
+        if fact.outcome == ExternalFactOutcome::CommitUnknown
+            && fact.evidence.is_none()
+            && record.next_action != StatementNextAction::ManualInspect
+        {
+            return Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact without provider evidence requires MANUAL_INSPECT"
+            )));
+        }
+        let encoded = serde_json::to_vec(fact).map_err(DmlError::journal_corruption)?;
+        if encoded.len() > DML_CTAS_FACT_ENCODED_LIMIT {
+            return Err(DmlError::journal_unavailable(format!(
+                "CTAS {label} fact encoded size {} exceeds per-fact limit {DML_CTAS_FACT_ENCODED_LIMIT}",
+                encoded.len()
+            )));
+        }
+        total_fact_bytes = total_fact_bytes.checked_add(encoded.len()).ok_or_else(|| {
+            DmlError::journal_unavailable("CTAS total fact encoded size overflow")
+        })?;
+    }
+    if total_fact_bytes > DML_CTAS_TOTAL_FACT_ENCODED_LIMIT {
+        return Err(DmlError::journal_unavailable(format!(
+            "CTAS total fact encoded size {total_fact_bytes} exceeds limit {DML_CTAS_TOTAL_FACT_ENCODED_LIMIT}"
+        )));
+    }
+
+    match record.phase {
+        CtasSagaPhase::PrepareUnknown => require_ctas_outcome(
+            "prepare unknown",
+            record.prepare_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Staged | CtasSagaPhase::Writing => require_ctas_outcome(
+            "prepared target",
+            record.prepare_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::WriteUnknown => require_ctas_outcome(
+            "write unknown",
+            record.write_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Publishing => require_ctas_outcome(
+            "completed write",
+            record.write_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::PublishUnknown => require_ctas_outcome(
+            "publish unknown",
+            record.publish_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::AbortUnknown => require_ctas_outcome(
+            "abort unknown",
+            record.abort_staging_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Committed => require_ctas_outcome(
+            "committed publish",
+            record.publish_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::NoOp
+            if record
+                .publish_fact
+                .as_ref()
+                .is_some_and(|fact| fact.outcome == ExternalFactOutcome::NoOp) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::NoOp
+            if record.create_policy == CTAS_CREATE_POLICY_NO_OP_IF_EXISTS
+                && record
+                    .prepare_fact
+                    .as_ref()
+                    .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::NoOp => Err(DmlError::journal_corruption(
+            "CTAS no-op phase requires publish NO_OP or NO_OP_IF_EXISTS prepare CONFLICT fact",
+        )),
+        CtasSagaPhase::Conflict
+            if record
+                .prepare_fact
+                .as_ref()
+                .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict)
+                || record
+                    .publish_fact
+                    .as_ref()
+                    .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::Conflict => Err(DmlError::journal_corruption(
+            "CTAS conflict phase requires prepare or publish CONFLICT fact",
+        )),
+        CtasSagaPhase::PreparingSource
+        | CtasSagaPhase::PreparingStagedTable
+        | CtasSagaPhase::AbortingStaging
+        | CtasSagaPhase::Failed
+        | CtasSagaPhase::Unsupported => Ok(()),
+    }
+}
+
+fn require_ctas_outcome(
+    label: &str,
+    fact: Option<&DurableExternalFact>,
+    expected: ExternalFactOutcome,
+) -> Result<(), DmlError> {
+    if fact.is_some_and(|fact| fact.outcome == expected) {
+        Ok(())
+    } else {
+        Err(DmlError::journal_corruption(format!(
+            "CTAS {label} phase requires {expected:?} fact"
+        )))
+    }
+}
+
+fn validate_ctas_external_fact_shape(
+    label: &str,
+    fact: &DurableExternalFact,
+) -> Result<(), DmlError> {
+    if fact.receipt.as_deref().is_some_and(str::is_empty)
+        || fact.evidence.as_deref().is_some_and(str::is_empty)
+        || fact
+            .finalization_failure
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || fact.failure.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(DmlError::journal_corruption(format!(
+            "CTAS {label} fact contains an empty durable field"
+        )));
+    }
+    if fact.receipt.is_some() && fact.evidence.is_some() {
+        return Err(DmlError::journal_corruption(format!(
+            "CTAS {label} fact cannot contain both receipt and evidence"
+        )));
+    }
+    match fact.outcome {
+        ExternalFactOutcome::CommitUnknown if fact.evidence.is_none() && fact.failure.is_none() => {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact requires provider evidence or a durable failure"
+            )))
+        }
+        ExternalFactOutcome::KnownCommitted | ExternalFactOutcome::NoOp
+            if fact.receipt.is_none() =>
+        {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} committed/no-op fact requires a receipt"
+            )))
+        }
+        ExternalFactOutcome::KnownUncommitted
+        | ExternalFactOutcome::Unsupported
+        | ExternalFactOutcome::Conflict
+            if fact.failure.is_none() =>
+        {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} uncommitted fact requires a failure"
+            )))
+        }
+        ExternalFactOutcome::CommitUnknown if fact.finalization_failure.is_some() => {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact cannot contain finalization failure"
+            )))
+        }
+        _ => Ok(()),
     }
 }
 
