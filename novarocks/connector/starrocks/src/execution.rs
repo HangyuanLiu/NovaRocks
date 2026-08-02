@@ -34,15 +34,15 @@ use crate::control::{
 };
 use crate::direct::{StarRocksDirectSplit, decode_direct_split};
 use crate::domain::{
-    StarRocksLocalBindingRef, StarRocksRpcOpaquePayload, StarRocksRpcTransport,
-    StarRocksSelectedStrategy, unavailable,
+    StarRocksLocalBindingRef, StarRocksRpcTransport, StarRocksSelectedStrategy, unavailable,
 };
+use crate::rpc::{StarRocksRpcSplit, decode_rpc_split};
 
 pub trait StarRocksRpcReaderFactory: Send + Sync {
     fn open_rpc_reader(
         &self,
         transport: StarRocksRpcTransport,
-        payload: StarRocksRpcOpaquePayload,
+        split: StarRocksRpcSplit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
 }
@@ -173,7 +173,7 @@ impl ConnectorReadExecution for CompositeReadExecution {
                     .ok_or_else(|| unavailable("StarRocks RPC reader factory is unavailable"))?
                     .open_rpc_reader(
                         transport,
-                        StarRocksRpcOpaquePayload::new(payload.0)?,
+                        decode_rpc_split(&payload.0, &direct_outer)?,
                         request,
                     )
             }
@@ -235,7 +235,8 @@ mod tests {
         StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
         StarRocksDirectMetadataLayout, StarRocksDirectSplitPlanner,
         StarRocksDirectTabletDescriptor, StarRocksDirectTabletPlanningSource,
-        StarRocksMetadataSource, StarRocksReadPolicy, StarRocksResolvedTable,
+        StarRocksMetadataSource, StarRocksReadPolicy, StarRocksRemoteEndpoint,
+        StarRocksResolvedTable, StarRocksRpcOutputBinding, StarRocksRpcSplit,
         StarRocksRpcSplitPlanner, StarRocksSharedDataDirectPlanner, StarRocksSplitPlanningInput,
         StarRocksStorageBindingRef, StarRocksStrategySplit, StarRocksStrategySplitPayload,
         StarRocksTopology,
@@ -310,14 +311,31 @@ mod tests {
     impl StarRocksRpcSplitPlanner for RpcPlanner {
         fn plan_rpc_splits(
             &self,
-            _: &StarRocksSplitPlanningInput,
-            _: &ConnectorSplitPlanningRequest,
+            input: &StarRocksSplitPlanningInput,
+            request: &ConnectorSplitPlanningRequest,
         ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
+            let facts = crate::control::rpc_outer_facts(input)?;
+            let split = StarRocksRpcSplit::try_new(
+                StarRocksRpcTransport::BrpcChunk,
+                StarRocksRemoteEndpoint::try_new("be.example", 8040)?,
+                Bytes::from_static(b"query-token"),
+                vec![StarRocksRpcOutputBinding {
+                    output_index: Some(0),
+                    remote_slot_id: 1,
+                    name: Arc::from("id"),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_const: false,
+                    row_marker: false,
+                }],
+            )?;
             Ok(vec![StarRocksStrategySplit {
                 split_id: Arc::from("rpc-1"),
-                payload: StarRocksStrategySplitPayload::Rpc(
-                    StarRocksRpcOpaquePayload::new(Bytes::from_static(b"query-token")).unwrap(),
-                ),
+                payload: StarRocksStrategySplitPayload::Rpc(crate::rpc::encode_rpc_split(
+                    &facts,
+                    &split,
+                    request.context.max_handle_payload_bytes(),
+                )?),
                 estimated_bytes: Some(8),
             }])
         }
@@ -524,10 +542,11 @@ mod tests {
         fn open_rpc_reader(
             &self,
             _: StarRocksRpcTransport,
-            payload: StarRocksRpcOpaquePayload,
+            split: StarRocksRpcSplit,
             request: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            assert_eq!(payload.as_bytes(), &Bytes::from_static(b"query-token"));
+            assert_eq!(split.endpoint().host(), "be.example");
+            assert_eq!(split.token(), &Bytes::from_static(b"query-token"));
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(Reader {
                 batch: Some(
@@ -580,7 +599,6 @@ mod tests {
     fn composite_execution_dispatches_only_the_frozen_rpc_factory() {
         let binding = control();
         let (declaration, split, schema) = planned_read(&binding);
-        assert!(String::from_utf8_lossy(split.payload()).contains("cXVlcnktdG9rZW4"));
         assert!(!format!("{declaration:?}").contains("query-token"));
         let rpc_calls = Arc::new(AtomicUsize::new(0));
         let direct_calls = Arc::new(AtomicUsize::new(0));

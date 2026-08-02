@@ -21,8 +21,8 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::{
-    ConnectorError, ConnectorPredicateDisposition, ConnectorRequestContext, ConnectorScanHandle,
-    ConnectorSplit, ConnectorStaticPredicate,
+    ConnectorError, ConnectorPredicateDisposition, ConnectorReadSessionLease,
+    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorStaticPredicate,
 };
 
 #[derive(Clone)]
@@ -72,6 +72,8 @@ pub struct ConnectorSplitPlanningMetrics {
 pub struct ConnectorSplitPlanningResult {
     pub splits: Vec<ConnectorSplit>,
     pub metrics: ConnectorSplitPlanningMetrics,
+    /// FE-local prepared remote session. It never enters any execution carrier.
+    pub session: Option<ConnectorReadSessionLease>,
 }
 
 impl ConnectorSplitPlanningResult {
@@ -85,7 +87,21 @@ impl ConnectorSplitPlanningResult {
                 "connector split planning metrics report more pruned units than considered units",
             ));
         }
-        Ok(Self { splits, metrics })
+        Ok(Self {
+            splits,
+            metrics,
+            session: None,
+        })
+    }
+
+    pub fn try_new_with_session(
+        splits: Vec<ConnectorSplit>,
+        metrics: ConnectorSplitPlanningMetrics,
+        session: ConnectorReadSessionLease,
+    ) -> Result<Self, ConnectorError> {
+        let mut result = Self::try_new(splits, metrics)?;
+        result.session = Some(session);
+        Ok(result)
     }
 }
 

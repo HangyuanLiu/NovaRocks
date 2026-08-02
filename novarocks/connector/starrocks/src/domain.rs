@@ -299,6 +299,8 @@ pub struct StarRocksSplitPlanningInput {
     pub output_schema: SchemaRef,
     pub projection: Vec<usize>,
     pub limit: Option<u64>,
+    /// True when Core must evaluate a residual predicate after connector read.
+    pub has_residual_predicates: bool,
 }
 
 impl fmt::Debug for StarRocksSplitPlanningInput {
@@ -311,6 +313,7 @@ impl fmt::Debug for StarRocksSplitPlanningInput {
             .field("table", &self.table)
             .field("projection", &self.projection)
             .field("limit", &self.limit)
+            .field("has_residual_predicates", &self.has_residual_predicates)
             .finish_non_exhaustive()
     }
 }

@@ -280,6 +280,7 @@ mod tests {
             output_schema: schema.clone(),
             projection: vec![0],
             limit: None,
+            has_residual_predicates: false,
         };
         let split = StarRocksDirectSplit::from_planning(
             &input,

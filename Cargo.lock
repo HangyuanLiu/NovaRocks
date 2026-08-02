@@ -3341,6 +3341,7 @@ dependencies = [
  "parquet",
  "prost 0.13.5",
  "protoc-bin-vendored",
+ "reqwest",
  "roaring 0.10.12",
  "serde",
  "serde_json",

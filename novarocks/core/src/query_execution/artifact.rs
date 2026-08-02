@@ -44,6 +44,7 @@ use crate::query_execution::lifecycle::{
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
+use crate::query_execution::read_session::ConnectorReadSessionSet;
 use crate::query_execution::schedule::{
     FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
 };
@@ -395,12 +396,14 @@ impl ConnectorBindingReadyDistributedQuery {
             stage_bindings,
             connector_write_plan,
         } = self;
+        let connector_read_sessions = ConnectorReadSessionSet::from_prepared(&prepared);
         let context = match options.native_submission_context() {
             Ok(context) => context,
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
                 let message = connector_binding_lease.abort_preserving(message);
+                let message = connector_read_sessions.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -441,6 +444,7 @@ impl ConnectorBindingReadyDistributedQuery {
                     let message =
                         query_lifecycle_lease.abort_preserving(error.message().to_string());
                     let message = connector_binding_lease.abort_preserving(message);
+                    let message = connector_read_sessions.abort_preserving(message);
                     return Err(DistributedQueryError::new(kind, message));
                 }
                 Ok(StagePreparedDistributedQuery {
@@ -451,12 +455,14 @@ impl ConnectorBindingReadyDistributedQuery {
                     query_lifecycle_lease,
                     connector_binding_lease,
                     connector_write_plan,
+                    connector_read_sessions,
                 })
             }
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
                 let message = connector_binding_lease.abort_preserving(message);
+                let message = connector_read_sessions.abort_preserving(message);
                 Err(DistributedQueryError::new(kind, message))
             }
         }
@@ -1211,6 +1217,7 @@ pub struct StagePreparedDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plan: Option<ConnectorWritePlanAttachment>,
+    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 struct AssembledNativeExecution {
@@ -1273,6 +1280,7 @@ impl StagePreparedDistributedQuery {
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
             let message = self.connector_binding_lease.abort_preserving(message);
+            let message = self.connector_read_sessions.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(StagedDistributedQuery {
@@ -1283,6 +1291,7 @@ impl StagePreparedDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plan: self.connector_write_plan,
+            connector_read_sessions: self.connector_read_sessions,
         })
     }
 }
@@ -1312,6 +1321,7 @@ pub struct StagedDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plan: Option<ConnectorWritePlanAttachment>,
+    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 impl StagedDistributedQuery {
@@ -1323,12 +1333,24 @@ impl StagedDistributedQuery {
         self,
         barrier: &dyn QueryLaunchBarrier,
     ) -> Result<RunningDistributedQuery, DistributedQueryError> {
+        if let Err(error) = self.connector_read_sessions.start_all() {
+            let message = self
+                .query_lifecycle_lease
+                .abort_preserving(error.to_string());
+            let message = self.connector_binding_lease.abort_preserving(message);
+            let message = self.connector_read_sessions.abort_preserving(message);
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                message,
+            ));
+        }
         if let Err(error) = barrier.start_all(&self.batches) {
             let kind = error.kind();
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
             let message = self.connector_binding_lease.abort_preserving(message);
+            let message = self.connector_read_sessions.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(RunningDistributedQuery {
@@ -1338,6 +1360,7 @@ impl StagedDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plan: self.connector_write_plan,
+            connector_read_sessions: self.connector_read_sessions,
         })
     }
 }
@@ -1351,6 +1374,7 @@ pub struct RunningDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plan: Option<ConnectorWritePlanAttachment>,
+    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 impl RunningDistributedQuery {
@@ -1362,6 +1386,7 @@ impl RunningDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plan: self.connector_write_plan,
+            connector_read_sessions: self.connector_read_sessions,
         }
     }
 }
@@ -1373,6 +1398,7 @@ pub struct RunningNativeExecutionParts {
     pub query_lifecycle_lease: QueryLifecycleLease,
     pub connector_binding_lease: ConnectorBindingInstallLease,
     pub connector_write_plan: Option<ConnectorWritePlanAttachment>,
+    pub connector_read_sessions: ConnectorReadSessionSet,
 }
 
 fn assemble_native_execution(

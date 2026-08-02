@@ -26,10 +26,10 @@ use novarocks_spi::connector::{
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadSelector, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTableRequest, StatisticsDataVersion,
+    ConnectorReadSelector, ConnectorReadSessionLease, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, StatisticsDataVersion,
     validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,22 @@ pub trait StarRocksRpcSplitPlanner: Send + Sync {
         input: &StarRocksSplitPlanningInput,
         request: &ConnectorSplitPlanningRequest,
     ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError>;
+
+    fn plan_rpc_read(
+        &self,
+        input: &StarRocksSplitPlanningInput,
+        request: &ConnectorSplitPlanningRequest,
+    ) -> Result<StarRocksRpcSplitPlan, ConnectorError> {
+        Ok(StarRocksRpcSplitPlan {
+            splits: self.plan_rpc_splits(input, request)?,
+            session: None,
+        })
+    }
+}
+
+pub struct StarRocksRpcSplitPlan {
+    pub splits: Vec<StarRocksStrategySplit>,
+    pub session: Option<ConnectorReadSessionLease>,
 }
 
 pub trait StarRocksDirectSplitPlanner: Send + Sync {
@@ -506,15 +522,38 @@ impl ConnectorScanPlanning for Provider {
             output_schema: decode_schema_ipc(&frozen.output_schema)?,
             projection: frozen.projection.clone(),
             limit: frozen.limit,
+            has_residual_predicates: !frozen.predicate_dispositions.is_empty(),
         };
         let planned = match frozen.strategy {
             StarRocksSelectedStrategy::Rpc { .. } => {
-                self.rpc_planner.plan_rpc_splits(&input, &request)?
+                let plan = self.rpc_planner.plan_rpc_read(&input, &request)?;
+                return self.encode_planned_splits(
+                    attempt,
+                    digest,
+                    frozen,
+                    plan.splits,
+                    plan.session,
+                    &request,
+                );
             }
             StarRocksSelectedStrategy::SharedDataDirect => {
                 self.direct_planner.plan_direct_splits(&input, &request)?
             }
         };
+        self.encode_planned_splits(attempt, digest, frozen, planned, None, &request)
+    }
+}
+
+impl Provider {
+    fn encode_planned_splits(
+        &self,
+        attempt: StarRocksReadAttemptId,
+        digest: StarRocksFreezeDigest,
+        frozen: FrozenRead,
+        planned: Vec<StarRocksStrategySplit>,
+        session: Option<ConnectorReadSessionLease>,
+        request: &ConnectorSplitPlanningRequest,
+    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
         let mut total = 0usize;
         let mut ids = std::collections::BTreeSet::new();
         let splits = planned
@@ -570,13 +609,16 @@ impl ConnectorScanPlanning for Provider {
                 )
             })
             .collect::<Result<Vec<_>, ConnectorError>>()?;
-        ConnectorSplitPlanningResult::try_new(
-            splits,
-            ConnectorSplitPlanningMetrics {
-                candidate_units_considered: 0,
-                candidate_units_pruned: 0,
-            },
-        )
+        let metrics = ConnectorSplitPlanningMetrics {
+            candidate_units_considered: 0,
+            candidate_units_pruned: 0,
+        };
+        match session {
+            Some(session) => {
+                ConnectorSplitPlanningResult::try_new_with_session(splits, metrics, session)
+            }
+            None => ConnectorSplitPlanningResult::try_new(splits, metrics),
+        }
     }
 }
 
@@ -663,6 +705,22 @@ pub(crate) fn direct_outer_facts(split: &SplitPayload) -> Result<DirectOuterFact
         schema_version: split.frozen.schema_version.0.clone(),
         data_version: split.frozen.data_version.0.clone(),
         output_schema_digest,
+    })
+}
+
+pub(crate) fn rpc_outer_facts(
+    input: &StarRocksSplitPlanningInput,
+) -> Result<DirectOuterFacts, ConnectorError> {
+    Ok(DirectOuterFacts {
+        owner: Arc::from(input.owner.as_str()),
+        incarnation: input.incarnation.to_bytes(),
+        attempt: input.attempt.as_uuid(),
+        freeze: input.freeze,
+        topology: input.topology,
+        strategy: input.strategy,
+        schema_version: input.schema_version.clone(),
+        data_version: input.data_version.clone(),
+        output_schema_digest: schema_digest(&encode_schema_ipc(input.output_schema.as_ref())?),
     })
 }
 

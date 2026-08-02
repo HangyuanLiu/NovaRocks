@@ -190,6 +190,7 @@ fn planned_connector_read_for_test()
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
         },
         planning_lease: None,
+        read_session: None,
     }
 }
 
