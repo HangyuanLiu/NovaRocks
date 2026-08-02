@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks::common::app_config::{ClusterRole, NovaRocksConfig};
+use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, trigger_path};
 use novarocks::server::StandaloneGrpcEndpointOwnership;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
@@ -61,11 +62,15 @@ struct BackendProcess {
 }
 
 impl BackendProcess {
-    fn spawn(config: &Path) -> Self {
+    fn spawn(config: &Path, lifecycle_fault_backend_index: usize) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
             .arg("standalone")
             .arg("--config")
             .arg(config)
+            .env(
+                "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+                lifecycle_fault_backend_index.to_string(),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -91,7 +96,7 @@ struct ThreeBackendFixture {
 }
 
 impl ThreeBackendFixture {
-    fn start() -> Self {
+    fn start(query_lifecycle_fault_dir: &Path) -> Self {
         let root = tempfile::tempdir().expect("create backend fixture root");
         let mut reservations = (0..3)
             .map(|_| (ReservedPort::new(), ReservedPort::new()))
@@ -120,20 +125,26 @@ grpc_port = {}
 
 [cluster]
 role = "be"
+
+[debug]
+query_lifecycle_fault_dir = "{}"
 "#,
                     root.path().join(format!("be-{index}")).display(),
                     http.port,
                     grpc.port,
+                    query_lifecycle_fault_dir.display(),
                 ),
             )
             .expect("write backend config");
             configs.push(config);
         }
         let mut processes = Vec::new();
-        for ((http, grpc), config) in reservations.drain(..).zip(configs.iter()) {
+        for (index, ((http, grpc), config)) in
+            reservations.drain(..).zip(configs.iter()).enumerate()
+        {
             let _ = http.release();
             let grpc_port = grpc.release();
-            processes.push(BackendProcess::spawn(config.path()));
+            processes.push(BackendProcess::spawn(config.path(), index));
             wait_for_tcp(grpc_port, "backend gRPC endpoint");
         }
         Self {
@@ -141,6 +152,44 @@ role = "be"
             _configs: configs,
             _processes: processes,
             endpoints,
+        }
+    }
+}
+
+fn arm_query_lifecycle_fault(
+    root: &Path,
+    backend_index: usize,
+    kind: QueryLifecycleFaultKind,
+    token: &str,
+) {
+    std::fs::write(
+        arm_path(root, backend_index, kind),
+        format!("token={token}\nbackend_index={backend_index}\n"),
+    )
+    .expect("arm query lifecycle fault");
+}
+
+fn arm_query_lifecycle_fault_for_any_backend(
+    root: &Path,
+    kind: QueryLifecycleFaultKind,
+    token: &str,
+) {
+    for backend_index in 0..3 {
+        arm_query_lifecycle_fault(root, backend_index, kind, token);
+    }
+}
+
+fn clear_query_lifecycle_fault(root: &Path, kind: QueryLifecycleFaultKind) {
+    for backend_index in 0..3 {
+        for path in [
+            arm_path(root, backend_index, kind),
+            trigger_path(root, backend_index, kind),
+        ] {
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                panic!("clear query lifecycle fault: {error}");
+            }
         }
     }
 }
@@ -185,7 +234,17 @@ fn connect_mysql(port: u16) -> MysqlConn {
 #[test]
 #[ignore = "requires native 1FE+3BE processes"]
 fn projection_first_refresh_stages_on_three_backend_processes() {
-    let backends = ThreeBackendFixture::start();
+    let query_lifecycle_fault_dir = tempfile::tempdir().expect("create query lifecycle fault root");
+    // The production config loader requires this runner-owned path to match
+    // the frontend and each BE configuration.  This test process owns one
+    // fixture at a time, so the inherited environment is unambiguous.
+    unsafe {
+        std::env::set_var(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR",
+            query_lifecycle_fault_dir.path(),
+        );
+    }
+    let backends = ThreeBackendFixture::start(query_lifecycle_fault_dir.path());
     let fe_mysql = ReservedPort::new();
     let fe_http = ReservedPort::new();
     let fe_grpc = ReservedPort::new();
@@ -227,6 +286,9 @@ provider = "sqlite"
 path = "{}"
 cluster_id = "mvx2w-native-staging"
 deployment_owner = "fe-1"
+
+[debug]
+query_lifecycle_fault_dir = "{}"
 "#,
             fe_http_port,
             fe_grpc_port,
@@ -234,6 +296,7 @@ deployment_owner = "fe-1"
             backend_list,
             metadata_path.display(),
             state_path.display(),
+            query_lifecycle_fault_dir.path().display(),
         ),
     )
     .expect("write frontend config");
@@ -456,6 +519,66 @@ deployment_owner = "fe-1"
     assert!(
         union_main_rows.is_empty(),
         "union fixture may commit only its staging branch"
+    );
+
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create start-fault MV target");
+    arm_query_lifecycle_fault_for_any_backend(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::StartAckSuppress,
+        "mvx2w-start-abort",
+    );
+    let start_fault = engine
+        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_start_fault_mv")
+        .expect_err("a partial native start must not produce a staging completion");
+    assert!(
+        !start_fault.to_string().is_empty(),
+        "failed native start must preserve an explanatory error"
+    );
+    let start_fault_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_start_fault_mv ORDER BY k1")
+        .expect("read start-fault MV main ref");
+    assert!(
+        start_fault_main_rows.is_empty(),
+        "a failed native start must never publish the MV main ref"
+    );
+    clear_query_lifecycle_fault(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::StartAckSuppress,
+    );
+
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_terminal_conflict_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+    )
+    .expect("create terminal-conflict MV target");
+    arm_query_lifecycle_fault_for_any_backend(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::TerminalSnapshotConflict,
+        "mvx2w-terminal-conflict",
+    );
+    let terminal_conflict = engine
+        .stage_iceberg_mv_first_refresh_for_test(
+            Some("staging_ice"),
+            "ns",
+            "orders_terminal_conflict_mv",
+        )
+        .expect_err("a conflicting terminal report must not produce a staging completion");
+    assert!(
+        !terminal_conflict.to_string().is_empty(),
+        "conflicting terminal report must preserve an explanatory error"
+    );
+    let terminal_conflict_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_terminal_conflict_mv ORDER BY k1")
+        .expect("read terminal-conflict MV main ref");
+    assert!(
+        terminal_conflict_main_rows.is_empty(),
+        "a conflicting terminal report must never publish the MV main ref"
+    );
+    clear_query_lifecycle_fault(
+        query_lifecycle_fault_dir.path(),
+        QueryLifecycleFaultKind::TerminalSnapshotConflict,
     );
 
     drop(engine);
