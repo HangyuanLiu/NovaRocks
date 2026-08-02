@@ -375,6 +375,26 @@ deployment_owner = "fe-1"
         "fixture may commit only its staging branch"
     );
 
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+    )
+    .expect("create aggregate MV target");
+    let aggregate_outcome = engine
+        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_agg_mv")
+        .expect("stage aggregate first refresh through native QES");
+    assert_eq!(aggregate_outcome.input_rows, 2);
+    assert!(
+        aggregate_outcome.artifact_count > 0,
+        "aggregate native writer must stage artifacts: {aggregate_outcome:?}"
+    );
+    let aggregate_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, total_v2 FROM orders_agg_mv ORDER BY k1")
+        .expect("read un-published aggregate MV main ref");
+    assert!(
+        aggregate_main_rows.is_empty(),
+        "aggregate fixture may commit only its staging branch"
+    );
+
     drop(engine);
     drop(conn);
     shutdown_tx
