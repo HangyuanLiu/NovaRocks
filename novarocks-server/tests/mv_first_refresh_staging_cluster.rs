@@ -432,6 +432,32 @@ deployment_owner = "fe-1"
     assert_eq!(empty_outcome.artifact_count, 0);
     assert_eq!(empty_outcome.staged_bytes, 0);
 
+    conn.query_drop(
+        "CREATE TABLE orders_extra (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create union base table");
+    conn.query_drop("INSERT INTO orders_extra VALUES (3, 30)")
+        .expect("seed union base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_union_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders UNION ALL SELECT k1, v2 FROM orders_extra",
+    )
+    .expect("create union MV target");
+    let union_outcome = engine
+        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_union_mv")
+        .expect("stage union first refresh through native QES");
+    assert_eq!(union_outcome.input_rows, 3);
+    assert!(
+        union_outcome.artifact_count > 0,
+        "union native writer must stage artifacts: {union_outcome:?}"
+    );
+    let union_main_rows: Vec<(i32, i64)> = conn
+        .query("SELECT k1, v2 FROM orders_union_mv ORDER BY k1")
+        .expect("read un-published union MV main ref");
+    assert!(
+        union_main_rows.is_empty(),
+        "union fixture may commit only its staging branch"
+    );
+
     drop(engine);
     drop(conn);
     shutdown_tx
