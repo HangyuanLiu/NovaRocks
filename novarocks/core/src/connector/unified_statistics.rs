@@ -34,6 +34,19 @@ use novarocks_spi::connector::{
     StatisticsMetricRequest, StatisticsReadRequest,
 };
 
+/// Application-side classification of a statistics read that cannot be
+/// represented as conservative missing evidence.  The SQL projection maps
+/// these values into its own typed fatal vocabulary without importing a
+/// connector error or capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StatisticsResolutionFailure {
+    OwnerMismatch,
+    IncarnationMismatch,
+    DataVersionMismatch,
+    CorruptEvidence(String),
+    Connector(ConnectorError),
+}
+
 #[derive(Clone)]
 pub(crate) struct ResolvedStatisticsTable {
     pub table: ConnectorTableHandle,
@@ -77,14 +90,12 @@ impl UnifiedStatisticsResolver {
         statistics: &dyn ConnectorStatistics,
         metrics: StatisticsMetricRequest,
         context: ConnectorRequestContext,
-    ) -> Result<Arc<StatisticsEvidence>, ConnectorError> {
-        if statistics.descriptor().instance_id != *table.table.owner()
-            || statistics.incarnation() != table.incarnation
-        {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "resolved connector statistics capability does not match the query binding generation",
-            ));
+    ) -> Result<Arc<StatisticsEvidence>, StatisticsResolutionFailure> {
+        if statistics.descriptor().instance_id != *table.table.owner() {
+            return Err(StatisticsResolutionFailure::OwnerMismatch);
+        }
+        if statistics.incarnation() != table.incarnation {
+            return Err(StatisticsResolutionFailure::IncarnationMismatch);
         }
         let key = ResolvedCacheKey {
             instance_id: table.table.owner().clone(),
@@ -93,17 +104,21 @@ impl UnifiedStatisticsResolver {
             data_version: table.data_version.clone(),
             metrics: metrics.metrics().to_vec(),
         };
-        let evidence = statistics.read_statistics(StatisticsReadRequest {
-            table: table.table.clone(),
-            data_version: table.data_version.clone(),
-            metrics,
-            context,
-        })?;
+        let evidence = statistics
+            .read_statistics(StatisticsReadRequest {
+                table: table.table.clone(),
+                data_version: table.data_version.clone(),
+                metrics,
+                context,
+            })
+            .map_err(|error| match error.kind() {
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData => {
+                    StatisticsResolutionFailure::CorruptEvidence(error.to_string())
+                }
+                _ => StatisticsResolutionFailure::Connector(error),
+            })?;
         if evidence.data_version != table.data_version {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                "connector statistics evidence did not echo the resolved table data version",
-            ));
+            return Err(StatisticsResolutionFailure::DataVersionMismatch);
         }
         let artifact_key = ArtifactCacheKey {
             instance_id: key.instance_id.clone(),

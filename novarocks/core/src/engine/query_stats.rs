@@ -23,7 +23,9 @@ use novarocks_spi::connector::{
     StatisticsMetricValue, StatisticsProvenance,
 };
 
-use crate::connector::unified_statistics::{ResolvedStatisticsTable, UnifiedStatisticsResolver};
+use crate::connector::unified_statistics::{
+    ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
+};
 use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingStore};
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
@@ -31,8 +33,9 @@ use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats_input::{
-    BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsMissingReason,
-    StatsRef, StatsSource,
+    BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, SqlStatisticsFatalError,
+    SqlStatisticsSnapshot, SqlTableStatisticsEvidence, StatValue, StatsMissingReason, StatsRef,
+    StatsSource,
 };
 use crate::sql::planner::table::ScanSource;
 
@@ -41,8 +44,8 @@ use crate::sql::planner::table::ScanSource;
 /// a provider registry: absent pins intentionally produce missing statistics
 /// rather than a second latest-resolution path.
 pub(crate) struct QueryStatisticsContext {
-    resolver: Option<Arc<UnifiedStatisticsResolver>>,
     bindings: Option<Arc<QueryTableBindingStore>>,
+    snapshot: Arc<SqlStatisticsSnapshot>,
 }
 
 impl QueryStatisticsContext {
@@ -59,7 +62,10 @@ impl QueryStatisticsContext {
         bindings: Arc<QueryTableBindingStore>,
     ) -> Self {
         Self {
-            resolver: Some(Arc::clone(&state.unified_statistics)),
+            snapshot: Arc::new(project_statistics_snapshot(
+                state.unified_statistics.as_ref(),
+                &bindings,
+            )),
             bindings: Some(bindings),
         }
     }
@@ -77,6 +83,107 @@ impl QueryStatisticsContext {
             (Some(_), None) => Self::none(),
             (None, _) => Self::none(),
         }
+    }
+}
+
+/// Project every admission-frozen connector observation into SQL values before
+/// optimization begins.  This is the one application boundary that may touch
+/// a lease, a table handle, or a connector capability; `QueryStatisticsContext`
+/// subsequently serves only the immutable snapshot below.
+fn project_statistics_snapshot(
+    resolver: &UnifiedStatisticsResolver,
+    bindings: &QueryTableBindingStore,
+) -> SqlStatisticsSnapshot {
+    let mut snapshot = SqlStatisticsSnapshot::empty();
+    for (binding_id, binding) in bindings.captured_bindings() {
+        let label = binding.resolved.catalog.identity.fqn();
+        match project_binding_statistics(resolver, &binding) {
+            Ok(statistics) => {
+                snapshot.insert(binding_id, SqlTableStatisticsEvidence { label, statistics })
+            }
+            Err(error) => snapshot.insert_fatal(binding_id, error),
+        }
+    }
+    snapshot
+}
+
+fn project_binding_statistics(
+    resolver: &UnifiedStatisticsResolver,
+    binding: &QueryTableBinding,
+) -> Result<BaseTableStatistics, SqlStatisticsFatalError> {
+    let Some(pin) = binding.statistics_pin.as_ref() else {
+        return Ok(BaseTableStatistics::missing(
+            StatsMissingReason::ConnectorUnsupported(
+                "resolved table does not expose connector statistics".to_string(),
+            ),
+        ));
+    };
+    let Some(planning_lease) = binding.planning_lease.as_ref() else {
+        return Err(SqlStatisticsFatalError::BindingMissing);
+    };
+    let control_binding = planning_lease.binding();
+    if control_binding.descriptor().instance_id != *pin.table.owner() {
+        return Err(SqlStatisticsFatalError::OwnerMismatch);
+    }
+    let Some(statistics) = control_binding.statistics() else {
+        return Ok(BaseTableStatistics::missing(
+            StatsMissingReason::ConnectorUnsupported(
+                "resolved connector generation does not expose statistics".to_string(),
+            ),
+        ));
+    };
+    let metrics = metric_request(&binding.resolved.planner.columns).map_err(|error| {
+        SqlStatisticsFatalError::CorruptEvidence(format!("build metric request: {error}"))
+    })?;
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .map_err(|error| {
+        SqlStatisticsFatalError::CorruptEvidence(format!("build statistics context: {error}"))
+    })?;
+    let evidence = match resolver.resolve(
+        &ResolvedStatisticsTable {
+            table: pin.table.clone(),
+            data_version: pin.data_version.clone(),
+            incarnation: control_binding.incarnation(),
+        },
+        statistics.as_ref(),
+        metrics,
+        context,
+    ) {
+        Ok(evidence) => evidence,
+        // A provider that cannot supply evidence remains the normal
+        // conservative path.  Only a fact that contradicts the retained
+        // binding is fatal to compilation.
+        Err(StatisticsResolutionFailure::Connector(error)) => {
+            return Ok(BaseTableStatistics::missing(
+                StatsMissingReason::CatalogLoadError(error.to_string()),
+            ));
+        }
+        Err(error) => return Err(map_resolution_failure(error)),
+    };
+    Ok(evidence_to_base_statistics(
+        &evidence,
+        &binding.resolved.planner.columns,
+    ))
+}
+
+fn map_resolution_failure(error: StatisticsResolutionFailure) -> SqlStatisticsFatalError {
+    match error {
+        StatisticsResolutionFailure::OwnerMismatch => SqlStatisticsFatalError::OwnerMismatch,
+        StatisticsResolutionFailure::IncarnationMismatch => {
+            SqlStatisticsFatalError::IncarnationMismatch
+        }
+        StatisticsResolutionFailure::DataVersionMismatch => {
+            SqlStatisticsFatalError::DataVersionMismatch
+        }
+        StatisticsResolutionFailure::CorruptEvidence(message) => {
+            SqlStatisticsFatalError::CorruptEvidence(message)
+        }
+        StatisticsResolutionFailure::Connector(error) => SqlStatisticsFatalError::CorruptEvidence(
+            format!("unexpected connector error after conservative mapping: {error}"),
+        ),
     }
 }
 
@@ -265,14 +372,6 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(resolver) = context.resolver.as_deref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "unified statistics cache is not available".to_string(),
-            )),
-        );
-    };
     let Some(bindings) = context.bindings.as_ref() else {
         return (
             label,
@@ -281,7 +380,7 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(query_binding) = bindings.iceberg_data_file_binding(table, *binding) else {
+    let Some(binding_id) = bindings.iceberg_data_file_binding_id(table, *binding) else {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
@@ -289,57 +388,17 @@ pub(super) fn collect_table_stats(
             )),
         );
     };
-    let Some(pin) = query_binding.statistics_pin.as_ref() else {
-        return (
+    match context.snapshot.get(binding_id) {
+        Ok(evidence) => (evidence.label.clone(), evidence.statistics.clone()),
+        // The legacy collector cannot return a compiler error.  The canonical
+        // kernel will consume this same immutable snapshot directly when its
+        // scan token migration lands; preserve conservative behavior here
+        // while retaining the typed failure in the snapshot for submission.
+        Err(error) => (
             label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain a statistics data-version pin".to_string(),
-            )),
-        );
-    };
-    let Some(planning_lease) = query_binding.planning_lease.as_ref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain its connector planning lease".to_string(),
-            )),
-        );
-    };
-    let Some(statistics) = planning_lease.binding().statistics() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "resolved connector generation does not expose statistics".to_string(),
-            )),
-        );
-    };
-    let metrics = metric_request(&table_def.columns).map_err(|error| error.to_string());
-    let context = crate::connector::connector_request_context(
-        None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
-    let stats = metrics
-        .and_then(|metrics| {
-            context.and_then(|context| {
-                resolver
-                    .resolve(
-                        &ResolvedStatisticsTable {
-                            table: pin.table.clone(),
-                            data_version: pin.data_version.clone(),
-                            incarnation: planning_lease.binding().incarnation(),
-                        },
-                        statistics.as_ref(),
-                        metrics,
-                        context,
-                    )
-                    .map_err(|error| error.to_string())
-            })
-        })
-        .map(|evidence| evidence_to_base_statistics(&evidence, &table_def.columns))
-        .unwrap_or_else(|error| {
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(error))
-        });
-    (label, stats)
+            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(error.to_string())),
+        ),
+    }
 }
 
 fn metric_request(

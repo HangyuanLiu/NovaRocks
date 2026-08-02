@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
@@ -470,6 +471,7 @@ impl TableStatistics {
 /// / `max_value` ranges. Without it, bounds stay at +/-infinity (the legacy
 /// behavior).
 #[allow(dead_code)] // kept for tests and external callers that do not have column schema handy
+#[cfg(test)]
 pub fn build_table_statistics(
     files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
 ) -> Option<TableStatistics> {
@@ -480,6 +482,7 @@ pub fn build_table_statistics(
 /// using the supplied column schema. The `columns` slice should match
 /// `TableDef::columns` so that `column.name` maps to the correct Arrow
 /// `DataType` for decoding.
+#[cfg(test)]
 pub fn build_table_statistics_with_columns(
     files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
     columns: &[novarocks_catalog::schema::ColumnDef],
@@ -501,6 +504,7 @@ pub fn build_table_statistics_with_columns(
 /// Iceberg manifest `value_counts` is a non-null value count, not an NDV. Using
 /// it as distinct-count metadata makes equality predicates on low-cardinality
 /// string columns look almost unique, which causes severe join-order mistakes.
+#[cfg(test)]
 pub fn build_table_statistics_with_ndv(
     files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
     columns: &[novarocks_catalog::schema::ColumnDef],
@@ -619,6 +623,7 @@ pub fn build_table_statistics_with_ndv(
 }
 
 #[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
+#[cfg(test)]
 pub(crate) fn build_base_table_statistics_with_ndv(
     files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
     columns: &[novarocks_catalog::schema::ColumnDef],
@@ -790,6 +795,7 @@ pub(crate) fn build_base_table_statistics_with_ndv(
 /// - FLOAT: 4-byte little-endian f32
 /// - DOUBLE: 8-byte little-endian f64
 /// - DECIMAL: big-endian two's-complement unscaled, truncated to min bytes
+#[cfg(test)]
 fn decode_bound_to_f64(bytes: &[u8], dtype: &DataType) -> Option<f64> {
     match dtype {
         DataType::Boolean => match bytes {
@@ -852,6 +858,7 @@ fn decode_bound_to_f64(bytes: &[u8], dtype: &DataType) -> Option<f64> {
 /// Decode a big-endian two's-complement unscaled decimal byte payload into an
 /// approximate `f64` using the given scale. Lossy for large precision but
 /// sufficient as a cost-model bound.
+#[cfg(test)]
 fn decode_decimal_be_bytes(bytes: &[u8], scale: i32) -> Option<f64> {
     if bytes.is_empty() || bytes.len() > 16 {
         return None;

@@ -28,8 +28,213 @@ use crate::connector::iceberg::catalog::backend::{
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
 use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::connector::stats::StatsProviderError;
-use crate::sql::optimizer::stats_input::{BaseTableStatistics, StatsMissingReason};
+use crate::sql::optimizer::statistics::Confidence;
+use crate::sql::optimizer::stats_input::{
+    BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
+};
 use novarocks_catalog::schema::ColumnDef;
+
+/// Provider-owned conversion of Iceberg manifest/Puffin artifacts into the
+/// neutral, immutable SQL statistics value.  SQL consumes only the returned
+/// `BaseTableStatistics`; it neither receives an Iceberg file nor decodes
+/// provider bounds itself.
+fn build_base_table_statistics_with_ndv(
+    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    columns: &[ColumnDef],
+    ndv_by_name: &HashMap<String, f64>,
+    name_to_field_id: &HashMap<String, i32>,
+) -> BaseTableStatistics {
+    if files.is_empty() {
+        return BaseTableStatistics {
+            row_count: StatValue::known(0, Confidence::Exact, StatsSource::IcebergManifest),
+            columns: HashMap::new(),
+            source: StatsSource::IcebergManifest,
+        };
+    }
+    if files.iter().any(|file| file.row_count.is_none()) {
+        return BaseTableStatistics::missing(StatsMissingReason::ManifestMissingRowCount);
+    }
+
+    let total_rows: u64 = files
+        .iter()
+        .map(|file| file.row_count.unwrap_or_default().max(0) as u64)
+        .sum();
+    let type_by_name: HashMap<String, &DataType> = columns
+        .iter()
+        .map(|column| (column.name.to_ascii_lowercase(), &column.data_type))
+        .collect();
+    let mut column_names: Vec<String> = type_by_name.keys().cloned().collect();
+    for name in ndv_by_name.keys().chain(name_to_field_id.keys()) {
+        let lower = name.to_ascii_lowercase();
+        if !column_names.contains(&lower) {
+            column_names.push(lower);
+        }
+    }
+
+    let columns = column_names
+        .into_iter()
+        .map(|column_name| {
+            let missing = StatsMissingReason::ColumnNotReported(column_name.clone());
+            let mut null_count_total = 0_i64;
+            let mut column_size_total = 0_i64;
+            let mut min_value = None;
+            let mut max_value = None;
+            let mut all_null_counts = true;
+            let mut all_column_sizes = true;
+            let mut all_lower_bounds = true;
+            let mut all_upper_bounds = true;
+
+            for file in files {
+                let stats = file.column_stats.as_ref().and_then(|stats| {
+                    stats
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&column_name))
+                        .map(|(_, stats)| stats)
+                });
+                match stats.and_then(|stats| stats.null_count) {
+                    Some(value) => null_count_total += value,
+                    None => all_null_counts = false,
+                }
+                match stats.and_then(|stats| stats.column_size) {
+                    Some(value) => column_size_total += value,
+                    None => all_column_sizes = false,
+                }
+                let data_type = type_by_name.get(&column_name).copied();
+                match data_type
+                    .and_then(|data_type| {
+                        stats
+                            .and_then(|stats| stats.lower_bound.as_deref())
+                            .and_then(|bytes| decode_bound_to_f64(bytes, data_type))
+                    })
+                    .filter(|value| value.is_finite())
+                {
+                    Some(value) => {
+                        min_value = Some(min_value.map_or(value, |old: f64| old.min(value)))
+                    }
+                    None => all_lower_bounds = false,
+                }
+                match data_type
+                    .and_then(|data_type| {
+                        stats
+                            .and_then(|stats| stats.upper_bound.as_deref())
+                            .and_then(|bytes| decode_bound_to_f64(bytes, data_type))
+                    })
+                    .filter(|value| value.is_finite())
+                {
+                    Some(value) => {
+                        max_value = Some(max_value.map_or(value, |old: f64| old.max(value)))
+                    }
+                    None => all_upper_bounds = false,
+                }
+            }
+
+            let exact =
+                |value| StatValue::known(value, Confidence::Exact, StatsSource::IcebergManifest);
+            let nulls_fraction = if all_null_counts {
+                exact(if total_rows == 0 {
+                    0.0
+                } else {
+                    null_count_total as f64 / total_rows as f64
+                })
+            } else {
+                StatValue::missing(missing.clone())
+            };
+            let average_row_size = if all_column_sizes {
+                exact(if total_rows == 0 {
+                    0.0
+                } else {
+                    column_size_total as f64 / total_rows as f64
+                })
+            } else {
+                StatValue::missing(missing.clone())
+            };
+            let min_value = if all_lower_bounds {
+                min_value
+                    .map(exact)
+                    .unwrap_or_else(|| StatValue::missing(missing.clone()))
+            } else {
+                StatValue::missing(missing.clone())
+            };
+            let max_value = if all_upper_bounds {
+                max_value
+                    .map(exact)
+                    .unwrap_or_else(|| StatValue::missing(missing.clone()))
+            } else {
+                StatValue::missing(missing.clone())
+            };
+            let ndv = ndv_by_name
+                .get(&column_name)
+                .filter(|value| value.is_finite() && **value >= 0.0)
+                .map(|value| {
+                    StatValue::known(*value, Confidence::Exact, StatsSource::IcebergPuffin)
+                })
+                .unwrap_or_else(|| StatValue::missing(missing));
+            (
+                column_name,
+                BaseColumnStatistics {
+                    nulls_fraction,
+                    average_row_size,
+                    min_value,
+                    max_value,
+                    ndv,
+                },
+            )
+        })
+        .collect();
+
+    BaseTableStatistics {
+        row_count: StatValue::known(total_rows, Confidence::Exact, StatsSource::IcebergManifest),
+        columns,
+        source: StatsSource::IcebergManifest,
+    }
+}
+
+fn decode_bound_to_f64(bytes: &[u8], dtype: &DataType) -> Option<f64> {
+    match dtype {
+        DataType::Boolean => match bytes {
+            [0] => Some(0.0),
+            [1] => Some(1.0),
+            _ => None,
+        },
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Date32
+        | DataType::Time32(_) => {
+            let bytes: [u8; 4] = bytes.try_into().ok()?;
+            Some(i32::from_le_bytes(bytes) as f64)
+        }
+        DataType::Int64
+        | DataType::Date64
+        | DataType::Timestamp(_, _)
+        | DataType::Time64(_)
+        | DataType::Duration(_) => {
+            let bytes: [u8; 8] = bytes.try_into().ok()?;
+            Some(i64::from_le_bytes(bytes) as f64)
+        }
+        DataType::Float32 => {
+            let bytes: [u8; 4] = bytes.try_into().ok()?;
+            Some(f32::from_le_bytes(bytes) as f64)
+        }
+        DataType::Float64 => {
+            let bytes: [u8; 8] = bytes.try_into().ok()?;
+            Some(f64::from_le_bytes(bytes))
+        }
+        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
+            decode_decimal_be_bytes(bytes, *scale as i32)
+        }
+        _ => None,
+    }
+}
+
+fn decode_decimal_be_bytes(bytes: &[u8], scale: i32) -> Option<f64> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 }; 16];
+    buf[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf) as f64 / 10_f64.powi(scale))
+}
 
 pub(crate) fn read_pinned_table_statistics(
     registry: &Arc<RwLock<IcebergCatalogRegistry>>,
@@ -92,14 +297,12 @@ pub(crate) fn read_pinned_table_statistics(
         snapshot_id,
         loaded.table.file_io(),
     );
-    Ok(
-        crate::sql::optimizer::statistics::build_base_table_statistics_with_ndv(
-            &files,
-            &stats_columns,
-            &ndv_by_name,
-            &name_to_field_id,
-        ),
-    )
+    Ok(build_base_table_statistics_with_ndv(
+        &files,
+        &stats_columns,
+        &ndv_by_name,
+        &name_to_field_id,
+    ))
 }
 
 fn iceberg_table_info_for_stats(

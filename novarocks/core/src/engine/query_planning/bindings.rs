@@ -228,6 +228,21 @@ impl QueryTableBindingStore {
         Ok(self.binding(id)?.planning_lease.clone())
     }
 
+    /// Return the immutable bindings captured during admission.  The caller
+    /// may project them into compiler input, but must not use this view to
+    /// acquire a newer connector generation.
+    pub(crate) fn captured_bindings(&self) -> Vec<(SqlTableBindingId, Arc<QueryTableBinding>)> {
+        let mut bindings: Vec<_> = self
+            .by_id
+            .lock()
+            .expect("query table binding by-id lock")
+            .iter()
+            .map(|(id, binding)| (*id, Arc::clone(binding)))
+            .collect();
+        bindings.sort_by_key(|(id, _)| id.ordinal().get());
+        bindings
+    }
+
     /// Lookup the exact resolution retained for the old physical scan facts
     /// while production callers are moved to `SqlScanSource`.  The result is
     /// still retrieved from this one token store; this helper never acquires a
@@ -266,6 +281,38 @@ impl QueryTableBindingStore {
             )),
         }?;
         self.binding_for_key(&key)
+    }
+
+    /// Transitional lookup for legacy physical scan facts.  It resolves only
+    /// the request-local key already captured by admission; no provider call
+    /// or latest-generation acquire is possible here.
+    pub(crate) fn iceberg_data_file_binding_id(
+        &self,
+        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    ) -> Option<SqlTableBindingId> {
+        use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+
+        let key = match binding {
+            IcebergDataFileBinding::ExplicitFiles => table.current_snapshot_id.map(|snapshot_id| {
+                QueryTableBindingKey::snapshot(
+                    &table.catalog,
+                    &table.namespace,
+                    &table.table,
+                    snapshot_id,
+                )
+            }),
+            _ => Some(QueryTableBindingKey::strict_base(
+                &table.catalog,
+                &table.namespace,
+                &table.table,
+            )),
+        }?;
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(&key)
+            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
     }
 
     fn binding_for_key(&self, key: &QueryTableBindingKey) -> Option<Arc<QueryTableBinding>> {

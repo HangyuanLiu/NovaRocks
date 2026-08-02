@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use crate::sql::binding::SqlTableBindingId;
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -128,6 +129,95 @@ pub(crate) struct BaseTableStatistics {
     pub row_count: StatValue<u64>,
     pub columns: HashMap<String, BaseColumnStatistics>,
     pub source: StatsSource,
+}
+
+/// Typed failures for evidence that claims to describe a query-local binding
+/// but cannot be proven to do so.  These are deliberately distinct from
+/// incomplete statistics: absence remains conservative optimizer input,
+/// whereas a mismatched or malformed fact must stop planning before a stale
+/// connector generation can be used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SqlStatisticsFatalError {
+    BindingMissing,
+    OwnerMismatch,
+    IncarnationMismatch,
+    DataVersionMismatch,
+    CorruptEvidence(String),
+}
+
+impl std::fmt::Display for SqlStatisticsFatalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BindingMissing => formatter.write_str("SQL statistics binding is missing"),
+            Self::OwnerMismatch => {
+                formatter.write_str("SQL statistics owner does not match binding")
+            }
+            Self::IncarnationMismatch => {
+                formatter.write_str("SQL statistics incarnation does not match binding")
+            }
+            Self::DataVersionMismatch => {
+                formatter.write_str("SQL statistics data version does not match binding")
+            }
+            Self::CorruptEvidence(message) => {
+                write!(formatter, "SQL statistics evidence is corrupt: {message}")
+            }
+        }
+    }
+}
+
+/// One immutable SQL-facing statistics observation.  The application has
+/// already validated and projected any connector evidence before constructing
+/// this value; it intentionally contains no provider authority or bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SqlTableStatisticsEvidence {
+    pub(crate) label: String,
+    pub(crate) statistics: BaseTableStatistics,
+}
+
+/// Query-scoped SQL statistics input keyed by the exact table binding token.
+/// Both successes and typed fatal failures are memoized before compilation, so
+/// optimizer phases cannot refresh a connector or observe another request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SqlStatisticsSnapshot {
+    entries:
+        HashMap<SqlTableBindingId, Result<SqlTableStatisticsEvidence, SqlStatisticsFatalError>>,
+}
+
+impl SqlStatisticsSnapshot {
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        binding: SqlTableBindingId,
+        evidence: SqlTableStatisticsEvidence,
+    ) {
+        self.entries.insert(binding, Ok(evidence));
+    }
+
+    pub(crate) fn insert_fatal(
+        &mut self,
+        binding: SqlTableBindingId,
+        error: SqlStatisticsFatalError,
+    ) {
+        self.entries.insert(binding, Err(error));
+    }
+
+    pub(crate) fn get(
+        &self,
+        binding: SqlTableBindingId,
+    ) -> Result<&SqlTableStatisticsEvidence, SqlStatisticsFatalError> {
+        self.entries
+            .get(&binding)
+            .ok_or(SqlStatisticsFatalError::BindingMissing)?
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl BaseTableStatistics {
@@ -246,8 +336,58 @@ impl OptimizerStatsInput {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use super::*;
     use crate::sql::optimizer::statistics::TableStatistics;
+
+    fn binding(ordinal: u32) -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(
+                NonZeroU64::new(11).expect("nonzero scope"),
+            ),
+            NonZeroU32::new(ordinal).expect("nonzero ordinal"),
+        )
+    }
+
+    #[test]
+    fn sqlx2_resolution_snapshot_keeps_missing_evidence_conservative() {
+        let mut snapshot = SqlStatisticsSnapshot::empty();
+        snapshot.insert(
+            binding(1),
+            SqlTableStatisticsEvidence {
+                label: "ice.db.orders".to_string(),
+                statistics: BaseTableStatistics::missing(StatsMissingReason::NoDataFiles),
+            },
+        );
+
+        let evidence = snapshot.get(binding(1)).expect("snapshot evidence");
+        assert!(evidence.statistics.row_count.known_value().is_none());
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    #[test]
+    fn sqlx2_resolution_snapshot_preserves_typed_fatal_binding_failures() {
+        let mut snapshot = SqlStatisticsSnapshot::empty();
+        snapshot.insert_fatal(binding(2), SqlStatisticsFatalError::DataVersionMismatch);
+        snapshot.insert_fatal(
+            binding(3),
+            SqlStatisticsFatalError::CorruptEvidence("invalid bounds".to_string()),
+        );
+
+        assert_eq!(
+            snapshot.get(binding(2)).unwrap_err(),
+            SqlStatisticsFatalError::DataVersionMismatch
+        );
+        assert_eq!(
+            snapshot.get(binding(3)).unwrap_err(),
+            SqlStatisticsFatalError::CorruptEvidence("invalid bounds".to_string())
+        );
+        assert_eq!(
+            snapshot.get(binding(4)).unwrap_err(),
+            SqlStatisticsFatalError::BindingMissing
+        );
+    }
 
     #[test]
     fn display_rows_sort_by_numeric_ref() {
