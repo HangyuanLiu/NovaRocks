@@ -395,6 +395,32 @@ deployment_owner = "fe-1"
         "aggregate fixture may commit only its staging branch"
     );
 
+    conn.query_drop(
+        "CREATE TABLE customers (k1 INT, region VARCHAR(16)) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )
+    .expect("create join base table");
+    conn.query_drop("INSERT INTO customers VALUES (1, 'east'), (2, 'west')")
+        .expect("seed join base table");
+    conn.query_drop(
+        "CREATE MATERIALIZED VIEW orders_join_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT o.k1, o.v2, c.region FROM orders o JOIN customers c ON o.k1 = c.k1",
+    )
+    .expect("create join MV target");
+    let join_outcome = engine
+        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_join_mv")
+        .expect("stage join first refresh through native QES");
+    assert_eq!(join_outcome.input_rows, 2);
+    assert!(
+        join_outcome.artifact_count > 0,
+        "join native writer must stage artifacts: {join_outcome:?}"
+    );
+    let join_main_rows: Vec<(i32, i64, String)> = conn
+        .query("SELECT k1, v2, region FROM orders_join_mv ORDER BY k1")
+        .expect("read un-published join MV main ref");
+    assert!(
+        join_main_rows.is_empty(),
+        "join fixture may commit only its staging branch"
+    );
+
     drop(engine);
     drop(conn);
     shutdown_tx

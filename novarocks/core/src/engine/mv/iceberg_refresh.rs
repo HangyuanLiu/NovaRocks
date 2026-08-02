@@ -315,6 +315,32 @@ fn try_stage_sql_first_refresh_for_test(
     })
 }
 
+#[cfg(feature = "mv-first-refresh-staging-test-support")]
+fn try_stage_join_first_refresh_for_test(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    staging_branch: String,
+) -> Option<Result<StatementResult, IcebergMvRefreshExecutionError>> {
+    FIRST_REFRESH_STAGING_TEST_RUNTIME.with(|slot| {
+        let runtime = slot.borrow().clone()?;
+        let outcome =
+            crate::engine::mv_first_refresh_staging::execute_mv_first_refresh_join_staging_for_test(
+                state,
+                ctx,
+                crate::sql::mv_refresh::first_refresh::MvFirstRefreshShape::Join,
+                append,
+                staging_branch,
+                &runtime.execution,
+            );
+        *runtime
+            .outcome
+            .lock()
+            .expect("MV first-refresh test outcome lock poisoned") = Some(outcome.clone());
+        Some(outcome.map(|_| StatementResult::Ok).map_err(Into::into))
+    })
+}
+
 /// Core adapter used by the frontend-owned MV application service. It keeps
 /// connector/analyzer state in core while exposing CREATE as auditable,
 /// side-effect-sized primitives.
@@ -11605,6 +11631,25 @@ fn refresh_iceberg_join_mv(
                 mv_definition.mv_id,
                 uuid::Uuid::new_v4().simple()
             );
+            #[cfg(feature = "mv-first-refresh-staging-test-support")]
+            {
+                let (plan, factory) = plan_canonical_select_for_imv(state, &ctx)
+                    .map_err(|error| IcebergMvRefreshExecutionError::from(error.message))?;
+                let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
+                    &ctx.rewrite,
+                    left_ref,
+                    right_ref,
+                    crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput { plan, factory },
+                )?;
+                if let Some(result) = try_stage_join_first_refresh_for_test(
+                    state,
+                    &ctx,
+                    append,
+                    staging_branch.clone(),
+                ) {
+                    return result;
+                }
+            }
             let refresh_id = begin_staged_iceberg_mv_refresh_intent(
                 state,
                 target,
