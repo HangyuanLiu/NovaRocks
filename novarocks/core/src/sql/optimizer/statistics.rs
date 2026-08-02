@@ -461,7 +461,43 @@ impl TableStatistics {
     }
 }
 
-/// Build table-level statistics from `IcebergDataFileInfo` entries.
+/// SQL-owned manifest facts used by optimizer test support. Provider adapters
+/// project concrete file metadata into this narrow value before it reaches the
+/// compiler; the optimizer never needs a connector data-file model.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SqlManifestColumnStatistics {
+    pub(crate) null_count: Option<i64>,
+    pub(crate) value_count: Option<i64>,
+    pub(crate) column_size: Option<i64>,
+    pub(crate) lower_bound: Option<Vec<u8>>,
+    pub(crate) upper_bound: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SqlManifestFileStatistics {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) row_count: Option<i64>,
+    pub(crate) column_stats: Option<HashMap<String, SqlManifestColumnStatistics>>,
+    pub(crate) partition_spec_id: Option<i32>,
+    pub(crate) partition_key: Option<String>,
+    pub(crate) first_row_id: Option<i64>,
+    pub(crate) data_sequence_number: Option<i64>,
+    pub(crate) ivm_change_op: Option<i8>,
+    pub(crate) included_positions: Option<Vec<i64>>,
+    pub(crate) delete_files: Vec<()>,
+    pub(crate) manifest_path: Option<String>,
+    pub(crate) partition_values: Vec<()>,
+}
+
+#[cfg(test)]
+type IcebergDataFileInfo = SqlManifestFileStatistics;
+#[cfg(test)]
+type IcebergColumnStats = SqlManifestColumnStatistics;
+
+/// Build table-level statistics from SQL manifest facts.
 ///
 /// Aggregates row counts and per-column Iceberg statistics across all files.
 /// Returns `None` if no file has a row count (e.g., non-Iceberg sources).
@@ -472,9 +508,7 @@ impl TableStatistics {
 /// behavior).
 #[allow(dead_code)] // kept for tests and external callers that do not have column schema handy
 #[cfg(test)]
-pub fn build_table_statistics(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
-) -> Option<TableStatistics> {
+pub fn build_table_statistics(files: &[SqlManifestFileStatistics]) -> Option<TableStatistics> {
     build_table_statistics_with_columns(files, &[])
 }
 
@@ -484,7 +518,7 @@ pub fn build_table_statistics(
 /// `DataType` for decoding.
 #[cfg(test)]
 pub fn build_table_statistics_with_columns(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
@@ -506,7 +540,7 @@ pub fn build_table_statistics_with_columns(
 /// string columns look almost unique, which causes severe join-order mistakes.
 #[cfg(test)]
 pub fn build_table_statistics_with_ndv(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     _name_to_field_id: &HashMap<String, i32>,
@@ -625,7 +659,7 @@ pub fn build_table_statistics_with_ndv(
 #[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
 #[cfg(test)]
 pub(crate) fn build_base_table_statistics_with_ndv(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     name_to_field_id: &HashMap<String, i32>,
@@ -1355,7 +1389,6 @@ mod tests {
 
     #[test]
     fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1402,7 +1435,6 @@ mod tests {
 
     #[test]
     fn build_table_statistics_skips_string_bounds() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1445,8 +1477,6 @@ mod tests {
 
     #[test]
     fn build_table_statistics_without_columns_leaves_ndv_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
-
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
@@ -1481,7 +1511,6 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1544,7 +1573,6 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1601,9 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn build_base_table_statistics_missing_row_count_stays_missing() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
-
+    fn sqlx2_scan_manifest_missing_row_count_stays_missing() {
         let file = IcebergDataFileInfo {
             path: "f1.parquet".to_string(),
             size: 100,
@@ -1631,7 +1657,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1683,7 +1708,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_heuristic_ndv_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1756,7 +1780,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1823,7 +1846,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1913,7 +1935,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_puffin_ndv() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
@@ -1962,7 +1983,6 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_zero_puffin_ndv() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
         use novarocks_catalog::schema::ColumnDef;
 
         let file = IcebergDataFileInfo {
