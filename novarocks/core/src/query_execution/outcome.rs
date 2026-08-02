@@ -91,7 +91,7 @@ impl WriteExecutionOutcome {
         (self.result, self.commit, self.abort)
     }
 
-    pub(crate) fn into_parts_with_connector(
+    pub fn into_parts_with_connector(
         self,
     ) -> (
         QueryResult,
@@ -121,6 +121,12 @@ impl WriteExecutionOutcome {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "connector staging terminal returned an abort payload",
+            ));
+        }
+        if self.commit.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector staging terminal returned a legacy direct commit payload",
             ));
         }
         self.connector_completion.ok_or_else(|| {
@@ -334,6 +340,12 @@ impl DistributedQueryOutcome {
         }
     }
 
+    /// Consume the outcome as a distributed write terminal result.
+    ///
+    /// Frontend-owned application lifecycles use the returned typed connector
+    /// completion to decide commit, abort, or authoritative reconciliation on
+    /// their retained exact lease. They never need a Core transaction helper
+    /// (or provider-specific receipt decoder) to make that decision.
     pub fn into_write(self) -> Result<WriteExecutionOutcome, DistributedQueryError> {
         match self {
             Self::Write(outcome) => Ok(outcome),
@@ -411,10 +423,10 @@ impl QueryOutcomeFactory {
                 "Write outcome cannot contain both commit and abort payloads",
             ));
         }
-        if connector_completion.is_some() && commit.is_none() {
+        if connector_completion.is_some() && commit.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "connector write completion requires a write commit payload",
+                "connector write completion cannot expose a legacy direct commit payload",
             ));
         }
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {

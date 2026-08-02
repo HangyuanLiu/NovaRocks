@@ -17,13 +17,13 @@
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
-    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
-    ConnectorTableHandle, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, StatisticsDataVersion, StatisticsEvidenceRevision,
-    StatisticsMetric, StatisticsMetricRequest,
+    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,
+    ConnectorProviderId, ConnectorRefAction, ConnectorRefreshPublicationGuard,
+    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
+    ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -91,6 +91,55 @@ fn connector_ids_reject_values_past_their_contract_limits() {
             .kind(),
         ConnectorErrorKind::InvalidRequest
     );
+}
+
+#[test]
+fn committed_version_is_bounded_and_redacted() {
+    let version =
+        ConnectorCommittedVersion::try_new(Bytes::from_static(b"provider-private"), Some(42))
+            .expect("bounded committed version");
+    version.validate().expect("stable committed version digest");
+    assert_eq!(version.snapshot_id(), Some(42));
+    assert!(!format!("{version:?}").contains("provider-private"));
+    assert_eq!(
+        ConnectorCommittedVersion::try_new(Bytes::new(), Some(0))
+            .expect_err("zero snapshot ID is invalid")
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        ConnectorCommittedVersion::try_new(
+            Bytes::from(vec![0; MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1]),
+            None,
+        )
+        .expect_err("oversized version must fail")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+}
+
+#[test]
+fn guarded_publication_carries_the_provider_committed_version() {
+    let committed_version =
+        ConnectorCommittedVersion::try_new(Bytes::from_static(b"provider-private"), Some(42))
+            .expect("committed version");
+    let guard =
+        ConnectorRefreshPublicationGuard::try_new(3, 4, "token").expect("publication guard");
+    let action = ConnectorRefAction::FastForwardBranch {
+        source_branch: Arc::from("mv-refresh-3"),
+        target_branch: Arc::from("main"),
+        committed_version: committed_version.clone(),
+        expected_target_snapshot_id: Some(41),
+        guard,
+    };
+
+    match action {
+        ConnectorRefAction::FastForwardBranch {
+            committed_version: actual,
+            ..
+        } => assert_eq!(actual, committed_version),
+        _ => panic!("guarded publication must retain the committed version"),
+    }
 }
 
 #[test]

@@ -33,6 +33,7 @@ use tokio::runtime::Handle;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::mv::refresh::execution_context::MvRefreshPruningLimits;
 use crate::novarocks_config;
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::query_result::{
@@ -43,7 +44,9 @@ use crate::catalog_attachment::{CatalogAttachmentProperties, CatalogAttachmentRe
 use crate::connector::{IcebergCatalogRegistry, iceberg_namespace_exists};
 use crate::meta::repository::iceberg_operation::IcebergOperationRepository;
 use crate::meta::repository::job::JobMetaRepository;
-use crate::mv::application::{MvApplicationService, UnavailableMvApplicationService};
+use crate::mv::application::{
+    MvApplicationService, MvFirstRefreshWriteActivator, UnavailableMvApplicationService,
+};
 use crate::mv::repository::{MvRepository, UnavailableMvRepository};
 use crate::sql::catalog::local::PlannerMemoryCatalog;
 use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
@@ -398,6 +401,39 @@ struct TestConnectorControlRegistry {
 
 #[cfg(test)]
 impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControlRegistry {
+    fn observe_current_binding(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        Ok(novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: binding.descriptor().instance_id.clone(),
+            incarnation: binding.incarnation(),
+        })
+    }
+
     fn acquire_current(
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
@@ -936,6 +972,11 @@ pub struct StandaloneOpenServices {
     /// durable worker only when it also owns a StateStore repository.
     pub statistics_attempt_executor_sink:
         Option<std::sync::Arc<dyn statistics_application::StatisticsAttemptExecutorSink>>,
+    /// Receives the Core-owned provider activation adapter after the engine
+    /// has its connector registry. The frontend remains the owner of every
+    /// durable and external refresh transition.
+    pub mv_first_refresh_write_activator_sink:
+        Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
     pub table_maintenance_service:
         std::sync::Arc<dyn crate::engine::table_maintenance::TableMaintenanceService>,
     pub mv_repository: std::sync::Arc<dyn MvRepository>,
@@ -992,6 +1033,7 @@ impl StandaloneOpenServices {
             statistics_target_resolver_sink: None,
             statistics_table_reader_sink: None,
             statistics_attempt_executor_sink: None,
+            mv_first_refresh_write_activator_sink: None,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1049,9 +1091,25 @@ impl StandaloneOpenServices {
         self.statistics_attempt_executor_sink = Some(sink);
         self
     }
+
+    pub fn with_mv_first_refresh_write_activator_sink(
+        mut self,
+        sink: Option<std::sync::Arc<dyn crate::mv::application::MvFirstRefreshWriteActivatorSink>>,
+    ) -> Self {
+        self.mv_first_refresh_write_activator_sink = sink;
+        self
+    }
 }
 
 impl StandaloneNovaRocks {
+    pub fn mv_first_refresh_write_activator(&self) -> Arc<dyn MvFirstRefreshWriteActivator> {
+        Arc::new(
+            crate::engine::mv_first_refresh_staging::StandaloneMvFirstRefreshWriteActivator::new(
+                Arc::downgrade(&self.inner),
+            ),
+        )
+    }
+
     pub fn open(opts: StandaloneOptions, services: StandaloneOpenServices) -> Result<Self, String> {
         #[cfg(test)]
         let _test_guard = Some(acquire_standalone_test_guard());
@@ -1120,6 +1178,7 @@ impl StandaloneNovaRocks {
             statistics_target_resolver_sink,
             statistics_table_reader_sink,
             statistics_attempt_executor_sink,
+            mv_first_refresh_write_activator_sink,
             connector_control,
             table_maintenance_service,
             mv_repository,
@@ -1174,6 +1233,9 @@ impl StandaloneNovaRocks {
         }
         if let Some(sink) = statistics_attempt_executor_sink {
             sink.bind_statistics_attempt_executor(engine.statistics_attempt_executor())?;
+        }
+        if let Some(sink) = mv_first_refresh_write_activator_sink {
+            sink.bind_mv_first_refresh_write_activator(engine.mv_first_refresh_write_activator())?;
         }
         let engine_port =
             Arc::clone(&engine.inner) as Arc<dyn table_maintenance::TableMaintenanceEngine>;
@@ -3149,15 +3211,14 @@ pub(crate) fn dispatch_statement(
                 connector_context,
             )
         }
-        Statement::RefreshMaterializedView(stmt) => {
-            crate::engine::mv_flow::refresh_mv_with_connector_context(
-                state,
-                current_catalog,
-                current_database,
-                &stmt,
-                connector_context,
-            )
-        }
+        Statement::RefreshMaterializedView(stmt) => dispatch_frontend_mv_refresh(
+            state,
+            current_catalog,
+            current_database,
+            &stmt,
+            request_context,
+            connector_context,
+        ),
         Statement::ShowMaterializedViews(stmt) => {
             crate::engine::mv_flow::list_mvs(state, current_catalog, &stmt)
         }
@@ -3239,6 +3300,91 @@ pub(crate) fn dispatch_statement(
             },
         ),
     }
+}
+
+/// Execute every dependency-ordered `REFRESH MATERIALIZED VIEW` step through
+/// the frontend lifecycle.  Dependency discovery remains side-effect free;
+/// no step may fall back to the old `MvBackend` plan/execute/commit surface.
+fn dispatch_frontend_mv_refresh(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &crate::sql::parser::ast::RefreshMaterializedViewStmt,
+    request_context: &crate::query_execution::request_context::RequestContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatementResult, String> {
+    let refresh_statement = crate::sql::mv_refresh::MvRefreshStatement::from(stmt);
+    refresh_statement.validate_supported()?;
+    let iceberg_target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+        current_catalog,
+        current_database,
+        &stmt.name,
+    )?;
+    let requested_object = crate::mv::dependency::model::iceberg_mv_dependency_ref(
+        &iceberg_target.catalog,
+        &iceberg_target.namespace,
+        &iceberg_target.table,
+    );
+    let steps =
+        crate::engine::mv::dependency::build_upstream_refresh_steps(state, &requested_object)?;
+    let mut last_result = None;
+
+    for step in steps {
+        if step.storage_engine != crate::mv::model::MvStorageEngine::Iceberg {
+            return Err(format!(
+                "REFRESH MATERIALIZED VIEW is only supported for Iceberg-backed materialized views: {}",
+                step.object.display_name().trim_start_matches("mv:")
+            ));
+        }
+        let step_statement = crate::sql::parser::ast::RefreshMaterializedViewStmt {
+            name: crate::sql::parser::ast::ObjectName {
+                parts: vec![step.target.database.clone(), step.target.name.clone()],
+            },
+            full: false,
+        };
+        let preparation =
+            crate::engine::mv::iceberg_refresh::StandaloneMvRefreshPreparationService::new(
+                state,
+                step.target.catalog.as_deref(),
+                &step.target.database,
+                &step_statement,
+                connector_context,
+            );
+        let result = state
+            .mv_application_service
+            .prepare_and_execute_refresh(
+                &preparation,
+                crate::mv::application::MvApplicationStatement::Refresh(
+                    crate::sql::mv_refresh::MvRefreshStatement::from(&step_statement),
+                ),
+                step.target.clone(),
+                connector_context.clone(),
+                request_context.execution(),
+            )
+            .map_err(|error| {
+                if step.object != requested_object {
+                    format!(
+                        "cannot refresh materialized view {}: upstream materialized view {} failed: {error}",
+                        requested_object.display_name().trim_start_matches("mv:"),
+                        step.object.display_name().trim_start_matches("mv:")
+                    )
+                } else {
+                    error.to_string()
+                }
+            })?;
+        last_result = Some(match result {
+            crate::mv::application::MvStatementResult::Ok => StatementResult::Ok,
+            crate::mv::application::MvStatementResult::Query(result) => {
+                StatementResult::Query(result)
+            }
+        });
+    }
+
+    let result = last_result.ok_or_else(|| {
+        "MV refresh dependency planning produced no target refresh step".to_string()
+    })?;
+    crate::engine::mv_maintenance::notify_refresh_completed(state);
+    Ok(result)
 }
 
 fn statistics_application_target(
@@ -3649,23 +3795,37 @@ fn connector_static_planning_metrics(
     Ok(metrics)
 }
 
-pub(crate) fn capture_maintenance_execution(
+pub(crate) fn capture_maintenance_request_context(
     state: &StandaloneState,
-) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<crate::query_execution::request_context::RequestContext, String> {
     let topology = state
         .backend_topology
         .snapshot()
         .map_err(|error| error.to_string())?;
     let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
     Ok(
-        crate::query_execution::request_context::QueryExecutionContext::new(
-            state.execution_role,
-            topology,
-            None,
-            cancellation.view(),
-            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        crate::query_execution::request_context::RequestContext::admit(
+            crate::query_execution::request_context::RequestAdmission::new(
+                current_catalog.map(str::to_string),
+                current_database.to_string(),
+                state.execution_role,
+                topology,
+                None,
+                cancellation.view(),
+                crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            ),
         ),
     )
+}
+
+pub(crate) fn capture_maintenance_execution(
+    state: &StandaloneState,
+) -> Result<crate::query_execution::request_context::QueryExecutionContext, String> {
+    Ok(capture_maintenance_request_context(state, None, "default")?
+        .execution()
+        .clone())
 }
 
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`.
@@ -4400,6 +4560,90 @@ pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connecto
     connector_staging_completion_from_result(result)
 }
 
+/// Prepare a typed MV logical append as the same inert distributed write
+/// request used by SQL-shaped connector writes.  It performs no submission or
+/// external mutation; the supplied template is activated from the frontend's
+/// retained exact lease and will be sealed there into one write session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
+    state: &Arc<StandaloneState>,
+    logical_plan: crate::sql::planner::logical::LogicalPlanNode,
+    factory: crate::sql::column_id::ColumnRefFactory,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
+    crate::connector::validate_request_context(connector_context)?;
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let output_columns = crate::sql::planner::plan_output_columns(&logical_plan)?;
+    let mut matching_columns = output_columns
+        .iter()
+        .filter(|column| column.name == root_distribution_output_name(&root_distribution));
+    let root_column = matching_columns.next().ok_or_else(|| {
+        format!(
+            "MV first-refresh logical writer is missing root hash output '{}'",
+            root_distribution_output_name(&root_distribution)
+        )
+    })?;
+    if matching_columns.next().is_some()
+        || root_column.column_id == crate::sql::column_id::ColumnId::UNSET
+    {
+        return Err(
+            "MV first-refresh logical writer has an ambiguous or unbound root hash output"
+                .to_string(),
+        );
+    }
+    let root_distribution =
+        crate::sql::optimizer::property::DistributionSpec::shuffle_agg([root_column.column_id]);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+        &logical_plan,
+        &mut scalar_arena,
+    )?;
+    let providers = query_stats::QueryStatisticsContext::unavailable();
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
+    let optimized_tree = crate::sql::optimizer::optimize_with_root_distribution(
+        optimizer_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        root_distribution,
+        &optimizer_settings,
+    )?;
+    let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        None,
+        Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    prepare_distributed_write_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Begin(connector_write)),
+    )
+}
+
 fn root_distribution_output_name(
     requirement: &crate::sql::compiler::RootDistributionRequirement,
 ) -> &str {
@@ -4441,7 +4685,7 @@ fn connector_staging_completion_from_result(
     Ok((completion, summary))
 }
 
-enum DistributedConnectorWrite {
+pub(crate) enum DistributedConnectorWrite {
     Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
     Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
 }
@@ -4574,6 +4818,123 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         execution,
         connector_write,
     )
+}
+
+/// Freeze a native connector-write request without starting a writer. The
+/// application owner later seals it through the exact retained write lease.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    query_opts: Option<QueryOptions>,
+    root_distribution: Option<crate::sql::compiler::RootDistributionRequirement>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let mut prepared_query = query.clone();
+    if has_time_travel_refs(&prepared_query) {
+        rewrite_time_travel_refs(
+            state,
+            current_catalog,
+            current_database,
+            &mut prepared_query,
+            connector_context,
+        )?;
+    }
+    let catalog_service_snapshot = catalog_service_snapshot(state);
+    let analyzer_provider = build_catalog_service_provider(
+        current_catalog,
+        &catalog_service_snapshot,
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        TableLookupMode::SchemaOnly,
+    );
+    let table_bindings = analyzer_provider.query_table_bindings();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
+        state,
+        table_bindings.clone(),
+    );
+    let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "Iceberg write requires a non-empty admitted backend topology".to_string()
+        })?;
+    let compiler_request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(prepared_query)),
+        crate::sql::compiler::SqlCompileIntent::IcebergWrite {
+            root_distribution: root_distribution
+                .unwrap_or(crate::sql::compiler::RootDistributionRequirement::Any),
+        },
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        &catalog_snapshot,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        None,
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            execution.cancellation().clone(),
+        ),
+    );
+    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(compiler_request)
+            .map_err(|error| error.to_string())?
+    else {
+        return Err("Iceberg write intent did not produce optimized SQL facts".to_string());
+    };
+    let physical_plan =
+        crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let writer_input = match sink_spec.mode {
+        crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
+        | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors => {
+            crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::OutputOrdinals(
+                vec![0, 1],
+            )
+        }
+        _ => crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+    };
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+            physical_plan,
+            crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+                descriptor_database: current_database.to_string(),
+                spec: sink_spec,
+                input: writer_input,
+            },
+            &optimizer_settings,
+        )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        Some(table_bindings.as_ref()),
+        None,
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let cohort_id = connector_write.cohort_id();
+    PreparedDistributedWriteRequest::new(
+        prepared,
+        native_bundle,
+        query_opts,
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
+            connector_write,
+        ),
+        cohort_id,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -4795,14 +5156,97 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
             &maintenance_execution
         }
     };
-    execute_distributed_write_with_execution(
-        &state.query_execution,
+    let prepared_request = prepare_planned_iceberg_change_stream_write(
         prepared,
         native_bundle,
         query_opts,
         execution,
         connector_write.map(DistributedConnectorWrite::Begin),
+    )?;
+    let request = bind_prepared_distributed_write_request(
+        &state.query_execution,
+        execution,
+        prepared_request,
+    )?;
+    execute_bound_distributed_write_request(&state.query_execution, request)
+}
+
+/// Convert an already planned change-stream writer into SQL's inert native
+/// write handoff.  The caller supplies the admitted execution context and
+/// retains responsibility for binding the exact connector write lease before
+/// submitting the request.
+pub(crate) fn prepare_planned_iceberg_change_stream_write(
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_opts: Option<QueryOptions>,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    prepare_distributed_write_request_with_execution(
+        prepared,
+        native_bundle,
+        query_opts,
+        execution,
+        connector_write,
     )
+}
+
+fn prepare_distributed_write_request_with_execution(
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
+    query_options: Option<QueryOptions>,
+    _execution: &crate::query_execution::request_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
+        return Err("prepared connector write requires an unsealed write template".to_string());
+    };
+    let cohort_id = template.cohort_id();
+    PreparedDistributedWriteRequest::new(
+        prepared,
+        native_bundle,
+        query_options,
+        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
+        cohort_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn bind_prepared_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+    prepared: PreparedDistributedWriteRequest,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+    let cohort_id = prepared.write_cohort_id();
+    let session = query_execution
+        .begin_write_operation(prepared.registration())
+        .map_err(|error| error.to_string())?;
+    let registration =
+        crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+            session, cohort_id,
+        )
+        .map_err(|error| error.to_string())?;
+    prepared
+        .into_request(execution, registration)
+        .map_err(|error| error.to_string())
+}
+
+fn execute_bound_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    request: crate::query_execution::contract::DistributedQueryRequest,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let (query_result, write_commit, write_abort, connector_completion) = query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::query_execution::outcome::QueryExecutionResult {
+        query_result,
+        write_commit,
+        write_abort,
+        connector_completion,
+        fragment_profiles: Vec::new(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6477,6 +6921,47 @@ mod tests {
             Err(MvApplicationError::new(
                 MvApplicationErrorKind::Unavailable,
                 "injected frontend MV service is unavailable",
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct RefreshRouteRecordingMvApplicationService {
+        refreshes: Mutex<
+            Vec<(
+                MvApplicationStatement,
+                MvTarget,
+                crate::query_execution::request_context::QueryExecutionContext,
+            )>,
+        >,
+    }
+
+    impl MvApplicationService for RefreshRouteRecordingMvApplicationService {
+        fn try_handle_statement(
+            &self,
+            _engine: &dyn MvEngine,
+            _statement: &MvApplicationStatement,
+            _context: MvRequestContext<'_>,
+        ) -> Result<Option<crate::mv::application::MvStatementResult>, MvApplicationError> {
+            Ok(None)
+        }
+
+        fn prepare_and_execute_refresh(
+            &self,
+            _preparation: &dyn crate::sql::mv_refresh::MvRefreshPreparationService,
+            statement: MvApplicationStatement,
+            target: MvTarget,
+            _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+            execution: &crate::query_execution::request_context::QueryExecutionContext,
+        ) -> Result<crate::mv::application::MvStatementResult, MvApplicationError> {
+            self.refreshes.lock().expect("refresh route calls").push((
+                statement,
+                target,
+                execution.clone(),
+            ));
+            Err(MvApplicationError::new(
+                MvApplicationErrorKind::Unavailable,
+                "recorded frontend refresh route",
             ))
         }
     }
@@ -8660,6 +9145,48 @@ mysql_port = 47892
                 || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
+    }
+
+    #[test]
+    fn refresh_dispatch_uses_frontend_refresh_entrypoint_with_admitted_context() {
+        let service = Arc::new(RefreshRouteRecordingMvApplicationService::default());
+        let state = Arc::new(StandaloneState {
+            mv_application_service: service.clone(),
+            ..Default::default()
+        });
+        let request_context = super::test_request_context(Some("ice"), "analytics");
+
+        let error = dispatch_statement(
+            &state,
+            Some("ice"),
+            "analytics",
+            crate::sql::parser::ast::Statement::RefreshMaterializedView(
+                crate::sql::parser::ast::RefreshMaterializedViewStmt {
+                    name: crate::sql::parser::ast::ObjectName {
+                        parts: vec!["orders_mv".to_string()],
+                    },
+                    full: false,
+                },
+            ),
+            &request_context,
+            &crate::connector::test_request_context(),
+        )
+        .expect_err("recording frontend service returns its route marker");
+
+        assert_eq!(error, "recorded frontend refresh route");
+        let refreshes = service.refreshes.lock().expect("refresh route calls");
+        assert_eq!(refreshes.len(), 1);
+        let (statement, target, execution) = &refreshes[0];
+        assert!(matches!(
+            statement,
+            MvApplicationStatement::Refresh(refresh)
+                if refresh.name_parts == ["orders_mv"] && !refresh.full
+        ));
+        assert_eq!(target.catalog.as_deref(), Some("ice"));
+        assert_eq!(target.database, "analytics");
+        assert_eq!(target.name, "orders_mv");
+        assert_eq!(execution.role(), request_context.execution().role());
+        assert_eq!(execution.topology(), request_context.execution().topology());
     }
 
     #[test]

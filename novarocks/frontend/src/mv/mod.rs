@@ -16,7 +16,9 @@
 // under the License.
 
 mod create;
+mod refresh;
 pub mod repository;
 mod service;
 
+pub(crate) use refresh::FrontendMvFirstRefreshWriteActivatorPort;
 pub use service::FrontendMvService;

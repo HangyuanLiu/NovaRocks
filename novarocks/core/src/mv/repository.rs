@@ -38,9 +38,9 @@ use crate::mv::persistence::partition::{
     UpdateMvPartitionContractRequest,
 };
 use crate::mv::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, RecordPublishCommitRequest,
-    RecordStagingCommitRequest, RefreshExternalOutcome, StoredMvRefresh,
-    UpdateStarRocksMvRefreshSummaryRequest,
+    BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshLedger,
+    MvRefreshFinalizeRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
+    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
 };
 
 pub const MV_REPOSITORY_UNAVAILABLE_MESSAGE: &str =
@@ -166,6 +166,26 @@ pub struct RecordExternalCommitAndFinalizeRequest {
     pub finalize: MvRefreshFinalizeRequest,
 }
 
+/// Frontend-owned v3 refresh intent. The provider-neutral repository port
+/// carries only durable application facts; concrete StateStore mechanics stay
+/// in the frontend repository implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginFrontendMvRefreshIntentRequest {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub target_catalog: String,
+    pub target_namespace: String,
+    pub target_table: String,
+    pub staging_branch: String,
+    pub expected_main_snapshot_id: Option<i64>,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub marker_token: String,
+    /// `false` is the explicit no-op/metadata form: it writes the durable v3
+    /// intent but does not synthesize writer or staging actions.
+    pub prepare_external_actions: bool,
+    pub ledger: FrontendMvRefreshLedger,
+}
+
 /// Synchronous consumer port used by core SQL and maintenance workers.
 ///
 /// Concrete repositories may bridge to an async store internally, but the
@@ -225,6 +245,26 @@ pub trait MvRepository: Send + Sync {
         &self,
         request: BeginIcebergMvRefreshRequest,
     ) -> Result<StoredMvRefresh, MvRepositoryError>;
+    fn begin_frontend_refresh_intent(
+        &self,
+        _request: BeginFrontendMvRefreshIntentRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    /// Reserve a positive refresh identity before SQL preparation.  This is
+    /// intentionally separate from the v3 intent write: a failed preparation
+    /// may leave an unused identity, but it must never leave an active refresh
+    /// or an incomplete lifecycle ledger.
+    fn reserve_frontend_refresh_id(&self) -> Result<i64, MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
+    fn record_frontend_refresh_action(
+        &self,
+        _refresh_id: i64,
+        _action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
     fn record_staging_commit(
         &self,
         request: RecordStagingCommitRequest,
@@ -240,6 +280,16 @@ pub trait MvRepository: Send + Sync {
         outcome: RefreshExternalOutcome,
     ) -> Result<(), MvRepositoryError>;
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError>;
+    /// Atomically finalize a frontend-owned refresh that deliberately has no
+    /// external phases (`NoOp` or `MetadataOnly`).  This is separate from the
+    /// historical publish-based finalizer so callers cannot invent a staging
+    /// or publication record merely to advance metadata.
+    fn finalize_frontend_refresh_without_external_actions(
+        &self,
+        _request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        Err(MvRepositoryError::unavailable())
+    }
     fn finalize_refresh_with_partitions(
         &self,
         request: FinalizeMvRefreshWithPartitionsRequest,
@@ -400,6 +450,21 @@ impl MvRepository for UnavailableMvRepository {
         &self,
         _request: BeginIcebergMvRefreshRequest,
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        unavailable!()
+    }
+
+    fn begin_frontend_refresh_intent(
+        &self,
+        _request: BeginFrontendMvRefreshIntentRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        unavailable!()
+    }
+
+    fn record_frontend_refresh_action(
+        &self,
+        _refresh_id: i64,
+        _action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
         unavailable!()
     }
 

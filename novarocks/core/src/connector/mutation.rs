@@ -29,17 +29,17 @@ use novarocks_spi::connector::{
 use crate::common::engine_error::EngineError;
 
 #[derive(Clone, Debug)]
-pub(crate) struct CompletedCatalogMutation {
-    pub(crate) effect: ExternalMutationEffect,
-    pub(crate) receipt: ConnectorCatalogMutationReceipt,
-    pub(crate) finalization: ExternalMutationFinalization,
+pub struct CompletedCatalogMutation {
+    pub effect: ExternalMutationEffect,
+    pub receipt: ConnectorCatalogMutationReceipt,
+    pub finalization: ExternalMutationFinalization,
 }
 
 /// Provider outcome after the application has performed its one permitted
 /// authoritative reconciliation. Consumers that own durable state machines
 /// must use this instead of inferring commit state from an EngineError string.
 #[derive(Clone, Debug)]
-pub(crate) enum ResolvedCatalogMutation {
+pub enum ResolvedCatalogMutation {
     KnownCommitted(CompletedCatalogMutation),
     KnownUncommitted {
         failure: ConnectorMutationFailure,
@@ -60,7 +60,7 @@ pub(crate) enum ResolvedCatalogMutation {
 /// What the application can prove about dispatch when the SPI boundary itself
 /// fails. It must not be inferred from a provider error string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MutationDispatchState {
+pub enum MutationDispatchState {
     ConfirmedNotDispatched,
     PossiblyDispatched,
 }
@@ -128,7 +128,7 @@ pub(crate) fn resolve_catalog_mutation(
 /// that acquired a planning generation may derive a mutation lease from it and
 /// must not silently acquire a newer current generation for the external
 /// mutation.
-pub(crate) fn resolve_catalog_mutation_with_lease(
+pub fn resolve_catalog_mutation_with_lease(
     lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
     operation_id: ConnectorMutationOperationId,
     operation: ConnectorCatalogMutationOperation,
@@ -152,7 +152,7 @@ pub(crate) fn resolve_catalog_mutation_with_lease(
             };
         }
     };
-    resolve_outcome(&lease, outcome, context)
+    resolve_outcome(lease, outcome, context)
 }
 
 fn resolve_outcome(

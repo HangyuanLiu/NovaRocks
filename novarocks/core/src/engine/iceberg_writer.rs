@@ -59,8 +59,8 @@ use crate::connector::iceberg::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1,
 };
 use crate::connector::iceberg::write_service::{
-    IcebergFirstRefreshWriteReportCommitter, IcebergWriteControlService,
-    IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
+    IcebergFirstRefreshWriteReportCommitter, IcebergMvPrimaryEmptyInputPolicy,
+    IcebergWriteControlService, IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
@@ -100,6 +100,35 @@ pub(crate) enum IcebergWriteMode {
     DynamicPartitionOverwrite,
 }
 
+/// Provider-owned identity and snapshot facts for a prepared Iceberg write.
+///
+/// The application layer may preallocate the opaque operation identity, but it
+/// never interprets or constructs Iceberg commit state. In particular, MV
+/// refresh uses this to make the staged writer, snapshot marker, and durable
+/// frontend ledger refer to one attempt before any external action starts.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergWritePreparationOptions {
+    pub(crate) operation_id: ConnectorWriteOperationId,
+    pub(crate) snapshot_properties: BTreeMap<String, String>,
+}
+
+impl IcebergWritePreparationOptions {
+    pub(crate) fn new(operation_id: ConnectorWriteOperationId) -> Self {
+        Self {
+            operation_id,
+            snapshot_properties: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_snapshot_properties(
+        mut self,
+        snapshot_properties: BTreeMap<String, String>,
+    ) -> Self {
+        self.snapshot_properties = snapshot_properties;
+        self
+    }
+}
+
 /// Core Iceberg write preparation shared by the frontend INSERT adapter,
 /// CTAS, and mutation flows. Construction validates and plans the write but
 /// never starts a distributed writer or external metadata commit.
@@ -114,6 +143,35 @@ pub(crate) fn prepare_iceberg_write(
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<PreparedIcebergWrite, String> {
+    prepare_iceberg_write_with_options(
+        state,
+        target,
+        resolved,
+        insert_columns,
+        source,
+        overwrite_mode,
+        target_ref,
+        execution,
+        connector_context,
+        IcebergWritePreparationOptions::new(ConnectorWriteOperationId::new()),
+    )
+}
+
+/// Prepare an Iceberg write with an application-preallocated operation
+/// identity. This still performs no writer execution or catalog mutation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_iceberg_write_with_options(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
+    source: &IcebergWriteInput,
+    overwrite_mode: IcebergWriteMode,
+    target_ref: &str,
+    execution: Option<QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: IcebergWritePreparationOptions,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -185,6 +243,7 @@ pub(crate) fn prepare_iceberg_write(
         table_ident,
         execution,
         connector_context,
+        options,
     )
 }
 
@@ -203,6 +262,7 @@ fn prepare_iceberg_distributed_write(
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: IcebergWritePreparationOptions,
 ) -> Result<PreparedIcebergWrite, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
@@ -243,9 +303,9 @@ fn prepare_iceberg_distributed_write(
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
-        snapshot_properties: BTreeMap::new(),
+        snapshot_properties: options.snapshot_properties.clone(),
     });
-    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_operation_id = options.operation_id;
     let connector_write = register_insert_connector_write(
         state,
         target,
@@ -280,7 +340,7 @@ fn prepare_iceberg_distributed_write(
             base_snapshot_id,
             base_snapshot_map: BTreeMap::new(),
             target_ref: target_ref.to_string(),
-            snapshot_properties: BTreeMap::new(),
+            snapshot_properties: options.snapshot_properties,
         },
         validation: IcebergWriteValidationPolicy {
             require_v3_for_branch: target_ref != "main",
@@ -381,6 +441,8 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
     writer_handle_payload: Bytes,
     payload: IcebergFirstRefreshWritePlanPayloadV2,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
+    intent: ConnectorWriteIntent,
+    empty_input_policy: IcebergMvPrimaryEmptyInputPolicy,
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
@@ -425,6 +487,7 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
         IcebergFirstRefreshWriteReportCommitter::new(
             commit_executor,
             payload.provenance_properties.clone(),
+            empty_input_policy,
         )
         .map_err(|error| format!("build Iceberg first-refresh committer: {error}"))?,
     );
@@ -448,13 +511,7 @@ pub(crate) fn activate_iceberg_first_refresh_connector_write(
         target,
         target_ref,
         operation_id,
-        vec![(
-            cohort_id,
-            ConnectorWriteIntent::Append,
-            input_schema,
-            provider_payload,
-            context,
-        )],
+        vec![(cohort_id, intent, input_schema, provider_payload, context)],
     )?;
     Ok(templates
         .pop()
@@ -525,6 +582,54 @@ where
         .register(operation_id, service)
         .map_err(|error| format!("register Iceberg connector write service: {error}"))?;
 
+    build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
+}
+
+/// Reserve an Iceberg write service only after the application has retained
+/// the exact write lease. The factory is evaluated lazily by the first SPI
+/// planning request, so SQL preparation cannot mutate the provider registry
+/// or accidentally bind a newer connector generation.
+#[allow(clippy::type_complexity)]
+pub(crate) fn reserve_iceberg_connector_write_cohort_service_with_exact_lease<F>(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    target_ref: &str,
+    operation_id: ConnectorWriteOperationId,
+    cohorts: Vec<(
+        novarocks_spi::connector::ConnectorWriteCohortId,
+        ConnectorWriteIntent,
+        Arc<Schema>,
+        Bytes,
+        novarocks_spi::connector::ConnectorRequestContext,
+    )>,
+    activation_digest: [u8; 32],
+    exact_lease: &ConnectorWriteLease,
+    factory: F,
+) -> Result<Vec<crate::query_execution::contract::ConnectorWritePlanningTemplate>, String>
+where
+    F: Fn() -> Result<
+            Arc<dyn crate::connector::iceberg::write_control::IcebergWriteControlBackend>,
+            novarocks_spi::connector::ConnectorError,
+        > + Send
+        + Sync
+        + 'static,
+{
+    if cohorts.is_empty() {
+        return Err("Iceberg connector write operation has no cohorts".to_string());
+    }
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
+    if exact_lease.binding_key().instance_id != instance_id {
+        return Err("Iceberg write lease does not match the target connector instance".to_string());
+    }
+    let services = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("Iceberg catalog registry read lock: {error}"))?
+        .write_services();
+    services
+        .register_lazy(operation_id, activation_digest, factory)
+        .map_err(|error| format!("reserve Iceberg connector write service: {error}"))?;
     build_iceberg_connector_write_templates(target, target_ref, operation_id, cohorts)
 }
 
@@ -659,6 +764,37 @@ impl PreparedIcebergWrite {
 
     pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
         self.executor.run_coordinated_write(&self.spec)
+    }
+
+    /// Convert a validated Iceberg write into SQL's inert distributed-write
+    /// handoff. This registers no writer attempt and executes no query; the
+    /// connector control service has already retained the provider-private
+    /// committer under the operation identity carried by the resulting plan.
+    ///
+    /// Frontend application owners use this form when they must persist their
+    /// intent and retain an exact connector lease before submitting native
+    /// fragments. The legacy runner continues to call `run_coordinated_write`
+    /// through the same prepared inputs.
+    pub(crate) fn into_prepared_distributed_write(
+        self,
+    ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String>
+    {
+        let Self { executor, .. } = self;
+        let execution = executor.execution.as_ref().ok_or_else(|| {
+            "prepared distributed Iceberg write requires an admitted execution context".to_string()
+        })?;
+        crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+            &executor.state,
+            Some(&executor.target.catalog),
+            &executor.target.namespace,
+            &executor.query,
+            executor.sink_spec,
+            None,
+            None,
+            execution,
+            &executor.connector_context,
+            executor.connector_write,
+        )
     }
 
     pub(crate) fn commit(

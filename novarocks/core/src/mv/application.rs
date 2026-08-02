@@ -25,6 +25,12 @@ use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
 use crate::runtime::query_result::QueryResult;
+use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
+use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
+use crate::sql::mv_refresh::{
+    MvRefreshPreparationService, MvRefreshStatement, PreparedDistributedWriteRequest,
+    PreparedMvRefresh,
+};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
@@ -146,6 +152,7 @@ impl From<&CreateMaterializedViewStmt> for MvCreateStatement {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MvApplicationStatement {
     Create(MvCreateStatement),
+    Refresh(MvRefreshStatement),
     Unhandled,
 }
 
@@ -153,6 +160,9 @@ pub(crate) fn project_statement(statement: &Statement) -> MvApplicationStatement
     match statement {
         Statement::CreateMaterializedView(statement) => {
             MvApplicationStatement::Create(MvCreateStatement::from(statement))
+        }
+        Statement::RefreshMaterializedView(statement) => {
+            MvApplicationStatement::Refresh(MvRefreshStatement::from(statement))
         }
         _ => MvApplicationStatement::Unhandled,
     }
@@ -290,6 +300,73 @@ pub trait MvApplicationService: Send + Sync {
         statement: &MvApplicationStatement,
         context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError>;
+
+    /// Execute a fully SQL-prepared refresh attempt.  This deliberately sits
+    /// beside the CREATE-only `MvEngine` port: refresh owns distributed
+    /// execution, external publication, and durable intent in the frontend,
+    /// not in a widened engine backend.
+    fn execute_prepared_refresh(
+        &self,
+        _refresh: PreparedMvRefresh,
+        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+        _execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        Err(MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "frontend MV refresh lifecycle is unavailable",
+        ))
+    }
+
+    /// Frontend-owned admission of a SQL-prepared refresh. The caller supplies
+    /// only the side-effect-free SQL preparation port; the frontend reserves
+    /// the attempt identity, persists durable intent, and owns every external
+    /// lifecycle phase.
+    fn prepare_and_execute_refresh(
+        &self,
+        _preparation: &dyn MvRefreshPreparationService,
+        _statement: MvApplicationStatement,
+        _target: MvTarget,
+        _connector_context: novarocks_spi::connector::ConnectorRequestContext,
+        _execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<MvStatementResult, MvApplicationError> {
+        Err(MvApplicationError::new(
+            MvApplicationErrorKind::Unavailable,
+            "frontend MV refresh lifecycle is unavailable",
+        ))
+    }
+}
+
+/// Core-owned provider activation and native fragment preparation for a
+/// SQL-shaped first-refresh artifact. The frontend owns intent persistence,
+/// write-session admission, execution, commit, publication, and cleanup; the
+/// port only turns an already frozen artifact into the generic result-free
+/// distributed write request after the exact lease is retained.
+pub trait MvFirstRefreshWriteActivator: Send + Sync {
+    fn bind_first_refresh_write(
+        &self,
+        prepared: PreparedMvFirstRefreshWrite,
+        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String>;
+
+    /// Bind one value-only incremental change-stream artifact after the same
+    /// retained exact lease has admitted its staging attempt.
+    fn bind_incremental_refresh_write(
+        &self,
+        prepared: PreparedMvIncrementalWrite,
+        exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
+        execution: &crate::query_execution::request_context::QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String>;
+}
+
+/// Frontend composition sink installed before Core opens. Core binds its
+/// provider activation adapter only after connector control and the engine
+/// state are available, avoiding a direct all-in-one call path.
+pub trait MvFirstRefreshWriteActivatorSink: Send + Sync {
+    fn bind_mv_first_refresh_write_activator(
+        &self,
+        activator: std::sync::Arc<dyn MvFirstRefreshWriteActivator>,
+    ) -> Result<(), String>;
 }
 
 pub trait MvEngine: Send + Sync {
@@ -332,7 +409,10 @@ impl MvApplicationService for UnavailableMvApplicationService {
         statement: &MvApplicationStatement,
         _context: MvRequestContext<'_>,
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        if matches!(statement, MvApplicationStatement::Create(_)) {
+        if matches!(
+            statement,
+            MvApplicationStatement::Create(_) | MvApplicationStatement::Refresh(_)
+        ) {
             return Err(MvApplicationError::new(
                 MvApplicationErrorKind::Unavailable,
                 MV_REPOSITORY_UNAVAILABLE_MESSAGE,

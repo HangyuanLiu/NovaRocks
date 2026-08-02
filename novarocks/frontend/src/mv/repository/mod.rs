@@ -34,9 +34,11 @@ use novarocks::mv::persistence::partition::{
     ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
 };
 use novarocks::mv::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshState,
-    RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
-    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
+    BeginIcebergMvRefreshRequest, FrontendMvRefreshAction, FrontendMvRefreshActionPhase,
+    FrontendMvRefreshActionState, FrontendMvRefreshLedger, MvRefreshFinalizeRequest,
+    MvRefreshLifecycleOwner, MvRefreshState, RecordPublishCommitRequest,
+    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome, StoredMvRefresh,
+    UpdateStarRocksMvRefreshSummaryRequest,
 };
 use novarocks::mv::repository::{
     CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
@@ -68,6 +70,8 @@ pub struct StateStoreMvRepository {
     runtime: tokio::runtime::Handle,
     runner_metrics: StateStoreMetrics,
 }
+
+pub use novarocks::mv::repository::BeginFrontendMvRefreshIntentRequest;
 
 impl StateStoreMvRepository {
     pub async fn open(
@@ -116,7 +120,7 @@ impl StateStoreMvRepository {
                 key::MvKeyKind::Sequence => {
                     let sequence: DecodedMvRecord<MvSequence> =
                         decode_record(&record.key, &record.value).map_err(corruption)?;
-                    if sequence.value.last_allocated_id < 0 {
+                    if sequence.value.last_allocated_id < 0 || sequence.value.last_refresh_id < 0 {
                         return Err(corruption("MV sequence must not be negative"));
                     }
                 }
@@ -230,6 +234,21 @@ impl StateStoreMvRepository {
             }
         }
         for refresh in refreshes {
+            match refresh.lifecycle_owner {
+                MvRefreshLifecycleOwner::LegacyCore if refresh.frontend_ledger.is_some() => {
+                    return Err(corruption(
+                        "legacy MV refresh unexpectedly carries a frontend ledger",
+                    ));
+                }
+                MvRefreshLifecycleOwner::FrontendCurrent => {
+                    let ledger = refresh
+                        .frontend_ledger
+                        .as_ref()
+                        .ok_or_else(|| corruption("frontend-owned MV refresh has no v3 ledger"))?;
+                    ledger.validate().map_err(corruption)?;
+                }
+                MvRefreshLifecycleOwner::LegacyCore => {}
+            }
             let definition = definitions
                 .get(&refresh.mv_id)
                 .ok_or_else(|| corruption("MV refresh references a missing definition"))?;
@@ -377,15 +396,18 @@ impl StateStoreMvRepository {
                     Box::pin(async move {
                         let sequence_key = sequence_key().map_err(invalid_state_store)?;
                         let sequence_record = transaction.get(&sequence_key).await?;
-                        let last = match &sequence_record {
+                        let sequence = match &sequence_record {
                             Some(record) => {
                                 decode_record::<MvSequence>(&sequence_key, &record.value)
                                     .map_err(invalid_state_store)?
                                     .value
-                                    .last_allocated_id
                             }
-                            None => 0,
+                            None => MvSequence {
+                                last_allocated_id: 0,
+                                last_refresh_id: 0,
+                            },
                         };
+                        let last = sequence.last_allocated_id;
                         let mv_id =
                             match explicit_id {
                                 Some(value) => value,
@@ -409,6 +431,7 @@ impl StateStoreMvRepository {
                             operation_id,
                             &MvSequence {
                                 last_allocated_id: last.max(mv_id),
+                                last_refresh_id: sequence.last_refresh_id,
                             },
                         )
                         .map_err(invalid_state_store)?;
@@ -610,21 +633,25 @@ impl StateStoreMvRepository {
                     }
                     let key = sequence_key().map_err(invalid_state_store)?;
                     let current = transaction.get(&key).await?;
-                    let last = match &current {
+                    let sequence = match &current {
                         Some(record) => {
                             decode_record::<MvSequence>(&key, &record.value)
                                 .map_err(invalid_state_store)?
                                 .value
-                                .last_allocated_id
                         }
-                        None => 0,
+                        None => MvSequence {
+                            last_allocated_id: 0,
+                            last_refresh_id: 0,
+                        },
                     };
+                    let last = sequence.last_allocated_id;
                     if last < mv_id {
                         let value = encode_record(
                             MvRecordKind::Sequence,
                             operation_id,
                             &MvSequence {
                                 last_allocated_id: mv_id,
+                                last_refresh_id: sequence.last_refresh_id,
                             },
                         )
                         .map_err(invalid_state_store)?;
@@ -1116,7 +1143,8 @@ impl StateStoreMvRepository {
                             "mv definition {mv_id} already has refresh in progress"
                         )));
                     }
-                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    let refresh_id =
+                        allocate_refresh_id(transaction, operation_id, page_size).await?;
                     definition.refresh_in_progress = true;
                     definition.active_refresh_id = Some(refresh_id);
                     definition.refresh_target_snapshots = target_snapshots.clone();
@@ -1167,7 +1195,8 @@ impl StateStoreMvRepository {
                             request.mv_id
                         )));
                     }
-                    let refresh_id = allocate_refresh_id(transaction, page_size).await?;
+                    let refresh_id =
+                        allocate_refresh_id(transaction, operation_id, page_size).await?;
                     definition.refresh_in_progress = true;
                     definition.active_refresh_id = Some(refresh_id);
                     definition.refresh_target_snapshots = request.base_snapshots.clone();
@@ -1192,6 +1221,8 @@ impl StateStoreMvRepository {
                             token: request.marker_token,
                         }),
                         external_outcome: None,
+                        lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
+                        frontend_ledger: None,
                     };
                     put_definition_transaction(
                         transaction,
@@ -1208,6 +1239,224 @@ impl StateStoreMvRepository {
                     )
                     .await?;
                     Ok(refresh)
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn begin_frontend_refresh_intent_async(
+        &self,
+        mut request: BeginFrontendMvRefreshIntentRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        validate_frontend_refresh_request(&request)?;
+        if request.prepare_external_actions {
+            request.ledger.actions = frontend_prepared_actions(&request.ledger);
+        }
+        request.ledger.validate().map_err(invalid)?;
+        self.require_definition_async(request.mv_id).await?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "begin frontend-owned MV refresh",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    let (definition_record, mut definition) =
+                        load_definition_transaction(transaction, request.mv_id).await?;
+                    if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+                        return Err(conflict_state_store(format!(
+                            "mv definition {} already has refresh in progress",
+                            request.mv_id
+                        )));
+                    }
+                    let refresh_id = request.refresh_id;
+                    definition.refresh_in_progress = true;
+                    definition.active_refresh_id = Some(refresh_id);
+                    definition.refresh_target_snapshots = request.base_snapshots.clone();
+                    let refresh = StoredMvRefresh {
+                        refresh_id,
+                        mv_id: request.mv_id,
+                        operation_id: None,
+                        state: MvRefreshState::IntentCreated,
+                        target_catalog: Some(request.target_catalog),
+                        target_namespace: Some(request.target_namespace),
+                        target_table: Some(request.target_table),
+                        staging_branch: Some(request.staging_branch),
+                        expected_main_snapshot_id: request.expected_main_snapshot_id,
+                        staging_snapshot_id: None,
+                        published_snapshot_id: None,
+                        target_snapshots: request.base_snapshots,
+                        base_table_uuids: BTreeMap::new(),
+                        rows: None,
+                        marker: Some(RefreshCommitMarker {
+                            refresh_id,
+                            mv_id: request.mv_id,
+                            token: request.marker_token,
+                        }),
+                        external_outcome: None,
+                        lifecycle_owner: MvRefreshLifecycleOwner::FrontendCurrent,
+                        frontend_ledger: Some(request.ledger),
+                    };
+                    put_definition_transaction(
+                        transaction,
+                        operation_id,
+                        &definition,
+                        Precondition::Version(definition_record.version),
+                    )
+                    .await?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Absent,
+                    )
+                    .await?;
+                    Ok(refresh)
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn reserve_frontend_refresh_id_async(&self) -> Result<i64, MvRepositoryError> {
+        let operation_id = Uuid::now_v7();
+        let page_size = self.store.limits().max_page_size;
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "reserve frontend-owned MV refresh ID",
+            move |transaction| {
+                Box::pin(
+                    async move { allocate_refresh_id(transaction, operation_id, page_size).await },
+                )
+            },
+        )
+        .await
+    }
+
+    pub async fn record_frontend_refresh_action_async(
+        &self,
+        refresh_id: i64,
+        action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
+        validate_frontend_refresh_action(&action)?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "record frontend-owned MV refresh action",
+            move |transaction| {
+                let action = action.clone();
+                Box::pin(async move {
+                    let (record, mut refresh) =
+                        load_refresh_transaction(transaction, refresh_id).await?;
+                    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {refresh_id} is not frontend-owned"
+                        )));
+                    }
+                    let ledger = refresh.frontend_ledger.as_mut().ok_or_else(|| {
+                        invalid_state_store("frontend-owned MV refresh has no v3 ledger")
+                    })?;
+                    let expected_operation_id = frontend_action_operation_id(ledger, &action.phase);
+                    if action.operation_id.as_slice() != expected_operation_id {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {refresh_id} action does not use its preallocated operation ID"
+                        )));
+                    }
+                    let Some(existing_index) = ledger
+                        .actions
+                        .iter()
+                        .position(|existing| existing.phase == action.phase)
+                    else {
+                        return Err(invalid_state_store(format!(
+                            "frontend-owned mv refresh {refresh_id} is missing a prepared {:?} action",
+                            action.phase
+                        )));
+                    };
+                    let existing = &ledger.actions[existing_index];
+                    if existing == &action {
+                        return Ok(());
+                    }
+                    if ledger.actions.iter().any(|existing| {
+                        existing.state == FrontendMvRefreshActionState::CommitUnknown
+                    }) {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {refresh_id} has a commit-unknown action and cannot advance"
+                        )));
+                    }
+                    if existing.state != FrontendMvRefreshActionState::Prepared {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {refresh_id} action {:?} conflicts with persisted outcome",
+                            action.phase
+                        )));
+                    }
+                    if action.state == FrontendMvRefreshActionState::Prepared {
+                        return Err(conflict_state_store(format!(
+                            "mv refresh {refresh_id} action {:?} cannot replace its prepared intent",
+                            action.phase
+                        )));
+                    }
+                    ensure_frontend_action_prerequisites(ledger, &action)
+                        .map_err(invalid_state_store)?;
+                    ledger.actions[existing_index] = action.clone();
+                    match (&action.phase, &action.state) {
+                        (_, FrontendMvRefreshActionState::CommitUnknown)
+                            if refresh.state != MvRefreshState::PublishCommitted =>
+                        {
+                            refresh.state = MvRefreshState::CommitUnknown;
+                        }
+                        (_, FrontendMvRefreshActionState::CommitUnknown) => {
+                            // Main is already known published. A later cleanup uncertainty must
+                            // retain that truth and force a visible finalization failure instead
+                            // of reopening the publication decision.
+                            ledger.cleanup_pending = true;
+                        }
+                        (
+                            FrontendMvRefreshActionPhase::Write,
+                            FrontendMvRefreshActionState::KnownCommitted,
+                        ) => refresh.state = MvRefreshState::StagingCommitted,
+                        (
+                            FrontendMvRefreshActionPhase::Publication,
+                            FrontendMvRefreshActionState::KnownCommitted,
+                        ) => {
+                            refresh.state = MvRefreshState::PublishCommitted;
+                            // The provider-neutral committed version carries
+                            // the optional typed snapshot fact needed by the
+                            // repository's atomic finalize check.  Its opaque
+                            // payload remains only in the v3 ledger.
+                            refresh.published_snapshot_id = action
+                                .committed_version
+                                .as_ref()
+                                .and_then(|version| version.snapshot_id);
+                            refresh.external_outcome = Some(RefreshExternalOutcome {
+                                target_snapshot_id: refresh.published_snapshot_id,
+                                commit_id: "frontend-v3-publication".to_string(),
+                            });
+                            ledger.cleanup_pending = true;
+                        }
+                        (
+                            FrontendMvRefreshActionPhase::StagingDrop,
+                            FrontendMvRefreshActionState::KnownCommitted,
+                        ) => ledger.cleanup_pending = false,
+                        _ => {}
+                    }
+                    ledger.validate().map_err(invalid_state_store)?;
+                    put_refresh_transaction(
+                        transaction,
+                        operation_id,
+                        &refresh,
+                        Precondition::Version(record.version),
+                    )
+                    .await
                 })
             },
         )
@@ -1403,6 +1652,33 @@ impl StateStoreMvRepository {
         .await
     }
 
+    async fn finalize_frontend_refresh_without_external_actions_async(
+        &self,
+        request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.require_refresh_async(request.refresh_id).await?;
+        let operation_id = Uuid::now_v7();
+        let store = Arc::clone(&self.store);
+        operation::run(
+            store.as_ref(),
+            &self.runner_metrics,
+            operation_id,
+            "finalize frontend MV refresh without external actions",
+            move |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    finalize_frontend_refresh_without_external_actions_transaction(
+                        transaction,
+                        operation_id,
+                        request,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
     async fn finalize_refresh_with_partitions_async(
         &self,
         request: FinalizeMvRefreshWithPartitionsRequest,
@@ -1583,10 +1859,11 @@ impl StateStoreMvRepository {
     ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
         let mut refreshes = self.list_refreshes_async().await?;
         refreshes.retain(|refresh| {
-            !matches!(
-                refresh.state,
-                MvRefreshState::Finalized | MvRefreshState::Aborted
-            )
+            refresh.lifecycle_owner == MvRefreshLifecycleOwner::LegacyCore
+                && !matches!(
+                    refresh.state,
+                    MvRefreshState::Finalized | MvRefreshState::Aborted
+                )
         });
         refreshes.sort_by_key(|refresh| refresh.refresh_id);
         Ok(refreshes)
@@ -1989,6 +2266,22 @@ impl MvRepository for StateStoreMvRepository {
     ) -> Result<StoredMvRefresh, MvRepositoryError> {
         self.blocking(self.begin_iceberg_refresh_intent_async(request))
     }
+    fn begin_frontend_refresh_intent(
+        &self,
+        request: BeginFrontendMvRefreshIntentRequest,
+    ) -> Result<StoredMvRefresh, MvRepositoryError> {
+        self.blocking(self.begin_frontend_refresh_intent_async(request))
+    }
+    fn reserve_frontend_refresh_id(&self) -> Result<i64, MvRepositoryError> {
+        self.blocking(self.reserve_frontend_refresh_id_async())
+    }
+    fn record_frontend_refresh_action(
+        &self,
+        refresh_id: i64,
+        action: FrontendMvRefreshAction,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.record_frontend_refresh_action_async(refresh_id, action))
+    }
     fn record_staging_commit(
         &self,
         request: RecordStagingCommitRequest,
@@ -2013,6 +2306,12 @@ impl MvRepository for StateStoreMvRepository {
     }
     fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {
         self.blocking(self.finalize_refresh_async(request))
+    }
+    fn finalize_frontend_refresh_without_external_actions(
+        &self,
+        request: MvRefreshFinalizeRequest,
+    ) -> Result<(), MvRepositoryError> {
+        self.blocking(self.finalize_frontend_refresh_without_external_actions_async(request))
     }
     fn finalize_refresh_with_partitions(
         &self,
@@ -2047,7 +2346,8 @@ impl MvRepository for StateStoreMvRepository {
                 .await?
                 .into_iter()
                 .filter(|refresh| {
-                    refresh.target_catalog.is_some()
+                    refresh.lifecycle_owner == MvRefreshLifecycleOwner::LegacyCore
+                        && refresh.target_catalog.is_some()
                         && refresh.target_namespace.is_some()
                         && refresh.target_table.is_some()
                         && refresh.staging_branch.is_some()
@@ -2185,6 +2485,7 @@ fn prevalidate_create_operation(
         operation_id,
         &MvSequence {
             last_allocated_id: mv_id,
+            last_refresh_id: 0,
         },
     )
     .map_err(invalid)?;
@@ -2373,15 +2674,29 @@ async fn put_partition_transaction(
 
 async fn allocate_refresh_id(
     transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
     page_size: usize,
 ) -> Result<i64, novarocks_spi::state_store::StateStoreError> {
+    let sequence_key = sequence_key().map_err(invalid_state_store)?;
+    let sequence_record = transaction.get(&sequence_key).await?;
+    let sequence = match &sequence_record {
+        Some(record) => {
+            decode_record::<MvSequence>(&sequence_key, &record.value)
+                .map_err(invalid_state_store)?
+                .value
+        }
+        None => MvSequence {
+            last_allocated_id: 0,
+            last_refresh_id: 0,
+        },
+    };
     let records = range_transaction_with_page_size(
         transaction,
         refresh_prefix().map_err(invalid_state_store)?,
         page_size,
     )
     .await?;
-    records
+    let existing_max = records
         .into_iter()
         .map(|record| {
             decode_record::<StoredMvRefresh>(&record.key, &record.value)
@@ -2391,10 +2706,32 @@ async fn allocate_refresh_id(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let next = sequence
+        .last_refresh_id
+        .max(existing_max)
         .checked_add(1)
         .filter(|value| *value > 0)
-        .ok_or_else(|| invalid_state_store("MV refresh ID sequence overflow"))
+        .ok_or_else(|| invalid_state_store("MV refresh ID sequence overflow"))?;
+    let value = encode_record(
+        MvRecordKind::Sequence,
+        operation_id,
+        &MvSequence {
+            last_allocated_id: sequence.last_allocated_id,
+            last_refresh_id: next,
+        },
+    )
+    .map_err(invalid_state_store)?;
+    transaction
+        .put(
+            sequence_key,
+            value,
+            sequence_record
+                .map(|record| Precondition::Version(record.version))
+                .unwrap_or(Precondition::Absent),
+        )
+        .await?;
+    Ok(next)
 }
 
 async fn range_transaction_with_page_size(
@@ -2582,6 +2919,60 @@ async fn finalize_refresh_transaction(
     .await
 }
 
+async fn finalize_frontend_refresh_without_external_actions_transaction(
+    transaction: &mut dyn WriteTransaction,
+    operation_id: Uuid,
+    request: MvRefreshFinalizeRequest,
+) -> Result<(), novarocks_spi::state_store::StateStoreError> {
+    let (refresh_record, mut refresh) =
+        load_refresh_transaction(transaction, request.refresh_id).await?;
+    if refresh.state == MvRefreshState::Finalized {
+        return Ok(());
+    }
+    if refresh.lifecycle_owner != MvRefreshLifecycleOwner::FrontendCurrent
+        || refresh
+            .frontend_ledger
+            .as_ref()
+            .is_none_or(|ledger| !ledger.actions.is_empty())
+    {
+        return Err(conflict_state_store(format!(
+            "mv refresh {} is not a frontend no-external-action attempt",
+            request.refresh_id
+        )));
+    }
+    expect_refresh_state(&refresh, MvRefreshState::IntentCreated)?;
+    let (definition_record, mut definition) =
+        load_definition_transaction(transaction, refresh.mv_id).await?;
+    if definition.active_refresh_id != Some(request.refresh_id) {
+        return Err(conflict_state_store(format!(
+            "mv definition {} active refresh is {:?}, expected {}",
+            refresh.mv_id, definition.active_refresh_id, request.refresh_id
+        )));
+    }
+    definition.last_refresh_rows = Some(request.rows);
+    definition.last_refresh_snapshots = request.base_snapshots;
+    definition.last_refresh_table_uuids = request.base_table_uuids;
+    definition.last_refreshed_iceberg_snapshot_id = request.target_snapshot_id;
+    definition.refresh_in_progress = false;
+    definition.active_refresh_id = None;
+    definition.refresh_target_snapshots.clear();
+    refresh.state = MvRefreshState::Finalized;
+    put_definition_transaction(
+        transaction,
+        operation_id,
+        &definition,
+        Precondition::Version(definition_record.version),
+    )
+    .await?;
+    put_refresh_transaction(
+        transaction,
+        operation_id,
+        &refresh,
+        Precondition::Version(refresh_record.version),
+    )
+    .await
+}
+
 fn new_refresh(
     refresh_id: i64,
     mv_id: i64,
@@ -2605,6 +2996,8 @@ fn new_refresh(
         rows: None,
         marker: None,
         external_outcome: None,
+        lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
+        frontend_ledger: None,
     }
 }
 
@@ -2647,6 +3040,136 @@ fn validate_iceberg_refresh_request(
         ));
     }
     Ok(())
+}
+
+fn validate_frontend_refresh_request(
+    request: &BeginFrontendMvRefreshIntentRequest,
+) -> Result<(), MvRepositoryError> {
+    if request.refresh_id <= 0
+        || request.mv_id <= 0
+        || request.target_catalog.is_empty()
+        || request.target_namespace.is_empty()
+        || request.target_table.is_empty()
+        || request.staging_branch.is_empty()
+        || request.marker_token.is_empty()
+    {
+        return Err(invalid(
+            "frontend MV refresh request requires non-empty identifiers and positive refresh and MV IDs",
+        ));
+    }
+    if !request.ledger.actions.is_empty() {
+        return Err(invalid(
+            "frontend MV refresh intent cannot contain completed external actions",
+        ));
+    }
+    request.ledger.validate().map_err(invalid)
+}
+
+fn validate_frontend_refresh_action(
+    action: &FrontendMvRefreshAction,
+) -> Result<(), MvRepositoryError> {
+    if action.operation_id.len() != 16 {
+        return Err(invalid(
+            "frontend MV refresh action operation ID must be a 16-byte UUID",
+        ));
+    }
+    Ok(())
+}
+
+fn frontend_action_operation_id<'a>(
+    ledger: &'a FrontendMvRefreshLedger,
+    phase: &FrontendMvRefreshActionPhase,
+) -> &'a [u8] {
+    match phase {
+        FrontendMvRefreshActionPhase::StagingCreate => &ledger.staging_create_operation_id,
+        FrontendMvRefreshActionPhase::Write => &ledger.write_operation_id,
+        FrontendMvRefreshActionPhase::Publication => &ledger.publication_operation_id,
+        FrontendMvRefreshActionPhase::StagingDrop => &ledger.staging_drop_operation_id,
+    }
+}
+
+fn frontend_prepared_actions(ledger: &FrontendMvRefreshLedger) -> Vec<FrontendMvRefreshAction> {
+    [
+        (
+            FrontendMvRefreshActionPhase::StagingCreate,
+            &ledger.staging_create_operation_id,
+        ),
+        (
+            FrontendMvRefreshActionPhase::Write,
+            &ledger.write_operation_id,
+        ),
+        (
+            FrontendMvRefreshActionPhase::Publication,
+            &ledger.publication_operation_id,
+        ),
+        (
+            FrontendMvRefreshActionPhase::StagingDrop,
+            &ledger.staging_drop_operation_id,
+        ),
+    ]
+    .into_iter()
+    .map(|(phase, operation_id)| FrontendMvRefreshAction {
+        phase,
+        state: FrontendMvRefreshActionState::Prepared,
+        operation_id: operation_id.clone(),
+        receipt: None,
+        committed_version: None,
+        external_evidence: None,
+        provider_finalized: false,
+    })
+    .collect()
+}
+
+fn ensure_frontend_action_prerequisites(
+    ledger: &FrontendMvRefreshLedger,
+    action: &FrontendMvRefreshAction,
+) -> Result<(), String> {
+    let state_for = |phase| {
+        ledger
+            .actions
+            .iter()
+            .find(|existing| existing.phase == phase)
+            .map(|existing| &existing.state)
+    };
+    match action.phase {
+        FrontendMvRefreshActionPhase::StagingCreate => Ok(()),
+        FrontendMvRefreshActionPhase::Write => {
+            if state_for(FrontendMvRefreshActionPhase::StagingCreate)
+                == Some(&FrontendMvRefreshActionState::KnownCommitted)
+            {
+                Ok(())
+            } else {
+                Err(
+                    "frontend MV write cannot advance before staging creation is known committed"
+                        .to_string(),
+                )
+            }
+        }
+        FrontendMvRefreshActionPhase::Publication => {
+            if state_for(FrontendMvRefreshActionPhase::Write)
+                == Some(&FrontendMvRefreshActionState::KnownCommitted)
+            {
+                Ok(())
+            } else {
+                Err(
+                    "frontend MV publication cannot advance before write is known committed"
+                        .to_string(),
+                )
+            }
+        }
+        FrontendMvRefreshActionPhase::StagingDrop => {
+            if state_for(FrontendMvRefreshActionPhase::Publication)
+                == Some(&FrontendMvRefreshActionState::KnownCommitted)
+            {
+                Ok(())
+            } else {
+                Err(
+                    "frontend MV cleanup cannot advance before publication is known committed"
+                        .to_string(),
+                )
+            }
+        }
+    }
 }
 
 fn validate_refresh_metadata_request(

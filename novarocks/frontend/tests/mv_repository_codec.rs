@@ -3,19 +3,30 @@ use novarocks::mv::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use novarocks::mv::persistence::refresh::{
+    FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
+    FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
+    MvRefreshLifecycleOwner, MvRefreshState, StoredMvRefresh,
+};
 use novarocks::mv::repository::MvTargetLookup;
 use novarocks_frontend::mv::repository::catalog::schema_catalog;
 use novarocks_frontend::mv::repository::codec::{
-    DecodedMvRecord, MvRecordKind, decode_definition, decode_record, encode_definition,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,
     encode_record,
 };
 use novarocks_frontend::mv::repository::key::{
     MvKeyKind, decode_key, definition_by_id_key, dependency_by_downstream_key,
-    dependency_by_upstream_key, partition_by_mv_key, target_lookup_key,
+    dependency_by_upstream_key, partition_by_mv_key, sequence_key, target_lookup_key,
 };
 use novarocks_spi::state_store::{Key, Value};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+fn sha256_bytes(payload: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(payload).to_vec()
+}
 
 fn upstream() -> MvDependencyObjectRef {
     MvDependencyObjectRef {
@@ -122,6 +133,19 @@ fn envelope_round_trips_and_rejects_corruption() {
 }
 
 #[test]
+fn sequence_v2_round_trips_the_frontend_refresh_high_water_mark() {
+    let key = sequence_key().expect("sequence key");
+    let sequence = MvSequence {
+        last_allocated_id: 42,
+        last_refresh_id: 99,
+    };
+    let value = encode_record(MvRecordKind::Sequence, Uuid::now_v7(), &sequence)
+        .expect("encode sequence v2");
+    let decoded: DecodedMvRecord<MvSequence> = decode_record(&key, &value).expect("decode v2");
+    assert_eq!(decoded.value, sequence);
+}
+
+#[test]
 fn envelope_rejects_key_kind_unknown_schema_and_trailing_bytes() {
     let operation_id = Uuid::now_v7();
     let value = encode_record(
@@ -201,8 +225,114 @@ fn mv_catalog_validates_all_historical_schemas_transitively() {
     );
     assert_eq!(
         catalog.latest("mv.refresh").expect("refresh schema").id(),
+        3
+    );
+    assert_eq!(
+        catalog.latest("mv.sequence").expect("sequence schema").id(),
         2
     );
+}
+
+#[test]
+fn refresh_v3_round_trips_frontend_owned_opaque_ledger() {
+    let request_id = Uuid::now_v7().into_bytes().to_vec();
+    let staging_create_operation_id = Uuid::now_v7().into_bytes().to_vec();
+    let write_operation_id = Uuid::now_v7().into_bytes().to_vec();
+    let publication_operation_id = Uuid::now_v7().into_bytes().to_vec();
+    let staging_drop_operation_id = Uuid::now_v7().into_bytes().to_vec();
+    let committed_payload = b"provider-version".to_vec();
+    let evidence_payload = b"provider-evidence".to_vec();
+    let refresh = StoredMvRefresh {
+        refresh_id: 7,
+        mv_id: 3,
+        operation_id: None,
+        state: MvRefreshState::IntentCreated,
+        target_catalog: Some("ice".to_string()),
+        target_namespace: Some("sales".to_string()),
+        target_table: Some("daily".to_string()),
+        staging_branch: Some("mv-7".to_string()),
+        expected_main_snapshot_id: Some(11),
+        staging_snapshot_id: None,
+        published_snapshot_id: None,
+        target_snapshots: BTreeMap::new(),
+        base_table_uuids: BTreeMap::new(),
+        rows: None,
+        marker: None,
+        external_outcome: None,
+        lifecycle_owner: MvRefreshLifecycleOwner::FrontendCurrent,
+        frontend_ledger: Some(FrontendMvRefreshLedger {
+            request_id,
+            provider_id: "iceberg".to_string(),
+            instance_id: "rest".to_string(),
+            incarnation: Uuid::now_v7().into_bytes().to_vec(),
+            expected_target_version: Some(
+                FrontendMvRefreshCommittedVersion::try_new(committed_payload.clone(), Some(12))
+                    .expect("committed version"),
+            ),
+            staging_create_operation_id: staging_create_operation_id.clone(),
+            write_operation_id: write_operation_id.clone(),
+            publication_operation_id: publication_operation_id.clone(),
+            staging_drop_operation_id: staging_drop_operation_id.clone(),
+            cohort_ids: vec!["cohort-a".to_string()],
+            actions: vec![
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::StagingCreate,
+                    state: FrontendMvRefreshActionState::Prepared,
+                    operation_id: staging_create_operation_id,
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: None,
+                    provider_finalized: false,
+                },
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::Write,
+                    state: FrontendMvRefreshActionState::KnownCommitted,
+                    operation_id: write_operation_id,
+                    receipt: Some(FrontendMvRefreshEvidence {
+                        payload: evidence_payload.clone(),
+                        digest: sha256_bytes(&evidence_payload),
+                    }),
+                    committed_version: Some(
+                        FrontendMvRefreshCommittedVersion::try_new(
+                            committed_payload.clone(),
+                            Some(12),
+                        )
+                        .expect("committed version"),
+                    ),
+                    external_evidence: None,
+                    provider_finalized: false,
+                },
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::Publication,
+                    state: FrontendMvRefreshActionState::Prepared,
+                    operation_id: publication_operation_id,
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: None,
+                    provider_finalized: false,
+                },
+                FrontendMvRefreshAction {
+                    phase: FrontendMvRefreshActionPhase::StagingDrop,
+                    state: FrontendMvRefreshActionState::Prepared,
+                    operation_id: staging_drop_operation_id,
+                    receipt: None,
+                    committed_version: None,
+                    external_evidence: None,
+                    provider_finalized: false,
+                },
+            ],
+            cleanup_pending: false,
+        }),
+    };
+    let key = Key::try_from(Bytes::from_static(
+        b"novarocks/frontend/mv/v1/refresh/by-id/0000000000000007",
+    ))
+    .expect("refresh key");
+    let encoded =
+        encode_record(MvRecordKind::Refresh, Uuid::now_v7(), &refresh).expect("encode v3 refresh");
+    let decoded: DecodedMvRecord<StoredMvRefresh> =
+        decode_record(&key, &encoded).expect("decode v3 refresh");
+    assert_eq!(decoded.value, refresh);
 }
 
 #[test]

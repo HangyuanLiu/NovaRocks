@@ -8,7 +8,7 @@
 //! MVX-2W exercises it through the native fixture; MVX-2 will make the route
 //! switch only after that fixture proves the data plane.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
@@ -28,12 +28,60 @@ use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
+use crate::sql::mv_refresh::PreparedDistributedWriteRequest;
 use crate::sql::mv_refresh::first_refresh::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshPhysicalSql, MvFirstRefreshShape,
     MvFirstRefreshTargetContract, MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest,
     PreparedMvFirstRefreshWrite,
 };
+use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
 use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
+
+/// Core-side implementation installed into the frontend composition through
+/// the typed MV activation port. It retains only a weak engine reference, so
+/// it cannot keep an engine or an all-in-one runtime alive past shutdown.
+pub(crate) struct StandaloneMvFirstRefreshWriteActivator {
+    state: Weak<StandaloneState>,
+}
+
+impl StandaloneMvFirstRefreshWriteActivator {
+    pub(crate) fn new(state: Weak<StandaloneState>) -> Self {
+        Self { state }
+    }
+}
+
+impl crate::mv::application::MvFirstRefreshWriteActivator
+    for StandaloneMvFirstRefreshWriteActivator
+{
+    fn bind_first_refresh_write(
+        &self,
+        prepared: PreparedMvFirstRefreshWrite,
+        exact_lease: &ConnectorWriteLease,
+        execution: &QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String> {
+        let state = self.state.upgrade().ok_or_else(|| {
+            "MV first-refresh write activator is unavailable during engine shutdown".to_string()
+        })?;
+        bind_prepared_mv_first_refresh_staging(&state, prepared, exact_lease, execution)
+    }
+
+    fn bind_incremental_refresh_write(
+        &self,
+        prepared: PreparedMvIncrementalWrite,
+        exact_lease: &ConnectorWriteLease,
+        execution: &QueryExecutionContext,
+    ) -> Result<PreparedDistributedWriteRequest, String> {
+        let state = self.state.upgrade().ok_or_else(|| {
+            "MV incremental write activator is unavailable during engine shutdown".to_string()
+        })?;
+        crate::engine::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
+            &state,
+            prepared,
+            exact_lease,
+            execution,
+        )
+    }
+}
 
 /// Bounded facts emitted by the feature-gated native fixture.  This deliberately
 /// contains no report frame, provider receipt, Arrow batch, or query result.
@@ -203,9 +251,7 @@ where
         .map_err(|error| format!("derive MV first-refresh test write lease: {error}"))?;
     let (sink_spec, template) = activate_mv_first_refresh_connector_write(
         state,
-        ctx,
         &prepared,
-        &staging_branch,
         std::collections::BTreeMap::from([
             (
                 "novarocks.mv.first-refresh-test".to_string(),
@@ -228,8 +274,6 @@ where
             .map_err(|error| format!("register MV first-refresh test cohort: {error}"))?;
     let (completion, summary) = execute_prepared_mv_first_refresh_staging(
         state,
-        ctx.rewrite.current_catalog.as_deref(),
-        &ctx.rewrite.current_database,
         prepared,
         sink_spec,
         execution,
@@ -366,7 +410,22 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
         observed_binding,
         connector_context,
     )?;
-    MvFirstRefreshWritePreparer::prepare_join_logical(request, append)
+    MvFirstRefreshWritePreparer::prepare_join_logical(request, append, frozen_logical_context(ctx))
+}
+
+pub(crate) fn frozen_logical_context(
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+) -> crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
+    crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
+        mv_definition: (*ctx.rewrite.mv_definition).clone(),
+        canonical_select_query: (*ctx.rewrite.canonical_select_query).clone(),
+        base_refs: ctx.rewrite.base_refs.to_vec(),
+        pin: (*ctx.rewrite.pin).clone(),
+        previous_snapshot_ids: ctx.rewrite.previous_snapshot_ids.clone(),
+        previous_table_uuids: ctx.rewrite.previous_table_uuids.clone(),
+        target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+        affected_partitions: ctx.affected_partitions.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,6 +503,13 @@ fn mv_first_refresh_request(
     MvFirstRefreshWriteRequest::try_new(
         ctx.rewrite.canonical_select_query.to_string(),
         shape,
+        target.catalog,
+        target.namespace,
+        target.table,
+        staging_branch.to_string(),
+        ctx.rewrite.current_catalog.clone(),
+        ctx.rewrite.current_database.clone(),
+        ctx.rewrite.target_snapshot_id,
         table,
         target_contract,
         observed_binding,
@@ -459,10 +525,8 @@ fn mv_first_refresh_request(
 /// artifact preparation remains side-effect free.
 pub(crate) fn activate_mv_first_refresh_connector_write(
     state: &Arc<StandaloneState>,
-    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     prepared: &PreparedMvFirstRefreshWrite,
-    staging_branch: &str,
-    provenance_properties: std::collections::BTreeMap<String, String>,
+    mut provenance_properties: std::collections::BTreeMap<String, String>,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<
     (
@@ -474,12 +538,20 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     if prepared.observed_binding() != exact_lease.binding_key() {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
     }
+    for (key, value) in prepared.provenance_properties() {
+        if provenance_properties
+            .insert(key.clone(), value.clone())
+            .is_some()
+        {
+            return Err("MV first-refresh provenance was supplied twice".to_string());
+        }
+    }
     let operation_id: ConnectorWriteOperationId = prepared.operation_id();
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
-        catalog: ctx.rewrite.target.catalog.clone(),
-        namespace: ctx.rewrite.target.namespace.clone(),
-        table: ctx.rewrite.target.table.clone(),
+        catalog: prepared.target_catalog().to_string(),
+        namespace: prepared.target_namespace().to_string(),
+        table: prepared.target_name().to_string(),
     };
     // The staging branch was just created through the provider mutation
     // contract.  The refresh context intentionally remains immutable, so its
@@ -487,12 +559,19 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     // activation adapter: this is the authoritative read used to validate the
     // ref CAS facts and construct the writer, never a SQL-preparation side
     // effect.
-    let entry = ctx.target_bindings.runtime().target_entry();
+    let entry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| {
+            format!("read Iceberg catalog registry for first-refresh activation: {error}")
+        })?
+        .get(&target.catalog)?;
     entry.invalidate_table_cache(&target.namespace, &target.table);
     let target_table =
         crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)
             .map_err(|error| format!("reload MV first-refresh staging target: {error}"))?
             .table;
+    validate_first_refresh_target_contract(&target_table, prepared.target_contract())?;
     let columns = crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(
         target_table.metadata().current_schema(),
     )?;
@@ -507,7 +586,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         &target,
         &resolved,
         &target_table,
-        entry,
+        &entry,
         &resolved.columns,
     )?;
     let ident = TableIdent::new(
@@ -517,12 +596,19 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     let collector = crate::mv::refresh::change_stream_write::new_iceberg_mv_commit_collector(
         &target_table,
         &ident,
-        staging_branch,
-        CommitOpKind::FastAppend,
+        prepared.staging_branch(),
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                CommitOpKind::FastAppend
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                CommitOpKind::Overwrite
+            }
+        },
     );
-    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)?;
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
-        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)?;
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
         state: Arc::downgrade(state),
         target: target.clone(),
@@ -532,14 +618,14 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         fs: abort_cleanup.fs,
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
-        target_ref: staging_branch.to_string(),
+        target_ref: prepared.staging_branch().to_string(),
         snapshot_properties: std::collections::BTreeMap::new(),
     });
     let payload = IcebergFirstRefreshWritePlanPayloadV2 {
         version: 2,
         target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
-        target_ref: staging_branch.to_string(),
-        expected_snapshot_id: ctx.rewrite.target_snapshot_id,
+        target_ref: prepared.staging_branch().to_string(),
+        expected_snapshot_id: prepared.expected_target_snapshot_id(),
         staging_path: collector.staging_dir.clone(),
         provenance_properties,
     };
@@ -550,11 +636,27 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     let template = crate::engine::iceberg_writer::activate_iceberg_first_refresh_connector_write(
         state,
         &target,
-        staging_branch,
+        prepared.staging_branch(),
         Arc::clone(prepared.target_contract().schema()),
         writer_handle_payload,
         payload,
         commit_executor,
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                novarocks_spi::connector::ConnectorWriteIntent::Append
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+            }
+        },
+        match prepared.write_mode() {
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
+            }
+            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+                crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
+            }
+        },
         operation_id,
         prepared.connector_context().clone(),
         exact_lease,
@@ -562,10 +664,221 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     Ok((sink_spec, template))
 }
 
-pub(crate) fn execute_prepared_mv_first_refresh_staging(
+fn validate_first_refresh_target_contract(
+    target_table: &iceberg::table::Table,
+    contract: &MvFirstRefreshTargetContract,
+) -> Result<(), String> {
+    let actual_schema = target_table.metadata().current_schema();
+    let actual_arrow_schema = iceberg::arrow::schema_to_arrow_schema(actual_schema)
+        .map_err(|error| format!("convert MV first-refresh activation schema to Arrow: {error}"))?;
+    let actual_field_ids = actual_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.id)
+        .collect::<Vec<_>>();
+    contract.validate_observed(
+        &actual_arrow_schema,
+        &actual_field_ids,
+        target_table.metadata().default_partition_spec_id(),
+    )
+}
+
+/// Bind an SQL-shaped first-refresh artifact only after the frontend has
+/// retained its exact write lease and admitted an immutable query execution.
+/// The result is the same generic result-free writer request used by all
+/// other frontend-owned write lifecycles; it deliberately does not submit a
+/// query, commit a provider mutation, or expose row payloads.
+pub(crate) fn bind_prepared_mv_first_refresh_staging(
+    state: &Arc<StandaloneState>,
+    prepared: PreparedMvFirstRefreshWrite,
+    exact_lease: &ConnectorWriteLease,
+    execution: &QueryExecutionContext,
+) -> Result<PreparedDistributedWriteRequest, String> {
+    let operation_id = prepared.operation_id();
+    let cohort_id = prepared.primary_cohort();
+    let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
+    let target_catalog = prepared.target_catalog().to_string();
+    let target_namespace = prepared.target_namespace().to_string();
+    let target_name = prepared.target_name().to_string();
+    let current_catalog = prepared.current_catalog().map(str::to_string);
+    let current_database = prepared.current_database().to_string();
+    let connector_context = prepared.connector_context().clone();
+    let root_distribution = iceberg_write_shuffle_by_output_name(prepared.root_hash_column());
+    let (sink_spec, template) = activate_mv_first_refresh_connector_write(
+        state,
+        &prepared,
+        std::collections::BTreeMap::new(),
+        exact_lease,
+    )?;
+    let distributed = match prepared.into_execution_artifact() {
+        MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
+            let query = parse_query_from_sql(physical_sql.sql())?;
+            crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
+                state,
+                current_catalog.as_deref(),
+                &current_database,
+                &query,
+                sink_spec,
+                None,
+                Some(root_distribution),
+                execution,
+                &connector_context,
+                template,
+            )?
+        }
+        MvFirstRefreshExecutionArtifact::Logical(logical) => {
+            let (logical_plan, factory, facts) = logical.into_parts();
+            let refresh_context = rebuild_frozen_mv_refresh_context(
+                state,
+                current_catalog.as_deref(),
+                &current_database,
+                expected_target_snapshot_id,
+                &target_catalog,
+                &target_namespace,
+                &target_name,
+                &facts,
+            )?;
+            crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
+                state,
+                logical_plan,
+                factory,
+                sink_spec,
+                root_distribution,
+                execution,
+                &connector_context,
+                &refresh_context,
+                template,
+            )?
+        }
+    };
+    if distributed.write_operation_id() != operation_id
+        || distributed.write_cohort_id() != cohort_id
+    {
+        return Err("MV first-refresh distributed artifact identity mismatch".to_string());
+    }
+    Ok(distributed)
+}
+
+pub(crate) fn rebuild_frozen_mv_refresh_context(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
+    expected_target_snapshot_id: Option<i64>,
+    target_catalog: &str,
+    target_namespace: &str,
+    target_name: &str,
+    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+) -> Result<crate::mv::refresh::execution_context::IcebergMvRefreshContext, String> {
+    let target_identity =
+        novarocks_catalog::identifier::TableIdentity {
+            catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no connector catalog".to_string()
+            })?,
+            namespace: facts
+                .mv_definition
+                .target_namespace
+                .clone()
+                .ok_or_else(|| {
+                    "MV first-refresh logical artifact target has no namespace".to_string()
+                })?,
+            table: facts.mv_definition.target_table.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact target has no table".to_string()
+            })?,
+        };
+    if target_identity.catalog != target_catalog
+        || target_identity.namespace != target_namespace
+        || target_identity.table != target_name
+    {
+        return Err(
+            "MV refresh logical artifact target does not match its frozen write request"
+                .to_string(),
+        );
+    }
+    validate_frozen_join_base_facts(state, facts)?;
+    let entry = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("read Iceberg catalog registry for join activation: {error}"))?
+        .get(&target_identity.catalog)?;
+    entry.invalidate_table_cache(&target_identity.namespace, &target_identity.table);
+    let target_table = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &target_identity.namespace,
+        &target_identity.table,
+    )
+    .map_err(|error| format!("reload MV join staging target: {error}"))?
+    .table;
+    if target_table.metadata().uuid().to_string() != facts.target_table_uuid {
+        return Err(
+            "MV refresh logical artifact target UUID drifted after preparation".to_string(),
+        );
+    }
+    let actual_target_snapshot_id = target_table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id());
+    if actual_target_snapshot_id != expected_target_snapshot_id {
+        return Err(
+            "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
+        );
+    }
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let catalogs = state
+        .iceberg_catalogs
+        .read()
+        .map_err(|error| format!("read Iceberg catalog registry for join context: {error}"))?;
+    crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
+        target_identity,
+        facts.mv_definition.mv_id,
+        current_catalog,
+        current_database,
+        Arc::new(facts.mv_definition.clone()),
+        Arc::new(facts.canonical_select_query.clone()),
+        Arc::from(facts.base_refs.clone()),
+        Arc::new(facts.pin.clone()),
+        facts.previous_snapshot_ids.clone(),
+        facts.previous_table_uuids.clone(),
+        expected_target_snapshot_id,
+        facts.target_table_uuid.clone(),
+        &catalogs,
+        Arc::new(entry),
+        catalog,
+        target_table,
+        facts.affected_partitions.clone(),
+        state.mv_refresh_pruning_limits,
+    )
+}
+
+fn validate_frozen_join_base_facts(
+    state: &Arc<StandaloneState>,
+    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+) -> Result<(), String> {
+    if facts.base_refs.is_empty() || facts.pin.len() != facts.base_refs.len() {
+        return Err(
+            "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),
+        );
+    }
+    for base in &facts.base_refs {
+        let pinned_uuid = facts.pin.uuid(base).ok_or_else(|| {
+            format!(
+                "MV first-refresh logical artifact has no UUID pin for {}",
+                base.fqn()
+            )
+        })?;
+        let loaded = crate::engine::mv::refresh_io::load_current_iceberg_base_table(state, base)?;
+        if loaded.table.metadata().uuid().to_string() != pinned_uuid {
+            return Err(format!(
+                "MV first-refresh join base table identity drifted after preparation for {}",
+                base.fqn()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn execute_prepared_mv_first_refresh_staging(
+    state: &Arc<StandaloneState>,
     prepared: PreparedMvFirstRefreshWrite,
     sink_spec: IcebergWriteSinkSpec,
     execution: &QueryExecutionContext,
@@ -584,14 +897,16 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     }
     let connector_context = prepared.connector_context().clone();
     let root_hash_column = prepared.root_hash_column().to_string();
+    let current_catalog = prepared.current_catalog().map(str::to_string);
+    let current_database = prepared.current_database().to_string();
     match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let query = parse_query_from_sql(physical_sql.sql())?;
             let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column);
             execute_query_as_iceberg_staging_in_operation_with_connector_context(
                 state,
-                current_catalog,
-                current_database,
+                current_catalog.as_deref(),
+                &current_database,
                 &query,
                 sink_spec,
                 None,
@@ -605,7 +920,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
             let mv_refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
                 "MV first-refresh logical staging requires its frozen refresh context".to_string()
             })?;
-            let (logical_plan, factory) = logical.into_parts();
+            let (logical_plan, factory, _frozen_context) = logical.into_parts();
             execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
                 state,
                 logical_plan,
