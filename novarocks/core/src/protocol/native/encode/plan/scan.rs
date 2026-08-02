@@ -30,9 +30,6 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
-use crate::connector::scan_model::starrocks::{
-    StarRocksColumnSchemaDescriptor, StarRocksKeysTypeDescriptor, StarRocksTabletSchemaDescriptor,
-};
 use crate::proto::{common, plan};
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
@@ -595,8 +592,7 @@ fn scan_binding_for_source<'a>(
         | table_model::ScanSource::IcebergMvTargetLocator(_) => {
             matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
         }
-        table_model::ScanSource::IcebergMetadataTable { .. }
-        | table_model::ScanSource::StarRocks { .. } => false,
+        table_model::ScanSource::IcebergMetadataTable { .. } => false,
     };
     if !valid_execution {
         return Err(format!(
@@ -611,7 +607,6 @@ fn scan_binding_for_source<'a>(
 fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
     match source {
         table_model::ScanSource::ConnectorPinned => "ConnectorPinned",
-        table_model::ScanSource::StarRocks { .. } => "StarRocks",
         table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         table_model::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
         table_model::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
@@ -689,36 +684,6 @@ fn encode_scan_source(
                         .map(|node_id| node_id.to_string())
                         .unwrap_or_else(|| "<none>".to_string())
                 ));
-            }
-            table_model::ScanSource::StarRocks { .. } => {
-                let node_id = scan_node_id.ok_or_else(|| {
-                    "StarRocks table source is only valid on a native ScanNode".to_string()
-                })?;
-                let descriptor = optional_context_ref(ctx.scan_bindings)
-                    .and_then(|bindings| bindings.starrocks_source(node_id))
-                    .ok_or_else(|| {
-                        format!(
-                            "StarRocks ScanNode node_id={node_id} missing native source descriptor"
-                        )
-                    })?;
-                Kind::StarrocksTable(plan::StarRocksTableSource {
-                    catalog_name: descriptor.catalog_name.clone(),
-                    db_id: descriptor.db_id,
-                    table_id: descriptor.table_id,
-                    schema_id: descriptor.schema_id,
-                    storage_columns: descriptor
-                        .storage_columns
-                        .iter()
-                        .map(|column| plan::StarRocksColumnStorageMeta {
-                            name: column.name.clone(),
-                            unique_id: column.unique_id,
-                            default_value: column.default_value.clone(),
-                        })
-                        .collect(),
-                    current_schema: Some(encode_starrocks_tablet_schema(
-                        &descriptor.tablet_schema,
-                    )),
-                })
             }
             table_model::ScanSource::IcebergDataFiles {
                 table,
@@ -918,58 +883,6 @@ fn encode_connector_expected_schema_ipc(
         ));
     }
     Ok(bytes)
-}
-
-fn encode_starrocks_tablet_schema(
-    schema: &StarRocksTabletSchemaDescriptor,
-) -> plan::StarRocksTabletSchema {
-    plan::StarRocksTabletSchema {
-        schema_id: schema.schema_id,
-        keys_type: match schema.keys_type {
-            StarRocksKeysTypeDescriptor::Duplicate => {
-                plan::StarRocksKeysType::StarrocksKeysTypeDuplicate as i32
-            }
-            StarRocksKeysTypeDescriptor::Unique => {
-                plan::StarRocksKeysType::StarrocksKeysTypeUnique as i32
-            }
-            StarRocksKeysTypeDescriptor::Aggregate => {
-                plan::StarRocksKeysType::StarrocksKeysTypeAggregate as i32
-            }
-            StarRocksKeysTypeDescriptor::Primary => {
-                plan::StarRocksKeysType::StarrocksKeysTypePrimary as i32
-            }
-        },
-        num_short_key_columns: schema.num_short_key_columns,
-        sort_key_idxes: schema.sort_key_idxes.clone(),
-        sort_key_unique_ids: schema.sort_key_unique_ids.clone(),
-        columns: schema
-            .columns
-            .iter()
-            .map(encode_starrocks_column_schema)
-            .collect(),
-    }
-}
-
-fn encode_starrocks_column_schema(
-    column: &StarRocksColumnSchemaDescriptor,
-) -> plan::StarRocksColumnSchema {
-    plan::StarRocksColumnSchema {
-        unique_id: column.unique_id,
-        name: column.name.clone(),
-        physical_type: column.physical_type.clone(),
-        is_key: Some(column.is_key),
-        aggregation: column.aggregation.clone(),
-        nullable: Some(column.nullable),
-        default_value: column.default_value.clone(),
-        precision: column.precision,
-        scale: column.scale,
-        visible: Some(column.visible),
-        children: column
-            .children
-            .iter()
-            .map(encode_starrocks_column_schema)
-            .collect(),
-    }
 }
 
 fn encode_mv_target_state_row_filter(

@@ -685,10 +685,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![column_def("k", DataType::Int64, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 1,
-                table_id: 2,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 

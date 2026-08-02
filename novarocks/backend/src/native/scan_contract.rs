@@ -73,10 +73,8 @@ fn visit(
                 ),
             )
         })?;
-        let kind = match source {
-            plan::scan_source::Kind::StarrocksTable(_) => ScanAssignmentKind::StarRocksTablet,
-            _ => ScanAssignmentKind::File,
-        };
+        let _ = source;
+        let kind = ScanAssignmentKind::File;
         if assignments
             .insert(
                 FragmentNodeId::new(node.node_id),

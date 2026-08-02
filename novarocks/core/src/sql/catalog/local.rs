@@ -51,7 +51,7 @@ impl PlannerTableProvider for PlannerMemoryCatalog {
         let planner = self.get(database, table)?;
         if matches!(
             planner.source,
-            crate::sql::planner::table::ScanSource::StarRocks { .. }
+            crate::sql::planner::table::ScanSource::ConnectorPinned
         ) {
             return Err(format!(
                 "StarRocks scan source {DEFAULT_CATALOG}.{database}.{table} requires an external connector binding; native planner catalogs cannot register internal StarRocks tables"
@@ -111,10 +111,7 @@ mod tests {
             name: name.to_string(),
             columns: vec![column("id", DataType::Int32, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 10,
-                table_id: 20,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 

@@ -111,10 +111,7 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::StarRocks {
-                    db_id: 1,
-                    table_id: 1,
-                },
+                source: ScanSource::ConnectorPinned,
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,

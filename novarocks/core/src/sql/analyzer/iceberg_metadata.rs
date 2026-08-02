@@ -219,7 +219,7 @@ fn table_info_from_source(source: &ScanSource) -> Option<&IcebergTableInfo> {
         | ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => Some(table),
         ScanSource::ConnectorPinned
-        | ScanSource::StarRocks { .. }
+        | ScanSource::ConnectorPinned
         | ScanSource::IcebergMvTargetState { .. }
         | ScanSource::IcebergMvTargetLocator(_) => None,
     }

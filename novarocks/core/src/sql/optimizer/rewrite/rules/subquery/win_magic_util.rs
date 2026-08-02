@@ -34,9 +34,9 @@ use crate::sql::planner::table::ScanSource;
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) enum TableIdentity {
-    StarRocks {
-        db_id: i64,
-        table_id: i64,
+    Connector {
+        database: String,
+        table: String,
     },
     Iceberg {
         catalog: String,
@@ -50,15 +50,9 @@ impl TableIdentity {
     #[allow(dead_code)]
     pub(super) fn from_scan(scan: &ScanOp) -> Self {
         match &scan.table.source {
-            ScanSource::ConnectorPinned => TableIdentity::Iceberg {
-                catalog: "__connector_pinned__".to_string(),
-                namespace: "__internal__".to_string(),
-                table: "__statistics__".to_string(),
-                table_uuid: None,
-            },
-            ScanSource::StarRocks { db_id, table_id } => TableIdentity::StarRocks {
-                db_id: *db_id,
-                table_id: *table_id,
+            ScanSource::ConnectorPinned => TableIdentity::Connector {
+                database: scan.database.clone(),
+                table: scan.table.name.clone(),
             },
             ScanSource::IcebergDataFiles { table, .. }
             | ScanSource::IcebergMetadataTable { table, .. }
@@ -273,7 +267,7 @@ mod tests {
                     name: format!("t{table_id}"),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks { db_id: 0, table_id },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 columns: cols
@@ -354,20 +348,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // table_identity_from_starrocks_scan
+    // table_identity_from_connector_scan
     // -----------------------------------------------------------------
     #[test]
-    fn table_identity_from_starrocks_scan() {
+    fn table_identity_from_connector_scan() {
         let scan_node = PlanScanNode {
             database: "default".to_string(),
             table: TableDef {
                 name: "t".to_string(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 7,
-                    table_id: 42,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             columns: vec![],
@@ -385,9 +376,9 @@ mod tests {
         let id = TableIdentity::from_scan(scan);
         assert_eq!(
             id,
-            TableIdentity::StarRocks {
-                db_id: 7,
-                table_id: 42
+            TableIdentity::Connector {
+                database: "default".to_string(),
+                table: "t".to_string(),
             }
         );
     }
@@ -411,13 +402,13 @@ mod tests {
         assert_eq!(ids.len(), 2);
         let set: HashSet<_> = ids.iter().collect();
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&TableIdentity::StarRocks {
-            db_id: 0,
-            table_id: 1
+        assert!(set.contains(&TableIdentity::Connector {
+            database: "default".to_string(),
+            table: "t1".to_string(),
         }));
-        assert!(set.contains(&TableIdentity::StarRocks {
-            db_id: 0,
-            table_id: 2
+        assert!(set.contains(&TableIdentity::Connector {
+            database: "default".to_string(),
+            table: "t2".to_string(),
         }));
     }
 
@@ -453,9 +444,9 @@ mod tests {
         let entry = map.get(&cid).expect("ColumnId(3) must be in the map");
         assert_eq!(
             entry.0,
-            TableIdentity::StarRocks {
-                db_id: 0,
-                table_id: 5
+            TableIdentity::Connector {
+                database: "default".to_string(),
+                table: "t5".to_string(),
             }
         );
         assert_eq!(entry.1, "l_partkey");
@@ -472,9 +463,9 @@ mod tests {
         let cid_b = ColumnId(20);
 
         let mut map: HashMap<ColumnId, (TableIdentity, String)> = HashMap::new();
-        let identity = TableIdentity::StarRocks {
-            db_id: 0,
-            table_id: 5,
+        let identity = TableIdentity::Connector {
+            database: "default".to_string(),
+            table: "t5".to_string(),
         };
         map.insert(cid_a, (identity.clone(), "l_partkey".to_string()));
         map.insert(cid_b, (identity.clone(), "l_partkey".to_string()));
@@ -557,9 +548,9 @@ mod tests {
         let cid_b = ColumnId(20);
 
         let mut map: HashMap<ColumnId, (TableIdentity, String)> = HashMap::new();
-        let id1 = TableIdentity::StarRocks {
-            db_id: 0,
-            table_id: 1,
+        let id1 = TableIdentity::Connector {
+            database: "default".to_string(),
+            table: "t1".to_string(),
         };
         map.insert(cid_a, (id1.clone(), "a".to_string()));
         map.insert(cid_b, (id1.clone(), "b".to_string()));

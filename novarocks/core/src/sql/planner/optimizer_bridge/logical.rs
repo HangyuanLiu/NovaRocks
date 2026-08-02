@@ -610,10 +610,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 
@@ -895,10 +892,7 @@ mod tests {
     #[test]
     fn scan_source_identity_survives_logical_optimizer_physical_roundtrip() {
         let mut table = dummy_table_def();
-        table.source = ScanSource::StarRocks {
-            db_id: 17,
-            table_id: 23,
-        };
+        table.source = ScanSource::ConnectorPinned;
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
@@ -935,11 +929,9 @@ mod tests {
         let PhysicalPlanKind::Scan(scan) = materialized.kind else {
             panic!("expected physical scan");
         };
-        let ScanSource::StarRocks { db_id, table_id } = scan.table.source else {
-            panic!("expected StarRocks scan source");
+        let ScanSource::ConnectorPinned = scan.table.source else {
+            panic!("expected ConnectorPinned scan source");
         };
-        assert_eq!(db_id, 17);
-        assert_eq!(table_id, 23);
     }
 
     #[test]

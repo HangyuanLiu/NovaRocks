@@ -127,7 +127,6 @@ pub(crate) fn prepare_fragments(
     let mut expected_range_keys = BTreeSet::new();
     let mut expected_binding_node_ids = BTreeSet::new();
     let mut expected_connector_read_keys = BTreeSet::new();
-    let mut expected_starrocks_node_ids = BTreeSet::new();
     for fragment in plan.fragments() {
         let mut scan_nodes = Vec::new();
         collect_scan_nodes(fragment.fragment_id, &fragment.root, &mut scan_nodes);
@@ -145,15 +144,6 @@ pub(crate) fn prepare_fragments(
             }
             match source {
                 ScanSource::IcebergMetadataTable { .. } => {}
-                ScanSource::StarRocks { .. } => {
-                    expected_starrocks_node_ids.insert(*node_id);
-                    if scan_bindings.starrocks_source(*node_id).is_none() {
-                        return Err(format!(
-                            "prepared fragment missing StarRocks source fragment_id={} node_id={node_id}",
-                            fragment.fragment_id
-                        ));
-                    }
-                }
                 _ => {
                     expected_binding_node_ids.insert(*node_id);
                     if scan_bindings.binding(*node_id).is_none() {
@@ -258,12 +248,6 @@ pub(crate) fn prepare_fragments(
         &expected_connector_read_keys,
         &scan_bindings.connector_read_keys().collect(),
     )?;
-    validate_binding_keys(
-        "StarRocks descriptors",
-        &expected_starrocks_node_ids,
-        &scan_bindings.starrocks_source_node_ids().collect(),
-    )?;
-
     Ok(PreparedFragmentSet::new(
         by_fragment,
         scan_bindings,

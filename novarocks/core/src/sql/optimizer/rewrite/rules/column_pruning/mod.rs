@@ -183,10 +183,7 @@ mod tests {
             name: "t1".to_string(),
             columns: cols.iter().map(|(_, name)| col_def(name)).collect(),
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
+            source: ScanSource::ConnectorPinned,
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {

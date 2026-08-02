@@ -87,7 +87,6 @@ pub enum ScanAssignmentKind {
     File,
     BrokerFile,
     SchemaSelection,
-    StarRocksTablet,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

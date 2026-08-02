@@ -553,10 +553,7 @@ mod tests {
                             logical_type: None,
                         }],
                         iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::planner::table::ScanSource::StarRocks {
-                            db_id: 1,
-                            table_id: 2,
-                        },
+                        source: crate::sql::planner::table::ScanSource::ConnectorPinned,
                     },
                 )
                 .expect("register table");

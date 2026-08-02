@@ -1112,10 +1112,7 @@ mod tests {
     /// never inspects `ScanSource`, so the cheap `StarRocks` variant (two i64s)
     /// is sufficient and avoids building a heavy `IcebergTableInfo`.
     fn test_scan_source() -> ScanSource {
-        ScanSource::StarRocks {
-            db_id: 0,
-            table_id: 0,
-        }
+        ScanSource::ConnectorPinned
     }
 
     fn scan(cols: &[OutputColumn]) -> PlanScanNode {

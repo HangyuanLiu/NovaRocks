@@ -52,20 +52,6 @@ impl ScanRangeParams {
             has_more: Some(false),
         }
     }
-
-    pub fn starrocks_tablet(
-        tablet_id: i64,
-        partition_id: i64,
-        version: i64,
-    ) -> Result<Self, String> {
-        let range = StarRocksTabletScanRange::try_new(tablet_id, partition_id, version)?;
-        Ok(Self {
-            range: ScanRange::StarRocksTablet(range),
-            volume_id: None,
-            empty: Some(false),
-            has_more: Some(false),
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +59,6 @@ pub enum ScanRange {
     File(FileScanRange),
     BrokerFile(BrokerFileScanRange),
     SchemaSelection(SchemaScanSelection),
-    StarRocksTablet(StarRocksTabletScanRange),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,34 +83,6 @@ pub struct BrokerFileScanRange {
     pub format: BrokerFileFormat,
     pub strip_outer_array: bool,
     pub jsonpaths: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StarRocksTabletScanRange {
-    pub tablet_id: i64,
-    pub partition_id: i64,
-    pub version: i64,
-}
-
-impl StarRocksTabletScanRange {
-    pub fn try_new(tablet_id: i64, partition_id: i64, version: i64) -> Result<Self, String> {
-        for (field, value) in [
-            ("tablet_id", tablet_id),
-            ("partition_id", partition_id),
-            ("version", version),
-        ] {
-            if value <= 0 {
-                return Err(format!(
-                    "StarRocks tablet scan range {field} must be positive, got {value}"
-                ));
-            }
-        }
-        Ok(Self {
-            tablet_id,
-            partition_id,
-            version,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,32 +196,4 @@ pub struct FilePruningMinMaxValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn starrocks_tablet_range_requires_positive_identity() {
-        let valid = ScanRangeParams::starrocks_tablet(300, 100, 7)
-            .expect("positive StarRocks tablet range");
-        let ScanRange::StarRocksTablet(range) = valid.range else {
-            panic!("expected StarRocks tablet range");
-        };
-        assert_eq!(range.tablet_id, 300);
-        assert_eq!(range.partition_id, 100);
-        assert_eq!(range.version, 7);
-        assert_eq!(valid.empty, Some(false));
-        assert_eq!(valid.has_more, Some(false));
-
-        for (tablet_id, partition_id, version, field) in [
-            (0, 100, 7, "tablet_id"),
-            (-1, 100, 7, "tablet_id"),
-            (300, 0, 7, "partition_id"),
-            (300, -1, 7, "partition_id"),
-            (300, 100, 0, "version"),
-            (300, 100, -1, "version"),
-        ] {
-            let err = ScanRangeParams::starrocks_tablet(tablet_id, partition_id, version)
-                .expect_err("non-positive StarRocks range identity must fail");
-            assert!(err.contains(field), "{err}");
-            assert!(err.contains("positive"), "{err}");
-        }
-    }
 }

@@ -18,8 +18,6 @@
 mod common;
 mod generic;
 mod iceberg_metadata;
-mod native_starrocks;
-mod starrocks;
 mod variant_path;
 
 use super::context::NativePlanDecodeContext;
@@ -97,13 +95,6 @@ pub(crate) fn lower_scan_node(
                 source_path.field("iceberg_mv_target_locator"),
                 "IcebergMvTargetLocator native scan source is not implemented",
             ))
-        }
-        plan::scan_source::Kind::StarrocksTable(source) => {
-            reject_variant_columns_for_source(scan, "StarRocksTable")
-                .map_err(|error| error.into_native(path.clone()))?;
-            starrocks::validate_starrocks_output_columns(&output_columns, source)?;
-            starrocks::lower_starrocks_scan(node, scan, source, &output_columns, ctx, arena)
-                .map_err(|error| error.into_native(source_path.field("starrocks_table")))
         }
         plan::scan_source::Kind::ConnectorRead(source) => {
             let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
@@ -816,109 +807,6 @@ mod tests {
             empty: None,
             has_more: None,
         }
-    }
-
-    fn starrocks_source() -> plan::scan_source::Kind {
-        plan::scan_source::Kind::StarrocksTable(plan::StarRocksTableSource {
-            catalog_name: "default_catalog".to_string(),
-            db_id: 10,
-            table_id: 20,
-            schema_id: 30,
-            storage_columns: vec![
-                plan::StarRocksColumnStorageMeta {
-                    name: "id".to_string(),
-                    unique_id: 0,
-                    default_value: None,
-                },
-                plan::StarRocksColumnStorageMeta {
-                    name: "flag".to_string(),
-                    unique_id: 12,
-                    default_value: Some("false".to_string()),
-                },
-            ],
-            current_schema: Some(plan::StarRocksTabletSchema {
-                schema_id: 30,
-                keys_type: plan::StarRocksKeysType::StarrocksKeysTypeDuplicate as i32,
-                num_short_key_columns: Some(1),
-                sort_key_idxes: vec![0],
-                sort_key_unique_ids: vec![0],
-                columns: vec![
-                    plan::StarRocksColumnSchema {
-                        unique_id: 0,
-                        name: Some("id".to_string()),
-                        physical_type: "BIGINT".to_string(),
-                        is_key: Some(true),
-                        aggregation: None,
-                        nullable: Some(false),
-                        default_value: None,
-                        precision: None,
-                        scale: None,
-                        visible: Some(true),
-                        children: vec![],
-                    },
-                    plan::StarRocksColumnSchema {
-                        unique_id: 12,
-                        name: Some("flag".to_string()),
-                        physical_type: "BOOLEAN".to_string(),
-                        is_key: Some(false),
-                        aggregation: None,
-                        nullable: Some(false),
-                        default_value: Some("false".to_string()),
-                        precision: None,
-                        scale: None,
-                        visible: Some(true),
-                        children: vec![],
-                    },
-                ],
-            }),
-        })
-    }
-
-    fn starrocks_range(
-        tablet_id: i64,
-        partition_id: i64,
-        version: i64,
-    ) -> native_proto::ScanRangeParams {
-        native_proto::ScanRangeParams {
-            range: Some(native_proto::ScanRange {
-                kind: Some(native_proto::scan_range::Kind::StarrocksTablet(
-                    native_proto::StarRocksTabletScanRange {
-                        tablet_id,
-                        partition_id,
-                        version,
-                    },
-                )),
-            }),
-            volume_id: None,
-            empty: Some(false),
-            has_more: Some(false),
-        }
-    }
-
-    fn starrocks_empty_range(
-        kind: Option<native_proto::scan_range::Kind>,
-    ) -> native_proto::ScanRangeParams {
-        native_proto::ScanRangeParams {
-            range: kind.map(|kind| native_proto::ScanRange { kind: Some(kind) }),
-            volume_id: None,
-            empty: Some(true),
-            has_more: Some(false),
-        }
-    }
-
-    #[test]
-    fn native_starrocks_scan_decode_defers_tablet_resolution_without_registry_mutation() {
-        let tablet_id = 8_700_000_000_000_001;
-        let query_id = novarocks_types::QueryId::new(8_700_000_000_000_002, 8_700_000_000_000_003);
-        let node = scan_node(starrocks_source());
-        let connectors = Arc::new(ConnectorRegistry::new());
-        let ctx = test_decode_context()
-            .with_connector_registry(connectors)
-            .with_query_id(query_id)
-            .with_scan_ranges(10, vec![starrocks_range(tablet_id, 100, 7)]);
-        let mut arena = ExprArena::default();
-        decode_node(&node, &mut arena, &ctx)
-            .expect("valid StarRocks scan decode must defer tablet-path resolution");
     }
 
     fn int_literal(value: i64) -> expr::Expr {

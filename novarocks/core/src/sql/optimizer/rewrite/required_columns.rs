@@ -1109,10 +1109,7 @@ mod tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
+            source: ScanSource::ConnectorPinned,
         };
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "d".to_string(),
@@ -2591,10 +2588,7 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
                 },
                 alias: None,
                 stats_ref: None,

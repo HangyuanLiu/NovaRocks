@@ -1598,7 +1598,7 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
 fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
     match &table.source {
         ScanSource::ConnectorPinned => return false,
-        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
+        ScanSource::IcebergDataFiles { .. } | ScanSource::ConnectorPinned => {}
         ScanSource::IcebergMetadataTable { .. } => return false,
         ScanSource::IcebergDeltaTable { .. }
         | ScanSource::IcebergVersionTable { .. }
@@ -2524,10 +2524,7 @@ mod tests {
                         column_def("v", DataType::Int64, true),
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 1,
-                        table_id: 2,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: Some("t".to_string()),
                 stats_ref: None,
@@ -2555,10 +2552,7 @@ mod tests {
                         column_def("v", DataType::Int64, true),
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 1,
-                        table_id: 2,
-                    },
+                    source: ScanSource::ConnectorPinned,
                 },
                 alias: Some("base".to_string()),
                 stats_ref: None,
@@ -2844,10 +2838,7 @@ mod tests {
                 column_def("v", DataType::Int64, true),
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 1,
-                table_id: 2,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 

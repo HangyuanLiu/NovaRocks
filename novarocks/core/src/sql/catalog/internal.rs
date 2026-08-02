@@ -80,10 +80,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 5,
-                table_id: 6,
-            },
+            source: ScanSource::ConnectorPinned,
         }
     }
 

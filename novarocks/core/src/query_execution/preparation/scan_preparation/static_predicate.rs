@@ -361,10 +361,7 @@ mod tests {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 1,
-                    table_id: 2,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             columns: vec![OutputColumn {

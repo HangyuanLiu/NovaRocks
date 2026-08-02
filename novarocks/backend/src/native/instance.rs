@@ -30,7 +30,7 @@ use novarocks::runtime::query_options::QueryOptions;
 use novarocks::runtime::scan_range::{
     DatacacheOptions, DeletionVectorDescriptor, FileFormat, FilePruningMinMaxValue,
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
-    ScanRange, ScanRangeParams, StarRocksTabletScanRange,
+    ScanRange, ScanRangeParams,
 };
 use novarocks_protocol::{common, novarocks as proto};
 use novarocks_types::QueryId;
@@ -194,19 +194,6 @@ fn decode_scan_range_params_at(
             file,
             path.clone().field("range").field("file"),
         )?),
-        proto::scan_range::Kind::StarrocksTablet(tablet) => ScanRange::StarRocksTablet(
-            StarRocksTabletScanRange::try_new(
-                tablet.tablet_id,
-                tablet.partition_id,
-                tablet.version,
-            )
-            .map_err(|detail| {
-                invalid_value(
-                    path.clone().field("range").field("starrocks_tablet"),
-                    detail,
-                )
-            })?,
-        ),
     };
     Ok(ScanRangeParams {
         range,

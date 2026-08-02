@@ -138,10 +138,7 @@ mod tests {
                 name: table.into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
+                source: ScanSource::ConnectorPinned,
             },
             alias: None,
             stats_ref: Some(stats_ref),

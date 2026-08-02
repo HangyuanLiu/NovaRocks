@@ -440,14 +440,9 @@ message ScanRangeParams {
 message ScanRange {
   oneof kind {
     FileScanRange file = 1;
-    StarRocksTabletScanRange starrocks_tablet = 2;
   }
-}
-
-message StarRocksTabletScanRange {
-  int64 tablet_id = 1;
-  int64 partition_id = 2;
-  int64 version = 3;
+  reserved 2;
+  reserved "starrocks_tablet";
 }
 
 message FileScanRange {

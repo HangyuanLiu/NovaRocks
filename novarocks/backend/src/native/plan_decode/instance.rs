@@ -121,19 +121,6 @@ pub(super) fn decode_scan_range_params_at(
             file,
             path.clone().field("range").field("file"),
         )?),
-        native_proto::scan_range::Kind::StarrocksTablet(tablet) => ScanRange::StarRocksTablet(
-            novarocks::runtime::scan_range::StarRocksTabletScanRange::try_new(
-                tablet.tablet_id,
-                tablet.partition_id,
-                tablet.version,
-            )
-            .map_err(|detail| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("range").field("starrocks_tablet"),
-                    detail,
-                )
-            })?,
-        ),
     };
     Ok(ScanRangeParams {
         range,

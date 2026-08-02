@@ -352,10 +352,7 @@ fn optimizer_rejects_unbound_scan_stats() {
             name: "unbound_table".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks {
-                db_id: 0,
-                table_id: 0,
-            },
+            source: ScanSource::ConnectorPinned,
         },
         alias: None,
         stats_ref: None,
@@ -1488,10 +1485,7 @@ mod is_known_rule_name_tests {
                             logical_type: None,
                         }],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::StarRocks {
-                            db_id: 0,
-                            table_id: 0,
-                        },
+                        source: ScanSource::ConnectorPinned,
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
@@ -1595,10 +1589,7 @@ mod is_known_rule_name_tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::StarRocks {
-                            db_id: 0,
-                            table_id: 0,
-                        },
+                        source: ScanSource::ConnectorPinned,
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
@@ -1737,10 +1728,7 @@ mod is_known_rule_name_tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::StarRocks {
-                            db_id: 0,
-                            table_id: 0,
-                        },
+                        source: ScanSource::ConnectorPinned,
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
