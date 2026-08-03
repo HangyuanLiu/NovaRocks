@@ -104,7 +104,7 @@ impl WriteAdmission for AlwaysAdmit {
 
 /// Drives one Iceberg write transaction through the operation state machine,
 /// persisting facts via the journal and delegating side effects to the executor.
-/// Re-authors core `IcebergWriteTransactionRunner::run`
+/// Owns the frontend durable write lifecycle.
 /// (`novarocks/core/src/engine/write_transaction.rs:256`) with narrow ports.
 pub struct WriteTransactionRunner<'a, E: WriteExecutor> {
     journal: &'a dyn OperationJournal,

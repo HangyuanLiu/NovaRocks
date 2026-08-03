@@ -58,7 +58,6 @@ pub(crate) mod backend_resolver;
 pub mod ctas_engine;
 pub mod delete_engine;
 pub(crate) mod dml_change_stream;
-pub(crate) mod iceberg_change_stream_write;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
