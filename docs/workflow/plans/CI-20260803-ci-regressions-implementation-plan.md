@@ -23,6 +23,7 @@ tags:
 - Spec：[[CI-20260803-distributed-rewrite-correctness]]
 - ADR：`docs/adr/ADR-0029-connector-distributed-rewrite-contract.md`
 - ADR：`docs/adr/ADR-0030-frontend-ctas-staged-publication.md`
+- ADR：`docs/adr/ADR-0035-connector-orphan-cleanup-reconcile-contract.md`
 - 不实现 Hadoop atomic staged publication，不增加 partial rewrite fallback，不猜测 unknown commit，不更新 golden。
 - distributed 1FE+3BE 是生产形态验证基线。
 
@@ -183,6 +184,17 @@ T3 是高风险关键路径；T1、T2、T4、T5 在代码所有权上独立，�
 
 | Task / Wave | Owner | Status | Commit | Evidence |
 |---|---|---|---|---|
-| T1-T5 | main agent | completed | — | core rewrite tests 9/9; runner ALTER test 1/1 |
-| T6 | main agent | completed | — | analytic 1/1 and iceberg 5/5; cross-process 1FE+3BE; `-j 1` |
-| T7 | main agent | completed | — | `logs/ci-full/20260803-210446/summary.md`: PASS, 3694s |
+| T1-T5 | main agent | completed | `e360dffa5` | core rewrite tests 9/9; runner ALTER test 1/1 |
+| T6 | main agent | completed | `e360dffa5` | analytic 1/1 and iceberg 5/5; cross-process 1FE+3BE; `-j 1` |
+| Rebase follow-up | main agent | completed | — | S3/Hadoop table discovery filters non-Iceberg prefixes; lake MV discovery skips unaddressable namespaces and unreadable stale table entries; focused units PASS; `cluster_mvp` FE lifecycle 4/4 PASS |
+| T7 | main agent | completed | — | `logs/ci-full/20260804-005832/summary.md`: PASS, 3925s; Rust stages PASS; SQL 28/28 including analytic 34/34, iceberg 28/28, distributed-resilience 15/15 |
+
+## Rebase 后补充说明
+
+rebase 引入 durable connector orphan cleanup 后，FE restart 开始在启动阶段扫描所有已注册 Iceberg catalog。共享 Hadoop warehouse 的 benchmark 原始数据目录、REST catalog 中不符合 NovaRocks identifier 契约的 namespace，以及元数据对象已缺失的旧 table entry 都不应被当作可重建 MV package，并且不能阻断 FE 启动。因此补充了三层边界：
+
+- S3/Hadoop `list_tables` 只返回实际存在 `metadata/*.metadata.json` 的目录；
+- lake MV rebuild 跳过 NovaRocks SQL 无法寻址的外部 namespace；
+- lake MV discovery 对单表加载失败做逐表隔离并记录 warning，仍继续扫描其他健康表。
+
+这些边界不放宽 descriptor 校验：一旦成功加载的表携带 MV descriptor，package id、schema contract、dependency 与 watermark 的精确验证仍保持 fail-fast。

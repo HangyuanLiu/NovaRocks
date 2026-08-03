@@ -534,6 +534,25 @@ fn s3_table_name_from_list_entry(ns_prefix: &str, entry_name: &str) -> Option<St
     (!table.is_empty() && !table.starts_with('.')).then(|| table.to_string())
 }
 
+async fn s3_table_has_metadata(
+    op: &opendal::Operator,
+    ns_prefix: &str,
+    table_name: &str,
+) -> Result<bool, String> {
+    let metadata_prefix = format!(
+        "{}/{}/metadata/",
+        ns_prefix.trim_end_matches('/'),
+        table_name.trim_matches('/')
+    );
+    let entries = op
+        .list(&metadata_prefix)
+        .await
+        .map_err(|e| format!("list table metadata prefix {metadata_prefix}: {e}"))?;
+    Ok(entries
+        .iter()
+        .any(|entry| entry.name().ends_with(".metadata.json")))
+}
+
 pub(crate) fn list_tables(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
@@ -560,14 +579,21 @@ pub(crate) fn list_tables(
                 .list(&ns_prefix)
                 .await
                 .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
-            let mut tables = Vec::new();
+            let mut candidates = Vec::new();
             for e in entries {
                 if let Some(table_name) = s3_table_name_from_list_entry(&ns_prefix, e.name()) {
+                    candidates.push(table_name);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+
+            let mut tables = Vec::new();
+            for table_name in candidates {
+                if s3_table_has_metadata(&op, &ns_prefix, &table_name).await? {
                     tables.push(table_name);
                 }
             }
-            tables.sort();
-            tables.dedup();
             Ok(tables)
         })
         .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?
@@ -3547,7 +3573,7 @@ mod data_file_with_stats_tests {
 
 #[cfg(test)]
 mod s3_listing_tests {
-    use super::s3_table_name_from_list_entry;
+    use super::{block_on_iceberg, s3_table_has_metadata, s3_table_name_from_list_entry};
 
     #[test]
     fn s3_table_name_from_list_entry_strips_full_namespace_prefix() {
@@ -3578,6 +3604,39 @@ mod s3_listing_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn s3_table_metadata_probe_skips_non_table_prefixes() {
+        let op = opendal::Operator::new(opendal::services::Memory::default())
+            .expect("build memory object store")
+            .finish();
+        block_on_iceberg(async {
+            op.write(
+                "warehouse/root/analytics/orders/metadata/v1.metadata.json",
+                b"{}".to_vec(),
+            )
+            .await
+            .expect("write Iceberg metadata");
+            op.write(
+                "warehouse/root/analytics/raw/orders.tbl",
+                b"1|example|".to_vec(),
+            )
+            .await
+            .expect("write raw benchmark file");
+
+            assert!(
+                s3_table_has_metadata(&op, "warehouse/root/analytics/", "orders")
+                    .await
+                    .expect("probe Iceberg table")
+            );
+            assert!(
+                !s3_table_has_metadata(&op, "warehouse/root/analytics/", "raw")
+                    .await
+                    .expect("probe non-table prefix")
+            );
+        })
+        .expect("run object-store probe");
     }
 }
 

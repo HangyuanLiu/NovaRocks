@@ -30,6 +30,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_catalog::identifier::normalize_identifier;
+
 use crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1;
 use crate::engine::StandaloneState;
 use crate::engine::mv::iceberg_discovery::{DiscoveredIcebergMv, discover_iceberg_mvs_from_entry};
@@ -40,6 +42,10 @@ use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::descriptor::DescriptorDependency;
+
+fn namespace_is_addressable(namespace: &str) -> bool {
+    normalize_identifier(namespace).is_ok()
+}
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the definition-create
 /// request `create_iceberg_mv` would have issued, plus the refresh watermark
@@ -167,6 +173,14 @@ pub(crate) fn rebuild_imv_cache_from_lake(state: &Arc<StandaloneState>) -> Resul
         };
         let namespaces = crate::connector::iceberg::catalog::registry::list_namespaces(&entry)?;
         for namespace in namespaces {
+            if !namespace_is_addressable(&namespace) {
+                tracing::warn!(
+                    catalog = %catalog,
+                    namespace = %namespace,
+                    "skip lake MV discovery for namespace outside the NovaRocks identifier contract"
+                );
+                continue;
+            }
             let discovered = discover_iceberg_mvs_from_entry(&entry, &catalog, &namespace)?;
             for mv in discovered {
                 rebuild_one_discovered_mv_if_missing(state, &entry, &mv)?;
@@ -290,6 +304,7 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 
 #[cfg(test)]
 mod tests {
+    use super::namespace_is_addressable;
     use super::*;
     use crate::connector::iceberg::commit::mv_provenance::{ProvenanceBase, RefreshTechnique};
     use crate::mv::persistence::descriptor::{DescriptorDependency, MvDescriptorV1};
@@ -389,6 +404,12 @@ mod tests {
             table: "mv_orders".to_string(),
             descriptor,
         }
+    }
+
+    #[test]
+    fn lake_rebuild_only_discovers_addressable_namespaces() {
+        assert!(namespace_is_addressable("statistics_sqlt_1"));
+        assert!(!namespace_is_addressable("statistics-sqlt-1"));
     }
 
     fn sample_provenance() -> MvProvenanceV1 {
