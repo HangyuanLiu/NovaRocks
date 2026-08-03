@@ -53,6 +53,7 @@ impl ChangeStreamWriteTransactionExecutor {
     }
 }
 
+#[cfg(test)]
 impl IcebergWriteTransactionExecutor for ChangeStreamWriteTransactionExecutor {
     fn run_coordinated_write(
         &self,

@@ -66,7 +66,7 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
-    IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
+    IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
 };
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -839,7 +839,18 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
-        self.executor.run_coordinated_write(&self.spec)
+        crate::engine::execute_query_as_iceberg_write_with_connector_context(
+            &self.executor.state,
+            Some(&self.executor.target.catalog),
+            &self.executor.target.namespace,
+            &self.executor.query,
+            self.executor.sink_spec.clone(),
+            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
+            self.executor.execution.as_ref(),
+            &self.executor.connector_context,
+            Some(self.executor.connector_write.clone()),
+        )
     }
 
     /// Convert a validated Iceberg write into SQL's inert distributed-write
@@ -880,7 +891,7 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        self.executor.finalize(&self.spec)
+        self.executor.commit_executor.finalize()
     }
 
     /// Convert an inert prepared append into the mutation reverse-port
@@ -999,41 +1010,6 @@ struct PreparedIcebergWriteExecutor {
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-}
-
-impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<QueryExecutionResult, String> {
-        crate::engine::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.query,
-            self.sink_spec.clone(),
-            None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
-            self.execution.as_ref(),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )
-    }
-
-    fn commit_connector_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
-        Some(commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        ))
-    }
-
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
-    }
 }
 
 /// Build the `(query, sink_spec)` pair for an iceberg INSERT/OVERWRITE write

@@ -1493,6 +1493,7 @@ impl MorUpdateChangeStreamExecutor {
     }
 }
 
+#[cfg(test)]
 impl IcebergWriteTransactionExecutor for MorUpdateChangeStreamExecutor {
     fn run_coordinated_write(
         &self,
@@ -1640,6 +1641,7 @@ impl MorMergeChangeStreamExecutor {
     }
 }
 
+#[cfg(test)]
 impl IcebergWriteTransactionExecutor for MorMergeChangeStreamExecutor {
     fn run_coordinated_write(
         &self,
@@ -2494,6 +2496,7 @@ impl DistributedCowUpdateExecutor {
     }
 }
 
+#[cfg(test)]
 impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
     fn run_coordinated_write(
         &self,
@@ -4895,6 +4898,7 @@ impl DistributedMergeExecutor {
     }
 }
 
+#[cfg(test)]
 impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
     fn run_coordinated_write(
         &self,
