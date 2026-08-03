@@ -59,6 +59,29 @@ impl<'a> ExpectedOutputSchemaView<'a> {
     }
 }
 
+/// Decode one typed root-result payload into the opaque dispatcher value.
+///
+/// Native transports live in role crates, while Core retains the execution
+/// batch representation and the canonical wire-to-chunk conversion.  This
+/// keeps that conversion available without exposing `Chunk` construction to a
+/// transport owner.
+pub fn decode_fetched_query_batch(
+    payload: &[u8],
+    expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+) -> Result<FetchedQueryBatch, String> {
+    let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
+        payload,
+        expected_output_schema.map(|view| view.chunk_schema()),
+    )?;
+    if chunks.len() != 1 {
+        return Err(format!(
+            "typed root result decoded {} chunks, expected 1",
+            chunks.len()
+        ));
+    }
+    Ok(FetchedQueryBatch::new(chunks.remove(0)))
+}
+
 /// Outcome of a single `fetch_result` call.
 pub enum FetchOutcome {
     /// A result batch is available.
@@ -98,4 +121,17 @@ pub fn new_grpc_fragment_dispatcher(
     Ok(Arc::new(
         crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(backends)?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_fetched_query_batch;
+
+    #[test]
+    fn opaque_fetch_decode_requires_exactly_one_chunk() {
+        let Err(error) = decode_fetched_query_batch(&[], None) else {
+            panic!("empty payload is not a batch");
+        };
+        assert_eq!(error, "typed root result decoded 0 chunks, expected 1");
+    }
 }

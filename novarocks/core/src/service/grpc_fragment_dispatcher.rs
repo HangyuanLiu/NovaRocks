@@ -320,18 +320,19 @@ impl FragmentDispatcher for RemoteDispatcher {
                         "BE[{backend_idx}] ({addr}): fetch_result READY without result_arrow_ipc"
                     ));
                 }
-                let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
+                match crate::query_execution::fragment_transport::decode_fetched_query_batch(
                     &resp.result_arrow_ipc,
-                    expected_output_schema.map(|view| view.chunk_schema()),
-                )?;
-                if chunks.len() != 1 {
-                    return Err(format!(
-                        "BE[{backend_idx}] ({addr}): typed fetch_result decoded {} chunks, expected 1",
-                        chunks.len()
-                    ));
+                    expected_output_schema,
+                ) {
+                    Ok(batch) => Ok(FetchOutcome::Ready(batch)),
+                    Err(error) if error.starts_with("typed root result decoded ") => {
+                        Err(format!(
+                            "BE[{backend_idx}] ({addr}): {}",
+                            error.replacen("typed root result", "typed fetch_result", 1)
+                        ))
+                    }
+                    Err(error) => Err(error),
                 }
-                let chunk = chunks.remove(0);
-                Ok(FetchOutcome::Ready(FetchedQueryBatch::new(chunk)))
             }
             FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
             FetchStatus::Eof => Ok(FetchOutcome::Eof),

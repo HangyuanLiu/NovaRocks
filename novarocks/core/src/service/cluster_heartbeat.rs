@@ -39,7 +39,7 @@ pub fn grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
         }
         Err(err) => HeartbeatOutcome::Failed { err },
     };
-    crate::service::metrics_http::observe_heartbeat_rtt(start.elapsed());
+    crate::service::metrics_http::observe_backend_heartbeat_rtt(start.elapsed());
     outcome
 }
 

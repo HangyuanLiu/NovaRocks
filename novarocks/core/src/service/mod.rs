@@ -28,7 +28,7 @@ pub mod internal_rpc;
 pub(crate) mod metrics_http;
 pub mod native_data_plane;
 pub use metrics_http::{
-    MetricsHttpServer, publish_backend_query_execution_resource,
+    MetricsHttpServer, observe_backend_heartbeat_rtt, publish_backend_query_execution_resource,
     publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,
     publish_frontend_query_lifecycle_metrics, render_metrics, render_metrics_json,
 };
