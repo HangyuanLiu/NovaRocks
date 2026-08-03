@@ -348,6 +348,15 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.query_control_fragment_backend_limit = Some(value);
             }
+            "iceberg_orphan_fixture" => {
+                if raw_value.is_empty() {
+                    bail!("@iceberg_orphan_fixture requires <namespace>.<table>");
+                }
+                meta.iceberg_orphan_fixture = Some(raw_value);
+            }
+            "iceberg_orphan_fixture_absent" => {
+                meta.iceberg_orphan_fixture_absent = parse_bool(&raw_value)?;
+            }
             "wait_alter_column" => {
                 meta.wait_alter_column = Some(raw_value);
             }
@@ -539,6 +548,12 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         query_control_fragment_backend_limit: override_meta
             .query_control_fragment_backend_limit
             .or(base.query_control_fragment_backend_limit),
+        iceberg_orphan_fixture: override_meta
+            .iceberg_orphan_fixture
+            .clone()
+            .or_else(|| base.iceberg_orphan_fixture.clone()),
+        iceberg_orphan_fixture_absent: override_meta.iceberg_orphan_fixture_absent
+            || base.iceberg_orphan_fixture_absent,
         wait_alter_column: override_meta
             .wait_alter_column
             .clone()

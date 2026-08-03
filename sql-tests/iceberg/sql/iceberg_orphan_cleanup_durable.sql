@@ -25,8 +25,9 @@
 CREATE EXTERNAL CATALOG cleanup_ice_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_test_warehouse}/cleanup_ice_${uuid0}",
+  "iceberg.catalog.type" = "rest",
+  "iceberg.catalog.uri" = "${iceberg_rest_uri}",
+  "iceberg.catalog.warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "aws.s3.access_key" = "${oss_ak}",
   "aws.s3.secret_key" = "${oss_sk}",
@@ -39,6 +40,9 @@ INSERT INTO cleanup_ice_${uuid0}.ns_${uuid0}.orders VALUES (1), (2);
 
 -- query 2
 -- @db=cleanup_ice_${uuid0}.ns_${uuid0}
+-- @iceberg_orphan_fixture=ns_${uuid0}.orders
+-- @iceberg_orphan_fixture_absent=true
+-- @result_contains=novarocks-orphan-fixture
 -- @skip_result_check=true
 -- @restart_fe_after_step=true
 -- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED

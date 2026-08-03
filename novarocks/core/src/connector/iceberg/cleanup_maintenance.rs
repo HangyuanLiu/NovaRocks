@@ -32,7 +32,9 @@ use novarocks_spi::connector::{
 use super::catalog::registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg, load_table,
 };
-use super::commit::remove_orphan_files::{ScannedFile, collect_orphan_candidates};
+use super::commit::remove_orphan_files::{
+    ScannedFile, canonical_object_mtime_ms, collect_orphan_candidates,
+};
 use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
 
@@ -756,7 +758,7 @@ async fn stat_matches(
     let size = metadata.content_length();
     let mtime = metadata
         .last_modified()
-        .map(|time| time.into_inner().as_millisecond());
+        .map(|time| canonical_object_mtime_ms(time.into_inner().as_millisecond()));
     Ok(match identity {
         ObjectIdentityV1::Version {
             version,

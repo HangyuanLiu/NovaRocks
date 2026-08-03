@@ -20,6 +20,7 @@ mod cluster;
 mod be_log_directive;
 mod config;
 mod fault_injection;
+mod iceberg_orphan_fixture;
 mod imv_stateless;
 mod managed_process;
 mod parser;
@@ -1538,6 +1539,25 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             &step.meta,
             Arc::clone(&ctx.server_handle),
         );
+        let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
+            Some(table) => match iceberg_orphan_fixture::install(table) {
+                Ok(fixture) => {
+                    let _ = writeln!(log, "    @iceberg_orphan_fixture installed {}", fixture.location());
+                    Some(fixture)
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ install orphan fixture: {error:#}");
+                    break;
+                }
+            },
+            None if step.meta.iceberg_orphan_fixture_absent => {
+                case_failed = true;
+                let _ = writeln!(log, "    ❌ @iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture");
+                break;
+            }
+            None => None,
+        };
 
         let be_log_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => be_log_directive::snapshot_with_deadline(
@@ -1706,6 +1726,19 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         case_failed = true;
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
+                    }
+                    if step.meta.iceberg_orphan_fixture_absent {
+                        let Some(fixture) = orphan_fixture.as_ref() else {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            continue;
+                        };
+                        if let Err(error) = fixture.assert_absent() {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                        let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(
@@ -2006,6 +2039,19 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
                         }
+                    }
+                    if step.meta.iceberg_orphan_fixture_absent {
+                        let Some(fixture) = orphan_fixture.as_ref() else {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            continue;
+                        };
+                        if let Err(error) = fixture.assert_absent() {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                        let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(

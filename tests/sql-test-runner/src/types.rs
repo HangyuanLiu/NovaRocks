@@ -120,6 +120,12 @@ pub struct QueryMeta {
     pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
     pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,
+    /// Before this step, resolve a REST-catalog table and write one real,
+    /// deliberately unreferenced MinIO object below its data directory.
+    pub iceberg_orphan_fixture: Option<String>,
+    /// After this step, assert that the fixture object for `iceberg_orphan_fixture`
+    /// is absent. This keeps the object-store assertion outside SQL result text.
+    pub iceberg_orphan_fixture_absent: bool,
     /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
     /// Value is the table name.
     pub wait_alter_column: Option<String>,

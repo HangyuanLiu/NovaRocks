@@ -359,7 +359,7 @@ async fn list_files_opendal(
             let last_modified_ms = entry
                 .metadata()
                 .last_modified()
-                .map(|dt| dt.into_inner().as_millisecond())
+                .map(|dt| canonical_object_mtime_ms(dt.into_inner().as_millisecond()))
                 .unwrap_or(i64::MAX); // i64::MAX → never older-than threshold
 
             result.push(ScannedFile {
@@ -378,6 +378,15 @@ async fn list_files_opendal(
         "remove_orphan_files: adapter opendal scan complete"
     );
     Ok(result)
+}
+
+/// S3-compatible list and stat APIs may expose the same Last-Modified value
+/// at different sub-second precision.  Persist the strongest precision which
+/// is reliably re-readable across both calls.  ETag/version and byte size
+/// remain exact, while this keeps a frozen identity from spuriously changing
+/// merely because MinIO lists milliseconds but stats seconds.
+pub(crate) fn canonical_object_mtime_ms(value: i64) -> i64 {
+    value.div_euclid(1_000) * 1_000
 }
 
 /// Recursively walk a directory, appending `ScannedFile` entries to `out`.
