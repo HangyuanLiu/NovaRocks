@@ -224,7 +224,7 @@ fn real_execution_artifacts() -> (
         &crate::connector::test_request_context(),
         None,
         None,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare production execution artifact");
     let native_bundle =

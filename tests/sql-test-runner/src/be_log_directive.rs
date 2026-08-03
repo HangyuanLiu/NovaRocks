@@ -851,6 +851,7 @@ fn evaluate_log_evidence(
         }
     }
 
+
     for pattern in &step.meta.be_log_not_contains {
         let mut total = 0usize;
         for index in 0..endpoint_count {

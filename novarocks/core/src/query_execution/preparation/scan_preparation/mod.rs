@@ -42,13 +42,35 @@ use static_predicate::lower_static_connector_predicates;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanPreparationOptions {
     pub(crate) enable_connector_static_predicate_pushdown: bool,
+    /// Parallelism is frozen at statement admission from the live backend
+    /// topology. Providers use it only while producing opaque splits; it is
+    /// never rediscovered from mutable membership later in the request.
+    pub(crate) connector_target_parallelism: std::num::NonZeroUsize,
+    /// An internal/test-only hard cap. Production admission deliberately does
+    /// not expose this as a user setting.
+    pub(crate) connector_max_split_bytes: Option<std::num::NonZeroU64>,
 }
 
-impl Default for ScanPreparationOptions {
-    fn default() -> Self {
+impl ScanPreparationOptions {
+    pub(crate) fn new(
+        enable_connector_static_predicate_pushdown: bool,
+        connector_target_parallelism: std::num::NonZeroUsize,
+        connector_max_split_bytes: Option<std::num::NonZeroU64>,
+    ) -> Self {
         Self {
-            enable_connector_static_predicate_pushdown: true,
+            enable_connector_static_predicate_pushdown,
+            connector_target_parallelism,
+            connector_max_split_bytes,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single_backend_fixture() -> Self {
+        Self::new(
+            true,
+            std::num::NonZeroUsize::new(1).expect("one is non-zero"),
+            None,
+        )
     }
 }
 
@@ -225,6 +247,8 @@ fn prepare_scan_node(
                 scan,
                 &execution,
                 static_predicates,
+                options.connector_target_parallelism,
+                options.connector_max_split_bytes,
             )
             .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             // The provider reader projects physical equality keys internally
@@ -253,6 +277,8 @@ fn prepare_scan_node(
                 context.clone(),
                 scan,
                 &execution,
+                options.connector_target_parallelism,
+                options.connector_max_split_bytes,
             )
             .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
             (Vec::new(), Vec::new(), Some(planned))

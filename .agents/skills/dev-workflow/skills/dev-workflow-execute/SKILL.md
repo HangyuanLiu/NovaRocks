@@ -51,13 +51,17 @@ description: "Execute an approved implementation plan continuously under a persi
 
 按 approved plan 的 DAG 调度 sub-agent：
 
-1. 每一 wave 只启动依赖已满足、标为 `sub-agent-safe` 且文件范围不冲突的 task。
-2. 给每个 sub-agent 传递 spec、单个 plan task、精确写入范围、禁止项和验证命令。
-3. 主 agent 保留 goal、共享文件、集成、冲突解决和最终验证所有权。
-4. 共享工作树中的 sub-agent 无论串行或并行都不得 commit；主 agent 在 wave 集成验证后创建检查点 commit。
-5. 只有使用独立 worktree 或独立 clone、并配有任务专用 branch 的 sub-agent 才可以本地 commit；仍禁止 push 和
+1. 默认优先调度：只要存在两个或以上依赖已满足、标为 `sub-agent-safe`、文件范围不冲突且能产生独立证据的 task，就使用可用
+   sub-agent 并行处理；不得仅因协调成本而把它们全部留给主 agent。
+2. 仅当串行明显更有优势时才不调度 sub-agent：改动极小且派发成本高于实现成本、任务共享高风险语义或同一文件、需要连续交互式
+   调试、可用并发槽会使关键构建/测试明显变慢，或主 agent 已在该精确文件范围内进行不可安全切分的整合。作出例外时，在计划或
+   commentary 中简短记录原因。
+3. 给每个 sub-agent 传递 spec、单个 plan task、精确写入范围、禁止项和验证命令。
+4. 主 agent 保留 goal、共享文件、集成、冲突解决和最终验证所有权。
+5. 共享工作树中的 sub-agent 无论串行或并行都不得 commit；主 agent 在 wave 集成验证后创建检查点 commit。
+6. 只有使用独立 worktree 或独立 clone、并配有任务专用 branch 的 sub-agent 才可以本地 commit；仍禁止 push 和
    PR。
-6. `main-agent`、`serial`、共享文件和最终收敛任务由主 agent 按依赖顺序执行。
+7. `main-agent`、`serial`、共享文件和最终收敛任务由主 agent 按依赖顺序执行。
 
 ## 本地检查点 Commit
 

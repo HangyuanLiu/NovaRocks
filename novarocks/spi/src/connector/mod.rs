@@ -74,7 +74,9 @@ pub use distribution::{
 pub use error::{ConnectorError, ConnectorErrorKind};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionInstaller,
-    ConnectorExecutionResolver, ConnectorReadExecution,
+    ConnectorExecutionResolver, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorReadExecution,
+    MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
 };
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,

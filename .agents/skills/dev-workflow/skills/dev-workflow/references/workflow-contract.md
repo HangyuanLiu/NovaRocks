@@ -275,14 +275,17 @@ Execute 开始时必须创建或继续当前 goal。Goal 明确绑定 spec、app
 
 Sub-agent 调度：
 
-1. 每一 wave 只调度依赖已满足、标记 `sub-agent-safe` 且文件范围不冲突的 task。
-2. 给每个 sub-agent 传递 accepted spec、对应 plan task、精确写入范围、禁止项和验证命令。
-3. 主 agent 保留 goal、任务图、共享文件、集成和最终验证所有权。
-4. 主 agent 对照代码复核 sub-agent 结论，不直接信任摘要。
-5. 共享工作树中的 sub-agent 无论串行或并行都不得 commit；由主 agent 在 wave 集成和验证后创建检查点 commit。
-6. 只有显式使用独立 worktree 或独立 clone、并配有任务专用 branch 时，sub-agent 才可各自本地 commit；仍禁止
+1. 默认优先调度：存在两个或以上依赖已满足、标记 `sub-agent-safe`、文件范围不冲突且能产生独立证据的 task 时，使用可用
+   sub-agent 并行处理；不得仅因协调成本而全部串行化。
+2. 仅当串行明显更有优势时才不调度：改动极小、共享高风险语义或同一文件、需要连续交互式调试、并发会拖慢关键构建/测试，或
+   主 agent 已在不可安全切分的同一整合范围中工作。例外必须在 plan 或 commentary 中简短说明。
+3. 给每个 sub-agent 传递 accepted spec、对应 plan task、精确写入范围、禁止项和验证命令。
+4. 主 agent 保留 goal、任务图、共享文件、集成和最终验证所有权。
+5. 主 agent 对照代码复核 sub-agent 结论，不直接信任摘要。
+6. 共享工作树中的 sub-agent 无论串行或并行都不得 commit；由主 agent 在 wave 集成和验证后创建检查点 commit。
+7. 只有显式使用独立 worktree 或独立 clone、并配有任务专用 branch 时，sub-agent 才可各自本地 commit；仍禁止
    push 和 PR，由主 agent 集成。
-7. 高风险共享语义、最终收敛和跨 task 冲突由主 agent 串行处理。
+8. 高风险共享语义、最终收敛和跨 task 冲突由主 agent 串行处理。
 
 本地 commit：
 

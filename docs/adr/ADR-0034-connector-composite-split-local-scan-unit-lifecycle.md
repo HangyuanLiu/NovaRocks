@@ -31,11 +31,13 @@ Connector 的 cluster scheduling work 与 Backend 本地 reader work 是否应�
 
 采用选项3。`ConnectorSplit`是 FE 冻结的 cluster work package，包含 stable membership、aggregate cost和bounded provider-private payload；它不是 reader handle。BE `ConnectorReadExecution`必须先 `prepare_split`，验证 exact binding/incarnation、schema/generation、payload和membership，再原子返回非空、bounded、stable-ordinal prepared unit set。Core为每个prepared unit建立本地morsel，reader只接受prepared unit。
 
-native wire继续只携带 split ID、opaque payload与aggregate cost。Provider可以在opaque codec中携带自己的file、row-group、segment和remote token facts；BE不得依赖latest metadata新增、删除、合并、拆分或重排unit。prepare失败不发布unit；terminal cancellation阻止新的prepare和reader open并关闭已注册reader。
+native wire继续只携带 split ID、opaque payload与aggregate cost。Provider可以在opaque codec中携带自己的file、row-group、tablet-merge和remote token facts；BE不得依赖latest metadata新增、删除、合并、拆分或重排unit。prepare失败不发布unit；terminal cancellation阻止新的prepare和reader open并关闭已注册reader。
 
 ## 接受的妥协（诚实记录）
 
 该边界会让Iceberg在FE多做footer metadata I/O，也会让StarRocks direct在BE认证frozen storage metadata；选择它是为了消除split同时承担三个生命周期的长期歧义，而不是因为增加阶段本身更简单。P0不引入unit级distributed retry、page-level unit或Runtime Filter facts；大于显式split hard limit的不可再分leaf必须失败，而不是偷偷降级到whole-file reader。
+
+StarRocks connector尚未拥有可由FE冻结的versioned rowset/segment/delete-vector membership API。因此P0明确将其RPC和shared-data direct都建模为provider-private explicit single unit（direct为tablet merge），并要求它们完整走prepare/open-unit path；不得为了追求segment并行而让BE查询latest metadata或伪造membership。StarRocks的细粒度direct units待上游pinned metadata contract具备后另行决策，不能阻塞Iceberg的composite/row-group production contract。
 
 prepared set允许携带provider-private共享与unit payload，并要求严格资源上限。这会复制少量codec数据，但避免在Core建立provider-global mutable membership registry或跨进程runtime object。
 

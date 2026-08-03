@@ -25,15 +25,15 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationRequest, ConnectorColumnDefinition,
     ConnectorDataType, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorExecutionInstaller, ConnectorInstanceId, ConnectorListTablesRequest,
-    ConnectorNamespaceIdentity, ConnectorOpenReaderRequest, ConnectorReadSelector,
-    ConnectorRequestContext, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
-    StatisticsCollectionRequest, StatisticsCollectionResult, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsProvenance,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader,
+    ConnectorNamespaceIdentity, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplit, ConnectorSplitPlanningRequest,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution, CreatePolicy,
+    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
+    StatisticsAccuracy, StatisticsCollectionRequest, StatisticsCollectionResult,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue,
+    StatisticsProvenance, StatisticsPublishPreparationRequest, StatisticsPublishRequest,
+    StatisticsReadRequest, StatisticsReader,
 };
 
 use super::iceberg::catalog::registry::{create_table, drop_table, insert_rows, load_table};
@@ -61,6 +61,35 @@ fn context() -> ConnectorRequestContext {
         4 * 1024 * 1024,
     )
     .expect("request context")
+}
+
+fn open_prepared_unit(
+    execution: &ConnectorExecutionBinding,
+    split: &ConnectorSplit,
+    request: ConnectorOpenReaderRequest,
+) -> Result<
+    Box<dyn novarocks_spi::connector::ConnectorBatchReader>,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let read = execution.read().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test execution has no read capability",
+        )
+    })?;
+    let prepared = read.prepare_split(
+        split,
+        ConnectorPrepareSplitRequest {
+            context: request.context.clone(),
+        },
+    )?;
+    let unit = prepared.units().next().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+            "test split prepared no units",
+        )
+    })?;
+    read.open_unit_reader(&unit, request)
 }
 
 fn registry_with_table() -> (Arc<RwLock<IcebergCatalogRegistry>>, tempfile::TempDir) {
@@ -559,21 +588,19 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
         .remove(0);
     let installed = install_execution(&planning);
 
-    let mut reader = installed
-        .read()
-        .expect("read capability")
-        .open_reader(
-            &split,
-            ConnectorOpenReaderRequest {
-                expected_schema: resolved.schema,
-                batch: ConnectorBatchBudget {
-                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
-                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
-                },
-                context: context(),
+    let mut reader = open_prepared_unit(
+        &installed,
+        &split,
+        ConnectorOpenReaderRequest {
+            expected_schema: resolved.schema,
+            batch: ConnectorBatchBudget {
+                max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
             },
-        )
-        .expect("read-only instance opens planned split");
+            context: context(),
+        },
+    )
+    .expect("read-only instance opens planned split");
     assert_eq!(
         reader
             .next_batch()
@@ -735,21 +762,19 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
     );
     let execution = install_execution(&instance);
     for _ in 0..2 {
-        let mut reader = execution
-            .read()
-            .expect("read capability")
-            .open_reader(
-                &splits[0],
-                ConnectorOpenReaderRequest {
-                    expected_schema: Arc::clone(&resolved.schema),
-                    batch: ConnectorBatchBudget {
-                        max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
-                        max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
-                    },
-                    context: context(),
+        let mut reader = open_prepared_unit(
+            &execution,
+            &splits[0],
+            ConnectorOpenReaderRequest {
+                expected_schema: Arc::clone(&resolved.schema),
+                batch: ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
                 },
-            )
-            .expect("open reader without re-reading snapshot manifests");
+                context: context(),
+            },
+        )
+        .expect("open reader without re-reading snapshot manifests");
         let batch = reader
             .next_batch()
             .expect("read batch")
@@ -869,7 +894,8 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
     );
 
     let execution = install_execution(&instance);
-    let error = match execution.read().expect("read capability").open_reader(
+    let error = match open_prepared_unit(
+        &execution,
         &stale_split,
         ConnectorOpenReaderRequest {
             expected_schema: Arc::clone(&resolved.schema),
@@ -926,21 +952,19 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
         .expect("plan current splits")
         .splits
         .remove(0);
-    let mut reader = execution
-        .read()
-        .expect("read capability")
-        .open_reader(
-            &current_split,
-            ConnectorOpenReaderRequest {
-                expected_schema: Arc::clone(&current.schema),
-                batch: ConnectorBatchBudget {
-                    max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
-                    max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
-                },
-                context: context(),
+    let mut reader = open_prepared_unit(
+        &execution,
+        &current_split,
+        ConnectorOpenReaderRequest {
+            expected_schema: Arc::clone(&current.schema),
+            batch: ConnectorBatchBudget {
+                max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+                max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero bytes"),
             },
-        )
-        .expect("open current split");
+            context: context(),
+        },
+    )
+    .expect("open current split");
     assert_eq!(
         reader
             .next_batch()

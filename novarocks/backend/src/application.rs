@@ -629,10 +629,10 @@ mod tests {
         ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
         ConnectorExecutionDistribution, ConnectorExecutionResolver, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-        ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorReadExecution,
-        ConnectorReadSelector, ConnectorRequestContext, ConnectorScanPlanning,
-        ConnectorSplitPlanningRequest, ConnectorTableIdentity, ConnectorTableRequest,
-        ConnectorTableResolution,
+        ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorProviderId,
+        ConnectorReadExecution, ConnectorReadSelector, ConnectorRequestContext,
+        ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution,
     };
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1069,18 +1069,28 @@ mod tests {
             .resolver_for(query)
             .resolve(&declaration.binding_key())
             .expect("resolve leased direct binding");
-        let mut reader = binding
-            .read()
-            .expect("read capability")
-            .open_reader(
+        let read = binding.read().expect("read capability");
+        let request = ConnectorOpenReaderRequest {
+            expected_schema: table.schema.clone(),
+            batch,
+            context: context.clone(),
+        };
+        let prepared = read
+            .prepare_split(
                 &splits.splits[0],
-                ConnectorOpenReaderRequest {
-                    expected_schema: table.schema.clone(),
-                    batch,
+                ConnectorPrepareSplitRequest {
                     context: context.clone(),
                 },
             )
-            .expect("open frozen direct split");
+            .expect("prepare frozen direct split");
+        let unit = prepared
+            .units()
+            .next()
+            .expect("prepared direct split has one unit");
+        assert_eq!(prepared.len(), 1, "fixture split has one local unit");
+        let mut reader = read
+            .open_unit_reader(&unit, request)
+            .expect("open frozen direct unit");
         let output = reader
             .next_batch()
             .expect("read fixture batch")

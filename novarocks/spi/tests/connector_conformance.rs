@@ -18,6 +18,7 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -32,14 +33,15 @@ use novarocks_spi::connector::{
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplit, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
-    ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType, ConnectorStaticPredicateId,
-    ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral, ConnectorStatistics,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
-    ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
+    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateDataType,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStaticPredicateLiteral,
+    ConnectorStatistics, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableRequest, ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
 
@@ -63,13 +65,380 @@ impl ConnectorReadExecution for OwnerExecution {
         &self.key
     }
 
-    fn open_reader(
+    fn prepare_split(
         &self,
-        _split: &ConnectorSplit,
+        split: &ConnectorSplit,
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        ConnectorPreparedScanUnitSet::try_new(
+            self.key.clone(),
+            split,
+            bytes::Bytes::new(),
+            vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"owner-test-unit"),
+                split.estimated_bytes(),
+            )?],
+            &request,
+        )
+    }
+
+    fn open_unit_reader(
+        &self,
+        _unit: &ConnectorPreparedScanUnit,
         _request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
         unreachable!("instance construction must not open a reader")
     }
+}
+
+struct NeverCancelled;
+
+impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+struct AlwaysCancelled;
+
+impl novarocks_spi::connector::ConnectorCancellation for AlwaysCancelled {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+}
+
+fn preparation_request() -> ConnectorPrepareSplitRequest {
+    preparation_request_with(
+        Instant::now() + Duration::from_secs(30),
+        Arc::new(NeverCancelled),
+        1024,
+        4096,
+    )
+}
+
+fn preparation_request_with(
+    deadline: Instant,
+    cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+    max_handle_payload_bytes: usize,
+    max_total_payload_bytes: usize,
+) -> ConnectorPrepareSplitRequest {
+    ConnectorPrepareSplitRequest {
+        context: novarocks_spi::connector::ConnectorRequestContext::try_new(
+            deadline,
+            cancellation,
+            max_handle_payload_bytes,
+            max_total_payload_bytes,
+        )
+        .expect("preparation context"),
+    }
+}
+
+fn prepared_unit(
+    payload: &'static [u8],
+    estimated_bytes: Option<u64>,
+) -> ConnectorPreparedScanUnitDescriptor {
+    ConnectorPreparedScanUnitDescriptor::try_new(
+        bytes::Bytes::from_static(payload),
+        estimated_bytes,
+    )
+    .expect("non-empty prepared unit")
+}
+
+fn prepared_split(
+    execution: &OwnerExecution,
+    split_id: &str,
+    estimated_bytes: Option<u64>,
+) -> ConnectorSplit {
+    ConnectorSplit::try_new(
+        execution.key.instance_id.clone(),
+        split_id,
+        bytes::Bytes::from_static(b"opaque-split"),
+        estimated_bytes,
+    )
+    .expect("split")
+}
+
+#[test]
+fn prepared_unit_set_is_sealed_bounded_and_cost_exact() {
+    let execution = OwnerExecution::new("file");
+    let split = ConnectorSplit::try_new(
+        execution.key.instance_id.clone(),
+        "split-a",
+        bytes::Bytes::from_static(b"opaque-split"),
+        Some(11),
+    )
+    .expect("split");
+    let set = ConnectorPreparedScanUnitSet::try_new(
+        execution.key.clone(),
+        &split,
+        bytes::Bytes::from_static(b"shared"),
+        vec![
+            ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"first"),
+                Some(4),
+            )
+            .expect("first unit"),
+            ConnectorPreparedScanUnitDescriptor::try_new(
+                bytes::Bytes::from_static(b"second"),
+                Some(7),
+            )
+            .expect("second unit"),
+        ],
+        &preparation_request(),
+    )
+    .expect("sealed unit set");
+
+    assert_eq!(set.len(), 2);
+    assert!(!set.is_empty());
+    assert_eq!(
+        set.units().map(|unit| unit.ordinal()).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(
+        set.units()
+            .map(|unit| unit.estimated_bytes())
+            .collect::<Vec<_>>(),
+        [Some(4), Some(7)]
+    );
+    assert_eq!(set.membership_digest().len(), 32);
+}
+
+#[test]
+fn prepared_unit_set_rejects_unknown_unit_cost_for_known_split_cost() {
+    let execution = OwnerExecution::new("file");
+    let split = ConnectorSplit::try_new(
+        execution.key.instance_id.clone(),
+        "split-a",
+        bytes::Bytes::from_static(b"opaque-split"),
+        Some(1),
+    )
+    .expect("split");
+    let error = ConnectorPreparedScanUnitSet::try_new(
+        execution.key,
+        &split,
+        bytes::Bytes::new(),
+        vec![
+            ConnectorPreparedScanUnitDescriptor::try_new(bytes::Bytes::from_static(b"unit"), None)
+                .expect("unit"),
+        ],
+        &preparation_request(),
+    )
+    .expect_err("known split cost cannot contain an unknown unit cost");
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+}
+
+#[test]
+fn prepared_unit_set_rejects_empty_and_over_limit_membership() {
+    let execution = OwnerExecution::new("file");
+    let split = prepared_split(&execution, "split-a", None);
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::new(),
+            Vec::new(),
+            &preparation_request(),
+        )
+        .expect_err("a sealed set cannot be empty")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+
+    let descriptors = vec![prepared_unit(b"unit", None); 4097];
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::new(),
+            descriptors,
+            &preparation_request(),
+        )
+        .expect_err("a split cannot contain more than 4096 prepared units")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+}
+
+#[test]
+fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
+    let execution = OwnerExecution::new("file");
+    let split = prepared_split(&execution, "split-a", None);
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::from_static(b"shared"),
+            vec![prepared_unit(b"unit", None)],
+            &preparation_request_with(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(NeverCancelled),
+                4,
+                16,
+            ),
+        )
+        .expect_err("the shared payload must honor the handle budget")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::from_static(b"unit"),
+            vec![prepared_unit(b"large", None)],
+            &preparation_request_with(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(NeverCancelled),
+                4,
+                16,
+            ),
+        )
+        .expect_err("each unit payload must honor the handle budget")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::from_static(b"four"),
+            vec![prepared_unit(b"four", None), prepared_unit(b"four", None)],
+            &preparation_request_with(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(NeverCancelled),
+                4,
+                10,
+            ),
+        )
+        .expect_err("shared and unit payloads must honor the aggregate budget")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+}
+
+#[test]
+fn prepared_unit_set_rejects_known_cost_mismatch_and_overflow() {
+    let execution = OwnerExecution::new("file");
+    let mismatch = prepared_split(&execution, "split-mismatch", Some(10));
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &mismatch,
+            bytes::Bytes::new(),
+            vec![prepared_unit(b"unit", Some(9))],
+            &preparation_request(),
+        )
+        .expect_err("known unit costs must equal the known split cost")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+
+    let overflow = prepared_split(&execution, "split-overflow", None);
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &overflow,
+            bytes::Bytes::new(),
+            vec![
+                prepared_unit(b"first", Some(u64::MAX)),
+                prepared_unit(b"second", Some(1))
+            ],
+            &preparation_request(),
+        )
+        .expect_err("unit cost summation must be checked")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+}
+
+#[test]
+fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
+    let execution = OwnerExecution::new("file");
+    let split = prepared_split(&execution, "split-a", None);
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::new(),
+            vec![prepared_unit(b"unit", None)],
+            &preparation_request_with(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(AlwaysCancelled),
+                1024,
+                4096,
+            ),
+        )
+        .expect_err("preparation must observe cancellation before publication")
+        .kind(),
+        ConnectorErrorKind::Cancelled
+    );
+
+    assert_eq!(
+        ConnectorPreparedScanUnitSet::try_new(
+            execution.key.clone(),
+            &split,
+            bytes::Bytes::new(),
+            vec![prepared_unit(b"unit", None)],
+            &preparation_request_with(
+                Instant::now() - Duration::from_secs(1),
+                Arc::new(NeverCancelled),
+                1024,
+                4096,
+            ),
+        )
+        .expect_err("preparation must observe an elapsed deadline before publication")
+        .kind(),
+        ConnectorErrorKind::DeadlineExceeded
+    );
+}
+
+#[test]
+fn prepared_unit_set_digest_is_deterministic_and_binding_sensitive() {
+    let execution = OwnerExecution::new("file");
+    let split = prepared_split(&execution, "split-a", Some(7));
+    let descriptors = vec![
+        prepared_unit(b"first", Some(3)),
+        prepared_unit(b"second", Some(4)),
+    ];
+    let first = ConnectorPreparedScanUnitSet::try_new(
+        execution.key.clone(),
+        &split,
+        bytes::Bytes::from_static(b"shared"),
+        descriptors.clone(),
+        &preparation_request(),
+    )
+    .expect("first sealed set");
+    let second = ConnectorPreparedScanUnitSet::try_new(
+        execution.key.clone(),
+        &split,
+        bytes::Bytes::from_static(b"shared"),
+        descriptors,
+        &preparation_request(),
+    )
+    .expect("identical sealed set");
+    assert_eq!(first.membership_digest(), second.membership_digest());
+
+    let foreign_binding = ConnectorExecutionBindingKey {
+        instance_id: execution.key.instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+    };
+    let foreign = ConnectorPreparedScanUnitSet::try_new(
+        foreign_binding,
+        &split,
+        bytes::Bytes::from_static(b"shared"),
+        vec![
+            prepared_unit(b"first", Some(3)),
+            prepared_unit(b"second", Some(4)),
+        ],
+        &preparation_request(),
+    )
+    .expect("same split under another incarnation is separately sealed");
+    assert_ne!(first.membership_digest(), foreign.membership_digest());
 }
 
 struct OwnerPlanning {
@@ -585,6 +954,7 @@ fn static_predicate_conformance_rejects_type_mismatch_and_invalid_planning_metri
             ConnectorSplitPlanningMetrics {
                 candidate_units_considered: 1,
                 candidate_units_pruned: 2,
+                ..ConnectorSplitPlanningMetrics::default()
             },
         )
         .expect_err("pruned candidates cannot exceed considered candidates")

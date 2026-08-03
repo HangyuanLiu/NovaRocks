@@ -40,10 +40,10 @@ pub enum ScanMorsel {
     IcebergMetadata {
         index: usize,
     },
-    /// Provider-neutral scheduled connector split. The generic core adapter
-    /// resolves the index to an SPI-owned split; no provider payload appears
-    /// in the core morsel contract.
-    ConnectorSplit {
+    /// Provider-neutral prepared connector unit. The generic core adapter
+    /// resolves the index to an SPI-owned sealed local unit; no provider
+    /// payload appears in the core morsel contract.
+    ConnectorScanUnit {
         index: usize,
         row_position: Option<ConnectorRowPosition>,
     },
@@ -71,11 +71,11 @@ impl ScanMorsel {
             ScanMorsel::IcebergMetadata { index } => {
                 format!("iceberg_metadata_index={index}")
             }
-            ScanMorsel::ConnectorSplit {
+            ScanMorsel::ConnectorScanUnit {
                 index,
                 row_position,
             } => format!(
-                "connector_split_index={index} row_position_range={}",
+                "connector_scan_unit_index={index} row_position_range={}",
                 row_position
                     .as_ref()
                     .map(|position| position.scan_range_id.to_string())
@@ -88,7 +88,7 @@ impl ScanMorsel {
 
     pub fn connector_row_position(&self) -> Option<&ConnectorRowPosition> {
         match self {
-            Self::ConnectorSplit { row_position, .. } => row_position.as_ref(),
+            Self::ConnectorScanUnit { row_position, .. } => row_position.as_ref(),
             _ => None,
         }
     }
@@ -551,8 +551,8 @@ mod tests {
     }
 
     #[test]
-    fn connector_split_keeps_only_generic_row_position_metadata() {
-        let morsel = ScanMorsel::ConnectorSplit {
+    fn connector_scan_unit_keeps_only_generic_row_position_metadata() {
+        let morsel = ScanMorsel::ConnectorScanUnit {
             index: 3,
             row_position: Some(ConnectorRowPosition { scan_range_id: 5 }),
         };

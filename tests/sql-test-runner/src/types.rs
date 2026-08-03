@@ -198,6 +198,7 @@ impl QueryMeta {
             || !self.be_log_be_count_at_least.is_empty()
             || self.be_log_exact_fragment_cancellation.is_some()
     }
+
 }
 
 #[derive(Debug, Clone)]

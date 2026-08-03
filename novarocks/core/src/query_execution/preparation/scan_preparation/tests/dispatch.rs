@@ -70,7 +70,7 @@ fn scan_preparation_propagates_caller_cancellation() {
         &context,
         None,
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
     ) {
         Ok(_) => panic!("caller cancellation must reach the connector provider"),
         Err(err) => err,
@@ -120,7 +120,7 @@ fn sqlx1_preparation_uses_the_query_binding_lease_without_reacquiring_current() 
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("exact query binding must plan the scan");
     let retained = prepared
@@ -147,7 +147,7 @@ fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
     ) {
         Ok(_) => panic!("missing binding must fail before a current-generation acquire"),
         Err(error) => error,
@@ -195,7 +195,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         None,
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
         &mut seen_scan_node_ids,
         &mut bindings,
     )
@@ -207,7 +207,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         None,
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
         &mut seen_scan_node_ids,
         &mut bindings,
     )

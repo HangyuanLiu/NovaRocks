@@ -3831,11 +3831,31 @@ fn optimizer_settings_for_execution(
 
 fn scan_preparation_options(
     settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
-) -> crate::query_execution::preparation::ScanPreparationOptions {
-    crate::query_execution::preparation::ScanPreparationOptions {
-        enable_connector_static_predicate_pushdown: settings
-            .connector_static_predicate_pushdown_enabled(),
-    }
+    execution: &crate::query_execution::request_context::QueryExecutionContext,
+) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
+    let target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .or_else(|| {
+            // Unit fixtures deliberately use an empty synthetic topology. A
+            // production request must instead fail before provider planning.
+            #[cfg(test)]
+            {
+                Some(std::num::NonZeroUsize::new(1).expect("one is non-zero"))
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            "connector split preparation requires a non-empty admitted backend topology".to_string()
+        })?;
+    Ok(
+        crate::query_execution::preparation::ScanPreparationOptions::new(
+            settings.connector_static_predicate_pushdown_enabled(),
+            target_parallelism,
+            None,
+        ),
+    )
 }
 
 fn connector_static_planning_metrics(
@@ -3843,10 +3863,7 @@ fn connector_static_planning_metrics(
 ) -> Result<crate::query_execution::profile::ConnectorStaticPlanningMetrics, String> {
     let mut metrics = crate::query_execution::profile::ConnectorStaticPlanningMetrics::default();
     for read in prepared.scan_bindings().connector_reads() {
-        metrics.record(
-            read.planning_metrics.candidate_units_considered,
-            read.planning_metrics.candidate_units_pruned,
-        )?;
+        metrics.record(read.planning_metrics)?;
     }
     Ok(metrics)
 }
@@ -3999,7 +4016,7 @@ fn explain_analyze_query(
         connector_context,
         Some(query_table_bindings.as_ref()),
         None,
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4599,7 +4616,7 @@ pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connecto
         connector_context,
         None,
         Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4685,7 +4702,7 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         connector_context,
         None,
         Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4745,7 +4762,7 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         connector_context,
         None,
         Some(scan_resolver),
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -4922,7 +4939,7 @@ fn execute_query_as_iceberg_write_with_connector_binding(
         &connector_context,
         Some(table_bindings.as_ref()),
         None,
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -5036,7 +5053,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         connector_context,
         Some(table_bindings.as_ref()),
         None,
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -5231,6 +5248,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         )?;
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
+    let maintenance_execution = capture_maintenance_execution(state)?;
     let scan_binding_resolver = mv_refresh_ctx
         .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -5239,7 +5257,10 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         connector_context,
         query_table_bindings,
         scan_binding_resolver,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        scan_preparation_options(
+            &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+            &maintenance_execution,
+        )?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,
@@ -5874,7 +5895,7 @@ fn prepare_query_with_sql_compiler_kernel(
         planning_inputs.post_compile.connector_context,
         Some(planning_inputs.post_compile.table_bindings.as_ref()),
         None,
-        scan_preparation_options(execution.optimizer_settings()),
+        scan_preparation_options(execution.optimizer_settings(), execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &compiled.distributed_plan,
@@ -6065,18 +6086,6 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         .ok_or_else(|| {
             "distributed query requires a frontend connector control host".to_string()
         })?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_controls,
-        connector_context,
-        analyzer_catalog.query_table_bindings().as_deref(),
-        scan_binding_resolver,
-        scan_preparation_options(&optimizer_settings),
-    )?;
-    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
-        &distributed_plan,
-        &prepared,
-    )?;
     let maintenance_execution;
     #[cfg(test)]
     let test_request;
@@ -6101,6 +6110,18 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
             }
         }
     };
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        connector_controls,
+        connector_context,
+        analyzer_catalog.query_table_bindings().as_deref(),
+        scan_binding_resolver,
+        scan_preparation_options(&optimizer_settings, execution)?,
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
     crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
@@ -6183,7 +6204,7 @@ pub(crate) fn execute_logical_plan_with_options(
         &connector_context,
         None,
         scan_binding_resolver,
-        scan_preparation_options(&optimizer_settings),
+        scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &distributed_plan,

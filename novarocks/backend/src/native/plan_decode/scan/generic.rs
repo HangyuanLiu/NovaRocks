@@ -32,9 +32,7 @@ use novarocks_spi::connector::{
 };
 
 use novarocks::common::ids::SlotId;
-use novarocks::connector::runtime::{
-    ConnectorBatchTransform, ConnectorReadScanSource, ConnectorScheduledSplit,
-};
+use novarocks::connector::runtime::{ConnectorBatchTransform, ConnectorReadScanSource};
 use novarocks::exec::chunk::ChunkSchema;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::scan::BoundScanRanges;
@@ -123,7 +121,7 @@ pub(super) fn lower_connector_read_scan(
     })?;
     let mut total_payload_bytes = source.scan_payload.len();
     let mut split_ids = BTreeSet::new();
-    let scheduled = source
+    let splits = source
         .splits
         .iter()
         .enumerate()
@@ -159,7 +157,7 @@ pub(super) fn lower_connector_read_scan(
                 .append_index(index));
             }
             total_payload_bytes = total_payload_bytes.saturating_add(split.payload().len());
-            Ok(ConnectorScheduledSplit::plain(split))
+            Ok(split)
         })
         .collect::<Result<Vec<_>, _>>()?;
     if source.scan_payload.len() > request_context.max_handle_payload_bytes() {
@@ -241,7 +239,7 @@ pub(super) fn lower_connector_read_scan(
         println!(
             "NOVAROCKS_CONNECTOR_READ_SOURCE instance={} splits={}",
             instance_id.as_str(),
-            scheduled.len()
+            splits.len()
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -252,14 +250,21 @@ pub(super) fn lower_connector_read_scan(
     };
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
     let source = Arc::new(
-        ConnectorReadScanSource::new_scheduled_execution_with_batch_transform(
+        ConnectorReadScanSource::new_execution_with_batch_transform(
             binding,
-            scheduled,
+            splits,
             request,
             output_schema.clone(),
             batch_transform
                 .map(|transform| Arc::new(transform) as Arc<dyn ConnectorBatchTransform>),
-        ),
+        )
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "splits",
+                error,
+            )
+        })?,
     );
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
     let scan_node = novarocks::exec::node::scan::ScanNode::new(source)

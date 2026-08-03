@@ -610,8 +610,12 @@ impl Provider {
             })
             .collect::<Result<Vec<_>, ConnectorError>>()?;
         let metrics = ConnectorSplitPlanningMetrics {
-            candidate_units_considered: 0,
+            candidate_units_considered: splits.len() as u64,
             candidate_units_pruned: 0,
+            composite_splits_planned: splits.len() as u64,
+            // Each frozen StarRocks strategy split is materialized as one
+            // provider-private local unit by the BE execution binding.
+            scan_units_planned: splits.len() as u64,
         };
         match session {
             Some(session) => {

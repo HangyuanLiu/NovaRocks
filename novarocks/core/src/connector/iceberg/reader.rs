@@ -85,6 +85,7 @@ impl IcebergBatchReader {
             file,
             physical_predicates,
             None,
+            None,
             access,
             request,
             file_context,
@@ -97,6 +98,29 @@ impl IcebergBatchReader {
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
         name_mapping: Option<&str>,
+        access: FsAccessHandle,
+        request: ConnectorOpenReaderRequest,
+        file_context: FileReadContext,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_name_mapping_and_row_groups(
+            file,
+            physical_predicates,
+            name_mapping,
+            None,
+            access,
+            request,
+            file_context,
+        )
+    }
+
+    /// Opens one FE-frozen physical leaf. A row-group selection is a
+    /// correctness boundary: it is applied before decoding, while Iceberg
+    /// delete/DV facts remain attached to the original data file.
+    pub(crate) fn try_new_with_name_mapping_and_row_groups(
+        file: &IcebergDataFileInfo,
+        physical_predicates: &[IcebergPhysicalPredicate],
+        name_mapping: Option<&str>,
+        row_groups: Option<&[usize]>,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
@@ -117,6 +141,7 @@ impl IcebergBatchReader {
             file,
             physical_predicates,
             name_mapping,
+            row_groups,
             access,
             request,
             file_context,
@@ -134,7 +159,17 @@ impl IcebergBatchReader {
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_equality_mode(file, &[], None, access, request, file_context, true, true)
+        Self::try_new_with_equality_mode(
+            file,
+            &[],
+            None,
+            None,
+            access,
+            request,
+            file_context,
+            true,
+            true,
+        )
     }
 
     /// Build one child of a multi-file delta reader.  The parent owns the
@@ -151,6 +186,7 @@ impl IcebergBatchReader {
             file,
             &[],
             None,
+            None,
             access,
             request,
             file_context,
@@ -163,6 +199,7 @@ impl IcebergBatchReader {
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
         name_mapping: Option<Arc<iceberg::spec::NameMapping>>,
+        row_groups: Option<&[usize]>,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
         file_context: FileReadContext,
@@ -209,7 +246,10 @@ impl IcebergBatchReader {
                 max_bytes: request.batch.max_bytes,
             },
             predicates,
-            pruning: PhysicalPruning::default(),
+            pruning: PhysicalPruning {
+                row_groups: row_groups.map(ToOwned::to_owned),
+                pages: Vec::new(),
+            },
             cache: None,
             context: file_context,
         })

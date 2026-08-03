@@ -19,11 +19,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorOpenReaderRequest, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorRequestContext, ConnectorSplit,
+    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
 };
 
 use crate::STARROCKS_PROVIDER_ID;
@@ -144,19 +146,85 @@ impl ConnectorReadExecution for CompositeReadExecution {
         &self.key
     }
 
-    fn open_reader(
+    fn prepare_split(
         &self,
         split: &ConnectorSplit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        ensure_active(&request.context)?;
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        request.check_active()?;
         if split.owner() != &self.key.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "StarRocks split belongs to another connector instance",
             ));
         }
-        let split = decode_split(split.payload())?;
+        let decoded_split = decode_split(split.payload())?;
+        validate_split_generation(&decoded_split, &self.key)?;
+        let direct_outer = direct_outer_facts(&decoded_split)?;
+        let leaf_kind = match (
+            split_strategy(&decoded_split),
+            &decoded_split.strategy_payload,
+        ) {
+            (StarRocksSelectedStrategy::Rpc { .. }, StrategyPayload::Rpc { payload }) => {
+                // Decode during preparation so that a malformed remote leaf never
+                // reaches the Core morsel queue. The payload remains provider-private.
+                let _ = decode_rpc_split(&payload.0, &direct_outer)?;
+                "rpc"
+            }
+            (
+                StarRocksSelectedStrategy::SharedDataDirect,
+                StrategyPayload::SharedDataDirect { payload },
+            ) => {
+                // The direct descriptor is a frontend-frozen tablet membership.
+                // This validates it without consulting or re-planning live metadata.
+                let _ = decode_direct_split(&payload.0, &direct_outer)?;
+                // The current frozen direct carrier covers a complete tablet, so
+                // the correctness-safe unit is a tablet merge, not a fabricated
+                // segment subdivision.
+                "tablet_merge"
+            }
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "StarRocks split tag does not match its frozen strategy",
+                ));
+            }
+        };
+        request.check_active()?;
+        let prepared = ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
+            self.key.clone(),
+            split,
+            Bytes::new(),
+            vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                split.payload().clone(),
+                split.estimated_bytes(),
+            )?],
+            Some(leaf_kind),
+            &request,
+        )?;
+        tracing::info!(
+            split_id = prepared.split_id(),
+            unit_count = prepared.len(),
+            shape = "single",
+            leaf_kind,
+            "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED"
+        );
+        Ok(prepared)
+    }
+
+    fn open_unit_reader(
+        &self,
+        unit: &ConnectorPreparedScanUnit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        ensure_active(&request.context)?;
+        if unit.binding_key() != &self.key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "StarRocks prepared scan unit belongs to another execution binding",
+            ));
+        }
+        let split = decode_split(unit.payload())?;
         validate_split_generation(&split, &self.key)?;
         let encoded_schema = encode_schema_ipc(request.expected_schema.as_ref())?;
         if schema_digest(&encoded_schema).as_slice() != split_output_schema_digest(&split) {
@@ -225,8 +293,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorBatchBudget, ConnectorCancellation, ConnectorControlBinding, ConnectorInstanceId,
-        ConnectorReadSelector, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
-        ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorPrepareSplitRequest, ConnectorReadSelector, ConnectorSplitPlanningRequest,
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
 
     use super::*;
@@ -526,6 +594,17 @@ mod tests {
         )
     }
 
+    fn prepare_single_unit(
+        read: &Arc<dyn ConnectorReadExecution>,
+        split: &ConnectorSplit,
+    ) -> ConnectorPreparedScanUnit {
+        let prepared = read
+            .prepare_split(split, ConnectorPrepareSplitRequest { context: context() })
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        prepared.units().next().unwrap()
+    }
+
     struct Reader {
         batch: Option<RecordBatch>,
     }
@@ -613,11 +692,16 @@ mod tests {
         let installed = StarRocksExecutionInstaller::new(bindings)
             .install(&declaration, &context())
             .unwrap();
-        let mut reader = installed
-            .read()
-            .unwrap()
-            .open_reader(
-                &split,
+        let read = installed.read().unwrap();
+        let unit = prepare_single_unit(read, &split);
+        assert_eq!(unit.ordinal(), 0);
+        assert!(matches!(
+            decode_split(unit.payload()).unwrap().strategy_payload,
+            StrategyPayload::Rpc { .. }
+        ));
+        let mut reader = read
+            .open_unit_reader(
+                &unit,
                 ConnectorOpenReaderRequest {
                     expected_schema: schema,
                     batch: ConnectorBatchBudget {
@@ -649,8 +733,10 @@ mod tests {
         let installed = StarRocksExecutionInstaller::new(bindings)
             .install(&declaration, &context())
             .unwrap();
-        let error = match installed.read().unwrap().open_reader(
-            &split,
+        let read = installed.read().unwrap();
+        let unit = prepare_single_unit(read, &split);
+        let error = match read.open_unit_reader(
+            &unit,
             ConnectorOpenReaderRequest {
                 expected_schema: schema,
                 batch: ConnectorBatchBudget {
@@ -683,11 +769,16 @@ mod tests {
         let installed = StarRocksExecutionInstaller::new(bindings)
             .install(&declaration, &context())
             .unwrap();
-        let mut reader = installed
-            .read()
-            .unwrap()
-            .open_reader(
-                &split,
+        let read = installed.read().unwrap();
+        let unit = prepare_single_unit(read, &split);
+        assert_eq!(unit.ordinal(), 0);
+        assert!(matches!(
+            decode_split(unit.payload()).unwrap().strategy_payload,
+            StrategyPayload::SharedDataDirect { .. }
+        ));
+        let mut reader = read
+            .open_unit_reader(
+                &unit,
                 ConnectorOpenReaderRequest {
                     expected_schema: schema,
                     batch: ConnectorBatchBudget {
@@ -721,21 +812,20 @@ mod tests {
         };
         let open = |installer: StarRocksExecutionInstaller, schema: arrow::datatypes::SchemaRef| {
             let installed = installer.install(&declaration, &context()).unwrap();
-            installed
-                .read()
-                .unwrap()
-                .open_reader(
-                    &split,
-                    ConnectorOpenReaderRequest {
-                        expected_schema: schema,
-                        batch: ConnectorBatchBudget {
-                            max_rows: NonZeroUsize::new(32).unwrap(),
-                            max_bytes: NonZeroUsize::new(4096).unwrap(),
-                        },
-                        context: context(),
+            let read = installed.read().unwrap();
+            let unit = prepare_single_unit(read, &split);
+            read.open_unit_reader(
+                &unit,
+                ConnectorOpenReaderRequest {
+                    expected_schema: schema,
+                    batch: ConnectorBatchBudget {
+                        max_rows: NonZeroUsize::new(32).unwrap(),
+                        max_bytes: NonZeroUsize::new(4096).unwrap(),
                     },
-                )
-                .unwrap()
+                    context: context(),
+                },
+            )
+            .unwrap()
         };
         let _reader = open(installer(Arc::clone(&be_one_calls)), Arc::clone(&schema));
         assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
@@ -743,5 +833,78 @@ mod tests {
         let _reader = open(installer(Arc::clone(&be_two_calls)), schema);
         assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
         assert_eq!(be_two_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_rejects_malformed_foreign_and_strategy_mismatched_splits_before_reader_open() {
+        let binding = control();
+        let (declaration, split, _) = planned_read(&binding);
+        let rpc_calls = Arc::new(AtomicUsize::new(0));
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let mut bindings = StarRocksExecutionBindings::new();
+        bindings.insert(
+            StarRocksLocalBindingRef::parse("test").unwrap(),
+            StarRocksLocalExecutionBinding {
+                rpc: Some(Arc::new(RpcFactory(Arc::clone(&rpc_calls)))),
+                direct: Some(Arc::new(DirectFactory(Arc::clone(&direct_calls)))),
+            },
+        );
+        let installed = StarRocksExecutionInstaller::new(bindings)
+            .install(&declaration, &context())
+            .unwrap();
+        let read = installed.read().unwrap();
+
+        let malformed = ConnectorSplit::try_new(
+            split.owner().clone(),
+            "malformed",
+            Bytes::from_static(b"not a StarRocks split"),
+            split.estimated_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            read.prepare_split(
+                &malformed,
+                ConnectorPrepareSplitRequest { context: context() }
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+
+        let foreign_binding = control();
+        let (_, foreign_generation, _) = planned_read(&foreign_binding);
+        assert_eq!(
+            read.prepare_split(
+                &foreign_generation,
+                ConnectorPrepareSplitRequest { context: context() }
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        let mut strategy_mismatch: serde_json::Value =
+            serde_json::from_slice(split.payload()).unwrap();
+        strategy_mismatch["strategy_payload"]["kind"] =
+            serde_json::Value::String("shared_data_direct".to_string());
+        let strategy_mismatch = ConnectorSplit::try_new(
+            split.owner().clone(),
+            "strategy-mismatch",
+            Bytes::from(serde_json::to_vec(&strategy_mismatch).unwrap()),
+            split.estimated_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            read.prepare_split(
+                &strategy_mismatch,
+                ConnectorPrepareSplitRequest { context: context() }
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        assert_eq!(rpc_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
     }
 }

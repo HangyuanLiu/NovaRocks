@@ -945,6 +945,13 @@ fn render_cross_process_launch_config(
             ),
         );
     }
+    // Cross-process SQL fixtures own both process logs, so they may enable the
+    // bounded connector scan lifecycle markers used for structural evidence.
+    // This is a test-runner config only; production configs retain the default.
+    table_mut(root, "debug").insert(
+        "emit_connector_reader_marker".to_string(),
+        Value::Boolean(true),
+    );
     if query_lifecycle_faults_enabled {
         let debug = table_mut(root, "debug");
         debug.insert(
