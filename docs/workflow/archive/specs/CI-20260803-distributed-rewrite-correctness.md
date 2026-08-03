@@ -2,7 +2,8 @@
 title: "CI-20260803：恢复 Iceberg distributed rewrite 的校验、提交与可见性语义"
 date: 2026-08-03
 type: design-spec
-status: implemented
+status: archived
+pr: "https://github.com/NovaRocks/NovaRocks/pull/832"
 tags:
   - dev-workflow/design
   - dev-workflow/specs

@@ -2,7 +2,8 @@
 title: "CI-20260803：解除 analytic 用例对 Hadoop CTAS 的错误依赖"
 date: 2026-08-03
 type: design-spec
-status: implemented
+status: archived
+pr: "https://github.com/NovaRocks/NovaRocks/pull/832"
 tags:
   - dev-workflow/design
   - dev-workflow/specs

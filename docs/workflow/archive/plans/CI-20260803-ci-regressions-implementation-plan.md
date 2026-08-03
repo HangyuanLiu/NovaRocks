@@ -2,7 +2,8 @@
 title: "CI-20260803 CI 回归修复实现计划"
 date: 2026-08-03
 type: implementation-plan
-status: completed
+status: archived
+pr: "https://github.com/NovaRocks/NovaRocks/pull/832"
 specs:
   - "[[CI-20260803-analytic-hadoop-ctas-fixture]]"
   - "[[CI-20260803-distributed-rewrite-correctness]]"
