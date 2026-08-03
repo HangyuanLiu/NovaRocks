@@ -54,6 +54,7 @@ struct CohortState {
 enum TerminalDecision {
     Commit([u8; 32]),
     Abort([u8; 32]),
+    KnownEmptyNoOp,
 }
 
 impl ConnectorWriteOperationSession {
@@ -136,6 +137,34 @@ impl ConnectorWriteOperationSession {
             ));
         }
         self.operation_completion(&state)
+    }
+
+    /// Seal an operation that the frontend has established needs no writer
+    /// attempt. This is an internal terminal decision and never contacts the
+    /// connector provider.
+    pub(crate) fn finish_known_empty_noop(&self) -> Result<(), ConnectorError> {
+        let mut state = self.lock_state()?;
+        if state.recovery_only {
+            return Err(invalid(
+                "connector write recovery session cannot finish a known-empty operation",
+            ));
+        }
+        if state.terminal.is_some() {
+            return Err(invalid(
+                "connector write operation already has a terminal decision",
+            ));
+        }
+        if state
+            .cohorts
+            .values()
+            .any(|cohort| cohort.accepted.is_some() || !cohort.superseded.is_empty())
+        {
+            return Err(invalid(
+                "connector write operation with accepted or superseded attempts cannot finish as known-empty",
+            ));
+        }
+        state.terminal = Some(TerminalDecision::KnownEmptyNoOp);
+        Ok(())
     }
 
     pub fn contains_cohort(&self, cohort_id: ConnectorWriteCohortId) -> bool {
@@ -314,6 +343,14 @@ impl ConnectorWriteOperationSession {
                     "connector write recovery session cannot submit a new commit",
                 ));
             }
+            if matches!(
+                state.terminal,
+                Some(TerminalDecision::Abort(_)) | Some(TerminalDecision::KnownEmptyNoOp)
+            ) {
+                return Err(invalid(
+                    "connector write operation already has another terminal decision",
+                ));
+            }
             let completion = self.operation_completion(&state)?;
             match state.terminal {
                 Some(TerminalDecision::Commit(digest))
@@ -344,6 +381,14 @@ impl ConnectorWriteOperationSession {
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
         let request = {
             let mut state = self.lock_state()?;
+            if matches!(
+                state.terminal,
+                Some(TerminalDecision::Commit(_)) | Some(TerminalDecision::KnownEmptyNoOp)
+            ) {
+                return Err(invalid(
+                    "connector write operation already has another terminal decision",
+                ));
+            }
             let cohorts = self.cohort_completions(&state, false)?;
             let request = ConnectorWriteAbortRequest::try_new(
                 self.inner.owner.clone(),
@@ -581,11 +626,13 @@ mod tests {
     use arrow::datatypes::Schema;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
+        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
+        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
+        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
         ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteIntent, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWriterHandle, ExternalMutationFinalization,
+        ConnectorWritePlanningRequest, ConnectorWriterHandle, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState, ExternalMutationFinalization,
     };
 
     use super::*;
@@ -626,6 +673,7 @@ mod tests {
     struct TestControl {
         key: ConnectorExecutionBindingKey,
         plan_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
     }
 
@@ -668,6 +716,7 @@ mod tests {
             &self,
             _request: ConnectorWriteCommitRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "session test does not commit complete operations",
@@ -731,12 +780,14 @@ mod tests {
     fn lease(
         release_calls: Arc<AtomicUsize>,
         plan_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
     ) -> ConnectorWriteLease {
         let key = owner();
         let control: Arc<dyn ConnectorWriteControl> = Arc::new(TestControl {
             key: key.clone(),
             plan_calls,
+            commit_calls,
             abort_calls,
         });
         ConnectorWriteLease::new_with_execution_distribution(
@@ -795,6 +846,42 @@ mod tests {
         .expect("writer manifest")
     }
 
+    fn attempt_completion(
+        operation_id: ConnectorWriteOperationId,
+        cohort_id: ConnectorWriteCohortId,
+        attempt: u64,
+    ) -> ConnectorWriteAttemptCompletion {
+        let execution_id = ConnectorWriteExecutionId::new([attempt as u8; 16], attempt);
+        let writer = ConnectorWriterIdentity::new(
+            operation_id,
+            cohort_id,
+            execution_id,
+            [0x77; 16],
+            3,
+            8,
+            0,
+            owner(),
+        );
+        let report = ConnectorStagedReport::try_new(
+            writer,
+            CONNECTOR_WRITE_CONTRACT_VERSION,
+            ConnectorWriterTerminalState::Staged,
+            ConnectorStagedReportSummary::default(),
+            Bytes::from_static(b"report"),
+        )
+        .expect("staged report");
+        ConnectorWriteAttemptCompletion::try_new(
+            owner(),
+            operation_id,
+            cohort_id,
+            execution_id,
+            [0x88; 32],
+            vec![report],
+            Bytes::new(),
+        )
+        .expect("attempt completion")
+    }
+
     #[test]
     fn sealed_session_reuses_one_exact_lease_for_cohort_retries() {
         let operation_id = ConnectorWriteOperationId::from_bytes([9; 16]);
@@ -807,6 +894,7 @@ mod tests {
             lease(
                 Arc::clone(&release_calls),
                 Arc::clone(&plan_calls),
+                Arc::new(AtomicUsize::new(0)),
                 Arc::clone(&abort_calls),
             ),
         )
@@ -859,6 +947,7 @@ mod tests {
             lease(
                 release_calls,
                 Arc::clone(&plan_calls),
+                Arc::new(AtomicUsize::new(0)),
                 Arc::clone(&abort_calls),
             ),
         )
@@ -894,5 +983,108 @@ mod tests {
             };
         assert!(terminal_error.to_string().contains("terminal"));
         assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn known_empty_noop_is_local_terminal_and_blocks_later_provider_calls() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([11; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let plan_calls = Arc::new(AtomicUsize::new(0));
+        let commit_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let session = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(operation_id, cohort_id)),
+            lease(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&plan_calls),
+                Arc::clone(&commit_calls),
+                Arc::clone(&abort_calls),
+            ),
+        )
+        .expect("sealed operation session");
+
+        session
+            .finish_known_empty_noop()
+            .expect("known-empty operation succeeds locally");
+        assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+
+        let plan_error = match session.plan_manifest(&manifest(
+            operation_id,
+            cohort_id,
+            1,
+            UniqueId::new(6, 66),
+        )) {
+            Ok(_) => panic!("terminal known-empty operation cannot plan"),
+            Err(error) => error,
+        };
+        assert!(plan_error.to_string().contains("terminal"));
+        let commit_error = session
+            .commit(context())
+            .expect_err("terminal known-empty operation cannot commit");
+        assert!(commit_error.to_string().contains("terminal"));
+        let abort_error = session
+            .abort(context())
+            .expect_err("terminal known-empty operation cannot abort");
+        assert!(abort_error.to_string().contains("terminal"));
+        let terminal_error = session
+            .finish_known_empty_noop()
+            .expect_err("known-empty decision is terminal");
+        assert!(terminal_error.to_string().contains("terminal"));
+        assert_eq!(plan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn known_empty_noop_rejects_accepted_or_superseded_attempts() {
+        let operation_id = ConnectorWriteOperationId::from_bytes([12; 16]);
+        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
+        let session = ConnectorWriteOperationSession::try_begin(
+            ConnectorWriteOperationRegistration::single(template(operation_id, cohort_id)),
+            lease(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        )
+        .expect("sealed operation session");
+
+        {
+            let mut state = session.lock_state().expect("operation state");
+            state
+                .cohorts
+                .get_mut(&cohort_id)
+                .expect("sealed cohort")
+                .accepted = Some(attempt_completion(operation_id, cohort_id, 1));
+        }
+        let accepted_error = session
+            .finish_known_empty_noop()
+            .expect_err("accepted attempt cannot become known-empty");
+        assert!(
+            accepted_error
+                .to_string()
+                .contains("accepted or superseded")
+        );
+
+        {
+            let mut state = session.lock_state().expect("operation state");
+            let cohort = state.cohorts.get_mut(&cohort_id).expect("sealed cohort");
+            cohort.accepted = None;
+            let superseded = attempt_completion(operation_id, cohort_id, 2);
+            cohort
+                .superseded
+                .insert(superseded.execution_id(), superseded);
+        }
+        let superseded_error = session
+            .finish_known_empty_noop()
+            .expect_err("superseded attempt cannot become known-empty");
+        assert!(
+            superseded_error
+                .to_string()
+                .contains("accepted or superseded")
+        );
     }
 }

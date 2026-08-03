@@ -17,6 +17,7 @@
 
 pub mod catalog;
 pub(crate) mod change_stream_routing;
+pub(crate) mod change_stream_write;
 pub mod changes;
 pub mod commit;
 #[cfg_attr(test, allow(dead_code))]
@@ -60,6 +61,7 @@ pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
 pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
+pub(crate) mod write_commit;
 pub(crate) mod write_contract;
 pub(crate) mod write_control;
 pub(crate) mod write_descriptor;

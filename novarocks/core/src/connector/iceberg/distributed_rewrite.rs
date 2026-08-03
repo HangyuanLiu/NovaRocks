@@ -41,6 +41,7 @@ use super::commit::{CommitOpKind, IcebergCommitCollector, SelectedRewriteKind};
 use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 use super::sink::build_position_delete_data_file_partition_index;
 use super::sink_plan::IcebergSinkObjectStoreConfig;
+use super::write_commit::IcebergWriteCommitExecutor;
 use super::write_contract::{
     encode_frozen_data_rewrite_handle_payload, encode_frozen_deletion_vector_rewrite_handle_payload,
 };
@@ -50,7 +51,6 @@ use super::write_service::{
     IcebergWriteReportCommitter, IcebergWriteServiceRegistry,
 };
 use crate::common::types::UniqueId;
-use crate::engine::IcebergWriteCommitExecutor;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
 
@@ -420,8 +420,6 @@ impl IcebergDistributedRewriteAdapter {
         let cleanup = build_abort_cleanup_for_catalog_entry(&entry)
             .map_err(|error| unavailable(format!("prepare rewrite cleanup: {error}")))?;
         let executor = Arc::new(IcebergWriteCommitExecutor {
-            state: std::sync::Weak::new(),
-            target,
             catalog,
             table: table.clone(),
             collector,

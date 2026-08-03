@@ -51,6 +51,7 @@ use crate::connector::iceberg::position_delete_descriptor::{
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
+use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::{
     decode_write_receipt, encode_data_sink_spec_handle_payload,
 };
@@ -65,8 +66,8 @@ use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
-    IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
-    IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
+    IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
+    IcebergWriteValidationPolicy,
 };
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -292,8 +293,6 @@ fn prepare_iceberg_distributed_write(
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::downgrade(state),
-        target: target.clone(),
         catalog,
         table,
         collector,
@@ -423,6 +422,113 @@ pub(crate) fn register_iceberg_connector_write(
         operation_id,
         context,
     )
+}
+
+/// Eagerly register a change-stream provider binding for legacy direct
+/// execution. The provider derives terminal handles and aggregate routing
+/// from the planner-frozen topology; this application wrapper only owns the
+/// FE-local service registry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_iceberg_change_stream_connector_write(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    entry: &IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    operation_id: ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    let target_ref = commit_executor.target_ref.clone();
+    let binding =
+        crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+            crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                target_ref: &target_ref,
+                table: &commit_executor.table,
+                entry,
+                base_snapshot_id,
+                operation_id,
+                topology,
+                commit_executor: Arc::clone(&commit_executor),
+            },
+        )?;
+    register_iceberg_change_stream_provider_binding(state, target, &binding, operation_id, context)
+}
+
+pub(crate) fn register_iceberg_change_stream_provider_binding(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    binding: &crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding,
+    operation_id: ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    register_iceberg_connector_write_service(
+        state,
+        target,
+        binding.target_ref(),
+        ConnectorWriteIntent::RowDelta,
+        Arc::new(Schema::empty()),
+        IcebergWritePlanPayloadV1::decode(&binding.provider_payload())
+            .map_err(|error| format!("decode Iceberg change-stream provider payload: {error}"))?,
+        binding
+            .control_service()
+            .map_err(|error| format!("build Iceberg change-stream write service: {error}"))?,
+        operation_id,
+        context,
+    )
+}
+
+/// Reserve the same provider binding only after exact-lease admission. The
+/// registry owns lazy activation; the connector owns the frozen binding and
+/// its digest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_iceberg_change_stream_connector_write(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    entry: &IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    operation_id: ConnectorWriteOperationId,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    let target_ref = commit_executor.target_ref.clone();
+    let binding =
+        crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+            crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                target_ref: &target_ref,
+                table: &commit_executor.table,
+                entry,
+                base_snapshot_id,
+                operation_id,
+                topology,
+                commit_executor: Arc::clone(&commit_executor),
+            },
+        )?;
+    let provider_payload = binding.provider_payload();
+    let target_ref = binding.target_ref().to_string();
+    let mut templates = reserve_iceberg_connector_write_cohort_service_with_exact_lease(
+        state,
+        target,
+        &target_ref,
+        operation_id,
+        vec![(
+            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
+            ConnectorWriteIntent::RowDelta,
+            Arc::new(Schema::empty()),
+            provider_payload,
+            context,
+        )],
+        binding.activation_digest(),
+        exact_lease,
+        binding.control_service_factory(),
+    )?;
+    Ok(templates
+        .pop()
+        .expect("single Iceberg change-stream cohort registration returns one template"))
 }
 
 /// Activates one first-refresh primary append cohort only after the caller has
@@ -891,7 +997,7 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        self.executor.commit_executor.finalize()
+        invalidate_iceberg_caches(&self.executor.state, &self.executor.target)
     }
 
     /// Convert an inert prepared append into the mutation reverse-port
@@ -902,6 +1008,7 @@ impl PreparedIcebergWrite {
         self,
     ) -> Result<Arc<dyn crate::engine::mutation_flow::MutationExecution>, String> {
         let state = Arc::clone(&self.executor.state);
+        let target = self.executor.target.clone();
         let commit_executor = Arc::clone(&self.executor.commit_executor);
         let connector_context = self.executor.connector_context.clone();
         let execution = self.executor.execution.clone().ok_or_else(|| {
@@ -910,6 +1017,7 @@ impl PreparedIcebergWrite {
         let prepared_request = self.into_prepared_distributed_write()?;
         Ok(Arc::new(PreparedIcebergWriteMutationExecution {
             state,
+            target,
             execution,
             prepared_request: Mutex::new(Some(prepared_request)),
             commit_executor,
@@ -921,6 +1029,7 @@ impl PreparedIcebergWrite {
 
 struct PreparedIcebergWriteMutationExecution {
     state: Arc<StandaloneState>,
+    target: TargetBackend,
     execution: QueryExecutionContext,
     prepared_request:
         Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
@@ -993,7 +1102,7 @@ impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMut
     }
 
     fn finalize(&self) -> Result<(), String> {
-        self.commit_executor.finalize()
+        invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 

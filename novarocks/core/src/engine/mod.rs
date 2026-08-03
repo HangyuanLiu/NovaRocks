@@ -57,7 +57,6 @@ pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub mod ctas_engine;
 pub mod delete_engine;
-pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
@@ -85,7 +84,6 @@ pub(crate) mod write_operation_lifecycle;
 mod write_transaction;
 #[cfg(feature = "mv-first-refresh-staging-test-support")]
 pub use mv_first_refresh_staging::MvFirstRefreshStagingTestOutcome;
-pub(crate) use write_transaction::IcebergWriteCommitExecutor;
 
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
@@ -5189,8 +5187,6 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::query_execution::preparation::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
-    pub(crate) commit_plan:
-        crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan,
     pub(crate) topology:
         crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
 }
@@ -5268,13 +5264,9 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         &distributed_plan,
         &prepared,
     )?;
-    let commit_plan = crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::from_topology(
-        &topology,
-    )?;
     Ok(PlannedIcebergChangeStreamWrite {
         prepared,
         native_bundle,
-        commit_plan,
         topology,
     })
 }

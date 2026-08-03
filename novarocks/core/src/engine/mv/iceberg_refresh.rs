@@ -15501,13 +15501,23 @@ fn execute_imv_change_stream_writer(
         )?;
     #[cfg(test)]
     if let Some(result) = take_imv_change_stream_execution_result_for_test() {
-        return executed_change_stream_write_from_result(result, planned.commit_plan);
+        return executed_change_stream_write_from_result(
+            result,
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::from_topology(
+                &planned.topology,
+            )?,
+        );
     }
     #[cfg(test)]
     if let Some(result) =
         crate::engine::observe_change_stream_write_build_for_test(&planned.topology)
     {
-        return executed_change_stream_write_from_result(result, planned.commit_plan);
+        return executed_change_stream_write_from_result(
+            result,
+            crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan::from_topology(
+                &planned.topology,
+            )?,
+        );
     }
     let op_kind = commit_op_kind.unwrap_or_else(|| {
         if refresh_plan
@@ -15526,18 +15536,18 @@ fn execute_imv_change_stream_writer(
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
-        state: Arc::downgrade(state),
-        target: target.clone(),
-        catalog,
-        table: table.clone(),
-        collector: Arc::clone(&collector),
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: refresh_plan.snapshot_properties.clone(),
-    });
+    let commit_executor = Arc::new(
+        crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
+            catalog,
+            table: table.clone(),
+            collector: Arc::clone(&collector),
+            fs: abort_cleanup.fs,
+            cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_rewrite: None,
+            target_ref: target_ref.to_string(),
+            snapshot_properties: refresh_plan.snapshot_properties.clone(),
+        },
+    );
     let base_snapshot_id = table
         .metadata()
         .refs()
@@ -15553,15 +15563,25 @@ fn execute_imv_change_stream_writer(
                 })
                 .flatten()
         });
+    let target_name = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    let binding =
+        crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+            crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                target: &target_name,
+                target_ref,
+                table: &commit_executor.table,
+                entry: &entry,
+                base_snapshot_id,
+                operation_id: refresh_plan.connector_operation_id,
+                topology: &planned.topology,
+                commit_executor: Arc::clone(&commit_executor),
+            },
+        )?;
     let connector_write =
-        crate::engine::mutation_flow::build_change_stream_connector_write_template(
+        crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
             target,
-            &planned.topology,
-            planned.commit_plan.clone(),
-            Arc::clone(&commit_executor),
-            &entry,
-            base_snapshot_id,
+            &binding,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
         )?;
@@ -15585,7 +15605,7 @@ fn execute_imv_change_stream_writer(
     Ok(
         crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite {
             write_commit: None,
-            commit_plan: planned.commit_plan,
+            commit_plan: binding.commit_plan().clone(),
             committed: Some(
                 crate::mv::refresh::change_stream_write::CommittedChangeStreamWrite {
                     collector,
@@ -15671,18 +15691,18 @@ fn prepare_imv_change_stream_writer(
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
-        state: Arc::downgrade(state),
-        target: target.clone(),
-        catalog,
-        table: table.clone(),
-        collector,
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: target_ref.to_string(),
-        snapshot_properties: refresh_plan.snapshot_properties.clone(),
-    });
+    let commit_executor = Arc::new(
+        crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
+            catalog,
+            table: table.clone(),
+            collector,
+            fs: abort_cleanup.fs,
+            cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_rewrite: None,
+            target_ref: target_ref.to_string(),
+            snapshot_properties: refresh_plan.snapshot_properties.clone(),
+        },
+    );
     let base_snapshot_id = table
         .metadata()
         .refs()
@@ -15699,11 +15719,10 @@ fn prepare_imv_change_stream_writer(
                 .flatten()
         });
     let connector_write =
-        crate::engine::mutation_flow::activate_change_stream_connector_write_template(
+        crate::engine::iceberg_writer::activate_iceberg_change_stream_connector_write(
             state,
             target,
             &planned.topology,
-            planned.commit_plan,
             commit_executor,
             &entry,
             base_snapshot_id,

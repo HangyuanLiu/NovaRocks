@@ -609,18 +609,18 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
-        state: Arc::downgrade(state),
-        target: target.clone(),
-        catalog,
-        table: target_table.clone(),
-        collector: Arc::clone(&collector),
-        fs: abort_cleanup.fs,
-        cleanup_path_mapper: abort_cleanup.path_mapper,
-        cow_update_rewrite: None,
-        target_ref: prepared.staging_branch().to_string(),
-        snapshot_properties: std::collections::BTreeMap::new(),
-    });
+    let commit_executor = Arc::new(
+        crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor {
+            catalog,
+            table: target_table.clone(),
+            collector: Arc::clone(&collector),
+            fs: abort_cleanup.fs,
+            cleanup_path_mapper: abort_cleanup.path_mapper,
+            cow_update_rewrite: None,
+            target_ref: prepared.staging_branch().to_string(),
+            snapshot_properties: std::collections::BTreeMap::new(),
+        },
+    );
     let payload = IcebergFirstRefreshWritePlanPayloadV2 {
         version: 2,
         target: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
