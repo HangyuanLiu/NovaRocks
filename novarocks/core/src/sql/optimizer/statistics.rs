@@ -493,7 +493,6 @@ pub(crate) struct SqlManifestFileStatistics {
 }
 
 #[cfg(test)]
-type IcebergDataFileInfo = SqlManifestFileStatistics;
 #[cfg(test)]
 type IcebergColumnStats = SqlManifestColumnStatistics;
 
@@ -1391,7 +1390,7 @@ mod tests {
     fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1437,7 +1436,7 @@ mod tests {
     fn build_table_statistics_skips_string_bounds() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(50),
@@ -1477,7 +1476,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_without_columns_leaves_ndv_missing() {
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -1513,7 +1512,7 @@ mod tests {
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -1575,7 +1574,7 @@ mod tests {
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(1_000),
@@ -1630,7 +1629,7 @@ mod tests {
 
     #[test]
     fn sqlx2_scan_manifest_missing_row_count_stays_missing() {
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: None,
@@ -1659,7 +1658,7 @@ mod tests {
     fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1710,7 +1709,7 @@ mod tests {
     fn build_base_table_statistics_marks_heuristic_ndv_missing() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1782,7 +1781,7 @@ mod tests {
     fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1848,7 +1847,7 @@ mod tests {
     fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10),
@@ -1937,7 +1936,7 @@ mod tests {
     fn build_base_table_statistics_preserves_puffin_ndv() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1985,7 +1984,7 @@ mod tests {
     fn build_base_table_statistics_preserves_zero_puffin_ndv() {
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
