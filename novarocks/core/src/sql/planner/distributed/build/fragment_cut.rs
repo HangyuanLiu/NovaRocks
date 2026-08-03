@@ -394,8 +394,10 @@ impl FragmentCutBuilder {
     ) -> Result<DistributedNode, String> {
         let parent_fragment_id = self.current_fragment_id()?;
         let exchange_output_columns = if requested_output_columns.is_empty()
-            && matches!(&flavor, ExchangeFlavor::Distribution)
-        {
+            && matches!(
+                &flavor,
+                ExchangeFlavor::Distribution | ExchangeFlavor::TopNSplit { .. }
+            ) {
             source_output_columns.clone()
         } else {
             stream_exchange_output_columns(&source_output_columns, &requested_output_columns)

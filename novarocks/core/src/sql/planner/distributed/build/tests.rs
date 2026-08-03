@@ -3214,7 +3214,11 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         PartitionKind::Unpartitioned
     ));
     assert!(receiver.partition.exprs.is_empty());
-    assert!(receiver.output_columns.is_empty());
+    assert_eq!(receiver.output_columns.len(), 1);
+    assert_eq!(
+        receiver.output_columns[0].column_id,
+        ColumnId::new_for_test(1)
+    );
     assert_eq!(receiver.output_qualifier, None);
     match &receiver.flavor {
         ExchangeFlavor::TopNSplit {
@@ -3242,6 +3246,7 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         edge.output_partition.kind,
         PartitionKind::Unpartitioned
     ));
+    assert_eq!(edge.output_slot_ids, vec![1]);
     let child_fragment = dp
         .fragments()
         .iter()

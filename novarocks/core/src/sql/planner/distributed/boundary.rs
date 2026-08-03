@@ -924,7 +924,7 @@ mod tests {
         .expect_err("out-of-range write input ordinal must not seal");
 
         assert!(error.contains("references output ordinal 99"), "{error}");
-        assert!(error.contains("iceberg-write-input"), "{error}");
+        assert!(error.contains("Iceberg write fragment id=0"), "{error}");
     }
 
     #[test]
