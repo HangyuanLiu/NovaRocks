@@ -37,12 +37,21 @@ struct FakeExecutor;
 
 impl WriteExecutor for FakeExecutor {
     type CommitHandle = ();
+    type AbortHandle = std::convert::Infallible;
 
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<()>, String> {
         Ok(CoordinatedWriteReport::CommitRequired(()))
+    }
+
+    fn abort(
+        &self,
+        _spec: &WriteTransactionSpec,
+        handle: &Self::AbortHandle,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        match *handle {}
     }
 
     fn commit(
@@ -65,12 +74,21 @@ struct KnownCommittedCommitErrorExecutor;
 
 impl WriteExecutor for KnownCommittedCommitErrorExecutor {
     type CommitHandle = ();
+    type AbortHandle = std::convert::Infallible;
 
     fn run_coordinated_write(
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<()>, String> {
         Ok(CoordinatedWriteReport::CommitRequired(()))
+    }
+
+    fn abort(
+        &self,
+        _spec: &WriteTransactionSpec,
+        handle: &Self::AbortHandle,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        match *handle {}
     }
 
     fn commit(
@@ -153,6 +171,7 @@ async fn dml_service_commits_over_real_state_store() {
             ref_name: None,
         },
         operation_kind: OperationKind::InsertAppend,
+        operation_subkind: None,
         commit_op_kind: CommitOpKind::FastAppend,
         attempt_id: "attempt-1".to_string(),
         base_snapshot_id: None,
@@ -188,6 +207,7 @@ async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_sta
             ref_name: None,
         },
         operation_kind: OperationKind::InsertAppend,
+        operation_subkind: None,
         commit_op_kind: CommitOpKind::FastAppend,
         attempt_id: "attempt-1".to_string(),
         base_snapshot_id: Some(10),

@@ -129,12 +129,21 @@ mod tests {
 
     impl WriteExecutor for OkExecutor {
         type CommitHandle = ();
+        type AbortHandle = std::convert::Infallible;
 
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
         ) -> Result<CoordinatedWriteReport<()>, String> {
             Ok(CoordinatedWriteReport::CommitRequired(()))
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            handle: &Self::AbortHandle,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            match *handle {}
         }
 
         fn commit(
@@ -162,6 +171,7 @@ mod tests {
                 ref_name: None,
             },
             operation_kind: OperationKind::InsertAppend,
+            operation_subkind: None,
             commit_op_kind: CommitOpKind::FastAppend,
             attempt_id: "a".to_string(),
             base_snapshot_id: None,

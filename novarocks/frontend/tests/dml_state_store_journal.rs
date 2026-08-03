@@ -394,6 +394,94 @@ async fn restart_loads_unfinished_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn update_subkind_survives_state_store_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (mut host, store, journal) = open_store(&path).await;
+    let mut update = request();
+    update.operation_kind = OperationKind::RowDelta;
+    update.operation_subkind = Some("UPDATE".to_string());
+    let operation_id = journal.create_preparing(update).unwrap();
+    drop(journal);
+    drop(store);
+    host.shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let (_host, _store, reopened) = open_store(&path).await;
+    let stored = reopened.load(operation_id).unwrap().unwrap();
+    assert_eq!(stored.operation_kind, OperationKind::RowDelta);
+    assert_eq!(stored.operation_subkind.as_deref(), Some("UPDATE"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_abort_known_committed_removes_unfinished_index() {
+    let temp = TempDir::new().unwrap();
+    let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = journal.create_preparing(request()).unwrap();
+    journal
+        .transition(operation_id, OperationState::Aborting)
+        .unwrap();
+    journal
+        .record_fact(
+            operation_id,
+            OperationFact {
+                state: OperationState::Committed,
+                commit_outcome: Some(IcebergCommitOutcomeRecord {
+                    snapshot_id: 11,
+                    written_manifest_paths: vec![],
+                }),
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: None,
+            },
+        )
+        .unwrap();
+    journal
+        .transition(operation_id, OperationState::Finalizing)
+        .unwrap();
+    journal
+        .transition(operation_id, OperationState::Finalized)
+        .unwrap();
+
+    assert!(journal.list_unfinished().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_abort_unknown_remains_in_unfinished_index_after_restart() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (mut host, store, journal) = open_store(&path).await;
+    let operation_id = journal.create_preparing(request()).unwrap();
+    journal
+        .transition(operation_id, OperationState::Aborting)
+        .unwrap();
+    journal
+        .record_fact(
+            operation_id,
+            OperationFact {
+                state: OperationState::CommitUnknown,
+                commit_outcome: None,
+                cleanup_outcome: None,
+                recovery_evidence: None,
+                failure: None,
+            },
+        )
+        .unwrap();
+    drop(journal);
+    drop(store);
+    host.shutdown(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let (_host, _store, reopened) = open_store(&path).await;
+    let unfinished = reopened.list_unfinished().unwrap();
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].operation_id, operation_id);
+    assert_eq!(unfinished[0].state, OperationState::CommitUnknown);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn identical_fact_replay_is_idempotent() {
     let temp = TempDir::new().unwrap();
     let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
@@ -807,6 +895,51 @@ async fn literal_v1_record_decodes_to_normalized_write_payload() {
         .unwrap();
     assert_eq!(stored.schema_version, DML_LEGACY_OPERATION_SCHEMA_VERSION);
     assert_eq!(stored.payload, OperationPayload::WriteV1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn literal_v1_record_without_subkind_decodes_as_none() {
+    let temp = TempDir::new().unwrap();
+    let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
+    let operation_id = Uuid::now_v7();
+    let value = json!({
+        "schema_version": DML_LEGACY_OPERATION_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "revision": 1,
+        "last_mutation_id": Uuid::now_v7(),
+        "operation_kind": "ROW_DELTA",
+        "target": {
+            "catalog": "cat",
+            "namespace": "ns",
+            "table": "tbl",
+            "ref_name": null
+        },
+        "state": "PREPARING",
+        "attempt_id": "attempt-1",
+        "base_snapshot_id": null,
+        "base_snapshot_map": {},
+        "staged_artifacts": [],
+        "commit_outcome": null,
+        "cleanup_outcome": null,
+        "recovery_evidence": null,
+        "failure": null,
+        "created_at_ms": 1,
+        "updated_at_ms": 1,
+        "finished_at_ms": null
+    });
+    raw_put(
+        store.as_ref(),
+        key(OPERATION_PREFIX, operation_id),
+        Value::try_from(Bytes::from(serde_json::to_vec(&value).unwrap())).unwrap(),
+    )
+    .await;
+
+    let stored = journal
+        .load(DmlOperationId::from(operation_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.operation_kind, OperationKind::RowDelta);
+    assert_eq!(stored.operation_subkind, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
