@@ -259,6 +259,17 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
             } => Some(format!(
                 "IcebergDeltaTable from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
             )),
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+            } => Some(format!("IcebergVersionTable snapshot_id={snapshot_id}")),
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version:
+                    crate::sql::planner::table::SqlTableVersionSelector::TimestampMillis(
+                        timestamp_millis,
+                    ),
+            } => Some(format!(
+                "IcebergVersionTable timestamp_millis={timestamp_millis}"
+            )),
             crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => Some(format!(
                 "IcebergMvTargetState target={}.{}.{} keys=[{}] states=[{}] {}",
                 source.table.catalog,
@@ -717,6 +728,24 @@ mod tests {
         ))
     }
 
+    fn sql_snapshot_source(snapshot_id: i64) -> ScanSource {
+        let binding = SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+            NonZeroU32::new(1).expect("ordinal"),
+        );
+        ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+            },
+            SqlScanKind::FrozenInputSet {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+            },
+        ))
+    }
+
     fn sql_target_locator_source() -> ScanSource {
         let binding = SqlTableBindingId::new(
             SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
@@ -793,6 +822,13 @@ mod tests {
             delta_verbose
                 .contains("source: IcebergDeltaTable from_snapshot_id=101 to_snapshot_id=200"),
             "{delta_verbose}"
+        );
+
+        let version_plan = scan_plan_with_source("orders", sql_snapshot_source(200));
+        let version_verbose = explain_plan(&version_plan, ExplainLevel::Verbose).join("\n");
+        assert!(
+            version_verbose.contains("source: IcebergVersionTable snapshot_id=200"),
+            "{version_verbose}"
         );
 
         let locator_plan = scan_plan_with_source("pf_mv", sql_target_locator_source());
