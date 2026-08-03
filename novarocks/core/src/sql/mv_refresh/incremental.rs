@@ -11,8 +11,7 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorWriteCohortId,
-    ConnectorWriteOperationId,
+    ConnectorExecutionBindingKey, ConnectorWriteCohortId, ConnectorWriteOperationId,
 };
 
 use super::first_refresh::MvFirstRefreshLogicalContext;
@@ -61,7 +60,6 @@ pub(crate) struct MvIncrementalWriteRequest {
     pub(crate) expected_target_snapshot_id: Option<i64>,
     pub(crate) observed_binding: ConnectorExecutionBindingKey,
     pub(crate) operation_id: ConnectorWriteOperationId,
-    pub(crate) connector_context: ConnectorRequestContext,
 }
 
 impl MvIncrementalWriteRequest {
@@ -76,7 +74,6 @@ impl MvIncrementalWriteRequest {
         expected_target_snapshot_id: Option<i64>,
         observed_binding: ConnectorExecutionBindingKey,
         operation_id: ConnectorWriteOperationId,
-        connector_context: ConnectorRequestContext,
     ) -> Result<Self, String> {
         if target_catalog.is_empty()
             || target_namespace.is_empty()
@@ -96,7 +93,6 @@ impl MvIncrementalWriteRequest {
             expected_target_snapshot_id,
             observed_binding,
             operation_id,
-            connector_context,
         })
     }
 }
@@ -151,10 +147,6 @@ impl PreparedMvIncrementalWrite {
 
     pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
         self.request.expected_target_snapshot_id
-    }
-
-    pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
-        &self.request.connector_context
     }
 
     pub(crate) const fn mode(&self) -> MvIncrementalWriteMode {
@@ -219,7 +211,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_rejects_missing_staging_identity() {
+    fn sqlx2_mv_incremental_request_rejects_missing_staging_identity() {
         let result = MvIncrementalWriteRequest::try_new(
             "ice".to_string(),
             "db".to_string(),
@@ -236,11 +228,6 @@ mod tests {
                 ),
             },
             ConnectorWriteOperationId::from_bytes([2; 16]),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )
-            .expect("request context"),
         );
         match result {
             Err(error) => assert_eq!(error, "invalid MV incremental write request identity"),

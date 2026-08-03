@@ -498,7 +498,6 @@ fn prepare_frontend_first_refresh_write(
             target_contract,
             observed_binding,
             attempt.write_operation_id,
-            connector_context,
         )?;
         return crate::sql::mv_refresh::first_refresh::MvFirstRefreshWritePreparer::prepare_join_logical(
             request,
@@ -620,7 +619,6 @@ fn prepare_frontend_first_refresh_write(
         target_contract,
         observed_binding,
         attempt.write_operation_id,
-        connector_context,
     )?;
     crate::sql::mv_refresh::first_refresh::MvFirstRefreshWritePreparer::prepare(
         request,
@@ -886,7 +884,6 @@ fn prepare_frontend_incremental_write(
             *target_snapshot_id,
             observed_binding,
             attempt.write_operation_id,
-            connector_context,
         )?;
         let marker = MvRefreshSnapshotMarker {
             refresh_id: attempt.refresh_id,
@@ -1037,7 +1034,6 @@ fn prepare_frontend_incremental_write(
         *target_snapshot_id,
         observed_binding,
         attempt.write_operation_id,
-        connector_context,
     )?;
     let marker = MvRefreshSnapshotMarker {
         refresh_id: attempt.refresh_id,
@@ -15743,7 +15739,9 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             &request.target_name,
             &facts,
         )?;
-    refresh_context.connector_context = Some(request.connector_context.clone());
+    refresh_context.connector_context = Some(
+        crate::connector::connector_request_context_for_execution(None, execution)?,
+    );
     let target = crate::engine::backend_resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: request.target_catalog,

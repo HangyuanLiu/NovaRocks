@@ -28,8 +28,8 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::LogicalPlanNode;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorWriteCohortId, ConnectorWriteOperationId,
+    ConnectorExecutionBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
+    ConnectorWriteOperationId,
 };
 use std::collections::BTreeSet;
 
@@ -242,7 +242,6 @@ pub(crate) struct MvFirstRefreshWriteRequest {
     target_contract: MvFirstRefreshTargetContract,
     observed_binding: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
-    connector_context: ConnectorRequestContext,
 }
 
 impl MvFirstRefreshWriteRequest {
@@ -261,7 +260,6 @@ impl MvFirstRefreshWriteRequest {
         target_contract: MvFirstRefreshTargetContract,
         observed_binding: ConnectorExecutionBindingKey,
         operation_id: ConnectorWriteOperationId,
-        connector_context: ConnectorRequestContext,
     ) -> Result<Self, String> {
         if canonical_select_sql.trim().is_empty()
             || target_catalog.is_empty()
@@ -287,7 +285,6 @@ impl MvFirstRefreshWriteRequest {
             target_contract,
             observed_binding,
             operation_id,
-            connector_context,
         })
     }
 
@@ -342,10 +339,6 @@ impl MvFirstRefreshWriteRequest {
     pub(crate) const fn operation_id(&self) -> ConnectorWriteOperationId {
         self.operation_id
     }
-
-    pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
-        &self.connector_context
-    }
 }
 
 /// Side-effect-free SQL preparation for a first-refresh write.  Its fields
@@ -378,10 +371,6 @@ impl PreparedMvFirstRefreshWrite {
 
     pub(crate) fn root_hash_column(&self) -> &str {
         self.artifact.root_hash_column()
-    }
-
-    pub(crate) fn connector_context(&self) -> &ConnectorRequestContext {
-        self.request.connector_context()
     }
 
     pub(crate) fn target_catalog(&self) -> &str {

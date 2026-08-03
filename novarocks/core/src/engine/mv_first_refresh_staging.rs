@@ -114,7 +114,7 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
         ctx,
         staging_branch.clone(),
         execution,
-        move |operation_id, observed_binding, connector_context| {
+        move |operation_id, observed_binding| {
             prepare_mv_first_refresh_sql_write(
                 ctx,
                 shape,
@@ -122,7 +122,6 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
                 &staging_branch,
                 operation_id,
                 observed_binding,
-                connector_context,
             )
         },
     )
@@ -143,7 +142,7 @@ pub(crate) fn execute_mv_first_refresh_join_staging_for_test(
         ctx,
         staging_branch.clone(),
         execution,
-        move |operation_id, observed_binding, connector_context| {
+        move |operation_id, observed_binding| {
             prepare_mv_first_refresh_join_write(
                 ctx,
                 shape,
@@ -151,7 +150,6 @@ pub(crate) fn execute_mv_first_refresh_join_staging_for_test(
                 &staging_branch,
                 operation_id,
                 observed_binding,
-                connector_context,
             )
         },
     )
@@ -169,7 +167,6 @@ where
     F: FnOnce(
         ConnectorWriteOperationId,
         ConnectorExecutionBindingKey,
-        novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<PreparedMvFirstRefreshWrite, String>,
 {
     let catalog_instance = ConnectorInstanceId::parse(&ctx.rewrite.target.catalog)
@@ -192,7 +189,7 @@ where
         .clone();
 
     // Preparation is intentionally complete before the staging-ref mutation.
-    let prepared = prepare(operation_id, observed_binding, connector_context.clone())?;
+    let prepared = prepare(operation_id, observed_binding)?;
     let mutation_lease = planning_lease
         .derive_mutation_lease()
         .map_err(|error| format!("derive MV first-refresh test mutation lease: {error}"))?;
@@ -262,6 +259,7 @@ where
                 operation_id.to_string(),
             ),
         ]),
+        connector_context.clone(),
         &write_lease,
     )?;
     let registration = ConnectorWriteOperationRegistration::single(template);
@@ -277,6 +275,7 @@ where
         prepared,
         sink_spec,
         execution,
+        connector_context.clone(),
         write_registration,
         Some(ctx),
     )?;
@@ -364,7 +363,6 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvFirstRefreshWrite, String> {
     if matches!(
         shape,
@@ -372,14 +370,8 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     ) {
         return Err("join first-refresh must use the typed append logical artifact".to_string());
     }
-    let request = mv_first_refresh_request(
-        ctx,
-        shape,
-        staging_branch,
-        operation_id,
-        observed_binding,
-        connector_context,
-    )?;
+    let request =
+        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
     MvFirstRefreshWritePreparer::prepare(request, physical_sql)
 }
 
@@ -394,7 +386,6 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvFirstRefreshWrite, String> {
     if !matches!(
         shape,
@@ -402,14 +393,8 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     ) {
         return Err("typed first-refresh append artifact requires a join shape".to_string());
     }
-    let request = mv_first_refresh_request(
-        ctx,
-        shape,
-        staging_branch,
-        operation_id,
-        observed_binding,
-        connector_context,
-    )?;
+    let request =
+        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
     MvFirstRefreshWritePreparer::prepare_join_logical(request, append, frozen_logical_context(ctx))
 }
 
@@ -435,7 +420,6 @@ fn mv_first_refresh_request(
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvFirstRefreshWriteRequest, String> {
     if staging_branch.is_empty() {
         return Err("MV first-refresh staging branch is empty".to_string());
@@ -514,7 +498,6 @@ fn mv_first_refresh_request(
         target_contract,
         observed_binding,
         operation_id,
-        connector_context,
     )
 }
 
@@ -527,6 +510,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     state: &Arc<StandaloneState>,
     prepared: &PreparedMvFirstRefreshWrite,
     mut provenance_properties: std::collections::BTreeMap<String, String>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<
     (
@@ -658,7 +642,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
             }
         },
         operation_id,
-        prepared.connector_context().clone(),
+        connector_context,
         exact_lease,
     )?;
     Ok((sink_spec, template))
@@ -703,12 +687,14 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
-    let connector_context = prepared.connector_context().clone();
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_distribution = iceberg_write_shuffle_by_output_name(prepared.root_hash_column());
     let (sink_spec, template) = activate_mv_first_refresh_connector_write(
         state,
         &prepared,
         std::collections::BTreeMap::new(),
+        connector_context.clone(),
         exact_lease,
     )?;
     let distributed = match prepared.into_execution_artifact() {
@@ -882,6 +868,7 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     prepared: PreparedMvFirstRefreshWrite,
     sink_spec: IcebergWriteSinkSpec,
     execution: &QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     registration: ConnectorWriteExecutionRegistration,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<(ConnectorWriteCompletion, ConnectorWriteStagingSummary), String> {
@@ -895,7 +882,6 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
             "MV first-refresh staging sink schema does not match target contract".to_string(),
         );
     }
-    let connector_context = prepared.connector_context().clone();
     let root_hash_column = prepared.root_hash_column().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
