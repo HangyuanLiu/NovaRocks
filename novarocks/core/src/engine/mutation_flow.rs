@@ -38,7 +38,7 @@ use crate::engine::StandaloneState;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
     IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    row_lineage_sink_spec_from_frozen_materialization, sql_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -272,9 +272,27 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) target_ref: String,
+    pub(crate) mor_write_target: Option<PreparedMorUpdateWriteTarget>,
     pub(crate) mode: IcebergUpdateMode,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+/// MOR-only writer facts frozen during UPDATE admission.
+///
+/// COW UPDATE retains its existing per-file application lifecycle.  In
+/// contrast, MOR builds one SQL change-stream producer after the frontend has
+/// persisted the mutation intent, so its writer target must be frozen here.
+pub(crate) struct PreparedMorUpdateWriteTarget {
+    /// The branch/current snapshot selected during admission. MOR production
+    /// planning must not observe a later branch head after the frontend has
+    /// recorded the mutation intent.
+    pub(crate) read_snapshot_id: Option<i64>,
+    /// Application-owned writer facts frozen with `planning_lease`. They are
+    /// admitted into the same query-local store as the producer compile, never
+    /// rebuilt during stage/preparation.
+    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
 pub(crate) struct PreparedMergeMutation {
@@ -371,6 +389,47 @@ pub(crate) fn prepare_update_mutation(
     validate_update_assignments(&stmt.assignments, &target_columns, &partition_columns)?;
 
     let mode = select_iceberg_update_mode(&table)?;
+    let mor_write_target = if mode == IcebergUpdateMode::MergeOnRead {
+        let read_snapshot_id = if target_ref != "main" {
+            crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+                table.metadata(),
+                &target_ref,
+            )?
+        } else {
+            table
+                .metadata()
+                .current_snapshot()
+                .map(|snapshot| snapshot.snapshot_id())
+        };
+        // Freeze the writer target at admission, alongside the prepared
+        // mutation. Stage runs after frontend lifecycle persistence and must
+        // never reopen the connector generation or observe a later snapshot.
+        let planning_lease = crate::connector::acquire_metadata_planning_lease(
+            state.connector_control.as_ref(),
+            &target.catalog,
+        )?;
+        let materialization =
+            crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+                planning_lease,
+                connector_context.clone(),
+                &target.namespace,
+                &target.table,
+            )?;
+        // Retain the lease returned beside the provider facts, rather than an
+        // independent clone, so the stored writer envelope has one explicit
+        // generation authority.
+        let planning_lease = materialization.planning_lease.clone();
+        let mut sink_spec =
+            row_lineage_sink_spec_from_frozen_materialization(&materialization, &entry)?;
+        sink_spec.set_planned_snapshot_id(read_snapshot_id)?;
+        Some(PreparedMorUpdateWriteTarget {
+            read_snapshot_id,
+            sink_spec,
+            planning_lease,
+        })
+    } else {
+        None
+    };
     Ok(PreparedUpdateMutation {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -381,6 +440,7 @@ pub(crate) fn prepare_update_mutation(
         target_columns,
         entry,
         target_ref,
+        mor_write_target,
         mode,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
@@ -458,9 +518,10 @@ pub(crate) fn prepare_merge_mutation(
     })
 }
 
-/// Execute the post-intent half of an UPDATE.  Preparation above is inert;
-/// match materialization, cohort registration and distributed staging happen
-/// only here, after the frontend has persisted its `Preparing` record.
+/// Execute the post-intent half of an UPDATE. Preparation above only freezes
+/// validation and connector planning facts; match materialization, cohort
+/// registration and distributed staging happen only here, after the frontend
+/// has persisted its `Preparing` record.
 pub(crate) fn stage_prepared_update_mutation(
     state: &Arc<StandaloneState>,
     prepared: PreparedUpdateMutation,
@@ -475,6 +536,7 @@ pub(crate) fn stage_prepared_update_mutation(
         target_columns,
         entry,
         target_ref,
+        mor_write_target,
         mode,
         execution,
         connector_context,
@@ -566,17 +628,13 @@ pub(crate) fn stage_prepared_update_mutation(
             })
         }
         IcebergUpdateMode::MergeOnRead => {
-            let read_snapshot_id = if target_ref != "main" {
-                crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
-                    table.metadata(),
-                    &target_ref,
-                )?
-            } else {
-                table
-                    .metadata()
-                    .current_snapshot()
-                    .map(|snapshot| snapshot.snapshot_id())
-            };
+            let PreparedMorUpdateWriteTarget {
+                read_snapshot_id,
+                sink_spec: write_sink_spec,
+                planning_lease: write_planning_lease,
+            } = mor_write_target.ok_or_else(|| {
+                "MOR UPDATE reached stage without an admitted frozen write target".to_string()
+            })?;
             let metadata = table.metadata();
             let collector = Arc::new(
                 IcebergCommitCollector::new(
@@ -605,6 +663,8 @@ pub(crate) fn stage_prepared_update_mutation(
                 metadata.last_sequence_number() + 1,
                 &execution,
                 &connector_context,
+                &write_sink_spec,
+                write_planning_lease,
             )?;
             let abort_cleanup =
                 crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -829,6 +889,8 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_sink_spec: &IcebergWriteSinkSpec,
+    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
     let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
@@ -866,6 +928,15 @@ fn build_update_mor_change_stream_write_plan(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
+    // This admission uses the exact lease and table facts selected above.  It
+    // intentionally precedes compilation, so `build_dml_change_stream_write_plan`
+    // can recover the write token from the same store that resolves producer
+    // scans. No preparation phase is allowed to reacquire current/latest.
+    admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        write_sink_spec,
+        write_planning_lease,
+    )?;
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         state,
         &query,

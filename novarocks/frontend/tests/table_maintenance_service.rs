@@ -759,6 +759,38 @@ async fn automatic_calls_bypass_sql_parser_but_use_typed_engine_and_duplicate_re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sqlx2_automatic_mv_expire_preserves_planned_retention_without_user_mv_guard() {
+    let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
+        .await
+        .expect("open frontend table-maintenance service");
+    let engine = FakeMaintenanceEngine::default();
+    let request = MaintenanceActionRequest::ExpireSnapshots {
+        target: target("ice", "db", "mv_table"),
+        older_than_ms: Some(1_767_225_600_000),
+        retain_last: Some(3),
+    };
+
+    assert_eq!(
+        service
+            .execute_automatic_action(&engine, request.clone())
+            .expect("execute frontend-owned automatic MV expire"),
+        MaintenanceActionOutcome::ExpireSnapshots {
+            deleted_data_files_count: Some(1),
+            deleted_position_delete_files_count: Some(2),
+            deleted_equality_delete_files_count: None,
+            deleted_manifest_files_count: Some(3),
+            deleted_manifest_lists_count: Some(4),
+            deleted_statistics_files_count: None,
+        }
+    );
+    assert_eq!(engine.requests(), vec![request]);
+    assert!(
+        engine.guarded_targets().is_empty(),
+        "automatic maintenance must not take the user-facing MV rejection path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn missing_state_store_only_blocks_repository_backed_operations() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await

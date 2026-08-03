@@ -230,6 +230,9 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
             vec![bound_read_for_test(Some(1), "order_id")],
         ))
         .expect("insert ordinary Iceberg binding");
+    bindings
+        .insert_connector_read(0, 10, planned_connector_read_for_test())
+        .expect("materialize ordinary connector read");
     let with_binding = encode_distributed_plan_with_context(
         &plan,
         NativePlanEncodeContext {
@@ -244,14 +247,15 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
 
     let scan = encoded_root_scan_for_test(&with_binding);
     let table = scan.table.as_ref().expect("bound table");
-    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+    let Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(connector)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
     else {
-        panic!("ordinary source must encode as IcebergDataFiles");
+        panic!("ordinary source must encode as ConnectorReadSource");
     };
-    let _ = files;
+    assert_eq!(connector.instance_id, "ice");
+    assert_eq!(connector.scan_payload, b"delta-scan");
 }
 
 #[test]
@@ -289,7 +293,6 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
     ];
 
     for source in refresh_sources {
-        let expected_source = source.clone();
         let plan = iceberg_delta_distributed_plan_for_test();
         let mut plan = crate::sql::planner::distributed::test_support::draft_builder_from_plan(
             &plan,
@@ -351,6 +354,9 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
                 ],
             ))
             .expect("insert refresh file binding");
+        bindings
+            .insert_connector_read(0, 10, planned_connector_read_for_test())
+            .expect("materialize refresh connector read");
 
         let encoded = encode_distributed_plan_with_context(
             &plan,
@@ -400,28 +406,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             .expect("encoded refresh source");
         assert!(
             matches!(
-                (&expected_source, encoded_source),
-                (
-                    table_model::ScanSource::Sql(table_model::SqlScanSource {
-                        kind: table_model::SqlScanKind::Data { .. },
-                        ..
-                    }),
-                    novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(_)
-                ) | (
-                    table_model::ScanSource::Sql(table_model::SqlScanSource {
-                        kind: table_model::SqlScanKind::MvTargetLocator { .. },
-                        ..
-                    }),
-                    novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetLocator(_)
-                ) | (
-                    table_model::ScanSource::Sql(table_model::SqlScanSource {
-                        kind: table_model::SqlScanKind::MvTargetState { .. },
-                        ..
-                    }),
-                    novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetState(_)
-                )
+                encoded_source,
+                novarocks_protocol::plan::scan_source::Kind::ConnectorRead(_)
             ),
-            "resolved file bindings must not erase the typed refresh source kind"
+            "prepared refresh scans must cross the native boundary as ConnectorReadSource"
         );
     }
 }
@@ -541,6 +529,9 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
             Vec::new(),
         ))
         .expect("insert variant binding");
+    bindings
+        .insert_connector_read(0, 10, planned_connector_read_for_test())
+        .expect("materialize VARIANT connector read");
 
     let encoded = encode_distributed_plan_with_context(
         &plan,
@@ -564,16 +555,14 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     assert_eq!(scan.required_columns, vec!["__nr_var_v_0"]);
     assert_eq!(scan.variant_columns[0].synthetic_column_id, 2);
     let table = scan.table.as_ref().expect("bound table");
-    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+    let Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(connector)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
     else {
-        panic!("variant binding must encode as IcebergDataFiles");
+        panic!("variant binding must encode as ConnectorReadSource");
     };
-    assert!(
-        matches!(files.binding, x if x == novarocks_protocol::plan::IcebergDataFileBinding::ExplicitFiles as i32)
-    );
+    assert_eq!(connector.instance_id, "ice");
 }
 
 fn root_scan_for_test(

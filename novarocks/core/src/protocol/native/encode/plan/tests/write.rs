@@ -114,7 +114,7 @@ fn encode_scan_node_with_file_binding(
             planner: OutputColumn {
                 column_id: ColumnId::new_for_test(10),
                 name: column_name.to_string(),
-                data_type,
+                data_type: data_type.clone(),
                 nullable,
                 is_internal: false,
             },
@@ -647,22 +647,15 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
         table.columns[0].write_default_json.as_deref(),
         Some("\"9.99\"")
     );
-    let source = table.source.as_ref().expect("scan source");
-    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(iceberg)) =
-        source.kind.as_ref()
-    else {
-        panic!("expected Iceberg data-files source");
-    };
-    let field = &iceberg
-        .table
-        .as_ref()
-        .expect("iceberg table")
-        .schema
-        .as_ref()
-        .expect("iceberg schema")
-        .fields[0];
-    assert_eq!(field.initial_default_json.as_deref(), Some("5"));
-    assert_eq!(field.write_default_json.as_deref(), Some("7"));
+    assert!(matches!(
+        table
+            .source
+            .as_ref()
+            .and_then(|source| source.kind.as_ref()),
+        Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(
+            _
+        ))
+    ));
 }
 
 #[test]

@@ -493,9 +493,9 @@ mod tests {
         assert_eq!(stored.attempt_id, "insert-10-20");
         assert_eq!(stored.base_snapshot_id, Some(42));
         assert_eq!(stored.base_snapshot_map["ice.sales.orders"], 42);
-        assert_eq!(
-            stored.staged_artifacts,
-            vec!["s3://warehouse/orders/_staging/a.parquet".to_string()]
+        assert!(
+            stored.staged_artifacts.is_empty(),
+            "provider artifacts remain behind the exact connector control lease"
         );
         assert_eq!(stored.created_at_ms, 1234);
         assert_eq!(stored.updated_at_ms, 1234);
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(stored.state, IcebergOperationState::FailedKnownUncommitted);
         let failure = stored.failure.expect("failure record");
         assert_eq!(failure.kind, IcebergOperationFailureKind::KnownUncommitted);
-        assert_eq!(failure.next_action, IcebergOperationNextAction::RetryAbort);
+        assert_eq!(failure.next_action, IcebergOperationNextAction::None);
         assert!(
             failure.message.contains("completed_writers=1"),
             "{}",
@@ -541,9 +541,7 @@ mod tests {
             "{}",
             failure.message
         );
-        let cleanup = stored.cleanup_outcome.expect("cleanup outcome");
-        assert!(!cleanup.attempted);
-        assert_eq!(cleanup.error_count, 0);
+        assert!(stored.cleanup_outcome.is_none());
         assert_eq!(stored.updated_at_ms, 2345);
         assert_eq!(stored.finished_at_ms, Some(2345));
     }

@@ -16,7 +16,10 @@
 // under the License.
 
 use arrow::datatypes::DataType;
+use bytes::Bytes;
 use prost::Message;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use super::super::plan;
 use super::{column_expr, int_expr};
@@ -120,11 +123,110 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
         columns,
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Data {
-                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
-            },
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
         ),
     }
+}
+
+fn prepared_connector_scan_bindings(
+    fragment_id: crate::sql::planner::distributed::FragmentId,
+    node_id: i32,
+    columns: &[crate::sql::analysis::OutputColumn],
+    required_columns: &[&str],
+) -> ScanExecutionBindings {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+        .expect("fixture connector instance ID");
+    let mut bindings = ScanExecutionBindings::default();
+    let physical_columns = columns
+        .iter()
+        .map(|planner| crate::query_execution::preparation::scan::ResolvedScanColumn {
+            planner: planner.clone(),
+            source: novarocks_catalog::schema::ColumnDef {
+                name: planner.name.clone(),
+                data_type: planner.data_type.clone(),
+                nullable: planner.nullable,
+                write_default: None,
+                logical_type: None,
+            },
+            kind: crate::query_execution::preparation::scan::ResolvedScanColumnKind::PhysicalTableColumn,
+        })
+        .collect::<Vec<_>>();
+    let required_reads = physical_columns
+        .iter()
+        .filter(|column| {
+            required_columns
+                .iter()
+                .any(|required| column.source.name.eq_ignore_ascii_case(required))
+        })
+        .map(|column| crate::query_execution::preparation::scan::ResolvedReadColumn {
+            planner_column_id: Some(column.planner.column_id),
+            source: column.source.clone(),
+            reason: crate::query_execution::preparation::scan::ResolvedReadReason::PlannerRequiredOrOutput,
+        })
+        .collect::<Vec<_>>();
+    bindings
+        .insert_binding(
+            crate::query_execution::preparation::scan::ResolvedScanBinding {
+                node_id,
+                execution:
+                    crate::query_execution::preparation::scan::ResolvedScanExecution::ConnectorRead,
+                physical_columns,
+                required_reads,
+            },
+        )
+        .expect("insert prepared connector scan binding");
+    let declaration = novarocks_spi::connector::ConnectorExecutionDeclaration::try_new(
+        novarocks_spi::connector::ConnectorInstanceDescriptor {
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("fixture connector provider ID"),
+            instance_id: instance_id.clone(),
+        },
+        novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        Bytes::from_static(b"integration-binding"),
+    )
+    .expect("fixture connector declaration");
+    bindings
+        .insert_connector_read(
+            fragment_id,
+            node_id,
+            crate::query_execution::preparation::scan::PlannedConnectorRead {
+                declaration,
+                scan: novarocks_spi::connector::ConnectorScan {
+                    handle: novarocks_spi::connector::ConnectorScanHandle::try_new(
+                        instance_id,
+                        Bytes::from_static(b"integration-scan"),
+                    )
+                    .expect("fixture connector scan handle"),
+                    output_schema: Arc::new(arrow::datatypes::Schema::new(
+                        columns
+                            .iter()
+                            .map(|column| {
+                                arrow::datatypes::Field::new(
+                                    &column.name,
+                                    column.data_type.clone(),
+                                    column.nullable,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    predicate_dispositions: Vec::new(),
+                },
+                splits: Vec::new(),
+                planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(
+                ),
+                static_predicates: Vec::new(),
+                predicate_dispositions: Vec::new(),
+                residual_predicates: Vec::new(),
+                batch: novarocks_spi::connector::ConnectorBatchBudget {
+                    max_rows: NonZeroUsize::new(1024).expect("nonzero row budget"),
+                    max_bytes: NonZeroUsize::new(1024).expect("nonzero byte budget"),
+                },
+                planning_lease: None,
+                read_session: None,
+            },
+        )
+        .expect("insert prepared connector read");
+    bindings
 }
 
 #[test]
@@ -266,7 +368,7 @@ fn stream_edge_projects_pruned_scan_columns_by_column_id() {
                 database: "db".to_string(),
                 table: iceberg_scan_table_for_columns(&["v1", "s2", "array1"]),
                 alias: None,
-                columns: all_scan_columns,
+                columns: all_scan_columns.clone(),
                 predicates: Vec::new(),
                 required_columns: Some(vec!["s2".to_string(), "array1".to_string()]),
                 variant_columns: Vec::new(),
@@ -330,8 +432,10 @@ fn stream_edge_projects_pruned_scan_columns_by_column_id() {
         }],
     };
 
-    let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
-        .expect("encode distributed plan");
+    let scan_bindings =
+        prepared_connector_scan_bindings(0, 11, &all_scan_columns, &["s2", "array1"]);
+    let encoded =
+        plan::encode_distributed_plan(&plan, &scan_bindings).expect("encode distributed plan");
     let target_fragment = encoded
         .fragments
         .iter()

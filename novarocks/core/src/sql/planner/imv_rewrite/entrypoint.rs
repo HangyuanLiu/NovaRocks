@@ -2461,6 +2461,39 @@ pub(crate) mod tests {
     pub(crate) mod tests_support {
         use super::*;
 
+        /// Request-local token assignment for the join-refresh coalesce
+        /// lowering fixture. The old SQL-only builder intentionally reused
+        /// its placeholder token for every scan. Owner tests that exercise
+        /// preparation must instead retain one exact binding per physical
+        /// base/target identity.
+        #[derive(Clone, Copy, Debug)]
+        pub(crate) struct JoinRefreshCoalesceBindingTokens {
+            pub(crate) left: crate::sql::binding::SqlTableBindingId,
+            pub(crate) right: crate::sql::binding::SqlTableBindingId,
+            pub(crate) target: crate::sql::binding::SqlTableBindingId,
+        }
+
+        impl JoinRefreshCoalesceBindingTokens {
+            pub(crate) fn for_scope(scope: crate::sql::binding::SqlTableBindingScopeId) -> Self {
+                use std::num::NonZeroU32;
+
+                Self {
+                    left: crate::sql::binding::SqlTableBindingId::new(
+                        scope,
+                        NonZeroU32::new(1).expect("nonzero fixture ordinal"),
+                    ),
+                    right: crate::sql::binding::SqlTableBindingId::new(
+                        scope,
+                        NonZeroU32::new(2).expect("nonzero fixture ordinal"),
+                    ),
+                    target: crate::sql::binding::SqlTableBindingId::new(
+                        scope,
+                        NonZeroU32::new(3).expect("nonzero fixture ordinal"),
+                    ),
+                }
+            }
+        }
+
         pub(crate) fn build_join_refresh_coalesce_plan_for_lowering()
         -> crate::sql::optimizer::OptimizedOperatorNode {
             let plan = join_projection_plan();
@@ -2496,6 +2529,42 @@ pub(crate) mod tests {
             }
             .expect("join projection coalesce plan");
             optimize_logical_for_test(coalesce)
+        }
+
+        /// Build the same coalesce plan as the SQL-only rule test, but bind
+        /// every scan to the request-local identity that preparation will
+        /// materialize. Repeated scans of the same base deliberately reuse
+        /// its one exact admitted binding; the target locator has its own
+        /// target binding.
+        pub(crate) fn build_tokenized_join_refresh_coalesce_plan_for_lowering(
+            scope: crate::sql::binding::SqlTableBindingScopeId,
+        ) -> (
+            crate::sql::optimizer::OptimizedOperatorNode,
+            JoinRefreshCoalesceBindingTokens,
+        ) {
+            let tokens = JoinRefreshCoalesceBindingTokens::for_scope(scope);
+            let mut optimized = build_join_refresh_coalesce_plan_for_lowering();
+            retokenize_coalesce_scans(&mut optimized, tokens);
+            (optimized, tokens)
+        }
+
+        fn retokenize_coalesce_scans(
+            node: &mut crate::sql::optimizer::OptimizedOperatorNode,
+            tokens: JoinRefreshCoalesceBindingTokens,
+        ) {
+            if let crate::sql::optimizer::Operator::PhysicalScan(scan) = &mut node.op
+                && let ScanSource::Sql(source) = &mut scan.table.source
+            {
+                source.binding = match source.table.table.as_str() {
+                    "l" => tokens.left,
+                    "r" => tokens.right,
+                    "mv" => tokens.target,
+                    table => panic!("unexpected coalesce fixture scan table {table}"),
+                };
+            }
+            for child in &mut node.children {
+                retokenize_coalesce_scans(child, tokens);
+            }
         }
     }
 

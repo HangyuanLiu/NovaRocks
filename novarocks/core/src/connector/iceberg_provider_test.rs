@@ -215,8 +215,8 @@ fn iceberg_statistics_reader_requires_the_metadata_data_version_pin() {
         })
         .expect("read pinned statistics");
     assert_eq!(evidence.data_version, data_version);
-    assert_eq!(evidence.coverage, StatisticsCoverage::Subset);
-    assert_eq!(evidence.accuracy, StatisticsAccuracy::Approximate);
+    assert_eq!(evidence.coverage, StatisticsCoverage::Full);
+    assert_eq!(evidence.accuracy, StatisticsAccuracy::Exact);
 
     let collection = control
         .statistics()

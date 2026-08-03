@@ -3452,6 +3452,7 @@ mod tests {
     fn column_ref_id(expr: &TypedExpr) -> u32 {
         match &expr.kind {
             ExprKind::ColumnRef { column_id, .. } => column_id.0,
+            ExprKind::Cast { expr, .. } => column_ref_id(expr),
             other => panic!("expected column ref expr, got {other:?}"),
         }
     }

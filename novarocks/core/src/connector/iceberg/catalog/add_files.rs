@@ -427,11 +427,11 @@ fn list_direct_files(
             .map_err(|error| format!("list ADD FILES directory {directory}: {error}"))?;
         let mut files = Vec::new();
         for entry in entries {
-            let relative = entry
-                .path()
+            let entry_path = entry.path().trim_end_matches('/');
+            let relative = entry_path
                 .strip_prefix(&prefix)
-                .unwrap_or(entry.path())
-                .trim_end_matches('/');
+                .or_else(|| entry_path.strip_prefix(prefix.trim_start_matches('/')))
+                .unwrap_or(entry_path);
             let name = relative.rsplit('/').next().unwrap_or(relative);
             if name.starts_with('.') || name.starts_with('_') {
                 continue;

@@ -589,6 +589,62 @@ mod tests {
             .expect("shutdown frontend application host");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
+        let mut config = novarocks::common::app_config::NovaRocksConfig::default();
+        config.cluster.role = novarocks::common::app_config::ClusterRole::AllInOne;
+        let host = FrontendApplicationHost::open(
+            None,
+            FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+            ),
+            super::cluster_backend_open_config(&config).expect("valid all-in-one backend config"),
+        )
+        .await
+        .expect("open frontend application host");
+        let engine = novarocks::engine::StandaloneNovaRocks::open_with_config(
+            novarocks::engine::StandaloneOptions::default(),
+            config,
+            standalone_open_services(
+                Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
+                &host,
+            ),
+        )
+        .expect("open engine with frontend-owned application services");
+
+        let cancellation = novarocks::query_execution::cancellation::QueryCancellationSource::new();
+        let context = novarocks::query_execution::request_context::RequestContext::admit(
+            novarocks::query_execution::request_context::RequestAdmission::new(
+                None,
+                "db1".to_string(),
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                novarocks::query_execution::backend::BackendTopologySnapshot::empty(1),
+                None,
+                cancellation.view(),
+                novarocks::query_execution::request_context::SessionOptimizerSettings::default(),
+            ),
+        );
+        let error = engine
+            .command_executor()
+            .execute("SHOW ANALYZE JOBS", &context, None)
+            .expect_err("a host without StateStore must reach the frontend statistics service");
+        assert!(
+            error.contains("statistics job commands require a configured frontend StateStore"),
+            "statistics application port was not injected: {error}"
+        );
+        assert!(
+            !error.contains("statistics application service is unavailable"),
+            "Core default statistics application port must not be used: {error}"
+        );
+
+        drop(engine);
+        host.shutdown()
+            .await
+            .expect("shutdown frontend application host");
+    }
+
     #[test]
     fn runner_exports_typed_application_errors() {
         fn accepts_sync_runner(

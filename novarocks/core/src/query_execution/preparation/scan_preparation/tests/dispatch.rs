@@ -57,6 +57,277 @@ impl ScanBindingResolver for EmptyResolver {
     }
 }
 
+struct JoinRefreshDeltaResolver;
+
+impl ScanBindingResolver for JoinRefreshDeltaResolver {
+    fn resolve_scan(
+        &self,
+        _node_id: i32,
+        scan: &PlanScanNode,
+    ) -> Result<Option<ResolvedScanExecution>, String> {
+        let ScanSource::Sql(source) = &scan.table.source;
+        if !matches!(
+            &source.kind,
+            crate::sql::planner::table::SqlScanKind::Delta { .. }
+        ) {
+            return Err("join refresh fixture resolver received a non-delta scan".to_string());
+        }
+        Ok(Some(ResolvedScanExecution::IcebergDelta(
+            crate::query_execution::preparation::scan::ResolvedIcebergDeltaScan {
+                runtime_plan:
+                    crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
+                        table_location: format!(
+                            "s3://sqlx2-coalesce/{}/{}/{}",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ),
+                        data_columns: Vec::new(),
+                        change_files: Vec::new(),
+                        delete_side: None,
+                    },
+            },
+        )))
+    }
+}
+
+fn collect_coalesce_scan_tables(
+    node: &crate::sql::planner::distributed::DistributedNode,
+    scans: &mut std::collections::BTreeMap<String, crate::sql::planner::table::TableDef>,
+    node_ids: &mut Vec<i32>,
+) {
+    if let DistributedNodeKind::Scan(scan) = &node.payload {
+        let ScanSource::Sql(source) = &scan.table.source;
+        let previous = scans.insert(source.table.table.clone(), scan.table.clone());
+        if let Some(previous) = previous {
+            let ScanSource::Sql(previous) = &previous.source;
+            assert_eq!(
+                previous.binding, source.binding,
+                "repeated join-refresh scan for {} must keep its exact token",
+                source.table.table
+            );
+            assert_eq!(
+                previous.table, source.table,
+                "repeated join-refresh scan for {} must keep its base identity",
+                source.table.table
+            );
+        }
+        node_ids.push(node.node_id);
+    }
+    for child in &node.children {
+        collect_coalesce_scan_tables(child, scans, node_ids);
+    }
+}
+
+fn coalesce_iceberg_table(
+    table: &crate::sql::planner::table::TableDef,
+    table_uuid: Option<&str>,
+    current_snapshot_id: Option<i64>,
+) -> IcebergTableInfo {
+    IcebergTableInfo {
+        catalog: "ice".to_string(),
+        namespace: "db".to_string(),
+        table: table.name.clone(),
+        table_uuid: table_uuid.map(str::to_string),
+        current_snapshot_id,
+        schema_id: 1,
+        location: format!("s3://sqlx2-coalesce/{}", table.name),
+        schema: IcebergSchemaDef {
+            fields: table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, column)| IcebergSchemaFieldDef {
+                    field_id: i32::try_from(ordinal + 1).expect("coalesce fixture schema field id"),
+                    name: column.name.clone(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                })
+                .collect(),
+        },
+        serialized_metadata: None,
+        serialized_metadata_rows: None,
+    }
+}
+
+fn coalesce_binding(
+    table: crate::sql::planner::table::TableDef,
+    materialization: crate::engine::query_planning::bindings::QueryScanMaterialization,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> crate::engine::query_planning::bindings::QueryTableBinding {
+    crate::engine::query_planning::bindings::QueryTableBinding {
+        resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+            Some("ice"),
+            "db",
+            table,
+        ),
+        statistics_pin: None,
+        planning_lease: Some(planning_lease),
+        scan_materialization: Some(materialization),
+        delta_runtime_plans: std::collections::BTreeMap::new(),
+    }
+}
+
+#[test]
+fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() {
+    use std::num::NonZeroU64;
+
+    use crate::engine::query_planning::bindings::{
+        QueryScanMaterialization, QueryTableBindingKey, QueryTableBindingStore,
+    };
+    use crate::sql::planner::table::SqlScanKind;
+
+    let bindings = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(79).expect("fixture scope"),
+    );
+    let (optimized, tokens) = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_tokenized_join_refresh_coalesce_plan_for_lowering(bindings.scope());
+    let physical = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized)
+        .expect("coalesce fixture physical plan");
+    let distributed = crate::sql::planner::pipeline::build_distributed_plan(physical)
+        .expect("coalesce fixture distributed plan");
+
+    let mut scan_tables = std::collections::BTreeMap::new();
+    let mut scan_node_ids = Vec::new();
+    for fragment in distributed.fragments() {
+        collect_coalesce_scan_tables(&fragment.root, &mut scan_tables, &mut scan_node_ids);
+    }
+    assert_eq!(scan_node_ids.len(), 9, "coalesce fixture scan count");
+    assert_eq!(scan_tables.len(), 3, "coalesce fixture binding identities");
+
+    let registry = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &registry,
+        "ice",
+        vec![data_file("s3://sqlx2-coalesce/frozen.parquet")],
+        None,
+    );
+    let controls = crate::connector::FixtureControlResolver::new(registry);
+    let lease = controls
+        .acquire_current(&ConnectorInstanceId::parse("ice").expect("fixture connector"))
+        .expect("fixture planning lease");
+
+    let left = scan_tables.remove("l").expect("left base scan");
+    let left_id = bindings
+        .resolve_or_insert_with_id(QueryTableBindingKey::strict_base("ice", "db", "l"), |id| {
+            assert_eq!(id, tokens.left);
+            Ok(coalesce_binding(
+                left.clone(),
+                QueryScanMaterialization::IcebergDataFiles {
+                    table: coalesce_iceberg_table(&left, Some("uuid-l"), Some(22)),
+                    files: vec![data_file("s3://sqlx2-coalesce/l.parquet")],
+                    binding: IcebergDataFileBinding::CurrentSnapshot,
+                },
+                lease.clone(),
+            ))
+        })
+        .expect("left binding");
+    let right = scan_tables.remove("r").expect("right base scan");
+    let right_id = bindings
+        .resolve_or_insert_with_id(QueryTableBindingKey::strict_base("ice", "db", "r"), |id| {
+            assert_eq!(id, tokens.right);
+            Ok(coalesce_binding(
+                right.clone(),
+                QueryScanMaterialization::IcebergDataFiles {
+                    table: coalesce_iceberg_table(&right, Some("uuid-r"), Some(44)),
+                    files: vec![data_file("s3://sqlx2-coalesce/r.parquet")],
+                    binding: IcebergDataFileBinding::CurrentSnapshot,
+                },
+                lease.clone(),
+            ))
+        })
+        .expect("right binding");
+    let target = scan_tables.remove("mv").expect("target locator scan");
+    let target_id = bindings
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::mv_target("ice", "db", "mv", "uuid-tgt", Some(99)),
+            |id| {
+                assert_eq!(id, tokens.target);
+                Ok(coalesce_binding(
+                    target.clone(),
+                    QueryScanMaterialization::IcebergMvTarget {
+                        table: coalesce_iceberg_table(&target, Some("uuid-tgt"), Some(99)),
+                        files: vec![data_file("s3://sqlx2-coalesce/mv.parquet")],
+                        binding: IcebergDataFileBinding::CurrentSnapshot,
+                        target_table_uuid: "uuid-tgt".to_string(),
+                        frozen_snapshot_id: Some(99),
+                        target_state_partition_filter:
+                            crate::mv::model::TargetPartitionFilter::None,
+                        target_partition_contract: None,
+                    },
+                    lease.clone(),
+                ))
+            },
+        )
+        .expect("target binding");
+    assert_eq!(
+        (left_id, right_id, target_id),
+        (tokens.left, tokens.right, tokens.target)
+    );
+    assert!(scan_tables.is_empty());
+
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&bindings),
+        Some(&JoinRefreshDeltaResolver),
+        super::super::ScanPreparationOptions::default(),
+    )
+    .expect("tokenized coalesce scans must prepare from exact bindings");
+    for node_id in &scan_node_ids {
+        assert!(
+            prepared.scan_bindings().binding(*node_id).is_some(),
+            "prepared binding missing coalesce scan node {node_id}"
+        );
+    }
+    let native =
+        crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)
+            .expect("tokenized coalesce plan must lower to native fragments");
+    assert_eq!(
+        native.fragment_ids().count(),
+        distributed.fragments().len(),
+        "native bundle must contain every prepared coalesce fragment"
+    );
+
+    let kinds = distributed
+        .fragments()
+        .iter()
+        .flat_map(|fragment| {
+            let mut sources = Vec::new();
+            fn visit(
+                node: &crate::sql::planner::distributed::DistributedNode,
+                out: &mut Vec<SqlScanKind>,
+            ) {
+                if let DistributedNodeKind::Scan(scan) = &node.payload {
+                    let ScanSource::Sql(source) = &scan.table.source;
+                    out.push(source.kind.clone());
+                }
+                for child in &node.children {
+                    visit(child, out);
+                }
+            }
+            visit(&fragment.root, &mut sources);
+            sources
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, SqlScanKind::MvTargetLocator { .. }))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, SqlScanKind::Delta { .. }))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, SqlScanKind::FrozenInputSet { .. }))
+    );
+}
+
 #[test]
 fn scan_preparation_propagates_caller_cancellation() {
     let context =
@@ -188,7 +459,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
 }
 
 #[test]
-fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
+fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
     let bindings = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
@@ -201,11 +472,12 @@ fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
     ) {
-        Ok(_) => panic!("missing binding must fail before a current-generation acquire"),
+        Ok(_) => panic!("unbound binding must fail before a current-generation acquire"),
         Err(error) => error,
     };
     assert!(
-        error.contains("SQL table binding token is missing from this request"),
+        error.contains("SQL table binding token is missing from this request")
+            || error.contains("SQL table binding token belongs to a different request"),
         "{error}"
     );
 }

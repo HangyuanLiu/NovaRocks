@@ -227,6 +227,56 @@ pub(crate) fn admit_frozen_iceberg_write_target(
     )
 }
 
+/// Build a row-lineage writer envelope from a connector materialization that
+/// was already resolved through an exact planning lease.
+///
+/// This is intentionally an application-only adapter.  It keeps concrete
+/// metadata out of SQL while ensuring a DML change-stream writer cannot mix a
+/// catalog-loaded table with a newer provider generation.  The caller admits
+/// the returned envelope into its query-local store before invoking the SQL
+/// compiler.
+pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
+    materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let metadata = admitted_iceberg_metadata(&materialization.table)?;
+    let mut target_columns = materialization.columns.clone();
+    target_columns.extend([
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+    ]);
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    Ok(IcebergWriteSinkSpec {
+        mode: IcebergWriteSinkMode::RowLineageData,
+        iceberg: materialization.table.clone(),
+        target_columns,
+        table_location,
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        cloud_properties: entry.cloud_properties_map(),
+        file_format: "parquet".to_string(),
+        compression: IcebergWriteFileCompression::Snappy,
+        position_delete_output_descriptor: None,
+    })
+}
+
 /// Admit a writer token from an already frozen target materialization.
 ///
 /// MV refresh has a target-state locator scan before it constructs a terminal

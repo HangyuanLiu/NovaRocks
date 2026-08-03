@@ -76,14 +76,16 @@ fn read_aggregate_state<F>(
 where
     F: FnMut(&str, &AggregateSqlCalls, sqlparser::ast::Query) -> Result<AggregateStateRead, String>,
 {
-    let state_sql = prepare_aggregate_first_refresh_state_sql(
-        select_sql,
-        calls,
+    let state_sql =
+        crate::mv::aggregate_state::mv_shape::rewrite_select_sql_for_state(select_sql, calls)?;
+    let mut state_query = parse_stored_select_query(&state_sql)?;
+    inject_pin_as_for_version_as_of(
+        &mut state_query,
         pin,
+        &HashSet::new(),
         current_catalog,
         current_database,
     )?;
-    let state_query = parse_stored_select_query(&state_sql)?;
     read(select_sql, calls, state_query)
 }
 
