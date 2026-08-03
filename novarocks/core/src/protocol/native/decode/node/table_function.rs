@@ -29,8 +29,8 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, expr, plan};
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, expr, plan};
 
 pub(super) fn lower_table_function_node(
     node: &plan::DistributedNode,
@@ -434,8 +434,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

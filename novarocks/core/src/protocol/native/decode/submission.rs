@@ -27,7 +27,6 @@ use crate::exec::fragment::program::{
     ScanSourceContract,
 };
 use crate::exec::node::ExecPlan;
-use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::test_assembly::{
     NativeExchangeContractDecoder, NativeExpressionDecoder, NativeFragmentEnvelopeDecoder,
@@ -43,6 +42,7 @@ use crate::runtime::fragment::instance::{
 };
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::query_context::QueryId;
+use novarocks_protocol::{novarocks, plan};
 
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use super::decode_fragment_sink_assignment;
@@ -687,11 +687,11 @@ fn decode_runtime_filter_contract(
     Ok(RuntimeFilterContract::new(build_filters, probe_filters))
 }
 
-fn unique_id_from_native(src: &crate::proto::common::UniqueId) -> UniqueId {
+fn unique_id_from_native(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
     UniqueId::new(src.hi, src.lo)
 }
 
-fn query_id_from_native(src: &crate::proto::common::UniqueId) -> QueryId {
+fn query_id_from_native(src: &novarocks_protocol::common::UniqueId) -> QueryId {
     QueryId::new(src.hi, src.lo)
 }
 
@@ -705,13 +705,13 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::exec::fragment::program::FragmentSinkKind;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::{common, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime::exchange::{ExchangeKey, snapshot_receiver_state};
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::runtime::result_buffer::{self, FetchErrorKind, TryFetchResult};
     use crate::runtime::runtime_filter_observability::{QueryKey, RuntimeFilterLifecycleRegistry};
+    use novarocks_protocol::{common, novarocks, plan};
 
     static NEXT_TEST_ID: AtomicI64 = AtomicI64::new(8_600_000_000_000_000_000);
 
@@ -904,7 +904,7 @@ mod tests {
             panic!("values root");
         };
         values.rows.push(plan::ExprList {
-            values: vec![crate::proto::expr::Expr::default()],
+            values: vec![novarocks_protocol::expr::Expr::default()],
         });
 
         let error = decode_fragment_submission(
@@ -932,12 +932,12 @@ mod tests {
             panic!("values root");
         };
         values.rows.push(plan::ExprList {
-            values: vec![crate::proto::expr::Expr {
+            values: vec![novarocks_protocol::expr::Expr {
                 r#type: Some(encode_type(&DataType::Boolean).expect("encode type")),
                 nullable: false,
-                kind: Some(crate::proto::expr::expr::Kind::BinaryOp(Box::new(
-                    crate::proto::expr::BinaryOpExpr {
-                        op: crate::proto::expr::BinaryOp::Eq as i32,
+                kind: Some(novarocks_protocol::expr::expr::Kind::BinaryOp(Box::new(
+                    novarocks_protocol::expr::BinaryOpExpr {
+                        op: novarocks_protocol::expr::BinaryOp::Eq as i32,
                         left: None,
                         right: None,
                     },

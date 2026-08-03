@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use crate::proto::{common, filter};
+use novarocks_protocol::{common, filter};
 
 fn roundtrip_message<M>(value: &M) -> M
 where

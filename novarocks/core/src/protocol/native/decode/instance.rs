@@ -18,7 +18,6 @@
 use std::collections::BTreeMap;
 
 use crate::common::types::UniqueId;
-use crate::proto::novarocks;
 use crate::protocol::common::error::FieldPath;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::query_options::QueryOptions;
@@ -27,6 +26,7 @@ use crate::runtime::scan_range::{
     FilePruningValueKind, FileScanRange, IcebergDeleteFile, IcebergFileContent, IcebergFileFormat,
     ScanRange, ScanRangeParams,
 };
+use novarocks_protocol::novarocks;
 
 use super::NativeFragmentDecodeError;
 
@@ -277,7 +277,7 @@ fn decode_file_pruning_value(
     })
 }
 
-fn unique_id(src: &crate::proto::common::UniqueId) -> UniqueId {
+fn unique_id(src: &novarocks_protocol::common::UniqueId) -> UniqueId {
     UniqueId::new(src.hi, src.lo)
 }
 
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn query_options_decode_is_owned_by_native_protocol() {
-        let decoded = decode_query_options(&crate::proto::novarocks::QueryOptions {
+        let decoded = decode_query_options(&novarocks_protocol::novarocks::QueryOptions {
             batch_size: 1024,
             pipeline_dop: 4,
             ..Default::default()
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn destination_missing_id_has_typed_path() {
-        let error = decode_destinations(&[crate::proto::novarocks::Destination {
+        let error = decode_destinations(&[novarocks_protocol::novarocks::Destination {
             finst_id: None,
             endpoint: "127.0.0.1:9070".to_string(),
         }])
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn query_options_reject_spill_without_options() {
-        let error = decode_query_options(&crate::proto::novarocks::QueryOptions {
+        let error = decode_query_options(&novarocks_protocol::novarocks::QueryOptions {
             enable_spill: true,
             ..Default::default()
         })

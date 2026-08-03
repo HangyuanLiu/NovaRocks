@@ -30,8 +30,8 @@ use crate::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
 pub(super) fn lower_hash_aggregate_node(
@@ -442,7 +442,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::plan;
+    use novarocks_protocol::plan;
 
     #[test]
     fn hash_aggregate_derives_output_columns_from_layout_sidecar() {

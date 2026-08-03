@@ -40,10 +40,10 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
-use crate::proto::plan;
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::query_options::query_expire_durations;
+use novarocks_protocol::plan;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};

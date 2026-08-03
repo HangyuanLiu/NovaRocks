@@ -13,8 +13,8 @@ use crate::exec::node::runtime_filter::{
     RuntimeOrderContract, RuntimeOrderKey, RuntimeTopKSummaryContract, SortDirection,
     TopKSummaryRequirement,
 };
-use crate::proto::plan;
 use crate::protocol::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
+use novarocks_protocol::plan;
 
 type CodecResult<T> = Result<T, ProtocolError>;
 
@@ -58,7 +58,7 @@ enum DecodedReduction {
 }
 
 pub(in crate::protocol::native) fn decode_runtime_filter_logical_domain_and_reduction(
-    wire_type: Option<&crate::proto::common::TypeDesc>,
+    wire_type: Option<&novarocks_protocol::common::TypeDesc>,
     wire_contract: Option<&plan::RuntimeFilterContract>,
     wire_reduction: Option<&plan::RuntimeFilterReductionContract>,
     path: FieldPath,

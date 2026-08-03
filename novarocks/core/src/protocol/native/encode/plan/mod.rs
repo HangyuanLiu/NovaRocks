@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 
 use super::expr::encode_expr;
-use crate::proto::{common, plan};
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
@@ -28,6 +27,7 @@ use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentStreamKind, NodeExecutionColumn,
     NodeOutputCatalog, PlanFragment, WriteContractCatalog,
 };
+use novarocks_protocol::{common, plan};
 
 use output::apply_sealed_node_output_columns;
 use relational::encode_physical_node;
@@ -244,7 +244,7 @@ pub(super) fn encode_node_with_context(
 
 fn encode_exprs(
     src: &[crate::sql::analysis::TypedExpr],
-) -> Result<Vec<crate::proto::expr::Expr>, String> {
+) -> Result<Vec<novarocks_protocol::expr::Expr>, String> {
     src.iter().map(encode_expr).collect()
 }
 

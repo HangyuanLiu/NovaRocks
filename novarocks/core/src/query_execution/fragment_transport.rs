@@ -17,12 +17,8 @@
 
 //! Fragment dispatcher port and native submission DTO.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::query_execution::contract::QueryId;
 
 /// Opaque data-plane batch returned by a fragment dispatcher.
 ///
@@ -111,16 +107,6 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
 
     /// Number of backends this dispatcher can route to.
     fn backend_count(&self) -> usize;
-}
-
-/// Build the production result/cancellation transport from one explicit
-/// immutable backend snapshot.
-pub fn new_grpc_fragment_dispatcher(
-    backends: &[(usize, SocketAddr)],
-) -> Result<Arc<dyn FragmentDispatcher>, String> {
-    Ok(Arc::new(
-        crate::service::grpc_fragment_dispatcher::RemoteDispatcher::new_with_backend_ids(backends)?,
-    ))
 }
 
 #[cfg(test)]

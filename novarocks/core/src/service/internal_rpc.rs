@@ -17,12 +17,12 @@
 use std::collections::HashMap;
 
 use crate::common::ids::SlotId;
-use crate::proto;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_position_lookup_request,
 };
 use crate::runtime::query_context::QueryId;
+use novarocks_protocol as proto;
 fn ok_common_status() -> proto::common::Status {
     proto::common::Status {
         code: 0,
@@ -146,20 +146,4 @@ pub fn handle_lookup(req: proto::filter::LookupRequest) -> proto::filter::Lookup
 pub fn handle_lookup_close(query_id: QueryId, lookup_node_id: i32) -> Result<(), String> {
     crate::runtime::query_context::query_context_manager()
         .complete_lookup_fetcher(query_id, lookup_node_id)
-}
-
-#[cfg(test)]
-mod native_runtime_filter_mode_tests {
-    use super::*;
-
-    fn submit_native_fragment(query_id: QueryId) -> Result<(), String> {
-        crate::service::native_fragment_service_test_fixture::submit_exec_plan_fragment_native(
-            crate::service::native_fragment_service_test_fixture::values_submission_for_test(
-                query_id,
-                novarocks_types::UniqueId::new(query_id.high() + 1, query_id.low() + 1),
-                81,
-                crate::exec::fragment::sink::FragmentSinkProgram::Noop,
-            ),
-        )
-    }
 }

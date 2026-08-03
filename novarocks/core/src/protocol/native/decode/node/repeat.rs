@@ -26,9 +26,9 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,
@@ -222,8 +222,8 @@ mod tests {
     use super::super::tests::{lower, physical_node, two_col_values_node};
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::plan;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use novarocks_protocol::plan;
 
     fn valid_repeat() -> plan::RepeatNode {
         plan::RepeatNode {

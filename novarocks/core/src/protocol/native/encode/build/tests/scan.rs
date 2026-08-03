@@ -174,7 +174,7 @@ fn native_root_scan(
         NativeFragmentBundle,
         Vec<BoundarySchemaReport>,
     ),
-) -> &crate::proto::plan::ScanNode {
+) -> &novarocks_protocol::plan::ScanNode {
     let root_fragment_id = result.0.scheduling_view().execution_anchor();
     let root = result
         .1
@@ -183,12 +183,12 @@ fn native_root_scan(
         .root
         .as_ref()
         .expect("root node");
-    let crate::proto::plan::distributed_node::Payload::Physical(physical) =
+    let novarocks_protocol::plan::distributed_node::Payload::Physical(physical) =
         root.payload.as_ref().expect("root payload")
     else {
         panic!("root must be physical");
     };
-    let crate::proto::plan::plan_node::Kind::Scan(scan) =
+    let novarocks_protocol::plan::plan_node::Kind::Scan(scan) =
         physical.kind.as_ref().expect("physical kind")
     else {
         panic!("root must be scan");

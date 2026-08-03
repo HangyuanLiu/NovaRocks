@@ -211,7 +211,7 @@ pub(crate) fn ensure_native_fragment_sink_supported(
 /// neither decodes its provider payload nor permits a fallback to an
 /// unplanned handle.
 pub(crate) fn patch_native_connector_write_sink(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     fragment_instance_id: crate::common::types::UniqueId,
     backend_num: i32,
@@ -230,7 +230,7 @@ pub(crate) fn patch_native_connector_write_sink(
 }
 
 fn patch_native_connector_write_sink_in_place(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     fragment_instance_id: crate::common::types::UniqueId,
     backend_num: i32,
@@ -254,7 +254,7 @@ fn patch_native_connector_write_sink_in_place(
         .as_mut()
         .ok_or_else(|| format!("terminal write fragment {fragment_id} has no native sink"))?;
     let template = match sink.kind.take() {
-        Some(crate::proto::plan::data_sink::Kind::ConnectorWrite(template)) => template,
+        Some(novarocks_protocol::plan::data_sink::Kind::ConnectorWrite(template)) => template,
         Some(other) => {
             sink.kind = Some(other);
             return Err(format!(
@@ -276,31 +276,37 @@ fn patch_native_connector_write_sink_in_place(
         format!("terminal connector write fragment {fragment_id} is missing input binding")
     })?;
     let input = match input.kind {
-        Some(crate::proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
-            value,
-        )) => crate::proto::plan::ConnectorWriteInputBinding {
+        Some(
+            novarocks_protocol::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+                value,
+            ),
+        ) => novarocks_protocol::plan::ConnectorWriteInputBinding {
             kind: Some(
-                crate::proto::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(value),
+                novarocks_protocol::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
+                    value,
+                ),
             ),
         },
-        Some(crate::proto::plan::connector_write_input_binding::Kind::OutputOrdinals(values)) => {
-            crate::proto::plan::ConnectorWriteInputBinding {
-                kind: Some(
-                    crate::proto::plan::connector_write_input_binding::Kind::OutputOrdinals(values),
+        Some(novarocks_protocol::plan::connector_write_input_binding::Kind::OutputOrdinals(
+            values,
+        )) => novarocks_protocol::plan::ConnectorWriteInputBinding {
+            kind: Some(
+                novarocks_protocol::plan::connector_write_input_binding::Kind::OutputOrdinals(
+                    values,
                 ),
-            }
-        }
+            ),
+        },
         None => {
             return Err(format!(
                 "terminal connector write fragment {fragment_id} has an empty input binding"
             ));
         }
     };
-    sink.kind = Some(crate::proto::plan::data_sink::Kind::ConnectorWrite(
-        crate::proto::plan::ConnectorWriteFragmentSink {
-            handle: Some(crate::proto::plan::ConnectorWriterHandleEnvelope {
+    sink.kind = Some(novarocks_protocol::plan::data_sink::Kind::ConnectorWrite(
+        novarocks_protocol::plan::ConnectorWriteFragmentSink {
+            handle: Some(novarocks_protocol::plan::ConnectorWriterHandleEnvelope {
                 contract_version: handle.version(),
-                writer: Some(crate::proto::plan::ConnectorWriterIdentity {
+                writer: Some(novarocks_protocol::plan::ConnectorWriterIdentity {
                     operation_id: writer.operation_id().to_bytes().to_vec(),
                     cohort_id: writer.cohort_id().to_bytes().to_vec(),
                     execution_query_id: writer.execution_id().query_id().to_vec(),
@@ -328,8 +334,8 @@ fn unique_id_bytes(value: crate::common::types::UniqueId) -> [u8; 16] {
     bytes
 }
 
-fn native_unique_id(value: [u8; 16]) -> crate::proto::common::UniqueId {
-    crate::proto::common::UniqueId {
+fn native_unique_id(value: [u8; 16]) -> novarocks_protocol::common::UniqueId {
+    novarocks_protocol::common::UniqueId {
         hi: i64::from_be_bytes(value[..8].try_into().expect("fixed writer identity prefix")),
         lo: i64::from_be_bytes(value[8..].try_into().expect("fixed writer identity suffix")),
     }
@@ -463,7 +469,7 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
 /// source. The traversal deliberately has no provider branch and never
 /// interprets a split payload.
 pub(crate) fn patch_native_connector_read_splits(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     node_id: i32,
     splits: &[ConnectorSplit],
 ) -> Result<(), String> {
@@ -489,7 +495,7 @@ pub(crate) fn patch_native_connector_read_splits(
 }
 
 fn patch_connector_splits_in_node(
-    node: &mut crate::proto::plan::DistributedNode,
+    node: &mut novarocks_protocol::plan::DistributedNode,
     node_id: i32,
     splits: &[ConnectorSplit],
     matches: &mut usize,
@@ -499,25 +505,26 @@ fn patch_connector_splits_in_node(
             .payload
             .as_mut()
             .and_then(|payload| match payload {
-                crate::proto::plan::distributed_node::Payload::Physical(physical) => {
+                novarocks_protocol::plan::distributed_node::Payload::Physical(physical) => {
                     physical.kind.as_mut()
                 }
-                crate::proto::plan::distributed_node::Payload::Exchange(_) => None,
+                novarocks_protocol::plan::distributed_node::Payload::Exchange(_) => None,
             })
             .and_then(|kind| match kind {
-                crate::proto::plan::plan_node::Kind::Scan(scan) => scan.table.as_mut(),
+                novarocks_protocol::plan::plan_node::Kind::Scan(scan) => scan.table.as_mut(),
                 _ => None,
             })
             .and_then(|table| table.source.as_mut())
             .and_then(|source| source.kind.as_mut());
-        let Some(crate::proto::plan::scan_source::Kind::ConnectorRead(source)) = source else {
+        let Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(source)) = source
+        else {
             return Err(format!(
                 "native connector split patch node {node_id} is not a ConnectorReadSource"
             ));
         };
         source.splits = splits
             .iter()
-            .map(|split| crate::proto::plan::ConnectorReadSplit {
+            .map(|split| novarocks_protocol::plan::ConnectorReadSplit {
                 split_id: split.split_id().to_string(),
                 split_payload: split.payload().to_vec(),
                 estimated_bytes: split.estimated_bytes(),
@@ -532,7 +539,7 @@ fn patch_connector_splits_in_node(
 }
 
 pub(crate) fn patch_native_change_stream_router_sink(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&FragmentEdge],
@@ -551,7 +558,7 @@ pub(crate) fn patch_native_change_stream_router_sink(
 }
 
 fn patch_native_change_stream_router_sink_in_place(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&FragmentEdge],
@@ -561,7 +568,7 @@ fn patch_native_change_stream_router_sink_in_place(
         return Err("native Iceberg change-stream router sink has no branch edges".to_string());
     }
     let router = match fragment.sink.as_mut().and_then(|sink| sink.kind.as_mut()) {
-        Some(crate::proto::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
+        Some(novarocks_protocol::plan::data_sink::Kind::ChangeStreamRouter(router)) => router,
         _ => {
             return Err(format!(
                 "fragment {fragment_id} is router source for group {router_group_id} but native \
@@ -682,7 +689,7 @@ fn patch_native_change_stream_router_sink_in_place(
                 fragment_id, router_group_id, branch_id, edge.target_fragment_id
             )
         })?;
-        route.destinations = Some(crate::proto::plan::StreamDestinationList {
+        route.destinations = Some(novarocks_protocol::plan::StreamDestinationList {
             destinations: dests
                 .iter()
                 .map(|placement| {
@@ -707,32 +714,32 @@ fn patch_native_change_stream_router_sink_in_place(
 fn native_change_stream_branch_kind(
     value: i32,
 ) -> Result<crate::sql::common::ChangeStreamBranchKind, String> {
-    match crate::proto::plan::ChangeStreamBranchKind::try_from(value)
+    match novarocks_protocol::plan::ChangeStreamBranchKind::try_from(value)
         .map_err(|_| format!("unknown native ChangeStreamBranchKind value {value}"))?
     {
-        crate::proto::plan::ChangeStreamBranchKind::DeleteDv => {
+        novarocks_protocol::plan::ChangeStreamBranchKind::DeleteDv => {
             Ok(crate::sql::common::ChangeStreamBranchKind::DeleteDv)
         }
-        crate::proto::plan::ChangeStreamBranchKind::ReuseData => {
+        novarocks_protocol::plan::ChangeStreamBranchKind::ReuseData => {
             Ok(crate::sql::common::ChangeStreamBranchKind::ReuseData)
         }
-        crate::proto::plan::ChangeStreamBranchKind::FreshData => {
+        novarocks_protocol::plan::ChangeStreamBranchKind::FreshData => {
             Ok(crate::sql::common::ChangeStreamBranchKind::FreshData)
         }
-        crate::proto::plan::ChangeStreamBranchKind::Unspecified => {
+        novarocks_protocol::plan::ChangeStreamBranchKind::Unspecified => {
             Err("native ChangeStreamBranchKind is unspecified".to_string())
         }
     }
 }
 
 pub(crate) fn patch_native_cte_multicast_sink(
-    fragment: &mut crate::proto::plan::PlanFragment,
+    fragment: &mut novarocks_protocol::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: CteId,
     consumers: &[(
         FragmentId,
         i32,
-        crate::proto::plan::DataPartition,
+        novarocks_protocol::plan::DataPartition,
         Vec<i32>,
         Vec<ColumnId>,
     )],
@@ -759,7 +766,7 @@ pub(crate) fn patch_native_cte_multicast_sink(
             output_slot_ids,
             receive_producer_column_ids,
         )?;
-        sinks.push(crate::proto::plan::DataStreamSink {
+        sinks.push(novarocks_protocol::plan::DataStreamSink {
             dest_node_id: *exchange_node_id,
             output_partition: Some(partition.clone()),
             output_columns: sink_output_columns,
@@ -768,17 +775,19 @@ pub(crate) fn patch_native_cte_multicast_sink(
         let dests = consumer_dests.get(consumer_fragment_id).ok_or_else(|| {
             format!("CTE consumer fragment {consumer_fragment_id} has no placements")
         })?;
-        destinations.push(crate::proto::plan::StreamDestinationList {
+        destinations.push(novarocks_protocol::plan::StreamDestinationList {
             destinations: dests.iter().map(native_stream_destination).collect(),
         });
     }
-    fragment.sink = Some(crate::proto::plan::DataSink {
-        kind: Some(crate::proto::plan::data_sink::Kind::MultiCastDataStream(
-            crate::proto::plan::MultiCastDataStreamSink {
-                sinks,
-                destinations,
-            },
-        )),
+    fragment.sink = Some(novarocks_protocol::plan::DataSink {
+        kind: Some(
+            novarocks_protocol::plan::data_sink::Kind::MultiCastDataStream(
+                novarocks_protocol::plan::MultiCastDataStreamSink {
+                    sinks,
+                    destinations,
+                },
+            ),
+        ),
     });
     debug!(
         "patched native CTE multicast sink: fragment={} cte_id={} sinks={}",
@@ -791,9 +800,9 @@ pub(crate) fn patch_native_cte_multicast_sink(
 
 fn native_stream_destination(
     src: &crate::runtime::endpoint::FragmentDestination,
-) -> crate::proto::plan::StreamDestination {
-    crate::proto::plan::StreamDestination {
-        finst_id: Some(crate::proto::common::UniqueId {
+) -> novarocks_protocol::plan::StreamDestination {
+    novarocks_protocol::plan::StreamDestination {
+        finst_id: Some(novarocks_protocol::common::UniqueId {
             hi: src.finst_id().high(),
             lo: src.finst_id().low(),
         }),
@@ -802,7 +811,7 @@ fn native_stream_destination(
 }
 
 fn native_cte_multicast_sink_output_columns(
-    fragment: &crate::proto::plan::PlanFragment,
+    fragment: &novarocks_protocol::plan::PlanFragment,
     cte_id: CteId,
     consumer_fragment_id: FragmentId,
     exchange_node_id: i32,
@@ -867,8 +876,8 @@ fn native_cte_multicast_sink_output_columns(
 }
 
 fn native_cte_multicast_contract_slot_map(
-    fragment: &crate::proto::plan::PlanFragment,
-    root_columns: &[crate::proto::common::OutputColumn],
+    fragment: &novarocks_protocol::plan::PlanFragment,
+    root_columns: &[novarocks_protocol::common::OutputColumn],
     root_slot_id_set: &BTreeSet<i32>,
 ) -> BTreeMap<i32, i32> {
     let mut map = BTreeMap::new();
@@ -879,7 +888,8 @@ fn native_cte_multicast_contract_slot_map(
             .iter()
             .zip(fragment.output_exprs.iter())
         {
-            let Some(crate::proto::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref()
+            let Some(novarocks_protocol::expr::expr::Kind::ColumnRef(column_ref)) =
+                expr.kind.as_ref()
             else {
                 continue;
             };
@@ -954,10 +964,10 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::common::types::UniqueId;
     use crate::exec::chunk::ChunkSchema;
-    use crate::proto::plan as native_plan;
     use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
     use crate::sql::common::ChangeStreamBranchKind;
     use crate::sql::planner::distributed::{DataPartition, FragmentStreamKind};
+    use novarocks_protocol::plan as native_plan;
 
     fn placement(fragment_id: FragmentId, instance_lo: i64) -> FragmentInstancePlacement {
         FragmentInstancePlacement {
@@ -1220,7 +1230,7 @@ mod tests {
     fn patches_cte_multicast_from_sealed_root_output_slots() {
         let mut fragment = native_plan::PlanFragment {
             fragment_id: 1,
-            output_columns: vec![crate::proto::common::OutputColumn {
+            output_columns: vec![novarocks_protocol::common::OutputColumn {
                 column_id: 10,
                 name: "total".to_string(),
                 r#type: None,

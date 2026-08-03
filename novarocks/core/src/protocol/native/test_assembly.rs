@@ -33,9 +33,6 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::{
     ExchangeInputContract, FragmentNodeId, RuntimeFilterContract, ScanSourceContract,
 };
-use crate::proto::expr;
-use crate::proto::novarocks;
-use crate::proto::plan;
 use crate::protocol::ProtocolError;
 use crate::protocol::{FieldPath, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::fragment::instance::{
@@ -44,6 +41,9 @@ use crate::runtime::fragment::instance::{
 use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
+use novarocks_protocol::expr;
+use novarocks_protocol::novarocks;
+use novarocks_protocol::plan;
 
 /// Immutable input-slot value supplied to backend expression decoders.
 ///
@@ -240,7 +240,7 @@ impl NativeOutputLayout {
 pub trait NativeOutputLayoutDecoder: Send + Sync {
     fn decode_output_layout(
         &self,
-        columns: &[crate::proto::common::OutputColumn],
+        columns: &[novarocks_protocol::common::OutputColumn],
         path: FieldPath,
     ) -> Result<NativeOutputLayout, ProtocolError>;
 }

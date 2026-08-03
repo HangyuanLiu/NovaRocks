@@ -19,9 +19,9 @@ use super::DecodedNode;
 use super::common::parse_optional_nonnegative_i64;
 use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_assert_one_row_node(
     node: &plan::DistributedNode,
@@ -157,8 +157,8 @@ mod tests {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::AssertNumRowsMode;
-    use crate::proto::plan;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use novarocks_protocol::plan;
 
     fn decode_error(
         node: &plan::DistributedNode,

@@ -20,7 +20,13 @@ use super::*;
 pub(super) fn encode_fragment_output_contract(
     src: &PlanFragment,
     ctx: &NativePlanEncodeContext<'_>,
-) -> Result<(Vec<crate::proto::expr::Expr>, Vec<common::OutputColumn>), String> {
+) -> Result<
+    (
+        Vec<novarocks_protocol::expr::Expr>,
+        Vec<common::OutputColumn>,
+    ),
+    String,
+> {
     if matches!(
         src.sink,
         DataSink::ConnectorWrite(ref sink) if sink.output_contract.is_some()

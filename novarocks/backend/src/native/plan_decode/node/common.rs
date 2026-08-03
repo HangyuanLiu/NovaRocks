@@ -25,8 +25,8 @@ use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::node::join::JoinType;
 use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{common as proto_common, plan};
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(

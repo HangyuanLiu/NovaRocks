@@ -17,7 +17,6 @@
 
 //! Borrow-only runtime-filter facts for the Frontend semantic encoder.
 
-use crate::proto::{common, expr};
 use crate::protocol::native::encode::expr::encode_expr;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::schedule::SchedulingPlan;
@@ -27,6 +26,7 @@ use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
     RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
 };
+use novarocks_protocol::{common, expr};
 
 use super::projection::PreparedFragmentSet;
 use super::runtime_filter_binding::{

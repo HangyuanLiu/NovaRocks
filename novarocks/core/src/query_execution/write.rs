@@ -30,12 +30,12 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
-use crate::proto::{common, novarocks};
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle::{
     FragmentTerminalOutcome, FragmentTerminalSnapshot, QueryExecutionId,
 };
+use novarocks_protocol::{common, novarocks};
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
 // SPI's first terminal state is `Staged`; coordinator code must never count a
@@ -488,7 +488,7 @@ pub(crate) fn encode_connector_staged_report_frame(
     let fragment_instance_id = writer.fragment_instance_id();
     novarocks::ConnectorStagedReportFrame {
         contract_version: frame.version(),
-        writer: Some(crate::proto::plan::ConnectorWriterIdentity {
+        writer: Some(novarocks_protocol::plan::ConnectorWriterIdentity {
             operation_id: writer.operation_id().to_bytes().to_vec(),
             cohort_id: writer.cohort_id().to_bytes().to_vec(),
             execution_query_id: writer.execution_id().query_id().to_vec(),
@@ -574,7 +574,7 @@ pub(crate) fn decode_connector_staged_report_frame(
 }
 
 fn connector_writer_identity_from_native(
-    writer: &crate::proto::plan::ConnectorWriterIdentity,
+    writer: &novarocks_protocol::plan::ConnectorWriterIdentity,
 ) -> Result<ConnectorWriterIdentity, DistributedQueryError> {
     let operation_id = ConnectorWriteOperationId::from_bytes(connector_id_bytes(
         &writer.operation_id,
@@ -837,9 +837,9 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::plan;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::AttemptId;
+    use novarocks_protocol::plan;
 
     fn query_id() -> UniqueId {
         UniqueId::new(7, 11)

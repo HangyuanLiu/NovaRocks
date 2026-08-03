@@ -64,8 +64,8 @@ use novarocks::exec::node::runtime_filter::{
     RuntimeFilterExecutionContract, RuntimeFilterExecutionReduction, SortDirection,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -1079,12 +1079,12 @@ fn lower_binding_expression(
 
 fn validate_column_refs_exact(
     binding_id: u32,
-    expression: &novarocks::proto::expr::Expr,
+    expression: &novarocks_protocol::expr::Expr,
     layout: &Layout,
     schema: &ChunkSchemaRef,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
-    use novarocks::proto::expr::expr::Kind;
+    use novarocks_protocol::expr::expr::Kind;
 
     let kind = expression.kind.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -1154,7 +1154,7 @@ fn validate_column_refs_exact(
         }
     }
 
-    let visit = |child: &novarocks::proto::expr::Expr, child_path: FieldPath| {
+    let visit = |child: &novarocks_protocol::expr::Expr, child_path: FieldPath| {
         validate_column_refs_exact(binding_id, child, layout, schema, child_path)
     };
     let missing = |child_path: FieldPath, detail: &'static str| {

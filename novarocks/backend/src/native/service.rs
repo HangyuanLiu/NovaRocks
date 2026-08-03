@@ -25,8 +25,13 @@
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use axum::Router;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use novarocks::query_execution::lifecycle::{
     QueryLifecycleIngress, QueryTerminalIngress, QueryTerminalReportOutcome,
     decode_query_terminal_snapshot,
@@ -37,7 +42,9 @@ use novarocks_protocol::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::body::boxed;
+use tonic::codegen::Service;
+use tonic::server::NamedService;
 
 use super::ingress::NativeFragmentIngress;
 use super::lifecycle_adapter::{
@@ -453,18 +460,22 @@ impl NativeGrpcServerHandle {
                         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                         let mut shutdown_rx = shutdown_rx;
-                        tonic::transport::Server::builder()
-                            .add_service(service)
-                            .serve_with_incoming_shutdown(
-                                TcpListenerStream::new(listener),
-                                async move {
-                                    while !*shutdown_rx.borrow() {
-                                        if shutdown_rx.changed().await.is_err() {
-                                            break;
-                                        }
+                        let grpc_path = format!(
+                            "/{}/*rest",
+                            <NovaRocksGrpcServer<NativeBackendGrpcService> as NamedService>::NAME
+                        );
+                        let app = Router::new()
+                            .route_service(&grpc_path, AxumGrpcService::new(service))
+                            .route("/metrics", get(novarocks::service::handle_metrics))
+                            .fallback(grpc_unimplemented_fallback);
+                        axum::serve(listener, app)
+                            .with_graceful_shutdown(async move {
+                                while !*shutdown_rx.borrow() {
+                                    if shutdown_rx.changed().await.is_err() {
+                                        break;
                                     }
-                                },
-                            )
+                                }
+                            })
                             .await
                             .map_err(|error| {
                                 format!("native backend gRPC serve future failed: {error}")
@@ -528,5 +539,50 @@ impl NativeGrpcServerHandle {
 impl Drop for NativeGrpcServerHandle {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+async fn grpc_unimplemented_fallback() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (tonic::Status::GRPC_STATUS, HeaderValue::from_static("12")),
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            ),
+        ],
+    )
+}
+
+#[derive(Clone)]
+struct AxumGrpcService<S> {
+    inner: S,
+}
+
+impl<S> AxumGrpcService<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S> Service<axum::http::Request<axum::body::Body>> for AxumGrpcService<S>
+where
+    S: Service<
+            axum::http::Request<tonic::body::BoxBody>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone,
+{
+    type Response = axum::http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: axum::http::Request<axum::body::Body>) -> Self::Future {
+        self.inner.call(request.map(boxed))
     }
 }

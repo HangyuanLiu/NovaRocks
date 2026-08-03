@@ -21,8 +21,8 @@ use arrow::datatypes::DataType;
 
 use super::lower_required_child;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 
 use super::super::layout::Layout;
 

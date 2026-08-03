@@ -26,8 +26,8 @@ use crate::exec::chunk::ChunkSchema;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,
@@ -154,7 +154,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::plan;
+    use novarocks_protocol::plan;
 
     #[test]
     fn nested_loop_join_output_schema_uses_plan_output_nullability() {

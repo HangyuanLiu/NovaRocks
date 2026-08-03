@@ -20,8 +20,8 @@ use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonneg
 use crate::native::plan_decode::error::NativeFragmentLeafDecodeError;
 use novarocks::exec::node::limit::LimitNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::plan;
 
 pub(super) fn lower_limit_node(
     node: &plan::DistributedNode,

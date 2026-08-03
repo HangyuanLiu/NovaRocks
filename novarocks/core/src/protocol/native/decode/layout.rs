@@ -30,9 +30,9 @@ use super::error::NativeFragmentLeafDecodeError;
 use crate::common::ids::SlotId;
 #[cfg(any(test, feature = "query-execution-contract-test-support"))]
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-use crate::proto::common;
 use crate::protocol::common::error::ProtocolErrorKind;
+#[cfg(any(test, feature = "query-execution-contract-test-support"))]
+use novarocks_protocol::common;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Layout {
@@ -249,8 +249,8 @@ mod tests {
 
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::proto::common;
     use crate::protocol::native::type_mapping::{encode_field_type, encode_type};
+    use novarocks_protocol::common;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

@@ -53,7 +53,7 @@ struct InProcessTestExchangeFrameTransmitter;
 impl ExchangeFrameTransmitter for InProcessTestExchangeFrameTransmitter {
     fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError> {
         let response = crate::service::internal_rpc::handle_transmit_chunk(
-            crate::proto::novarocks::ExchangeRequest {
+            novarocks_protocol::novarocks::ExchangeRequest {
                 finst_id_hi: frame.destination_fragment_instance_id.high(),
                 finst_id_lo: frame.destination_fragment_instance_id.low(),
                 node_id: frame.destination_node_id,

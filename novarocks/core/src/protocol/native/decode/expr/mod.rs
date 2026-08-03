@@ -24,8 +24,8 @@ use super::{decode_field_type, decode_type};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 
 mod binary;
 mod case;
@@ -606,8 +606,8 @@ pub(crate) mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
-    use crate::proto::{common, expr};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr};
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
     pub(crate) fn type_desc(data_type: &DataType) -> common::TypeDesc {

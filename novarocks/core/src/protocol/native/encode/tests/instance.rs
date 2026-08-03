@@ -133,7 +133,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(encoded_range.volume_id, Some(13));
     assert_eq!(encoded_range.empty, Some(true));
     assert_eq!(encoded_range.has_more, Some(false));
-    let crate::proto::novarocks::scan_range::Kind::File(file) = encoded_range
+    let novarocks_protocol::novarocks::scan_range::Kind::File(file) = encoded_range
         .range
         .as_ref()
         .and_then(|range| range.kind.as_ref())

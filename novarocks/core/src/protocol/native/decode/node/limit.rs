@@ -19,9 +19,9 @@ use super::DecodedNode;
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_limit_node(
     node: &plan::DistributedNode,
@@ -72,8 +72,8 @@ pub(super) fn lower_limit_node(
 mod tests {
     use super::super::tests::{one_col_values_node, physical_node};
     use crate::exec::expr::ExprArena;
-    use crate::proto::plan;
     use crate::protocol::common::error::ProtocolErrorKind;
+    use novarocks_protocol::plan;
 
     fn limit_node(payload_limit: Option<i64>, offset: Option<i64>) -> plan::DistributedNode {
         physical_node(

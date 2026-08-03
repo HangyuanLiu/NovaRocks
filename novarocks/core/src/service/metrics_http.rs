@@ -422,7 +422,8 @@ pub fn publish_frontend_query_lifecycle_metrics(
     }
 }
 
-pub(crate) async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
+/// Shared metrics HTTP handler for role-owned native listeners.
+pub async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
     if params
         .get("type")
         .is_some_and(|value| value.eq_ignore_ascii_case("json"))
@@ -529,6 +530,24 @@ fn refresh_backend_gauges() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_bind_addr_accepts_ipv4_and_ipv6_literals() {
+        assert_eq!(
+            parse_metrics_bind_addr("127.0.0.1", 9070).expect("parse IPv4"),
+            "127.0.0.1:9070"
+                .parse::<SocketAddr>()
+                .expect("IPv4 address")
+        );
+        assert_eq!(
+            parse_metrics_bind_addr("::1", 9070).expect("parse bare IPv6"),
+            "[::1]:9070".parse::<SocketAddr>().expect("IPv6 address")
+        );
+        assert_eq!(
+            parse_metrics_bind_addr("[::]", 9070).expect("parse bracketed IPv6"),
+            "[::]:9070".parse::<SocketAddr>().expect("IPv6 wildcard")
+        );
+    }
 
     #[test]
     fn rendered_metrics_include_cluster_core_names() {

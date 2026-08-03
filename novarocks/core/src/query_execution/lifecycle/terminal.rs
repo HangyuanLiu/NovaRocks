@@ -25,10 +25,10 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 
 use crate::common::types::UniqueId;
-use crate::proto::novarocks;
 use crate::runtime::fragment::fact::{FragmentOutcome, FragmentTerminalFact};
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+use novarocks_protocol::novarocks;
 
 use super::{
     ParticipantBackendIdentity, ParticipantManifestDigest, QueryExecutionId, QueryLifecycleError,

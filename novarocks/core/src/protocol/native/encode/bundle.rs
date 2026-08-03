@@ -17,9 +17,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
-use crate::proto::plan::PlanFragment as NativePlanFragment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::sql::planner::distributed::{DistributedPlan, FragmentId};
+use novarocks_protocol::plan::PlanFragment as NativePlanFragment;
 
 pub(crate) struct NativeFragmentBundle {
     by_fragment: BTreeMap<FragmentId, NativePlanFragment>,
@@ -51,7 +51,7 @@ impl NativeFragmentBundle {
     /// shell cannot be reused to attach a second set of runtime-filter tables.
     pub(crate) fn bind_runtime_filter_tables(
         mut self,
-        tables: BTreeMap<FragmentId, crate::proto::plan::RuntimeFilterBindingTable>,
+        tables: BTreeMap<FragmentId, novarocks_protocol::plan::RuntimeFilterBindingTable>,
     ) -> Result<Self, String> {
         let expected = self.by_fragment.keys().copied().collect::<BTreeSet<_>>();
         let actual = tables.keys().copied().collect::<BTreeSet<_>>();

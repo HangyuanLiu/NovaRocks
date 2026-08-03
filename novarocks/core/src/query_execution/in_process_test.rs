@@ -74,7 +74,7 @@ pub(crate) fn bind_empty_runtime_filter_tables_for_test(
                     "in-process native test execution does not support runtime-filter bindings",
                 ));
             }
-            Ok(crate::proto::plan::RuntimeFilterBindingTable {
+            Ok(novarocks_protocol::plan::RuntimeFilterBindingTable {
                 fragment_id: fragment.fragment_id(),
                 bindings: Vec::new(),
             })

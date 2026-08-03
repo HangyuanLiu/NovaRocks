@@ -104,8 +104,8 @@ mod tests {
     #[test]
     fn ensure_request_rejects_invalid_incarnation_length() {
         let error = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
-            execution_id: Some(novarocks::proto::novarocks::QueryExecutionId {
-                query_id: Some(novarocks::proto::common::UniqueId { hi: 7, lo: 9 }),
+            execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
+                query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
             provider_id: "iceberg".to_string(),

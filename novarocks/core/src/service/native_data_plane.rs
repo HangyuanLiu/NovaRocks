@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use novarocks_types::UniqueId;
 
-use crate::proto;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use crate::service::internal_rpc;
+use novarocks_protocol as proto;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 

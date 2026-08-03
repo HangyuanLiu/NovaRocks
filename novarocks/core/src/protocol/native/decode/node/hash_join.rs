@@ -29,8 +29,8 @@ use crate::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 use novarocks_types::wider_type;
 
 pub(super) fn lower_hash_join_node(
@@ -435,7 +435,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::plan;
+    use novarocks_protocol::plan;
 
     #[test]
     fn hash_join_output_schema_uses_plan_output_nullability() {

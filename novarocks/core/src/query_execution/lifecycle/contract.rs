@@ -32,8 +32,8 @@ use super::stage::{
 };
 use super::terminal::{QueryTerminalSnapshot, QueryTerminalSnapshotDigest};
 use crate::common::types::UniqueId;
-use crate::proto::{common, filter, novarocks};
 use crate::runtime::profile::RuntimeProfileTree;
+use novarocks_protocol::{common, filter, novarocks};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryLifecycleErrorCode {
@@ -1813,7 +1813,7 @@ mod tests {
             .is_err()
         );
 
-        let invalid_profile = crate::proto::novarocks::FragmentLiveObservation {
+        let invalid_profile = novarocks_protocol::novarocks::FragmentLiveObservation {
             execution_id: Some(super::encode_execution_id(execution_id())),
             init_digest: digest.as_bytes().to_vec(),
             backend: Some(super::encode_backend_identity(&observation_backend())),
@@ -1821,7 +1821,7 @@ mod tests {
                 1, 2,
             ))),
             sequence: 1,
-            profile: Some(crate::proto::novarocks::RuntimeProfileTree::default()),
+            profile: Some(novarocks_protocol::novarocks::RuntimeProfileTree::default()),
             ..Default::default()
         };
         assert!(decode_fragment_live_observation(&invalid_profile).is_err());
@@ -1975,9 +1975,9 @@ mod tests {
 
     fn stage_fragment(lo: i64) -> StageFragment {
         StageFragment::new(
-            crate::proto::plan::PlanFragment::default(),
-            crate::proto::novarocks::InstanceParams {
-                fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 17, lo }),
+            novarocks_protocol::plan::PlanFragment::default(),
+            novarocks_protocol::novarocks::InstanceParams {
+                fragment_instance_id: Some(novarocks_protocol::common::UniqueId { hi: 17, lo }),
                 ..Default::default()
             },
         )

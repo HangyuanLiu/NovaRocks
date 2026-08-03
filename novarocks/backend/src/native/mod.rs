@@ -17,10 +17,10 @@
 
 //! Backend-owned native gRPC transport declarations.
 //!
-//! This module intentionally contains no service implementation yet. It owns
-//! the generated server stub while `novarocks-protocol` remains the sole owner
-//! of all native protobuf DTO definitions.
+//! This module owns Backend's generated client and server stubs while
+//! `novarocks-protocol` remains the sole owner of all native protobuf DTOs.
 
+pub(crate) mod client;
 pub(crate) mod codec;
 pub(crate) mod connector_binding;
 pub(crate) mod decode;
@@ -49,8 +49,10 @@ pub(crate) mod transport {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn generated_native_server_stub_references_protocol_dtos() {
+    fn generated_native_transport_stubs_reference_protocol_dtos() {
         let generated = include_str!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
+        assert!(generated.contains("nova_rocks_grpc_client"));
+        assert!(generated.contains("nova_rocks_grpc_server"));
         assert!(generated.contains("::novarocks_protocol::novarocks::HeartbeatRequest"));
         assert!(generated.contains("::novarocks_protocol::filter::LookupRequest"));
     }

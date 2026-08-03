@@ -28,9 +28,9 @@ use crate::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
 use crate::sql::common::ChangeStreamBranchKind;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,
@@ -234,7 +234,7 @@ mod tests {
     use super::super::tests::{one_col_values_node, output_column, physical_node};
     use super::super::{NativePlanDecodeContext, decode_node};
     use crate::exec::expr::ExprArena;
-    use crate::proto::plan;
+    use novarocks_protocol::plan;
 
     #[test]
     fn change_event_rejects_invalid_data_route_slot() {

@@ -26,8 +26,8 @@ use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks::exec::node::union_all::UnionAllNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{common as proto_common, plan};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,

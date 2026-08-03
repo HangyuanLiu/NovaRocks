@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crate::proto::{expr, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ComparatorDigest, CompletionFenceKind, CompletionRequirement,
@@ -33,6 +32,7 @@ use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
 use crate::runtime_filter::port::ordered_bound::{RuntimeOrderContract, RuntimeOrderKey};
 use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+use novarocks_protocol::{expr, plan};
 
 use super::error::NativeFragmentLeafDecodeError;
 
@@ -377,7 +377,7 @@ fn digest32(binding_id: u32, field: &str, bytes: &[u8]) -> Result<[u8; 32], Stri
 
 #[allow(dead_code)] // Shared with the install codec before its Task 4 handler call site lands.
 pub(in crate::protocol::native) fn decode_runtime_filter_logical_domain_and_reduction(
-    wire_type: Option<&crate::proto::common::TypeDesc>,
+    wire_type: Option<&novarocks_protocol::common::TypeDesc>,
     wire_contract: Option<&plan::RuntimeFilterContract>,
     wire_reduction: Option<&plan::RuntimeFilterReductionContract>,
     path: FieldPath,
@@ -1144,7 +1144,6 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::proto::expr;
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime_filter::model::contract::{
@@ -1157,6 +1156,7 @@ mod tests {
         COMPARATOR_ALGORITHM_VERSION, RuntimeOrderContract, comparator_digest_for_test,
     };
     use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
+    use novarocks_protocol::expr;
 
     fn expression(column_id: u32) -> expr::Expr {
         expr::Expr {

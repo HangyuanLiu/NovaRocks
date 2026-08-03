@@ -22,8 +22,8 @@ use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::sort::SortNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_topn_node(
     node: &plan::DistributedNode,

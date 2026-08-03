@@ -22,8 +22,8 @@ use super::{DecodedNode, NativePlanDecodeContext};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::SortNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_topn_node(
     node: &plan::DistributedNode,
@@ -115,8 +115,8 @@ mod tests {
     use super::super::{NativePlanDecodeContext, decode_node};
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

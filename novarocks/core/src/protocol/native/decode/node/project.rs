@@ -25,9 +25,9 @@ use crate::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlo
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{expr, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_project_node(
     node: &plan::DistributedNode,
@@ -310,9 +310,9 @@ mod tests {
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
     use crate::exec::expr::ExprArena;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

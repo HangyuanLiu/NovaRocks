@@ -5,6 +5,8 @@ use novarocks::runtime::fragment::{
     LookupColumn, LookupKind, LookupRequest,
 };
 
+use crate::native::client::NativeGrpcClient;
+
 pub(crate) fn grpc_fragment_lookup_client() -> Arc<dyn FragmentLookupClient> {
     Arc::new(GrpcFragmentLookupClient)
 }
@@ -47,12 +49,10 @@ impl FragmentLookupClient for GrpcFragmentLookupClient {
                 format!("invalid gRPC lookup port: {error}"),
             )
         })?;
-        let response = novarocks::service::grpc_client::lookup(
-            endpoint.host(),
-            port,
-            remote_request(&request)?,
-        )
-        .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
+        let request = remote_request(&request)?;
+        let response = NativeGrpcClient::new_host_port(endpoint.host().to_string(), port)
+            .and_then(|client| client.lookup(request))
+            .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
         decode_response(response)
     }
 }

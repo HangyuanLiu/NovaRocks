@@ -306,6 +306,22 @@ impl BackendApplicationHost {
         &self.ready_marker
     }
 
+    /// Return the actual listener endpoint in a form a same-process frontend
+    /// can dial.  A wildcard bind remains a listener concern; composition must
+    /// use loopback rather than attempting to connect to `0.0.0.0` or `::`.
+    pub fn connectable_native_endpoint(&self) -> SocketAddr {
+        let bound = self.grpc_server.bound_addr();
+        let ip = if bound.ip().is_unspecified() {
+            match bound.ip() {
+                std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            }
+        } else {
+            bound.ip()
+        };
+        SocketAddr::new(ip, bound.port())
+    }
+
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
@@ -590,12 +606,12 @@ mod tests {
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
     };
+    use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks::common::app_config::NovaRocksConfig;
-    use novarocks::proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks::query_execution::lifecycle::contract::{
         decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
         encode_query_control_command, encode_query_init_request,
@@ -607,7 +623,6 @@ mod tests {
         QueryTerminationReason,
     };
     use novarocks::runtime::query_options::QueryOptions;
-    use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
     use novarocks_connector_starrocks::{
         StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksControlGeneration,
         StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
@@ -882,6 +897,8 @@ mod tests {
         NovaRocksGrpcClient::connect(format!("http://127.0.0.1:{grpc_port}"))
             .await
             .expect("connect native backend gRPC")
+            .max_encoding_message_size(64 * 1024 * 1024)
+            .max_decoding_message_size(64 * 1024 * 1024)
     }
 
     #[test]

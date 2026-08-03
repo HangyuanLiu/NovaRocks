@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use super::{lower_expr_list, lower_required_child};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 use novarocks_types::comparison_common_type;
 
 use super::super::layout::Layout;
@@ -249,9 +249,9 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, LiteralValue};
-    use crate::proto::expr;
     use arrow::array::{Array, BooleanArray};
     use arrow::datatypes::DataType;
+    use novarocks_protocol::expr;
 
     #[test]
     fn in_list_casts_numeric_candidates_to_string_operand_type() {

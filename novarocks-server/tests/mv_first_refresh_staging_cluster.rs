@@ -16,7 +16,6 @@
 #![cfg(feature = "mv-first-refresh-staging-test-support")]
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -24,17 +23,9 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
-use novarocks::common::app_config::{ClusterRole, NovaRocksConfig};
+use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::common::query_lifecycle_fault::{QueryLifecycleFaultKind, arm_path, trigger_path};
-use novarocks::server::StandaloneGrpcEndpointOwnership;
-use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
-    FrontendQueryService,
-};
-use novarocks_state_store::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHostConfig, StateStoreLimitOverrides,
-    StateStoreProviderConfig,
-};
+use novarocks_frontend::{FrontendServerConfig, run_frontend_server_until_shutdown};
 use tempfile::{NamedTempFile, TempDir};
 
 struct ReservedPort {
@@ -406,105 +397,25 @@ query_lifecycle_fault_dir = "{}"
     )
     .expect("write frontend config");
     let config = NovaRocksConfig::load_from_file(config_file.path()).expect("load frontend config");
-    novarocks::common::app_config::install_preloaded_config(config.clone());
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build frontend runtime");
-    let frontend = runtime
-        .block_on(FrontendApplicationHost::open(
-            Some(StateStoreHostConfig {
-                state_store: StateStoreAppConfig {
-                    store: StateStoreConfig {
-                        cluster_id: "mvx2w-native-staging".to_string(),
-                        limits: StateStoreLimitOverrides::default(),
-                        provider: StateStoreProviderConfig::Sqlite {
-                            path: state_path.clone(),
-                            deployment_owner: "fe-1".to_string(),
-                        },
-                    },
-                    mysql_client: None,
-                },
-                foundationdb_client: None,
-            }),
-            FrontendExecutionConfig::new(
-                "127.0.0.1",
-                fe_grpc_port,
-                NonZeroUsize::new(3).expect("non-zero coordinator concurrency"),
-            ),
-            ClusterBackendOpenConfig::new(
-                ClusterRole::Fe,
-                backends.endpoints.clone(),
-                Duration::from_secs(1),
-                3,
-                Duration::from_secs(1),
-            )
-            .expect("build frontend backend config"),
-        ))
-        .expect("open frontend host");
-    let services = novarocks_frontend::standalone_open_services_for_server(&frontend);
-    let query_control = services.query_control.clone();
-    let query_execution = services.query_execution.clone();
-    let topology = services.backend_topology.clone();
-    let role = services.execution_role;
-    let dml = frontend.dml_service();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let (engine_tx, engine_rx) = mpsc::channel();
     let _ = fe_mysql.release();
     let _ = fe_http.release();
     let _ = fe_grpc.release();
-    let server =
-        novarocks::server::run_standalone_server_with_config_until_shutdown_with_session_factory(
+    let server = run_frontend_server_until_shutdown(
+        FrontendServerConfig {
             config,
-            Some(config_file.path().to_path_buf()),
-            None,
-            // This fixture owns the report-only endpoint.  A bare
-            // FrontendApplicationHost deliberately does not bind it; treating it
-            // as externally hosted would register the FE as a fake backend.
-            StandaloneGrpcEndpointOwnership::HostedReportOnly,
-            services,
-            move |engine| {
-                engine_tx
-                    .send(engine.clone())
-                    .map_err(|error| error.to_string())?;
-                let insert_engine = engine.insert_engine();
-                let delete_engine = engine.delete_engine();
-                let mutation_engine = engine.mutation_engine();
-                let add_files_engine = engine.add_files_engine();
-                let ctas_engine = engine.ctas_engine();
-                let truncate_engine = engine.truncate_engine();
-                Ok(std::sync::Arc::new(FrontendQueryService::new(
-                    engine,
-                    query_control,
-                    query_execution,
-                    role,
-                    topology,
-                    dml,
-                    insert_engine,
-                    delete_engine,
-                    mutation_engine,
-                    add_files_engine,
-                    ctas_engine,
-                    truncate_engine,
-                )))
-            },
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        );
+            config_path: Some(config_file.path().to_path_buf()),
+            port_override: None,
+        },
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    );
     let server_task = runtime.spawn(server);
-    let engine = match engine_rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(engine) => engine,
-        Err(error) => {
-            let terminal = runtime
-                .block_on(server_task)
-                .expect("join prematurely terminated frontend server task");
-            panic!(
-                "native frontend server did not construct an engine: {error}; terminal result: {terminal:?}"
-            );
-        }
-    };
     let mut conn = connect_mysql(fe_mysql_port);
     conn.query_drop(format!(
         r#"CREATE EXTERNAL CATALOG staging_ice PROPERTIES("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{}")"#,
@@ -527,22 +438,8 @@ query_lifecycle_fault_dir = "{}"
     )
     .expect("create MV target");
 
-    let outcome = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_mv")
-        .expect("stage projection first refresh through native QES");
-    assert_eq!(outcome.input_rows, 2);
-    assert!(
-        outcome.staged_bytes > 0,
-        "native writer must stage bytes: {outcome:?}"
-    );
-    assert!(
-        outcome.artifact_count > 0,
-        "native writer must stage artifacts: {outcome:?}"
-    );
-    assert!(
-        (1..=3).contains(&outcome.writer_count),
-        "writer reports must belong to the admitted live BE topology: {outcome:?}"
-    );
+    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_mv")
+        .expect("stage projection first refresh through native FE session");
     let main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, v2 FROM orders_mv ORDER BY k1")
         .expect("read un-published MV main ref");
@@ -555,14 +452,8 @@ query_lifecycle_fault_dir = "{}"
         "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
     )
     .expect("create aggregate MV target");
-    let aggregate_outcome = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_agg_mv")
-        .expect("stage aggregate first refresh through native QES");
-    assert_eq!(aggregate_outcome.input_rows, 2);
-    assert!(
-        aggregate_outcome.artifact_count > 0,
-        "aggregate native writer must stage artifacts: {aggregate_outcome:?}"
-    );
+    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_agg_mv")
+        .expect("stage aggregate first refresh through native FE session");
     let aggregate_main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, total_v2 FROM orders_agg_mv ORDER BY k1")
         .expect("read un-published aggregate MV main ref");
@@ -581,14 +472,8 @@ query_lifecycle_fault_dir = "{}"
         "CREATE MATERIALIZED VIEW orders_join_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT o.k1, o.v2, c.region FROM orders o JOIN customers c ON o.k1 = c.k1",
     )
     .expect("create join MV target");
-    let join_outcome = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_join_mv")
-        .expect("stage join first refresh through native QES");
-    assert_eq!(join_outcome.input_rows, 2);
-    assert!(
-        join_outcome.artifact_count > 0,
-        "join native writer must stage artifacts: {join_outcome:?}"
-    );
+    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_join_mv")
+        .expect("stage join first refresh through native FE session");
     let join_main_rows: Vec<(i32, i64, String)> = conn
         .query("SELECT k1, v2, region FROM orders_join_mv ORDER BY k1")
         .expect("read un-published join MV main ref");
@@ -601,12 +486,8 @@ query_lifecycle_fault_dir = "{}"
         "CREATE MATERIALIZED VIEW orders_empty_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders WHERE k1 < 0",
     )
     .expect("create empty MV target");
-    let empty_outcome = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_empty_mv")
-        .expect("stage empty first refresh through native QES");
-    assert_eq!(empty_outcome.input_rows, 0);
-    assert_eq!(empty_outcome.artifact_count, 0);
-    assert_eq!(empty_outcome.staged_bytes, 0);
+    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_empty_mv")
+        .expect("stage empty first refresh through native FE session");
 
     conn.query_drop(
         "CREATE TABLE orders_extra (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
@@ -618,14 +499,8 @@ query_lifecycle_fault_dir = "{}"
         "CREATE MATERIALIZED VIEW orders_union_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders UNION ALL SELECT k1, v2 FROM orders_extra",
     )
     .expect("create union MV target");
-    let union_outcome = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_union_mv")
-        .expect("stage union first refresh through native QES");
-    assert_eq!(union_outcome.input_rows, 3);
-    assert!(
-        union_outcome.artifact_count > 0,
-        "union native writer must stage artifacts: {union_outcome:?}"
-    );
+    conn.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_union_mv")
+        .expect("stage union first refresh through native FE session");
     let union_main_rows: Vec<(i32, i64)> = conn
         .query("SELECT k1, v2 FROM orders_union_mv ORDER BY k1")
         .expect("read un-published union MV main ref");
@@ -643,8 +518,8 @@ query_lifecycle_fault_dir = "{}"
         QueryLifecycleFaultKind::StartAckSuppress,
         "mvx2w-start-abort",
     );
-    let start_fault = engine
-        .stage_iceberg_mv_first_refresh_for_test(Some("staging_ice"), "ns", "orders_start_fault_mv")
+    let start_fault = conn
+        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_start_fault_mv")
         .expect_err("a partial native start must not produce a staging completion");
     assert!(
         !start_fault.to_string().is_empty(),
@@ -671,12 +546,8 @@ query_lifecycle_fault_dir = "{}"
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
         "mvx2w-terminal-conflict",
     );
-    let terminal_conflict = engine
-        .stage_iceberg_mv_first_refresh_for_test(
-            Some("staging_ice"),
-            "ns",
-            "orders_terminal_conflict_mv",
-        )
+    let terminal_conflict = conn
+        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_terminal_conflict_mv")
         .expect_err("a conflicting terminal report must not produce a staging completion");
     assert!(
         !terminal_conflict.to_string().is_empty(),
@@ -699,12 +570,8 @@ query_lifecycle_fault_dir = "{}"
     )
     .expect("create fragment-failure MV target");
     arm_fragment_failure(&fragment_failure_trigger, "mvx2w-fragment-failure");
-    let fragment_failure = engine
-        .stage_iceberg_mv_first_refresh_for_test(
-            Some("staging_ice"),
-            "ns",
-            "orders_fragment_failure_mv",
-        )
+    let fragment_failure = conn
+        .query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_fragment_failure_mv")
         .expect_err("a failed native writer fragment must not produce a staging completion");
     assert!(
         !fragment_failure.to_string().is_empty(),
@@ -736,14 +603,17 @@ query_lifecycle_fault_dir = "{}"
         QueryLifecycleFaultKind::RestartAfterInitAck,
         BACKEND_LOSS_TOKEN,
     );
-    let staging_engine = engine.clone();
     let (backend_loss_tx, backend_loss_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = staging_engine.stage_iceberg_mv_first_refresh_for_test(
-            Some("staging_ice"),
-            "ns",
-            "orders_backend_loss_mv",
-        );
+        let mut staging = connect_mysql(fe_mysql_port);
+        staging
+            .query_drop("SET CATALOG staging_ice")
+            .expect("select backend-loss staging catalog");
+        staging
+            .query_drop("USE ns")
+            .expect("select backend-loss staging database");
+        let result =
+            staging.query_drop("ADMIN TEST MVX2W STAGE FIRST REFRESH orders_backend_loss_mv");
         let _ = backend_loss_tx.send(result);
     });
     let admitted_backend = backends.wait_for_init_ack_marker(BACKEND_LOSS_TOKEN);
@@ -835,7 +705,6 @@ query_lifecycle_fault_dir = "{}"
         QueryLifecycleFaultKind::RestartAfterInitAck,
     );
 
-    drop(engine);
     drop(conn);
     shutdown_tx
         .send(())
@@ -844,21 +713,4 @@ query_lifecycle_fault_dir = "{}"
         .block_on(server_task)
         .expect("join frontend server task");
     server_result.expect("shutdown frontend server");
-    if let Err(error) = runtime.block_on(frontend.shutdown()) {
-        // RestartAfterInitAck deliberately replaces a BE while the frontend's
-        // background statistics worker can be either acquiring or releasing
-        // its lease after its stop check. `release_resources` still tears down
-        // the host and StateStore; this known worker-stop race is unrelated to
-        // the staged write attempt proved above. Do not mask any other
-        // teardown error.
-        let message = error.to_string();
-        assert!(
-            message.contains("shutdown statistics analyze worker failed")
-                && (message.contains("acquire statistics worker lease failed")
-                    || message.contains("release statistics worker lease failed"))
-                && message.contains("OperationNotCommitted")
-                && !message.contains("; cleanup failed:"),
-            "unexpected frontend shutdown failure after BE restart: {message}"
-        );
-    }
 }

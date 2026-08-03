@@ -63,7 +63,6 @@ use crate::exec::node::runtime_filter::{
 };
 use crate::exec::node::scan::BoundScanRanges;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{novarocks, plan};
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::test_assembly::{
     NativeExpressionDecoder, NativeExpressionInputLayout, NativeOutputLayout,
@@ -77,6 +76,7 @@ use crate::runtime::query_context::QueryId;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::runtime_filter::port::binding::RuntimeFilterProducerTarget;
+use novarocks_protocol::{novarocks, plan};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -172,7 +172,7 @@ impl NativePlanDecodeContext {
 
     pub(crate) fn decode_output_layout(
         &self,
-        columns: &[crate::proto::common::OutputColumn],
+        columns: &[novarocks_protocol::common::OutputColumn],
         path: FieldPath,
     ) -> Result<NativeOutputLayout, super::NativeFragmentDecodeError> {
         let Some(decoder) = self.output_layout_decoder.as_ref() else {
@@ -211,7 +211,7 @@ impl NativePlanDecodeContext {
 
     pub(crate) fn decode_expression(
         &self,
-        expression: &crate::proto::expr::Expr,
+        expression: &novarocks_protocol::expr::Expr,
         path: FieldPath,
         arena: &mut ExprArena,
         layout: &Layout,
@@ -1370,12 +1370,12 @@ fn lower_binding_expression(
 
 fn validate_column_refs_exact(
     binding_id: u32,
-    expression: &crate::proto::expr::Expr,
+    expression: &novarocks_protocol::expr::Expr,
     layout: &Layout,
     schema: &ChunkSchemaRef,
     path: FieldPath,
 ) -> Result<(), super::NativeFragmentDecodeError> {
-    use crate::proto::expr::expr::Kind;
+    use novarocks_protocol::expr::expr::Kind;
 
     let kind = expression.kind.as_ref().ok_or_else(|| {
         super::NativeFragmentDecodeError::missing(
@@ -1447,7 +1447,7 @@ fn validate_column_refs_exact(
         }
     }
 
-    let visit = |child: &crate::proto::expr::Expr, child_path: FieldPath| {
+    let visit = |child: &novarocks_protocol::expr::Expr, child_path: FieldPath| {
         validate_column_refs_exact(binding_id, child, layout, schema, child_path)
     };
     let missing = |child_path: FieldPath, detail: &'static str| {
@@ -1915,8 +1915,8 @@ mod tests {
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
     use crate::exec::node::set_op::SetOpKind;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     struct DummyScanOp;
 

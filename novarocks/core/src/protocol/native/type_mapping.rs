@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::proto::common;
+use novarocks_protocol::common;
 use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
 const TIME_UNIT_MICROS: i32 = 2;

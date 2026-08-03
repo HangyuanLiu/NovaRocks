@@ -24,8 +24,8 @@ use crate::native::plan_decode::layout::Layout;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{expr, plan};
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_sort_node(
     node: &plan::DistributedNode,

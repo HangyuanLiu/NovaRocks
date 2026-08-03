@@ -121,12 +121,12 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
     .expect("encode prepared delta binding");
 
     let root = encoded.fragments[0].root.as_ref().expect("encoded root");
-    let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Physical(physical)) =
         root.payload.as_ref()
     else {
         panic!("expected physical root");
     };
-    let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+    let Some(novarocks_protocol::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
         panic!("expected scan root");
     };
     assert_eq!(scan.columns[0].name, "physical_order_id");
@@ -144,7 +144,7 @@ fn iceberg_delta_table_encoder_requires_prepared_connector_read() {
         vec!["physical_order_id", "tenant_id"]
     );
     assert!(table.iceberg_row_lineage_metadata_columns.is_empty());
-    let Some(crate::proto::plan::scan_source::Kind::ConnectorRead(connector)) = table
+    let Some(novarocks_protocol::plan::scan_source::Kind::ConnectorRead(connector)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
@@ -248,7 +248,7 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
     assert_eq!(with_binding, without_binding);
     let scan = encoded_root_scan_for_test(&with_binding);
     let table = scan.table.as_ref().expect("bound table");
-    let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(files)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
@@ -410,13 +410,13 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
                 (&expected_source, encoded_source),
                 (
                     table_model::ScanSource::IcebergVersionTable { .. },
-                    crate::proto::plan::scan_source::Kind::IcebergVersionTable(_)
+                    novarocks_protocol::plan::scan_source::Kind::IcebergVersionTable(_)
                 ) | (
                     table_model::ScanSource::IcebergMvTargetLocator(_),
-                    crate::proto::plan::scan_source::Kind::IcebergMvTargetLocator(_)
+                    novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetLocator(_)
                 ) | (
                     table_model::ScanSource::IcebergMvTargetState(_),
-                    crate::proto::plan::scan_source::Kind::IcebergMvTargetState(_)
+                    novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetState(_)
                 )
             ),
             "resolved file bindings must not erase the typed refresh source kind"
@@ -565,7 +565,7 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     assert_eq!(scan.required_columns, vec!["__nr_var_v_0"]);
     assert_eq!(scan.variant_columns[0].synthetic_column_id, 2);
     let table = scan.table.as_ref().expect("bound table");
-    let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(files)) = table
+    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(files)) = table
         .source
         .as_ref()
         .and_then(|source| source.kind.as_ref())
@@ -573,7 +573,7 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
         panic!("variant binding must encode as IcebergDataFiles");
     };
     assert!(
-        matches!(files.binding, x if x == crate::proto::plan::IcebergDataFileBinding::ExplicitFiles as i32)
+        matches!(files.binding, x if x == novarocks_protocol::plan::IcebergDataFileBinding::ExplicitFiles as i32)
     );
 }
 

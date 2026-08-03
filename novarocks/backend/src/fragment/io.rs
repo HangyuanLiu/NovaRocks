@@ -5,6 +5,8 @@ use novarocks::runtime::fragment::{
     FragmentIoOperation,
 };
 
+use crate::native::client::NativeGrpcClient;
+
 pub(crate) fn grpc_exchange_transmitter() -> Arc<dyn ExchangeFrameTransmitter> {
     Arc::new(GrpcExchangeFrameTransmitter)
 }
@@ -20,23 +22,30 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 format!("invalid gRPC exchange destination port: {error}"),
             )
         })?;
-        novarocks::service::grpc_client::send_chunks(
-            frame.destination.host(),
-            port,
-            frame.destination_fragment_instance_id,
-            frame.destination_node_id,
-            frame.sender_id,
-            frame.backend_number,
-            frame.eos,
-            frame.sequence,
-            frame.payload,
-        )
-        .map_err(|error| {
-            FragmentIoError::new(
-                FragmentIoOperation::ExchangeTransmit,
-                FragmentIoErrorKind::Unavailable,
-                error,
+        let client = NativeGrpcClient::new_host_port(frame.destination.host().to_string(), port)
+            .map_err(|error| {
+                FragmentIoError::new(
+                    FragmentIoOperation::ExchangeTransmit,
+                    FragmentIoErrorKind::Unavailable,
+                    error,
+                )
+            })?;
+        client
+            .exchange_unary(
+                frame.destination_fragment_instance_id,
+                frame.destination_node_id,
+                frame.sender_id,
+                frame.backend_number,
+                frame.eos,
+                frame.sequence,
+                frame.payload,
             )
-        })
+            .map_err(|error| {
+                FragmentIoError::new(
+                    FragmentIoOperation::ExchangeTransmit,
+                    FragmentIoErrorKind::Unavailable,
+                    error,
+                )
+            })
     }
 }

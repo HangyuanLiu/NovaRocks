@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
 
+use crate::native::transport::heartbeat as native_heartbeat;
+
 const CLUSTER_BACKENDS_KEY: &[u8] = b"novarocks/frontend/cluster-backends/v1/state";
 const CLUSTER_BACKENDS_SCHEMA_VERSION: u8 = 1;
 
@@ -506,7 +508,7 @@ impl ClusterBackendService {
             }
         };
         let service = Arc::new(Self::new(storage, runtime, &config, |be_id, endpoint| {
-            novarocks::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint)
+            native_heartbeat(be_id, endpoint)
         }));
         if let MembershipStorage::Durable(repository) = &service.storage {
             let stored = match repository.load().await? {
@@ -587,9 +589,7 @@ impl ClusterBackendService {
             MembershipStorage::Transient,
             runtime,
             &config,
-            |be_id, endpoint| {
-                novarocks::service::cluster_heartbeat::grpc_heartbeat(be_id, endpoint)
-            },
+            |be_id, endpoint| native_heartbeat(be_id, endpoint),
         )
     }
 

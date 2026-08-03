@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use super::{collection, lower_expr_list};
 use crate::exec::expr::function::{FunctionKind, function_metadata, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 
 use super::super::layout::Layout;
 

@@ -24,10 +24,10 @@ use super::type_mapping::{
     encode_sort_topn_type, encode_topn_phase, usize_to_u64,
 };
 use super::{NativePlanEncodeContext, encode_exprs};
-use crate::proto::plan;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::sql::planner::payload::PlanRowCountAssertion;
 use crate::sql::planner::physical::PhysicalPlanKind;
+use novarocks_protocol::plan;
 
 #[cfg(test)]
 pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static str] {

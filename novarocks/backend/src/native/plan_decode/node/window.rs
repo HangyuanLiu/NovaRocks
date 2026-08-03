@@ -32,8 +32,8 @@ use novarocks::exec::node::analytic::{
 };
 use novarocks::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{expr, plan};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,
