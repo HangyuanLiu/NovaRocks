@@ -19,6 +19,8 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -105,7 +107,7 @@ use crate::mv::persistence::refresh::{
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource, HIDDEN_COLUMNS_PROPERTY,
+    HIDDEN_COLUMNS_PROPERTY,
 };
 use crate::mv::refresh::aggregate_first_refresh::{
     AggregateStateRead, prepare_aggregate_first_refresh_chunks,
@@ -2605,7 +2607,9 @@ fn validate_branch_union_contract(
             query_branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source != mv_schema::ApplyKeySource::GroupRowId {
+    if branch_contract.inner_apply_key_source
+        != crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+    {
         return Err(format!(
             "iceberg branch UNION ALL aggregate MV {}.{}.{} branch contract must use GroupRowId inner apply keys",
             target.catalog, target.namespace, target.table
@@ -2711,7 +2715,9 @@ fn validate_union_projection_schema_contract_for_base(
             branch_count
         ));
     }
-    if branch_contract.inner_apply_key_source != mv_schema::ApplyKeySource::BaseRowId {
+    if branch_contract.inner_apply_key_source
+        != crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
+    {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract must use BaseRowId inner apply keys",
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
@@ -2768,10 +2774,12 @@ fn validate_union_projection_schema_contract_for_base(
 
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
-) -> mv_schema::ApplyKeySource {
+) -> crate::sql::planner::vocabulary::ApplyKeySource {
     match branch_kind {
-        UnionBranchKind::Aggregate => mv_schema::ApplyKeySource::GroupRowId,
-        UnionBranchKind::ProjectionFilter => mv_schema::ApplyKeySource::BaseRowId,
+        UnionBranchKind::Aggregate => crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId,
+        UnionBranchKind::ProjectionFilter => {
+            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
+        }
     }
 }
 
@@ -2943,11 +2951,15 @@ fn create_apply_key_source_property(apply_key: &ApplyKeyContract) -> &'static st
     }
 }
 
-fn create_apply_key_contract_source(apply_key: &ApplyKeyContract) -> mv_schema::ApplyKeySource {
+fn create_apply_key_contract_source(
+    apply_key: &ApplyKeyContract,
+) -> crate::sql::planner::vocabulary::ApplyKeySource {
     match apply_key.column_name {
-        HIDDEN_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::BaseRowId,
-        JOIN_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::JoinRowKey,
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => mv_schema::ApplyKeySource::GroupRowId,
+        HIDDEN_APPLY_KEY_COLUMN_NAME => crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId,
+        JOIN_APPLY_KEY_COLUMN_NAME => crate::sql::planner::vocabulary::ApplyKeySource::JoinRowKey,
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME => {
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+        }
         other => unreachable!("unknown Iceberg MV apply-key column {other}"),
     }
 }
@@ -3925,8 +3937,10 @@ fn build_branch_union_schema_contract(
     };
 
     let inner_apply_key_source = match inner {
-        TargetIdentity::BaseRowId => mv_schema::ApplyKeySource::BaseRowId,
-        TargetIdentity::GroupRowId(_) => mv_schema::ApplyKeySource::GroupRowId,
+        TargetIdentity::BaseRowId => crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId,
+        TargetIdentity::GroupRowId(_) => {
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
+        }
         other => {
             return Err(format!(
                 "iceberg MV UNION ALL branch inner apply key undefined for identity {other:?}"
@@ -4152,7 +4166,7 @@ fn target_contract(
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
     actual_apply_key_field_id: i32,
     hidden_apply_key_column_name: &str,
-    hidden_apply_key_source: mv_schema::ApplyKeySource,
+    hidden_apply_key_source: ApplyKeySource,
 ) -> Result<mv_schema::TargetContract, String> {
     Ok(mv_schema::TargetContract {
         table_fqn: format!("{}.{}.{}", target.catalog, target.namespace, target.table),
@@ -13957,8 +13971,8 @@ fn rewrite_outcome_rule_changed(
 mod partition_planning_tests {
     use super::*;
     use mv_schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
@@ -17610,11 +17624,9 @@ mod tests {
         assert!(is_imv_change_op_output_column(&output));
     }
 
-    fn branch_field_test_contract(
-        source: mv_schema::ApplyKeySource,
-    ) -> mv_schema::MvSchemaContract {
-        let aggregate = (source == mv_schema::ApplyKeySource::GroupRowId).then(|| {
-            mv_schema::AggregateStateContract {
+    fn branch_field_test_contract(source: ApplyKeySource) -> mv_schema::MvSchemaContract {
+        let aggregate = (source == crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId)
+            .then(|| mv_schema::AggregateStateContract {
                 state_layout_version: 1,
                 row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
                 state_columns: vec![mv_schema::AggregateStateColumnContract {
@@ -17624,12 +17636,17 @@ mod tests {
                     nullable: false,
                     role: mv_schema::AggregateStateRoleContract::Single,
                 }],
-            }
-        });
+            });
         let hidden_name = match source {
-            mv_schema::ApplyKeySource::BaseRowId => HIDDEN_APPLY_KEY_COLUMN_NAME,
-            mv_schema::ApplyKeySource::JoinRowKey => JOIN_APPLY_KEY_COLUMN_NAME,
-            mv_schema::ApplyKeySource::GroupRowId => GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId => {
+                HIDDEN_APPLY_KEY_COLUMN_NAME
+            }
+            crate::sql::planner::vocabulary::ApplyKeySource::JoinRowKey => {
+                JOIN_APPLY_KEY_COLUMN_NAME
+            }
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId => {
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            }
         };
         mv_schema::MvSchemaContract {
             contract_version: if aggregate.is_some() { 3 } else { 1 },
@@ -17748,7 +17765,8 @@ mod tests {
             namespace: "db".to_string(),
             table: "mv".to_string(),
         };
-        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::GroupRowId);
+        let contract =
+            branch_field_test_contract(crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId);
         let expected = [
             "iceberg branch UNION ALL aggregate MV ice.db.mv branch id field id 2 is missing from target schema",
             "iceberg branch UNION ALL aggregate MV ice.db.mv branch id column renamed externally to renamed_branch; recreate the MV",
@@ -17770,7 +17788,8 @@ mod tests {
             namespace: "db".to_string(),
             table: "mv".to_string(),
         };
-        let contract = branch_field_test_contract(mv_schema::ApplyKeySource::BaseRowId);
+        let contract =
+            branch_field_test_contract(crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId);
         let base_ref = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
@@ -17819,9 +17838,8 @@ mod tests {
         right_fqn: &str,
     ) -> mv_schema::MvSchemaContract {
         use mv_schema::{
-            ApplyKeySource, HiddenApplyKeyContract, JoinContract, JoinContractKind,
-            JoinPredicateLineage, MvSchemaContract, OutputContract, QualifiedFieldLineage,
-            TargetContract,
+            HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
+            MvSchemaContract, OutputContract, QualifiedFieldLineage, TargetContract,
         };
 
         MvSchemaContract {
@@ -19342,7 +19360,7 @@ mod tests {
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            mv_schema::ApplyKeySource::GroupRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
         );
     }
 
@@ -23182,7 +23200,7 @@ mod tests {
         );
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            mv_schema::ApplyKeySource::GroupRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
         );
         assert_eq!(contract.target.hidden_apply_key.target_field_id, 1);
         assert_eq!(sorted_base_field_ids(&contract.base), vec![2, 3]);
@@ -23244,7 +23262,7 @@ mod tests {
         assert!(contract.aggregate.is_some());
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            mv_schema::ApplyKeySource::GroupRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
         );
         assert_eq!(
             contract.target.hidden_apply_key.column_name,
@@ -23467,14 +23485,14 @@ mod tests {
         assert_eq!(contract.bases.len(), 2);
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            mv_schema::ApplyKeySource::BaseRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
         );
         assert_eq!(contract.target.hidden_apply_key.target_field_id, 3);
         let branch = contract.branch.expect("branch contract");
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            mv_schema::ApplyKeySource::BaseRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::BaseRowId
         );
         assert_eq!(branch.branch_id_column.column_name, BRANCH_ID_COLUMN_NAME);
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
@@ -24030,14 +24048,14 @@ mod tests {
 
         assert_eq!(
             contract.target.hidden_apply_key.source,
-            mv_schema::ApplyKeySource::GroupRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
         );
         assert!(contract.aggregate.is_some());
         let branch = contract.branch.expect("branch contract");
         assert_eq!(branch.branch_count, 2);
         assert_eq!(
             branch.inner_apply_key_source,
-            mv_schema::ApplyKeySource::GroupRowId
+            crate::sql::planner::vocabulary::ApplyKeySource::GroupRowId
         );
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
     }
@@ -24153,7 +24171,7 @@ mod tests {
 
     #[test]
     fn union_branch_inner_apply_key_maps_kind_to_source() {
-        use mv_schema::ApplyKeySource;
+        use crate::sql::planner::vocabulary::ApplyKeySource;
 
         assert_eq!(
             union_branch_inner_apply_key(UnionBranchKind::Aggregate),

@@ -24,8 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sql::planner::vocabulary::{
-    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-    JOIN_APPLY_KEY_COLUMN_NAME,
+    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,24 +221,6 @@ pub enum MvPartitionTransformContract {
     Bucket { num_buckets: u32 },
     Truncate { width: u32 },
     Void,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ApplyKeySource {
-    BaseRowId,
-    JoinRowKey,
-    GroupRowId,
-}
-
-impl ApplyKeySource {
-    pub const fn table_property_value(self) -> &'static str {
-        match self {
-            Self::BaseRowId => "base._row_id",
-            Self::JoinRowKey => "JoinRowKey",
-            Self::GroupRowId => "GroupRowId",
-        }
-    }
 }
 
 /// Errors returned by `MvSchemaContract::ensure_self_consistent`.

@@ -17,6 +17,9 @@
 
 //! Canonical execution binding for materialized-view target apply.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
@@ -600,12 +603,13 @@ mod tests {
 
     use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
     use crate::mv::persistence::schema::{
-        ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvSchemaContract,
+        BranchIdColumnContract, BranchUnionContract, MvSchemaContract,
     };
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
+    use crate::sql::planner::vocabulary::ApplyKeySource;
     use novarocks_catalog::identifier::TableIdentity;
 
     use super::{

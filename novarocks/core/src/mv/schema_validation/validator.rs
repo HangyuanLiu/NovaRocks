@@ -26,14 +26,15 @@
 //! Decisions are explicit. There is NO fallback path: incompatible
 //! contracts result in fail-fast errors that propagate to the user.
 
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use super::model::{
     BranchFieldValidationError, ContractDecision, CurrentIcebergTableView, JoinContractDecision,
     JoinSchemaValidationError, SchemaEvolutionError,
 };
 use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
-    ApplyKeySource, BaseContract, BranchIdColumnContract, MvPartitionTransformContract,
-    MvSchemaContract,
+    BaseContract, BranchIdColumnContract, MvPartitionTransformContract, MvSchemaContract,
 };
 use crate::sql::planner::vocabulary::{
     GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
@@ -623,8 +624,8 @@ mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
-        ExpressionKind, ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
         JoinPredicateLineage, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,

@@ -51,6 +51,9 @@
 //! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::contract::{
     AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
@@ -2390,7 +2393,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::mv::persistence::schema::{
-        AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
+        AggregateStateContract, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, ExpressionKind, ExpressionLineage,
         HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,

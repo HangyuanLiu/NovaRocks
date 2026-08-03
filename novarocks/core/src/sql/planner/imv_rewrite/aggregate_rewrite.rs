@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -2232,7 +2235,7 @@ mod tests {
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
+        BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
     };
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
     use crate::mv::rewrite::context::tests_support::{

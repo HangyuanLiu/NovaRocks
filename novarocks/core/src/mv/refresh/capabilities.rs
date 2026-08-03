@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::persistence::schema::{ApplyKeySource, MvSchemaContract};
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
+use crate::mv::persistence::schema::MvSchemaContract;
 use crate::mv::refresh::apply_key::ApplyKeyValueType;
 use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
 

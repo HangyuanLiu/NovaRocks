@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::connector::iceberg::changes::IcebergChangeBatch;
 use crate::engine::mv::partition::mapping::map_file_partition_to_mv_key;
 use crate::mv::model::{AffectedTargetPartitions, MvPartitionKey};
@@ -86,11 +89,12 @@ mod tests {
         AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
     };
     use crate::mv::persistence::schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+    use crate::sql::planner::vocabulary::ApplyKeySource;
 
     fn contract_with_identity_partition() -> MvSchemaContract {
         MvSchemaContract {

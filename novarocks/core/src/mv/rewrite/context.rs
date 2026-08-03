@@ -21,6 +21,9 @@
 //! pins, schemas, and derived aggregate layout. Concrete catalogs, tables,
 //! scan binding, and refresh execution state remain in the engine adapter.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -602,10 +605,10 @@ pub(crate) mod tests_support {
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
-        JoinPredicateLineage, MvSchemaContract, OutputColumnLineage, OutputContract,
-        QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
+        MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
+        TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
 
@@ -937,7 +940,7 @@ mod tests {
     use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
+        BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
 

@@ -21,6 +21,9 @@
 //! limits, and scan/file binding. Immutable rewrite metadata is held by the
 //! canonical `mv::rewrite::context::IcebergMvRewriteContext`.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -770,7 +773,6 @@ pub(crate) mod tests_support {
     use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource,
     };
     use novarocks_catalog::identifier::TableIdentity;
 

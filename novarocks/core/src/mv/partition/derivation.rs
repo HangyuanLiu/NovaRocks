@@ -23,6 +23,9 @@
 //! `PartitionPruningPolicy` (BestEffort in v1, spec D5) whether that means
 //! "no pruning" or "fail the refresh".
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::BTreeSet;
 
 use crate::exec::chunk::Chunk;
@@ -638,7 +641,7 @@ mod tests {
     // --- Test fixture: copied verbatim from aggregate_delta.rs:720-799 ---
 
     use mv_schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionLineage,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionLineage,
         HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract, MvSchemaContract,
         OutputColumnLineage, OutputContract, TargetContract, TargetVisibleColumn,
     };

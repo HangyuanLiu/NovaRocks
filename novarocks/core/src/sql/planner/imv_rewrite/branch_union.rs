@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::OutputColumn;
@@ -335,7 +338,7 @@ mod tests {
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
         BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         QualifiedFieldLineage,
     };

@@ -25,12 +25,13 @@
 //! direct-scan helpers.
 
 #[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::mv::model::TargetPartitionFilter;
 
 #[cfg(test)]
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource,
 };
 use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column,

@@ -20,10 +20,31 @@
 //! These are part of the SQL planner contract. Persistence and execution
 //! materialize them, but must not define an independent vocabulary.
 
+use serde::{Deserialize, Serialize};
+
 pub(crate) const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
 pub(crate) const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
 pub(crate) const GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str = "__row_id__";
 pub(crate) const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
+
+/// SQL lineage source used to derive an IMV target's hidden apply key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApplyKeySource {
+    BaseRowId,
+    JoinRowKey,
+    GroupRowId,
+}
+
+impl ApplyKeySource {
+    pub(crate) const fn table_property_value(self) -> &'static str {
+        match self {
+            Self::BaseRowId => "base._row_id",
+            Self::JoinRowKey => "JoinRowKey",
+            Self::GroupRowId => "GroupRowId",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -35,5 +56,13 @@ mod tests {
         assert_eq!(JOIN_APPLY_KEY_COLUMN_NAME, "__nova_join_row_key");
         assert_eq!(GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, "__row_id__");
         assert_eq!(BRANCH_ID_COLUMN_NAME, "__branch_id__");
+    }
+
+    #[test]
+    fn sqlx2_planner_vocabulary_owns_apply_key_source() {
+        assert_eq!(
+            ApplyKeySource::BaseRowId.table_property_value(),
+            "base._row_id"
+        );
     }
 }

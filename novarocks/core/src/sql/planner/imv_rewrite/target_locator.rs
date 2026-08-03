@@ -22,11 +22,12 @@
 //! this rule appends a refresh-only target scan and LEFT JOINs it for DELETE
 //! rows before the sink boundary.
 
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::ApplyKeySource;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };

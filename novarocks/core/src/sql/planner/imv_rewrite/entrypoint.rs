@@ -18,6 +18,9 @@
 //! Entrypoint for the IMV rewrite pipeline. See
 //! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -455,7 +458,7 @@ pub(crate) mod tests {
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
         BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, QualifiedFieldLineage,
     };
