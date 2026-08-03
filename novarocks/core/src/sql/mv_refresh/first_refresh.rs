@@ -24,7 +24,6 @@ use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::projection_first_refresh::{
     prepare_projection_full_read_sql, prepare_union_projection_full_read_sql,
 };
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::LogicalPlanNode;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -450,33 +449,6 @@ impl PreparedMvFirstRefreshWrite {
             MvFirstRefreshExecutionArtifact::Sql(sql) => Some(sql.sql()),
             MvFirstRefreshExecutionArtifact::Logical(_) => None,
         }
-    }
-
-    /// Consuming bind boundary: fragment preparation may only happen after
-    /// admission and exact-lease activation.  The resulting artifact cannot
-    /// be rebound to another operation/cohort.
-    pub(crate) fn bind_distributed(
-        self,
-        distributed: PreparedDistributedWriteRequest,
-    ) -> Result<BoundMvFirstRefreshWrite, String> {
-        if distributed.write_operation_id() != self.operation_id()
-            || distributed.write_cohort_id() != self.primary_cohort
-        {
-            return Err("MV first-refresh distributed artifact identity mismatch".to_string());
-        }
-        Ok(BoundMvFirstRefreshWrite { distributed })
-    }
-}
-
-/// Opaque post-admission artifact. It is intentionally consumable only by the
-/// application route that owns the exact write session.
-pub(crate) struct BoundMvFirstRefreshWrite {
-    distributed: PreparedDistributedWriteRequest,
-}
-
-impl BoundMvFirstRefreshWrite {
-    pub(crate) fn into_distributed(self) -> PreparedDistributedWriteRequest {
-        self.distributed
     }
 }
 
