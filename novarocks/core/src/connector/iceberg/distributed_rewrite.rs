@@ -224,23 +224,27 @@ impl IcebergDistributedRewritePlanner {
             .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unavailable, error))?;
         let groups = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
-                plan_data_file_groups(files)?
+                let live_delete_paths = live_delete_file_paths(&table)?;
+                plan_data_file_groups(files, &live_delete_paths)?
             }
             ConnectorDistributedRewriteOperation::RewritePositionDeletes {
                 rewrite_all,
                 min_input_files,
                 ..
             } => {
-                if metadata.format_version() != iceberg::spec::FormatVersion::V3 {
+                let groups = plan_position_delete_groups(
+                    files,
+                    *rewrite_all,
+                    min_input_files.unwrap_or(2) as usize,
+                )?;
+                if !groups.is_empty()
+                    && metadata.format_version() != iceberg::spec::FormatVersion::V3
+                {
                     return Err(invalid(
                         "Iceberg rewrite position delete files requires a format v3 table",
                     ));
                 }
-                plan_position_delete_groups(
-                    files,
-                    *rewrite_all,
-                    min_input_files.unwrap_or(2) as usize,
-                )?
+                groups
             }
         };
         let artifact = IcebergFrozenRewriteArtifactV1 {
@@ -661,23 +665,32 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteAdapter {
         plan: &ConnectorDistributedRewritePlan,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<ConnectorDistributedRewriteReceipt, ConnectorError> {
+        receipt.validate()?;
+        let target_version = receipt
+            .committed_version()
+            .and_then(|version| version.snapshot_id());
         let payload = canonical_payload(&IcebergRewriteReceiptPayloadV1 {
             version: 1,
             operation_id_hex: hex::encode(plan.operation_id().to_bytes()),
             plan_digest_hex: hex::encode(plan.plan_digest()),
             receipt_digest_hex: hex::encode(receipt.digest()),
         })?;
-        ConnectorDistributedRewriteReceipt::try_new(
+        let rewrite_receipt = ConnectorDistributedRewriteReceipt::try_new(
             ConnectorDistributedRewriteReceiptSummary {
                 input_data_files: plan.summary().input_data_files,
                 input_delete_files: plan.summary().input_delete_files,
                 output_data_files: 0,
                 output_delete_files: 0,
-                output_rows: 0,
-                target_version: None,
+                output_rows: receipt.resulting_row_count().unwrap_or(0),
+                target_version,
             },
             payload,
-        )
+        )?;
+        let (namespace, table) = super::provider::decode_data_mutation_table_target(plan.target())?;
+        self.planner
+            .entry()?
+            .invalidate_table_cache(&namespace, &table);
+        Ok(rewrite_receipt)
     }
 }
 
@@ -1521,12 +1534,54 @@ fn split_artifact_parts(
 /// no delete file can cause cross-group ownership in a later aggregate commit.
 pub(crate) fn plan_data_file_groups(
     files: Vec<DataFileWithStats>,
+    live_delete_paths: &BTreeSet<String>,
 ) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
     let files = files
         .into_iter()
         .map(data_file_with_stats_to_iceberg_data_file_info)
         .collect::<Vec<_>>();
-    group_data_files(files, false, None)
+    let mut groups = group_data_files(files, false, None)?;
+    assign_unattached_data_delete_owners(&mut groups, live_delete_paths)?;
+    Ok(groups)
+}
+
+fn live_delete_file_paths(
+    table: &iceberg::table::Table,
+) -> Result<BTreeSet<String>, ConnectorError> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(BTreeSet::new());
+    };
+    let file_io = table.file_io();
+    block_on_iceberg(async {
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, metadata)
+            .await
+            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+        let mut paths = BTreeSet::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != iceberg::spec::ManifestContentType::Deletes {
+                continue;
+            }
+            let manifest = manifest_file
+                .load_manifest(file_io)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "load Iceberg rewrite delete manifest {}: {error}",
+                        manifest_file.manifest_path
+                    )
+                })?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    paths.insert(entry.data_file().file_path().to_string());
+                }
+            }
+        }
+        Ok::<_, String>(paths)
+    })
+    .map_err(unavailable)?
+    .map_err(unavailable)
 }
 
 /// Build deterministic deletion-vector rewrite groups.  Each group is keyed
@@ -1554,6 +1609,14 @@ fn group_data_files(
     if let Some(min_inputs) = position_delete_min_inputs {
         let mut groups = Vec::new();
         for file in files {
+            if file.delete_files.iter().any(|delete| {
+                matches!(delete.file_content, IcebergDeleteFileContent::Position)
+                    && matches!(delete.file_format, IcebergDeleteFileFormat::Parquet)
+            }) {
+                return Err(invalid(
+                    "V2 Parquet position delete rewrite is not supported",
+                ));
+            }
             let selected = file
                 .delete_files
                 .iter()
@@ -1633,6 +1696,41 @@ fn assign_data_delete_owners(groups: &mut [IcebergFrozenRewriteGroupV1]) {
         group.owned_data_delete_files.sort();
         group.owned_data_delete_files.dedup();
     }
+}
+
+/// A read snapshot attaches only delete files that still apply to a live data
+/// file. A whole-table Replace must additionally remove every live delete
+/// manifest entry, including an orphan left behind after COW replaced its
+/// referenced data file. Assign those paths to the canonical first cohort so
+/// the aggregate commit owns the exact provider-frozen live set.
+fn assign_unattached_data_delete_owners(
+    groups: &mut [IcebergFrozenRewriteGroupV1],
+    live_delete_paths: &BTreeSet<String>,
+) -> Result<(), ConnectorError> {
+    let owned = groups
+        .iter()
+        .flat_map(|group| group.owned_data_delete_files.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if !owned.is_subset(live_delete_paths) {
+        return Err(invalid(
+            "Iceberg data rewrite dependencies include a non-live delete file",
+        ));
+    }
+    let missing = live_delete_paths
+        .difference(&owned)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let owner = groups
+        .iter_mut()
+        .min_by(|left, right| left.group_digest_hex.cmp(&right.group_digest_hex))
+        .ok_or_else(|| invalid("Iceberg data rewrite has live delete files but no data cohort"))?;
+    owner.owned_data_delete_files.extend(missing);
+    owner.owned_data_delete_files.sort();
+    owner.owned_data_delete_files.dedup();
+    Ok(())
 }
 
 fn bounded_groups(
@@ -1977,6 +2075,47 @@ mod tests {
                 .filter(|path| path.as_str() == "s3://bucket/shared-delete.parquet")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn data_rewrite_assigns_orphan_live_delete_to_a_canonical_cohort() {
+        let data = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
+        let mut groups = group_data_files(vec![data], false, None).expect("frozen groups");
+        assign_unattached_data_delete_owners(
+            &mut groups,
+            &BTreeSet::from(["s3://bucket/orphan.puffin".to_string()]),
+        )
+        .expect("orphan owner");
+
+        assert_eq!(
+            groups[0].owned_data_delete_files,
+            vec!["s3://bucket/orphan.puffin".to_string()]
+        );
+    }
+
+    #[test]
+    fn position_rewrite_rejects_v2_parquet_delete_before_puffin_planning() {
+        let mut data = IcebergDataFileInfo::for_test("s3://bucket/data.parquet", 10, 1);
+        data.delete_files.push(IcebergDeleteFileInfo {
+            path: "s3://bucket/delete.parquet".to_string(),
+            file_format: IcebergDeleteFileFormat::Parquet,
+            file_content: IcebergDeleteFileContent::Position,
+            length: Some(8),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(3),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            equality_column_names: Vec::new(),
+            equality_field_ids: Vec::new(),
+        });
+
+        let error = group_data_files(vec![data], true, Some(1)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("V2 Parquet position delete rewrite is not supported")
         );
     }
 
