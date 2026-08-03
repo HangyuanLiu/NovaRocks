@@ -138,6 +138,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
 - ADR-0030 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
 - ADR-0031 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
+- ADR-0032 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（active）
 
 ### frontend-mv
 

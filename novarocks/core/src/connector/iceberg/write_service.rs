@@ -87,6 +87,7 @@ use super::commit::{
 };
 use super::report::IcebergWriterReport;
 use super::sink_plan::IcebergSinkPlan;
+use super::write_commit::IcebergWriteCommitExecutor;
 use super::write_contract::{
     decode_sink_plan_handle_payload, decode_writer_reports, encode_sink_plan_handle_payload,
 };
@@ -94,7 +95,6 @@ use super::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlBackend, IcebergWriteControlPlan,
     IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
 };
-use crate::engine::IcebergWriteCommitExecutor;
 
 /// A staged-action build can create manifest artifacts before it discovers a
 /// definite failure.  Keep the exact abort register with the typed error so
@@ -1076,10 +1076,7 @@ impl IcebergWriteReportCommitter for IcebergDistributedRewriteReportCommitter {
                     .to_string(),
             ));
         }
-        let ident = TableIdent::new(
-            NamespaceIdent::new(self.executor.target.namespace.clone()),
-            self.executor.target.table.clone(),
-        );
+        let ident = self.executor.collector.table_ident.clone();
         let table = crate::runtime::global_async_runtime::data_block_on(async {
             self.executor.catalog.load_table(&ident).await
         })

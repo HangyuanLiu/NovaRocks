@@ -3029,7 +3029,7 @@ fn cross_process_three_be_frontend_update_merge_lifecycle() {
         .expect("create UPDATE/MERGE lifecycle fixture directory");
     let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
     let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
-    let namespace = format!("dml5_cluster_{}", std::process::id());
+    let namespace = format!("dml6_cluster_{}", std::process::id());
     let catalog = "update_merge_lifecycle_ice";
     let cluster_id = "frontend-update-merge-lifecycle";
     let be_object_store = format!(
@@ -3071,7 +3071,8 @@ enable_path_style_access = true
         .expect("create UPDATE/MERGE namespace");
     conn.query_drop(format!(
         "CREATE TABLE {catalog}.{namespace}.target_orders (id INT, amount INT) \
-         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\", \
+         \"novarocks.update.mode\"=\"merge-on-read\")"
     ))
     .expect("create UPDATE/MERGE target table");
     conn.query_drop(format!(
@@ -3088,6 +3089,25 @@ enable_path_style_access = true
     ))
     .expect("seed UPDATE/MERGE source");
 
+    let snapshots_before_empty_update: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots before zero-effect UPDATE");
+    conn.query_drop(format!(
+        "UPDATE {catalog}.{namespace}.target_orders SET amount = 999 WHERE id = 999"
+    ))
+    .expect("execute zero-effect MOR UPDATE");
+    let snapshots_after_empty_update: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots after zero-effect UPDATE");
+    assert_eq!(
+        snapshots_after_empty_update, snapshots_before_empty_update,
+        "zero-effect MOR UPDATE must not create a snapshot"
+    );
+
     let scheduled_before_update = scheduled_fragments(&mut conn);
     conn.query_drop(format!(
         "UPDATE {catalog}.{namespace}.target_orders SET amount = 100 WHERE id = 1"
@@ -3099,12 +3119,12 @@ enable_path_style_access = true
         "UPDATE must schedule remote fragments: before={scheduled_before_update}, \
          after={scheduled_after_update}"
     );
-    let snapshots_before_merge: Vec<i64> = conn
+    let snapshots_before_first_merge: Vec<i64> = conn
         .query(format!(
             "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
         ))
         .expect("count snapshots before MERGE");
-    let scheduled_before_merge = scheduled_fragments(&mut conn);
+    let scheduled_before_first_merge = scheduled_fragments(&mut conn);
     conn.query_drop(format!(
         "MERGE INTO {catalog}.{namespace}.target_orders AS t \
          USING {catalog}.{namespace}.source_orders AS s ON t.id = s.id \
@@ -3112,30 +3132,65 @@ enable_path_style_access = true
          WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount)"
     ))
     .expect("execute frontend matched-update/not-matched-insert MERGE");
-    let scheduled_after_merge = scheduled_fragments(&mut conn);
+    let scheduled_after_first_merge = scheduled_fragments(&mut conn);
     assert!(
-        scheduled_after_merge > scheduled_before_merge,
-        "MERGE must schedule remote fragments: before={scheduled_before_merge}, \
-         after={scheduled_after_merge}"
+        scheduled_after_first_merge > scheduled_before_first_merge,
+        "first MOR MERGE must schedule remote fragments: before={scheduled_before_first_merge}, \
+         after={scheduled_after_first_merge}"
     );
-    let snapshots_after_merge: Vec<i64> = conn
+    let snapshots_after_first_merge: Vec<i64> = conn
         .query(format!(
             "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
         ))
         .expect("count snapshots after MERGE");
-    assert_eq!(snapshots_after_merge.len(), 1);
-    assert_eq!(snapshots_before_merge.len(), 1);
+    assert_eq!(snapshots_after_first_merge.len(), 1);
+    assert_eq!(snapshots_before_first_merge.len(), 1);
     assert_eq!(
-        snapshots_after_merge[0],
-        snapshots_before_merge[0] + 1,
+        snapshots_after_first_merge[0],
+        snapshots_before_first_merge[0] + 1,
         "matched UPDATE and not-matched INSERT must produce one MERGE snapshot"
+    );
+    conn.query_drop(format!(
+        "INSERT INTO {catalog}.{namespace}.source_orders VALUES (4, 400)"
+    ))
+    .expect("seed delete/insert MOR MERGE source row");
+    let snapshots_before_second_merge: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots before delete/insert MERGE");
+    let scheduled_before_second_merge = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "MERGE INTO {catalog}.{namespace}.target_orders AS t \
+         USING {catalog}.{namespace}.source_orders AS s ON t.id = s.id \
+         WHEN MATCHED AND s.id = 2 THEN DELETE \
+         WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount)"
+    ))
+    .expect("execute frontend matched-delete/not-matched-insert MOR MERGE");
+    let scheduled_after_second_merge = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_second_merge > scheduled_before_second_merge,
+        "second MOR MERGE must schedule remote fragments: before={scheduled_before_second_merge}, \
+         after={scheduled_after_second_merge}"
+    );
+    let snapshots_after_second_merge: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots after delete/insert MERGE");
+    assert_eq!(snapshots_after_second_merge.len(), 1);
+    assert_eq!(snapshots_before_second_merge.len(), 1);
+    assert_eq!(
+        snapshots_after_second_merge[0],
+        snapshots_before_second_merge[0] + 1,
+        "matched DELETE and not-matched INSERT must produce one MERGE snapshot"
     );
     let rows: Vec<(i32, i32)> = conn
         .query(format!(
             "SELECT id, amount FROM {catalog}.{namespace}.target_orders ORDER BY id"
         ))
         .expect("read UPDATE/MERGE target rows");
-    assert_eq!(rows, vec![(1, 100), (2, 200), (3, 300)]);
+    assert_eq!(rows, vec![(1, 100), (3, 300), (4, 400)]);
 
     let scheduled_before_compat = scheduled_fragments(&mut conn);
     let compat_error = conn
@@ -3169,7 +3224,7 @@ enable_path_style_access = true
             "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
         ))
         .expect("count snapshots after FE restart");
-    assert_eq!(restored_snapshots, snapshots_after_merge);
+    assert_eq!(restored_snapshots, snapshots_after_second_merge);
     drop(conn);
     cluster.shutdown_fe_cleanly(Duration::from_secs(10));
 
@@ -3205,20 +3260,38 @@ enable_path_style_access = true
         .collect::<Vec<_>>();
     assert_eq!(
         row_deltas.len(),
-        2,
-        "UPDATE and MERGE must each be journaled"
+        4,
+        "zero-effect UPDATE, non-empty UPDATE and two MERGEs must each be journaled"
     );
     assert!(
         row_deltas
             .iter()
-            .all(|operation| operation.state == OperationState::Finalized),
-        "successful UPDATE/MERGE must be finalized: {row_deltas:?}"
-    );
-    assert!(
-        row_deltas
-            .iter()
+            .filter(|operation| operation.state == OperationState::Finalized)
             .all(|operation| operation.commit_outcome.is_some()),
-        "successful UPDATE/MERGE must retain commit outcome: {row_deltas:?}"
+        "non-empty UPDATE/MERGE must retain commit outcomes: {row_deltas:?}"
+    );
+    assert!(
+        row_deltas
+            .iter()
+            .filter(|operation| operation.state == OperationState::Aborted)
+            .all(|operation| operation.commit_outcome.is_none()),
+        "zero-effect UPDATE must be aborted without a commit outcome: {row_deltas:?}"
+    );
+    assert_eq!(
+        row_deltas
+            .iter()
+            .filter(|operation| operation.state == OperationState::Finalized)
+            .count(),
+        3,
+        "non-empty UPDATE and both MERGEs must be finalized: {row_deltas:?}"
+    );
+    assert_eq!(
+        row_deltas
+            .iter()
+            .filter(|operation| operation.state == OperationState::Aborted)
+            .count(),
+        1,
+        "zero-effect UPDATE must have one Aborted record: {row_deltas:?}"
     );
     assert!(
         row_deltas

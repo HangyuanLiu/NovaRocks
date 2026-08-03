@@ -599,9 +599,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
                     .map_err(internal)?;
             let catalog: Arc<dyn iceberg::Catalog> = prepared.staged.catalog.clone();
-            let commit_executor = Arc::new(crate::engine::IcebergWriteCommitExecutor {
-                state: std::sync::Weak::new(),
-                target: target.clone(),
+            let commit_executor = Arc::new(super::write_commit::IcebergWriteCommitExecutor {
                 catalog,
                 table: staged_table.clone(),
                 collector,

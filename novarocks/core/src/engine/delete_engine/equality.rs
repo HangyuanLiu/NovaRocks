@@ -32,6 +32,7 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec,
 };
+use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_equality_delete_sink_spec_handle_payload;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_existing_table_target;
@@ -40,7 +41,6 @@ use crate::engine::delete_engine::{
     prepared_delete,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
-use crate::engine::write_transaction::IcebergWriteCommitExecutor;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
@@ -168,14 +168,14 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )
     }
 
     fn finalize(&self) -> Result<(), String> {
-        self.commit_executor.finalize()
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
 
@@ -239,8 +239,6 @@ fn prepare_equality_delete_distributed_write(
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = Arc::new(IcebergWriteCommitExecutor {
-        state: Arc::downgrade(state),
-        target: target.clone(),
         catalog,
         table: table.clone(),
         collector: Arc::clone(&collector),

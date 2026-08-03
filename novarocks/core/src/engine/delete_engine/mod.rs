@@ -221,7 +221,7 @@ impl DeleteEngine for Arc<StandaloneState> {
 
 pub(crate) fn has_iceberg_staged_output(
     completion: &crate::query_execution::ConnectorWriteCompletion,
-    commit_executor: &crate::engine::write_transaction::IcebergWriteCommitExecutor,
+    commit_executor: &crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor,
 ) -> Result<bool, String> {
     completion
         .input()

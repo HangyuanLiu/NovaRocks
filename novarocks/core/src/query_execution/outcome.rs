@@ -315,6 +315,34 @@ impl ConnectorWriteCompletion {
             },
         )
     }
+
+    /// Return whether this accepted aggregate contains no input, staged bytes
+    /// or provider artifacts. Its report envelopes are transport metadata only
+    /// and are discarded before the session makes a terminal no-op decision.
+    pub(crate) fn is_known_empty(&self) -> Result<bool, DistributedQueryError> {
+        let summary = self.staging_summary()?;
+        Ok(summary.input_rows == 0 && summary.staged_bytes == 0 && summary.artifact_count == 0)
+    }
+
+    /// Undo the metadata-only accepted attempt and terminalize the exact
+    /// session as a known-empty no-op. No provider RPC is issued.
+    pub(crate) fn finish_known_empty_noop(&self) -> Result<(), DistributedQueryError> {
+        if !self.is_known_empty()? {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "connector write completion has input, staged bytes, or artifacts and cannot finish as known-empty",
+            ));
+        }
+        self.session
+            .discard_known_empty_attempt(&self.attachment, &self.input)
+            .and_then(|_| self.session.finish_known_empty_noop())
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!("terminalize connector write known-empty session: {error}"),
+                )
+            })
+    }
 }
 
 pub struct FragmentProfileSet {
