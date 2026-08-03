@@ -28,7 +28,7 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     build_distributed_query_request_with_execution,
 };
-use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
+use crate::query_execution::lifecycle::{AttemptId, QueryExecutionId};
 use crate::query_execution::lifecycle::{
     QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLaunchBarrier, QueryLifecycleLease,
     QueryLifecycleLeaseGuard,
@@ -47,7 +47,7 @@ use crate::sql::planner::distributed::{
 use crate::sql::planner::payload::PlanValuesNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
@@ -314,8 +314,6 @@ fn query_control_typestate_initializes_before_native_assembly() {
         vec![crate::query_execution::backend::LiveBackendTarget::new(
             3, endpoint, 11,
         )],
-        2,
-        parts.options.runtime_filter_lifecycle(),
         &parts.options,
         1_000,
         std::time::Duration::from_secs(30),
@@ -325,10 +323,19 @@ fn query_control_typestate_initializes_before_native_assembly() {
     )
     .expect("valid init options");
 
-    let execution = parts
-        .artifacts
+    let scheduled =
+        crate::query_execution::in_process_test::bind_empty_runtime_filter_tables_for_test(
+            parts.artifacts,
+        )
+        .expect("bind explicit empty runtime-filter tables")
         .bind_schedule(schedule)
-        .expect("bind schedule")
+        .expect("bind schedule");
+    let deployment = scheduled
+        .seal_runtime_filter_deployment(std::iter::empty())
+        .expect("seal explicit empty runtime-filter deployment");
+    let execution = scheduled
+        .attach_runtime_filter_deployment(deployment)
+        .expect("attach empty runtime-filter deployment")
         .initialize_query(options, &barrier)
         .expect("initialize query")
         .prepare_connector_bindings(&NoopConnectorBindingBarrier)

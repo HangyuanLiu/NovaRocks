@@ -136,24 +136,9 @@ pub(super) fn encode_plan_fragment_with_context(
                 column_ids: column_ids.iter().map(|id| id.0).collect(),
             })
             .collect(),
-        runtime_filter_bindings: Some({
-            let prepared = required_context_ref(ctx.runtime_filter_bindings, || {
-                format!(
-                    "native fragment {} encoding requires prepared runtime filter binding tables",
-                    src.fragment_id
-                )
-            })?;
-            let prepared_fragment = prepared.fragment(src.fragment_id).ok_or_else(|| {
-                format!(
-                    "prepared fragment {} missing while encoding runtime filter bindings",
-                    src.fragment_id
-                )
-            })?;
-            encode_runtime_filter_binding_table(
-                src.fragment_id,
-                prepared_fragment.runtime_filter_bindings(),
-            )?
-        }),
+        // Runtime-filter bindings are a Frontend-owned semantic attachment.
+        // Core only freezes the RF-unbound fragment shell here.
+        runtime_filter_bindings: None,
     })
 }
 

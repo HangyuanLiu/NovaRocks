@@ -23,6 +23,7 @@ pub mod dml;
 pub mod mv;
 pub mod query;
 pub mod query_control;
+pub mod runtime_filter;
 mod server;
 pub mod statistics;
 pub mod statistics_jobs;

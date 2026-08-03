@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use novarocks::query_execution::lifecycle::{
     QueryExecutionId, QueryLifecycleError, QueryLifecycleErrorCode, QueryTerminationReason,
-    RuntimeFilterContribution,
 };
 use novarocks::runtime::mem_tracker::MemTracker;
 use novarocks::runtime_filter_transition::port::transport::{
@@ -40,6 +39,7 @@ use super::service::{
     InboundConsumerDispatchOutcome, InboundProducerDispatchOutcome,
     NativeRuntimeFilterExecutionContext, RuntimeFilterService,
 };
+use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
 const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: runtime filter ack ingress is not supported";
@@ -71,7 +71,7 @@ pub(crate) trait RuntimeFilterParticipantFactory: Send + Sync + 'static {
     fn install(
         &self,
         execution_id: QueryExecutionId,
-        contribution: RuntimeFilterContribution,
+        contribution: DecodedRuntimeFilterContribution,
     ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError>;
 }
 
@@ -82,10 +82,10 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
     fn install(
         &self,
         execution_id: QueryExecutionId,
-        contribution: RuntimeFilterContribution,
+        contribution: DecodedRuntimeFilterContribution,
     ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError> {
         let expected_epoch = execution_id.attempt_id().get();
-        if contribution.install().epoch().get() != expected_epoch {
+        if contribution.install.epoch().get() != expected_epoch {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::InvalidManifest,
                 "runtime filter install epoch does not match query execution attempt",
@@ -113,7 +113,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
             Arc::new(BackendRuntimeFilterEventObserver { diagnostic_sink }),
             &memory,
         ));
-        if let Err(error) = service.install(contribution.install().clone()) {
+        if let Err(error) = service.install(contribution.install.clone()) {
             // The entry has not observed this participant yet. Tear the
             // concrete owner down before returning so an Init rejection never
             // leaves an unreachable half-installed service behind.
@@ -125,7 +125,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
         }
         Ok(Arc::new(RuntimeFilterParticipant {
             execution_id,
-            epoch: contribution.install().epoch(),
+            epoch: contribution.install.epoch(),
             service,
             _memory: memory,
             close_hook: Arc::new(|service, _reason| {

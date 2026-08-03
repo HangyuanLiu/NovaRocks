@@ -45,6 +45,42 @@ impl NativeFragmentBundle {
     pub(crate) fn into_fragments(self) -> btree_map::IntoIter<FragmentId, NativePlanFragment> {
         self.by_fragment.into_iter()
     }
+
+    /// Bind the RF-specific payload after the generic plan encoder has frozen
+    /// every non-RF fragment fact. This is deliberately consuming: a fragment
+    /// shell cannot be reused to attach a second set of runtime-filter tables.
+    pub(crate) fn bind_runtime_filter_tables(
+        mut self,
+        tables: BTreeMap<FragmentId, crate::proto::plan::RuntimeFilterBindingTable>,
+    ) -> Result<Self, String> {
+        let expected = self.by_fragment.keys().copied().collect::<BTreeSet<_>>();
+        let actual = tables.keys().copied().collect::<BTreeSet<_>>();
+        if expected != actual {
+            return Err(fragment_set_error(
+                "runtime filter attachment",
+                &expected,
+                &actual,
+            ));
+        }
+        for (fragment_id, fragment) in &mut self.by_fragment {
+            let table = tables
+                .get(fragment_id)
+                .expect("validated runtime-filter table key set");
+            if table.fragment_id != *fragment_id {
+                return Err(format!(
+                    "runtime filter attachment table fragment mismatch: key={fragment_id} table_fragment_id={}",
+                    table.fragment_id
+                ));
+            }
+            if fragment.runtime_filter_bindings.is_some() {
+                return Err(format!(
+                    "native fragment {fragment_id} already has runtime filter bindings"
+                ));
+            }
+            fragment.runtime_filter_bindings = Some(table.clone());
+        }
+        Ok(self)
+    }
 }
 
 #[cfg(feature = "query-execution-contract-test-support")]

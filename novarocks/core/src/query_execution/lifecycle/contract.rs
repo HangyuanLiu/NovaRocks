@@ -1353,10 +1353,7 @@ fn encode_participant_manifest(
             .collect(),
         runtime_filter: manifest
             .runtime_filter()
-            .map(|contribution| {
-                encode_runtime_filter_contribution(manifest.execution_id(), contribution)
-            })
-            .transpose()?,
+            .map(|contribution| contribution.wire().clone()),
         pre_start_timeout_ms: u64::try_from(manifest.pre_start_timeout().as_millis())
             .expect("validated pre-start timeout fits in u64 milliseconds"),
         report_endpoint: Some(encode_endpoint(manifest.report_endpoint())),
@@ -1402,7 +1399,7 @@ fn decode_participant_manifest(
     let runtime_filter = manifest
         .runtime_filter
         .as_ref()
-        .map(|contribution| decode_runtime_filter_contribution(execution_id, contribution))
+        .map(|contribution| RuntimeFilterContribution::from_wire(contribution.clone()))
         .transpose()?;
     let report_endpoint = manifest
         .report_endpoint
@@ -1551,70 +1548,6 @@ fn decode_exchange_route(
     )
 }
 
-fn encode_runtime_filter_contribution(
-    execution_id: QueryExecutionId,
-    contribution: &RuntimeFilterContribution,
-) -> Result<novarocks::RuntimeFilterContribution, QueryLifecycleError> {
-    let envelope = crate::protocol::native::encode_participant_install(
-        UniqueId::new(
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-        ),
-        contribution.lifecycle(),
-        contribution.install(),
-    )
-    .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
-    Ok(novarocks::RuntimeFilterContribution {
-        participant_id: contribution.participant_id(),
-        lifecycle: envelope.lifecycle,
-        install: envelope.install,
-        contribution_digest: contribution.digest().to_vec(),
-    })
-}
-
-fn decode_runtime_filter_contribution(
-    execution_id: QueryExecutionId,
-    contribution: &novarocks::RuntimeFilterContribution,
-) -> Result<RuntimeFilterContribution, QueryLifecycleError> {
-    let digest: [u8; 32] = contribution
-        .contribution_digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            QueryLifecycleError::invalid_manifest(
-                "runtime filter contribution digest must be 32 bytes",
-            )
-        })?;
-    let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-        query_id: Some(common::UniqueId {
-            hi: execution_id.query_id().high(),
-            lo: execution_id.query_id().low(),
-        }),
-        deployment_epoch: execution_id.attempt_id().get(),
-        participant_id: contribution.participant_id,
-        lifecycle: contribution.lifecycle.clone(),
-        install: contribution.install.clone(),
-    };
-    let decoded = crate::protocol::native::decode_participant_install(&envelope)
-        .map_err(|error| QueryLifecycleError::invalid_manifest(error.to_string()))?;
-    let canonical_digest = RuntimeFilterContribution::canonical_digest(
-        execution_id,
-        decoded.lifecycle,
-        &decoded.install,
-    )?;
-    if digest != canonical_digest {
-        return Err(QueryLifecycleError::invalid_manifest(
-            "runtime filter contribution digest does not match canonical payload",
-        ));
-    }
-    RuntimeFilterContribution::new(
-        contribution.participant_id,
-        decoded.lifecycle,
-        decoded.install,
-        canonical_digest,
-    )
-}
-
 fn encode_init_outcome(outcome: QueryInitOutcome) -> i32 {
     match outcome {
         QueryInitOutcome::Applied => 1,
@@ -1721,7 +1654,6 @@ fn decode_termination_reason(reason: i32) -> Result<QueryTerminationReason, Quer
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     use super::{
@@ -1747,11 +1679,6 @@ mod tests {
     use crate::runtime::profile::{ProfileUnit, RuntimeProfile};
     use crate::runtime::query_options::{QueryCacheOptions, QueryOptions};
     use crate::runtime::sink_commit::SinkCommitReportSnapshot;
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::{
-        RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
-    };
-    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -1901,25 +1828,8 @@ mod tests {
     }
 
     fn service_only_request() -> QueryInitRequest {
-        let participant = RuntimeFilterParticipantId::new(3);
-        let epoch = DeploymentEpoch::new(7);
-        let install = RuntimeFilterParticipantInstall::new(
-            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
-            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
-                .expect("empty routing shard is structurally valid"),
-        );
-        let lifecycle = crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-            delivery_expire: Duration::from_secs(5),
-            query_expire: Duration::from_secs(30),
-            transport_retry_interval: Duration::from_millis(200),
-            transport_max_attempts: 3,
-            transport_deadline: Duration::from_secs(2),
-            transport_max_pending_entries: 1024,
-            transport_max_pending_bytes: 1 << 20,
-        };
-        let contribution =
-            RuntimeFilterContribution::from_compiled(execution_id(), 3, lifecycle, install)
-                .expect("valid contribution");
+        let contribution = RuntimeFilterContribution::empty_for_contract_test(execution_id(), 3)
+            .expect("valid opaque contribution");
         let options = QueryOptions {
             batch_size: Some(4096),
             query_timeout: Some(120),
@@ -2001,22 +1911,19 @@ mod tests {
     }
 
     #[test]
-    fn proto_query_lifecycle_rejects_runtime_filter_payload_digest_mismatch() {
+    fn proto_query_lifecycle_rejects_invalid_runtime_filter_carrier_shape() {
         let mut wire = encode_query_init_request(&service_only_request()).expect("request encodes");
-        let lifecycle = wire
-            .manifest
+        wire.manifest
             .as_mut()
             .expect("manifest")
             .runtime_filter
             .as_mut()
             .expect("runtime filter contribution")
-            .lifecycle
-            .as_mut()
-            .expect("runtime filter lifecycle");
-        lifecycle.delivery_expire_ms += 1;
+            .contribution_digest
+            .pop();
 
         let error = decode_query_init_request(&wire)
-            .expect_err("mutated runtime filter payload must not retain the original digest");
+            .expect_err("runtime filter carrier digest length must remain structural");
 
         assert_eq!(
             error.code(),
@@ -2024,7 +1931,7 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "runtime filter contribution digest does not match canonical payload"
+            "runtime filter contribution digest must be 32 bytes"
         );
     }
 

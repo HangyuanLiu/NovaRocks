@@ -10,7 +10,9 @@ provenance:
   - "discussion: 2026-08-02 SQL runtime-filter planning ownership"
 code-anchors:
   - "novarocks/core/src/sql/planner/runtime_filter/mod.rs (SQL-private planning closure)"
-  - "novarocks/core/src/runtime_filter/deployment/planning_adapter.rs (one-way deployment projection)"
+  - "novarocks/core/src/query_execution/preparation/runtime_filter_view.rs (sealed borrow-only handoff)"
+  - "novarocks/frontend/src/runtime_filter/compiler.rs (Frontend deployment projection)"
+  - "novarocks/backend/src/native/runtime_filter_install.rs (Backend semantic install decode)"
 ---
 
 ## 问题

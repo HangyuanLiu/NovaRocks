@@ -32,16 +32,18 @@ use novarocks::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks::runtime::query_options::QueryOptions;
-use novarocks_protocol::{common, novarocks as proto_novarocks, plan};
+use novarocks_protocol::{common, filter, novarocks as proto_novarocks, plan};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use prost::Message;
+use sha2::Digest;
 
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
+use crate::native::runtime_filter_install::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };
@@ -222,7 +224,7 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
     fn install(
         &self,
         execution_id: QueryExecutionId,
-        contribution: RuntimeFilterContribution,
+        contribution: DecodedRuntimeFilterContribution,
     ) -> Result<
         Arc<crate::runtime_filter::participant::RuntimeFilterParticipant>,
         QueryLifecycleError,
@@ -511,6 +513,42 @@ fn execution_id(query_low: i64, attempt: u64) -> QueryExecutionId {
     .expect("nonzero query execution id")
 }
 
+fn runtime_filter_contribution(
+    execution_id: QueryExecutionId,
+    participant_id: u32,
+) -> RuntimeFilterContribution {
+    let lifecycle = filter::RuntimeFilterQueryLifecycleOptions {
+        delivery_expire_ms: 1,
+        query_expire_ms: 1,
+        transport_retry_interval_ms: 1,
+        transport_max_attempts: 1,
+        transport_deadline_ms: 1,
+        transport_max_pending_entries: 1,
+        transport_max_pending_bytes: 1,
+    };
+    let install = filter::RuntimeFilterParticipantInstall::default();
+    let envelope = filter::InstallRuntimeFilterDeploymentRequest {
+        query_id: Some(common::UniqueId {
+            hi: execution_id.query_id().high(),
+            lo: execution_id.query_id().low(),
+        }),
+        deployment_epoch: execution_id.attempt_id().get(),
+        participant_id,
+        lifecycle: Some(lifecycle.clone()),
+        install: Some(install.clone()),
+    };
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
+    digest.update(envelope.encode_to_vec());
+    RuntimeFilterContribution::from_wire(proto_novarocks::RuntimeFilterContribution {
+        participant_id,
+        lifecycle: Some(lifecycle),
+        install: Some(install),
+        contribution_digest: digest.finalize().to_vec(),
+    })
+    .expect("valid runtime-filter contribution")
+}
+
 fn init_request_fixture(
     query_low: i64,
     attempt: u64,
@@ -518,8 +556,7 @@ fn init_request_fixture(
     query_deadline_unix_ms: u64,
 ) -> QueryInitRequest {
     let execution_id = execution_id(query_low, attempt);
-    let runtime_filter = RuntimeFilterContribution::empty_for_contract_test(execution_id, 3)
-        .expect("valid runtime filter contribution");
+    let runtime_filter = runtime_filter_contribution(execution_id, 3);
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(

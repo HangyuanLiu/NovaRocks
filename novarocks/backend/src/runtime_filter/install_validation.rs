@@ -15,23 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native coordinator-to-runtime wire encoders.
+//! Backend-owned validation entry point for decoded participant installs.
+
+pub(crate) use crate::native::runtime_filter_install::validate_participant_install;
 
 #[cfg(test)]
-mod boundary_schema;
-#[cfg(test)]
-mod build;
-mod bundle;
-pub(crate) mod expr;
-mod iceberg_literal_json;
-pub(crate) mod instance;
-pub(crate) mod plan;
-
-#[cfg(feature = "query-execution-contract-test-support")]
-pub(crate) use bundle::native_fragment_bundle_for_contract_test;
-pub(crate) use bundle::{NativeFragmentBundle, encode_native_fragment_bundle};
-pub(crate) use instance::encode_instance_params;
-pub(crate) use plan::encode_data_partition;
-
-#[cfg(test)]
-mod tests;
+pub(crate) use crate::native::runtime_filter_install::{
+    validate_channel_contract_for_test, validate_install_view_contract_for_test,
+};

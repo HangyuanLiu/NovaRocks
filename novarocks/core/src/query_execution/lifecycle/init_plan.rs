@@ -22,9 +22,7 @@ use std::time::Duration;
 use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, ResolvedQueryOptions,
-    RuntimeFilterLifecycleView,
 };
-use crate::query_execution::runtime_filter::RuntimeFilterContributionPlan;
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime::query_options::QueryOptions;
@@ -43,21 +41,13 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 pub(crate) struct QueryInitPlanHeader {
     execution_id: QueryExecutionId,
     query_deadline_unix_ms: u64,
-    runtime_filter_strategy: Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions>,
 }
 
 impl QueryInitPlanHeader {
-    const fn new(
-        execution_id: QueryExecutionId,
-        query_deadline_unix_ms: u64,
-        runtime_filter_strategy: Option<
-            crate::protocol::native::RuntimeFilterQueryLifecycleOptions,
-        >,
-    ) -> Self {
+    const fn new(execution_id: QueryExecutionId, query_deadline_unix_ms: u64) -> Self {
         Self {
             execution_id,
             query_deadline_unix_ms,
-            runtime_filter_strategy,
         }
     }
 
@@ -69,8 +59,6 @@ impl QueryInitPlanHeader {
 pub struct QueryInitOptions {
     execution_id: QueryExecutionId,
     live_backends: Vec<LiveBackendTarget>,
-    runtime_filter_worker_count: usize,
-    runtime_filter_lifecycle: RuntimeFilterLifecycleView,
     query_options: QueryOptions,
     query_deadline_unix_ms: u64,
     pre_start_timeout: Duration,
@@ -82,8 +70,6 @@ impl QueryInitOptions {
     pub fn new(
         execution_id: QueryExecutionId,
         live_backends: Vec<LiveBackendTarget>,
-        runtime_filter_worker_count: usize,
-        runtime_filter_lifecycle: RuntimeFilterLifecycleView,
         query_options: &ResolvedQueryOptions,
         query_deadline_unix_ms: u64,
         pre_start_timeout: Duration,
@@ -92,11 +78,6 @@ impl QueryInitOptions {
         if live_backends.is_empty() {
             return Err(contract_error(
                 "query initialization requires at least one live backend",
-            ));
-        }
-        if runtime_filter_worker_count == 0 {
-            return Err(contract_error(
-                "query initialization runtime-filter worker count must be nonzero",
             ));
         }
         if query_deadline_unix_ms == 0 {
@@ -139,8 +120,6 @@ impl QueryInitOptions {
         Ok(Self {
             execution_id,
             live_backends,
-            runtime_filter_worker_count,
-            runtime_filter_lifecycle,
             query_options: query_options.runtime_options().clone(),
             query_deadline_unix_ms,
             pre_start_timeout,
@@ -154,14 +133,6 @@ impl QueryInitOptions {
 
     pub fn live_backends(&self) -> &[LiveBackendTarget] {
         &self.live_backends
-    }
-
-    pub const fn runtime_filter_worker_count(&self) -> usize {
-        self.runtime_filter_worker_count
-    }
-
-    pub const fn runtime_filter_lifecycle(&self) -> RuntimeFilterLifecycleView {
-        self.runtime_filter_lifecycle
     }
 
     pub(crate) fn native_submission_context(
@@ -178,7 +149,6 @@ impl QueryInitOptions {
 pub struct QueryInitPlan {
     execution_id: QueryExecutionId,
     query_deadline_unix_ms: u64,
-    runtime_filter_strategy: Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions>,
     participants: Vec<QueryInitParticipant>,
 }
 
@@ -189,12 +159,6 @@ impl QueryInitPlan {
 
     pub(crate) const fn query_deadline_unix_ms(&self) -> u64 {
         self.query_deadline_unix_ms
-    }
-
-    pub(crate) const fn runtime_filter_strategy(
-        &self,
-    ) -> Option<crate::protocol::native::RuntimeFilterQueryLifecycleOptions> {
-        self.runtime_filter_strategy
     }
 
     pub fn participant_count(&self) -> usize {
@@ -306,10 +270,6 @@ impl QueryInitPlan {
         Ok(Self {
             execution_id,
             query_deadline_unix_ms: participants[0].manifest().query_deadline_unix_ms(),
-            runtime_filter_strategy: participants
-                .iter()
-                .find_map(|participant| participant.manifest().runtime_filter())
-                .map(RuntimeFilterContribution::lifecycle),
             participants,
         })
     }
@@ -434,7 +394,7 @@ impl Drop for QueryLifecycleLease {
 
 pub(crate) fn compile_query_init_plan(
     fragments: &FragmentLifecycleProjection,
-    runtime_filters: Vec<RuntimeFilterContributionPlan>,
+    runtime_filters: Vec<(usize, RuntimeFilterContribution)>,
     options: &QueryInitOptions,
 ) -> Result<QueryInitPlan, DistributedQueryError> {
     let live_by_backend = options
@@ -462,30 +422,8 @@ pub(crate) fn compile_query_init_plan(
         }
     }
 
-    let runtime_filter_strategy = runtime_filters
-        .first()
-        .map(RuntimeFilterContributionPlan::lifecycle);
-    if let Some(strategy) = runtime_filter_strategy {
-        if strategy.delivery_expire != options.runtime_filter_lifecycle.delivery_expire()
-            || strategy.query_expire != options.runtime_filter_lifecycle.query_expire()
-        {
-            return Err(contract_error(
-                "runtime filter lifecycle strategy differs from frozen query options",
-            ));
-        }
-        if runtime_filters
-            .iter()
-            .any(|contribution| contribution.lifecycle() != strategy)
-        {
-            return Err(contract_error(
-                "runtime filter lifecycle strategy differs between init participants",
-            ));
-        }
-    }
-
     let mut runtime_filter_by_backend = BTreeMap::new();
-    for contribution in runtime_filters {
-        let backend_idx = contribution.backend_idx();
+    for (backend_idx, contribution) in runtime_filters {
         if !live_by_backend.contains_key(&backend_idx) {
             return Err(contract_error(format!(
                 "runtime filter backend {backend_idx} is absent from query initialization live snapshot"
@@ -528,24 +466,10 @@ pub(crate) fn compile_query_init_plan(
         if !expected_instances.is_empty() {
             roles.insert(ParticipantRole::FragmentExecutor);
         }
-        let runtime_filter = runtime_filter_by_backend
-            .remove(&backend_idx)
-            .map(|contribution| {
-                roles.insert(ParticipantRole::RuntimeFilterService);
-                let (_, participant_id, lifecycle, install) = contribution.into_parts();
-                RuntimeFilterContribution::from_compiled(
-                    options.execution_id,
-                    participant_id,
-                    lifecycle,
-                    install,
-                )
-            })
-            .transpose()
-            .map_err(|error| {
-                contract_error(format!(
-                    "query initialization runtime filter contribution is invalid: {error}"
-                ))
-            })?;
+        let runtime_filter = runtime_filter_by_backend.remove(&backend_idx);
+        if runtime_filter.is_some() {
+            roles.insert(ParticipantRole::RuntimeFilterService);
+        }
         let manifest = ParticipantManifest::new(
             options.execution_id,
             backend.clone(),
@@ -571,16 +495,11 @@ pub(crate) fn compile_query_init_plan(
             digest,
         });
     }
-    let header = QueryInitPlanHeader::new(
-        options.execution_id,
-        options.query_deadline_unix_ms,
-        runtime_filter_strategy,
-    );
+    let header = QueryInitPlanHeader::new(options.execution_id, options.query_deadline_unix_ms);
     fragments.freeze_query_init_header(header)?;
     Ok(QueryInitPlan {
         execution_id: header.execution_id,
         query_deadline_unix_ms: header.query_deadline_unix_ms,
-        runtime_filter_strategy: header.runtime_filter_strategy,
         participants,
     })
 }
@@ -594,14 +513,10 @@ mod tests {
     use crate::common::types::UniqueId;
     use crate::query_execution::backend::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
-    use crate::query_execution::lifecycle::{AttemptId, ParticipantRole, QueryExecutionId};
-    use crate::query_execution::runtime_filter::RuntimeFilterContributionPlan;
-    use crate::query_execution::schedule::FragmentLifecycleProjection;
-    use crate::runtime_filter::port::identity::{DeploymentEpoch, RuntimeFilterParticipantId};
-    use crate::runtime_filter::port::install::{
-        RuntimeFilterInstallView, RuntimeFilterParticipantInstall,
+    use crate::query_execution::lifecycle::{
+        AttemptId, ParticipantRole, QueryExecutionId, RuntimeFilterContribution,
     };
-    use crate::runtime_filter::port::routing::RuntimeFilterRoutingShard;
+    use crate::query_execution::schedule::FragmentLifecycleProjection;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -621,37 +536,12 @@ mod tests {
         )
     }
 
-    fn runtime_filter(backend_idx: usize) -> RuntimeFilterContributionPlan {
-        runtime_filter_with_retry_interval(backend_idx, Duration::from_millis(200))
-    }
-
-    fn runtime_filter_with_retry_interval(
-        backend_idx: usize,
-        transport_retry_interval: Duration,
-    ) -> RuntimeFilterContributionPlan {
-        let participant =
-            RuntimeFilterParticipantId::new(u32::try_from(backend_idx + 1).expect("participant"));
-        let epoch = DeploymentEpoch::new(execution_id().attempt_id().get());
-        let install = RuntimeFilterParticipantInstall::new(
-            RuntimeFilterInstallView::new(epoch, participant, BTreeMap::new()),
-            RuntimeFilterRoutingShard::new(epoch, participant, BTreeMap::new())
-                .expect("empty routing shard"),
-        );
-        RuntimeFilterContributionPlan::new(
-            backend_idx,
-            participant.get(),
-            crate::protocol::native::RuntimeFilterQueryLifecycleOptions {
-                delivery_expire: Duration::from_secs(300),
-                query_expire: Duration::from_secs(300),
-                transport_retry_interval,
-                transport_max_attempts: 3,
-                transport_deadline: Duration::from_secs(2),
-                transport_max_pending_entries: 1024,
-                transport_max_pending_bytes: 1 << 20,
-            },
-            install,
-        )
-        .expect("valid contribution")
+    fn runtime_filter(backend_idx: usize) -> (usize, RuntimeFilterContribution) {
+        let participant_id = u32::try_from(backend_idx + 1).expect("participant");
+        let contribution =
+            RuntimeFilterContribution::empty_for_contract_test(execution_id(), participant_id)
+                .expect("valid opaque contribution");
+        (backend_idx, contribution)
     }
 
     #[test]
@@ -685,8 +575,6 @@ mod tests {
         let options = QueryInitOptions::new(
             execution_id(),
             vec![backend(0), backend(1), backend(2)],
-            2,
-            resolved.runtime_filter_lifecycle(),
             &resolved,
             1_000,
             Duration::from_secs(30),
@@ -721,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_contribution_is_bound_to_outer_attempt() {
+    fn runtime_filter_contribution_is_carried_opaquely() {
         let fragments =
             FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
                 .with_frozen_live_backends(vec![backend(2)])
@@ -730,8 +618,6 @@ mod tests {
         let options = QueryInitOptions::new(
             execution_id(),
             vec![backend(2)],
-            2,
-            resolved.runtime_filter_lifecycle(),
             &resolved,
             1_000,
             Duration::from_secs(30),
@@ -750,10 +636,8 @@ mod tests {
             .runtime_filter()
             .expect("runtime filter contribution");
 
-        assert_eq!(
-            contribution.install().epoch().get(),
-            execution_id().attempt_id().get()
-        );
+        assert_eq!(contribution.participant_id(), 3);
+        assert_eq!(contribution.digest(), &[0; 32]);
     }
 
     #[test]
@@ -777,8 +661,6 @@ mod tests {
         let options = QueryInitOptions::new(
             execution_id(),
             vec![restarted],
-            2,
-            resolved.runtime_filter_lifecycle(),
             &resolved,
             1_000,
             Duration::from_secs(30),
@@ -801,17 +683,15 @@ mod tests {
     }
 
     #[test]
-    fn query_init_plan_rejects_per_participant_runtime_filter_strategy_drift() {
+    fn query_init_plan_rejects_duplicate_runtime_filter_backend() {
         let fragments =
             FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
-                .with_frozen_live_backends(vec![backend(1), backend(2)])
+                .with_frozen_live_backends(vec![backend(1)])
                 .expect("freeze schedule topology");
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
-            vec![backend(1), backend(2)],
-            2,
-            resolved.runtime_filter_lifecycle(),
+            vec![backend(1)],
             &resolved,
             9_000,
             Duration::from_secs(30),
@@ -823,25 +703,22 @@ mod tests {
 
         let error = match compile_query_init_plan(
             &fragments,
-            vec![
-                runtime_filter_with_retry_interval(1, Duration::from_millis(200)),
-                runtime_filter_with_retry_interval(2, Duration::from_millis(201)),
-            ],
+            vec![runtime_filter(1), runtime_filter(1)],
             &options,
         ) {
-            Ok(_) => panic!("one immutable init plan must have one runtime-filter strategy"),
+            Ok(_) => panic!("one backend must have at most one runtime-filter contribution"),
             Err(error) => error,
         };
 
         assert!(
             error
                 .message()
-                .contains("runtime filter lifecycle strategy differs")
+                .contains("runtime filter contribution repeats backend 1")
         );
     }
 
     #[test]
-    fn query_init_plan_freezes_deadline_and_runtime_filter_strategy() {
+    fn query_init_plan_freezes_deadline() {
         let fragments =
             FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
                 .with_frozen_live_backends(vec![backend(2)])
@@ -850,8 +727,6 @@ mod tests {
         let options = QueryInitOptions::new(
             execution_id(),
             vec![backend(2)],
-            2,
-            resolved.runtime_filter_lifecycle(),
             &resolved,
             9_000,
             Duration::from_secs(30),
@@ -865,18 +740,10 @@ mod tests {
             .expect("valid init plan");
 
         assert_eq!(plan.query_deadline_unix_ms(), 9_000);
-        assert_eq!(
-            plan.runtime_filter_strategy()
-                .expect("nonempty RF plan has one strategy")
-                .transport_retry_interval,
-            Duration::from_millis(200)
-        );
 
         let changed_deadline = QueryInitOptions::new(
             execution_id(),
             vec![backend(2)],
-            2,
-            resolved.runtime_filter_lifecycle(),
             &resolved,
             9_001,
             Duration::from_secs(30),
@@ -892,23 +759,6 @@ mod tests {
             };
         assert!(
             deadline_error
-                .message()
-                .contains("query initialization header differs")
-        );
-
-        let strategy_error = match compile_query_init_plan(
-            &fragments,
-            vec![runtime_filter_with_retry_interval(
-                2,
-                Duration::from_millis(201),
-            )],
-            &options,
-        ) {
-            Ok(_) => panic!("one schedule cannot rebuild the same QEI with a new RF strategy"),
-            Err(error) => error,
-        };
-        assert!(
-            strategy_error
                 .message()
                 .contains("query initialization header differs")
         );

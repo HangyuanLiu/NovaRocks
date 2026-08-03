@@ -20,6 +20,7 @@ mod cte;
 mod iceberg_delta;
 mod projection;
 pub(crate) mod runtime_filter_binding;
+pub(crate) mod runtime_filter_view;
 pub(crate) mod scan;
 mod scan_preparation;
 mod topology;

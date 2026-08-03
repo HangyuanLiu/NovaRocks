@@ -45,6 +45,7 @@ use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
+use crate::native::runtime_filter_install::decode_runtime_filter_contribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
     RuntimeFilterParticipantFactory,
@@ -2979,6 +2980,8 @@ impl InitWorkspace {
     fn install_and_publish(self) -> QueryInitAck {
         let contribution = self.entry.manifest.runtime_filter().cloned();
         let install_result = contribution.map_or(Ok(None), |contribution| {
+            let contribution =
+                decode_runtime_filter_contribution(self.execution_id, &contribution)?;
             self.registry
                 .runtime_filter_factory
                 .install(self.execution_id, contribution)
