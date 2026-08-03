@@ -137,7 +137,7 @@ impl SqlScanSource {
 /// standalone refresh codegen lowers this source into the local target-state
 /// scan used by aggregate-state merge execution.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IcebergMvTargetStateScan {
+pub(crate) struct SqlMvTargetStateScan {
     pub(crate) catalog: String,
     pub(crate) database: String,
     pub(crate) table: String,
@@ -149,15 +149,15 @@ pub(crate) struct IcebergMvTargetStateScan {
     pub(crate) aggregate_state_names: Vec<String>,
     pub(crate) physical_column_names: Vec<String>,
     pub(crate) row_id_column_name: String,
-    pub(crate) row_filter: IcebergMvTargetStateRowFilter,
-    pub(crate) partition_constraint: IcebergMvTargetStatePartitionConstraint,
+    pub(crate) row_filter: SqlMvTargetStateRowFilter,
+    pub(crate) partition_constraint: SqlMvTargetStatePartitionConstraint,
 }
 
 /// Metadata for an IMV target-locator scan source. It is a refresh-only
 /// placeholder that reads the MV target at the refresh-before snapshot and
 /// projects the physical apply-key columns plus Iceberg `_file` / `_pos`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IcebergMvTargetLocatorScan {
+pub struct SqlMvTargetLocatorScan {
     pub(crate) catalog: String,
     pub(crate) database: String,
     pub(crate) table: String,
@@ -174,7 +174,7 @@ pub(crate) struct BranchScope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvTargetStateRowFilter {
+pub(crate) enum SqlMvTargetStateRowFilter {
     DeltaInputRowIds {
         row_id_column_name: String,
         branch_scope: Option<BranchScope>,
@@ -182,25 +182,25 @@ pub(crate) enum IcebergMvTargetStateRowFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvTargetStatePartitionConstraint {
+pub(crate) enum SqlMvTargetStatePartitionConstraint {
     Unpartitioned,
     AffectedPartitionAllowListRequired,
 }
 
-impl IcebergMvTargetStateScan {
+impl SqlMvTargetStateScan {
     pub(crate) fn fqn(&self) -> String {
         format!("{}.{}.{}", self.catalog, self.database, self.table)
     }
 
     pub(crate) fn constraint_summary(&self) -> String {
         let row_filter = match &self.row_filter {
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: None,
             } => {
                 format!("row_filter=delta_input_row_ids({row_id_column_name})")
             }
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: Some(scope),
             } => format!(
@@ -209,8 +209,8 @@ impl IcebergMvTargetStateScan {
             ),
         };
         let partition = match self.partition_constraint {
-            IcebergMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
-            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+            SqlMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
+            SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 "partition=affected_allow_list_required"
             }
         };
@@ -227,7 +227,7 @@ impl IcebergMvTargetStateScan {
     }
 }
 
-impl IcebergMvTargetLocatorScan {
+impl SqlMvTargetLocatorScan {
     pub(crate) fn fqn(&self) -> String {
         format!("{}.{}.{}", self.catalog, self.database, self.table)
     }
@@ -283,12 +283,12 @@ pub enum ScanSource {
     /// columns, and the aggregate/join logical contract) and has no codegen
     /// or runtime behavior in this task. Future tasks will implement the
     /// optimizer rewrite and execution path.
-    IcebergMvTargetState(IcebergMvTargetStateScan),
+    MvTargetState(SqlMvTargetStateScan),
     /// IMV target locator placeholder. Produced by the IMV rewrite pipeline
     /// after the change stream carries its logical apply key. Codegen resolves
     /// it through `IcebergMvRefreshContext` into an explicit target snapshot
     /// scan that emits physical apply key, `_file`, and `_pos`.
-    IcebergMvTargetLocator(IcebergMvTargetLocatorScan),
+    MvTargetLocator(SqlMvTargetLocatorScan),
 }
 
 #[derive(Clone, Debug)]
@@ -432,8 +432,8 @@ mod imv_target_state_tests {
     }
 
     #[test]
-    fn iceberg_mv_target_state_scan_source_carries_logical_contract() {
-        let source = ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
+    fn sqlx2_mv_target_state_scan_source_carries_logical_contract() {
+        let source = ScanSource::MvTargetState(SqlMvTargetStateScan {
             catalog: "ice".to_string(),
             database: "ns".to_string(),
             table: "mv_sales".to_string(),
@@ -445,14 +445,14 @@ mod imv_target_state_tests {
             aggregate_state_names: vec!["c".to_string()],
             physical_column_names: vec!["region".to_string(), "c".to_string()],
             row_id_column_name: "__row_id__".to_string(),
-            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
-            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            partition_constraint: SqlMvTargetStatePartitionConstraint::Unpartitioned,
         });
 
-        let ScanSource::IcebergMvTargetState(scan) = source else {
+        let ScanSource::MvTargetState(scan) = source else {
             panic!("expected target-state scan source");
         };
         assert_eq!(scan.fqn(), "ice.ns.mv_sales");
@@ -467,7 +467,7 @@ mod imv_target_state_tests {
 
     #[test]
     fn target_state_row_filter_carries_branch_scope() {
-        let filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        let filter = SqlMvTargetStateRowFilter::DeltaInputRowIds {
             row_id_column_name: "__row_id__".to_string(),
             branch_scope: Some(BranchScope {
                 branch_id_column_name: "__branch_id__".to_string(),
@@ -475,7 +475,7 @@ mod imv_target_state_tests {
             }),
         };
 
-        let IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        let SqlMvTargetStateRowFilter::DeltaInputRowIds {
             branch_scope: Some(scope),
             ..
         } = filter

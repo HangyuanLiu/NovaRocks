@@ -262,14 +262,14 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
         ScanSource::IcebergVersionTable { snapshot_id, .. } => {
             Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
         }
-        ScanSource::IcebergMvTargetState(scan) => Some(format!(
+        ScanSource::MvTargetState(scan) => Some(format!(
             "IcebergMvTargetState target={} keys=[{}] states=[{}] {}",
             scan.fqn(),
             scan.group_key_names.join(","),
             scan.aggregate_state_names.join(","),
             scan.constraint_summary()
         )),
-        ScanSource::IcebergMvTargetLocator(scan) => Some(format!(
+        ScanSource::MvTargetLocator(scan) => Some(format!(
             "IcebergMvTargetLocator target={} apply_key={}{}",
             scan.fqn(),
             scan.apply_key_column,
@@ -646,7 +646,7 @@ mod tests {
         PlanAssertOneRowNode, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
         PlanWindowNode, WindowExpr,
     };
-    use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
     use novarocks_catalog::schema::ColumnDef;
 
     fn empty_values_for_test() -> LogicalPlanNode {
@@ -768,7 +768,7 @@ mod tests {
 
         let locator_plan = scan_plan_with_source(
             "pf_mv",
-            ScanSource::IcebergMvTargetLocator(IcebergMvTargetLocatorScan {
+            ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
                 catalog: "ice".to_string(),
                 database: "db".to_string(),
                 table: "pf_mv".to_string(),

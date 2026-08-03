@@ -44,7 +44,7 @@ use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct InjectTargetLocatorJoinRule {
@@ -103,7 +103,7 @@ pub(crate) fn is_target_locator_join(plan: &LogicalPlanNode) -> bool {
         && matches!(
             &plan.right().kind,
             LogicalPlanKind::Scan(scan)
-                if matches!(scan.table.source, ScanSource::IcebergMvTargetLocator(_))
+                if matches!(scan.table.source, ScanSource::MvTargetLocator(_))
         )
 }
 
@@ -406,7 +406,7 @@ fn build_target_locator_scan(
                 name: target.table.clone(),
                 columns,
                 iceberg_row_lineage_metadata_columns: metadata_columns,
-                source: ScanSource::IcebergMvTargetLocator(IcebergMvTargetLocatorScan {
+                source: ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
                     catalog: target.catalog.clone(),
                     database: target.namespace.clone(),
                     table: target.table.clone(),

@@ -265,7 +265,7 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             table: iceberg_table_info_for_test(),
             snapshot_id: 1,
         },
-        table_model::ScanSource::IcebergMvTargetLocator(table_model::IcebergMvTargetLocatorScan {
+        table_model::ScanSource::MvTargetLocator(table_model::SqlMvTargetLocatorScan {
             catalog: "ice".to_string(),
             database: "db".to_string(),
             table: "orders".to_string(),
@@ -274,7 +274,7 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             apply_key_column: "bound_order_id".to_string(),
             branch_id_column: None,
         }),
-        table_model::ScanSource::IcebergMvTargetState(table_model::IcebergMvTargetStateScan {
+        table_model::ScanSource::MvTargetState(table_model::SqlMvTargetStateScan {
             catalog: "ice".to_string(),
             database: "db".to_string(),
             table: "orders".to_string(),
@@ -286,12 +286,11 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             aggregate_state_names: Vec::new(),
             physical_column_names: vec!["bound_order_id".to_string()],
             row_id_column_name: "bound_order_id".to_string(),
-            row_filter: table_model::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "bound_order_id".to_string(),
                 branch_scope: None,
             },
-            partition_constraint:
-                table_model::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            partition_constraint: table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
         }),
     ];
 
@@ -412,10 +411,10 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
                     table_model::ScanSource::IcebergVersionTable { .. },
                     novarocks_protocol::plan::scan_source::Kind::IcebergVersionTable(_)
                 ) | (
-                    table_model::ScanSource::IcebergMvTargetLocator(_),
+                    table_model::ScanSource::MvTargetLocator(_),
                     novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetLocator(_)
                 ) | (
-                    table_model::ScanSource::IcebergMvTargetState(_),
+                    table_model::ScanSource::MvTargetState(_),
                     novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetState(_)
                 )
             ),

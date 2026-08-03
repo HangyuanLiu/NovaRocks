@@ -97,8 +97,8 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
         column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
-    scan.table.source = ScanSource::IcebergMvTargetLocator(
-        crate::sql::planner::table::IcebergMvTargetLocatorScan {
+    scan.table.source =
+        ScanSource::MvTargetLocator(crate::sql::planner::table::SqlMvTargetLocatorScan {
             catalog: "test_catalog".to_string(),
             database: "test_db".to_string(),
             table: "test_table".to_string(),
@@ -106,8 +106,7 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
             target_snapshot_id: Some(6),
             apply_key_column: "id".to_string(),
             branch_id_column: None,
-        },
-    );
+        });
     let resolver = StaticResolver {
         execution: resolved_files(vec![data_file("s3://bucket/target-6.parquet")]),
     };
@@ -187,7 +186,7 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
     scan.table.source =
-        ScanSource::IcebergMvTargetState(crate::sql::planner::table::IcebergMvTargetStateScan {
+        ScanSource::MvTargetState(crate::sql::planner::table::SqlMvTargetStateScan {
             catalog: "test_catalog".to_string(),
             database: "test_db".to_string(),
             table: "test_table".to_string(),
@@ -199,13 +198,12 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
             aggregate_state_names: vec!["agg".to_string()],
             physical_column_names: vec!["id".to_string(), "agg".to_string()],
             row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
-            row_filter:
-                crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
-                    row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
-                    branch_scope: None,
-                },
+            row_filter: crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
+                branch_scope: None,
+            },
             partition_constraint:
-                crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
         });
     let resolver = StaticResolver {
         execution: resolved_files(vec![data_file("s3://bucket/target-state-6.parquet")]),

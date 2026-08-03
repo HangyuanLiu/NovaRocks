@@ -405,7 +405,7 @@ impl IcebergTargetApplyBinding {
 
     pub(crate) fn resolve_locator_scan(
         &self,
-        scan: &crate::sql::planner::table::IcebergMvTargetLocatorScan,
+        scan: &crate::sql::planner::table::SqlMvTargetLocatorScan,
     ) -> Result<crate::sql::planner::table::ScanSource, String> {
         if !scan.catalog.eq_ignore_ascii_case(&self.target.catalog)
             || !scan.database.eq_ignore_ascii_case(&self.target.namespace)
@@ -1144,7 +1144,7 @@ mod tests {
             fixture.target_table,
         )
         .expect("target bindings");
-        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+        let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1195,7 +1195,7 @@ mod tests {
             fixture.target_table,
         )
         .expect("empty target bindings");
-        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+        let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1237,7 +1237,7 @@ mod tests {
             fixture.target_table,
         )
         .expect("target bindings");
-        let exact = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+        let exact = crate::sql::planner::table::SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1283,7 +1283,7 @@ mod tests {
             fixture.target_table,
         )
         .expect("target bindings");
-        let scan = crate::sql::planner::table::IcebergMvTargetLocatorScan {
+        let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),

@@ -1689,8 +1689,8 @@ fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) ->
         ScanSource::IcebergDataFiles { .. } => {}
         ScanSource::IcebergDeltaTable { .. }
         | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::IcebergMvTargetState { .. }
-        | ScanSource::IcebergMvTargetLocator { .. } => return false,
+        | ScanSource::MvTargetState { .. }
+        | ScanSource::MvTargetLocator { .. } => return false,
     }
     required_columns.iter().all(|required| {
         table

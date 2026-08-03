@@ -811,7 +811,7 @@ mod tests {
             &plan.kind,
             LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
-                    source: ScanSource::IcebergMvTargetState(_),
+                    source: ScanSource::MvTargetState(_),
                     ..
                 },
                 ..

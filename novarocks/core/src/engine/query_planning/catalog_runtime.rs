@@ -78,8 +78,8 @@ impl CatalogRuntimeMetadata {
             | ScanSource::ConnectorPinned
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
-            | ScanSource::IcebergMvTargetState { .. }
-            | ScanSource::IcebergMvTargetLocator { .. } => Err(format!(
+            | ScanSource::MvTargetState { .. }
+            | ScanSource::MvTargetLocator { .. } => Err(format!(
                 "synthetic plan-time scan source is not a catalog base table: {}.{}.{}",
                 identity.catalog, identity.namespace, identity.table
             )),

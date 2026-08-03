@@ -36,8 +36,8 @@ use crate::mv::refresh::pin::RefreshSnapshotPin;
 use crate::mv::refresh::target_apply::IcebergMvTargetBindings;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 #[cfg(test)]
-use crate::sql::planner::table::IcebergMvTargetLocatorScan;
-use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
+use crate::sql::planner::table::SqlMvTargetLocatorScan;
+use crate::sql::planner::table::{ScanSource, SqlMvTargetStateScan};
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
 
@@ -365,7 +365,7 @@ impl IcebergMvRefreshContext {
 
     pub(crate) fn target_state_scan_source(
         &self,
-        scan: &IcebergMvTargetStateScan,
+        scan: &SqlMvTargetStateScan,
     ) -> Result<ScanSource, String> {
         let target = &self.rewrite.target;
         if !scan.catalog.eq_ignore_ascii_case(&target.catalog)
@@ -417,7 +417,7 @@ impl IcebergMvRefreshContext {
             ));
         }
         match &scan.row_filter {
-            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope,
             } if row_id_column_name.eq_ignore_ascii_case(&scan.row_id_column_name) => {
@@ -427,7 +427,7 @@ impl IcebergMvRefreshContext {
                     &self.rewrite.schema_contract,
                 )?;
             }
-            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 ..
             } => {
@@ -482,13 +482,13 @@ impl IcebergMvRefreshContext {
 
     fn target_state_partition_allow_list(
         &self,
-        scan: &IcebergMvTargetStateScan,
+        scan: &SqlMvTargetStateScan,
     ) -> Result<Option<BTreeSet<crate::mv::model::MvPartitionKey>>, String> {
         match scan.partition_constraint {
-            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
+            crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned => {
                 Ok(None)
             }
-            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+            crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 match &self.affected_partitions {
                     crate::mv::model::AffectedTargetPartitions::Unpartitioned => {
                         Ok(None)
@@ -530,7 +530,7 @@ impl IcebergMvRefreshContext {
 }
 
 fn validate_target_state_branch_scope(
-    scan: &IcebergMvTargetStateScan,
+    scan: &SqlMvTargetStateScan,
     scope: Option<&crate::sql::planner::table::BranchScope>,
     contract: &MvSchemaContract,
 ) -> Result<(), String> {
@@ -585,7 +585,7 @@ fn filter_target_state_files_by_partition(
     contract: &MvSchemaContract,
     allow_list: &BTreeSet<crate::mv::model::MvPartitionKey>,
     files: Vec<IcebergDataFileInfo>,
-    scan: &IcebergMvTargetStateScan,
+    scan: &SqlMvTargetStateScan,
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
     if allow_list.is_empty() {
         return Ok(Vec::new());
@@ -765,7 +765,7 @@ pub(crate) mod tests_support {
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
     use crate::sql::planner::table::{
-        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
+        SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter,
     };
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
@@ -963,7 +963,7 @@ pub(crate) mod tests_support {
     }
 
     pub(crate) fn aggregate_target_state_refresh_fixture()
-    -> (IcebergMvRefreshContext, IcebergMvTargetStateScan) {
+    -> (IcebergMvRefreshContext, SqlMvTargetStateScan) {
         use iceberg::{NamespaceIdent, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
@@ -1099,7 +1099,7 @@ pub(crate) mod tests_support {
             ),
             pruning_limits: MvRefreshPruningLimits::default(),
         };
-        let scan = IcebergMvTargetStateScan {
+        let scan = SqlMvTargetStateScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1111,11 +1111,11 @@ pub(crate) mod tests_support {
             aggregate_state_names: vec!["__agg_state_v".to_string()],
             physical_column_names,
             row_id_column_name: "__row_id__".to_string(),
-            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
-            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            partition_constraint: SqlMvTargetStatePartitionConstraint::Unpartitioned,
         };
         (ctx, scan)
     }
@@ -1701,7 +1701,7 @@ mod tests {
     fn target_locator_scan_source_loads_snapshot_pinned_explicit_files() {
         let fixture = target_locator_refresh_fixture("explicit_files");
         let ctx = refresh_context_for_target_fixture(&fixture);
-        let scan = IcebergMvTargetLocatorScan {
+        let scan = SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1747,7 +1747,7 @@ mod tests {
     fn target_locator_scan_source_rejects_apply_key_mismatch() {
         let fixture = target_locator_refresh_fixture("apply_key_mismatch");
         let ctx = refresh_context_for_target_fixture(&fixture);
-        let scan = IcebergMvTargetLocatorScan {
+        let scan = SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1828,7 +1828,7 @@ mod tests {
                 max_affected_partitions: 2,
             },
         };
-        let scan = IcebergMvTargetStateScan {
+        let scan = SqlMvTargetStateScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -1840,12 +1840,12 @@ mod tests {
             aggregate_state_names: Vec::new(),
             physical_column_names: Vec::new(),
             row_id_column_name: "__row_id__".to_string(),
-            row_filter: crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
             partition_constraint:
-                crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
+                crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
         };
 
         let unknown_filter = ctx

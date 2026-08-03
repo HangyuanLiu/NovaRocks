@@ -692,7 +692,7 @@ pub(crate) mod tests {
             panic!("expected target locator scan on join right side");
         };
         assert!(
-            matches!(scan.table.source, ScanSource::IcebergMvTargetLocator(_)),
+            matches!(scan.table.source, ScanSource::MvTargetLocator(_)),
             "join right side must be target locator scan"
         );
         join_plan.left()
@@ -3115,7 +3115,7 @@ pub(crate) mod tests {
             &plan.kind,
             LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
-                    source: ScanSource::IcebergMvTargetState(_),
+                    source: ScanSource::MvTargetState(_),
                     ..
                 },
                 ..

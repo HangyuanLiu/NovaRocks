@@ -268,8 +268,8 @@ fn scan_source_requires_resolved_binding(source: &table_model::ScanSource) -> bo
         source,
         table_model::ScanSource::IcebergDeltaTable { .. }
             | table_model::ScanSource::IcebergVersionTable { .. }
-            | table_model::ScanSource::IcebergMvTargetState(_)
-            | table_model::ScanSource::IcebergMvTargetLocator(_)
+            | table_model::ScanSource::MvTargetState(_)
+            | table_model::ScanSource::MvTargetLocator(_)
     )
 }
 
@@ -605,8 +605,8 @@ fn scan_binding_for_source<'a>(
         }
         table_model::ScanSource::IcebergDataFiles { .. }
         | table_model::ScanSource::IcebergVersionTable { .. }
-        | table_model::ScanSource::IcebergMvTargetState(_)
-        | table_model::ScanSource::IcebergMvTargetLocator(_) => {
+        | table_model::ScanSource::MvTargetState(_)
+        | table_model::ScanSource::MvTargetLocator(_) => {
             matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
         }
     };
@@ -635,8 +635,8 @@ fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
         table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         table_model::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
         table_model::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
-        table_model::ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
-        table_model::ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
+        table_model::ScanSource::MvTargetState(_) => "IcebergMvTargetState",
+        table_model::ScanSource::MvTargetLocator(_) => "IcebergMvTargetLocator",
     }
 }
 
@@ -786,7 +786,7 @@ fn encode_scan_source(
                     snapshot_id: *snapshot_id,
                 })
             }
-            table_model::ScanSource::IcebergMvTargetState(scan) => {
+            table_model::ScanSource::MvTargetState(scan) => {
                 Kind::IcebergMvTargetState(plan::IcebergMvTargetState {
                     catalog: scan.catalog.clone(),
                     database: scan.database.clone(),
@@ -805,16 +805,16 @@ fn encode_scan_source(
                     row_id_column_name: scan.row_id_column_name.clone(),
                     row_filter: Some(encode_mv_target_state_row_filter(&scan.row_filter)),
                     partition_constraint: match scan.partition_constraint {
-                        table_model::IcebergMvTargetStatePartitionConstraint::Unpartitioned => {
+                        table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned => {
                             plan::IcebergMvTargetStatePartitionConstraint::Unpartitioned as i32
                         }
-                        table_model::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+                        table_model::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                             plan::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired as i32
                         }
                     },
                 })
             }
-            table_model::ScanSource::IcebergMvTargetLocator(scan) => {
+            table_model::ScanSource::MvTargetLocator(scan) => {
                 Kind::IcebergMvTargetLocator(plan::IcebergMvTargetLocator {
                     catalog: scan.catalog.clone(),
                     database: scan.database.clone(),
@@ -941,13 +941,13 @@ fn encode_connector_expected_schema_ipc(
 }
 
 fn encode_mv_target_state_row_filter(
-    src: &table_model::IcebergMvTargetStateRowFilter,
+    src: &table_model::SqlMvTargetStateRowFilter,
 ) -> plan::IcebergMvTargetStateRowFilter {
     use plan::iceberg_mv_target_state_row_filter::Kind;
 
     plan::IcebergMvTargetStateRowFilter {
         kind: Some(match src {
-            table_model::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope,
             } => Kind::DeltaInputRowIds(plan::DeltaInputRowIdsFilter {

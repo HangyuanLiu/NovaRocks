@@ -468,7 +468,7 @@ fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
         &plan.kind,
         LogicalPlanKind::Scan(PlanScanNode {
             table: TableDef {
-                source: ScanSource::IcebergMvTargetState(_),
+                source: ScanSource::MvTargetState(_),
                 ..
             },
             ..
@@ -535,7 +535,7 @@ mod tests {
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
     use crate::sql::planner::table::{
-        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+        SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
     };
     use novarocks_catalog::schema::ColumnDef;
 
@@ -587,11 +587,11 @@ mod tests {
                         vec!["sum_v_state".to_string()],
                         vec!["k".to_string(), "sum_v_state".to_string()],
                         "__row_id__".to_string(),
-                        IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                        SqlMvTargetStateRowFilter::DeltaInputRowIds {
                             row_id_column_name: "__row_id__".to_string(),
                             branch_scope: None,
                         },
-                        IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                        SqlMvTargetStatePartitionConstraint::Unpartitioned,
                     ),
                 },
                 alias: None,

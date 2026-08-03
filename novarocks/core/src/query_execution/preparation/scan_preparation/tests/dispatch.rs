@@ -375,21 +375,19 @@ fn target_state_and_locator_reject_equality_deletes() {
 
     let sources = [
         (
-            ScanSource::IcebergMvTargetLocator(
-                crate::sql::planner::table::IcebergMvTargetLocatorScan {
-                    catalog: "test_catalog".to_string(),
-                    database: "test_db".to_string(),
-                    table: "test_table".to_string(),
-                    target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-                    target_snapshot_id: Some(6),
-                    apply_key_column: "id".to_string(),
-                    branch_id_column: None,
-                },
-            ),
+            ScanSource::MvTargetLocator(crate::sql::planner::table::SqlMvTargetLocatorScan {
+                catalog: "test_catalog".to_string(),
+                database: "test_db".to_string(),
+                table: "test_table".to_string(),
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(6),
+                apply_key_column: "id".to_string(),
+                branch_id_column: None,
+            }),
             "target-locator",
         ),
         (
-            ScanSource::IcebergMvTargetState(crate::sql::planner::table::IcebergMvTargetStateScan {
+            ScanSource::MvTargetState(crate::sql::planner::table::SqlMvTargetStateScan {
                 catalog: "test_catalog".to_string(),
                 database: "test_db".to_string(),
                 table: "test_table".to_string(),
@@ -402,12 +400,12 @@ fn target_state_and_locator_reject_equality_deletes() {
                 physical_column_names: vec!["id".to_string()],
                 row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                 row_filter:
-                    crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                    crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                         row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
                         branch_scope: None,
                     },
                 partition_constraint:
-                    crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+                    crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
             }),
             "target-state",
         ),

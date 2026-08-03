@@ -62,10 +62,8 @@ fn resolve_scan_source<V, S, L, D>(
 ) -> Result<Option<ResolvedScanExecution>, String>
 where
     V: FnOnce(&IcebergTableInfo, i64) -> Result<ScanSource, String>,
-    S: FnOnce(&crate::sql::planner::table::IcebergMvTargetStateScan) -> Result<ScanSource, String>,
-    L: FnOnce(
-        &crate::sql::planner::table::IcebergMvTargetLocatorScan,
-    ) -> Result<ScanSource, String>,
+    S: FnOnce(&crate::sql::planner::table::SqlMvTargetStateScan) -> Result<ScanSource, String>,
+    L: FnOnce(&crate::sql::planner::table::SqlMvTargetLocatorScan) -> Result<ScanSource, String>,
     D: FnOnce(&IcebergTableInfo, i64, i64) -> Result<IcebergDeltaScanRuntimePlan, String>,
 {
     let (kind, resolved) = match source {
@@ -77,7 +75,7 @@ where
             });
             ("IcebergVersionTable", resolved)
         }
-        ScanSource::IcebergMvTargetState(scan) => {
+        ScanSource::MvTargetState(scan) => {
             let resolved = target_state(scan).and_then(|source| {
                 resolve_file_scan(node_id, "IcebergMvTargetState", source)
                     .map(ResolvedScanExecution::IcebergFiles)
@@ -85,7 +83,7 @@ where
             });
             ("IcebergMvTargetState", resolved)
         }
-        ScanSource::IcebergMvTargetLocator(scan) => {
+        ScanSource::MvTargetLocator(scan) => {
             let resolved = target_locator(scan).and_then(|source| {
                 resolve_file_scan(node_id, "IcebergMvTargetLocator", source)
                     .map(ResolvedScanExecution::IcebergFiles)
@@ -311,8 +309,8 @@ mod tests {
         target_locator_refresh_fixture,
     };
     use crate::sql::planner::table::{
-        BranchScope, IcebergMvTargetLocatorScan, IcebergMvTargetStatePartitionConstraint,
-        IcebergMvTargetStateRowFilter, IcebergMvTargetStateScan, TableDef,
+        BranchScope, SqlMvTargetLocatorScan, SqlMvTargetStatePartitionConstraint,
+        SqlMvTargetStateRowFilter, SqlMvTargetStateScan, TableDef,
     };
 
     fn table_info(catalog: &str, table: &str) -> IcebergTableInfo {
@@ -568,11 +566,11 @@ mod tests {
         panic!("unexpected version resolver call")
     }
 
-    fn panic_state(_: &IcebergMvTargetStateScan) -> Result<ScanSource, String> {
+    fn panic_state(_: &SqlMvTargetStateScan) -> Result<ScanSource, String> {
         panic!("unexpected target-state resolver call")
     }
 
-    fn panic_locator(_: &IcebergMvTargetLocatorScan) -> Result<ScanSource, String> {
+    fn panic_locator(_: &SqlMvTargetLocatorScan) -> Result<ScanSource, String> {
         panic!("unexpected target-locator resolver call")
     }
 
@@ -673,17 +671,15 @@ mod tests {
         let resolved = ctx
             .resolve_scan(
                 105,
-                &plan_scan(ScanSource::IcebergMvTargetLocator(
-                    IcebergMvTargetLocatorScan {
-                        catalog: "tgt".to_string(),
-                        database: "db".to_string(),
-                        table: "mv".to_string(),
-                        target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
-                        target_snapshot_id: Some(fixture.target_snapshot_id),
-                        apply_key_column: "k".to_string(),
-                        branch_id_column: None,
-                    },
-                )),
+                &plan_scan(ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
+                    catalog: "tgt".to_string(),
+                    database: "db".to_string(),
+                    table: "mv".to_string(),
+                    target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+                    target_snapshot_id: Some(fixture.target_snapshot_id),
+                    apply_key_column: "k".to_string(),
+                    branch_id_column: None,
+                })),
             )
             .expect("real target locator adapter")
             .expect("locator binding");
@@ -701,10 +697,7 @@ mod tests {
     fn real_context_resolves_target_state_through_trait_adapter() {
         let (ctx, target_scan) = aggregate_target_state_refresh_fixture();
         let resolved = ctx
-            .resolve_scan(
-                106,
-                &plan_scan(ScanSource::IcebergMvTargetState(target_scan)),
-            )
+            .resolve_scan(106, &plan_scan(ScanSource::MvTargetState(target_scan)))
             .expect("real target-state adapter")
             .expect("target-state binding");
         let ResolvedScanExecution::IcebergFiles(files) = resolved else {
@@ -728,9 +721,9 @@ mod tests {
 
     fn resolve_target_state_error(
         ctx: &IcebergMvRefreshContext,
-        scan: IcebergMvTargetStateScan,
+        scan: SqlMvTargetStateScan,
     ) -> String {
-        ctx.resolve_scan(206, &plan_scan(ScanSource::IcebergMvTargetState(scan)))
+        ctx.resolve_scan(206, &plan_scan(ScanSource::MvTargetState(scan)))
             .expect_err("invalid target-state binding must fail")
     }
 
@@ -792,7 +785,7 @@ mod tests {
     #[test]
     fn target_state_scan_rejects_row_filter_column_mismatch() {
         let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
-        scan.row_filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        scan.row_filter = SqlMvTargetStateRowFilter::DeltaInputRowIds {
             row_id_column_name: "unexpected_row_id".to_string(),
             branch_scope: None,
         };
@@ -810,7 +803,7 @@ mod tests {
     #[test]
     fn target_state_scan_rejects_branch_scope_mismatch() {
         let (ctx, mut scan) = aggregate_target_state_refresh_fixture();
-        scan.row_filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        scan.row_filter = SqlMvTargetStateRowFilter::DeltaInputRowIds {
             row_id_column_name: scan.row_id_column_name.clone(),
             branch_scope: Some(BranchScope {
                 branch_id_column_name: "__branch_id__".to_string(),
@@ -908,7 +901,7 @@ mod tests {
 
     #[test]
     fn target_state_dispatch_preserves_projection_contract() {
-        let scan = IcebergMvTargetStateScan {
+        let scan = SqlMvTargetStateScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),
@@ -920,13 +913,13 @@ mod tests {
             aggregate_state_names: vec!["sum_state".to_string()],
             physical_column_names: vec!["k".to_string(), "sum_state".to_string()],
             row_id_column_name: "k".to_string(),
-            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            row_filter: SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "k".to_string(),
                 branch_scope: None,
             },
-            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            partition_constraint: SqlMvTargetStatePartitionConstraint::Unpartitioned,
         };
-        let source = ScanSource::IcebergMvTargetState(scan);
+        let source = ScanSource::MvTargetState(scan);
         let resolved = resolve_scan_source(
             8,
             &source,
@@ -948,7 +941,7 @@ mod tests {
 
     #[test]
     fn target_locator_dispatch_preserves_apply_key_projection() {
-        let source = ScanSource::IcebergMvTargetLocator(IcebergMvTargetLocatorScan {
+        let source = ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
             catalog: "tgt".to_string(),
             database: "db".to_string(),
             table: "mv".to_string(),

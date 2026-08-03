@@ -338,7 +338,7 @@ fn union_outputs_action_column(plan: &LogicalPlanNode) -> bool {
 fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         LogicalPlanKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergMvTargetState(_))
+            matches!(scan.table.source, ScanSource::MvTargetState(_))
         }
         _ => plan.children.iter().any(contains_target_state_scan),
     }

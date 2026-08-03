@@ -73,13 +73,13 @@ impl TableIdentity {
             // IcebergMvTargetState node before identity comparison runs. The __mv__
             // prefix is a belt-and-suspenders signal, not the sole guard — a same-named
             // user catalog colliding here is harmless because the whitelist fires first.
-            ScanSource::IcebergMvTargetState(mv) => TableIdentity::Iceberg {
+            ScanSource::MvTargetState(mv) => TableIdentity::Iceberg {
                 catalog: format!("__mv__{}", mv.catalog),
                 namespace: mv.database.clone(),
                 table: mv.table.clone(),
                 table_uuid: None,
             },
-            ScanSource::IcebergMvTargetLocator(mv) => TableIdentity::Iceberg {
+            ScanSource::MvTargetLocator(mv) => TableIdentity::Iceberg {
                 catalog: format!("__mv_locator__{}", mv.catalog),
                 namespace: mv.database.clone(),
                 table: mv.table.clone(),

@@ -81,16 +81,14 @@ pub(super) fn resolve_physical_columns(
 
 fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
     match source {
-        ScanSource::IcebergMvTargetState(scan) => Some(projected_target_state_column_names(scan)),
-        ScanSource::IcebergMvTargetLocator(scan) => {
-            Some(projected_target_locator_column_names(scan))
-        }
+        ScanSource::MvTargetState(scan) => Some(projected_target_state_column_names(scan)),
+        ScanSource::MvTargetLocator(scan) => Some(projected_target_locator_column_names(scan)),
         _ => None,
     }
 }
 
 fn projected_target_state_column_names(
-    scan: &crate::sql::planner::table::IcebergMvTargetStateScan,
+    scan: &crate::sql::planner::table::SqlMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
     push_unique_projected_name(&mut names, &scan.row_id_column_name);
@@ -101,7 +99,7 @@ fn projected_target_state_column_names(
     {
         push_unique_projected_name(&mut names, name);
     }
-    if let crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+    if let crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
     } = &scan.row_filter
@@ -120,7 +118,7 @@ fn projected_target_state_column_names(
 }
 
 fn projected_target_locator_column_names(
-    scan: &crate::sql::planner::table::IcebergMvTargetLocatorScan,
+    scan: &crate::sql::planner::table::SqlMvTargetLocatorScan,
 ) -> Vec<String> {
     let mut names = vec![scan.apply_key_column.clone()];
     if let Some(branch_id_column) = &scan.branch_id_column {

@@ -47,7 +47,7 @@ use crate::sql::planner::payload::{
 };
 use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
 use crate::sql::planner::table::{
-    IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter, TableDef,
+    SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
 };
 use novarocks_catalog::schema::ColumnDef;
 
@@ -169,9 +169,9 @@ pub(crate) fn build_aggregate_state_merge(
         .map(|column| column.column.name.clone())
         .collect::<Vec<_>>();
     let partition_constraint = if is_unpartitioned_target_contract(&ext.mv_ctx.schema_contract) {
-        IcebergMvTargetStatePartitionConstraint::Unpartitioned
+        SqlMvTargetStatePartitionConstraint::Unpartitioned
     } else {
-        IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+        SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
     };
 
     let old_source = build_target_state_scan_source(
@@ -186,7 +186,7 @@ pub(crate) fn build_aggregate_state_merge(
         aggregate_state_names.clone(),
         physical_column_names,
         row_id_column_name.clone(),
-        IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        SqlMvTargetStateRowFilter::DeltaInputRowIds {
             row_id_column_name: row_id_column_name.clone(),
             branch_scope: branch_scope.clone(),
         },
@@ -2773,7 +2773,7 @@ mod tests {
 
     fn find_target_state_scan(plan: &LogicalPlanNode) -> &PlanScanNode {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
-            && matches!(&scan.table.source, ScanSource::IcebergMvTargetState(_))
+            && matches!(&scan.table.source, ScanSource::MvTargetState(_))
         {
             return scan;
         }
@@ -2794,7 +2794,7 @@ mod tests {
             &plan.kind,
             LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
-                    source: ScanSource::IcebergMvTargetState(_),
+                    source: ScanSource::MvTargetState(_),
                     ..
                 },
                 ..
@@ -2843,7 +2843,7 @@ mod tests {
             let filter_plan = plan.unary_input();
             if let LogicalPlanKind::Filter(filter) = &filter_plan.kind
                 && let LogicalPlanKind::Scan(scan) = &filter_plan.unary_input().kind
-                && matches!(&scan.table.source, ScanSource::IcebergMvTargetState(_))
+                && matches!(&scan.table.source, ScanSource::MvTargetState(_))
             {
                 return (project, filter, scan);
             }
@@ -2871,7 +2871,7 @@ mod tests {
                     &plan.unary_input().unary_input().kind,
                     LogicalPlanKind::Scan(PlanScanNode {
                         table: TableDef {
-                            source: ScanSource::IcebergMvTargetState(_),
+                            source: ScanSource::MvTargetState(_),
                             ..
                         },
                         ..
@@ -3018,7 +3018,7 @@ mod tests {
         let changed = expect_changed_merge(result, &arena_rc.borrow());
 
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
         assert_eq!(target_state.fqn(), "tgt.db.mv");
@@ -3532,13 +3532,13 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
 
         assert_eq!(
             target_state.partition_constraint,
-            IcebergMvTargetStatePartitionConstraint::Unpartitioned
+            SqlMvTargetStatePartitionConstraint::Unpartitioned
         );
     }
 
@@ -3569,12 +3569,12 @@ mod tests {
 
         let _ = aggregate_change_stream_project(&merge);
         let (project, filter, old_scan) = find_branch_scoped_old_input(&merge);
-        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
         assert!(matches!(
             &target_state.row_filter,
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 branch_scope: Some(scope),
                 ..
             } if scope.branch_id == 1
@@ -3770,7 +3770,7 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
+        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
             panic!("expected IcebergMvTargetState source");
         };
         assert_eq!(target_state.group_key_names, vec!["k"]);

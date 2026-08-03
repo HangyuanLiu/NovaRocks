@@ -498,8 +498,8 @@ fn validate_resolved_execution_kind(
         }
         ScanSource::IcebergDataFiles { .. }
         | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::IcebergMvTargetState(_)
-        | ScanSource::IcebergMvTargetLocator(_) => {
+        | ScanSource::MvTargetState(_)
+        | ScanSource::MvTargetLocator(_) => {
             matches!(execution, ResolvedScanExecution::IcebergFiles(_))
         }
     };
@@ -525,8 +525,8 @@ fn reject_target_equality_deletes(
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
     let target_kind = match source {
-        ScanSource::IcebergMvTargetState(_) => "target-state",
-        ScanSource::IcebergMvTargetLocator(_) => "target-locator",
+        ScanSource::MvTargetState(_) => "target-state",
+        ScanSource::MvTargetLocator(_) => "target-locator",
         _ => return Ok(()),
     };
     let ResolvedScanExecution::IcebergFiles(files) = execution else {
@@ -552,8 +552,8 @@ fn scan_source_requires_resolver(source: &ScanSource) -> bool {
         source,
         ScanSource::ConnectorPinned
             | ScanSource::IcebergVersionTable { .. }
-            | ScanSource::IcebergMvTargetState(_)
-            | ScanSource::IcebergMvTargetLocator(_)
+            | ScanSource::MvTargetState(_)
+            | ScanSource::MvTargetLocator(_)
             | ScanSource::IcebergDeltaTable { .. }
     )
 }
@@ -573,8 +573,8 @@ fn scan_source_kind(source: &ScanSource) -> &'static str {
         ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
         ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
         ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
-        ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
-        ScanSource::IcebergMvTargetLocator(_) => "IcebergMvTargetLocator",
+        ScanSource::MvTargetState(_) => "IcebergMvTargetState",
+        ScanSource::MvTargetLocator(_) => "IcebergMvTargetLocator",
     }
 }
 

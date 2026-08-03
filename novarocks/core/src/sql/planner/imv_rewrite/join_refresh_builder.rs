@@ -30,7 +30,7 @@ use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
 };
 use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
-use crate::sql::planner::table::{IcebergMvTargetLocatorScan, ScanSource, TableDef};
+use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn build_join_apply_key_project(
@@ -678,7 +678,7 @@ fn build_target_locator_scan(
                 name: desc.mv_identity.name.clone(),
                 columns,
                 iceberg_row_lineage_metadata_columns: metadata_columns,
-                source: ScanSource::IcebergMvTargetLocator(IcebergMvTargetLocatorScan {
+                source: ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
                     catalog: desc.mv_identity.catalog.clone(),
                     database: desc.mv_identity.database.clone(),
                     table: desc.mv_identity.name.clone(),
@@ -1693,9 +1693,9 @@ mod tests {
 
     fn find_target_locator_scan(
         plan: &LogicalPlanNode,
-    ) -> Option<&crate::sql::planner::table::IcebergMvTargetLocatorScan> {
+    ) -> Option<&crate::sql::planner::table::SqlMvTargetLocatorScan> {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
-            && let crate::sql::planner::table::ScanSource::IcebergMvTargetLocator(locator) =
+            && let crate::sql::planner::table::ScanSource::MvTargetLocator(locator) =
                 &scan.table.source
         {
             return Some(locator);
