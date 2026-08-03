@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use iceberg::Catalog;
 use iceberg::spec::TableMetadata;
 use iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
@@ -224,6 +225,17 @@ impl IcebergWriteControlBackend for RegisteredIcebergWriteControlBackend {
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?
             .reconcile(evidence)
     }
+
+    fn resulting_row_count(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        self.services
+            .resolve(operation_id)
+            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?
+            .resulting_row_count(operation_id, outcome)
+    }
 }
 
 /// The narrow provider-private commit seam used by the FE service.  The
@@ -310,6 +322,10 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
                 .to_string(),
             self.recovery_evidence(),
         ))
+    }
+
+    fn resulting_row_count(&self, _: &CommitOutcome) -> Result<Option<u64>, CommitServiceError> {
+        Ok(None)
     }
 }
 
@@ -411,11 +427,11 @@ impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
                 cleanup,
             ));
         }
-        let mut provenance = self.provenance_properties.clone();
-        provenance.insert(
-            "novarocks.mv.refresh.row_count".to_string(),
-            row_count.to_string(),
-        );
+        // `merge_snapshot_summary_properties` derives provenance.rows and the
+        // compatibility row-count property from the committed snapshot's
+        // total-records.  The accepted BE reports remain an input-staging
+        // fact, never the frontend's final MV row count.
+        let provenance = self.provenance_properties.clone();
         self.executor
             .commit_iceberg_writer_reports_with_snapshot_properties(reports, provenance)
     }
@@ -436,6 +452,13 @@ impl IcebergWriteReportCommitter for IcebergFirstRefreshWriteReportCommitter {
 
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.executor.collector)
+    }
+
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
     }
 }
 
@@ -474,6 +497,60 @@ impl IcebergWriteReportCommitter for IcebergWriteCommitExecutor {
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.collector)
     }
+}
+
+fn committed_mv_row_count(
+    executor: &IcebergWriteCommitExecutor,
+    snapshot_id: i64,
+) -> Result<u64, CommitServiceError> {
+    let catalog = Arc::clone(&executor.catalog);
+    let table_ident = executor.collector.table_ident.clone();
+    let table = crate::runtime::global_async_runtime::data_block_on(async move {
+        catalog.load_table(&table_ident).await
+    })
+    .map_err(|error| {
+        CommitServiceError::finalize_failed_known_committed(
+            None,
+            format!("reload Iceberg MV commit snapshot for row count: {error}"),
+            RecoveryEvidence::from_collector(&executor.collector),
+        )
+    })?
+    .map_err(|error| {
+        CommitServiceError::finalize_failed_known_committed(
+            None,
+            format!("reload Iceberg MV commit snapshot for row count: {error}"),
+            RecoveryEvidence::from_collector(&executor.collector),
+        )
+    })?;
+    let snapshot = table
+        .metadata()
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| {
+            CommitServiceError::finalize_failed_known_committed(
+                None,
+                "committed Iceberg MV snapshot is absent after catalog acknowledgement".to_string(),
+                RecoveryEvidence::from_collector(&executor.collector),
+            )
+        })?;
+    snapshot
+        .summary()
+        .additional_properties
+        .get("total-records")
+        .ok_or_else(|| {
+            CommitServiceError::finalize_failed_known_committed(
+                None,
+                "committed Iceberg MV snapshot lacks total-records".to_string(),
+                RecoveryEvidence::from_collector(&executor.collector),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            CommitServiceError::finalize_failed_known_committed(
+                None,
+                format!("committed Iceberg MV snapshot has invalid total-records: {error}"),
+                RecoveryEvidence::from_collector(&executor.collector),
+            )
+        })
 }
 
 /// Operation-scoped committer for a change stream with several terminal
@@ -524,6 +601,13 @@ impl IcebergWriteReportCommitter for IcebergChangeStreamWriteReportCommitter {
 
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.executor.collector)
+    }
+
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
     }
 }
 
@@ -1056,6 +1140,13 @@ impl IcebergWriteReportCommitter for IcebergCowWriteReportCommitter {
 
     fn recovery_evidence(&self) -> RecoveryEvidence {
         RecoveryEvidence::from_collector(&self.executor.collector)
+    }
+
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
     }
 }
 
@@ -1724,6 +1815,14 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
         self.context
             .commit_executor
             .reconcile_connector_operation(evidence)
+    }
+
+    fn resulting_row_count(
+        &self,
+        _: ConnectorWriteOperationId,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        self.context.commit_executor.resulting_row_count(outcome)
     }
 }
 
