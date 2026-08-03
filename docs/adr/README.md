@@ -88,6 +88,7 @@ code-anchors:
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
+- ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
 
 ### distributed-query-lifecycle
 
