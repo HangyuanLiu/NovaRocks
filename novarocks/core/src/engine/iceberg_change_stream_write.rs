@@ -12,12 +12,17 @@
 use std::sync::{Arc, Mutex};
 
 use crate::connector::iceberg::change_stream_routing::ChangeStreamWriterCommitPlan;
+#[cfg(test)]
 use crate::connector::iceberg::commit::{CleanupAttempt, CommitOutcome, CommitServiceError};
 use crate::engine::StandaloneState;
+use crate::engine::write_transaction::IcebergWriteCommitExecutor;
+#[cfg(test)]
 use crate::engine::write_transaction::{
-    IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
+    IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
 };
+#[cfg(test)]
 use crate::query_execution::outcome::QueryExecutionResult;
+#[cfg(test)]
 use crate::query_execution::write::WriteCommitInput;
 use crate::runtime::query_options::QueryOptions;
 use crate::sql::optimizer::OptimizedOperatorNode;

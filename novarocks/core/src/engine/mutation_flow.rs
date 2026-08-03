@@ -37,13 +37,12 @@ use crate::engine::StandaloneState;
 #[cfg(test)]
 use crate::engine::StatementResult;
 use crate::engine::write_transaction::{
-    IcebergWriteCommitExecutor, IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec,
-    write_commit_has_files,
+    IcebergWriteCommitExecutor, write_commit_has_files,
 };
 #[cfg(test)]
 use crate::engine::write_transaction::{
-    IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionRunner,
-    IcebergWriteValidationPolicy,
+    IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionExecutor,
+    IcebergWriteTransactionRunner, IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
 };
 #[cfg(test)]
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};

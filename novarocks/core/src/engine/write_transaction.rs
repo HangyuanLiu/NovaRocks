@@ -81,6 +81,7 @@ pub(crate) struct IcebergWriteTransactionSpec {
 
 /// Outcome of a successful (or empty/no-op) transaction.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct IcebergWriteTransactionOutcome {
     pub(crate) query_result: QueryResult,
     /// `Some` for committed writes; `None` for empty/no-op writes.
@@ -92,6 +93,7 @@ pub(crate) struct IcebergWriteTransactionOutcome {
 /// The side-effecting dependencies of a write transaction. Production
 /// implementations wrap the execution coordinator, connector control binding,
 /// and cache finalization; tests inject a fake.
+#[cfg(test)]
 pub(crate) trait IcebergWriteTransactionExecutor {
     /// Run the coordinated writer plan, returning the writer outcome.
     fn run_coordinated_write(
@@ -406,11 +408,13 @@ pub(crate) fn write_commit_has_files(write_commit: &WriteCommitInput) -> bool {
 }
 
 /// Drives one Iceberg write transaction through the operation state machine.
+#[cfg(test)]
 pub(crate) struct IcebergWriteTransactionRunner<'a, E: IcebergWriteTransactionExecutor> {
     state: Arc<StandaloneState>,
     executor: &'a E,
 }
 
+#[cfg(test)]
 impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E> {
     pub(crate) fn new(state: Arc<StandaloneState>, executor: &'a E) -> Self {
         Self { state, executor }
