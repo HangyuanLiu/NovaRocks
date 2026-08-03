@@ -339,6 +339,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
                 binding:
                     crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             }),
+            frozen_snapshot_files: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     })

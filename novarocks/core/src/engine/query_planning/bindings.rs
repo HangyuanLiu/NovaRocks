@@ -198,6 +198,14 @@ pub(crate) struct QueryTableBinding {
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
     pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+    /// Exact file sets captured for the snapshot selectors emitted by one
+    /// admitted logical plan.  A binding can serve both sides of an IMV
+    /// from/to comparison, so the primary materialization alone is not
+    /// sufficient to recover a historical scan at preparation time.
+    ///
+    /// The map is query-local and shares the binding's planning lease; it is
+    /// never populated by a later catalog lookup.
+    pub(crate) frozen_snapshot_files: BTreeMap<i64, Vec<IcebergDataFileInfo>>,
     /// Exact snapshot-window physical facts admitted for a SQL delta scan.
     /// They remain application-owned and are retrieved only through this
     /// binding's request-local token during preparation.
@@ -267,6 +275,7 @@ impl QueryTableBinding {
             statistics_pin: None,
             planning_lease: None,
             scan_materialization: None,
+            frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
     }
@@ -473,6 +482,41 @@ impl QueryTableBindingStore {
         id: SqlTableBindingId,
     ) -> Result<Option<QueryScanMaterialization>, String> {
         Ok(self.binding(id)?.scan_materialization.clone())
+    }
+
+    /// Recover the exact file set admitted for one frozen snapshot selector.
+    /// A selector without an admitted entry is a hard submission failure: a
+    /// preparation-time fallback to the current materialization would silently
+    /// turn an IMV `From` scan into a `To` scan.
+    pub(crate) fn frozen_snapshot_materialization(
+        &self,
+        id: SqlTableBindingId,
+        snapshot_id: i64,
+    ) -> Result<QueryScanMaterialization, String> {
+        let binding = self.binding(id)?;
+        let files = binding.frozen_snapshot_files.get(&snapshot_id).cloned().ok_or_else(|| {
+            format!(
+                "SQL frozen snapshot {snapshot_id} has no admitted file set for its request-local binding"
+            )
+        })?;
+        let Some(QueryScanMaterialization::IcebergDataFiles {
+            table,
+            binding: file_binding,
+            ..
+        }) = binding.scan_materialization.as_ref()
+        else {
+            return Err(
+                "SQL frozen snapshot binding has no admitted Iceberg data materialization"
+                    .to_string(),
+            );
+        };
+        let mut table = table.clone();
+        table.current_snapshot_id = Some(snapshot_id);
+        Ok(QueryScanMaterialization::IcebergDataFiles {
+            table,
+            files,
+            binding: *file_binding,
+        })
     }
 
     /// Return the immutable bindings captured during admission.  The caller

@@ -173,8 +173,24 @@ fn fixture_query_table_bindings_with_materialized_files(
                     _ => QueryScanMaterialization::IcebergDataFiles {
                         table,
                         files: materialized_files.clone(),
-                        binding: IcebergDataFileBinding::CurrentSnapshot,
+                        binding: match &source.kind {
+                            SqlScanKind::FrozenInputSet { .. } => {
+                                IcebergDataFileBinding::ExplicitFiles
+                            }
+                            _ => IcebergDataFileBinding::CurrentSnapshot,
+                        },
                     },
+                };
+                let frozen_snapshot_files = match &source.kind {
+                    SqlScanKind::FrozenInputSet {
+                        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
+                            snapshot_id,
+                        ),
+                    } => std::collections::BTreeMap::from([(
+                        *snapshot_id,
+                        materialized_files.clone(),
+                    )]),
+                    _ => std::collections::BTreeMap::new(),
                 };
                 Ok(QueryTableBinding {
                     resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
@@ -185,6 +201,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                     statistics_pin: None,
                     planning_lease: planning_lease.clone(),
                     scan_materialization: Some(scan_materialization),
+                    frozen_snapshot_files,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },

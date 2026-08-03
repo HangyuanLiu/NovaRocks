@@ -182,6 +182,7 @@ fn sqlx2_scan_metadata_recovers_exact_request_local_materialization() {
                             metadata_payload: None,
                         },
                     ),
+                    frozen_snapshot_files: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },
@@ -325,6 +326,99 @@ fn explicit_files_plan_opaque_connector_splits() {
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].split_id(), "fixture-0");
     assert_eq!(planned.splits[0].owner().as_str(), "test_catalog");
+}
+
+#[test]
+fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
+    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    };
+    let plan = plan(root);
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
+        "s3://bucket/current.parquet",
+    )]));
+    let store = fixture_query_table_bindings_with_materialized_files(
+        &plan,
+        &controls,
+        vec![data_file("s3://bucket/snapshot-11.parquet")],
+    );
+    let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
+        panic!("fixture root must remain a scan");
+    };
+    let ScanSource::Sql(source) = &scan.table.source;
+    let selected = store
+        .frozen_snapshot_materialization(source.binding, 11)
+        .expect("select admitted snapshot files");
+    let crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
+        files,
+        ..
+    } = selected
+    else {
+        panic!("frozen snapshot must retain data-file materialization");
+    };
+
+    assert_eq!(
+        files[0].path, "s3://bucket/snapshot-11.parquet",
+        "FrozenInputSet must not fall back to the binding's current materialization"
+    );
+    super::super::prepare_scan_bindings(
+        &plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    )
+    .expect("prepare selected frozen snapshot scan");
+}
+
+#[test]
+fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
+    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    };
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
+        "s3://bucket/current.parquet",
+    )]));
+    let store = fixture_query_table_bindings_with_materialized_files(
+        &plan(root.clone()),
+        &controls,
+        vec![data_file("s3://bucket/snapshot-11.parquet")],
+    );
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must remain a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(12),
+    };
+    let plan = plan(root);
+
+    let error = match super::super::prepare_scan_bindings(
+        &plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    ) {
+        Ok(_) => panic!("unadmitted frozen snapshot must fail before split planning"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("snapshot 12 has no admitted file set"),
+        "{error}"
+    );
 }
 
 #[test]

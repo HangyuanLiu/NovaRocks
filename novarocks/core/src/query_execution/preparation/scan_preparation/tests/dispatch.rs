@@ -165,6 +165,7 @@ fn coalesce_binding(
         statistics_pin: None,
         planning_lease: Some(planning_lease),
         scan_materialization: Some(materialization),
+        frozen_snapshot_files: std::collections::BTreeMap::new(),
         delta_runtime_plans: std::collections::BTreeMap::new(),
     }
 }
@@ -407,6 +408,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                             binding: IcebergDataFileBinding::CurrentSnapshot,
                         },
                     ),
+                    frozen_snapshot_files: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 };
                 Ok(binding)

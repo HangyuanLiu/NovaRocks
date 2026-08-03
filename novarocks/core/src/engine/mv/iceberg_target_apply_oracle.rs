@@ -924,6 +924,7 @@ fn framework_locator_query_local_overlay(
                         files: files.clone(),
                         binding: IcebergDataFileBinding::ExplicitFiles,
                     }),
+                    frozen_snapshot_files: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },

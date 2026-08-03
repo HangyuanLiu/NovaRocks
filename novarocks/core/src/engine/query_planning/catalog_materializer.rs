@@ -56,6 +56,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
         sql_table_name,
         binding,
         BTreeMap::new(),
+        BTreeMap::new(),
     )
 }
 
@@ -71,6 +72,10 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
     delta_runtime_plans: BTreeMap<
         (i64, i64),
         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
+    >,
+    mut frozen_snapshot_files: BTreeMap<
+        i64,
+        Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
     >,
 ) -> Result<QueryTableBinding, String> {
     use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
@@ -110,6 +115,22 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
             ),
         ),
     };
+    if matches!(
+        materialization.binding,
+        IcebergDataFileBinding::ExplicitFiles
+    ) {
+        let snapshot_id = materialization.table.current_snapshot_id.ok_or_else(|| {
+            format!(
+                "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
+                materialization.table.catalog,
+                materialization.table.namespace,
+                materialization.table.table
+            )
+        })?;
+        frozen_snapshot_files
+            .entry(snapshot_id)
+            .or_insert_with(|| materialization.files.clone());
+    }
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
         statistics_pin: materialization.statistics_pin,
@@ -119,6 +140,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
             files: materialization.files,
             binding: materialization.binding,
         }),
+        frozen_snapshot_files,
         delta_runtime_plans,
     })
 }
@@ -486,6 +508,7 @@ mod tests {
                 files: vec![],
                 binding: IcebergDataFileBinding::ExplicitFiles,
             }),
+            frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
     }

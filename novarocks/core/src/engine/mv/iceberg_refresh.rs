@@ -14295,6 +14295,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
                     .affected_partitions_to_target_partition_filter(),
                 target_partition_contract: refresh.rewrite.schema_contract.target.partition.clone(),
             }),
+            frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         })
     })?;
@@ -14413,8 +14414,20 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         materialization.table.current_snapshot_id = Some(snapshot_id);
         materialization.files = files;
         materialization.binding = IcebergDataFileBinding::ExplicitFiles;
+        let mut frozen_snapshot_files =
+            BTreeMap::from([(snapshot_id, materialization.files.clone())]);
         let mut delta_runtime_plans = BTreeMap::new();
         if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
+            let previous_files = crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                &loaded.table,
+                *previous_snapshot_id,
+            )?
+            .into_iter()
+            .map(
+                crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+            )
+            .collect();
+            frozen_snapshot_files.insert(*previous_snapshot_id, previous_files);
             let runtime_plan =
                 crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
                     &materialization.table,
@@ -14443,6 +14456,7 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                         &table,
                         binding,
                         delta_runtime_plans.clone(),
+                        frozen_snapshot_files.clone(),
                     )
                 },
             ),

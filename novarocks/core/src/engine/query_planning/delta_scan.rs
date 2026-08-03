@@ -314,6 +314,7 @@ mod tests {
             statistics_pin: None,
             planning_lease: None,
             scan_materialization: None,
+            frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::from([((10, 20), delta_plan())]),
         }
     }

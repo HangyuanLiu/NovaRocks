@@ -500,6 +500,7 @@ fn admit_statistics_scan_binding(
                     statistics_pin: None,
                     planning_lease: None,
                     scan_materialization: None,
+                    frozen_snapshot_files: BTreeMap::new(),
                     delta_runtime_plans: BTreeMap::new(),
                 })
             },

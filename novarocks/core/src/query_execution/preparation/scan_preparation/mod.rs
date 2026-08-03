@@ -159,7 +159,9 @@ fn prepare_scan_node(
     let execution = match &scan.table.source {
         ScanSource::Sql(source) => match &source.kind {
             crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            } => {
                 let query_table_bindings = query_table_bindings.ok_or_else(|| {
                     format!(
                         "SQL scan node_id={node_id} has binding token but no query-local binding store"
@@ -189,6 +191,41 @@ fn prepare_scan_node(
                     files,
                     binding,
                 })
+            }
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+            } => {
+                let query_table_bindings = query_table_bindings.ok_or_else(|| {
+                    format!(
+                        "SQL frozen scan node_id={node_id} has binding token but no query-local binding store"
+                    )
+                })?;
+                let materialization = query_table_bindings
+                    .frozen_snapshot_materialization(source.binding, *snapshot_id)?;
+                let QueryScanMaterialization::IcebergDataFiles {
+                    table,
+                    files,
+                    binding,
+                } = materialization
+                else {
+                    return Err(format!(
+                        "SQL frozen scan binding for '{}.{}.{}' has non-data materialization",
+                        source.table.catalog, source.table.namespace, source.table.table
+                    ));
+                };
+                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                    table,
+                    files,
+                    binding,
+                })
+            }
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version:
+                    crate::sql::planner::table::SqlTableVersionSelector::TimestampMillis(timestamp),
+            } => {
+                return Err(format!(
+                    "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
+                ));
             }
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
                 let query_table_bindings = query_table_bindings.ok_or_else(|| {
