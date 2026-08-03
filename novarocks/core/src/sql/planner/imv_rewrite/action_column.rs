@@ -26,7 +26,6 @@ use std::sync::atomic::AtomicBool;
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -48,6 +47,7 @@ use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::vocabulary::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct ImvActionColumn;

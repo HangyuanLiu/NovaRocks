@@ -23,10 +23,10 @@ use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
 use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
-use crate::mv::persistence::schema::{
+use crate::mv::rewrite::context::IcebergMvRewriteContext;
+use crate::sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
-use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {

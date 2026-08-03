@@ -76,9 +76,10 @@ mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HIDDEN_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
-        OutputColumnLineage, OutputContract, TargetContract, TargetVisibleColumn,
+        ExpressionLineage, HiddenApplyKeyContract, OutputColumnLineage, OutputContract,
+        TargetContract, TargetVisibleColumn,
     };
+    use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
         let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);

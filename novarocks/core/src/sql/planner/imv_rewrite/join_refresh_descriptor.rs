@@ -211,7 +211,7 @@ impl JoinRefreshDescriptor {
         if !self
             .join_apply_key_column
             .name
-            .eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+            .eq_ignore_ascii_case(crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
             || self.join_apply_key_column.data_type != DataType::Utf8
             || self.join_apply_key_column.nullable
             || !self.join_apply_key_column.is_internal
@@ -455,7 +455,7 @@ mod tests {
             ),
             join_apply_key_column: out(
                 4,
-                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                 DataType::Utf8,
                 false,
                 true,
@@ -483,7 +483,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         10,
-                        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                        crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                         DataType::Utf8,
                         false,
                         true,

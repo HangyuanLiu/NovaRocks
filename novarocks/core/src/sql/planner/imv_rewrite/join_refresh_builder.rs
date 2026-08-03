@@ -1169,7 +1169,7 @@ fn input_internal_matches(actual: &OutputColumn, expected: &OutputColumn) -> boo
 fn is_internal_output_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
         || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+        || name.eq_ignore_ascii_case(crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
 fn join_row_key_expr(desc: &JoinRefreshDescriptor, left_uuid: &str, right_uuid: &str) -> TypedExpr {
@@ -1668,7 +1668,7 @@ mod tests {
             vec![
                 ("mv_k", ColumnId(80)),
                 (
-                    crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                    crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                     ColumnId(90),
                 ),
                 (crate::sql::common::CHANGE_OP_COLUMN, ColumnId(91)),
@@ -1742,7 +1742,7 @@ mod tests {
         column.column_id.0 > 104
             && matches!(
                 column.name.as_str(),
-                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
+                crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
                     | "__pending_insert_count"
                     | "__pending_delete_count"
             )
@@ -1998,14 +1998,14 @@ mod tests {
         );
         let join_apply_key = out(
             5,
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
             DataType::Utf8,
             false,
             true,
         );
         let join_apply_key_output = out(
             90,
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
             DataType::Utf8,
             false,
             true,
@@ -2094,7 +2094,7 @@ mod tests {
     fn assert_join_apply_key_item(item: &ProjectItem) {
         assert!(
             item.output_name
-                .eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+                .eq_ignore_ascii_case(crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
         );
         assert_eq!(item.output_column_id, ColumnId(90));
         let ExprKind::FunctionCall { name, args, .. } = &item.expr.kind else {

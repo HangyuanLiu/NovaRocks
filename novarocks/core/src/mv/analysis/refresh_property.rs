@@ -2392,8 +2392,7 @@ mod tests {
     use crate::mv::persistence::schema::{
         AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, ExpressionKind, ExpressionLineage,
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
-        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
+        HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
@@ -2402,6 +2401,10 @@ mod tests {
         PartitionPruningPolicy, RefreshCapabilities, RefreshIdentity,
     };
     use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
+    use crate::sql::planner::vocabulary::{
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        JOIN_APPLY_KEY_COLUMN_NAME,
+    };
 
     fn from_schema_contract(contract: &MvSchemaContract) -> Result<RefreshCapabilities, String> {
         RefreshCapabilities::from_schema_contract(contract)

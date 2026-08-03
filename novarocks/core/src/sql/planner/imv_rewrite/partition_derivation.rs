@@ -167,7 +167,7 @@ mod tests {
             ),
             join_apply_key_column: out(
                 4,
-                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                 DataType::Utf8,
                 false,
                 true,
@@ -195,7 +195,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         10,
-                        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                        crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                         DataType::Utf8,
                         false,
                         true,

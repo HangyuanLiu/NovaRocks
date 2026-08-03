@@ -30,15 +30,16 @@ use crate::mv::model::TargetPartitionFilter;
 #[cfg(test)]
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-};
-use crate::mv::persistence::schema::{
-    BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+    ApplyKeySource,
 };
 use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column,
     expose_physical_apply_key_for_locator_registration, iceberg_mv_physical_select_sql,
     join_apply_key_table_column,
+};
+use crate::sql::planner::vocabulary::{
+    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+    JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[cfg(test)]

@@ -455,9 +455,8 @@ pub(crate) mod tests {
     use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
-        BranchIdColumnContract, BranchUnionContract, HIDDEN_APPLY_KEY_COLUMN_NAME,
-        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
+        BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, QualifiedFieldLineage,
     };
     use crate::mv::rewrite::context::tests_support::{
@@ -489,6 +488,9 @@ pub(crate) mod tests {
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
     use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::vocabulary::{
+        BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+    };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_catalog::schema::ColumnDef;

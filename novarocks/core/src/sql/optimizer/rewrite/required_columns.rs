@@ -746,7 +746,7 @@ fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) ->
 fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+        .eq_ignore_ascii_case(crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
 fn is_join_refresh_row_id_column(column: &crate::sql::analysis::OutputColumn) -> bool {
@@ -1642,7 +1642,7 @@ mod tests {
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(15),
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = true;
@@ -1703,7 +1703,7 @@ mod tests {
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(20),
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = false;

@@ -17,7 +17,6 @@
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -33,6 +32,7 @@ use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, o
 use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
+use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 
 pub(crate) struct RewriteBranchUnionRule;
 
@@ -860,7 +860,7 @@ mod tests {
         contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
         contract.branch = Some(BranchUnionContract {
             branch_id_column: BranchIdColumnContract {
-                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
+                column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME.to_string(),
                 target_field_id: 998,
             },
             branch_count: 2,
@@ -1004,7 +1004,7 @@ mod tests {
         });
         contract.branch = Some(BranchUnionContract {
             branch_id_column: BranchIdColumnContract {
-                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
+                column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME.to_string(),
                 target_field_id: 998,
             },
             branch_count: 2,

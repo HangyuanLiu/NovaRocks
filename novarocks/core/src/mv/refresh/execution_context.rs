@@ -767,9 +767,10 @@ pub(crate) mod tests_support {
     use crate::sql::planner::table::{
         SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter,
     };
+    use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, JOIN_APPLY_KEY_COLUMN_NAME,
+        ApplyKeySource,
     };
     use novarocks_catalog::identifier::TableIdentity;
 

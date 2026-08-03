@@ -19,7 +19,6 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
 use crate::mv::persistence::schema::{
     BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
 };
@@ -55,6 +54,7 @@ use crate::sql::planner::logical::{
 };
 use crate::sql::planner::payload::PlanProjectNode;
 use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 
 pub(crate) struct RewriteJoinDeltaRule;
 

@@ -32,9 +32,11 @@ use super::model::{
 };
 use crate::mv::analysis::rebind::RebindColumn;
 use crate::mv::persistence::schema::{
-    ApplyKeySource, BaseContract, BranchIdColumnContract, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME, MvPartitionTransformContract,
+    ApplyKeySource, BaseContract, BranchIdColumnContract, MvPartitionTransformContract,
     MvSchemaContract,
+};
+use crate::sql::planner::vocabulary::{
+    GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 pub(crate) fn validate_schema_contract(
@@ -621,12 +623,15 @@ mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
-        BranchIdColumnContract, ExpressionKind, ExpressionLineage,
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME,
-        JoinContract, JoinContractKind, JoinPredicateLineage, MvPartitionContract,
-        MvPartitionFieldContract, MvPartitionTransformContract, OutputColumnLineage,
-        OutputContract, QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
+        ExpressionKind, ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
+        JoinPredicateLineage, MvPartitionContract, MvPartitionFieldContract,
+        MvPartitionTransformContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
+        TargetContract, TargetVisibleColumn,
+    };
+    use crate::sql::planner::vocabulary::{
+        BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        JOIN_APPLY_KEY_COLUMN_NAME,
     };
     use std::sync::Arc;
 

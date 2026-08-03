@@ -285,7 +285,7 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
         .cloned()
         .collect::<Vec<_>>();
     fields.push(Arc::new(arrow::datatypes::Field::new(
-        crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME,
+        crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME,
         arrow::datatypes::DataType::Int32,
         false,
     )));

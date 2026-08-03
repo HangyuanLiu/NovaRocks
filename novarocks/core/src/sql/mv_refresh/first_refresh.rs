@@ -15,7 +15,6 @@ use crate::mv::aggregate_state::mv_agg_state::{
     AGG_RETRACTION_COUNT_STATE_COLUMN, AGG_STATE_PREFIX, ROW_ID_COLUMN, sanitize_state_column_name,
 };
 use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
-use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
 use crate::mv::refresh::aggregate_first_refresh::{
     prepare_aggregate_first_refresh_state_sql,
     prepare_branch_union_aggregate_first_refresh_state_sqls,
@@ -26,6 +25,7 @@ use crate::mv::refresh::projection_first_refresh::{
 };
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::planner::logical::LogicalPlanNode;
+use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
@@ -78,7 +78,7 @@ impl MvFirstRefreshLogicalArtifact {
         Self {
             plan: append.plan,
             factory: append.factory,
-            root_hash_column: crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
+            root_hash_column: crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
                 .to_string(),
             context,
         }
@@ -525,7 +525,7 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
     let sql = prepare_projection_full_read_sql(select_sql, pin, current_catalog, current_database)?;
     Ok(MvFirstRefreshPhysicalSql {
         sql,
-        root_hash_column: crate::mv::persistence::schema::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+        root_hash_column: crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
     })
 }
 
@@ -545,7 +545,7 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     )?;
     Ok(MvFirstRefreshPhysicalSql {
         sql,
-        root_hash_column: crate::mv::persistence::schema::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
+        root_hash_column: crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME.to_string(),
     })
 }
 
@@ -987,7 +987,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             prepared.root_hash_column(),
-            crate::mv::persistence::schema::HIDDEN_APPLY_KEY_COLUMN_NAME
+            crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME
         );
         assert!(prepared.sql().contains("__nova_base_row_id"));
         assert!(

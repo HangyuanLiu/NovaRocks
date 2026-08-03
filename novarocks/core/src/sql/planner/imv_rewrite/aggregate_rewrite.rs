@@ -2338,7 +2338,7 @@ mod tests {
             None,
             Some(BranchUnionContract {
                 branch_id_column: BranchIdColumnContract {
-                    column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
+                    column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME.to_string(),
                     target_field_id: 998,
                 },
                 branch_count: 2,
@@ -3558,7 +3558,7 @@ mod tests {
             None,
             None,
             Some(crate::sql::planner::table::BranchScope {
-                branch_id_column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME
+                branch_id_column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME
                     .to_string(),
                 branch_id: 1,
             }),
@@ -3632,7 +3632,7 @@ mod tests {
                 is_root: true,
                 action_column: None,
                 branch_scope: Some(crate::sql::planner::table::BranchScope {
-                    branch_id_column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME
+                    branch_id_column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME
                         .to_string(),
                     branch_id: 1,
                 }),

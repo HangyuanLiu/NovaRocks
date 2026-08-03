@@ -105,8 +105,7 @@ use crate::mv::persistence::refresh::{
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-    HIDDEN_APPLY_KEY_COLUMN_NAME, HIDDEN_COLUMNS_PROPERTY, JOIN_APPLY_KEY_COLUMN_NAME,
+    ApplyKeySource, HIDDEN_COLUMNS_PROPERTY,
 };
 use crate::mv::refresh::aggregate_first_refresh::{
     AggregateStateRead, prepare_aggregate_first_refresh_chunks,
@@ -166,6 +165,10 @@ use crate::sql::mv_refresh::{
 use crate::sql::parser::ast::{
     AlterMaterializedViewAction, AlterMaterializedViewStmt, CreateMaterializedViewStmt,
     DropMaterializedViewStmt, IcebergPartitionFieldExpr, ObjectName, RefreshMaterializedViewStmt,
+};
+use crate::sql::planner::vocabulary::{
+    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+    JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
@@ -3932,7 +3935,7 @@ fn build_branch_union_schema_contract(
     };
     contract.branch = Some(mv_schema::BranchUnionContract {
         branch_id_column: mv_schema::BranchIdColumnContract {
-            column_name: mv_schema::BRANCH_ID_COLUMN_NAME.into(),
+            column_name: BRANCH_ID_COLUMN_NAME.into(),
             target_field_id: branch_id_field_id,
         },
         branch_count,
@@ -17886,7 +17889,7 @@ mod tests {
         let column = crate::mv::refresh::target_apply::join_apply_key_table_column();
         assert_eq!(
             column.name,
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
         );
     }
 
@@ -23175,7 +23178,7 @@ mod tests {
         assert_eq!(contract.contract_version, 3);
         assert_eq!(
             contract.target.hidden_apply_key.column_name,
-            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(
             contract.target.hidden_apply_key.source,
@@ -23193,7 +23196,7 @@ mod tests {
         assert_eq!(aggregate.state_layout_version, 1);
         assert_eq!(
             aggregate.row_id_column_name,
-            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
         assert_eq!(aggregate.state_columns.len(), 2);
         assert_eq!(aggregate.state_columns[0].column_name, "__agg_state_c");
@@ -23245,7 +23248,7 @@ mod tests {
         );
         assert_eq!(
             contract.target.hidden_apply_key.column_name,
-            mv_schema::GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
+            GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME
         );
 
         let fact_contract = contract

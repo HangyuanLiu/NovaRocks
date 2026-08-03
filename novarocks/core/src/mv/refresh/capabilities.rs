@@ -121,9 +121,12 @@ mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
         AggregateStateContract, BaseContract, BaseSchemaSnapshot, BranchIdColumnContract,
-        BranchUnionContract, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
-        HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind,
+        BranchUnionContract, HiddenApplyKeyContract, JoinContract, JoinContractKind,
         OutputContract, TargetContract,
+    };
+    use crate::sql::planner::vocabulary::{
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        JOIN_APPLY_KEY_COLUMN_NAME,
     };
 
     fn schema_contract(source: ApplyKeySource) -> MvSchemaContract {

@@ -17,7 +17,6 @@
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -35,6 +34,7 @@ use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
 use crate::sql::planner::payload::PlanProjectNode;
+use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 
 pub(crate) struct RewriteUnionAggregateDeltaRule;
 

@@ -600,11 +600,12 @@ pub(crate) mod tests_support {
 
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
+    use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
-        JoinContractKind, JoinPredicateLineage, MvSchemaContract, OutputColumnLineage,
-        OutputContract, QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
+        ExpressionLineage, HiddenApplyKeyContract, JoinContract, JoinContractKind,
+        JoinPredicateLineage, MvSchemaContract, OutputColumnLineage, OutputContract,
+        QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
 
@@ -933,9 +934,10 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
+    use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
+        ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
 
