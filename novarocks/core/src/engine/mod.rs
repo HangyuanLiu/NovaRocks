@@ -4424,13 +4424,16 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
             sink,
             &optimizer_settings,
         )?;
+    let scan_resolver =
+        crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new(
+            table_bindings.as_ref(),
+        );
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),
         connector_context,
         Some(table_bindings.as_ref()),
-        None,
-        Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
+        Some(&scan_resolver),
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
@@ -4948,16 +4951,9 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     let maintenance_execution = capture_maintenance_execution(state)?;
     let scan_resolver = query_table_bindings
         .map(crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new);
-    let scan_binding_resolver = scan_resolver
-        .as_ref()
-        .map(|resolver| {
-            resolver as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
-        })
-        .or_else(|| {
-            mv_refresh_ctx.map(|ctx| {
-                ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
-            })
-        });
+    let scan_binding_resolver = scan_resolver.as_ref().map(|resolver| {
+        resolver as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
+    });
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),

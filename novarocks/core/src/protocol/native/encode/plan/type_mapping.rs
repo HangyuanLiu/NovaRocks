@@ -16,7 +16,6 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::proto::{common, plan};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind, SqlTopNType};
 use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 use crate::sql::planner::physical::{
