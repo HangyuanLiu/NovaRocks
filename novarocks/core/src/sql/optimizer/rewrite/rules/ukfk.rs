@@ -597,7 +597,6 @@ fn iceberg_table_info(
         | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::ConnectorPinned
         | crate::sql::planner::table::ScanSource::IcebergMvTargetState { .. }
         | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator { .. } => None,
     }
