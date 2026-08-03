@@ -35,7 +35,8 @@ use crate::connector::iceberg::scan_model::{
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::planner::table::{
-    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+    SqlTableVersionSelector,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +56,7 @@ pub(crate) enum QueryTableBindingSelector {
     StrictBaseTable,
     Snapshot(i64),
     TimestampMillis(i64),
+    Metadata(SqlMetadataTableKind),
 }
 
 impl QueryTableBindingKey {
@@ -97,6 +99,20 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::TimestampMillis(timestamp_millis),
+        )
+    }
+
+    pub(crate) fn metadata(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        kind: SqlMetadataTableKind,
+    ) -> Self {
+        Self::new(
+            catalog,
+            namespace,
+            table,
+            QueryTableBindingSelector::Metadata(kind),
         )
     }
 
@@ -413,6 +429,23 @@ impl QueryTableBindingStore {
             .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
     }
 
+    /// Return the admission-frozen binding for one metadata alias.  Metadata
+    /// scans must not reuse a base-table token: the provider may resolve the
+    /// alias through a distinct table handle and schema version.
+    pub(crate) fn metadata_binding_id(
+        &self,
+        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+        kind: SqlMetadataTableKind,
+    ) -> Option<SqlTableBindingId> {
+        let key =
+            QueryTableBindingKey::metadata(&table.catalog, &table.namespace, &table.table, kind);
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(&key)
+            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
+    }
+
     fn binding_for_key(&self, key: &QueryTableBindingKey) -> Option<Arc<QueryTableBinding>> {
         let id = self
             .entries
@@ -555,5 +588,33 @@ mod tests {
             "the SQL projection must carry the exact token published by admission"
         );
         assert!(store.binding(token).is_ok());
+    }
+
+    #[test]
+    fn sqlx2_binding_metadata_alias_uses_a_distinct_request_local_token() {
+        let store = QueryTableBindingStore::try_new().expect("store");
+        let base = store
+            .resolve_or_insert(
+                QueryTableBindingKey::strict_base("ice", "db", "orders"),
+                || Ok(local_binding()),
+            )
+            .expect("base token");
+        let metadata_key = QueryTableBindingKey::metadata(
+            "ice",
+            "db",
+            "orders",
+            crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+        );
+        let metadata = store
+            .resolve_or_insert(metadata_key.clone(), || Ok(local_binding()))
+            .expect("metadata token");
+        let repeated = store
+            .resolve_or_insert(metadata_key, || {
+                Err("must not reload metadata alias".to_string())
+            })
+            .expect("memoized metadata token");
+
+        assert_ne!(base, metadata);
+        assert_eq!(metadata, repeated);
     }
 }

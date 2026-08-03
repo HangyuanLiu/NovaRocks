@@ -411,6 +411,18 @@ fn exact_query_binding_lease_for_source(
             table.catalog.as_str(),
             format!("'{}.{}.{}'", table.catalog, table.namespace, table.table),
         ),
+        ScanSource::IcebergMetadataTable {
+            table,
+            metadata_table_type,
+            ..
+        } => (
+            bindings.metadata_binding_id(table, *metadata_table_type),
+            table.catalog.as_str(),
+            format!(
+                "'{}.{}.{}${metadata_table_type:?}'",
+                table.catalog, table.namespace, table.table
+            ),
+        ),
         source => {
             return Err(format!(
                 "scan preparation cannot recover an exact query binding from source {}",

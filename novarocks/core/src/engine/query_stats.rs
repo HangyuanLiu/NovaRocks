@@ -270,7 +270,8 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         namespace: &str,
         table: &str,
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
-    ) -> Result<crate::sql::planner::table::TableDef, String> {
+        _binding_id: crate::sql::binding::SqlTableBindingId,
+    ) -> Result<QueryTableBinding, String> {
         let metadata_table_type = match metadata_table_type {
             crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
                 crate::connector::iceberg::IcebergMetadataTableType::Snapshots
@@ -294,14 +295,21 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
             }
         };
-        crate::connector::iceberg::provider::load_metadata_table_def(
-            self.controls,
-            self.connector_context.clone(),
-            catalog,
-            namespace,
-            table,
-            metadata_table_type,
-        )
+        let (planner, statistics_pin, planning_lease) =
+            crate::connector::iceberg::provider::load_metadata_table_def_with_lease(
+                self.controls,
+                self.connector_context.clone(),
+                catalog,
+                namespace,
+                table,
+                metadata_table_type,
+            )?;
+        Ok(QueryTableBinding {
+            resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+            statistics_pin,
+            planning_lease: Some(planning_lease),
+            scan_materialization: None,
+        })
     }
 }
 

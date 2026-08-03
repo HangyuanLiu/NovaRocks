@@ -6499,14 +6499,23 @@ pub(crate) fn load_time_travel_table_def_with_lease(
     Ok((table_def, statistics_pin, planning_lease))
 }
 
-pub(crate) fn load_metadata_table_def(
+/// Resolve an Iceberg metadata alias while retaining the exact connector
+/// generation that supplied its schema and provider descriptor.
+pub(crate) fn load_metadata_table_def_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
     metadata_table_type: super::IcebergMetadataTableType,
-) -> Result<crate::sql::planner::table::TableDef, String> {
+) -> Result<
+    (
+        crate::sql::planner::table::TableDef,
+        Option<ResolvedTableStatisticsPin>,
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+    ),
+    String,
+> {
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
@@ -6528,7 +6537,14 @@ pub(crate) fn load_metadata_table_def(
             context,
         })
         .map_err(|error| error.to_string())?;
-    table_def_from_metadata(metadata)
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(|data_version| ResolvedTableStatisticsPin {
+            table: metadata.table.clone(),
+            data_version,
+        });
+    Ok((table_def_from_metadata(metadata)?, statistics_pin, lease))
 }
 
 fn table_def_from_metadata(

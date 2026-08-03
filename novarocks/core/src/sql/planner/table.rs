@@ -39,7 +39,7 @@ pub(crate) enum SqlTableVersionSelector {
 
 /// SQL-level metadata table identity.  Provider-specific metadata APIs are
 /// deliberately not represented in the compiler vocabulary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum SqlMetadataTableKind {
     Snapshots,
     History,

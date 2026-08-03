@@ -55,7 +55,8 @@ pub(crate) trait QueryTableBindingLoader: Send + Sync {
         namespace: &str,
         table: &str,
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
-    ) -> Result<TableDef, String>;
+        binding: SqlTableBindingId,
+    ) -> Result<QueryTableBinding, String>;
 }
 
 /// Application-owned catalog facade.  Its binding store is request-local and
@@ -194,8 +195,18 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 .expect("catalog service local read lock")
                 .get(database, table),
             Some(catalog) => {
-                self.loader
-                    .load_metadata_table(catalog, database, table, metadata_table_type)
+                let key =
+                    QueryTableBindingKey::metadata(catalog, database, table, metadata_table_type);
+                let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
+                    self.loader.load_metadata_table(
+                        catalog,
+                        database,
+                        table,
+                        metadata_table_type,
+                        binding_id,
+                    )
+                })?;
+                Ok(self.bindings.binding(token)?.resolved.planner.clone())
             }
         }
     }
