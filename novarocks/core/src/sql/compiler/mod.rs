@@ -982,6 +982,35 @@ mod tests {
     }
 
     #[test]
+    fn sqlx2_kernel_compiles_a_query_from_sql_owned_inputs() {
+        let catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let request = SqlCompileRequest::new(
+            SqlStatementInput::Sql("select 1".to_string()),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed {
+                backend_count: NonZeroUsize::new(3).expect("non-zero fixture topology"),
+            },
+            &catalog_snapshot,
+            &STATISTICS,
+            crate::sql::functions::builtin_sql_function_catalog(),
+            None,
+            control(None, &cancellation),
+        );
+
+        assert!(matches!(
+            SqlCompiler::compile(request),
+            Ok(SqlCompileOutput::Distributed(_))
+        ));
+    }
+
+    #[test]
     fn parsed_query_input_preserves_complex_types_and_escapes_without_sql_round_trip() {
         let statement =
             crate::sql::parser::parse_sql_raw(r"SELECT CAST('{}' AS MAP<STRING, INT>), 'e\\f'")
@@ -1025,6 +1054,33 @@ mod tests {
         assert!(matches!(
             SqlCompiler::compile(request),
             Err(SqlCompileError::InvalidRequest(error)) if error.contains("output column 'missing' not found")
+        ));
+    }
+
+    #[test]
+    fn sqlx2_kernel_rejects_missing_aggregate_rewrite_evidence() {
+        let input = SqlImvPlanningInput::new(
+            crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
+            SqlImvRewriteValidation::Aggregate,
+        );
+        let outcome = crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome {
+            plan: crate::sql::planner::logical::LogicalPlanNode::new(
+                crate::sql::planner::logical::LogicalPlanKind::Values(
+                    crate::sql::planner::payload::PlanValuesNode {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    },
+                ),
+                Vec::new(),
+                None,
+            ),
+            trace: crate::sql::optimizer::rewrite::trace::RewriteTrace::default(),
+            annotation: crate::sql::planner::imv_rewrite::annotation::ImvPlanAnnotation::default(),
+        };
+
+        assert!(matches!(
+            validate_imv_rewrite_outcome(&input, &outcome),
+            Err(SqlCompileError::Compilation(error)) if error.contains("RewriteAggregateState")
         ));
     }
 }

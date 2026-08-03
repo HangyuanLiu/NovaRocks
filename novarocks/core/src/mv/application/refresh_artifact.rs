@@ -41,6 +41,13 @@ pub(crate) struct MvFirstRefreshLogicalContext {
     pub(crate) previous_table_uuids: BTreeMap<String, String>,
     pub(crate) target_table_uuid: String,
     pub(crate) affected_partitions: crate::mv::model::AffectedTargetPartitions,
+    /// Base-table materializations admitted while the first-refresh artifact
+    /// was prepared.  The overlays retain their exact control leases, files,
+    /// and snapshot facts until activation creates the request-local binding
+    /// store. `None` identifies artifact modes that have not admitted a
+    /// logical join input and therefore cannot use this handoff.
+    pub(crate) frozen_base_overlays:
+        Option<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>>,
 }
 
 /// Application envelope for a join first-refresh artifact.
@@ -221,6 +228,10 @@ impl PreparedMvFirstRefreshWrite {
 
     pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
         self.request.target_contract()
+    }
+
+    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
+        self.request.shape()
     }
 
     pub(crate) fn root_hash_column(&self) -> &str {

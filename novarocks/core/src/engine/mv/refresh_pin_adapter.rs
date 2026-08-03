@@ -46,10 +46,7 @@ pub(crate) fn capture_refresh_snapshot_pin(
             loaded.table.metadata().uuid().to_string(),
         ));
     }
-    let pin = RefreshSnapshotPin::from_captured_entries(entries);
-    #[cfg(test)]
-    invoke_after_capture_hook();
-    Ok(pin)
+    Ok(RefreshSnapshotPin::from_captured_entries(entries))
 }
 
 #[cfg(test)]
@@ -89,6 +86,14 @@ fn invoke_after_capture_hook() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Test-only race seam.  Production callers must retain every exact base
+/// materialization before any post-capture work can observe a newer table
+/// generation.
+#[cfg(test)]
+pub(crate) fn invoke_after_capture_hook_for_test() {
+    invoke_after_capture_hook();
 }
 
 #[cfg(test)]

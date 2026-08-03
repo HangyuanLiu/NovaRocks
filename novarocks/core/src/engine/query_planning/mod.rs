@@ -141,7 +141,7 @@ mod tests {
     use super::{QueryCancellationObservation, sql_explain_profile};
 
     #[test]
-    fn sqlx2_application_cancellation_adapter_hides_the_reason() {
+    fn sqlx2_control_profile_cancellation_adapter_hides_the_reason() {
         let source = QueryCancellationSource::new();
         let observation = QueryCancellationObservation::new(source.view());
         assert!(!observation.is_cancelled());

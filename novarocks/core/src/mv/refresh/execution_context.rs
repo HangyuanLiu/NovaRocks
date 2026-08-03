@@ -53,6 +53,12 @@ pub(crate) struct IcebergMvRefreshContext {
     pub(crate) connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
     pub(crate) target_bindings: IcebergMvTargetBindings,
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
+    /// Exact base-table materializations captured with the refresh pin.  They
+    /// are application-owned and must be handed to every later IMV compiler
+    /// request instead of reacquiring the current connector generation.
+    pub(crate) frozen_base_overlays: Option<
+        Arc<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>>,
+    >,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
     pub pruning_limits: MvRefreshPruningLimits,
@@ -284,10 +290,27 @@ impl IcebergMvRefreshContext {
             connector_context: None,
             target_bindings,
             base_catalog_entries,
+            frozen_base_overlays: None,
             iceberg_catalog,
             affected_partitions,
             pruning_limits,
         })
+    }
+
+    pub(crate) fn set_frozen_base_overlays(
+        &mut self,
+        overlays: Arc<
+            Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+        >,
+    ) {
+        self.frozen_base_overlays = Some(overlays);
+    }
+
+    pub(crate) fn frozen_base_overlays(
+        &self,
+    ) -> Option<Arc<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>>>
+    {
+        self.frozen_base_overlays.clone()
     }
 
     pub(crate) fn affected_partitions_to_target_partition_filter(
@@ -640,7 +663,7 @@ fn target_contract_transform_text(
     }
 }
 
-fn collect_base_catalog_entries(
+pub(crate) fn collect_base_catalog_entries(
     iceberg_catalogs: &IcebergCatalogRegistry,
     base_refs: &[TableIdentity],
 ) -> Result<BTreeMap<String, IcebergCatalogEntry>, String> {
@@ -854,6 +877,7 @@ pub(crate) mod tests_support {
             connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
+            frozen_base_overlays: None,
             iceberg_catalog: fixture.iceberg_catalog.clone(),
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
@@ -883,6 +907,7 @@ pub(crate) mod tests_support {
             connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
+            frozen_base_overlays: None,
             iceberg_catalog,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "engine test context",
@@ -1022,6 +1047,7 @@ pub(crate) mod tests_support {
             connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
+            frozen_base_overlays: None,
             iceberg_catalog,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
@@ -1245,6 +1271,7 @@ pub(crate) mod tests_support {
                 connector_context: None,
                 target_bindings,
                 base_catalog_entries,
+                frozen_base_overlays: None,
                 iceberg_catalog,
                 affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                     "test context",
@@ -1675,6 +1702,7 @@ mod tests {
             connector_context: None,
             target_bindings,
             base_catalog_entries: BTreeMap::new(),
+            frozen_base_overlays: None,
             iceberg_catalog,
             affected_partitions: crate::mv::model::AffectedTargetPartitions::not_derived(
                 "test context",
