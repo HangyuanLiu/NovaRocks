@@ -28,9 +28,9 @@ use novarocks::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
 use novarocks::sql::common::change_stream::ChangeStreamBranchKind;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,
