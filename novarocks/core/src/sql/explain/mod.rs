@@ -252,32 +252,36 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
 
 fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
     match source {
-        ScanSource::IcebergDeltaTable {
-            from_snapshot_id,
-            to_snapshot_id,
-            ..
-        } => Some(format!(
-            "IcebergDeltaTable from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
-        )),
-        ScanSource::IcebergVersionTable { snapshot_id, .. } => {
-            Some(format!("IcebergVersionTable snapshot_id={snapshot_id}"))
-        }
-        ScanSource::MvTargetState(scan) => Some(format!(
-            "IcebergMvTargetState target={} keys=[{}] states=[{}] {}",
-            scan.fqn(),
-            scan.group_key_names.join(","),
-            scan.aggregate_state_names.join(","),
-            scan.constraint_summary()
-        )),
-        ScanSource::MvTargetLocator(scan) => Some(format!(
-            "IcebergMvTargetLocator target={} apply_key={}{}",
-            scan.fqn(),
-            scan.apply_key_column,
-            scan.branch_id_column
-                .as_deref()
-                .map(|column| format!(" branch_id={column}"))
-                .unwrap_or_default()
-        )),
+        ScanSource::Sql(source) => match &source.kind {
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+            } => Some(format!(
+                "IcebergDeltaTable from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}"
+            )),
+            crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => Some(format!(
+                "IcebergMvTargetState target={}.{}.{} keys=[{}] states=[{}] {}",
+                source.table.catalog,
+                source.table.namespace,
+                source.table.table,
+                facts.group_key_names.join(","),
+                facts.aggregate_state_names.join(","),
+                facts.constraint_summary()
+            )),
+            crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(format!(
+                "IcebergMvTargetLocator target={}.{}.{} apply_key={}{}",
+                source.table.catalog,
+                source.table.namespace,
+                source.table.table,
+                facts.apply_key_column,
+                facts
+                    .branch_id_column
+                    .as_deref()
+                    .map(|column| format!(" branch_id={column}"))
+                    .unwrap_or_default()
+            )),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -628,6 +632,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use arrow::datatypes::DataType;
 
@@ -635,10 +640,10 @@ mod tests {
         ExplainLevel, PlanNodeExplainStage, explain_plan, format_expr, format_project_item,
         format_shared_plan_node_header,
     };
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ApplyKind;
     use crate::sql::planner::logical::{LogicalApplyNode, LogicalPlanKind, LogicalPlanNode};
@@ -646,7 +651,9 @@ mod tests {
         PlanAssertOneRowNode, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
         PlanWindowNode, WindowExpr,
     };
-    use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
 
     fn empty_values_for_test() -> LogicalPlanNode {
@@ -685,23 +692,52 @@ mod tests {
             name: "t".to_string(),
             columns: vec![column_def("k", DataType::Int64, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         }
     }
 
-    fn iceberg_table_info() -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "orders".to_string(),
-            table_uuid: Some("uuid-orders".to_string()),
-            current_snapshot_id: Some(200),
-            schema_id: 1,
-            location: "file:///tmp/ice/db/orders".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn sql_delta_source(from_snapshot_id: i64, to_snapshot_id: i64) -> ScanSource {
+        let binding = SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+            NonZeroU32::new(1).expect("ordinal"),
+        );
+        ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+            },
+            SqlScanKind::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+            },
+        ))
+    }
+
+    fn sql_target_locator_source() -> ScanSource {
+        let binding = SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+            NonZeroU32::new(1).expect("ordinal"),
+        );
+        ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "pf_mv".to_string(),
+            },
+            SqlScanKind::MvTargetLocator {
+                facts: SqlMvTargetLocatorScan {
+                    target_table_uuid: "uuid-pf-mv".to_string(),
+                    target_snapshot_id: Some(99),
+                    apply_key_column: "__nova_base_row_id".to_string(),
+                    branch_id_column: Some("__branch_id".to_string()),
+                },
+            },
+        ))
     }
 
     fn scan_plan_with_source(table_name: &str, source: ScanSource) -> LogicalPlanNode {
@@ -748,14 +784,7 @@ mod tests {
 
     #[test]
     fn logical_explain_verbose_prints_refresh_scan_sources() {
-        let delta_plan = scan_plan_with_source(
-            "orders",
-            ScanSource::IcebergDeltaTable {
-                table: iceberg_table_info(),
-                from_snapshot_id: 101,
-                to_snapshot_id: 200,
-            },
-        );
+        let delta_plan = scan_plan_with_source("orders", sql_delta_source(101, 200));
 
         let delta_normal = explain_plan(&delta_plan, ExplainLevel::Normal).join("\n");
         assert!(!delta_normal.contains("source:"), "{delta_normal}");
@@ -766,18 +795,7 @@ mod tests {
             "{delta_verbose}"
         );
 
-        let locator_plan = scan_plan_with_source(
-            "pf_mv",
-            ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
-                catalog: "ice".to_string(),
-                database: "db".to_string(),
-                table: "pf_mv".to_string(),
-                target_table_uuid: "uuid-pf-mv".to_string(),
-                target_snapshot_id: Some(99),
-                apply_key_column: "__nova_base_row_id".to_string(),
-                branch_id_column: Some("__branch_id".to_string()),
-            }),
-        );
+        let locator_plan = scan_plan_with_source("pf_mv", sql_target_locator_source());
 
         let locator_normal = explain_plan(&locator_plan, ExplainLevel::Normal).join("\n");
         assert!(!locator_normal.contains("source:"), "{locator_normal}");

@@ -16,9 +16,6 @@
 // under the License.
 
 mod tests {
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::mv::analysis::refresh_property::derive_imv_refresh_contract;
     use crate::mv::analysis::{MvAnalysis, ResolvedTableRef};
     use crate::mv::refresh::apply_key::{ApplyKeyContract, ApplyKeyValueType, RewriteEvidence};
@@ -29,7 +26,9 @@ mod tests {
         ExprKind, LiteralValue, QueryBody, SortItem, SubqueryKind, TypedExpr,
     };
     use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::identifier::TableIdentity;
     use novarocks_catalog::schema::ColumnDef;
@@ -52,17 +51,38 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDataFiles {
-                    table: iceberg_table_info(database, table),
-                    files: Vec::new(),
-                    cloud_properties: Default::default(),
-                    binding: IcebergDataFileBinding::CurrentSnapshot,
-                },
+                source: test_scan_source(catalog.unwrap_or("default_catalog"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
+    }
+
+    fn test_scan_source(catalog: &str, database: &str, table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: database.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
+    }
+
+    fn test_connector_source(catalog: &str, database: &str, table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: database.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::ConnectorRead,
+        ))
     }
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
@@ -72,21 +92,6 @@ mod tests {
             nullable,
             write_default: None,
             logical_type: None,
-        }
-    }
-
-    fn iceberg_table_info(database: &str, table: &str) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: database.to_string(),
-            table: table.to_string(),
-            table_uuid: Some(format!("uuid-{table}")),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: format!("file:///tmp/{database}/{table}"),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
         }
     }
 
@@ -111,7 +116,11 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::ConnectorPinned,
+                source: test_connector_source(
+                    catalog.unwrap_or("default_catalog"),
+                    database,
+                    table,
+                ),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,

@@ -3416,7 +3416,9 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+            source: crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         }
     }
 

@@ -528,7 +528,7 @@ mod tests {
             sink: DataSink::ConnectorWrite(
                 crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
                     handle: None,
-                    input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    input: crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                     output_contract: None,
                 },
             ),

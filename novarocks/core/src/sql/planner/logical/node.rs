@@ -391,7 +391,9 @@ mod plan_tests {
             name: "mv_orders".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
         let node = LogicalPlanKind::Scan(PlanScanNode {
             database: "default".to_string(),

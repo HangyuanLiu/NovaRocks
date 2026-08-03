@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::DataType;
@@ -23,7 +23,6 @@ use arrow::datatypes::DataType;
 use super::super::boundary_schema::{BoundaryKind, BoundarySchemaColumn, project_boundary_reports};
 use super::*;
 use crate::connector::ConnectorRegistry;
-use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn, TypedExpr};
 use crate::sql::catalog::PlannerTableProvider;
@@ -178,12 +177,11 @@ fn iceberg_scan_plan_with_outputs(
             },
         ],
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: ScanSource::IcebergDataFiles {
-            table: iceberg_table_info(),
-            files: Vec::new(),
-            cloud_properties: BTreeMap::new(),
-            binding: IcebergDataFileBinding::CurrentSnapshot,
-        },
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ),
     };
     let scan = DistributedNode {
         node_id: 10,
@@ -322,19 +320,14 @@ fn finalized_router_plan() -> DistributedPlan {
     let mut branch =
         crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
     branch.output_partition_ordinals = vec![2];
-    branch.sink_spec.iceberg.serialized_metadata = Some(
-        crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-    );
     let dag =
         crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
             Some(0),
             None,
             vec![branch],
         );
-    crate::sql::planner::distributed::write::plan::finalize_iceberg_change_stream_test_plan(
-        dp, "test_db", dag,
-    )
-    .expect("plan change-stream write")
+    crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
+        .expect("plan change-stream write")
 }
 
 mod boundary;

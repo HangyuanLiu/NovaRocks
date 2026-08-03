@@ -1685,12 +1685,10 @@ fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) ->
             | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {}
             _ => return false,
         },
-        ScanSource::ConnectorPinned => return false,
-        ScanSource::IcebergDataFiles { .. } => {}
-        ScanSource::IcebergDeltaTable { .. }
-        | ScanSource::IcebergVersionTable { .. }
-        | ScanSource::MvTargetState { .. }
-        | ScanSource::MvTargetLocator { .. } => return false,
+        // Admission projects every executable scan into `SqlScanSource`
+        // before it can reach the compiler.  A legacy carrier here would
+        // mean a caller bypassed the query-local binding boundary.
+        _ => return false,
     }
     required_columns.iter().all(|required| {
         table
@@ -2619,7 +2617,9 @@ mod tests {
                         column_def("v", DataType::Int64, true),
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: Some("t".to_string()),
                 stats_ref: None,
@@ -2647,7 +2647,9 @@ mod tests {
                         column_def("v", DataType::Int64, true),
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: Some("base".to_string()),
                 stats_ref: None,
@@ -2933,7 +2935,9 @@ mod tests {
                 column_def("v", DataType::Int64, true),
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         }
     }
 

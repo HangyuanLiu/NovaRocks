@@ -131,10 +131,10 @@ pub(super) fn plan_iceberg_connector_read(
 /// splits.  Core keeps the logical `IcebergDeltaTable` identity for planning,
 /// but it does not retain a delta physical reader or a delete-side decoder.
 pub(super) fn plan_iceberg_delta_connector_read(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    exact_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+    exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    scan: &PlanScanNode,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    predicates: &[TypedExpr],
     execution: &ResolvedScanExecution,
     target_parallelism: std::num::NonZeroUsize,
     max_split_bytes: Option<std::num::NonZeroU64>,
@@ -142,33 +142,15 @@ pub(super) fn plan_iceberg_delta_connector_read(
     let ResolvedScanExecution::IcebergDelta(delta) = execution else {
         return Err("Iceberg delta connector planning requires IcebergDelta execution".to_string());
     };
-    let ScanSource::IcebergDeltaTable { table, .. } = &scan.table.source else {
-        return Err(
-            "Iceberg delta connector planning requires IcebergDeltaTable source".to_string(),
-        );
-    };
-    let planned = match exact_lease {
-        Some(lease) => {
-            crate::connector::iceberg::provider::plan_native_iceberg_delta_read_with_lease(
-                lease,
-                context,
-                table,
-                &delta.runtime_plan.change_files,
-                delta.runtime_plan.delete_side.as_ref(),
-                target_parallelism,
-                max_split_bytes,
-            )?
-        }
-        None => crate::connector::iceberg::provider::plan_native_iceberg_delta_read(
-            controls,
-            context,
-            table,
-            &delta.runtime_plan.change_files,
-            delta.runtime_plan.delete_side.as_ref(),
-            target_parallelism,
-            max_split_bytes,
-        )?,
-    };
+    let planned = crate::connector::iceberg::provider::plan_native_iceberg_delta_read_with_lease(
+        exact_lease,
+        context,
+        table,
+        &delta.runtime_plan.change_files,
+        delta.runtime_plan.delete_side.as_ref(),
+        target_parallelism,
+        max_split_bytes,
+    )?;
     Ok(PlannedConnectorRead {
         declaration: planned.declaration,
         scan: planned.scan,
@@ -176,7 +158,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         planning_metrics: planned.planning_metrics,
         static_predicates: Vec::new(),
         predicate_dispositions: Vec::new(),
-        residual_predicates: scan.predicates.clone(),
+        residual_predicates: predicates.to_vec(),
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
         read_session: None,

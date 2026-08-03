@@ -15,13 +15,17 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorWriteCohortId};
 use crate::connector::backend::ResolvedTable;
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::engine::query_planning::write_sink::{
+    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
+    sql_write_plan_input_for_admitted_target,
+};
 use crate::query_execution::distributed_rewrite::{
     ConnectorDistributedRewriteSession, FrozenRewriteReadResolver,
     frozen_rewrite_scan_physical_plan, plan_frozen_rewrite_connector_read,
 };
 use crate::query_execution::outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
 use crate::query_execution::request_context::QueryExecutionContext;
-use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
 use super::catalog::registry::load_table;
 /// Stage one sealed frozen cohort.  The caller is responsible for recording
@@ -48,18 +52,37 @@ pub(crate) fn stage_frozen_rewrite_cohort(
         context.clone(),
     )
     .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
+    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
+    let source_binding =
+        crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
+            table_bindings.as_ref(),
+            cohort.input_schema(),
+        )?;
     let resolver = FrozenRewriteReadResolver::new(read);
-    let physical_plan = frozen_rewrite_scan_physical_plan(cohort.input_schema());
+    let physical_plan = frozen_rewrite_scan_physical_plan(cohort.input_schema(), source_binding);
     let sink_spec = build_rewrite_sink_spec(state, session, cohort_id)?;
+    let target_binding = admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        &sink_spec,
+        session.lease().planning_lease(),
+    )?;
+    let sink = sql_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        None,
+    )?;
     let registration = session
         .execution_registration(cohort_id)
         .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
     crate::engine::execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         state,
         physical_plan,
-        sink_spec,
+        sink,
         Some(execution),
         context,
+        table_bindings.as_ref(),
         &resolver,
         registration,
     )

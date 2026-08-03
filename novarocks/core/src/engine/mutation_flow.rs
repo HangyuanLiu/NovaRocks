@@ -34,6 +34,7 @@ use crate::connector::iceberg::commit::{
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::StandaloneState;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
@@ -98,7 +99,7 @@ struct DmlChangeStreamWritePlan {
     producer: crate::sql::optimizer::OptimizedOperatorNode,
     dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
-    table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
 }
 
@@ -114,7 +115,7 @@ fn build_dml_change_stream_write_plan(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     producer: crate::sql::optimizer::OptimizedOperatorNode,
-    table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     branch_set: DmlChangeStreamBranchSet,
@@ -891,11 +892,14 @@ fn build_update_mor_change_stream_write_plan(
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
+    let table_bindings = analyzer_provider.query_table_bindings();
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        state,
         &query,
         &analyzer_provider,
         &target.namespace,
         None,
+        table_bindings,
         execution,
     )?;
     let producer = build_update_mor_change_event_expand_plan(
@@ -3730,11 +3734,14 @@ fn build_merge_mor_change_stream_write_plan(
         connector_context.clone(),
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
+    let table_bindings = analyzer_provider.query_table_bindings();
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
+        state,
         &query,
         &analyzer_provider,
         &target.namespace,
         None,
+        table_bindings,
         execution,
     )?;
     let producer = build_merge_mor_change_event_expand_plan(

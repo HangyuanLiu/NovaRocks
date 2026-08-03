@@ -88,23 +88,8 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     let DistributedNodeKind::Scan(scan) = &root.payload else {
         panic!("fixture root must be a scan");
     };
-    let ScanSource::IcebergDataFiles { table, .. } = &scan.table.source else {
-        panic!("fixture scan must use IcebergDataFiles");
-    };
-    let table = table.clone();
+    let table = iceberg_table();
     let source_table = scan.table.clone();
-    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
-        panic!("fixture root must be a scan");
-    };
-    let ScanSource::IcebergDataFiles {
-        files: stale_files, ..
-    } = &mut scan.table.source
-    else {
-        panic!("fixture scan must use IcebergDataFiles");
-    };
-    // The plan's legacy file carrier is deliberately stale.  Preparation must
-    // take the exact request-local materialization retained at admission.
-    stale_files.clear();
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry);
     let lease = controls
@@ -122,17 +107,34 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                 &table.table,
             ),
             |id| {
-                let mut binding = crate::engine::query_planning::bindings::QueryTableBinding {
+                let mut resolved = source_table.clone();
+                resolved.source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+                    id,
+                    crate::sql::planner::table::SqlTableIdentity {
+                        catalog: table.catalog.clone(),
+                        namespace: table.namespace.clone(),
+                        table: table.table.clone(),
+                    },
+                    crate::sql::planner::table::SqlScanKind::Data {
+                        version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                    },
+                ));
+                let binding = crate::engine::query_planning::bindings::QueryTableBinding {
                     resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&table.catalog),
                         "default",
-                        source_table.clone(),
+                        resolved,
                     ),
                     statistics_pin: None,
                     planning_lease: Some(lease.clone()),
-                    scan_materialization: None,
+                    scan_materialization: Some(
+                        crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
+                            table: table.clone(),
+                            files: vec![data_file("s3://bucket/stale-plan-carrier.parquet")],
+                            binding: IcebergDataFileBinding::CurrentSnapshot,
+                        },
+                    ),
                 };
-                binding.project_legacy_scan_for_sql(id)?;
                 Ok(binding)
             },
         )
@@ -265,23 +267,15 @@ fn duplicate_scan_node_defense_reports_exact_error() {
 
 #[test]
 fn refresh_only_sources_require_resolver_with_kind_and_node_id() {
-    for (source, expected_kind) in [
-        (
-            ScanSource::IcebergVersionTable {
-                table: iceberg_table(),
-                snapshot_id: 6,
-            },
-            "IcebergVersionTable",
-        ),
-        (
-            ScanSource::IcebergDeltaTable {
-                table: iceberg_table(),
+    for (source, expected_kind) in [(
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
                 from_snapshot_id: 6,
                 to_snapshot_id: 7,
             },
-            "IcebergDeltaTable",
         ),
-    ] {
+        "SqlDelta",
+    )] {
         let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
         replace_scan_source(&mut root, source);
 
@@ -301,10 +295,12 @@ fn resolver_error_reports_source_kind_node_id_and_cause() {
     let mut root = scan_node(47, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
-        ScanSource::IcebergVersionTable {
-            table: iceberg_table(),
-            snapshot_id: 6,
-        },
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+        ),
     );
 
     let err =
@@ -315,7 +311,7 @@ fn resolver_error_reports_source_kind_node_id_and_cause() {
 
     assert_eq!(
         err,
-        "scan binding resolver failed for required source IcebergVersionTable node_id=47: boom"
+        "scan binding resolver failed for required source SqlDelta from_snapshot_id=6 to_snapshot_id=7 node_id=47: boom"
     );
 }
 
@@ -324,10 +320,12 @@ fn resolver_ok_none_reports_exact_required_source_error() {
     let mut root = scan_node(48, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
-        ScanSource::IcebergVersionTable {
-            table: iceberg_table(),
-            snapshot_id: 6,
-        },
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+        ),
     );
 
     let err =
@@ -338,7 +336,7 @@ fn resolver_ok_none_reports_exact_required_source_error() {
 
     assert_eq!(
         err,
-        "scan binding resolver returned no binding for required source IcebergVersionTable node_id=48"
+        "scan binding resolver returned no binding for required source SqlDelta from_snapshot_id=6 to_snapshot_id=7 node_id=48"
     );
 }
 
@@ -349,10 +347,12 @@ fn resolver_failure_precedes_invalid_physical_projection() {
         panic!("test root must be a scan");
     };
     scan.columns[0].name = "missing".to_string();
-    scan.table.source = ScanSource::IcebergVersionTable {
-        table: iceberg_table(),
-        snapshot_id: 6,
-    };
+    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+        crate::sql::planner::table::SqlScanKind::Delta {
+            from_snapshot_id: 6,
+            to_snapshot_id: 7,
+        },
+    );
 
     let err =
         match prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), Some(&ErrorResolver)) {
@@ -362,7 +362,7 @@ fn resolver_failure_precedes_invalid_physical_projection() {
 
     assert_eq!(
         err,
-        "scan binding resolver failed for required source IcebergVersionTable node_id=49: boom"
+        "scan binding resolver failed for required source SqlDelta from_snapshot_id=6 to_snapshot_id=7 node_id=49: boom"
     );
 }
 
@@ -375,22 +375,16 @@ fn target_state_and_locator_reject_equality_deletes() {
 
     let sources = [
         (
-            ScanSource::MvTargetLocator(crate::sql::planner::table::SqlMvTargetLocatorScan {
-                catalog: "test_catalog".to_string(),
-                database: "test_db".to_string(),
-                table: "test_table".to_string(),
+            crate::sql::planner::table::test_sql_scan_source(crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts: crate::sql::planner::table::SqlMvTargetLocatorScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 apply_key_column: "id".to_string(),
                 branch_id_column: None,
-            }),
+            }}),
             "target-locator",
         ),
         (
-            ScanSource::MvTargetState(crate::sql::planner::table::SqlMvTargetStateScan {
-                catalog: "test_catalog".to_string(),
-                database: "test_db".to_string(),
-                table: "test_table".to_string(),
+            crate::sql::planner::table::test_sql_scan_source(crate::sql::planner::table::SqlScanKind::MvTargetState { facts: crate::sql::planner::table::SqlMvTargetStateScan {
                 target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
                 target_snapshot_id: Some(6),
                 aggregate_state_layout_version: 1,
@@ -406,7 +400,7 @@ fn target_state_and_locator_reject_equality_deletes() {
                     },
                 partition_constraint:
                     crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
-            }),
+            }}),
             "target-state",
         ),
     ];
@@ -453,10 +447,12 @@ fn resolver_execution_kind_must_match_semantic_source() {
     let mut version = scan_node(41, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut version,
-        ScanSource::IcebergVersionTable {
-            table: iceberg_table(),
-            snapshot_id: 6,
-        },
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+        ),
     );
     let resolver = StaticResolver {
         execution: resolved_delta(),
@@ -468,7 +464,7 @@ fn resolver_execution_kind_must_match_semantic_source() {
             Err(err) => err,
         };
 
-    assert!(err.contains("IcebergVersionTable"), "{err}");
+    assert!(err.contains("SqlDelta"), "{err}");
     assert!(err.contains("requires IcebergFiles execution"), "{err}");
     assert!(err.contains("node_id=41"), "{err}");
 }

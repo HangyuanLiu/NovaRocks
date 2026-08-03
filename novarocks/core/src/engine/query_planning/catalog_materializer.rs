@@ -22,6 +22,7 @@
 //! preparation.  SQL sees the resulting neutral table facts solely through
 //! `PlannerTableProvider`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use novarocks_catalog::partition::LegacyRangePartition;
@@ -29,13 +30,73 @@ use novarocks_catalog::provider::CatalogProvider;
 use novarocks_catalog::table::CatalogTable;
 
 use crate::engine::query_planning::bindings::{
-    QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
 };
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable,
 };
 use crate::sql::planner::table::TableDef;
+
+/// Convert an admitted Iceberg provider envelope into the one SQL-facing
+/// table shape.  The caller supplies the token allocated by
+/// `QueryTableBindingStore`; every concrete descriptor remains paired with
+/// that token in `QueryScanMaterialization`.
+pub(crate) fn iceberg_query_binding_from_materialization(
+    materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    sql_table_name: &str,
+    binding: SqlTableBindingId,
+) -> Result<QueryTableBinding, String> {
+    use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    };
+
+    let version = match materialization.binding {
+        IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
+        IcebergDataFileBinding::ExplicitFiles => SqlTableVersionSelector::Snapshot(
+            materialization.table.current_snapshot_id.ok_or_else(|| {
+                format!(
+                    "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
+                    materialization.table.catalog,
+                    materialization.table.namespace,
+                    materialization.table.table
+                )
+            })?,
+        ),
+    };
+    let kind = match materialization.binding {
+        IcebergDataFileBinding::CurrentSnapshot => SqlScanKind::Data { version },
+        IcebergDataFileBinding::ExplicitFiles => SqlScanKind::FrozenInputSet { version },
+    };
+    let table_identity = SqlTableIdentity {
+        catalog: materialization.table.catalog.clone(),
+        namespace: materialization.table.namespace.clone(),
+        table: materialization.table.table.clone(),
+    };
+    let planner = TableDef {
+        name: sql_table_name.to_string(),
+        columns: materialization.columns,
+        iceberg_row_lineage_metadata_columns: materialization.iceberg_row_lineage_metadata_columns,
+        source: ScanSource::Sql(
+            SqlScanSource::new(binding, table_identity, kind).with_ukfk_facts(
+                super::bindings::sql_ukfk_facts_from_admitted_table(&materialization.table),
+            ),
+        ),
+    };
+    Ok(QueryTableBinding {
+        resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+        statistics_pin: materialization.statistics_pin,
+        planning_lease: Some(materialization.planning_lease),
+        scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
+            table: materialization.table,
+            files: materialization.files,
+            binding: materialization.binding,
+        }),
+    })
+}
 
 /// Application materializer for connector-controlled table metadata.  The
 /// interface is intentionally application-owned because it returns an exact
@@ -67,6 +128,53 @@ pub(crate) struct CatalogServiceMaterializer<'a> {
     service: &'a crate::engine::query_planning::catalog_runtime::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
+    /// Request-scoped synthetic relations used by application rewrite flows.
+    /// They are intentionally kept next to the binding store instead of the
+    /// shared memory catalog: SQL can only observe their projected tokenized
+    /// scan after this materializer has admitted the exact connector lease.
+    query_local_overlays: HashMap<(String, String), QueryLocalTableOverlay>,
+}
+
+/// One application-owned relation overlay for a generated query.
+///
+/// The overlay is a binding factory, not a `TableDef`: generated COW and MV
+/// reads must supply their frozen provider facts to the request-local store
+/// before SQL sees the resulting tokenized table.  Keeping the factory here
+/// prevents a synthetic relation from leaking into the shared catalog.
+#[derive(Clone)]
+pub(crate) struct QueryLocalTableOverlay {
+    namespace: String,
+    table: String,
+    key: QueryTableBindingKey,
+    materialize:
+        Arc<dyn Fn(SqlTableBindingId) -> Result<QueryTableBinding, String> + Send + Sync + 'static>,
+}
+
+impl QueryLocalTableOverlay {
+    pub(crate) fn new(
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+        key: QueryTableBindingKey,
+        materialize: impl Fn(SqlTableBindingId) -> Result<QueryTableBinding, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        let namespace = namespace.into();
+        Self {
+            table: table.into(),
+            namespace,
+            key,
+            materialize: Arc::new(materialize),
+        }
+    }
+
+    fn key(&self) -> (String, String) {
+        (
+            self.namespace.to_ascii_lowercase(),
+            self.table.to_ascii_lowercase(),
+        )
+    }
 }
 
 impl<'a> CatalogServiceMaterializer<'a> {
@@ -76,16 +184,45 @@ impl<'a> CatalogServiceMaterializer<'a> {
         bindings: Arc<QueryTableBindingStore>,
         loader: Box<dyn QueryTableBindingLoader + 'a>,
     ) -> Self {
+        Self::new_with_query_local_overlays(current_catalog, service, bindings, loader, Vec::new())
+    }
+
+    pub(crate) fn new_with_query_local_overlays(
+        current_catalog: Option<&'a str>,
+        service: &'a crate::engine::query_planning::catalog_runtime::QueryCatalogService,
+        bindings: Arc<QueryTableBindingStore>,
+        loader: Box<dyn QueryTableBindingLoader + 'a>,
+        overlays: Vec<QueryLocalTableOverlay>,
+    ) -> Self {
         Self {
             current_catalog,
             service,
             bindings,
             loader,
+            query_local_overlays: overlays
+                .into_iter()
+                .map(|overlay| (overlay.key(), overlay))
+                .collect(),
         }
     }
 
     pub(crate) fn query_table_bindings(&self) -> Arc<QueryTableBindingStore> {
         Arc::clone(&self.bindings)
+    }
+
+    /// Publish one application-resolved table only after its scan has been
+    /// projected into the SQL vocabulary with the token allocated for this
+    /// request.  Provider loaders may temporarily use a legacy carrier while
+    /// decoding connector metadata, but that carrier must not escape this
+    /// method into analysis or the compiler.
+    fn bind_for_sql(
+        &self,
+        key: QueryTableBindingKey,
+        load: impl FnOnce(SqlTableBindingId) -> Result<QueryTableBinding, String>,
+    ) -> Result<SqlTableBindingId, String> {
+        self.bindings.resolve_or_insert_with_id(key, |binding_id| {
+            project_binding_for_sql(binding_id, load(binding_id)?)
+        })
     }
 
     fn effective_catalog<'b>(&'b self, override_catalog: Option<&'b str>) -> Option<&'b str> {
@@ -100,84 +237,54 @@ impl<'a> CatalogServiceMaterializer<'a> {
     ) -> Result<ResolvedAnalyzerTable, String> {
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
+                if let Some(overlay) = self
+                    .query_local_overlays
+                    .get(&(database.to_ascii_lowercase(), table.to_ascii_lowercase()))
+                    .cloned()
+                {
+                    return self.resolve_query_local_overlay(overlay);
+                }
                 let planner = self
                     .service
                     .local()
                     .read()
                     .expect("catalog service local read lock")
                     .get(database, table)?;
-                // COW writes register a query-local synthetic table in the
-                // local catalog. Preserve that planner shape but materialize
-                // exactly one physical connector lease under its real table
-                // identity for later statistics and preparation.
-                if let crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                    table: iceberg,
-                    binding,
-                    ..
-                } = &planner.source
-                {
-                    let catalog = iceberg.catalog.clone();
-                    let namespace = iceberg.namespace.clone();
-                    let table_name = iceberg.table.clone();
-                    if catalog != "default_catalog" {
-                        let key = match binding {
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
-                                QueryTableBindingKey::strict_base(&catalog, &namespace, &table_name)
-                            }
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
-                                let snapshot_id = iceberg.current_snapshot_id.ok_or_else(|| {
-                                    format!(
-                                        "explicit Iceberg input '{}.{}.{}' has no frozen snapshot identity",
-                                        catalog, namespace, table_name
-                                    )
-                                })?;
-                                QueryTableBindingKey::snapshot(
-                                    &catalog,
-                                    &namespace,
-                                    &table_name,
-                                    snapshot_id,
-                                )
-                            }
-                        };
-                        let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
-                            let mut binding = self.loader.load_strict_base_table(
-                                &catalog,
-                                &namespace,
-                                &table_name,
-                                binding_id,
-                            )?;
-                            binding.resolved = ResolvedAnalyzerTable::from_planner(
-                                Some("default_catalog"),
-                                database,
-                                planner,
-                            );
-                            binding.project_legacy_scan_for_sql(binding_id)?;
-                            Ok(binding)
-                        })?;
-                        return Ok(self.bindings.binding(token)?.resolved.clone());
-                    }
-                }
                 let key = QueryTableBindingKey::analysis_lookup("default_catalog", database, table);
-                let token = self.bindings.resolve_or_insert_with_id(key, |_| {
+                let token = self.bind_for_sql(key, |binding| {
                     Ok(QueryTableBinding::local(
                         ResolvedAnalyzerTable::from_planner(
                             Some("default_catalog"),
                             database,
                             planner,
                         ),
+                        binding,
                     ))
                 })?;
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
             Some(catalog) => {
                 let key = QueryTableBindingKey::analysis_lookup(catalog, database, table);
-                let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
+                let token = self.bind_for_sql(key, |binding_id| {
                     self.loader
                         .load_strict_base_table(catalog, database, table, binding_id)
                 })?;
                 Ok(self.bindings.binding(token)?.resolved.clone())
             }
         }
+    }
+
+    /// Materialize a generated local relation through the same request store
+    /// as ordinary external tables.  The factory receives the exact token it
+    /// must attach to the SQL table, while frozen provider facts remain paired
+    /// with that token in the returned application binding.
+    fn resolve_query_local_overlay(
+        &self,
+        overlay: QueryLocalTableOverlay,
+    ) -> Result<ResolvedAnalyzerTable, String> {
+        let token =
+            self.bind_for_sql(overlay.key, |binding_id| (overlay.materialize)(binding_id))?;
+        Ok(self.bindings.binding(token)?.resolved.clone())
     }
 
     fn metadata_table_def(
@@ -197,7 +304,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
             Some(catalog) => {
                 let key =
                     QueryTableBindingKey::metadata(catalog, database, table, metadata_table_type);
-                let token = self.bindings.resolve_or_insert_with_id(key, |binding_id| {
+                let token = self.bind_for_sql(key, |binding_id| {
                     self.loader.load_metadata_table(
                         catalog,
                         database,
@@ -210,6 +317,14 @@ impl<'a> CatalogServiceMaterializer<'a> {
             }
         }
     }
+}
+
+fn project_binding_for_sql(
+    binding_id: SqlTableBindingId,
+    mut binding: QueryTableBinding,
+) -> Result<QueryTableBinding, String> {
+    binding.validate_sql_scan_binding(binding_id)?;
+    Ok(binding)
 }
 
 impl CatalogProvider for CatalogServiceMaterializer<'_> {
@@ -271,9 +386,132 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::connector::iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
+    use crate::sql::catalog::PlannerTableProvider;
+    use crate::sql::planner::table::ScanSource;
+
+    fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(
+                NonZeroU64::new(scope).expect("non-zero scope"),
+            ),
+            NonZeroU32::new(ordinal).expect("non-zero ordinal"),
+        )
+    }
+
+    fn local_binding(binding: SqlTableBindingId) -> QueryTableBinding {
+        QueryTableBinding::local(
+            ResolvedAnalyzerTable::from_planner(
+                Some("default_catalog"),
+                "db",
+                TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::planner::table::test_sql_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
+                },
+            ),
+            binding,
+        )
+    }
+
+    fn frozen_overlay_binding(binding: SqlTableBindingId) -> QueryTableBinding {
+        let table = IcebergTableInfo {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///tmp/orders".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        let planner = TableDef {
+            name: "__nr_cow_orders".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+                binding,
+                crate::sql::planner::table::SqlTableIdentity {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: "orders".to_string(),
+                },
+                crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(7),
+                },
+            )),
+        };
+        QueryTableBinding {
+            resolved: ResolvedAnalyzerTable::from_planner(Some("ice"), "db", planner),
+            statistics_pin: None,
+            planning_lease: None,
+            scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
+                table,
+                files: vec![],
+                binding: IcebergDataFileBinding::ExplicitFiles,
+            }),
+        }
+    }
+
+    struct OverlayLoader;
+
+    impl QueryTableBindingLoader for OverlayLoader {
+        fn load_strict_base_table(
+            &self,
+            _catalog: &str,
+            _namespace: &str,
+            _table: &str,
+            _binding: SqlTableBindingId,
+        ) -> Result<QueryTableBinding, String> {
+            Ok(local_binding(_binding))
+        }
+
+        fn load_metadata_table(
+            &self,
+            _catalog: &str,
+            _namespace: &str,
+            _table: &str,
+            _metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+            _binding: SqlTableBindingId,
+        ) -> Result<QueryTableBinding, String> {
+            Err("metadata is not part of this overlay fixture".to_string())
+        }
+    }
+
+    #[test]
+    fn sqlx2_application_materializer_projects_local_scan_before_publication() {
+        let binding =
+            project_binding_for_sql(binding_id(101, 1), local_binding(binding_id(101, 1)))
+                .expect("local scan must be tokenized before SQL receives it");
+
+        assert!(matches!(
+            binding.resolved.planner.source,
+            crate::sql::planner::table::ScanSource::Sql(ref source)
+                if source.binding == binding_id(101, 1)
+        ));
+    }
+
+    #[test]
+    fn sqlx2_application_materializer_rejects_foreign_scan_token() {
+        let binding = local_binding(binding_id(102, 2));
+
+        let error = match project_binding_for_sql(binding_id(102, 1), binding) {
+            Ok(_) => panic!("foreign token must not enter this request"),
+            Err(error) => error,
+        };
+        assert!(error.contains("different request binding"));
+    }
 
     #[test]
     fn sqlx2_application_materializer_error_memoizes_by_canonical_identity() {
@@ -300,5 +538,49 @@ mod tests {
         let overlay = QueryTableBindingKey::analysis_lookup("ice", "db", "__sqlx1_tt_orders_42");
         let physical = QueryTableBindingKey::snapshot("ICE", "DB", "orders", 42);
         assert_eq!(overlay, physical);
+    }
+
+    #[test]
+    fn sqlx2_application_cow_overlay_is_tokenized_without_local_catalog_registration() {
+        let service = crate::engine::query_planning::catalog_runtime::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
+        let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
+            Some("default_catalog"),
+            &service,
+            Arc::clone(&bindings),
+            Box::new(OverlayLoader),
+            vec![QueryLocalTableOverlay::new(
+                "db",
+                "__nr_cow_orders",
+                QueryTableBindingKey::snapshot("ice", "db", "orders", 7),
+                |binding| Ok(frozen_overlay_binding(binding)),
+            )],
+        );
+
+        let resolved = materializer
+            .resolve_table_for_analysis(None, "db", "__nr_cow_orders")
+            .expect("query-local overlay resolves");
+        let ScanSource::Sql(source) = resolved.planner.source else {
+            panic!("SQL must not receive the overlay's legacy scan source");
+        };
+        assert!(source.binding.belongs_to(bindings.scope()));
+        assert!(matches!(
+            source.kind,
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+        ));
+        assert!(matches!(
+            bindings
+                .scan_materialization(source.binding)
+                .expect("binding materialization"),
+            Some(QueryScanMaterialization::IcebergDataFiles { .. })
+        ));
+        assert!(
+            service
+                .local()
+                .read()
+                .expect("catalog read")
+                .get("db", "__nr_cow_orders")
+                .is_err()
+        );
     }
 }

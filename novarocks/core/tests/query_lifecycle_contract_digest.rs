@@ -19,7 +19,6 @@
 
 use std::time::Duration;
 
-use novarocks::query_execution::contract::QueryId;
 use novarocks::query_execution::lifecycle::contract::{
     QueryInitRequest, decode_query_init_request, encode_query_init_request,
 };
@@ -29,6 +28,7 @@ use novarocks::query_execution::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks::runtime::query_options::QueryOptions;
+use novarocks_types::QueryId;
 
 fn request_with_runtime_filter() -> QueryInitRequest {
     let execution_id = QueryExecutionId::new(

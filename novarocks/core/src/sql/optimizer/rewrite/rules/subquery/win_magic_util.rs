@@ -26,7 +26,7 @@ use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{Operator, ScanOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{ScanSource, SqlScanKind};
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -50,40 +50,33 @@ impl TableIdentity {
     #[allow(dead_code)]
     pub(super) fn from_scan(scan: &ScanOp) -> Self {
         match &scan.table.source {
-            ScanSource::Sql(source) => TableIdentity::Iceberg {
-                catalog: source.table.catalog.clone(),
-                namespace: source.table.namespace.clone(),
-                table: source.table.table.clone(),
-                table_uuid: None,
+            ScanSource::Sql(source) => match &source.kind {
+                SqlScanKind::MvTargetState { .. } => TableIdentity::Iceberg {
+                    catalog: format!("__mv__{}", source.table.catalog),
+                    namespace: source.table.namespace.clone(),
+                    table: source.table.table.clone(),
+                    table_uuid: None,
+                },
+                SqlScanKind::MvTargetLocator { facts } => TableIdentity::Iceberg {
+                    catalog: format!("__mv_locator__{}", source.table.catalog),
+                    namespace: source.table.namespace.clone(),
+                    table: source.table.table.clone(),
+                    table_uuid: Some(facts.target_table_uuid.clone()),
+                },
+                _ => TableIdentity::Iceberg {
+                    catalog: source.table.catalog.clone(),
+                    namespace: source.table.namespace.clone(),
+                    table: source.table.table.clone(),
+                    table_uuid: None,
+                },
             },
-            ScanSource::ConnectorPinned => TableIdentity::Connector {
+            // Compiler callers must not retain a provider carrier after
+            // application admission.  This fallback preserves the previous
+            // conservative identity behavior without reconstructing any
+            // connector facts from a legacy scan variant.
+            _ => TableIdentity::Connector {
                 database: scan.database.clone(),
                 table: scan.table.name.clone(),
-            },
-            ScanSource::IcebergDataFiles { table, .. }
-            | ScanSource::IcebergDeltaTable { table, .. }
-            | ScanSource::IcebergVersionTable { table, .. } => TableIdentity::Iceberg {
-                catalog: table.catalog.clone(),
-                namespace: table.namespace.clone(),
-                table: table.table.clone(),
-                table_uuid: table.table_uuid.clone(),
-            },
-            // MV-target-state scans never reach this in practice: ApplyToWindow's
-            // operator whitelist (a later task) rejects any plan containing an
-            // IcebergMvTargetState node before identity comparison runs. The __mv__
-            // prefix is a belt-and-suspenders signal, not the sole guard — a same-named
-            // user catalog colliding here is harmless because the whitelist fires first.
-            ScanSource::MvTargetState(mv) => TableIdentity::Iceberg {
-                catalog: format!("__mv__{}", mv.catalog),
-                namespace: mv.database.clone(),
-                table: mv.table.clone(),
-                table_uuid: None,
-            },
-            ScanSource::MvTargetLocator(mv) => TableIdentity::Iceberg {
-                catalog: format!("__mv_locator__{}", mv.catalog),
-                namespace: mv.database.clone(),
-                table: mv.table.clone(),
-                table_uuid: Some(mv.target_table_uuid.clone()),
             },
         }
     }
@@ -272,7 +265,9 @@ mod tests {
                     name: format!("t{table_id}"),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 columns: cols
@@ -363,7 +358,9 @@ mod tests {
                 name: "t".to_string(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             columns: vec![],

@@ -16,20 +16,162 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
+use bytes::Bytes;
+use novarocks_spi::connector::{
+    ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorScan,
+    ConnectorScanHandle,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::scan::encode_column_def;
 use super::super::write::encode_change_stream_router_sink;
 use super::*;
-use crate::protocol::native::encode::plan;
+use crate::query_execution::preparation::scan::{
+    ResolvedIcebergFileScan, ResolvedReadColumn, ResolvedReadReason, ResolvedScanBinding,
+    ResolvedScanColumn, ResolvedScanColumnKind, ResolvedScanExecution, ScanExecutionBindings,
+};
+use crate::sql::analysis::OutputColumn;
+use crate::sql::column_id::ColumnId;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::write::change_stream::{
     ChangeStreamBranchRoute, ChangeStreamRouterSink,
 };
 use novarocks_catalog::schema::{ColumnDef, ColumnDefault};
+
+fn planned_connector_read_for_test(
+    column_name: &str,
+    data_type: DataType,
+    nullable: bool,
+) -> crate::query_execution::preparation::scan::PlannedConnectorRead {
+    let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+    let declaration = ConnectorExecutionDeclaration::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: instance_id.clone(),
+        },
+        ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        Bytes::from_static(b"binding"),
+    )
+    .expect("declaration");
+    crate::query_execution::preparation::scan::PlannedConnectorRead {
+        declaration,
+        scan: ConnectorScan {
+            handle: ConnectorScanHandle::try_new(instance_id, Bytes::from_static(b"scan"))
+                .expect("scan handle"),
+            output_schema: Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                column_name,
+                data_type.clone(),
+                nullable,
+            )])),
+            predicate_dispositions: Vec::new(),
+        },
+        splits: Vec::new(),
+        planning_metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics::default(),
+        static_predicates: Vec::new(),
+        predicate_dispositions: Vec::new(),
+        residual_predicates: Vec::new(),
+        batch: ConnectorBatchBudget {
+            max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
+            max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
+        },
+        planning_lease: None,
+        read_session: None,
+    }
+}
+
+fn encode_scan_node_with_file_binding(
+    scan: &DistributedNode,
+    table: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    column_name: &str,
+    data_type: DataType,
+    nullable: bool,
+) -> Result<novarocks_protocol::plan::DistributedNode, String> {
+    let crate::sql::planner::distributed::DistributedNodeKind::Scan(plan_scan) = &scan.payload
+    else {
+        return Err("write-default fixture requires a scan node".to_string());
+    };
+    let column = plan_scan
+        .table
+        .columns
+        .iter()
+        .find(|column| column.name == column_name)
+        .cloned()
+        .ok_or_else(|| format!("write-default fixture missing column {column_name}"))?;
+    let mut bindings = ScanExecutionBindings::default();
+    bindings.insert_binding(ResolvedScanBinding {
+        node_id: scan.node_id,
+        execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+            table,
+            files: Vec::new(),
+            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+        }),
+        physical_columns: vec![ResolvedScanColumn {
+            planner: OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: column_name.to_string(),
+                data_type,
+                nullable,
+                is_internal: false,
+            },
+            source: column.clone(),
+            kind: ResolvedScanColumnKind::PhysicalTableColumn,
+        }],
+        required_reads: vec![ResolvedReadColumn {
+            planner_column_id: Some(ColumnId::new_for_test(10)),
+            source: column,
+            reason: ResolvedReadReason::PlannerRequiredOrOutput,
+        }],
+    })?;
+    bindings.insert_connector_read(
+        scan.fragment_id,
+        scan.node_id,
+        planned_connector_read_for_test(column_name, data_type.clone(), nullable),
+    )?;
+    encode_node_with_context(
+        scan,
+        &NativePlanEncodeContext {
+            scan_bindings: Some(&bindings),
+            node_outputs: None,
+            fragment_edge_outputs: None,
+            write_contracts: None,
+            runtime_filter_bindings: None,
+        },
+    )
+}
+
+fn iceberg_table_for_write_default_test(
+    column_name: &str,
+) -> crate::connector::iceberg::scan_model::IcebergTableInfo {
+    crate::connector::iceberg::scan_model::IcebergTableInfo {
+        catalog: "ice".to_string(),
+        namespace: "db".to_string(),
+        table: "orders".to_string(),
+        table_uuid: Some("uuid-orders".to_string()),
+        current_snapshot_id: Some(10),
+        schema_id: 1,
+        location: "s3://warehouse/db/orders".to_string(),
+        schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+            fields: vec![
+                crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                    field_id: 1,
+                    name: column_name.to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    write_default_json: None,
+                    children: Vec::new(),
+                },
+            ],
+        },
+        serialized_metadata: None,
+        serialized_metadata_rows: None,
+    }
+}
 
 fn encode_write_default_json_for_test(
     data_type: DataType,
@@ -454,12 +596,11 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
             logical_type: None,
         }],
         iceberg_row_lineage_metadata_columns: vec![],
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: iceberg_table,
-            files: vec![],
-            cloud_properties: std::collections::BTreeMap::new(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        },
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ),
     };
     let scan = crate::sql::planner::distributed::DistributedNode {
         node_id: 7,
@@ -484,7 +625,14 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
         ),
     };
 
-    let encoded = plan::encode_node(&scan).expect("encode scan node");
+    let encoded = encode_scan_node_with_file_binding(
+        &scan,
+        iceberg_table,
+        "amount",
+        DataType::Decimal128(10, 2),
+        true,
+    )
+    .expect("encode scan node");
     let Some(novarocks_protocol::plan::distributed_node::Payload::Physical(physical)) =
         encoded.payload.as_ref()
     else {
@@ -535,23 +683,11 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
             logical_type: None,
         }],
         iceberg_row_lineage_metadata_columns: vec![],
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: crate::connector::iceberg::scan_model::IcebergTableInfo {
-                catalog: "ice".to_string(),
-                namespace: "db".to_string(),
-                table: "orders".to_string(),
-                table_uuid: Some("uuid-orders".to_string()),
-                current_snapshot_id: Some(10),
-                schema_id: 1,
-                location: "s3://warehouse/db/orders".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef { fields: vec![] },
-                serialized_metadata: None,
-                serialized_metadata_rows: None,
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
             },
-            files: vec![],
-            cloud_properties: std::collections::BTreeMap::new(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        },
+        ),
     };
     let scan = crate::sql::planner::distributed::DistributedNode {
         node_id: 7,
@@ -567,7 +703,7 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
                 database: "db".to_string(),
                 table,
                 alias: None,
-                columns: vec![output_column(10, "tags", list_type)],
+                columns: vec![output_column(10, "tags", list_type.clone())],
                 predicates: Vec::new(),
                 required_columns: None,
                 variant_columns: Vec::new(),
@@ -576,7 +712,14 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
         ),
     };
 
-    let encoded = plan::encode_node(&scan).expect("encode scan node");
+    let encoded = encode_scan_node_with_file_binding(
+        &scan,
+        iceberg_table_for_write_default_test("tags"),
+        "tags",
+        list_type,
+        true,
+    )
+    .expect("encode scan node");
     let Some(novarocks_protocol::plan::distributed_node::Payload::Physical(physical)) =
         encoded.payload.as_ref()
     else {

@@ -49,14 +49,6 @@ impl PlannerTableProvider for PlannerMemoryCatalog {
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String> {
         let planner = self.get(database, table)?;
-        if matches!(
-            planner.source,
-            crate::sql::planner::table::ScanSource::ConnectorPinned
-        ) {
-            return Err(format!(
-                "connector-pinned scan source {DEFAULT_CATALOG}.{database}.{table} requires an external connector binding; native planner catalogs cannot register synthetic connector tables"
-            ));
-        }
         Ok(ResolvedAnalyzerTable::from_planner(
             Some(DEFAULT_CATALOG),
             database,
@@ -86,12 +78,16 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::PlannerMemoryCatalog;
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::identifier::TableIdentity;
     use novarocks_catalog::memory::DEFAULT_DATABASE;
     use novarocks_catalog::provider::CatalogProvider;
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
         ColumnDef {
@@ -103,12 +99,39 @@ mod tests {
         }
     }
 
+    fn test_scan_source(name: &str, kind: SqlScanKind) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(47).expect("non-zero scope")),
+                NonZeroU32::new(
+                    name.bytes()
+                        .fold(0u32, |ordinal, byte| {
+                            ordinal.wrapping_mul(31) + u32::from(byte)
+                        })
+                        .max(1),
+                )
+                .expect("non-zero binding ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "default_catalog".to_string(),
+                namespace: DEFAULT_DATABASE.to_string(),
+                table: name.to_string(),
+            },
+            kind,
+        ))
+    }
+
     fn test_table(name: &str) -> TableDef {
         TableDef {
             name: name.to_string(),
             columns: vec![column("id", DataType::Int32, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: test_scan_source(
+                name,
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            ),
         }
     }
 
@@ -117,7 +140,12 @@ mod tests {
             name: name.to_string(),
             columns: vec![column("id", DataType::Int64, false)],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: test_scan_source(
+                name,
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            ),
         }
     }
 
@@ -144,19 +172,16 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_lookup_rejects_internal_connector_pinned_table() {
+    fn sqlx2_local_catalog_accepts_sql_owned_test_binding() {
         let mut catalog = PlannerMemoryCatalog::default();
         catalog
             .register(DEFAULT_DATABASE, test_table("connector_tbl"))
             .expect("register table");
 
-        let error = catalog
+        let table = catalog
             .resolve_table_for_analysis(None, DEFAULT_DATABASE, "connector_tbl")
-            .expect_err("native planner catalog must reject synthetic connector-pinned tables");
-        assert_eq!(
-            error,
-            "connector-pinned scan source default_catalog.default.connector_tbl requires an external connector binding; native planner catalogs cannot register synthetic connector tables"
-        );
+            .expect("SQL-owned test binding should remain analyzable");
+        assert_eq!(table.planner.name, "connector_tbl");
     }
 
     #[test]

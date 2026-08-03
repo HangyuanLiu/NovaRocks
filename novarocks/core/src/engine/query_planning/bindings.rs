@@ -36,7 +36,7 @@ use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::planner::table::{
     ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
-    SqlTableVersionSelector,
+    SqlUkFkTableFacts,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -51,12 +51,19 @@ pub(crate) struct QueryTableBindingKey {
     selector: QueryTableBindingSelector,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum QueryTableBindingSelector {
     StrictBaseTable,
     Snapshot(i64),
     TimestampMillis(i64),
     Metadata(SqlMetadataTableKind),
+    /// One frozen materialized-view target.  The target UUID distinguishes a
+    /// recreated table at the same name, while the snapshot keeps target-state
+    /// and target-locator scans on the exact refresh baseline.
+    MvTarget {
+        target_table_uuid: String,
+        frozen_snapshot_id: Option<i64>,
+    },
 }
 
 impl QueryTableBindingKey {
@@ -113,6 +120,28 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::Metadata(kind),
+        )
+    }
+
+    /// Identity for a materialized-view refresh target captured during
+    /// admission.  This is deliberately distinct from a normal base-table or
+    /// time-travel key: both target-state and target-locator scans must reuse
+    /// this same frozen materialization, never a later target generation.
+    pub(crate) fn mv_target(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        target_table_uuid: &str,
+        frozen_snapshot_id: Option<i64>,
+    ) -> Self {
+        Self::new(
+            catalog,
+            namespace,
+            table,
+            QueryTableBindingSelector::MvTarget {
+                target_table_uuid: target_table_uuid.to_ascii_lowercase(),
+                frozen_snapshot_id,
+            },
         )
     }
 
@@ -175,10 +204,40 @@ pub(crate) enum QueryScanMaterialization {
         serialized_table: String,
         metadata_payload: Option<String>,
     },
+    /// Exact target facts retained for one MV refresh.  SQL sees the binding
+    /// token and target-state/locator facts only; the provider table, frozen
+    /// files, and admission lease remain application-owned in this store.
+    ///
+    /// `frozen_snapshot_id` is separate from `table.current_snapshot_id`: the
+    /// latter is provider metadata and may be absent for the empty-target
+    /// bootstrap case, whereas the former is the refresh contract identity.
+    IcebergMvTarget {
+        table: IcebergTableInfo,
+        files: Vec<IcebergDataFileInfo>,
+        binding: IcebergDataFileBinding,
+        target_table_uuid: String,
+        frozen_snapshot_id: Option<i64>,
+        /// Admission-frozen facts for the aggregate target-state lane.  These
+        /// stay with the provider materialization rather than the SQL scan:
+        /// SQL only states whether an allow-list is required, while
+        /// preparation derives matching files from this exact file set.
+        target_state_partition_filter: crate::mv::model::TargetPartitionFilter,
+        target_partition_contract: Option<crate::mv::persistence::schema::MvPartitionContract>,
+    },
 }
 
 impl QueryTableBinding {
-    pub(crate) fn local(resolved: ResolvedAnalyzerTable) -> Self {
+    pub(crate) fn local(mut resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
+        let identity = &resolved.catalog.identity;
+        resolved.planner.source = ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: identity.catalog.clone(),
+                namespace: identity.namespace.clone(),
+                table: identity.table.clone(),
+            },
+            SqlScanKind::ConnectorRead,
+        ));
         Self {
             resolved,
             statistics_pin: None,
@@ -187,77 +246,42 @@ impl QueryTableBinding {
         }
     }
 
-    /// Project one application-resolved Iceberg file scan into the SQL-owned
-    /// source vocabulary. Concrete table/file facts remain in
-    /// `scan_materialization`, paired with this exact request-local token.
-    pub(crate) fn project_legacy_scan_for_sql(
-        &mut self,
+    /// Verify that the application materializer paired this table with the
+    /// token it reserved.  Concrete provider scans are never accepted here:
+    /// they must already live in `scan_materialization` before SQL receives
+    /// the table facts.
+    pub(crate) fn validate_sql_scan_binding(
+        &self,
         binding: SqlTableBindingId,
     ) -> Result<(), String> {
-        let (source, materialization) = match &self.resolved.planner.source {
-            ScanSource::IcebergDataFiles {
-                table,
-                files,
-                binding: file_binding,
-                ..
-            } => {
-                let version = match file_binding {
-                    IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
-                    IcebergDataFileBinding::ExplicitFiles => SqlTableVersionSelector::Snapshot(
-                        table.current_snapshot_id.ok_or_else(|| {
-                            format!(
-                                "frozen Iceberg input '{}.{}.{}' has no snapshot identity",
-                                table.catalog, table.namespace, table.table
-                            )
-                        })?,
-                    ),
-                };
-                let kind = match file_binding {
-                    IcebergDataFileBinding::CurrentSnapshot => SqlScanKind::Data { version },
-                    IcebergDataFileBinding::ExplicitFiles => {
-                        SqlScanKind::FrozenInputSet { version }
-                    }
-                };
-                (
-                    SqlScanSource::new(
-                        binding,
-                        SqlTableIdentity {
-                            catalog: table.catalog.clone(),
-                            namespace: table.namespace.clone(),
-                            table: table.table.clone(),
-                        },
-                        kind,
-                    ),
-                    Some(QueryScanMaterialization::IcebergDataFiles {
-                        table: table.clone(),
-                        files: files.clone(),
-                        binding: *file_binding,
-                    }),
-                )
-            }
-            ScanSource::ConnectorPinned => (
-                SqlScanSource::new(
-                    binding,
-                    SqlTableIdentity {
-                        catalog: self.resolved.catalog.identity.catalog.clone(),
-                        namespace: self.resolved.catalog.identity.namespace.clone(),
-                        table: self.resolved.catalog.identity.table.clone(),
-                    },
-                    SqlScanKind::ConnectorRead,
-                ),
-                None,
+        match &self.resolved.planner.source {
+            ScanSource::Sql(source) if source.binding == binding => Ok(()),
+            ScanSource::Sql(_) => Err(
+                "catalog materialization produced a SQL scan with a different request binding"
+                    .to_string(),
             ),
-            ScanSource::Sql(_) => return Ok(()),
-            source => {
-                return Err(format!(
-                    "catalog base-table resolution returned unsupported application scan source {source:?}"
-                ));
-            }
-        };
-        self.resolved.planner.source = ScanSource::Sql(source);
-        self.scan_materialization = materialization;
-        Ok(())
+        }
     }
+}
+
+/// Convert only the two optimizer constraint properties while this
+/// application binding still owns the admitted provider descriptor.  Parse
+/// failures preserve the historical conservative behavior: the SQL scan gets
+/// no UK/FK facts instead of a guessed constraint.  The serialized metadata
+/// itself never crosses into the SQL scan source.
+pub(crate) fn sql_ukfk_facts_from_admitted_table(table: &IcebergTableInfo) -> SqlUkFkTableFacts {
+    let Some(serialized) = table.serialized_metadata.as_deref() else {
+        return SqlUkFkTableFacts::default();
+    };
+    let Ok(metadata) = serde_json::from_str::<iceberg::spec::TableMetadata>(serialized) else {
+        return SqlUkFkTableFacts::default();
+    };
+    let properties = metadata
+        .properties()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    SqlUkFkTableFacts::from_frozen_properties(&properties)
 }
 
 struct StoredBinding {
@@ -289,6 +313,55 @@ impl QueryTableBindingStore {
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Construct a deterministic request-local store for owner-side unit
+    /// fixtures.  Production admission must always use `try_new`, which
+    /// allocates a process-unique scope.  Tests use this only alongside
+    /// `test_sql_scan_source`, whose token has the same fixed scope.
+    #[cfg(test)]
+    pub(crate) fn try_new_with_scope_for_test(scope: NonZeroU64) -> Self {
+        Self {
+            scope: SqlTableBindingScopeId::new(scope),
+            next_ordinal: Mutex::new(0),
+            entries: Mutex::new(HashMap::new()),
+            by_id: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Stable, redacted identity material for one admitted binding set.
+    ///
+    /// This is used to bind application-side prepared artifacts (for example
+    /// CTAS) to the exact catalog/statistics/control generation used during
+    /// compilation. Opaque provider bytes are hashed rather than embedded so
+    /// the digest cannot become a provider payload carrier.
+    pub(crate) fn stable_digest_material(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+
+        let mut material = Vec::new();
+        material.extend_from_slice(&self.scope().get().get().to_be_bytes());
+        for (binding_id, binding) in self.captured_bindings() {
+            material.extend_from_slice(&binding_id.ordinal().get().to_be_bytes());
+            let identity = binding.resolved.catalog.identity.fqn();
+            material.extend_from_slice(&(identity.len() as u64).to_be_bytes());
+            material.extend_from_slice(identity.as_bytes());
+            if let Some(pin) = &binding.statistics_pin {
+                material.extend_from_slice(pin.table.owner().as_str().as_bytes());
+                material.push(0);
+                material.extend_from_slice(Sha256::digest(pin.table.payload()).as_slice());
+                material.extend_from_slice(Sha256::digest(pin.data_version.as_bytes()).as_slice());
+            }
+            if let Some(lease) = &binding.planning_lease {
+                let descriptor = lease.binding().descriptor();
+                material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());
+                material.push(0);
+                material.extend_from_slice(descriptor.instance_id.as_str().as_bytes());
+                material.push(0);
+                material.extend_from_slice(&lease.binding().incarnation().to_bytes());
+            }
+            material.push(0xff);
+        }
+        material
     }
 
     pub(crate) fn scope(&self) -> SqlTableBindingScopeId {
@@ -407,6 +480,47 @@ impl QueryTableBindingStore {
         ))
     }
 
+    /// Return the only admitted Iceberg table binding for one write target.
+    ///
+    /// Write admission must name the target through the same request-local
+    /// token that analysis used.  Selecting an arbitrary matching table would
+    /// hide a self-join/time-travel ambiguity and could bind the writer to a
+    /// different generation, so ambiguity is a terminal submission error.
+    pub(crate) fn admitted_iceberg_write_binding_id(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Result<SqlTableBindingId, String> {
+        let matches = self
+            .captured_bindings()
+            .into_iter()
+            .filter_map(|(id, binding)| {
+                let identity = &binding.resolved.catalog.identity;
+                (identity.catalog.eq_ignore_ascii_case(catalog)
+                    && identity.namespace.eq_ignore_ascii_case(namespace)
+                    && identity.table.eq_ignore_ascii_case(table)
+                    && matches!(
+                        binding.scan_materialization.as_ref(),
+                        Some(
+                            QueryScanMaterialization::IcebergDataFiles { .. }
+                                | QueryScanMaterialization::IcebergMvTarget { .. }
+                        )
+                    ))
+                .then_some(id)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [binding] => Ok(*binding),
+            [] => Err(format!(
+                "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
+            )),
+            _ => Err(format!(
+                "SQL write target {catalog}.{namespace}.{table} has multiple admitted bindings; writer admission is ambiguous"
+            )),
+        }
+    }
+
     /// Transitional lookup for legacy physical scan facts.  It resolves only
     /// the request-local key already captured by admission; no provider call
     /// or latest-generation acquire is possible here.
@@ -449,6 +563,31 @@ impl QueryTableBindingStore {
     ) -> Option<SqlTableBindingId> {
         let key =
             QueryTableBindingKey::metadata(&table.catalog, &table.namespace, &table.table, kind);
+        self.entries
+            .lock()
+            .expect("query table binding lock")
+            .get(&key)
+            .and_then(|entry| entry.as_ref().ok().map(|stored| stored.id))
+    }
+
+    /// Return the one admission-frozen MV target binding.  The UUID and
+    /// snapshot are part of the lookup key so a recreated target or a later
+    /// refresh baseline can never reuse an earlier request's authority.
+    pub(crate) fn mv_target_binding_id(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        target_table_uuid: &str,
+        frozen_snapshot_id: Option<i64>,
+    ) -> Option<SqlTableBindingId> {
+        let key = QueryTableBindingKey::mv_target(
+            catalog,
+            namespace,
+            table,
+            target_table_uuid,
+            frozen_snapshot_id,
+        );
         self.entries
             .lock()
             .expect("query table binding lock")
@@ -500,21 +639,35 @@ mod tests {
     use super::{QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore};
 
     fn local_binding() -> QueryTableBinding {
-        QueryTableBinding {
-            resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+        let binding = crate::sql::binding::SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(
+                std::num::NonZeroU64::new(1).expect("scope"),
+            ),
+            std::num::NonZeroU32::new(1).expect("ordinal"),
+        );
+        QueryTableBinding::local(
+            crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 Some("default_catalog"),
                 "db",
                 crate::sql::planner::table::TableDef {
                     name: "orders".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                    source: crate::sql::planner::table::ScanSource::Sql(
+                        crate::sql::planner::table::SqlScanSource::new(
+                            binding,
+                            crate::sql::planner::table::SqlTableIdentity {
+                                catalog: "default_catalog".to_string(),
+                                namespace: "db".to_string(),
+                                table: "orders".to_string(),
+                            },
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
+                    ),
                 },
             ),
-            statistics_pin: None,
-            planning_lease: None,
-            scan_materialization: None,
-        }
+            binding,
+        )
     }
 
     #[test]
@@ -580,6 +733,25 @@ mod tests {
     }
 
     #[test]
+    fn sqlx2_binding_digest_is_stable_per_request_and_scoped_across_requests() {
+        let first = QueryTableBindingStore::try_new().expect("first store");
+        let first_key = QueryTableBindingKey::strict_base("ice", "db", "orders");
+        first
+            .resolve_or_insert(first_key, || Ok(local_binding()))
+            .expect("first binding");
+
+        let first_digest = first.stable_digest_material();
+        assert_eq!(first_digest, first.stable_digest_material());
+
+        let second = QueryTableBindingStore::try_new().expect("second store");
+        let second_key = QueryTableBindingKey::strict_base("ice", "db", "orders");
+        second
+            .resolve_or_insert(second_key, || Ok(local_binding()))
+            .expect("second binding");
+        assert_ne!(first_digest, second.stable_digest_material());
+    }
+
+    #[test]
     fn sqlx2_binding_loader_receives_the_token_published_by_the_store() {
         let store = QueryTableBindingStore::try_new().expect("store");
         let key = QueryTableBindingKey::strict_base("ice", "db", "orders");
@@ -626,5 +798,82 @@ mod tests {
 
         assert_ne!(base, metadata);
         assert_eq!(metadata, repeated);
+    }
+
+    #[test]
+    fn sqlx2_binding_mv_target_reuses_one_frozen_target_only_within_the_request() {
+        let first = QueryTableBindingStore::try_new().expect("first store");
+        let second = QueryTableBindingStore::try_new().expect("second store");
+        let key = QueryTableBindingKey::mv_target(
+            "ice",
+            "analytics",
+            "orders_mv",
+            "target-uuid-a",
+            Some(42),
+        );
+
+        let first_token = first
+            .resolve_or_insert(key.clone(), || Ok(local_binding()))
+            .expect("first MV target token");
+        let repeated_token = first
+            .resolve_or_insert(key.clone(), || {
+                Err("must not rematerialize target".to_string())
+            })
+            .expect("memoized MV target token");
+        let second_token = second
+            .resolve_or_insert(key, || Ok(local_binding()))
+            .expect("second MV target token");
+
+        assert_eq!(first_token, repeated_token);
+        assert_ne!(first_token, second_token);
+        assert_eq!(
+            first.mv_target_binding_id("ICE", "ANALYTICS", "ORDERS_MV", "TARGET-UUID-A", Some(42),),
+            Some(first_token),
+        );
+        assert!(second.binding(first_token).is_err());
+    }
+
+    #[test]
+    fn sqlx2_binding_mv_target_keeps_uuid_and_snapshot_in_the_identity() {
+        let store = QueryTableBindingStore::try_new().expect("store");
+        let first = store
+            .resolve_or_insert(
+                QueryTableBindingKey::mv_target(
+                    "ice",
+                    "analytics",
+                    "orders_mv",
+                    "target-uuid-a",
+                    Some(42),
+                ),
+                || Ok(local_binding()),
+            )
+            .expect("first target");
+        let recreated = store
+            .resolve_or_insert(
+                QueryTableBindingKey::mv_target(
+                    "ice",
+                    "analytics",
+                    "orders_mv",
+                    "target-uuid-b",
+                    Some(42),
+                ),
+                || Ok(local_binding()),
+            )
+            .expect("recreated target");
+        let later_snapshot = store
+            .resolve_or_insert(
+                QueryTableBindingKey::mv_target(
+                    "ice",
+                    "analytics",
+                    "orders_mv",
+                    "target-uuid-a",
+                    Some(43),
+                ),
+                || Ok(local_binding()),
+            )
+            .expect("later snapshot target");
+
+        assert_ne!(first, recreated);
+        assert_ne!(first, later_snapshot);
     }
 }

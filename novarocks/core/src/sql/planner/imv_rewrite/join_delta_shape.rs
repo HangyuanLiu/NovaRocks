@@ -23,7 +23,7 @@ use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JoinDeltaOrientation {
@@ -175,9 +175,7 @@ fn has_reserved_action_project_output_name(item: &ProjectItem) -> bool {
 
 fn join_delta_delta_action_column_id(plan: &LogicalPlanNode) -> Option<ColumnId> {
     match &plan.kind {
-        LogicalPlanKind::Scan(scan)
-            if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
-        {
+        LogicalPlanKind::Scan(scan) if is_delta_scan_source(&scan.table.source) => {
             unique_action_output_column_id(&scan.columns)
         }
         LogicalPlanKind::Filter(_) => join_delta_delta_action_column_id(plan.unary_input()),
@@ -198,10 +196,8 @@ fn join_delta_delta_action_column_id(plan: &LogicalPlanNode) -> Option<ColumnId>
 fn is_join_delta_version_like(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
         LogicalPlanKind::Scan(scan) => {
-            matches!(
-                scan.table.source,
-                ScanSource::IcebergVersionTable { .. } | ScanSource::IcebergDataFiles { .. }
-            ) && !scan.columns.iter().any(has_reserved_action_output_name)
+            is_version_like_scan_source(&scan.table.source)
+                && !scan.columns.iter().any(has_reserved_action_output_name)
         }
         LogicalPlanKind::Filter(_) => is_join_delta_version_like(plan.unary_input()),
         LogicalPlanKind::Project(node) => {
@@ -252,9 +248,7 @@ fn subtree_has_reserved_action_output(plan: &LogicalPlanNode) -> bool {
 
 fn subtree_has_delta_marker_or_scan(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
-        }
+        LogicalPlanKind::Scan(scan) => is_delta_scan_source(&scan.table.source),
         LogicalPlanKind::ImvDelta(_) => true,
         LogicalPlanKind::Filter(_)
         | LogicalPlanKind::Project(_)
@@ -266,6 +260,27 @@ fn subtree_has_delta_marker_or_scan(plan: &LogicalPlanNode) -> bool {
         }
         _ => false,
     }
+}
+
+fn sql_scan_source(source: &ScanSource) -> Option<&SqlScanSource> {
+    match source {
+        ScanSource::Sql(source) => Some(source),
+        _ => None,
+    }
+}
+
+fn is_delta_scan_source(source: &ScanSource) -> bool {
+    matches!(
+        sql_scan_source(source).map(|source| &source.kind),
+        Some(SqlScanKind::Delta { .. })
+    )
+}
+
+fn is_version_like_scan_source(source: &ScanSource) -> bool {
+    matches!(
+        sql_scan_source(source).map(|source| &source.kind),
+        Some(SqlScanKind::Data { .. } | SqlScanKind::FrozenInputSet { .. })
+    )
 }
 
 fn is_supported_marker_input(plan: &LogicalPlanNode) -> bool {
@@ -290,29 +305,30 @@ mod tests {
     use crate::sql::planner::payload::*;
     use arrow::datatypes::DataType;
 
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::logical::LogicalPlanKind;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::TableDef;
+    use crate::sql::planner::table::{
+        SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
-    fn table_info(table: &str) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: table.to_string(),
-            table_uuid: Some(format!("uuid-{table}")),
-            current_snapshot_id: Some(22),
-            schema_id: 7,
-            location: format!("file:///tmp/ice/db/{table}"),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn scan_source(table: &str, kind: SqlScanKind) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero scope")),
+                NonZeroU32::new(1).expect("non-zero ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: table.to_string(),
+            },
+            kind,
+        ))
     }
 
     fn scan(table: &str, column_id: ColumnId, source: ScanSource) -> LogicalPlanNode {
@@ -353,11 +369,13 @@ mod tests {
         scan(
             table,
             column_id,
-            ScanSource::IcebergDeltaTable {
-                table: table_info(table),
-                from_snapshot_id: 11,
-                to_snapshot_id: 22,
-            },
+            scan_source(
+                table,
+                SqlScanKind::Delta {
+                    from_snapshot_id: 11,
+                    to_snapshot_id: 22,
+                },
+            ),
         )
     }
 
@@ -378,10 +396,12 @@ mod tests {
         scan(
             table,
             column_id,
-            ScanSource::IcebergVersionTable {
-                table: table_info(table),
-                snapshot_id: 22,
-            },
+            scan_source(
+                table,
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Snapshot(22),
+                },
+            ),
         )
     }
 
@@ -389,12 +409,12 @@ mod tests {
         scan(
             table,
             column_id,
-            ScanSource::IcebergDataFiles {
-                table: table_info(table),
-                files: Vec::new(),
-                cloud_properties: Default::default(),
-                binding: IcebergDataFileBinding::ExplicitFiles,
-            },
+            scan_source(
+                table,
+                SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(22),
+                },
+            ),
         )
     }
 
@@ -499,7 +519,7 @@ mod tests {
 
         assert!(
             is_supported_join_delta_branch(&branch),
-            "join delta coalesce branches use IcebergDataFiles for snapshot sides"
+            "join delta coalesce branches accept snapshot sides"
         );
     }
 

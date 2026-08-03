@@ -23,7 +23,10 @@ use std::sync::{Arc, RwLock};
 use novarocks::connector::mutation::{
     CompletedCatalogMutation, ResolvedCatalogMutation, resolve_catalog_mutation_with_lease,
 };
-use novarocks::mv::application::{MvApplicationError, MvApplicationErrorKind, MvStatementResult};
+use novarocks::mv::application::{
+    MvApplicationError, MvApplicationErrorKind, MvStatementResult, PreparedMvFirstRefreshWrite,
+    PreparedMvIncrementalWrite, PreparedMvRefresh, PreparedMvRefreshWork,
+};
 use novarocks::mv::application::{MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink};
 use novarocks::mv::persistence::refresh::{
     FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
@@ -35,11 +38,9 @@ use novarocks::mv::repository::{
 };
 use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::contract::ConnectorWriteExecutionRegistration;
+use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::sql::mv_refresh::{
-    MvRefreshFinalizeFacts, PreparedDistributedWriteRequest, PreparedMvRefresh,
-    PreparedMvRefreshWork,
-};
+use novarocks::sql::mv_refresh::MvRefreshFinalizeFacts;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -87,7 +88,8 @@ impl FrontendMvFirstRefreshWriteActivatorPort {
 
     fn bind_write(
         &self,
-        prepared: novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite,
+        prepared: PreparedMvFirstRefreshWrite,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
@@ -98,13 +100,14 @@ impl FrontendMvFirstRefreshWriteActivatorPort {
             .clone()
             .ok_or_else(|| unavailable("MV first-refresh provider activation is unavailable"))?;
         activator
-            .bind_first_refresh_write(prepared, lease, execution)
+            .bind_first_refresh_write(prepared, planning_lease, lease, execution)
             .map_err(invalid)
     }
 
     fn bind_incremental_write(
         &self,
-        prepared: novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite,
+        prepared: PreparedMvIncrementalWrite,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &novarocks::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, MvApplicationError> {
@@ -115,7 +118,7 @@ impl FrontendMvFirstRefreshWriteActivatorPort {
             .clone()
             .ok_or_else(|| unavailable("MV incremental provider activation is unavailable"))?;
         activator
-            .bind_incremental_refresh_write(prepared, lease, execution)
+            .bind_incremental_refresh_write(prepared, planning_lease, lease, execution)
             .map_err(invalid)
     }
 }
@@ -205,7 +208,6 @@ pub(super) fn execute(
             Ok(MvStatementResult::Ok)
         }
         PreparedMvRefreshWork::DataProducing {
-            distributed_writes,
             first_refresh_writes,
             incremental_writes,
         } => execute_data_refresh(
@@ -214,7 +216,6 @@ pub(super) fn execute(
             &planning_lease,
             attempt,
             finalize,
-            distributed_writes,
             first_refresh_writes,
             incremental_writes,
             base_snapshots,
@@ -229,18 +230,15 @@ fn execute_data_refresh(
     repository: &dyn MvRepository,
     dependencies: &FrontendMvRefreshDependencies,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt: novarocks::sql::mv_refresh::MvRefreshAttemptIdentity,
+    attempt: novarocks::mv::application::MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
-    distributed_writes: Vec<PreparedDistributedWriteRequest>,
-    first_refresh_writes: Vec<
-        novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite,
-    >,
-    incremental_writes: Vec<novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite>,
+    first_refresh_writes: Vec<PreparedMvFirstRefreshWrite>,
+    incremental_writes: Vec<PreparedMvIncrementalWrite>,
     base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
     execution: &novarocks::query_execution::request_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    if distributed_writes.len() + first_refresh_writes.len() + incremental_writes.len() != 1 {
+    if first_refresh_writes.len() + incremental_writes.len() != 1 {
         return Err(invalid(
             "MV refresh data preparation must produce exactly one staged distributed write",
         ));
@@ -277,12 +275,10 @@ fn execute_data_refresh(
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
     let write = match (
-        distributed_writes.into_iter().next(),
         first_refresh_writes.into_iter().next(),
         incremental_writes.into_iter().next(),
     ) {
-        (Some(write), None, None) => write,
-        (None, Some(first_refresh), None) => {
+        (Some(first_refresh), None) => {
             if first_refresh.operation_id() != attempt.write_operation_id {
                 return Err(invalid(
                     "SQL-prepared MV first-refresh write does not use the frontend-preallocated operation ID",
@@ -290,11 +286,12 @@ fn execute_data_refresh(
             }
             dependencies.first_refresh_activator.bind_write(
                 first_refresh,
+                planning_lease,
                 &write_lease,
                 execution,
             )?
         }
-        (None, None, Some(incremental)) => {
+        (None, Some(incremental)) => {
             if incremental.operation_id() != attempt.write_operation_id {
                 return Err(invalid(
                     "SQL-prepared MV incremental write does not use the frontend-preallocated operation ID",
@@ -302,7 +299,7 @@ fn execute_data_refresh(
             }
             dependencies
                 .first_refresh_activator
-                .bind_incremental_write(incremental, &write_lease, execution)?
+                .bind_incremental_write(incremental, planning_lease, &write_lease, execution)?
         }
         _ => unreachable!("checked exactly one prepared MV write"),
     };
@@ -458,17 +455,11 @@ fn new_ledger(
 ) -> Result<FrontendMvRefreshLedger, MvApplicationError> {
     let cohort_ids = match &refresh.work {
         PreparedMvRefreshWork::DataProducing {
-            distributed_writes,
             first_refresh_writes,
             incremental_writes,
-        } => distributed_writes
+        } => first_refresh_writes
             .iter()
-            .map(|write| hex::encode(write.write_cohort_id().to_bytes()))
-            .chain(
-                first_refresh_writes
-                    .iter()
-                    .map(|write| hex::encode(write.primary_cohort().to_bytes())),
-            )
+            .map(|write| hex::encode(write.primary_cohort().to_bytes()))
             .chain(
                 incremental_writes
                     .iter()
@@ -897,12 +888,11 @@ mod tests {
 
     use novarocks::mv::application::{
         MvFirstRefreshWriteActivator, MvFirstRefreshWriteActivatorSink,
+        PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
     };
+    use novarocks::query_execution::prepared_write::PreparedDistributedWriteRequest;
     use novarocks::query_execution::request_context::QueryExecutionContext;
-    use novarocks::sql::mv_refresh::PreparedDistributedWriteRequest;
-    use novarocks::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
-    use novarocks::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
-    use novarocks_spi::connector::ConnectorWriteLease;
+    use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
     use super::FrontendMvFirstRefreshWriteActivatorPort;
 
@@ -912,6 +902,7 @@ mod tests {
         fn bind_first_refresh_write(
             &self,
             _prepared: PreparedMvFirstRefreshWrite,
+            _planning_lease: &ConnectorControlPlanningLease,
             _exact_lease: &ConnectorWriteLease,
             _execution: &QueryExecutionContext,
         ) -> Result<PreparedDistributedWriteRequest, String> {
@@ -921,6 +912,7 @@ mod tests {
         fn bind_incremental_refresh_write(
             &self,
             _prepared: PreparedMvIncrementalWrite,
+            _planning_lease: &ConnectorControlPlanningLease,
             _exact_lease: &ConnectorWriteLease,
             _execution: &QueryExecutionContext,
         ) -> Result<PreparedDistributedWriteRequest, String> {

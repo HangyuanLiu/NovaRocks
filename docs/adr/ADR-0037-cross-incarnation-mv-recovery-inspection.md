@@ -1,5 +1,9 @@
 ---
+<<<<<<<< HEAD:docs/adr/ADR-0037-cross-incarnation-mv-recovery-inspection.md
 id: ADR-0037
+========
+id: ADR-0031
+>>>>>>>> 98726ab8d (refactor(sql): complete dependency inversion caller cutover):docs/adr/ADR-0031-cross-incarnation-mv-recovery-inspection.md
 title: "Cross-incarnation MV recovery uses lake inspection"
 domain: [frontend-mv]
 status: active

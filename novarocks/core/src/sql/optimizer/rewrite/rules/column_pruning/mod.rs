@@ -183,7 +183,9 @@ mod tests {
             name: "t1".to_string(),
             columns: cols.iter().map(|(_, name)| col_def(name)).collect(),
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {

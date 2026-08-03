@@ -3655,7 +3655,9 @@ fn table_def() -> TableDef {
         name: "t".to_string(),
         columns: vec![column_def("k", DataType::Int64, false)],
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::ConnectorPinned,
+        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        ),
     }
 }
 
@@ -3667,7 +3669,9 @@ fn table_def_with_columns(columns: &[OutputColumn]) -> TableDef {
             .map(|column| column_def(&column.name, column.data_type.clone(), column.nullable))
             .collect(),
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::ConnectorPinned,
+        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        ),
     }
 }
 

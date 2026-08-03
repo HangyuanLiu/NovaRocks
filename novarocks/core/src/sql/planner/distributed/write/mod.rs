@@ -16,5 +16,6 @@
 // under the License.
 
 pub(crate) mod change_stream;
+pub(crate) mod contract;
 pub(crate) mod plan;
 pub(crate) mod sink;

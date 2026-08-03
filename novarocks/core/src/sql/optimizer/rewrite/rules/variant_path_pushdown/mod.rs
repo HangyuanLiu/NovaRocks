@@ -24,18 +24,16 @@ mod tests {
     use crate::sql::planner::logical::*;
     use crate::sql::planner::payload::*;
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
     use super::VariantPathPushdownRule;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
@@ -43,7 +41,9 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::{PlanFilterNode, PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
 
     fn add_column(
@@ -66,19 +66,11 @@ mod tests {
         }
     }
 
-    fn iceberg_info() -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(1),
-            schema_id: 1,
-            location: "file:///tmp/t".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn test_binding() -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero test scope")),
+            NonZeroU32::new(1).expect("non-zero test binding"),
+        )
     }
 
     fn table_def(source: ScanSource, source_type: DataType) -> TableDef {
@@ -97,16 +89,29 @@ mod tests {
     }
 
     fn iceberg_source() -> ScanSource {
-        ScanSource::IcebergDataFiles {
-            table: iceberg_info(),
-            files: vec![],
-            cloud_properties: BTreeMap::new(),
-            binding: IcebergDataFileBinding::CurrentSnapshot,
-        }
+        ScanSource::Sql(SqlScanSource::new(
+            test_binding(),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
     }
 
     fn connector_pinned_source() -> ScanSource {
-        ScanSource::ConnectorPinned
+        ScanSource::Sql(SqlScanSource::new(
+            test_binding(),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+            },
+            SqlScanKind::ConnectorRead,
+        ))
     }
 
     fn scan_with_source(

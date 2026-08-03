@@ -21,7 +21,7 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
 
 use super::super::FragmentId;
-use super::sink::IcebergWriteSinkSpec;
+use super::contract::SqlWritePlanInput;
 
 /// Canonical internal output used by SQL change-stream plans to route rows to
 /// data writer branches. It is a planner contract and never reaches a user
@@ -51,7 +51,7 @@ pub(crate) struct ChangeStreamWriteBranchSpec {
     pub(crate) branch_kind: ChangeStreamBranchKind,
     pub(crate) stream_output_ordinals: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) sink: SqlWritePlanInput,
 }
 
 #[derive(Clone, Debug)]
@@ -80,16 +80,16 @@ pub(crate) struct ChangeStreamBranchRoute {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamWriteTopology {
-    pub(crate) writer_branches: Vec<IcebergChangeStreamWriterBranch>,
+pub(crate) struct SqlChangeStreamWriteTopology {
+    pub(crate) writer_branches: Vec<SqlChangeStreamWriterBranch>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamWriterBranch {
+pub(crate) struct SqlChangeStreamWriterBranch {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
     pub(crate) writer_fragment_id: FragmentId,
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) sink: SqlWritePlanInput,
 }
 
 impl ChangeStreamWriteBranchSpec {
@@ -99,20 +99,14 @@ impl ChangeStreamWriteBranchSpec {
         branch_kind: ChangeStreamBranchKind,
         stream_output_ordinals: Vec<usize>,
     ) -> Self {
-        let mut sink_spec = super::sink::test_support::simple_sink_spec();
-        sink_spec.iceberg.serialized_metadata =
-            Some(super::sink::test_support::single_bucket_partition_metadata_json());
-        sink_spec.mode = match branch_kind {
-            ChangeStreamBranchKind::DeleteDv => super::sink::IcebergWriteSinkMode::DeletionVectors,
-            ChangeStreamBranchKind::ReuseData => super::sink::IcebergWriteSinkMode::RowLineageData,
-            ChangeStreamBranchKind::FreshData => super::sink::IcebergWriteSinkMode::Data,
-        };
         Self {
             branch_id,
             branch_kind,
             stream_output_ordinals,
             output_partition_ordinals: Vec::new(),
-            sink_spec,
+            sink: super::contract::test_support::simple_sql_write_plan_input(
+                super::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
         }
     }
 

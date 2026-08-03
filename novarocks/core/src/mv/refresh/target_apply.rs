@@ -406,20 +406,14 @@ impl IcebergTargetApplyBinding {
         })
     }
 
-    pub(crate) fn resolve_locator_scan(
+    /// Validate SQL target-locator facts against the admission-frozen target
+    /// contract.  The target files themselves are never returned through this
+    /// adapter: scan preparation recovers them from the request-local binding
+    /// token on the enclosing `SqlScanSource`.
+    pub(crate) fn validate_locator_scan(
         &self,
         scan: &crate::sql::planner::table::SqlMvTargetLocatorScan,
-    ) -> Result<crate::sql::planner::table::ScanSource, String> {
-        if !scan.catalog.eq_ignore_ascii_case(&self.target.catalog)
-            || !scan.database.eq_ignore_ascii_case(&self.target.namespace)
-            || !scan.table.eq_ignore_ascii_case(&self.target.table)
-        {
-            return Err(format!(
-                "Iceberg target-locator scan {} does not match MV refresh target {}",
-                scan.fqn(),
-                self.target.fqn()
-            ));
-        }
+    ) -> Result<(), String> {
         if scan.target_table_uuid != self.target_table_uuid {
             return Err(format!(
                 "Iceberg target-locator scan {} target uuid mismatch: scan={} binding={}",
@@ -462,12 +456,7 @@ impl IcebergTargetApplyBinding {
             }
         }
 
-        Ok(crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: self.runtime.table_info()?,
-            files: self.runtime.data_files_at_frozen_snapshot()?,
-            cloud_properties: self.runtime.target_entry.cloud_properties_map(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        })
+        Ok(())
     }
 }
 
@@ -608,6 +597,9 @@ mod tests {
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
+    };
+    use crate::sql::planner::table::{
+        SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
     };
     use crate::sql::planner::vocabulary::ApplyKeySource;
     use novarocks_catalog::identifier::TableIdentity;
@@ -1075,13 +1067,9 @@ mod tests {
                 write_default: None,
                 logical_type: None,
             }],
-            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                table: bindings.runtime().table_info().expect("table info"),
-                files: Vec::new(),
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            },
+            source: crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
 
         let err = expose_physical_apply_key_for_locator_registration(
@@ -1119,13 +1107,9 @@ mod tests {
                 metadata_column("_file", DataType::Utf8),
                 metadata_column("_pos", DataType::Int64),
             ],
-            source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                table: bindings.runtime().table_info().expect("table info"),
-                files: Vec::new(),
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            },
+            source: crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
 
         let err = expose_physical_apply_key_for_locator_registration(
@@ -1149,44 +1133,16 @@ mod tests {
         )
         .expect("target bindings");
         let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: rewrite.target_table_uuid.clone(),
             target_snapshot_id: Some(snapshot_id),
             apply_key_column: "k".to_string(),
             branch_id_column: None,
         };
 
-        let source = bindings
+        bindings
             .target_apply()
-            .resolve_locator_scan(&scan)
-            .expect("locator source");
-
-        let crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table,
-            files,
-            cloud_properties,
-            binding,
-        } = source
-        else {
-            panic!("expected explicit target files");
-        };
-        assert_eq!(
-            binding,
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-        );
-        assert_eq!(table.catalog, "tgt");
-        assert_eq!(table.namespace, "db");
-        assert_eq!(table.table, "mv");
-        assert_eq!(table.current_snapshot_id, Some(snapshot_id));
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].row_count, Some(1));
-        assert!(files[0].path.ends_with(".parquet"));
-        assert_eq!(
-            cloud_properties,
-            bindings.runtime().target_entry().cloud_properties_map()
-        );
+            .validate_locator_scan(&scan)
+            .expect("locator facts");
     }
 
     #[test]
@@ -1200,38 +1156,20 @@ mod tests {
         )
         .expect("empty target bindings");
         let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: rewrite.target_table_uuid.clone(),
             target_snapshot_id: None,
             apply_key_column: "k".to_string(),
             branch_id_column: None,
         };
 
-        let source = bindings
+        bindings
             .target_apply()
-            .resolve_locator_scan(&scan)
-            .expect("empty locator source");
-        let crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table,
-            files,
-            binding,
-            ..
-        } = source
-        else {
-            panic!("expected explicit target files");
-        };
-        assert_eq!(
-            binding,
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-        );
-        assert_eq!(table.current_snapshot_id, None);
-        assert!(files.is_empty());
+            .validate_locator_scan(&scan)
+            .expect("empty locator facts");
     }
 
     #[test]
-    fn rejects_each_locator_identity_drift() {
+    fn locator_identity_is_owned_by_outer_sql_source_and_facts_reject_drift() {
         let fixture = target_fixture_with_branch("locator_identity_drift", true);
         let snapshot_id = fixture.snapshot_id();
         let rewrite = rewrite_context(&fixture, Some(snapshot_id), |_| {});
@@ -1241,19 +1179,28 @@ mod tests {
             fixture.target_table,
         )
         .expect("target bindings");
-        let exact = crate::sql::planner::table::SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
+        let exact = SqlMvTargetLocatorScan {
             target_table_uuid: rewrite.target_table_uuid.clone(),
             target_snapshot_id: Some(snapshot_id),
             apply_key_column: "k".to_string(),
             branch_id_column: Some(BRANCH_ID_COLUMN_NAME.to_string()),
         };
+        let mut source = SqlScanSource::new(
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            SqlTableIdentity {
+                catalog: "tgt".to_string(),
+                namespace: "db".to_string(),
+                table: "mv".to_string(),
+            },
+            SqlScanKind::MvTargetLocator {
+                facts: exact.clone(),
+            },
+        );
+        source.table.catalog = "other".to_string();
+        assert_eq!(source.table.catalog, "other");
+        assert!(matches!(source.kind, SqlScanKind::MvTargetLocator { .. }));
+
         let mut cases = Vec::new();
-        let mut fqn = exact.clone();
-        fqn.catalog = "other".to_string();
-        cases.push(("FQN", fqn, "does not match MV refresh target"));
         let mut uuid = exact.clone();
         uuid.target_table_uuid = "other-uuid".to_string();
         cases.push(("UUID", uuid, "target uuid mismatch"));
@@ -1270,7 +1217,7 @@ mod tests {
         for (name, scan, expected) in cases {
             let err = bindings
                 .target_apply()
-                .resolve_locator_scan(&scan)
+                .validate_locator_scan(&scan)
                 .expect_err("locator drift must fail");
             assert!(err.contains(expected), "{name}: got {err}");
         }
@@ -1288,9 +1235,6 @@ mod tests {
         )
         .expect("target bindings");
         let scan = crate::sql::planner::table::SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: rewrite.target_table_uuid.clone(),
             target_snapshot_id: Some(snapshot_id),
             apply_key_column: "wrong_key".to_string(),
@@ -1299,7 +1243,7 @@ mod tests {
 
         let err = bindings
             .target_apply()
-            .resolve_locator_scan(&scan)
+            .validate_locator_scan(&scan)
             .expect_err("apply-key drift must fail");
         assert!(err.contains("apply-key column mismatch"), "got: {err}");
     }

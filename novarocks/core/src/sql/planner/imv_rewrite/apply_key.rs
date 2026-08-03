@@ -257,8 +257,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -283,7 +281,7 @@ mod tests {
         ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
@@ -302,22 +300,7 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDeltaTable {
-                    table: IcebergTableInfo {
-                        catalog: "ice".to_string(),
-                        namespace: "db".to_string(),
-                        table: "b".to_string(),
-                        table_uuid: Some("uuid-b".to_string()),
-                        current_snapshot_id: Some(22),
-                        schema_id: 7,
-                        location: "file:///tmp/ice/db/b".to_string(),
-                        schema: IcebergSchemaDef { fields: Vec::new() },
-                        serialized_metadata: None,
-                        serialized_metadata_rows: None,
-                    },
-                    from_snapshot_id: 11,
-                    to_snapshot_id: 22,
-                },
+                source: crate::sql::compiler::mv_rewrite::test_delta_scan_source(11, 22),
             },
             alias: None,
             columns: vec![

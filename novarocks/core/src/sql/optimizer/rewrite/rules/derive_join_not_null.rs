@@ -297,7 +297,9 @@ mod tests {
                     })
                     .collect(),
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: Some(alias.to_string()),
             stats_ref: None,
@@ -573,7 +575,9 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: Some("l".to_string()),
             stats_ref: None,
@@ -601,7 +605,9 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: Some("r".to_string()),
             stats_ref: None,

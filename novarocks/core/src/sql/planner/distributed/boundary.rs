@@ -51,7 +51,7 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 
-use super::write::sink::ConnectorWriteInputBinding;
+use super::write::contract::ConnectorWriteInputBinding;
 use super::{
     DataSink, DistributedNode, DistributedNodeKind, ExchangeReceiver, FragmentEdge, FragmentId,
     PlanFragment,
@@ -472,13 +472,9 @@ mod tests {
     use crate::sql::planner::distributed::write::change_stream::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
     };
-    use crate::sql::planner::distributed::write::plan::finalize_iceberg_change_stream_test_plan;
-    use crate::sql::planner::distributed::write::sink::test_support::{
-        simple_sink_spec, unpartitioned_metadata_json,
-    };
-    use crate::sql::planner::distributed::write::sink::{
-        ConnectorWriteInputBinding, IcebergWritePlanInput,
-    };
+    use crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding;
+    use crate::sql::planner::distributed::write::contract::test_support;
+    use crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
@@ -731,10 +727,8 @@ mod tests {
         );
         let mut branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
-        branch.sink_spec.iceberg.serialized_metadata = Some(unpartitioned_metadata_json());
         let dag = ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        finalize_iceberg_change_stream_test_plan(builder, "test_db", dag)
-            .expect("router plan seals")
+        finalize_sql_change_stream_test_plan(builder, dag).expect("router plan seals")
     }
 
     fn iceberg_write_plan(
@@ -749,8 +743,7 @@ mod tests {
             ConnectorWriteInputBinding::RootOutputByOrdinal => columns.len(),
             ConnectorWriteInputBinding::OutputOrdinals(ordinals) => ordinals.len(),
         };
-        let mut spec = simple_sink_spec();
-        spec.target_columns = (0..target_arity)
+        let target_columns = (0..target_arity)
             .map(|idx| ColumnDef {
                 name: format!("t{idx}"),
                 data_type: DataType::Int64,
@@ -758,7 +751,9 @@ mod tests {
                 write_default: None,
                 logical_type: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut sink = test_support::simple_sql_write_plan_input(input.clone());
+        sink.contract.input_columns = target_columns;
         let draft = DistributedPlanDraftBuilder::new(
             vec![PlanFragment {
                 fragment_id: 0,
@@ -776,14 +771,8 @@ mod tests {
             Default::default(),
         )
         .into_draft();
-        let draft = crate::sql::planner::distributed::write::plan::with_iceberg_write_sink(
-            draft,
-            IcebergWritePlanInput {
-                descriptor_database: "test_db".to_string(),
-                spec,
-                input,
-            },
-        )?;
+        let draft =
+            crate::sql::planner::distributed::write::plan::with_sql_write_sink(draft, sink)?;
         crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
     }
 

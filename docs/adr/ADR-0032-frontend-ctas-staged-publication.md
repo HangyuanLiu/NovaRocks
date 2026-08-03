@@ -1,5 +1,5 @@
 ---
-id: ADR-0030
+id: ADR-0032
 title: "Frontend CTAS uses provider-owned staged publication"
 domain: [frontend-dml, provider-spi]
 status: active

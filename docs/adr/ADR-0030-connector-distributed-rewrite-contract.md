@@ -1,5 +1,5 @@
 ---
-id: ADR-0029
+id: ADR-0030
 title: "Connector distributed rewrite contract"
 domain: [provider-spi, table-maintenance]
 status: active

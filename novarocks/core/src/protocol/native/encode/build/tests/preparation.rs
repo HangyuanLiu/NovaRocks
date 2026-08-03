@@ -32,11 +32,14 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
         assert_eq!(node_id, 10);
         assert!(matches!(
             scan.table.source,
-            ScanSource::IcebergDeltaTable {
-                from_snapshot_id: 6,
-                to_snapshot_id: 7,
+            ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+                kind: crate::sql::planner::table::SqlScanKind::Delta {
+                    from_snapshot_id: 6,
+                    to_snapshot_id: 7,
+                    ..
+                },
                 ..
-            }
+            })
         ));
         Ok(Some(
             crate::query_execution::preparation::scan::ResolvedScanExecution::IcebergDelta(
@@ -72,11 +75,12 @@ fn fragment_build_prepares_delta_once_without_mutating_input_plan() {
             let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
                 panic!("root must be scan");
             };
-            scan.table.source = ScanSource::IcebergDeltaTable {
-                table: iceberg_table_info(),
-                from_snapshot_id: 6,
-                to_snapshot_id: 7,
-            };
+            scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::Delta {
+                    from_snapshot_id: 6,
+                    to_snapshot_id: 7,
+                },
+            );
         },
     );
     let before = format!("{plan:#?}");
@@ -132,11 +136,12 @@ fn fragment_build_reports_missing_delta_resolver_before_encoding() {
             let DistributedNodeKind::Scan(scan) = &mut draft.fragments_mut()[0].root.payload else {
                 panic!("root must be scan");
             };
-            scan.table.source = ScanSource::IcebergDeltaTable {
-                table: iceberg_table_info(),
-                from_snapshot_id: 6,
-                to_snapshot_id: 7,
-            };
+            scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::Delta {
+                    from_snapshot_id: 6,
+                    to_snapshot_id: 7,
+                },
+            );
         },
     );
 
@@ -150,7 +155,7 @@ fn fragment_build_reports_missing_delta_resolver_before_encoding() {
         Err(err) => err,
     };
 
-    assert!(err.contains("IcebergDeltaTable"), "{err}");
+    assert!(err.contains("SqlDelta"), "{err}");
     assert!(err.contains("node_id=10"), "{err}");
     assert!(err.contains("from_snapshot_id=6"), "{err}");
     assert!(err.contains("to_snapshot_id=7"), "{err}");

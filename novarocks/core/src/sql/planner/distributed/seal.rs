@@ -332,18 +332,10 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use arrow::datatypes::DataType;
 
-    use crate::common::types::UniqueId;
-    use crate::query_execution::backend::LiveBackendSnapshot;
-    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-    use crate::runtime::endpoint::RuntimeEndpoint;
-    use crate::runtime_filter::deployment::compiler::compile_with_join_progress;
-    use crate::runtime_filter::deployment::{DeploymentError, RuntimeFilterDeploymentPolicy};
-    use crate::runtime_filter::port::identity::DeploymentEpoch;
-    use crate::runtime_filter::port::install::{MaterializationPolicy, RuntimeFilterCoreBudget};
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::fragment::{
@@ -707,51 +699,6 @@ mod tests {
         requirement.activation
     }
 
-    fn cycle_scheduling_plan(plan: &super::DistributedPlan) -> SchedulingPlan {
-        let endpoint = RuntimeEndpoint::from_socket_addr("127.0.0.1:9060".parse().unwrap());
-        let by_fragment = plan
-            .fragments()
-            .iter()
-            .map(|fragment| {
-                (
-                    fragment.fragment_id,
-                    vec![FragmentInstancePlacement {
-                        fragment_id: fragment.fragment_id,
-                        instance_index: 0,
-                        finst_id: UniqueId::new(1, i64::from(fragment.fragment_id)),
-                        backend_idx: 0,
-                        endpoint: endpoint.clone(),
-                        scan_ranges: BTreeMap::new(),
-                        connector_splits: BTreeMap::new(),
-                        destinations: Vec::new(),
-                        per_exch_num_senders: plan
-                            .edges()
-                            .iter()
-                            .filter(|edge| edge.target_fragment_id == fragment.fragment_id)
-                            .fold(BTreeMap::new(), |mut counts, edge| {
-                                *counts.entry(edge.target_exchange_node_id).or_insert(0) += 1;
-                                counts
-                            }),
-                    }],
-                )
-            })
-            .collect();
-        SchedulingPlan {
-            root_fragment_id: plan.root_fragment_id(),
-            by_fragment,
-            root_finst_id: UniqueId::new(1, i64::from(plan.root_fragment_id())),
-            root_backend_idx: 0,
-        }
-    }
-
-    fn cycle_deployment_policy() -> RuntimeFilterDeploymentPolicy {
-        RuntimeFilterDeploymentPolicy {
-            core_budget: RuntimeFilterCoreBudget::new(1024),
-            replica_redundancy: 1,
-            materialization: MaterializationPolicy::for_test(),
-        }
-    }
-
     /// A non-empty but structurally invalid graph: a producer binding points at a
     /// channel that was never inserted. `validate` rejects it with `UnknownChannel`.
     fn graph_with_binding_to_unknown_channel() -> DraftRuntimeFilterGraph {
@@ -886,117 +833,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sealed_pure_cycle_encodes_batch_activation_and_rejects_forged_blocking() {
-        let plan = seal_draft(cycle_draft(JoinKind::Inner)).expect("pure cycle draft seals");
-        let registry = crate::connector::ConnectorRegistry::new();
-        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
-        let prepared = crate::query_execution::preparation::prepare_fragments(
-            &plan,
-            &controls,
-            &crate::connector::test_request_context(),
-            None,
-            None,
-            crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
-        )
-        .expect("prepare actual sealed cycle plan");
-        let bundle =
-            crate::protocol::native::encode::encode_native_fragment_bundle(&plan, &prepared)
-                .expect("encode actual sealed cycle plan");
-        let encoded = bundle.get(5).expect("consumer fragment");
-        let root = encoded.root.as_ref().expect("consumer root");
-        assert_eq!(root.runtime_filter_binding_ids, vec![2]);
-        let table = encoded
-            .runtime_filter_bindings
-            .as_ref()
-            .expect("actual binding table");
-        let binding = table
-            .bindings
-            .first()
-            .expect("one encoded consumer binding");
-        let Some(novarocks_protocol::plan::runtime_filter_binding::Role::Consumer(consumer)) =
-            binding.role.as_ref()
-        else {
-            panic!("encoded binding remains a consumer");
-        };
-        let activation = consumer.activation.as_ref().expect("encoded activation");
-        let Some(
-            novarocks_protocol::plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
-                late_apply,
-            ),
-        ) = activation.kind.as_ref()
-        else {
-            panic!("cycle consumer encodes a non-blocking live activation");
-        };
-        assert_eq!(
-            *late_apply,
-            i32::from(novarocks_protocol::plan::RuntimeFilterLateApplyGranularity::Batch),
-            "only the sealed concrete activation crosses the native wire boundary",
-        );
-
-        let scheduling = cycle_scheduling_plan(&plan);
-        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
-        let policy = cycle_deployment_policy();
-        compile_with_join_progress(
-            plan.runtime_filter_graph(),
-            &scheduling,
-            plan.edges(),
-            plan.runtime_filter_join_progress(),
-            &backends,
-            &policy,
-            DeploymentEpoch::new(1),
-        )
-        .expect("actual sealed Batch Live graph is deployment-valid");
-
-        let mut forged_graph = plan.runtime_filter_graph().clone();
-        let RuntimeFilterBindingRole::Consumer(requirement) = &mut forged_graph
-            .binding_mut_for_test(BindingId::new(2))
-            .expect("actual graph consumer")
-            .role
-        else {
-            panic!("binding remains a consumer");
-        };
-        requirement.activation = ConsumerActivation::BlockingSnapshot;
-        assert!(matches!(
-            compile_with_join_progress(
-                &forged_graph,
-                &scheduling,
-                plan.edges(),
-                plan.runtime_filter_join_progress(),
-                &backends,
-                &policy,
-                DeploymentEpoch::new(1),
-            ),
-            Err(DeploymentError::BlockingFeedbackCycle { .. })
-        ));
-    }
-
-    #[test]
-    fn seal_keeps_impure_cycle_blocking_for_deployment_validator() {
-        let plan =
-            seal_draft(cycle_draft(JoinKind::LeftOuter)).expect("impure cycle draft must seal");
-
-        assert_eq!(
-            sealed_consumer_activation(&plan),
-            ConsumerActivation::BlockingSnapshot
-        );
-
-        let backends = LiveBackendSnapshot::from_endpoints(vec!["127.0.0.1:9060".parse().unwrap()]);
-        assert!(matches!(
-            compile_with_join_progress(
-                plan.runtime_filter_graph(),
-                &cycle_scheduling_plan(&plan),
-                plan.edges(),
-                plan.runtime_filter_join_progress(),
-                &backends,
-                &cycle_deployment_policy(),
-                DeploymentEpoch::new(1),
-            ),
-            Err(DeploymentError::BlockingFeedbackCycle { .. })
-        ));
-    }
-
-    #[test]
     fn seal_catalog_covers_each_consumer_in_binding_id_order() {
         let mut draft = super::test_support::single_fragment_draft(Some(0));
         draft.runtime_filter_graph = valid_non_empty_graph();

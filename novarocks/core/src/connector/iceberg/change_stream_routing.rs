@@ -18,7 +18,7 @@ use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
 use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
-use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology;
+use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriterCommitPlan {
@@ -36,9 +36,7 @@ impl ChangeStreamWriterCommitPlan {
         self.branch_by_writer_fragment.is_empty()
     }
 
-    pub(crate) fn from_topology(
-        topology: &IcebergChangeStreamWriteTopology,
-    ) -> Result<Self, String> {
+    pub(crate) fn from_topology(topology: &SqlChangeStreamWriteTopology) -> Result<Self, String> {
         let mut branch_by_writer_fragment = BTreeMap::new();
         for branch in &topology.writer_branches {
             insert_writer_fragment_branch(
@@ -54,7 +52,7 @@ impl ChangeStreamWriterCommitPlan {
     #[cfg(test)]
     pub(crate) fn writer_fragment_ids_for_topology(
         &self,
-        topology: &IcebergChangeStreamWriteTopology,
+        topology: &SqlChangeStreamWriteTopology,
     ) -> Vec<Option<FragmentId>> {
         let by_kind = self
             .branch_by_writer_fragment
@@ -388,16 +386,18 @@ mod tests {
 
     fn topology_for_test(
         branches: Vec<(i32, ChangeStreamBranchKind, FragmentId)>,
-    ) -> IcebergChangeStreamWriteTopology {
-        IcebergChangeStreamWriteTopology {
+    ) -> SqlChangeStreamWriteTopology {
+        SqlChangeStreamWriteTopology {
             writer_branches: branches
                 .into_iter()
                 .map(|(branch_id, branch_kind, writer_fragment_id)| {
-                    crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriterBranch {
+                    crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriterBranch {
                         branch_id,
                         branch_kind,
                         writer_fragment_id,
-                        sink_spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
+                        sink: crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                            crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                        ),
                     }
                 })
                 .collect(),

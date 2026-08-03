@@ -28,7 +28,7 @@ pub(crate) const DATA_ROUTE_REUSE: i32 = 1;
 pub(crate) const DATA_ROUTE_FRESH: i32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ChangeStreamBranchKind {
+pub enum ChangeStreamBranchKind {
     DeleteDv,
     ReuseData,
     FreshData,

@@ -1001,10 +1001,14 @@ fn iceberg_ref_from_scan(
     scan: &crate::sql::analysis::ScanRelation,
 ) -> Result<TableIdentity, String> {
     match &scan.table.source {
-        ScanSource::IcebergDataFiles { table, .. } => Ok(TableIdentity {
-            catalog: table.catalog.clone(),
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
+        // The IMV contract only needs the admitted SQL identity.  It must not
+        // retain an Iceberg scan descriptor merely to rediscover the base
+        // table; execution later obtains provider facts from this source's
+        // request-local binding.
+        ScanSource::Sql(source) => Ok(TableIdentity {
+            catalog: source.table.catalog.clone(),
+            namespace: source.table.namespace.clone(),
+            table: source.table.table.clone(),
         }),
         _ => Err(format!(
             "Iceberg IMV refresh contract requires Iceberg base tables, got non-Iceberg scan of `{}`",
@@ -1682,11 +1686,10 @@ fn join_key_side(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -1708,17 +1711,26 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDataFiles {
-                    table: iceberg_table_info(database, table),
-                    files: Vec::new(),
-                    cloud_properties: Default::default(),
-                    binding: IcebergDataFileBinding::CurrentSnapshot,
-                },
+                source: test_scan_source(catalog.unwrap_or("default_catalog"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
+    }
+
+    fn test_scan_source(catalog: &str, database: &str, table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: database.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
     }
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
@@ -1728,21 +1740,6 @@ mod tests {
             nullable,
             write_default: None,
             logical_type: None,
-        }
-    }
-
-    fn iceberg_table_info(database: &str, table: &str) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: database.to_string(),
-            table: table.to_string(),
-            table_uuid: Some(format!("uuid-{table}")),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: format!("file:///tmp/{database}/{table}"),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
         }
     }
 

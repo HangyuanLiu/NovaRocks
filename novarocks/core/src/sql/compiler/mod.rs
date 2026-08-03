@@ -21,6 +21,7 @@
 //! Application admission, connector execution preparation, native encoding,
 //! and query lifecycle orchestration remain outside this boundary.
 // Design: ADR-0025 (docs/adr/ADR-0025-sql-compiler-explicit-input-boundary.md)
+// Design: ADR-0036 (docs/adr/ADR-0036-sql-compiler-dependency-inversion.md)
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -122,23 +123,19 @@ pub(crate) enum SqlImvRewriteValidation {
 /// Application-frozen incremental-MV planning input.  The compiler owns the
 /// rewrite pipeline and its validation; application provides only the exact
 /// immutable refresh facts captured for this statement.
-///
-/// `IcebergMvRewriteContext` remains a transitional carrier while the
-/// remaining schema-contract vocabulary is moved under SQL ownership.  It is
-/// a value here, never a behavior callback or request context.
 #[derive(Clone)]
 pub(crate) struct SqlImvPlanningInput {
-    pub(crate) rewrite_context: Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>,
+    pub(crate) snapshot: Arc<mv_rewrite::SqlImvRewriteSnapshot>,
     pub(crate) validation: SqlImvRewriteValidation,
 }
 
 impl SqlImvPlanningInput {
     pub(crate) fn new(
-        rewrite_context: Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>,
+        snapshot: Arc<mv_rewrite::SqlImvRewriteSnapshot>,
         validation: SqlImvRewriteValidation,
     ) -> Self {
         Self {
-            rewrite_context,
+            snapshot,
             validation,
         }
     }
@@ -374,27 +371,36 @@ impl SqlCompiler {
                 factory,
             }));
         }
-        if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
+        if matches!(request.intent, SqlCompileIntent::LogicalOnly) && request.imv_rewrite.is_none()
+        {
             return Ok(SqlCompileOutput::Logical(SqlAnalysisOutput {
                 logical_plan,
                 factory,
             }));
         }
         let mut settings = request.session.optimizer_settings.clone();
-        apply_planning_environment(&mut settings, request.environment)?;
+        if !matches!(request.intent, SqlCompileIntent::LogicalOnly) {
+            apply_planning_environment(&mut settings, request.environment)?;
+        }
         let mut change_stream =
             crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
         if let Some(input) = request.imv_rewrite {
-            if !matches!(request.intent, SqlCompileIntent::ChangeStreamWrite) {
+            if !matches!(
+                request.intent,
+                SqlCompileIntent::ChangeStreamWrite
+                    | SqlCompileIntent::Explain { analyze: false, .. }
+                    | SqlCompileIntent::LogicalOnly
+            ) {
                 return Err(SqlCompileError::InvalidRequest(
-                    "incremental MV rewrite requires ChangeStreamWrite intent".to_string(),
+                    "incremental MV rewrite requires ChangeStreamWrite, LogicalOnly, or non-analyze EXPLAIN intent"
+                        .to_string(),
                 ));
             }
             let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
             let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
                 crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
                     plan: crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(logical_plan),
-                    mv_ctx: Arc::clone(&input.rewrite_context),
+                    snapshot: Arc::clone(&input.snapshot),
                     disabled_rules: settings.disabled_rules.clone(),
                     deadline: request.deadline(),
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -412,6 +418,12 @@ impl SqlCompiler {
                 })?
                 .into_inner();
             request.check_control()?;
+        }
+        if matches!(request.intent, SqlCompileIntent::LogicalOnly) {
+            return Ok(SqlCompileOutput::Logical(SqlAnalysisOutput {
+                logical_plan,
+                factory,
+            }));
         }
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
         let mut optimizer_expr =
@@ -543,7 +555,7 @@ pub(crate) fn validate_imv_rewrite_outcome(
     input: &SqlImvPlanningInput,
     outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
 ) -> Result<(), SqlCompileError> {
-    let target = input.rewrite_context.target.fqn();
+    let target = input.snapshot.target.fqn();
     let rule_changed = |rule_name: &str| {
         outcome.trace.events().iter().any(|event| {
             matches!(

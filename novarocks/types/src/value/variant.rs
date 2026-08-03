@@ -1457,6 +1457,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sqlx2_value_codec_variant_get_target_type_is_stable() {
+        assert_eq!(variant_get_target_type("bigint"), Ok(DataType::Int64));
+        assert_eq!(variant_get_target_type(" INT "), Ok(DataType::Int32));
+        assert_eq!(variant_get_target_type("string"), Ok(DataType::Utf8));
+        assert_eq!(
+            variant_get_target_type("datetime"),
+            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
+        );
+        assert!(variant_get_target_type("decimal(10,2)").is_err());
+        assert!(variant_get_target_type("variant").is_err());
+    }
+
+    #[test]
     fn split_serialized_round_trips_create_inputs() {
         let metadata = VariantMetadata::empty();
         let value = vec![6u8 << 2, 123, 0, 0, 0, 0, 0, 0, 0]; // int64 primitive 123

@@ -1298,7 +1298,9 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: None,
@@ -1318,7 +1320,9 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: None,
@@ -3236,7 +3240,9 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: None,
@@ -3576,7 +3582,9 @@ mod tests {
                 name: "t".into(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: None,

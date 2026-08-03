@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn any_of_channel_is_replica_direct() {
+    fn sqlx2_deployment_anyof_channel_is_replica_direct() {
         let inputs = ChannelRoleInputs {
             channel_id: ChannelId::new(1),
             availability_coverage: Coverage::AnyOf(vec![
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn all_of_channel_uses_aggregator() {
+    fn sqlx2_deployment_allof_channel_uses_aggregator() {
         let inputs = ChannelRoleInputs {
             channel_id: ChannelId::new(1),
             availability_coverage: Coverage::AllOf(vec![

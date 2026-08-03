@@ -46,7 +46,7 @@ use crate::sql::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::sql::planner::imv_rewrite::target_locator::is_target_locator_join;
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource};
 use crate::sql::planner::vocabulary::{HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME};
 use novarocks_catalog::schema::ColumnDef;
 
@@ -311,13 +311,14 @@ fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
 }
 
 fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
-    let fqn = match &scan.table.source {
-        ScanSource::IcebergDeltaTable { table, .. }
-        | ScanSource::IcebergVersionTable { table, .. } => {
-            format!("{}.{}.{}", table.catalog, table.namespace, table.table)
-        }
-        _ => scan.table.name.clone(),
-    };
+    let fqn = sql_scan_source(&scan.table.source)
+        .map(|source| {
+            format!(
+                "{}.{}.{}",
+                source.table.catalog, source.table.namespace, source.table.table
+            )
+        })
+        .unwrap_or_else(|| scan.table.name.clone());
 
     let action_columns: Vec<&OutputColumn> = scan
         .columns
@@ -325,8 +326,8 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
         .filter(|c| ImvActionColumn::matches(c))
         .collect();
 
-    match &scan.table.source {
-        ScanSource::IcebergDeltaTable { .. } => match action_columns.as_slice() {
+    match sql_scan_source(&scan.table.source).map(|source| &source.kind) {
+        Some(SqlScanKind::Delta { .. }) => match action_columns.as_slice() {
             [] => Err(format!("Delta-bound scan {fqn} missing action column")),
             [col] => {
                 if col.data_type != DataType::Int8 {
@@ -345,7 +346,7 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
                 "Delta-bound scan {fqn} has duplicate action columns"
             )),
         },
-        ScanSource::IcebergVersionTable { .. } => {
+        Some(_) if is_version_bound_scan_source(&scan.table.source) => {
             if !action_columns.is_empty() {
                 return Err(format!(
                     "Version-bound scan {fqn} must not carry action column"
@@ -389,11 +390,36 @@ fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
 
 fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanKind::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
-        }
+        LogicalPlanKind::Scan(scan) => is_delta_scan_source(&scan.table.source),
         _ => plan.children.iter().any(subtree_has_delta),
     }
+}
+
+fn sql_scan_source(source: &ScanSource) -> Option<&SqlScanSource> {
+    match source {
+        ScanSource::Sql(source) => Some(source),
+        _ => None,
+    }
+}
+
+fn is_delta_scan_source(source: &ScanSource) -> bool {
+    matches!(
+        sql_scan_source(source).map(|source| &source.kind),
+        Some(SqlScanKind::Delta { .. })
+    )
+}
+
+fn is_version_bound_scan_source(source: &ScanSource) -> bool {
+    matches!(
+        sql_scan_source(source).map(|source| &source.kind),
+        Some(
+            SqlScanKind::FrozenInputSet { .. }
+                | SqlScanKind::Data {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(_)
+                        | crate::sql::planner::table::SqlTableVersionSelector::TimestampMillis(_),
+                }
+        )
+    )
 }
 
 fn has_visible_output(plan: &LogicalPlanNode) -> bool {
@@ -422,8 +448,8 @@ fn has_visible_output(plan: &LogicalPlanNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{ExprKind, ProjectItem, TypedExpr};
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::imv_rewrite::change_stream::{
         AggregateChangeStreamDescriptor, AggregateChangeStreamShape, ImvChangeStreamDescriptor,
@@ -433,8 +459,11 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalUnionNode};
     use crate::sql::planner::payload::PlanProjectNode;
     use crate::sql::planner::payload::*;
-    use crate::sql::planner::table::TableDef;
+    use crate::sql::planner::table::{
+        SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     #[test]
     fn output_column_has_expected_shape() {
@@ -480,6 +509,21 @@ mod tests {
 
     // ── Validation tests (V1-V5) ────────────────────────────────────────────
 
+    fn scan_source(kind: SqlScanKind) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero scope")),
+                NonZeroU32::new(1).expect("non-zero ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "b".to_string(),
+            },
+            kind,
+        ))
+    }
+
     fn delta_scan_with(action: Option<OutputColumn>) -> PlanScanNode {
         let mut scan = PlanScanNode {
             database: "db".to_string(),
@@ -493,22 +537,10 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDeltaTable {
-                    table: IcebergTableInfo {
-                        catalog: "ice".to_string(),
-                        namespace: "db".to_string(),
-                        table: "b".to_string(),
-                        table_uuid: Some("uuid-b".to_string()),
-                        current_snapshot_id: Some(22),
-                        schema_id: 7,
-                        location: "file:///tmp/ice/db/b".to_string(),
-                        schema: IcebergSchemaDef { fields: Vec::new() },
-                        serialized_metadata: None,
-                        serialized_metadata_rows: None,
-                    },
+                source: scan_source(SqlScanKind::Delta {
                     from_snapshot_id: 11,
                     to_snapshot_id: 22,
-                },
+                }),
             },
             alias: None,
             columns: vec![OutputColumn {
@@ -673,14 +705,9 @@ mod tests {
     fn version_scan_with_action() -> PlanScanNode {
         let mut scan = delta_scan_with(Some(ImvActionColumn::output_column(ColumnId(100))));
         // Re-point the source to a version scan while keeping the (illegal) action column.
-        let table = match &scan.table.source {
-            ScanSource::IcebergDeltaTable { table, .. } => table.clone(),
-            _ => unreachable!(),
-        };
-        scan.table.source = ScanSource::IcebergVersionTable {
-            table,
-            snapshot_id: 22,
-        };
+        scan.table.source = scan_source(SqlScanKind::Data {
+            version: SqlTableVersionSelector::Snapshot(22),
+        });
         scan
     }
 

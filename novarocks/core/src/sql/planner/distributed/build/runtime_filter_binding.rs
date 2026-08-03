@@ -1021,12 +1021,6 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::deployment::planning_adapter as planning;
-    use crate::runtime_filter::deployment::role_graph::{
-        ChannelRoleGraph, ChannelRoleInputs, ConsumerPlacement, ProducerPlacement,
-        RouteEdgeAllocator, RouteKind, build_channel_role_graph,
-    };
-    use crate::runtime_filter::port::identity::RuntimeFilterParticipantId;
     use crate::sql::analysis::{ExprKind, LiteralValue};
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver,
@@ -1206,34 +1200,6 @@ mod tests {
             .expect("one producer witness")
     }
 
-    fn projected_role_graph(graph: &DraftRuntimeFilterGraph) -> ChannelRoleGraph {
-        let channel = graph.channels().next().expect("one channel");
-        let producer = graph
-            .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Producer(_)))
-            .expect("producer binding");
-        let consumer = graph
-            .bindings()
-            .find(|binding| matches!(binding.role, RuntimeFilterBindingRoleData::Consumer(_)))
-            .expect("consumer binding");
-        let inputs = ChannelRoleInputs {
-            channel_id: planning::channel_id(channel.channel_id),
-            availability_coverage: planning::coverage(&channel.availability_coverage),
-            producers: vec![ProducerPlacement {
-                binding: planning::binding_id(producer.binding_id),
-                participants: BTreeSet::from([
-                    RuntimeFilterParticipantId::new(1),
-                    RuntimeFilterParticipantId::new(3),
-                ]),
-            }],
-            consumers: vec![ConsumerPlacement {
-                binding: planning::binding_id(consumer.binding_id),
-                participants: BTreeSet::from([RuntimeFilterParticipantId::new(2)]),
-            }],
-        };
-        build_channel_role_graph(&inputs, 2, &mut RouteEdgeAllocator::new())
-    }
-
     #[test]
     fn broadcast_join_declares_anyof_coverage() {
         let graph = join_graph(&[(7, JoinExecutionMode::Broadcast)]);
@@ -1242,16 +1208,6 @@ mod tests {
         let expected = Coverage::AnyOf(vec![Coverage::Leaf(witness)]);
         assert_eq!(channel.availability_coverage, expected);
         assert_eq!(channel.terminal_coverage, expected);
-
-        let role_graph = projected_role_graph(&graph);
-        assert_eq!(role_graph.aggregator, None);
-        assert!(!role_graph.routes.is_empty());
-        assert!(
-            role_graph
-                .routes
-                .iter()
-                .all(|route| route.kind == RouteKind::ReplicaDirect)
-        );
     }
 
     #[test]
@@ -1262,21 +1218,6 @@ mod tests {
         let expected = Coverage::AllOf(vec![Coverage::Leaf(witness)]);
         assert_eq!(channel.availability_coverage, expected);
         assert_eq!(channel.terminal_coverage, expected);
-
-        let role_graph = projected_role_graph(&graph);
-        assert!(role_graph.aggregator.is_some());
-        assert!(
-            role_graph
-                .routes
-                .iter()
-                .any(|route| route.kind == RouteKind::ToAggregator)
-        );
-        assert!(
-            role_graph
-                .routes
-                .iter()
-                .any(|route| route.kind == RouteKind::FromAggregator)
-        );
     }
 
     #[test]

@@ -117,16 +117,57 @@ pub(crate) fn build_catalog_service_provider<'a>(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
 ) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
+    build_catalog_service_provider_with_query_local_overlays(
+        current_catalog,
+        catalog_service,
+        controls,
+        connector_context,
+        _lookup_mode,
+        Vec::new(),
+    )
+}
+
+/// Build the application catalog facade for one admitted query, optionally
+/// supplying generated relations that are scoped to that request.  These
+/// overlays are projected into SQL binding tokens before analysis and never
+/// enter the shared local catalog.
+pub(crate) fn build_catalog_service_provider_with_query_local_overlays<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    _lookup_mode: TableLookupMode,
+    overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let bindings = Arc::new(
         crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
             .expect("query table binding scope allocation must not fail"),
     );
+    build_catalog_service_provider_with_bindings_and_query_local_overlays(
+        current_catalog,
+        catalog_service,
+        controls,
+        connector_context,
+        bindings,
+        overlays,
+    )
+}
+
+pub(crate) fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>(
+    current_catalog: Option<&'a str>,
+    catalog_service: &'a QueryCatalogService,
+    controls: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    overlays: Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>,
+) -> crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer<'a> {
     let loader = query_stats::iceberg_table_binding_loader(controls, connector_context);
-    crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new(
+    crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
         current_catalog,
         catalog_service,
         bindings,
         loader,
+        overlays,
     )
 }
 
@@ -2141,6 +2182,7 @@ impl StandaloneSession {
                     current_database,
                     &stmt,
                     level,
+                    &connector_context,
                 )?;
             return Ok(StatementResult::Query(build_string_query_result(
                 "Explain String",
@@ -4538,7 +4580,8 @@ pub(crate) fn execute_query_as_iceberg_write(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -4554,7 +4597,8 @@ pub(crate) fn execute_query_as_iceberg_write(
         current_catalog,
         current_database,
         query,
-        sink_spec,
+        sink,
+        table_bindings,
         query_opts,
         root_distribution,
         execution,
@@ -4569,7 +4613,8 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -4581,12 +4626,14 @@ pub(crate) fn execute_query_as_iceberg_write_with_connector_context(
         current_catalog,
         current_database,
         query,
-        sink_spec,
+        sink,
+        table_bindings,
         query_opts,
         root_distribution,
         execution,
         connector_context,
         connector_write.map(DistributedConnectorWrite::Begin),
+        &[],
     )
 }
 
@@ -4596,7 +4643,8 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -4608,12 +4656,49 @@ pub(crate) fn execute_query_as_iceberg_write_in_operation_with_connector_context
         current_catalog,
         current_database,
         query,
-        sink_spec,
+        sink,
+        table_bindings,
         query_opts,
         root_distribution,
         execution,
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
+        &[],
+    )
+}
+
+/// Execute one generated write query with request-local relation overlays.
+/// This is used by COW rewrite slices whose frozen file input is not a durable
+/// catalog table.  The overlay is consumed by the application materializer
+/// and is never registered in the shared local catalog.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_write_in_operation_with_query_local_overlays(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
+    query_opts: Option<QueryOptions>,
+    root_distribution: crate::sql::compiler::RootDistributionRequirement,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+    overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    execute_query_as_iceberg_write_with_connector_binding(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink,
+        table_bindings,
+        query_opts,
+        root_distribution,
+        execution,
+        connector_context,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+        overlays,
     )
 }
 
@@ -4629,7 +4714,8 @@ pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_conte
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
@@ -4647,7 +4733,8 @@ pub(crate) fn execute_query_as_iceberg_staging_in_operation_with_connector_conte
         current_catalog,
         current_database,
         query,
-        sink_spec,
+        sink,
+        table_bindings,
         query_opts,
         root_distribution,
         execution,
@@ -4667,11 +4754,11 @@ pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connecto
     state: &Arc<StandaloneState>,
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 ) -> Result<
     (
@@ -4718,19 +4805,17 @@ pub(crate) fn execute_logical_plan_as_iceberg_staging_in_operation_with_connecto
         &optimizer_settings,
     )?;
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
-        physical_plan,
-        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
-            spec: sink_spec,
-            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        },
-        &optimizer_settings,
-    )?;
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+            physical_plan,
+            sink,
+            &optimizer_settings,
+        )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),
         connector_context,
+        Some(table_bindings),
         None,
         Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
         scan_preparation_options(&optimizer_settings, execution)?,
@@ -4759,11 +4844,11 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
     state: &Arc<StandaloneState>,
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    mv_refresh_ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 ) -> Result<crate::query_execution::prepared_write::PreparedDistributedWriteRequest, String> {
     crate::connector::validate_request_context(connector_context)?;
@@ -4804,19 +4889,17 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         &optimizer_settings,
     )?;
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
-        physical_plan,
-        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-            descriptor_database: mv_refresh_ctx.rewrite.current_database.clone(),
-            spec: sink_spec,
-            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        },
-        &optimizer_settings,
-    )?;
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+            physical_plan,
+            sink,
+            &optimizer_settings,
+        )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),
         connector_context,
+        Some(table_bindings),
         None,
         Some(mv_refresh_ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver),
         scan_preparation_options(&optimizer_settings, execution)?,
@@ -4842,9 +4925,10 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
 pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
     state: &Arc<StandaloneState>,
     physical_plan: crate::sql::planner::physical::PhysicalPlanNode,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
     connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
 ) -> Result<
@@ -4864,20 +4948,17 @@ pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
         }
     };
     let optimizer_settings = optimizer_settings_for_execution(Some(execution));
-    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
-        physical_plan,
-        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-            descriptor_database: "__distributed_rewrite".to_string(),
-            spec: sink_spec,
-            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        },
-        &optimizer_settings,
-    )?;
+    let distributed_plan =
+        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+            physical_plan,
+            sink,
+            &optimizer_settings,
+        )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),
         connector_context,
-        None,
+        Some(table_bindings),
         Some(scan_resolver),
         scan_preparation_options(&optimizer_settings, execution)?,
     )?;
@@ -4948,12 +5029,14 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: crate::sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
+    query_local_overlays: &[crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay],
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let maintenance_execution;
     let execution = match execution {
@@ -4984,18 +5067,24 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     }
 
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let analyzer_provider = build_catalog_service_provider(
+    let analyzer_provider = build_catalog_service_provider_with_bindings_and_query_local_overlays(
         current_catalog,
         &catalog_service_snapshot,
         state.connector_control.as_ref(),
         connector_context.clone(),
-        TableLookupMode::SchemaOnly,
+        Arc::clone(&table_bindings),
+        query_local_overlays.to_vec(),
     );
 
-    let table_bindings = analyzer_provider.query_table_bindings();
+    let resolved_bindings = analyzer_provider.query_table_bindings();
+    if !Arc::ptr_eq(&table_bindings, &resolved_bindings) {
+        return Err(
+            "SQL write catalog materializer replaced the admitted binding store".to_string(),
+        );
+    }
     let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
-        table_bindings.clone(),
+        Arc::clone(&table_bindings),
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -5030,26 +5119,10 @@ fn execute_query_as_iceberg_write_with_connector_binding(
     };
     let optimized_tree = compiled.optimized_tree;
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)?;
-    let writer_input = if connector_write.is_some()
-        && matches!(
-            sink_spec.mode,
-            crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
-                | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors
-        ) {
-        crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::OutputOrdinals(
-            vec![0, 1],
-        )
-    } else {
-        crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal
-    };
     let distributed_plan =
-        crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
             physical_plan,
-            crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-                descriptor_database: current_database.to_string(),
-                spec: sink_spec,
-                input: writer_input,
-            },
+            sink,
             &optimizer_settings,
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -5082,7 +5155,8 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
-    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     query_opts: Option<QueryOptions>,
     root_distribution: Option<crate::sql::compiler::RootDistributionRequirement>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
@@ -5101,17 +5175,23 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
         )?;
     }
     let catalog_service_snapshot = catalog_service_snapshot(state);
-    let analyzer_provider = build_catalog_service_provider(
+    let analyzer_provider = build_catalog_service_provider_with_bindings_and_query_local_overlays(
         current_catalog,
         &catalog_service_snapshot,
         state.connector_control.as_ref(),
         connector_context.clone(),
-        TableLookupMode::SchemaOnly,
+        Arc::clone(&table_bindings),
+        Vec::new(),
     );
-    let table_bindings = analyzer_provider.query_table_bindings();
+    let resolved_bindings = analyzer_provider.query_table_bindings();
+    if !Arc::ptr_eq(&table_bindings, &resolved_bindings) {
+        return Err(
+            "SQL write catalog materializer replaced the admitted binding store".to_string(),
+        );
+    }
     let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
         state,
-        table_bindings.clone(),
+        Arc::clone(&table_bindings),
     );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
@@ -5149,23 +5229,10 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_binding(
     };
     let physical_plan =
         crate::sql::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    let writer_input = match sink_spec.mode {
-        crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::PositionDeletes
-        | crate::sql::planner::distributed::write::sink::IcebergWriteSinkMode::DeletionVectors => {
-            crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::OutputOrdinals(
-                vec![0, 1],
-            )
-        }
-        _ => crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
-    };
     let distributed_plan =
-        crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        crate::sql::planner::pipeline::build_sql_write_distributed_plan_with_settings(
             physical_plan,
-            crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-                descriptor_database: current_database.to_string(),
-                spec: sink_spec,
-                input: writer_input,
-            },
+            sink,
             &optimizer_settings,
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -5269,7 +5336,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
-    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    topology: &crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 ) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
@@ -5307,7 +5374,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
     pub(crate) prepared: crate::query_execution::preparation::PreparedFragmentSet,
     pub(crate) native_bundle: crate::protocol::native::encode::NativeFragmentBundle,
     pub(crate) topology:
-        crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+        crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5348,7 +5415,7 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     optimized_tree: &crate::sql::optimizer::OptimizedOperatorNode,
     query_table_bindings: Option<&crate::engine::query_planning::bindings::QueryTableBindingStore>,
     dag: &mut crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
+    _mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
     pre_expand_keyed_assert: Option<crate::sql::planner::physical::PreExpandKeyedAssertSpec>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PlannedIcebergChangeStreamWrite, String> {
@@ -5360,9 +5427,8 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
         .clone();
     let physical_plan = crate::sql::planner::optimizer_bridge::to_physical_plan(optimized_tree)?;
     let planned_dp =
-        crate::sql::planner::pipeline::build_iceberg_change_stream_distributed_plan_with_settings(
+        crate::sql::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
             physical_plan,
-            current_database,
             dag.clone(),
             pre_expand_keyed_assert,
             &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
@@ -5705,15 +5771,12 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     imv_rewrite: Option<&crate::sql::compiler::SqlImvPlanningInput>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    let default_imv_rewrite;
     let imv_rewrite = match (mv_refresh_ctx, imv_rewrite) {
         (Some(_), Some(input)) => Some(input),
-        (Some(refresh), None) => {
-            default_imv_rewrite = crate::engine::mv::iceberg_refresh::sql_imv_planning_input(
-                refresh,
-                crate::engine::mv::iceberg_refresh::RewriteMergeRefreshEvidence::None,
+        (Some(_), None) => {
+            return Err(
+                "IMV refresh execution requires an admission-frozen SQL planning input".to_string(),
             );
-            Some(&default_imv_rewrite)
         }
         (None, Some(_)) => {
             return Err("IMV rewrite input requires MV refresh context".to_string());
@@ -5788,24 +5851,23 @@ pub(crate) struct PlannedIcebergChangeStreamRefreshQuery {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
+    state: &Arc<StandaloneState>,
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::PlannerTableProvider,
     current_database: &str,
     imv_rewrite: Option<&crate::sql::compiler::SqlImvPlanningInput>,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| {
             "distributed SQL compilation requires a frozen non-zero backend count".to_string()
         })?;
-    // Incremental MV refresh supplies its immutable, generation-fenced scan
-    // bindings through `IcebergMvRefreshContext`. Its one-shot in-memory
-    // analysis catalog therefore has no ordinary query binding store; retain
-    // that absence in the compiler output so physical preparation delegates
-    // only to the typed refresh resolver rather than reacquiring metadata.
-    let table_bindings = None;
     let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let statistics = query_stats::QueryStatisticsContext::unavailable();
+    let statistics = query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+        state,
+        Arc::clone(&table_bindings),
+    );
     let request = crate::sql::compiler::SqlCompileRequest::new(
         crate::sql::compiler::SqlStatementInput::ParsedQuery(Box::new(query.clone())),
         crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -5839,7 +5901,7 @@ pub(crate) fn plan_query_for_iceberg_change_stream_refresh(
         output_columns: compiled.optimized_tree.output_columns.clone(),
         optimized_tree: compiled.optimized_tree,
         change_stream: compiled.change_stream,
-        table_bindings,
+        table_bindings: Some(table_bindings),
     })
 }
 
@@ -6138,7 +6200,7 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
                 plan: crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
                     logical_plan,
                 ),
-                mv_ctx: std::sync::Arc::clone(&input.rewrite_context),
+                snapshot: std::sync::Arc::clone(&input.snapshot),
                 disabled_rules: optimizer_settings.disabled_rules.clone(),
                 deadline: execution.and_then(|execution| execution.deadline()),
                 column_ref_factory: std::rc::Rc::clone(&factory_cell),
@@ -6207,8 +6269,6 @@ fn prepare_query_with_options_and_imv_validator_with_catalog_provider(
         physical_plan,
         &optimizer_settings,
     )?;
-    let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     #[cfg(test)]
     let test_connector_controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     #[cfg(test)]
@@ -6319,8 +6379,6 @@ pub(crate) fn execute_logical_plan_with_options(
         physical_plan,
         &optimizer_settings,
     )?;
-    let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
     #[cfg(test)]
     let test_connector_controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     #[cfg(test)]
@@ -7190,7 +7248,7 @@ mod tests {
 
         fn prepare_and_execute_refresh(
             &self,
-            _preparation: &dyn crate::sql::mv_refresh::MvRefreshPreparationService,
+            _preparation: &dyn crate::mv::application::MvRefreshPreparationService,
             statement: MvApplicationStatement,
             target: MvTarget,
             _connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -8439,6 +8497,55 @@ mysql_port = 47892
     }
 
     #[test]
+    fn sqlx2_application_change_stream_kernel_retains_admission_binding_store() {
+        use crate::common::app_config::ClusterRole;
+        use crate::engine::query_planning::bindings::QueryTableBindingStore;
+        use crate::query_execution::backend::BackendTopologySnapshot;
+        use crate::query_execution::cancellation::QueryCancellationSource;
+        use crate::query_execution::request_context::QueryExecutionContext;
+
+        let query = parse_query_for_engine_test("select 1");
+        let catalog = super::PlannerMemoryCatalog::default();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
+        let topology = BackendTopologySnapshot::try_new(
+            7,
+            vec![LiveBackendTarget::new(
+                3,
+                "127.0.0.1:9030".parse().expect("backend endpoint"),
+                11,
+            )],
+        )
+        .expect("frozen topology");
+        let cancellation = QueryCancellationSource::new();
+        let execution = QueryExecutionContext::new(
+            ClusterRole::Fe,
+            topology,
+            None,
+            cancellation.view(),
+            crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        );
+
+        let planned = super::plan_query_for_iceberg_change_stream_refresh(
+            &Arc::new(super::StandaloneState::default()),
+            &query,
+            &catalog,
+            "default",
+            None,
+            Arc::clone(&bindings),
+            &execution,
+        )
+        .expect("change-stream compilation");
+
+        assert!(Arc::ptr_eq(
+            planned
+                .table_bindings
+                .as_ref()
+                .expect("kernel must retain admission bindings"),
+            &bindings,
+        ));
+    }
+
+    #[test]
     fn query_without_exchange_backend_fails_instead_of_direct_exec() {
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
@@ -8593,45 +8700,25 @@ mysql_port = 47892
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-                        table: crate::connector::iceberg::scan_model::IcebergTableInfo {
-                            catalog: "ice".to_string(),
-                            namespace: "db".to_string(),
-                            table: "b".to_string(),
-                            table_uuid: Some("uuid-b".to_string()),
-                            current_snapshot_id: Some(22),
-                            schema_id: 1,
-                            location: "file:///ice/db/b".to_string(),
-                            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
-                                fields: vec![
-                                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-                                        field_id: 1,
-                                        name: "k".to_string(),
-                                        initial_default: None,
-                                        write_default: None,
-                                        initial_default_json: None,
-                                        write_default_json: None,
-                                        children: Vec::new(),
-                                    },
-                                    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-                                        field_id: 2,
-                                        name: "v".to_string(),
-                                        initial_default: None,
-                                        write_default: None,
-                                        initial_default_json: None,
-                                        write_default_json: None,
-                                        children: Vec::new(),
-                                    },
-                                ],
+                    source: crate::sql::planner::table::ScanSource::Sql(
+                        crate::sql::planner::table::SqlScanSource::new(
+                            crate::sql::binding::SqlTableBindingId::new(
+                                crate::sql::binding::SqlTableBindingScopeId::new(
+                                    std::num::NonZeroU64::new(1).expect("nonzero scope"),
+                                ),
+                                std::num::NonZeroU32::new(1).expect("nonzero ordinal"),
+                            ),
+                            crate::sql::planner::table::SqlTableIdentity {
+                                catalog: "ice".to_string(),
+                                namespace: "db".to_string(),
+                                table: "b".to_string(),
                             },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
-                        },
-                        files: Vec::new(),
-                        cloud_properties: Default::default(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                            crate::sql::planner::table::SqlScanKind::Data {
+                                version:
+                                    crate::sql::planner::table::SqlTableVersionSelector::Current,
+                            },
+                        ),
+                    ),
                 },
             )
             .expect("register base table");
@@ -8640,8 +8727,10 @@ mysql_port = 47892
         let query_execution = super::test_query_execution_service();
         let validator = crate::engine::mv::iceberg_refresh::sql_imv_planning_input(
             &mv_ctx,
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
             crate::engine::mv::iceberg_refresh::RewriteMergeRefreshEvidence::Aggregate,
-        );
+        )
+        .expect("validator test projects immutable SQL IMV facts");
 
         let err = super::execute_query_with_options_and_imv_validator(
             &query,
@@ -8660,7 +8749,10 @@ mysql_port = 47892
         )
         .expect_err("typed IMV validation errors must abort refresh query execution");
 
-        assert!(err.contains("RewriteAggregateState"));
+        assert!(
+            err.contains("RewriteAggregateState"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -11169,22 +11261,170 @@ path = "meta/operations.sqlite"
         drop(engine);
     }
 
+    #[allow(dead_code)]
+    fn test_iceberg_write_sink_spec()
+    -> crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
+        crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
+            mode: crate::engine::query_planning::write_sink::IcebergWriteSinkMode::Data,
+            iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "target_orders".to_string(),
+                table_uuid: Some("00000000-0000-0000-0000-000000000002".to_string()),
+                current_snapshot_id: Some(1),
+                schema_id: 1,
+                location: "file:///warehouse/target_orders".to_string(),
+                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                    fields: vec![
+                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                            field_id: 1,
+                            name: "id".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            write_default_json: None,
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            },
+            target_columns: vec![novarocks_catalog::schema::ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            table_location: "file:///warehouse/target_orders".to_string(),
+            data_location: "file:///warehouse/target_orders/data".to_string(),
+            target_partition_spec_id: 0,
+            cloud_properties: BTreeMap::new(),
+            file_format: "parquet".to_string(),
+            compression:
+                crate::engine::query_planning::write_sink::IcebergWriteFileCompression::Snappy,
+            position_delete_output_descriptor: None,
+        }
+    }
+
+    fn test_sql_write_plan_input(
+        bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    ) -> crate::sql::planner::distributed::write::contract::SqlWritePlanInput {
+        use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
+        use crate::sql::catalog::ResolvedAnalyzerTable;
+        use crate::sql::planner::distributed::write::contract::{
+            ConnectorWriteInputBinding, SqlWritePartitionContract, SqlWriteSinkContract,
+            SqlWriteSinkMode, SqlWriteSinkTargetContract, SqlWriteTargetField,
+        };
+        use crate::sql::planner::table::{TableDef, test_sql_scan_source};
+
+        let column = novarocks_catalog::schema::ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        let binding = bindings
+            .resolve_or_insert_with_id(
+                QueryTableBindingKey::strict_base("test_catalog", "test_db", "target_orders"),
+                |binding| {
+                    Ok(QueryTableBinding::local(
+                        ResolvedAnalyzerTable::from_planner(
+                            Some("test_catalog"),
+                            "test_db",
+                            TableDef {
+                                name: "target_orders".to_string(),
+                                columns: vec![column.clone()],
+                                iceberg_row_lineage_metadata_columns: Vec::new(),
+                                source: test_sql_scan_source(
+                                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                                ),
+                            },
+                        ),
+                        binding,
+                    ))
+                },
+            )
+            .expect("test SQL write binding");
+        let target = SqlWriteSinkTargetContract::try_new(
+            binding,
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "target_orders".to_string(),
+            },
+            Some(1),
+            vec![SqlWriteTargetField {
+                field_id: 1,
+                column: column.clone(),
+                is_hidden: false,
+            }],
+            SqlWritePartitionContract {
+                spec_id: 0,
+                fields: Vec::new(),
+            },
+        )
+        .expect("test SQL write target");
+        crate::sql::planner::distributed::write::contract::SqlWritePlanInput {
+            contract: SqlWriteSinkContract::try_new(
+                SqlWriteSinkMode::Data,
+                target,
+                vec![column],
+                None,
+            )
+            .expect("test SQL write contract"),
+            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
+            root_output_exprs: None,
+        }
+    }
+
+    fn single_bucket_partition_metadata_json() -> String {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id_bucket", iceberg::spec::Transform::Bucket(16))
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/target_orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        serde_json::to_string(&metadata.metadata).expect("serialize metadata")
+    }
+
     #[test]
     fn coordinated_iceberg_insert_requires_exchange_server() {
         let query = parse_query_for_engine_test("SELECT id FROM missing_table");
         let state = Arc::new(StandaloneState::default());
-        let mut sink_spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-        sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
+        let table_bindings = Arc::new(
+            crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+                .expect("test binding store"),
         );
+        let sink = test_sql_write_plan_input(table_bindings.as_ref());
 
         let result = super::execute_query_as_iceberg_write(
             &state,
             None,
             "default",
             &query,
-            sink_spec,
+            sink,
+            table_bindings,
             None,
             crate::sql::compiler::RootDistributionRequirement::Any,
             None,
@@ -11213,18 +11453,19 @@ path = "meta/operations.sqlite"
         let mut state = StandaloneState::default();
         state.exchange_port = 1;
         let state = Arc::new(state);
-        let mut sink_spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-        sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::distributed::write::sink::test_support::single_bucket_partition_metadata_json(),
+        let table_bindings = Arc::new(
+            crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+                .expect("test binding store"),
         );
+        let sink = test_sql_write_plan_input(table_bindings.as_ref());
 
         let result = super::execute_query_as_iceberg_write(
             &state,
             None,
             "default",
             &query,
-            sink_spec,
+            sink,
+            table_bindings,
             None,
             crate::sql::compiler::RootDistributionRequirement::ShuffleOutputName(
                 "missing".to_string(),

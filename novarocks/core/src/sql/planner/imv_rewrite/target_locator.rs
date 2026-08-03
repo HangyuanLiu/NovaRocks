@@ -43,7 +43,10 @@ use crate::sql::planner::imv_rewrite::column_alloc::allocate_imv_column;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
+use crate::sql::planner::table::{
+    ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+    sql_mv_target_locator_scan,
+};
 use crate::sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
@@ -105,7 +108,7 @@ pub(crate) fn is_target_locator_join(plan: &LogicalPlanNode) -> bool {
         && matches!(
             &plan.right().kind,
             LogicalPlanKind::Scan(scan)
-                if matches!(scan.table.source, ScanSource::MvTargetLocator(_))
+                if sql_mv_target_locator_scan(&scan.table.source).is_some()
         )
 }
 
@@ -143,7 +146,7 @@ fn target_locator_join_input(
     let Some(ext) = ctx.extension::<ImvExtension>() else {
         return Ok(None);
     };
-    let contract = &ext.mv_ctx.schema_contract;
+    let contract = &ext.snapshot.schema_contract;
     if contract.target.hidden_apply_key.source == ApplyKeySource::GroupRowId {
         return Ok(None);
     }
@@ -171,13 +174,13 @@ fn target_locator_join_input(
             .find(|column| {
                 column
                     .name
-                    .eq_ignore_ascii_case(&branch.branch_id_column.column_name)
+                    .eq_ignore_ascii_case(&branch.branch_id_column_name)
                     || column.name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME)
             })?
             .clone();
         Some(LocatorBranchInput {
             left,
-            target_column: branch.branch_id_column.column_name.clone(),
+            target_column: branch.branch_id_column_name.clone(),
         })
     });
     Ok(Some(LocatorJoinInput {
@@ -309,7 +312,7 @@ fn build_target_locator_scan(
     right_row_id_id: ColumnId,
     right_last_updated_seq_id: ColumnId,
 ) -> LogicalPlanNode {
-    let target = &ext.mv_ctx.target;
+    let target = &ext.snapshot.target;
     let mut columns = vec![ColumnDef {
         name: input.target_apply_key_column.clone(),
         data_type: input.left_apply_key.data_type.clone(),
@@ -408,18 +411,25 @@ fn build_target_locator_scan(
                 name: target.table.clone(),
                 columns,
                 iceberg_row_lineage_metadata_columns: metadata_columns,
-                source: ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
-                    catalog: target.catalog.clone(),
-                    database: target.namespace.clone(),
-                    table: target.table.clone(),
-                    target_table_uuid: ext.mv_ctx.target_table_uuid.clone(),
-                    target_snapshot_id: ext.mv_ctx.target_snapshot_id,
-                    apply_key_column: input.target_apply_key_column.clone(),
-                    branch_id_column: input
-                        .branch
-                        .as_ref()
-                        .map(|branch| branch.target_column.clone()),
-                }),
+                source: ScanSource::Sql(SqlScanSource::new(
+                    ext.snapshot.target_binding,
+                    SqlTableIdentity {
+                        catalog: target.catalog.clone(),
+                        namespace: target.namespace.clone(),
+                        table: target.table.clone(),
+                    },
+                    SqlScanKind::MvTargetLocator {
+                        facts: SqlMvTargetLocatorScan {
+                            target_table_uuid: ext.snapshot.target_table_uuid.clone(),
+                            target_snapshot_id: ext.snapshot.target_snapshot_id,
+                            apply_key_column: input.target_apply_key_column.clone(),
+                            branch_id_column: input
+                                .branch
+                                .as_ref()
+                                .map(|branch| branch.target_column.clone()),
+                        },
+                    },
+                )),
             },
             alias: None,
             columns: scan_columns,

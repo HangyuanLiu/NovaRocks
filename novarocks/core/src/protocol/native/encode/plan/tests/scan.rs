@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -207,17 +206,15 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
         true,
     ));
     let table = iceberg_table_info_for_test();
-    scan.table.source = table_model::ScanSource::IcebergDataFiles {
-        table: table.clone(),
-        files: Vec::new(),
-        cloud_properties: BTreeMap::from([("region".to_string(), "test".to_string())]),
-        binding: iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot,
-    };
+    scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
+        version: table_model::SqlTableVersionSelector::Current,
+    });
     scan.required_columns = Some(vec!["order_id".to_string()]);
     let plan = plan.seal().expect("seal ordinary Iceberg fixture");
 
-    let without_binding = encode_distributed_plan(&plan, empty_scan_bindings())
-        .expect("encode ordinary Iceberg scan");
+    let missing = encode_distributed_plan(&plan, empty_scan_bindings())
+        .expect_err("tokenized SQL scans require a prepared binding");
+    assert!(missing.contains("SqlData"), "{missing}");
     let mut bindings = ScanExecutionBindings::default();
     bindings
         .insert_binding(file_binding_for_test(
@@ -245,7 +242,6 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
     )
     .expect("encode ordinary Iceberg binding");
 
-    assert_eq!(with_binding, without_binding);
     let scan = encoded_root_scan_for_test(&with_binding);
     let table = scan.table.as_ref().expect("bound table");
     let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(files)) = table
@@ -261,36 +257,34 @@ fn ordinary_iceberg_binding_preserves_existing_encoding() {
 #[test]
 fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
     let refresh_sources = [
-        table_model::ScanSource::IcebergVersionTable {
-            table: iceberg_table_info_for_test(),
-            snapshot_id: 1,
-        },
-        table_model::ScanSource::MvTargetLocator(table_model::SqlMvTargetLocatorScan {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            table: "orders".to_string(),
-            target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-            target_snapshot_id: Some(1),
-            apply_key_column: "bound_order_id".to_string(),
-            branch_id_column: None,
+        table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
+            version: table_model::SqlTableVersionSelector::Snapshot(1),
         }),
-        table_model::ScanSource::MvTargetState(table_model::SqlMvTargetStateScan {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            table: "orders".to_string(),
-            target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-            target_snapshot_id: Some(1),
-            aggregate_state_layout_version: 1,
-            columns: Vec::new(),
-            group_key_names: vec!["bound_order_id".to_string()],
-            aggregate_state_names: Vec::new(),
-            physical_column_names: vec!["bound_order_id".to_string()],
-            row_id_column_name: "bound_order_id".to_string(),
-            row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
-                row_id_column_name: "bound_order_id".to_string(),
-                branch_scope: None,
+        table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetLocator {
+            facts: table_model::SqlMvTargetLocatorScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(1),
+                apply_key_column: "bound_order_id".to_string(),
+                branch_id_column: None,
             },
-            partition_constraint: table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+        }),
+        table_model::test_sql_scan_source(table_model::SqlScanKind::MvTargetState {
+            facts: table_model::SqlMvTargetStateScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(1),
+                aggregate_state_layout_version: 1,
+                columns: Vec::new(),
+                group_key_names: vec!["bound_order_id".to_string()],
+                aggregate_state_names: Vec::new(),
+                physical_column_names: vec!["bound_order_id".to_string()],
+                row_id_column_name: "bound_order_id".to_string(),
+                row_filter: table_model::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                    row_id_column_name: "bound_order_id".to_string(),
+                    branch_scope: None,
+                },
+                partition_constraint:
+                    table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+            },
         }),
     ];
 
@@ -408,13 +402,22 @@ fn refresh_file_bindings_drive_source_projection_metadata_and_hidden_reads() {
             matches!(
                 (&expected_source, encoded_source),
                 (
-                    table_model::ScanSource::IcebergVersionTable { .. },
-                    novarocks_protocol::plan::scan_source::Kind::IcebergVersionTable(_)
+                    table_model::ScanSource::Sql(table_model::SqlScanSource {
+                        kind: table_model::SqlScanKind::Data { .. },
+                        ..
+                    }),
+                    novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(_)
                 ) | (
-                    table_model::ScanSource::MvTargetLocator(_),
+                    table_model::ScanSource::Sql(table_model::SqlScanSource {
+                        kind: table_model::SqlScanKind::MvTargetLocator { .. },
+                        ..
+                    }),
                     novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetLocator(_)
                 ) | (
-                    table_model::ScanSource::MvTargetState(_),
+                    table_model::ScanSource::Sql(table_model::SqlScanSource {
+                        kind: table_model::SqlScanKind::MvTargetState { .. },
+                        ..
+                    }),
                     novarocks_protocol::plan::scan_source::Kind::IcebergMvTargetState(_)
                 )
             ),
@@ -438,7 +441,7 @@ fn required_bindings_reject_missing_node_and_execution_variant_mismatch() {
     )
     .expect_err("delta source without prepared binding must fail");
     assert!(missing.contains("node_id=10"), "{missing}");
-    assert!(missing.contains("IcebergDeltaTable"), "{missing}");
+    assert!(missing.contains("SqlDelta"), "{missing}");
     assert!(missing.contains("from_snapshot_id=1"), "{missing}");
     assert!(missing.contains("to_snapshot_id=2"), "{missing}");
 
@@ -500,12 +503,9 @@ fn binding_encoder_preserves_variant_synthetic_output_and_required_name() {
     let mut table = iceberg_table_info_for_test();
     table.schema.fields[0].name = "v".to_string();
     scan.table.columns = vec![column_def_for_test("v", DataType::LargeBinary, false)];
-    scan.table.source = table_model::ScanSource::IcebergDataFiles {
-        table: table.clone(),
-        files: Vec::new(),
-        cloud_properties: BTreeMap::new(),
-        binding: iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles,
-    };
+    scan.table.source = table_model::test_sql_scan_source(table_model::SqlScanKind::Data {
+        version: table_model::SqlTableVersionSelector::Current,
+    });
     scan.columns = vec![
         output_column(1, "v", DataType::LargeBinary),
         OutputColumn {
@@ -727,11 +727,10 @@ fn iceberg_delta_table_for_test() -> table_model::TableDef {
             logical_type: None,
         }],
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: table_model::ScanSource::IcebergDeltaTable {
-            table: iceberg_table_info_for_test(),
+        source: table_model::test_sql_scan_source(table_model::SqlScanKind::Delta {
             from_snapshot_id: 1,
             to_snapshot_id: 2,
-        },
+        }),
     }
 }
 

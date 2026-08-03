@@ -266,11 +266,12 @@ fn delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
-        ScanSource::IcebergDeltaTable {
-            table: iceberg_table(),
-            from_snapshot_id: 6,
-            to_snapshot_id: 7,
-        },
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+        ),
     );
     let resolver = StaticResolver {
         execution: resolved_data_delta(),
@@ -419,4 +420,62 @@ fn unsupported_predicate_does_not_guess_pruning() {
         format!("{:?}", vec![unsupported_id_predicate()])
     );
     assert_eq!(read.splits.len(), 2);
+}
+
+#[test]
+fn sqlx2_mv_target_state_uses_only_frozen_allow_list_files() {
+    use std::collections::BTreeSet;
+
+    use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+    use crate::mv::persistence::schema::{
+        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+    };
+
+    let mut selected = identity_partition_file("s3://bucket/selected.parquet", 7);
+    selected.partition_spec_id = Some(3);
+    let mut skipped = identity_partition_file("s3://bucket/skipped.parquet", 9);
+    skipped.partition_spec_id = Some(3);
+    let allow_key = MvPartitionKey::new(
+        3,
+        vec![MvPartitionKeyField::new(
+            "id".to_string(),
+            MvPartitionValue::String("7".to_string()),
+        )],
+    );
+    let contract = MvPartitionContract {
+        target_spec_id: 3,
+        fields: vec![MvPartitionFieldContract {
+            partition_field_id: 100,
+            partition_field_name: "id".to_string(),
+            source_target_field_id: 1,
+            source_column_name: "id".to_string(),
+            transform: MvPartitionTransformContract::Identity,
+        }],
+    };
+
+    let files = super::super::filter_frozen_mv_target_state_files(
+        vec![selected, skipped],
+        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::from([allow_key])),
+        Some(&contract),
+        42,
+    )
+    .expect("frozen target-state files should be deterministically pruned");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "s3://bucket/selected.parquet");
+}
+
+#[test]
+fn sqlx2_mv_target_state_empty_allow_list_reads_no_frozen_files() {
+    use std::collections::BTreeSet;
+
+    let files = super::super::filter_frozen_mv_target_state_files(
+        vec![data_file("s3://bucket/target.parquet")],
+        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::new()),
+        None,
+        43,
+    )
+    .expect("an empty admitted allow-list is a zero-file scan");
+
+    assert!(files.is_empty());
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! UK/FK-based logical rewrites for standalone Iceberg table properties.
+//! UK/FK-based logical rewrites over frozen SQL table facts.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,18 +35,12 @@ use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::collect_output_ids_opt;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
+use crate::sql::planner::table::{ScanSource, SqlUkFkTableFacts};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
     Left,
     Right,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ForeignKeyConstraint {
-    local_columns: Vec<String>,
-    referenced_table: String,
-    referenced_columns: Vec<String>,
 }
 
 pub(crate) struct PruneUkFkJoin;
@@ -533,9 +527,7 @@ fn group_by_columns(
 }
 
 fn table_has_unique_key(scan: &ScanOp, columns: &[String]) -> bool {
-    unique_constraints(scan)
-        .into_iter()
-        .any(|constraint| same_columns(&constraint, columns))
+    sql_ukfk_facts(scan).is_some_and(|facts| facts.has_unique_key(columns))
 }
 
 fn foreign_key_matches(
@@ -544,117 +536,28 @@ fn foreign_key_matches(
     local_columns: &[String],
     referenced_columns: &[String],
 ) -> bool {
-    if !table_has_unique_key(referenced_scan, referenced_columns) {
-        return false;
-    }
-    foreign_key_constraints(local_scan).into_iter().any(|fk| {
-        same_columns(&fk.local_columns, local_columns)
-            && table_name_matches(referenced_scan, &fk.referenced_table)
-            && same_columns(&fk.referenced_columns, referenced_columns)
-    })
-}
-
-fn unique_constraints(scan: &ScanOp) -> Vec<Vec<String>> {
-    let Some(value) = table_properties(scan).remove("unique_constraints") else {
-        return Vec::new();
-    };
-    value.split(';').filter_map(parse_column_list).collect()
-}
-
-fn foreign_key_constraints(scan: &ScanOp) -> Vec<ForeignKeyConstraint> {
-    let Some(value) = table_properties(scan).remove("foreign_key_constraints") else {
-        return Vec::new();
-    };
-    value
-        .split(';')
-        .filter_map(parse_foreign_key_constraint)
-        .collect()
-}
-
-fn table_properties(scan: &ScanOp) -> HashMap<String, String> {
-    let Some(serialized_metadata) =
-        iceberg_table_info(&scan.table.source).and_then(|table| table.serialized_metadata.as_ref())
+    let (Some(local_facts), Some(referenced_facts)) =
+        (sql_ukfk_facts(local_scan), sql_ukfk_facts(referenced_scan))
     else {
-        return HashMap::new();
-    };
-    let Ok(metadata) = serde_json::from_str::<iceberg::spec::TableMetadata>(serialized_metadata)
-    else {
-        return HashMap::new();
-    };
-    metadata
-        .properties()
-        .iter()
-        .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
-        .collect()
-}
-
-fn iceberg_table_info(
-    source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
-    match source {
-        crate::sql::planner::table::ScanSource::Sql(_) => None,
-        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::MvTargetState { .. }
-        | crate::sql::planner::table::ScanSource::MvTargetLocator { .. } => None,
-    }
-}
-
-fn parse_foreign_key_constraint(raw: &str) -> Option<ForeignKeyConstraint> {
-    let raw = raw.trim().trim_end_matches(';').trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let references_idx = raw.to_ascii_lowercase().find("references")?;
-    let left = raw[..references_idx].trim();
-    let right = raw[references_idx + "references".len()..].trim();
-    let local_columns = parse_column_list(left)?;
-    let open = right.find('(')?;
-    let referenced_table = normalize_table_name(&right[..open]);
-    let referenced_columns = parse_column_list(right)?;
-    if referenced_table.is_empty() || local_columns.is_empty() || referenced_columns.is_empty() {
-        return None;
-    }
-    Some(ForeignKeyConstraint {
-        local_columns,
-        referenced_table,
-        referenced_columns,
-    })
-}
-
-fn parse_column_list(raw: &str) -> Option<Vec<String>> {
-    let segment = if let Some(open) = raw.find('(') {
-        let close = raw[open + 1..].find(')')? + open + 1;
-        &raw[open + 1..close]
-    } else {
-        raw
-    };
-    let columns = segment
-        .split(',')
-        .map(normalize_identifier)
-        .filter(|column| !column.is_empty())
-        .collect::<Vec<_>>();
-    (!columns.is_empty()).then_some(columns)
-}
-
-fn same_columns(left: &[String], right: &[String]) -> bool {
-    if left.len() != right.len() {
         return false;
-    }
-    let left: HashSet<&str> = left.iter().map(String::as_str).collect();
-    right.iter().all(|column| left.contains(column.as_str()))
+    };
+    referenced_facts.has_unique_key(referenced_columns)
+        && local_facts.has_matching_foreign_key(
+            local_columns,
+            &referenced_scan.table.name,
+            referenced_scan.alias.as_deref(),
+            referenced_columns,
+        )
 }
 
-fn table_name_matches(scan: &ScanOp, raw_table: &str) -> bool {
-    let table = normalize_table_name(raw_table);
-    if table.eq_ignore_ascii_case(&scan.table.name) {
-        return true;
+fn sql_ukfk_facts(scan: &ScanOp) -> Option<&SqlUkFkTableFacts> {
+    match &scan.table.source {
+        ScanSource::Sql(source) => Some(source.ukfk_facts()),
+        // A non-SQL source cannot carry admission-frozen constraint facts.
+        // Keep the rewrite conservative while rejecting the stale carrier at
+        // the compiler boundary rather than reconstructing provider state.
+        _ => None,
     }
-    scan.alias
-        .as_ref()
-        .is_some_and(|alias| table.eq_ignore_ascii_case(alias))
 }
 
 fn normalize_identifier(raw: &str) -> String {
@@ -669,10 +572,6 @@ fn normalize_identifier(raw: &str) -> String {
         .trim_matches('"')
         .trim_matches('\'')
         .to_ascii_lowercase()
-}
-
-fn normalize_table_name(raw: &str) -> String {
-    normalize_identifier(raw)
 }
 
 fn add_not_null_filter(
@@ -824,7 +723,9 @@ mod tests {
                 name: table_name.to_string(),
                 columns,
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: None,
@@ -1017,6 +918,36 @@ mod tests {
         assert!(matches!(
             arena.node(rewritten.expr),
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1)))
+        ));
+    }
+
+    #[test]
+    fn sqlx2_ukfk_facts_match_frozen_sql_constraints_without_provider_metadata() {
+        let properties = std::collections::BTreeMap::from([
+            (
+                "UNIQUE_CONSTRAINTS".to_string(),
+                "`customer_id`".to_string(),
+            ),
+            (
+                "foreign_key_constraints".to_string(),
+                "`customer_id` REFERENCES sales.customers (`id`)".to_string(),
+            ),
+        ]);
+
+        let facts = SqlUkFkTableFacts::from_frozen_properties(&properties);
+
+        assert!(facts.has_unique_key(&["CUSTOMER_ID".to_string()]));
+        assert!(facts.has_matching_foreign_key(
+            &["customer_id".to_string()],
+            "customers",
+            Some("c"),
+            &["id".to_string()],
+        ));
+        assert!(!facts.has_matching_foreign_key(
+            &["customer_id".to_string()],
+            "orders",
+            None,
+            &["id".to_string()],
         ));
     }
 }

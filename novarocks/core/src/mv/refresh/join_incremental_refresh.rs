@@ -16,8 +16,8 @@ use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
     execute_and_collect_change_stream_write,
 };
-use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
 
@@ -57,17 +57,17 @@ pub(crate) struct JoinIncrementalLogicalPlan {
 }
 
 pub(crate) fn build_join_incremental_refresh_logical_plan(
-    rewrite: &Arc<IcebergMvRewriteContext>,
+    snapshot: &Arc<SqlImvRewriteSnapshot>,
     mode: JoinIncrementalRefreshMode,
     input: JoinIncrementalLogicalInput,
 ) -> Result<JoinIncrementalLogicalPlan, String> {
     let JoinIncrementalLogicalInput { plan, factory } = input;
-    let is_aggregate_refresh = rewrite.schema_contract.aggregate.is_some();
+    let is_aggregate_refresh = snapshot.schema_contract.aggregate.is_some();
     let factory_cell = Rc::new(RefCell::new(factory));
     let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
         crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
-            mv_ctx: Arc::clone(rewrite),
+            snapshot: Arc::clone(snapshot),
             disabled_rules: logical_execution_disabled_rules(
                 is_aggregate_refresh,
                 &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
@@ -93,13 +93,13 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
                 .ok_or_else(|| {
                     format!(
                         "iceberg join MV {} incremental refresh rewrite did not produce join refresh descriptor",
-                        rewrite.target.fqn()
+                        snapshot.target.fqn()
                     )
                 })?;
             descriptor.validate().map_err(|e| {
                 format!(
                     "iceberg join MV {} incremental refresh descriptor is invalid: {e}",
-                    rewrite.target.fqn()
+                    snapshot.target.fqn()
                 )
             })?;
             change_stream_override = Some(ImvChangeStreamDescriptor {
@@ -111,7 +111,7 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
             crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                 outcome.plan,
                 &descriptor,
-                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(rewrite),
+                &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(snapshot),
                 &mut factory,
                 locator_columns.net,
                 locator_columns.file,

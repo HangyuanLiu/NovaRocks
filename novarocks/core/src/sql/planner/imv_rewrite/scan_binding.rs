@@ -18,12 +18,11 @@
 //! Iceberg IMV scan binding.
 //!
 //! This module consumes refresh-only IMV scan markers by resolving snapshot
-//! windows from `IcebergMvRewriteContext`. It must never fall back to the
+//! windows from the SQL-owned IMV rewrite snapshot. It must never fall back to the
 //! current Iceberg snapshot: the refresh pin is the read upper bound.
 
-use crate::connector::iceberg::scan_model::IcebergTableInfo;
-use crate::mv::rewrite::context::IcebergMvRewriteContext;
 pub(crate) use crate::sql::common::ImvVersionRole;
+use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -34,8 +33,9 @@ use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::PlanScanNode;
-use crate::sql::planner::table::ScanSource;
-use novarocks_catalog::identifier::TableIdentity;
+use crate::sql::planner::table::{
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -92,7 +92,7 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                     let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
-                    let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
+                    let mut bound = bind_delta_scan(scan, &ext.snapshot)?;
                     if let Some(column_id) = node.action_column {
                         bound
                             .columns
@@ -114,7 +114,7 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                     let LogicalPlanKind::Scan(scan) = scan_kind else {
                         return Ok(PlanRewriteResult::Unchanged);
                     };
-                    let bound = bind_version_scan(scan, &ext.mv_ctx, node.version_ref.role)?;
+                    let bound = bind_version_scan(scan, &ext.snapshot, node.version_ref.role)?;
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                         LogicalPlanKind::Scan(bound),
                         vec![],
@@ -129,30 +129,39 @@ impl LogicalRewriteRule for BindIcebergScanRule {
 
 fn bind_delta_scan(
     mut scan: PlanScanNode,
-    mv_ctx: &IcebergMvRewriteContext,
+    snapshot: &SqlImvRewriteSnapshot,
 ) -> Result<PlanScanNode, String> {
-    let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
-    let window = resolve_snapshot_window(mv_ctx, &table)?;
-    scan.table.source = ScanSource::IcebergDeltaTable {
-        table,
-        from_snapshot_id: window.from_snapshot_id,
-        to_snapshot_id: window.to_snapshot_id,
-    };
+    let source = sql_base_scan_source(&scan.table.source)?;
+    let window = resolve_snapshot_window(snapshot, &source.table)?;
+    scan.table.source = ScanSource::Sql(SqlScanSource::new(
+        source.binding,
+        source.table,
+        SqlScanKind::Delta {
+            from_snapshot_id: window.from_snapshot_id,
+            to_snapshot_id: window.to_snapshot_id,
+        },
+    ));
     Ok(scan)
 }
 
 fn bind_version_scan(
     mut scan: PlanScanNode,
-    mv_ctx: &IcebergMvRewriteContext,
+    snapshot: &SqlImvRewriteSnapshot,
     role: ImvVersionRole,
 ) -> Result<PlanScanNode, String> {
-    let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
-    let window = resolve_snapshot_window(mv_ctx, &table)?;
+    let source = sql_base_scan_source(&scan.table.source)?;
+    let window = resolve_snapshot_window(snapshot, &source.table)?;
     let snapshot_id = match role {
         ImvVersionRole::From => window.from_snapshot_id,
         ImvVersionRole::To => window.to_snapshot_id,
     };
-    scan.table.source = ScanSource::IcebergVersionTable { table, snapshot_id };
+    scan.table.source = ScanSource::Sql(SqlScanSource::new(
+        source.binding,
+        source.table,
+        SqlScanKind::FrozenInputSet {
+            version: SqlTableVersionSelector::Snapshot(snapshot_id),
+        },
+    ));
     scan.columns
         .retain(|column| !is_action_column_name(&column.name));
     scan.table
@@ -165,29 +174,30 @@ fn is_action_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(ImvActionColumn::NAME)
 }
 
-fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableInfo, String> {
+fn sql_base_scan_source(source: &ScanSource) -> Result<SqlScanSource, String> {
     match source {
+        ScanSource::Sql(source)
+            if matches!(
+                source.kind,
+                SqlScanKind::Data { .. } | SqlScanKind::FrozenInputSet { .. }
+            ) =>
+        {
+            Ok(source.clone())
+        }
         ScanSource::Sql(_) => {
-            Err("BindIcebergScan requires immutable Iceberg snapshot facts".to_string())
+            Err("BindIcebergScan requires a data or frozen-input SQL scan source".to_string())
         }
-        ScanSource::IcebergDataFiles { table, .. }
-        | ScanSource::IcebergDeltaTable { table, .. }
-        | ScanSource::IcebergVersionTable { table, .. } => Ok(table),
-        ScanSource::ConnectorPinned
-        | ScanSource::MvTargetState { .. }
-        | ScanSource::MvTargetLocator { .. } => {
-            Err("BindIcebergScan only supports Iceberg scan sources".to_string())
-        }
+        _ => Err("BindIcebergScan requires a token-bound SQL scan source".to_string()),
     }
 }
 
 fn resolve_snapshot_window(
-    mv_ctx: &IcebergMvRewriteContext,
-    table: &IcebergTableInfo,
+    snapshot: &SqlImvRewriteSnapshot,
+    table: &SqlTableIdentity,
 ) -> Result<ImvSnapshotWindow, String> {
-    let base_ref = find_base_ref(mv_ctx, table)?;
-    let base_fqn = base_ref.fqn();
-    let from_snapshot_id = mv_ctx
+    let base = find_base_ref(snapshot, table)?;
+    let base_fqn = base.table.fqn();
+    let from_snapshot_id = snapshot
         .previous_snapshot_ids
         .get(&base_fqn)
         .copied()
@@ -196,40 +206,22 @@ fn resolve_snapshot_window(
                 "IMV scan binding requires previous snapshot for base {base_fqn}; first refresh/full rebuild must not enter incremental scan binding"
             )
         })?;
-    let to_snapshot_id = mv_ctx.pin.get(base_ref).ok_or_else(|| {
-        format!("IMV scan binding refresh pin missing snapshot for base {base_fqn}")
-    })?;
-    let pin_uuid = mv_ctx
-        .pin
-        .uuid(base_ref)
-        .ok_or_else(|| format!("IMV scan binding refresh pin missing uuid for base {base_fqn}"))?;
-    if let Some(table_uuid) = table.table_uuid.as_deref()
-        && table_uuid != pin_uuid
-    {
-        return Err(format!(
-            "IMV scan binding base table uuid mismatch for {base_fqn}: plan has {table_uuid}, pin has {pin_uuid}"
-        ));
-    }
+    let to_snapshot_id = base.snapshot_id;
+    let pin_uuid = &base.table_uuid;
     Ok(ImvSnapshotWindow {
         base_fqn,
         from_snapshot_id,
         to_snapshot_id,
-        table_uuid: pin_uuid.to_string(),
+        table_uuid: pin_uuid.clone(),
     })
 }
 
 fn find_base_ref<'a>(
-    mv_ctx: &'a IcebergMvRewriteContext,
-    table: &IcebergTableInfo,
-) -> Result<&'a TableIdentity, String> {
-    mv_ctx
-        .base_refs
-        .iter()
-        .find(|base| {
-            base.catalog.eq_ignore_ascii_case(&table.catalog)
-                && base.namespace.eq_ignore_ascii_case(&table.namespace)
-                && base.table.eq_ignore_ascii_case(&table.table)
-        })
+    snapshot: &'a SqlImvRewriteSnapshot,
+    table: &SqlTableIdentity,
+) -> Result<&'a crate::sql::compiler::mv_rewrite::SqlImvBaseSnapshot, String> {
+    snapshot
+        .base_snapshot_for_parts(&table.catalog, &table.namespace, &table.table)
         .ok_or_else(|| {
             format!(
                 "IMV scan binding base {}.{}.{} is not part of MV refresh context",
@@ -240,20 +232,19 @@ fn find_base_ref<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::logical::*;
-    use crate::sql::planner::payload::*;
-    use std::collections::BTreeMap;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
-    use crate::sql::planner::table::TableDef;
+    use crate::sql::planner::logical::*;
+    use crate::sql::planner::payload::*;
+    use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef};
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -265,22 +256,32 @@ mod tests {
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
 
-    fn iceberg_table_info(uuid: Option<&str>) -> IcebergTableInfo {
-        IcebergTableInfo {
+    fn sql_source(table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+                NonZeroU32::new(1).expect("ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
+    }
+
+    fn base_identity(table: &str) -> SqlTableIdentity {
+        SqlTableIdentity {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
-            table: "b".to_string(),
-            table_uuid: uuid.map(str::to_string),
-            current_snapshot_id: Some(22),
-            schema_id: 7,
-            location: "file:///tmp/ice/db/b".to_string(),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
+            table: table.to_string(),
         }
     }
 
-    fn iceberg_scan(uuid: Option<&str>) -> PlanScanNode {
+    fn iceberg_scan() -> PlanScanNode {
         let column = ColumnDef {
             name: "k".to_string(),
             data_type: DataType::Int64,
@@ -294,12 +295,7 @@ mod tests {
                 name: "b".to_string(),
                 columns: vec![column],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDataFiles {
-                    table: iceberg_table_info(uuid),
-                    files: Vec::new(),
-                    cloud_properties: BTreeMap::new(),
-                    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                },
+                source: sql_source("b"),
             },
             alias: None,
             columns: vec![OutputColumn {
@@ -318,9 +314,9 @@ mod tests {
 
     #[test]
     fn resolve_window_uses_previous_snapshot_and_refresh_pin() {
-        let ctx = dummy_rewrite_context();
-        let window = resolve_snapshot_window(&ctx, &iceberg_table_info(Some("uuid-b")))
-            .expect("window should resolve");
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let window =
+            resolve_snapshot_window(&snapshot, &base_identity("b")).expect("window should resolve");
         assert_eq!(window.base_fqn, "ice.db.b");
         assert_eq!(window.from_snapshot_id, 11);
         assert_eq!(window.to_snapshot_id, 22);
@@ -328,29 +324,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_window_rejects_uuid_mismatch() {
-        let ctx = dummy_rewrite_context();
-        let err = resolve_snapshot_window(&ctx, &iceberg_table_info(Some("other-uuid")))
-            .expect_err("uuid mismatch must fail");
-        assert!(err.contains("uuid mismatch"), "unexpected error: {err}");
-        assert!(err.contains("ice.db.b"), "unexpected error: {err}");
+    fn resolve_window_rejects_unbound_base_identity() {
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let err = resolve_snapshot_window(&snapshot, &base_identity("other"))
+            .expect_err("unbound base must fail");
+        assert!(
+            err.contains("not part of MV refresh context"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("ice.db.other"), "unexpected error: {err}");
     }
 
     #[test]
-    fn bind_delta_scan_replaces_source_with_iceberg_delta_table() {
-        let ctx = dummy_rewrite_context();
-        let bound =
-            bind_delta_scan(iceberg_scan(Some("uuid-b")), &ctx).expect("delta scan should bind");
+    fn bind_delta_scan_replaces_source_with_sql_delta_fact() {
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let bound = bind_delta_scan(iceberg_scan(), &snapshot).expect("delta scan should bind");
         match bound.table.source {
-            ScanSource::IcebergDeltaTable {
-                from_snapshot_id,
-                to_snapshot_id,
+            ScanSource::Sql(SqlScanSource {
+                kind:
+                    SqlScanKind::Delta {
+                        from_snapshot_id,
+                        to_snapshot_id,
+                    },
                 ..
-            } => {
+            }) => {
                 assert_eq!(from_snapshot_id, 11);
                 assert_eq!(to_snapshot_id, 22);
             }
-            other => panic!("expected IcebergDeltaTable, got {other:?}"),
+            other => panic!("expected SQL delta source, got {other:?}"),
         }
     }
 
@@ -360,7 +361,7 @@ mod tests {
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         let plan = LogicalPlanNode::new(
@@ -370,7 +371,7 @@ mod tests {
                 branch_scope: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Scan(iceberg_scan(Some("uuid-b"))),
+                LogicalPlanKind::Scan(iceberg_scan()),
                 vec![],
                 None,
             )],
@@ -423,10 +424,10 @@ mod tests {
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
-        let mut scan = iceberg_scan(Some("uuid-b"));
+        let mut scan = iceberg_scan();
         scan.columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(9),
             name: ImvActionColumn::NAME.to_string(),
@@ -483,34 +484,46 @@ mod tests {
 
     #[test]
     fn bind_version_scan_uses_from_snapshot() {
-        let ctx = dummy_rewrite_context();
-        let bound = bind_version_scan(iceberg_scan(Some("uuid-b")), &ctx, ImvVersionRole::From)
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let bound = bind_version_scan(iceberg_scan(), &snapshot, ImvVersionRole::From)
             .expect("version scan should bind");
         match bound.table.source {
-            ScanSource::IcebergVersionTable { snapshot_id, .. } => {
+            ScanSource::Sql(SqlScanSource {
+                kind:
+                    SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                    },
+                ..
+            }) => {
                 assert_eq!(snapshot_id, 11);
             }
-            other => panic!("expected IcebergVersionTable, got {other:?}"),
+            other => panic!("expected frozen SQL source, got {other:?}"),
         }
     }
 
     #[test]
     fn bind_version_scan_uses_to_snapshot() {
-        let ctx = dummy_rewrite_context();
-        let bound = bind_version_scan(iceberg_scan(Some("uuid-b")), &ctx, ImvVersionRole::To)
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let bound = bind_version_scan(iceberg_scan(), &snapshot, ImvVersionRole::To)
             .expect("version scan should bind");
         match bound.table.source {
-            ScanSource::IcebergVersionTable { snapshot_id, .. } => {
+            ScanSource::Sql(SqlScanSource {
+                kind:
+                    SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                    },
+                ..
+            }) => {
                 assert_eq!(snapshot_id, 22);
             }
-            other => panic!("expected IcebergVersionTable, got {other:?}"),
+            other => panic!("expected frozen SQL source, got {other:?}"),
         }
     }
 
     #[test]
     fn bind_version_scan_strips_refresh_action_column() {
-        let ctx = dummy_rewrite_context();
-        let mut scan = iceberg_scan(Some("uuid-b"));
+        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let mut scan = iceberg_scan();
         scan.columns
             .push(ImvActionColumn::output_column(ColumnId::new_for_test(99)));
         scan.table
@@ -523,8 +536,8 @@ mod tests {
                 logical_type: None,
             });
 
-        let bound =
-            bind_version_scan(scan, &ctx, ImvVersionRole::To).expect("version scan should bind");
+        let bound = bind_version_scan(scan, &snapshot, ImvVersionRole::To)
+            .expect("version scan should bind");
 
         assert!(
             !bound.columns.iter().any(ImvActionColumn::matches),

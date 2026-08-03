@@ -264,13 +264,7 @@ pub(super) fn encode_table_def_with_context(
 }
 
 fn scan_source_requires_resolved_binding(source: &table_model::ScanSource) -> bool {
-    matches!(
-        source,
-        table_model::ScanSource::IcebergDeltaTable { .. }
-            | table_model::ScanSource::IcebergVersionTable { .. }
-            | table_model::ScanSource::MvTargetState(_)
-            | table_model::ScanSource::MvTargetLocator(_)
-    )
+    matches!(source, table_model::ScanSource::Sql(_))
 }
 
 fn resolved_binding_table_columns(
@@ -556,11 +550,15 @@ fn scan_binding_for_source<'a>(
     let required = scan_source_requires_resolved_binding(source);
     if required && binding.is_none() {
         return Err(match source {
-            table_model::ScanSource::IcebergDeltaTable {
-                from_snapshot_id,
-                to_snapshot_id,
+            table_model::ScanSource::Sql(table_model::SqlScanSource {
+                kind:
+                    table_model::SqlScanKind::Delta {
+                        from_snapshot_id,
+                        to_snapshot_id,
+                        ..
+                    },
                 ..
-            } => format!(
+            }) => format!(
                 "native scan encoder missing prepared binding for node_id={node_id} source={} from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}",
                 scan_source_kind(source)
             ),
@@ -597,18 +595,6 @@ fn scan_binding_for_source<'a>(
                 matches!(binding.execution, ResolvedScanExecution::IcebergMetadata(_))
             }
         },
-        table_model::ScanSource::ConnectorPinned => {
-            matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
-        }
-        table_model::ScanSource::IcebergDeltaTable { .. } => {
-            matches!(binding.execution, ResolvedScanExecution::IcebergDelta(_))
-        }
-        table_model::ScanSource::IcebergDataFiles { .. }
-        | table_model::ScanSource::IcebergVersionTable { .. }
-        | table_model::ScanSource::MvTargetState(_)
-        | table_model::ScanSource::MvTargetLocator(_) => {
-            matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
-        }
     };
     if !valid_execution {
         return Err(format!(
@@ -631,12 +617,6 @@ fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
             table_model::SqlScanKind::MvTargetState { .. } => "SqlMvTargetState",
             table_model::SqlScanKind::MvTargetLocator { .. } => "SqlMvTargetLocator",
         },
-        table_model::ScanSource::ConnectorPinned => "ConnectorPinned",
-        table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
-        table_model::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
-        table_model::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
-        table_model::ScanSource::MvTargetState(_) => "IcebergMvTargetState",
-        table_model::ScanSource::MvTargetLocator(_) => "IcebergMvTargetLocator",
     }
 }
 
@@ -703,6 +683,47 @@ fn encode_scan_source(
     Ok(plan::ScanSource {
         kind: Some(match src {
             table_model::ScanSource::Sql(source) => match &source.kind {
+                table_model::SqlScanKind::MvTargetState { facts } => {
+                    Kind::IcebergMvTargetState(plan::IcebergMvTargetState {
+                        catalog: source.table.catalog.clone(),
+                        database: source.table.namespace.clone(),
+                        table: source.table.table.clone(),
+                        target_table_uuid: facts.target_table_uuid.clone(),
+                        target_snapshot_id: facts.target_snapshot_id,
+                        aggregate_state_layout_version: u32::from(
+                            facts.aggregate_state_layout_version,
+                        ),
+                        columns: facts
+                            .columns
+                            .iter()
+                            .map(encode_column_def)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        group_key_names: facts.group_key_names.clone(),
+                        aggregate_state_names: facts.aggregate_state_names.clone(),
+                        physical_column_names: facts.physical_column_names.clone(),
+                        row_id_column_name: facts.row_id_column_name.clone(),
+                        row_filter: Some(encode_mv_target_state_row_filter(&facts.row_filter)),
+                        partition_constraint: match facts.partition_constraint {
+                            table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned => {
+                                plan::IcebergMvTargetStatePartitionConstraint::Unpartitioned as i32
+                            }
+                            table_model::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+                                plan::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired as i32
+                            }
+                        },
+                    })
+                }
+                table_model::SqlScanKind::MvTargetLocator { facts } => {
+                    Kind::IcebergMvTargetLocator(plan::IcebergMvTargetLocator {
+                        catalog: source.table.catalog.clone(),
+                        database: source.table.namespace.clone(),
+                        table: source.table.table.clone(),
+                        target_table_uuid: facts.target_table_uuid.clone(),
+                        target_snapshot_id: facts.target_snapshot_id,
+                        apply_key_column: facts.apply_key_column.clone(),
+                        branch_id_column: facts.branch_id_column.clone(),
+                    })
+                }
                 table_model::SqlScanKind::Metadata { kind, .. } => {
                     let binding = binding.ok_or_else(|| {
                         format!(
@@ -744,87 +765,6 @@ fn encode_scan_source(
                     ));
                 }
             },
-            table_model::ScanSource::ConnectorPinned => {
-                return Err(format!(
-                    "native ConnectorPinned node_id={} must be materialized as ConnectorReadSource before encoding",
-                    scan_node_id
-                        .map(|node_id| node_id.to_string())
-                        .unwrap_or_else(|| "<none>".to_string())
-                ));
-            }
-            table_model::ScanSource::IcebergDataFiles {
-                table,
-                files,
-                cloud_properties: _,
-                binding,
-            } => Kind::IcebergDataFiles(plan::IcebergDataFiles {
-                table: Some(encode_iceberg_table_info(table)?),
-                files: files
-                    .iter()
-                    .map(encode_iceberg_data_file_info)
-                    .collect::<Result<Vec<_>, _>>()?,
-                binding: match binding {
-                    iceberg_scan_model::IcebergDataFileBinding::CurrentSnapshot => {
-                        plan::IcebergDataFileBinding::CurrentSnapshot as i32
-                    }
-                    iceberg_scan_model::IcebergDataFileBinding::ExplicitFiles => {
-                        plan::IcebergDataFileBinding::ExplicitFiles as i32
-                    }
-                },
-            }),
-            table_model::ScanSource::IcebergDeltaTable { .. } => {
-                return Err(format!(
-                    "native IcebergDeltaTable node_id={} must be materialized as ConnectorReadSource before encoding",
-                    scan_node_id
-                        .map(|node_id| node_id.to_string())
-                        .unwrap_or_else(|| "<none>".to_string())
-                ));
-            }
-            table_model::ScanSource::IcebergVersionTable { table, snapshot_id } => {
-                Kind::IcebergVersionTable(plan::IcebergVersionTable {
-                    table: Some(encode_iceberg_table_info(table)?),
-                    snapshot_id: *snapshot_id,
-                })
-            }
-            table_model::ScanSource::MvTargetState(scan) => {
-                Kind::IcebergMvTargetState(plan::IcebergMvTargetState {
-                    catalog: scan.catalog.clone(),
-                    database: scan.database.clone(),
-                    table: scan.table.clone(),
-                    target_table_uuid: scan.target_table_uuid.clone(),
-                    target_snapshot_id: scan.target_snapshot_id,
-                    aggregate_state_layout_version: u32::from(scan.aggregate_state_layout_version),
-                    columns: scan
-                        .columns
-                        .iter()
-                        .map(encode_column_def)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    group_key_names: scan.group_key_names.clone(),
-                    aggregate_state_names: scan.aggregate_state_names.clone(),
-                    physical_column_names: scan.physical_column_names.clone(),
-                    row_id_column_name: scan.row_id_column_name.clone(),
-                    row_filter: Some(encode_mv_target_state_row_filter(&scan.row_filter)),
-                    partition_constraint: match scan.partition_constraint {
-                        table_model::SqlMvTargetStatePartitionConstraint::Unpartitioned => {
-                            plan::IcebergMvTargetStatePartitionConstraint::Unpartitioned as i32
-                        }
-                        table_model::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
-                            plan::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired as i32
-                        }
-                    },
-                })
-            }
-            table_model::ScanSource::MvTargetLocator(scan) => {
-                Kind::IcebergMvTargetLocator(plan::IcebergMvTargetLocator {
-                    catalog: scan.catalog.clone(),
-                    database: scan.database.clone(),
-                    table: scan.table.clone(),
-                    target_table_uuid: scan.target_table_uuid.clone(),
-                    target_snapshot_id: scan.target_snapshot_id,
-                    apply_key_column: scan.apply_key_column.clone(),
-                    branch_id_column: scan.branch_id_column.clone(),
-                })
-            }
         }),
     })
 }
@@ -834,11 +774,6 @@ fn iceberg_schema_for_connector_source(
 ) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
     match source {
         table_model::ScanSource::Sql(_) => None,
-        table_model::ScanSource::ConnectorPinned => None,
-        table_model::ScanSource::IcebergDataFiles { table, .. }
-        | table_model::ScanSource::IcebergDeltaTable { table, .. }
-        | table_model::ScanSource::IcebergVersionTable { table, .. } => Some(&table.schema),
-        _ => None,
     }
 }
 

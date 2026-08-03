@@ -10,43 +10,163 @@
 //! connector writer at the native distributed root without materializing data
 //! in the frontend.
 
-use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
-use crate::mv::aggregate_state::mv_agg_state::{
-    AGG_RETRACTION_COUNT_STATE_COLUMN, AGG_STATE_PREFIX, ROW_ID_COLUMN, sanitize_state_column_name,
-};
-use crate::mv::refresh::aggregate_first_refresh::{
-    prepare_aggregate_first_refresh_state_sql,
-    prepare_branch_union_aggregate_first_refresh_state_sqls,
-};
-use crate::mv::refresh::pin::RefreshSnapshotPin;
-use crate::mv::refresh::projection_first_refresh::{
-    prepare_projection_full_read_sql, prepare_union_projection_full_read_sql,
-};
+mod sql_shape;
+use crate::sql::binding::SqlTableBindingId;
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::compiler::RootDistributionRequirement;
+use crate::sql::mv_refresh::aggregate_shape::{
+    SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN, SQL_MV_ROW_ID_COLUMN, SqlAggregateCalls,
+    rewrite_select_sql_for_state, state_column_name,
+};
 use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
-use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
-    ConnectorWriteOperationId,
-};
 use std::collections::BTreeSet;
 
-/// Value-only facts needed to reconstruct the provider-private scan binding
-/// for a typed join append after the frontend has admitted its exact lease.
-/// This deliberately excludes catalog entries, table handles and execution
-/// services: the Core activation adapter reloads those and validates them
-/// against these facts.
-pub(crate) struct MvFirstRefreshLogicalContext {
-    pub(crate) mv_definition: crate::mv::persistence::definition::StoredMvDefinition,
-    pub(crate) canonical_select_query: sqlparser::ast::Query,
-    pub(crate) base_refs: Vec<novarocks_catalog::identifier::TableIdentity>,
-    pub(crate) pin: RefreshSnapshotPin,
-    pub(crate) previous_snapshot_ids: std::collections::BTreeMap<String, i64>,
-    pub(crate) previous_table_uuids: std::collections::BTreeMap<String, String>,
-    pub(crate) target_table_uuid: String,
-    pub(crate) affected_partitions: crate::mv::model::AffectedTargetPartitions,
+pub(crate) use self::sql_shape::SqlMvSnapshotPin;
+use self::sql_shape::{
+    branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
+    prepare_union_projection_full_read_sql,
+};
+
+/// SQL-only input for one first-refresh planning step.
+///
+/// The application has already frozen the target binding before constructing
+/// this value.  It deliberately carries neither a connector table handle nor
+/// a write operation/cohort: those are lifecycle facts and are attached only
+/// after the application admits an exact write lease.
+pub(crate) struct SqlMvFirstRefreshPlannerInput {
+    pub(crate) shape: MvFirstRefreshShape,
+    pub(crate) target_contract: MvFirstRefreshTargetContract,
+    pub(crate) target_binding: SqlTableBindingId,
+    pub(crate) root_distribution: RootDistributionRequirement,
+    pub(crate) artifact: SqlMvFirstRefreshArtifactInput,
+}
+
+/// A first-refresh artifact before it becomes an immutable plan.  The logical
+/// variant contains only SQL planner values; it intentionally has no refresh
+/// context or provider authority.
+pub(crate) enum SqlMvFirstRefreshArtifactInput {
+    Sql(MvFirstRefreshPhysicalSql),
+    Logical {
+        plan: LogicalPlanNode,
+        factory: ColumnRefFactory,
+        root_hash_column: String,
+    },
+}
+
+/// Immutable SQL first-refresh artifact handed to the application lifecycle.
+///
+/// This is the complete SQL boundary: a logical/physical plan, shape, target
+/// contract, root distribution requirement and query-local binding token.  In
+/// particular, it contains no operation/cohort ID, connector handle/request
+/// context, prepared write, catalog object or commit lifecycle value.
+pub(crate) struct SqlMvFirstRefreshPlan {
+    shape: MvFirstRefreshShape,
+    target_contract: MvFirstRefreshTargetContract,
+    target_binding: SqlTableBindingId,
+    root_distribution: RootDistributionRequirement,
+    artifact: SqlMvFirstRefreshArtifact,
+}
+
+pub(crate) enum SqlMvFirstRefreshArtifact {
+    Sql(MvFirstRefreshPhysicalSql),
+    Logical {
+        plan: LogicalPlanNode,
+        factory: ColumnRefFactory,
+    },
+}
+
+/// Canonical, side-effect-free SQL planner for an MV first refresh.
+pub(crate) struct SqlMvFirstRefreshPlanner;
+
+impl SqlMvFirstRefreshPlanner {
+    pub(crate) fn plan(
+        input: SqlMvFirstRefreshPlannerInput,
+    ) -> Result<SqlMvFirstRefreshPlan, String> {
+        let (artifact, root_hash_column) = match input.artifact {
+            SqlMvFirstRefreshArtifactInput::Sql(sql) => {
+                let root_hash_column = sql.root_hash_column().to_string();
+                (SqlMvFirstRefreshArtifact::Sql(sql), root_hash_column)
+            }
+            SqlMvFirstRefreshArtifactInput::Logical {
+                plan,
+                factory,
+                root_hash_column,
+            } => {
+                if root_hash_column.is_empty() {
+                    return Err(
+                        "MV first-refresh logical artifact has no root hash column".to_string()
+                    );
+                }
+                (
+                    SqlMvFirstRefreshArtifact::Logical { plan, factory },
+                    root_hash_column,
+                )
+            }
+        };
+        validate_root_distribution(
+            &input.root_distribution,
+            &root_hash_column,
+            input.target_contract.hidden_hash_key(),
+        )?;
+        Ok(SqlMvFirstRefreshPlan {
+            shape: input.shape,
+            target_contract: input.target_contract,
+            target_binding: input.target_binding,
+            root_distribution: input.root_distribution,
+            artifact,
+        })
+    }
+}
+
+impl SqlMvFirstRefreshPlan {
+    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
+        self.shape
+    }
+
+    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
+        &self.target_contract
+    }
+
+    pub(crate) const fn target_binding(&self) -> SqlTableBindingId {
+        self.target_binding
+    }
+
+    pub(crate) fn root_distribution(&self) -> &RootDistributionRequirement {
+        &self.root_distribution
+    }
+
+    pub(crate) fn into_artifact(self) -> SqlMvFirstRefreshArtifact {
+        self.artifact
+    }
+}
+
+fn validate_root_distribution(
+    requirement: &RootDistributionRequirement,
+    root_hash_column: &str,
+    target_hidden_hash_key: &str,
+) -> Result<(), String> {
+    if root_hash_column != target_hidden_hash_key {
+        return Err(
+            "MV first-refresh root distribution does not match the target hidden hash key"
+                .to_string(),
+        );
+    }
+    match requirement {
+        RootDistributionRequirement::ShuffleOutputName(name) if name == root_hash_column => Ok(()),
+        RootDistributionRequirement::ShuffleOutputName(_) => Err(
+            "MV first-refresh root distribution output name does not match the SQL artifact"
+                .to_string(),
+        ),
+        RootDistributionRequirement::ShuffleOutputOrdinal(_) => {
+            Err("MV first-refresh requires a named root distribution key".to_string())
+        }
+        RootDistributionRequirement::Any => {
+            Err("MV first-refresh requires an explicit root distribution key".to_string())
+        }
+    }
 }
 
 /// Immutable SQL artifact for a distributed first-refresh write.
@@ -57,56 +177,6 @@ pub(crate) struct MvFirstRefreshLogicalContext {
 pub(crate) struct MvFirstRefreshPhysicalSql {
     sql: String,
     root_hash_column: String,
-}
-
-/// Canonical typed append projection for a join first refresh.  It is a
-/// planning value, not a backend-local executable: code generation, fragment
-/// preparation and connector handle attachment remain deferred until the
-/// admitted native execution boundary.
-pub(crate) struct MvFirstRefreshLogicalArtifact {
-    plan: LogicalPlanNode,
-    factory: ColumnRefFactory,
-    root_hash_column: String,
-    context: MvFirstRefreshLogicalContext,
-}
-
-impl MvFirstRefreshLogicalArtifact {
-    pub(crate) fn from_join_append(
-        append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
-        context: MvFirstRefreshLogicalContext,
-    ) -> Self {
-        Self {
-            plan: append.plan,
-            factory: append.factory,
-            root_hash_column: crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME
-                .to_string(),
-            context,
-        }
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        LogicalPlanNode,
-        ColumnRefFactory,
-        MvFirstRefreshLogicalContext,
-    ) {
-        (self.plan, self.factory, self.context)
-    }
-}
-
-pub(crate) enum MvFirstRefreshExecutionArtifact {
-    Sql(MvFirstRefreshPhysicalSql),
-    Logical(MvFirstRefreshLogicalArtifact),
-}
-
-impl MvFirstRefreshExecutionArtifact {
-    fn root_hash_column(&self) -> &str {
-        match self {
-            Self::Sql(sql) => sql.root_hash_column(),
-            Self::Logical(logical) => &logical.root_hash_column,
-        }
-    }
 }
 
 impl MvFirstRefreshPhysicalSql {
@@ -131,15 +201,6 @@ pub(crate) enum MvFirstRefreshShape {
     Join,
     JoinAggregate,
     ComposedAggregate,
-}
-
-/// The provider commit semantics for a fresh MV staging artifact. A policy
-/// rebuild writes the same SQL-shaped rows as a first refresh, but its staging
-/// branch starts from the published target and therefore must overwrite it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MvStagedRefreshWriteMode {
-    Append,
-    FullOverwrite,
 }
 
 /// Target facts frozen before a first-refresh writer is admitted.  It carries
@@ -224,301 +285,9 @@ impl MvFirstRefreshTargetContract {
     }
 }
 
-/// SQL/application handoff before fragment preparation.  The source SQL and
-/// target contract are frozen, but topology, writer handles, provider service
-/// construction and native fragment preparation are intentionally deferred.
-#[derive(Clone)]
-pub(crate) struct MvFirstRefreshWriteRequest {
-    canonical_select_sql: String,
-    shape: MvFirstRefreshShape,
-    target_catalog: String,
-    target_namespace: String,
-    target_name: String,
-    staging_branch: String,
-    current_catalog: Option<String>,
-    current_database: String,
-    expected_target_snapshot_id: Option<i64>,
-    target_table: ConnectorTableHandle,
-    target_contract: MvFirstRefreshTargetContract,
-    observed_binding: ConnectorExecutionBindingKey,
-    operation_id: ConnectorWriteOperationId,
-}
-
-impl MvFirstRefreshWriteRequest {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new(
-        canonical_select_sql: String,
-        shape: MvFirstRefreshShape,
-        target_catalog: String,
-        target_namespace: String,
-        target_name: String,
-        staging_branch: String,
-        current_catalog: Option<String>,
-        current_database: String,
-        expected_target_snapshot_id: Option<i64>,
-        target_table: ConnectorTableHandle,
-        target_contract: MvFirstRefreshTargetContract,
-        observed_binding: ConnectorExecutionBindingKey,
-        operation_id: ConnectorWriteOperationId,
-    ) -> Result<Self, String> {
-        if canonical_select_sql.trim().is_empty()
-            || target_catalog.is_empty()
-            || target_namespace.is_empty()
-            || target_name.is_empty()
-            || staging_branch.is_empty()
-            || current_database.is_empty()
-            || target_table.owner() != &observed_binding.instance_id
-        {
-            return Err("invalid MV first-refresh write request identity".to_string());
-        }
-        Ok(Self {
-            canonical_select_sql,
-            shape,
-            target_catalog,
-            target_namespace,
-            target_name,
-            staging_branch,
-            current_catalog,
-            current_database,
-            expected_target_snapshot_id,
-            target_table,
-            target_contract,
-            observed_binding,
-            operation_id,
-        })
-    }
-
-    pub(crate) fn canonical_select_sql(&self) -> &str {
-        &self.canonical_select_sql
-    }
-
-    pub(crate) const fn shape(&self) -> MvFirstRefreshShape {
-        self.shape
-    }
-
-    pub(crate) fn target_catalog(&self) -> &str {
-        &self.target_catalog
-    }
-
-    pub(crate) fn target_namespace(&self) -> &str {
-        &self.target_namespace
-    }
-
-    pub(crate) fn target_name(&self) -> &str {
-        &self.target_name
-    }
-
-    pub(crate) fn staging_branch(&self) -> &str {
-        &self.staging_branch
-    }
-
-    pub(crate) fn current_catalog(&self) -> Option<&str> {
-        self.current_catalog.as_deref()
-    }
-
-    pub(crate) fn current_database(&self) -> &str {
-        &self.current_database
-    }
-
-    pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
-        self.expected_target_snapshot_id
-    }
-
-    pub(crate) fn target_table(&self) -> &ConnectorTableHandle {
-        &self.target_table
-    }
-
-    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
-        &self.target_contract
-    }
-
-    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
-        &self.observed_binding
-    }
-
-    pub(crate) const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-}
-
-/// Side-effect-free SQL preparation for a first-refresh write.  Its fields
-/// remain private so an application owner can inspect facts but cannot obtain
-/// a local program, catalog object, record batch or provider payload.
-pub struct PreparedMvFirstRefreshWrite {
-    request: MvFirstRefreshWriteRequest,
-    artifact: MvFirstRefreshExecutionArtifact,
-    primary_cohort: ConnectorWriteCohortId,
-    write_mode: MvStagedRefreshWriteMode,
-    provenance_properties: std::collections::BTreeMap<String, String>,
-}
-
-impl PreparedMvFirstRefreshWrite {
-    pub fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.request.operation_id()
-    }
-
-    pub const fn primary_cohort(&self) -> ConnectorWriteCohortId {
-        self.primary_cohort
-    }
-
-    pub fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
-        self.request.observed_binding()
-    }
-
-    pub(crate) fn target_contract(&self) -> &MvFirstRefreshTargetContract {
-        self.request.target_contract()
-    }
-
-    pub(crate) fn root_hash_column(&self) -> &str {
-        self.artifact.root_hash_column()
-    }
-
-    pub(crate) fn target_catalog(&self) -> &str {
-        self.request.target_catalog()
-    }
-
-    pub(crate) fn target_namespace(&self) -> &str {
-        self.request.target_namespace()
-    }
-
-    pub(crate) fn target_name(&self) -> &str {
-        self.request.target_name()
-    }
-
-    pub(crate) fn staging_branch(&self) -> &str {
-        self.request.staging_branch()
-    }
-
-    pub(crate) fn current_catalog(&self) -> Option<&str> {
-        self.request.current_catalog()
-    }
-
-    pub(crate) fn current_database(&self) -> &str {
-        self.request.current_database()
-    }
-
-    pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
-        self.request.expected_target_snapshot_id()
-    }
-
-    pub(crate) const fn write_mode(&self) -> MvStagedRefreshWriteMode {
-        self.write_mode
-    }
-
-    /// Reclassify a validated full-read artifact as a staging overwrite. This
-    /// is only valid for SQL preparation before the artifact is activated or
-    /// bound to an execution attempt.
-    pub(crate) fn into_full_overwrite(mut self) -> Self {
-        self.write_mode = MvStagedRefreshWriteMode::FullOverwrite;
-        self
-    }
-
-    pub(crate) fn with_provenance_properties(
-        mut self,
-        provenance_properties: std::collections::BTreeMap<String, String>,
-    ) -> Self {
-        self.provenance_properties = provenance_properties;
-        self
-    }
-
-    pub(crate) fn provenance_properties(&self) -> &std::collections::BTreeMap<String, String> {
-        &self.provenance_properties
-    }
-
-    pub(crate) fn into_execution_artifact(self) -> MvFirstRefreshExecutionArtifact {
-        self.artifact
-    }
-
-    /// Returns the frozen SQL physicalization for the generic distributed
-    /// writer binder. Typed join artifacts deliberately return `None`: their
-    /// dedicated native binder has not yet been extracted, so callers must
-    /// fail closed rather than materialize rows in the frontend.
-    pub(crate) fn physical_sql(&self) -> Option<&str> {
-        match &self.artifact {
-            MvFirstRefreshExecutionArtifact::Sql(sql) => Some(sql.sql()),
-            MvFirstRefreshExecutionArtifact::Logical(_) => None,
-        }
-    }
-}
-
-pub(crate) struct MvFirstRefreshWritePreparer;
-
-impl MvFirstRefreshWritePreparer {
-    pub(crate) fn prepare(
-        request: MvFirstRefreshWriteRequest,
-        physical_sql: MvFirstRefreshPhysicalSql,
-    ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        Self::prepare_artifact(
-            request,
-            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
-            MvStagedRefreshWriteMode::Append,
-        )
-    }
-
-    /// A policy-driven rebuild uses the pinned full-read physicalization but
-    /// replaces the staging ref contents instead of appending to its main-ref
-    /// base snapshot.
-    pub(crate) fn prepare_full_overwrite(
-        request: MvFirstRefreshWriteRequest,
-        physical_sql: MvFirstRefreshPhysicalSql,
-    ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        Self::prepare_artifact(
-            request,
-            MvFirstRefreshExecutionArtifact::Sql(physical_sql),
-            MvStagedRefreshWriteMode::FullOverwrite,
-        )
-    }
-
-    /// Freeze a typed join append projection behind the same prepared artifact
-    /// boundary used by SQL-shaped first refreshes.
-    pub(crate) fn prepare_join_logical(
-        request: MvFirstRefreshWriteRequest,
-        append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
-        context: MvFirstRefreshLogicalContext,
-    ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        Self::prepare_artifact(
-            request,
-            MvFirstRefreshExecutionArtifact::Logical(
-                MvFirstRefreshLogicalArtifact::from_join_append(append, context),
-            ),
-            MvStagedRefreshWriteMode::Append,
-        )
-    }
-
-    fn prepare_artifact(
-        request: MvFirstRefreshWriteRequest,
-        artifact: MvFirstRefreshExecutionArtifact,
-        write_mode: MvStagedRefreshWriteMode,
-    ) -> Result<PreparedMvFirstRefreshWrite, String> {
-        if artifact.root_hash_column() != request.target_contract().hidden_hash_key() {
-            return Err(
-                "MV first-refresh root distribution does not match the target hidden hash key"
-                    .to_string(),
-            );
-        }
-        if matches!(&artifact, MvFirstRefreshExecutionArtifact::Sql(physical_sql)
-            if physical_sql.sql().contains("QueryResult")
-                || physical_sql.sql().contains("RecordBatch")
-                || physical_sql.sql().contains("Chunk"))
-        {
-            return Err(
-                "MV first-refresh SQL artifact contains a frontend row carrier".to_string(),
-            );
-        }
-        let operation_id = request.operation_id();
-        Ok(PreparedMvFirstRefreshWrite {
-            request,
-            artifact,
-            primary_cohort: ConnectorWriteCohortId::primary(operation_id),
-            write_mode,
-            provenance_properties: std::collections::BTreeMap::new(),
-        })
-    }
-}
-
 pub(crate) fn prepare_projection_first_refresh_write_sql(
     select_sql: &str,
-    pin: &RefreshSnapshotPin,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -532,7 +301,7 @@ pub(crate) fn prepare_projection_first_refresh_write_sql(
 pub(crate) fn prepare_union_projection_first_refresh_write_sql(
     select_sql: &str,
     branch_count: usize,
-    pin: &RefreshSnapshotPin,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -551,8 +320,8 @@ pub(crate) fn prepare_union_projection_first_refresh_write_sql(
 
 pub(crate) fn prepare_aggregate_first_refresh_write_sql(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -568,8 +337,8 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql(
 
 pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
@@ -587,8 +356,8 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema(
 
 pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
@@ -609,7 +378,7 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
             target_schema,
             aggregate_input_types,
         )?,
-        root_hash_column: ROW_ID_COLUMN.to_string(),
+        root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
     })
 }
 
@@ -619,8 +388,8 @@ pub(crate) fn prepare_aggregate_first_refresh_write_sql_with_target_schema_and_i
 /// contract explicit without reintroducing a frontend materialization phase.
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -636,8 +405,8 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql(
 
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
@@ -655,8 +424,8 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
 
 pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
@@ -679,8 +448,8 @@ pub(crate) fn prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schem
 /// connector writer.
 pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
     select_sql: &str,
-    calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -696,8 +465,8 @@ pub(crate) fn prepare_composed_aggregate_first_refresh_write_sql(
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
     select_sql: &str,
     branch_count: usize,
-    first_branch_calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    first_branch_calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<MvFirstRefreshPhysicalSql, String> {
@@ -715,8 +484,8 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql(
 pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target_schema(
     select_sql: &str,
     branch_count: usize,
-    first_branch_calls: &AggregateSqlCalls,
-    pin: &RefreshSnapshotPin,
+    first_branch_calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
     target_schema: Option<&Schema>,
@@ -743,13 +512,55 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_write_sql_with_target
         .join(" UNION ALL ");
     Ok(MvFirstRefreshPhysicalSql {
         sql,
-        root_hash_column: ROW_ID_COLUMN.to_string(),
+        root_hash_column: SQL_MV_ROW_ID_COLUMN.to_string(),
     })
+}
+
+fn prepare_aggregate_first_refresh_state_sql(
+    select_sql: &str,
+    calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<String, String> {
+    let state_sql = rewrite_select_sql_for_state(select_sql, calls)?;
+    pin_state_sql(&state_sql, pin, current_catalog, current_database)
+}
+
+fn prepare_branch_union_aggregate_first_refresh_state_sqls(
+    select_sql: &str,
+    branch_count: usize,
+    first_branch_calls: &SqlAggregateCalls,
+    pin: &SqlMvSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<Vec<(SqlAggregateCalls, String)>, String> {
+    branch_union_queries(select_sql, branch_count)?
+        .into_iter()
+        .enumerate()
+        .map(|(branch_index, (branch_query, branch_sql))| {
+            let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
+            if branch_index == 0 && &branch_calls != first_branch_calls {
+                return Err(
+                    "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                        .to_string(),
+                );
+            }
+            let state_sql = prepare_aggregate_first_refresh_state_sql(
+                &branch_sql,
+                &branch_calls,
+                pin,
+                current_catalog,
+                current_database,
+            )?;
+            Ok((branch_calls, state_sql))
+        })
+        .collect()
 }
 
 fn aggregate_physical_sql(
     state_sql: &str,
-    calls: &AggregateSqlCalls,
+    calls: &SqlAggregateCalls,
     branch_id: Option<i32>,
     target_schema: Option<&Schema>,
     aggregate_input_types: Option<&[Option<DataType>]>,
@@ -765,7 +576,7 @@ fn aggregate_physical_sql(
     projection.push(format!(
         "mv_group_row_id({}) AS {}",
         group_key_refs.join(", "),
-        quote_sql_identifier(ROW_ID_COLUMN),
+        quote_sql_identifier(SQL_MV_ROW_ID_COLUMN),
     ));
 
     for output in &calls.visible_outputs {
@@ -854,12 +665,11 @@ fn aggregate_physical_sql(
             quote_sql_identifier(&state_name),
         ));
     }
-    if crate::mv::aggregate_state::mv_agg_state::aggregate_shape_needs_retraction_count_state(calls)
-    {
+    if calls.needs_retraction_count_state() {
         projection.push(format!(
             "{} AS {}",
-            qualified_column("state", AGG_RETRACTION_COUNT_STATE_COLUMN),
-            quote_sql_identifier(AGG_RETRACTION_COUNT_STATE_COLUMN),
+            qualified_column("state", SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN),
+            quote_sql_identifier(SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN),
         ));
     }
     if let Some(branch_id) = branch_id {
@@ -899,8 +709,8 @@ fn aggregate_visible_type_witness(data_type: &DataType) -> Result<String, String
 
 fn validate_branch_aggregate_contract(
     branch_index: usize,
-    calls: &AggregateSqlCalls,
-    expected: &AggregateSqlCalls,
+    calls: &SqlAggregateCalls,
+    expected: &SqlAggregateCalls,
 ) -> Result<(), String> {
     if calls.visible_outputs != expected.visible_outputs {
         return Err(format!(
@@ -946,13 +756,6 @@ fn aggregate_visible_function(kind: AggregateFunctionKind) -> &'static str {
     }
 }
 
-fn state_column_name(output_name: &str) -> String {
-    format!(
-        "{AGG_STATE_PREFIX}{}",
-        sanitize_state_column_name(output_name)
-    )
-}
-
 fn qualified_column(qualifier: &str, column: &str) -> String {
     format!(
         "{}.{}",
@@ -968,12 +771,83 @@ fn quote_sql_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Arc;
 
     use super::*;
 
-    fn pin() -> RefreshSnapshotPin {
-        RefreshSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
+    fn sqlx2_target_binding() -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(NonZeroU64::new(701).unwrap()),
+            NonZeroU32::new(1).unwrap(),
+        )
+    }
+
+    fn sqlx2_target_contract() -> MvFirstRefreshTargetContract {
+        MvFirstRefreshTargetContract::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "__apply_key__",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![1],
+            0,
+            "__apply_key__".to_string(),
+        )
+        .expect("valid SQL target contract")
+    }
+
+    #[test]
+    fn sqlx2_mv_first_refresh_plan_is_sql_only_and_binding_scoped() {
+        let plan = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
+            shape: MvFirstRefreshShape::Projection,
+            target_contract: sqlx2_target_contract(),
+            target_binding: sqlx2_target_binding(),
+            root_distribution: RootDistributionRequirement::ShuffleOutputName(
+                "__apply_key__".to_string(),
+            ),
+            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalSql {
+                sql: "SELECT 1 AS `__apply_key__`".to_string(),
+                root_hash_column: "__apply_key__".to_string(),
+            }),
+        })
+        .expect("pure SQL first-refresh plan");
+
+        assert_eq!(plan.shape(), MvFirstRefreshShape::Projection);
+        assert_eq!(plan.target_binding(), sqlx2_target_binding());
+        assert_eq!(plan.target_contract().hidden_hash_key(), "__apply_key__");
+        assert!(matches!(
+            plan.into_artifact(),
+            SqlMvFirstRefreshArtifact::Sql(_)
+        ));
+    }
+
+    #[test]
+    fn sqlx2_mv_first_refresh_plan_rejects_implicit_or_wrong_distribution() {
+        let make_input = |root_distribution| SqlMvFirstRefreshPlannerInput {
+            shape: MvFirstRefreshShape::Projection,
+            target_contract: sqlx2_target_contract(),
+            target_binding: sqlx2_target_binding(),
+            root_distribution,
+            artifact: SqlMvFirstRefreshArtifactInput::Sql(MvFirstRefreshPhysicalSql {
+                sql: "SELECT 1 AS `__apply_key__`".to_string(),
+                root_hash_column: "__apply_key__".to_string(),
+            }),
+        };
+
+        assert!(
+            SqlMvFirstRefreshPlanner::plan(make_input(RootDistributionRequirement::Any)).is_err()
+        );
+        assert!(
+            SqlMvFirstRefreshPlanner::plan(make_input(
+                RootDistributionRequirement::ShuffleOutputName("other".to_string())
+            ))
+            .is_err()
+        );
+    }
+
+    fn pin() -> SqlMvSnapshotPin {
+        SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
     }
 
     #[test]
@@ -1007,9 +881,7 @@ mod tests {
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected SELECT")
         };
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .unwrap();
+        let calls = SqlAggregateCalls::extract(&query).unwrap();
         let prepared = prepare_aggregate_first_refresh_write_sql(
             "SELECT k, sum(v) AS total FROM ice.db.fact GROUP BY k",
             &calls,
@@ -1018,7 +890,7 @@ mod tests {
             "db",
         )
         .unwrap();
-        assert_eq!(prepared.root_hash_column(), ROW_ID_COLUMN);
+        assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
         assert!(prepared.sql().contains("mv_group_row_id"));
         assert!(prepared.sql().contains("sum_state_visible"));
         assert!(prepared.sql().contains("__agg_state_total"));
@@ -1033,17 +905,15 @@ mod tests {
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected SELECT")
         };
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .unwrap();
-        let pin = RefreshSnapshotPin::from_entries_for_tests(&[
+        let calls = SqlAggregateCalls::extract(&query).unwrap();
+        let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
             ("ice.db.a", 11, "a-uuid"),
             ("ice.db.b", 22, "b-uuid"),
         ]);
         let prepared =
             prepare_fan_in_aggregate_first_refresh_write_sql(sql, &calls, &pin, Some("ice"), "db")
                 .unwrap();
-        assert_eq!(prepared.root_hash_column(), ROW_ID_COLUMN);
+        assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
         assert!(prepared.sql().contains("VERSION AS OF 11"));
         assert!(prepared.sql().contains("VERSION AS OF 22"));
         assert!(prepared.sql().contains("sum_state_visible"));
@@ -1057,9 +927,7 @@ mod tests {
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected SELECT")
         };
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .unwrap();
+        let calls = SqlAggregateCalls::extract(&query).unwrap();
         let target = Schema::new(vec![
             Field::new("k", DataType::Int32, true),
             Field::new("a_d", DataType::Decimal128(38, 12), true),
@@ -1068,7 +936,7 @@ mod tests {
             prepare_fan_in_aggregate_first_refresh_write_sql_with_target_schema_and_input_types(
                 sql,
                 &calls,
-                &RefreshSnapshotPin::from_entries_for_tests(&[
+                &SqlMvSnapshotPin::from_entries_for_tests(&[
                     ("ice.db.a", 11, "a"),
                     ("ice.db.b", 22, "b"),
                 ]),
@@ -1089,10 +957,8 @@ mod tests {
         let sqlparser::ast::Statement::Query(query) = statement else {
             panic!("expected SELECT")
         };
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::extract_aggregate_sql_calls(&query)
-                .unwrap();
-        let pin = RefreshSnapshotPin::from_entries_for_tests(&[
+        let calls = SqlAggregateCalls::extract(&query).unwrap();
+        let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
             ("ice.db.a", 11, "a-uuid"),
             ("ice.db.b", 22, "b-uuid"),
         ]);
@@ -1104,7 +970,7 @@ mod tests {
             "db",
         )
         .unwrap();
-        assert_eq!(prepared.root_hash_column(), ROW_ID_COLUMN);
+        assert_eq!(prepared.root_hash_column(), SQL_MV_ROW_ID_COLUMN);
         assert!(prepared.sql().contains("VERSION AS OF 11"));
         assert!(prepared.sql().contains("VERSION AS OF 22"));
         assert!(prepared.sql().contains("count_state_visible"));

@@ -278,11 +278,10 @@ fn plan_iceberg_metadata_scan(
 }
 
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
-/// `LogicalPlanKind::Scan` whose `TableDef` carries the synthetic
-/// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
-/// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
-/// (rather than `HDFS_SCAN_NODE`). Refresh/codegen expands the storage
-/// variant into a typed explicit payload; lower only consumes that payload.
+/// `LogicalPlanKind::Scan` whose `TableDef` carries a token-bound
+/// `SqlScanSource::Delta` fact. Preparation resolves the exact provider
+/// materialization through that same request-local token; the logical plan
+/// neither receives nor reconstructs Iceberg metadata.
 fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
@@ -331,14 +330,39 @@ fn plan_iceberg_delta_scan(
             is_internal: false,
         });
     }
-    let table_info = iceberg_table_info(&rel.table.source)
-        .ok_or_else(|| {
-            format!(
-                "iceberg delta scan {}.{}.{} requires iceberg table identity",
-                rel.catalog, rel.namespace, rel.table_name
-            )
-        })?
-        .clone();
+    let ScanSource::Sql(source) = rel.table.source else {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} requires a token-bound SQL scan source",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    };
+    if !matches!(
+        &source.kind,
+        crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+    ) {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} requires a data or frozen-input SQL scan source",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    }
+    if source.table.catalog != rel.catalog
+        || source.table.namespace != rel.namespace
+        || source.table.table != rel.table_name
+    {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} binding identity does not match the resolved table",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    }
+    let delta_source = crate::sql::planner::table::SqlScanSource::new(
+        source.binding,
+        source.table,
+        crate::sql::planner::table::SqlScanKind::Delta {
+            from_snapshot_id: rel.from_snapshot_id,
+            to_snapshot_id: rel.to_snapshot_id,
+        },
+    );
     let synthetic_table = TableDef {
         name: rel.table.name.clone(),
         columns: rel.table.columns.clone(),
@@ -346,11 +370,7 @@ fn plan_iceberg_delta_scan(
             .table
             .iceberg_row_lineage_metadata_columns
             .clone(),
-        source: ScanSource::IcebergDeltaTable {
-            table: table_info,
-            from_snapshot_id: rel.from_snapshot_id,
-            to_snapshot_id: rel.to_snapshot_id,
-        },
+        source: ScanSource::Sql(delta_source),
     };
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
@@ -366,20 +386,6 @@ fn plan_iceberg_delta_scan(
         vec![],
         None,
     ))
-}
-
-fn iceberg_table_info(
-    source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
-    match source {
-        crate::sql::planner::table::ScanSource::Sql(_) => None,
-        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::MvTargetState { .. }
-        | crate::sql::planner::table::ScanSource::MvTargetLocator { .. } => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

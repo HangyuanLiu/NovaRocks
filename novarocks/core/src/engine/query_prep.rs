@@ -16,7 +16,7 @@
 // under the License.
 
 //! Synthetic/local query preparation for time-travel, delta scans, MV helpers,
-//! ANALYZE schema materialization, and catalog-service table invalidation.
+//! statement schema lookup, and catalog-service table invalidation.
 //! Ordinary SELECT external tables resolve through the query catalog materializer.
 
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use crate::sql::analyzer::iceberg_ref::{
     resolve_read_binding,
 };
 use crate::sql::parser::ast::ObjectName;
+#[cfg(test)]
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 
@@ -443,60 +444,45 @@ fn rewrite_time_travel_in_factor(
     }
 }
 
-/// Materialize a single external connector table into the standalone in-memory
-/// catalog so that statement paths which do not run through the SELECT
-/// query-prep flow (e.g. `ANALYZE TABLE` / `ANALYZE FULL TABLE`) can still
-/// resolve its schema.
-///
-/// Already-materialized non-Iceberg sources are a no-op here. Unlike the
-/// best-effort query-prep loop, an Iceberg load failure is surfaced as an
-/// error: the table was named explicitly by the statement, so an unresolvable
-/// name is a real error.
-pub(crate) fn materialize_external_schema_table_for_statement(
+/// Resolve statement-level connector schema facts without registering a
+/// concrete scan in the shared local catalog.  `ANALYZE` only needs columns;
+/// it must not leave a provider table or file carrier visible to a later SQL
+/// request.
+pub(crate) fn external_schema_columns_for_statement(
     state: &Arc<StandaloneState>,
     current_catalog: Option<&str>,
     current_database: &str,
     name: &ObjectName,
-) -> Result<(), String> {
+) -> Result<Option<Vec<ColumnDef>>, String> {
     let target = resolve_table_target(state, name, current_catalog, current_database)?;
     if target.backend_name != "iceberg" {
-        // Non-Iceberg sources are already represented in the logical catalog.
-        return Ok(());
+        // Non-Iceberg sources are already represented in the local catalog.
+        return Ok(None);
     }
     // Time-travel identities live only in a query binding store and are never
     // valid statement-level catalog objects.
     if is_synthetic_time_travel_table(&target.table) {
-        return Ok(());
+        return Err("time-travel identities are not valid ANALYZE targets".to_string());
     }
 
-    {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        let entry = registry.get(&target.catalog)?;
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-    }
-    drop_local_table_registration_if_exists(state, &target.namespace, &target.table)?;
-
-    let (mut table_def, _, _) = crate::connector::iceberg::provider::load_schema_table_def(
-        state.connector_control.as_ref(),
-        crate::connector::connector_request_context(
-            None,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )
-    .map_err(|err| {
-        format!(
-            "load iceberg table {}.{}.{} failed: {err}",
-            target.catalog, target.namespace, target.table
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+            state.connector_control.as_ref(),
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
         )
-    })?;
-    table_def.name = target.table;
-    register_local_table_registration(state, &target.namespace, table_def)
+        .map_err(|err| {
+            format!(
+                "load iceberg table {}.{}.{} failed: {err}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    Ok(Some(materialization.columns))
 }
 
 /// Returns true if `table_name` was produced by a time-travel rewriter.
@@ -515,36 +501,6 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     } else {
         false
     }
-}
-
-fn register_local_table_registration(
-    state: &Arc<StandaloneState>,
-    namespace: &str,
-    table_def: TableDef,
-) -> Result<(), String> {
-    let mut guard = state
-        .catalog_service
-        .local()
-        .write()
-        .expect("catalog service local write lock");
-    guard.create_database(namespace).ok();
-    guard
-        .register(namespace, table_def)
-        .map_err(|e| format!("register local table metadata: {e}"))
-}
-
-/// Register a synthetic `TableDef` into the standalone in-memory catalog so a
-/// generated query can reference it by name (e.g. a single-file
-/// `ExplicitFiles`-bound scan used by distributed COW UPDATE rewrites). Mirrors
-/// the time-travel synthetic-table registration. Callers are responsible for
-/// dropping the table via [`drop_local_table_registration_if_exists`] once the
-/// query has run.
-pub(crate) fn register_synthetic_table_for_query(
-    state: &Arc<StandaloneState>,
-    namespace: &str,
-    table_def: TableDef,
-) -> Result<(), String> {
-    register_local_table_registration(state, namespace, table_def)
 }
 
 pub(crate) fn drop_local_table_registration_if_exists(
@@ -569,6 +525,7 @@ pub(crate) fn drop_local_table_registration_if_exists(
 /// Advertises Iceberg v3 row-lineage virtual columns (`_row_id`, etc.) so
 /// the analyzer can resolve apply-key references; the actual per-snapshot
 /// files come from the `IcebergDeltaScan` operator at runtime.
+#[cfg(test)]
 pub(crate) fn build_iceberg_table_def_for_delta_scan(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
@@ -591,6 +548,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_iceberg_table_def_with_files(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
@@ -635,6 +593,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_iceberg_delta_table_def_with_files(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     catalog_name: &str,
@@ -645,6 +604,11 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
 ) -> Result<TableDef, String> {
     let change_ops = validate_delta_file_change_ops(&data_files)?;
     let data_files = iceberg_files_for_query_to_stats(data_files);
+    let mut frozen_files = data_files
+        .iter()
+        .cloned()
+        .map(crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+        .collect::<Vec<_>>();
     let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
         entry,
         catalog_name,
@@ -653,10 +617,11 @@ pub(crate) fn build_iceberg_delta_table_def_with_files(
         loaded,
         data_files,
     )?;
-    stamp_delta_table_def_change_ops(&mut table_def, &change_ops)?;
+    stamp_delta_table_def_change_ops(&mut table_def, &mut frozen_files, &change_ops)?;
     Ok(table_def)
 }
 
+#[cfg(test)]
 fn iceberg_files_for_query_to_stats(
     data_files: Vec<IcebergFileForQuery>,
 ) -> Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats> {
@@ -681,6 +646,7 @@ fn iceberg_files_for_query_to_stats(
         .collect()
 }
 
+#[cfg(test)]
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {
     data_files
         .iter()
@@ -700,8 +666,10 @@ fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<
         .collect()
 }
 
+#[cfg(test)]
 fn stamp_delta_table_def_change_ops(
     table_def: &mut TableDef,
+    files: &mut [crate::connector::iceberg::scan_model::IcebergDataFileInfo],
     change_ops: &[i8],
 ) -> Result<(), String> {
     if table_def.columns.iter().any(|col| {
@@ -738,15 +706,9 @@ fn stamp_delta_table_def_change_ops(
             logical_type: None,
         });
 
-    let ScanSource::IcebergDataFiles { files, .. } = &mut table_def.source else {
-        return Err(
-            "iceberg delta source requires Iceberg data-file storage for synthetic files"
-                .to_string(),
-        );
-    };
     if files.len() != change_ops.len() {
         return Err(format!(
-            "iceberg delta source file count mismatch: table storage has {}, input has {}",
+            "iceberg delta source file count mismatch: frozen input has {}, input has {}",
             files.len(),
             change_ops.len()
         ));
@@ -759,87 +721,33 @@ fn stamp_delta_table_def_change_ops(
 
 #[cfg(test)]
 mod tests {
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::engine::query_prep::IcebergFileForQuery;
     use crate::sql::planner::table::{ScanSource, TableDef};
 
-    fn test_iceberg_table_info() -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "test_table".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: "file:///tmp/test_table".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
-    }
-
-    fn table_def_with_binding(
-        table: &crate::connector::backend::ResolvedTable,
-        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
-    ) -> TableDef {
-        let mut iceberg = test_iceberg_table_info();
-        iceberg.catalog = table.catalog.clone();
-        iceberg.namespace = table.namespace.clone();
-        iceberg.table = table.table.clone();
-        TableDef {
-            name: table.table.clone(),
-            columns: table.columns.clone(),
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: iceberg,
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding,
+    fn test_sql_source() -> ScanSource {
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(1),
             },
-        }
+        )
     }
 
-    #[test]
-    fn synthetic_query_table_registration_is_explicitly_local_and_scoped() {
-        let state = std::sync::Arc::new(crate::engine::StandaloneState::default());
-        let table = crate::connector::backend::ResolvedTable {
-            catalog: "ice".to_string(),
-            namespace: "scratch".to_string(),
-            table: "rewrite_piece".to_string(),
-            columns: vec![],
-            statistics_pin: None,
-        };
-        let table_def = table_def_with_binding(
-            &table,
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        );
-
-        super::register_synthetic_table_for_query(&state, "scratch", table_def)
-            .expect("register synthetic table");
-
-        let registered = state
-            .catalog_service
-            .local()
-            .read()
-            .expect("catalog read lock")
-            .get("scratch", "rewrite_piece")
-            .expect("synthetic table is visible in local catalog");
-        assert_eq!(registered.name, "rewrite_piece");
-
-        super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
-            .expect("drop synthetic table");
-        assert!(
-            state
-                .catalog_service
-                .local()
-                .read()
-                .expect("catalog read lock")
-                .get("scratch", "rewrite_piece")
-                .is_err(),
-            "synthetic table must not outlive the scoped query"
-        );
-        super::drop_local_table_registration_if_exists(&state, "scratch", "rewrite_piece")
-            .expect("drop is idempotent for scoped cleanup");
+    fn test_data_file() -> crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+        crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+            path: "file:///tmp/data.parquet".to_string(),
+            size: 10,
+            row_count: Some(1),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        }
     }
 
     #[test]
@@ -849,11 +757,26 @@ mod tests {
             .split("pub(crate) fn rewrite_time_travel_refs")
             .nth(1)
             .expect("time-travel rewrite source")
-            .split("pub(crate) fn materialize_external_schema_table_for_statement")
+            .split("pub(crate) fn external_schema_columns_for_statement")
             .next()
             .expect("time-travel rewrite boundary");
         assert!(rewrite.contains("__sqlx1_tt_"));
         assert!(!rewrite.contains("register_local_table_registration"));
+    }
+
+    #[test]
+    fn sqlx2_application_statement_schema_lookup_does_not_publish_local_scan() {
+        let source = include_str!("query_prep.rs");
+        let lookup = source
+            .split("pub(crate) fn external_schema_columns_for_statement")
+            .nth(1)
+            .expect("statement schema lookup source")
+            .split("/// Returns true if `table_name`")
+            .next()
+            .expect("statement schema lookup boundary");
+        assert!(lookup.contains("load_schema_materialization_with_lease"));
+        assert!(!lookup.contains("register("));
+        assert!(!lookup.contains("drop_local_table_registration_if_exists"));
     }
 
     fn parse_query_for_table_names(sql: &str) -> sqlparser::ast::Query {
@@ -902,30 +825,11 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: test_iceberg_table_info(),
-                files: vec![crate::connector::iceberg::scan_model::IcebergDataFileInfo {
-                    path: "file:///tmp/data.parquet".to_string(),
-                    size: 10,
-                    row_count: Some(1),
-                    column_stats: None,
-                    partition_spec_id: None,
-                    partition_key: None,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
-                    delete_files: vec![],
-                    manifest_path: None,
-                    partition_values: vec![],
-                }],
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            },
+            source: test_sql_source(),
         };
+        let mut files = vec![test_data_file()];
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &[1]).expect("stamp");
+        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[1]).expect("stamp");
 
         assert_eq!(
             table_def
@@ -935,9 +839,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected s3 parquet storage");
-        };
         assert_eq!(files[0].ivm_change_op, Some(1));
     }
 
@@ -976,30 +877,11 @@ mod tests {
                     logical_type: None,
                 },
             ],
-            source: ScanSource::IcebergDataFiles {
-                table: test_iceberg_table_info(),
-                files: vec![crate::connector::iceberg::scan_model::IcebergDataFileInfo {
-                    path: "file:///tmp/data.parquet".to_string(),
-                    size: 10,
-                    row_count: Some(1),
-                    column_stats: None,
-                    partition_spec_id: None,
-                    partition_key: None,
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    ivm_change_op: None,
-                    included_positions: None,
-                    delete_files: vec![],
-                    manifest_path: None,
-                    partition_values: vec![],
-                }],
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            },
+            source: test_sql_source(),
         };
+        let mut files = vec![test_data_file()];
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &[-1]).expect("stamp");
+        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[-1]).expect("stamp");
 
         assert_eq!(
             table_def
@@ -1019,9 +901,6 @@ mod tests {
                 ("__change_op", &arrow::datatypes::DataType::Int8, false),
             ]
         );
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected s3 parquet storage");
-        };
         assert_eq!(files[0].ivm_change_op, Some(-1));
     }
 
@@ -1038,16 +917,11 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: test_iceberg_table_info(),
-                files: Vec::new(),
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-            },
+            source: test_sql_source(),
         };
+        let mut files = Vec::new();
 
-        super::stamp_delta_table_def_change_ops(&mut table_def, &[])
+        super::stamp_delta_table_def_change_ops(&mut table_def, &mut files, &[])
             .expect("stamp empty delta over empty iceberg storage");
 
         assert_eq!(
@@ -1058,9 +932,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
         );
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected empty delta to use s3 parquet storage");
-        };
         assert!(files.is_empty());
     }
 }

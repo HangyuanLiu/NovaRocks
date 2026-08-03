@@ -26,9 +26,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
@@ -40,7 +40,7 @@ use crate::sql::planner::payload::{AggregateCall, WindowExpr};
 
 pub(crate) struct ImvRewriteInput {
     pub plan: LogicalPlanNode,
-    pub mv_ctx: Arc<IcebergMvRewriteContext>,
+    pub snapshot: Arc<SqlImvRewriteSnapshot>,
     pub disabled_rules: Vec<String>,
     pub deadline: Option<Instant>,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
@@ -56,7 +56,7 @@ pub(crate) struct ImvRewriteOutcome {
 pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcome, String> {
     let ImvRewriteInput {
         plan,
-        mv_ctx,
+        snapshot,
         disabled_rules,
         deadline,
         column_ref_factory,
@@ -71,7 +71,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     );
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
-        mv_ctx,
+        snapshot,
         annotation: ImvPlanAnnotation::default(),
     });
     if let Some(deadline) = deadline {
@@ -455,19 +455,10 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::persistence::schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
-        BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
-        MvSchemaContract, QualifiedFieldLineage,
-    };
-    use crate::mv::rewrite::context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
-    };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::opt_expr::OptExpr;
@@ -490,12 +481,13 @@ pub(crate) mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use crate::sql::planner::vocabulary::{
         BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
     };
     use arrow::datatypes::DataType;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_catalog::schema::ColumnDef;
 
     /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
@@ -509,12 +501,9 @@ pub(crate) mod tests {
             &mut arena.borrow_mut(),
         )
     }
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{HashMap, HashSet};
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn dummy_mv_ctx() -> Arc<IcebergMvRewriteContext> {
-        crate::mv::rewrite::context::tests_support::dummy_rewrite_context()
-    }
 
     fn test_column_ref_factory() -> Rc<RefCell<ColumnRefFactory>> {
         Rc::new(RefCell::new(ColumnRefFactory::new()))
@@ -577,24 +566,17 @@ pub(crate) mod tests {
                     name: "b".to_string(),
                     columns: vec![column],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        crate::sql::compiler::mv_rewrite::test_target_binding(),
+                        SqlTableIdentity {
                             catalog: "ice".to_string(),
                             namespace: "db".to_string(),
                             table: "b".to_string(),
-                            table_uuid: Some("uuid-b".to_string()),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: "file:///tmp/ice/db/b".to_string(),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
                         },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
                 },
                 alias: None,
                 columns: vec![OutputColumn {
@@ -697,7 +679,13 @@ pub(crate) mod tests {
             panic!("expected target locator scan on join right side");
         };
         assert!(
-            matches!(scan.table.source, ScanSource::MvTargetLocator(_)),
+            matches!(
+                scan.table.source,
+                ScanSource::Sql(SqlScanSource {
+                    kind: SqlScanKind::MvTargetLocator { .. },
+                    ..
+                })
+            ),
             "join right side must be target locator scan"
         );
         join_plan.left()
@@ -706,7 +694,13 @@ pub(crate) mod tests {
     fn find_delta_scan(plan: &LogicalPlanNode) -> Option<&PlanScanNode> {
         match &plan.kind {
             LogicalPlanKind::Scan(scan)
-                if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
+                if matches!(
+                    scan.table.source,
+                    ScanSource::Sql(SqlScanSource {
+                        kind: SqlScanKind::Delta { .. },
+                        ..
+                    })
+                ) =>
             {
                 Some(scan)
             }
@@ -721,118 +715,88 @@ pub(crate) mod tests {
         }
     }
 
-    fn aggregate_mv_ctx_customized(
-        mutate: impl FnOnce(&mut crate::mv::persistence::schema::MvSchemaContract),
-    ) -> Arc<IcebergMvRewriteContext> {
-        let mut mv_def = make_mv_definition();
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[0].output_name = "k".to_string();
-        contract.target.visible_columns[1].output_name = "s".to_string();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_s".to_string(),
-                    target_field_id: 200,
-                    type_signature: "binary".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-                AggregateStateColumnContract {
-                    column_name: "__agg_state___ivm_row_count".to_string(),
-                    target_field_id: 201,
-                    type_signature: "long".to_string(),
-                    nullable: false,
-                    role: AggregateStateRoleContract::RetractionCount,
-                },
-            ],
-        });
-        // Let the caller mutate the fully-built contract (e.g. attach a
-        // partition spec or perturb output lineage) before it is cloned into
-        // the mv definition and wrapped into the rewrite context.
-        mutate(&mut contract);
-        mv_def.schema_contract = Some(contract.clone());
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "k",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )),
-                    Arc::new(NestedField::required(
-                        201,
-                        "__agg_state___ivm_row_count",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build target schema"),
-        );
-        Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT k, sum(v) AS s FROM ice.db.b GROUP BY k",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "b")]),
-                Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("aggregate mv context must build"),
-        )
+    fn dummy_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        crate::sql::compiler::mv_rewrite::test_snapshot()
     }
 
-    fn aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+    fn aggregate_mv_ctx_customized(
+        mutate: impl FnOnce(&mut crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot),
+    ) -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        let mut snapshot = (*crate::sql::compiler::mv_rewrite::test_aggregate_snapshot(
+            vec![
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
+                    column_name: "__agg_state_s".to_string(),
+                    type_signature: "binary".to_string(),
+                    role: crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::Single,
+                },
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumnContract {
+                    column_name: "__agg_state___ivm_row_count".to_string(),
+                    type_signature: "long".to_string(),
+                    role: crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::RetractionCount,
+                },
+            ],
+            None,
+            None,
+        ))
+        .clone();
+        let contract = Arc::make_mut(&mut snapshot.schema_contract);
+        contract.output_columns = vec![
+            crate::sql::compiler::mv_rewrite::SqlImvOutputColumnLineage {
+                expression: crate::sql::compiler::mv_rewrite::SqlImvExpressionLineage {
+                    kind: crate::sql::compiler::mv_rewrite::SqlImvExpressionKind::Column,
+                    referenced_base_field_ids: vec![1],
+                    referenced_base_fields: Vec::new(),
+                },
+            },
+            crate::sql::compiler::mv_rewrite::SqlImvOutputColumnLineage {
+                expression: crate::sql::compiler::mv_rewrite::SqlImvExpressionLineage {
+                    kind: crate::sql::compiler::mv_rewrite::SqlImvExpressionKind::Column,
+                    referenced_base_field_ids: vec![2],
+                    referenced_base_fields: Vec::new(),
+                },
+            },
+        ];
+        mutate(&mut snapshot);
+        Arc::new(snapshot)
+    }
+
+    fn aggregate_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
         aggregate_mv_ctx_customized(|_| {})
     }
 
-    fn partitioned_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
-        use crate::mv::persistence::schema::{
-            MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-        };
-        aggregate_mv_ctx_customized(|contract| {
-            contract.target.partition = Some(MvPartitionContract {
+    fn partitioned_aggregate_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot>
+    {
+        aggregate_mv_ctx_customized(|snapshot| {
+            Arc::make_mut(&mut snapshot.schema_contract)
+                .target
+                .partition = Some(crate::sql::compiler::mv_rewrite::SqlImvPartitionContract {
                 target_spec_id: 7,
-                fields: vec![MvPartitionFieldContract {
-                    partition_field_id: 1000,
+                fields: vec![crate::sql::compiler::mv_rewrite::SqlImvPartitionField {
                     partition_field_name: "k".to_string(),
                     source_target_field_id: 100,
-                    source_column_name: "k".to_string(),
-                    transform: MvPartitionTransformContract::Identity,
+                    transform: crate::sql::compiler::mv_rewrite::SqlImvPartitionTransform::Identity,
                 }],
             });
         })
     }
 
-    fn aggregate_scan_plan() -> LogicalPlanNode {
+    fn join_aggregate_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        crate::sql::compiler::mv_rewrite::test_join_snapshot(true)
+    }
+
+    fn join_projection_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        crate::sql::compiler::mv_rewrite::test_join_snapshot(false)
+    }
+
+    fn join_aggregate_mv_ctx_customized(
+        mutate: impl FnOnce(&mut crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot),
+    ) -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        let mut snapshot = (*crate::sql::compiler::mv_rewrite::test_join_snapshot(true)).clone();
+        mutate(&mut snapshot);
+        Arc::new(snapshot)
+    }
+
+    fn aggregate_plan() -> LogicalPlanNode {
         let columns = vec![
             ColumnDef {
                 name: "k".to_string(),
@@ -849,17 +813,14 @@ pub(crate) mod tests {
                 logical_type: None,
             },
         ];
-        LogicalPlanNode::new(
+        let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: match &iceberg_scan_plan().kind {
-                        LogicalPlanKind::Scan(scan) => scan.table.source.clone(),
-                        _ => unreachable!(),
-                    },
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source(),
                 },
                 alias: None,
                 columns: vec![
@@ -885,32 +846,13 @@ pub(crate) mod tests {
             }),
             vec![],
             None,
-        )
-    }
-
-    fn aggregate_plan() -> LogicalPlanNode {
+        );
         LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
-                group_by: vec![TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: ColumnId(1),
-                        qualifier: None,
-                        column: "k".to_string(),
-                    },
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }],
+                group_by: vec![column_ref(1, "k", DataType::Int64, false)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: ColumnId(2),
-                            qualifier: None,
-                            column: "v".to_string(),
-                        },
-                        data_type: DataType::Int64,
-                        nullable: true,
-                    }],
+                    args: vec![column_ref(2, "v", DataType::Int64, true)],
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
@@ -934,186 +876,12 @@ pub(crate) mod tests {
                 ],
                 already_pushed: false,
             }),
-            vec![aggregate_scan_plan()],
+            vec![scan],
             None,
         )
     }
 
-    fn join_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
-        join_aggregate_mv_ctx_customized(|_| {})
-    }
-
-    fn join_projection_mv_ctx() -> Arc<IcebergMvRewriteContext> {
-        crate::mv::rewrite::context::tests_support::join_projection_rewrite_context()
-    }
-
-    fn join_aggregate_mv_ctx_customized(
-        mutate: impl FnOnce(&mut MvSchemaContract),
-    ) -> Arc<IcebergMvRewriteContext> {
-        let mut mv_def = make_mv_definition();
-        mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
-        mv_def.last_refresh_snapshots = [
-            ("ice.db.l".to_string(), 11i64),
-            ("ice.db.r".to_string(), 33i64),
-        ]
-        .into_iter()
-        .collect();
-        mv_def.last_refresh_table_uuids = [
-            ("ice.db.l".to_string(), "uuid-l".to_string()),
-            ("ice.db.r".to_string(), "uuid-r".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[0].output_name = "k".to_string();
-        contract.target.visible_columns[1].output_name = "s".to_string();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.bases = vec![
-            join_base_contract("ice.db.l", "uuid-l", "l"),
-            join_base_contract("ice.db.r", "uuid-r", "r"),
-        ];
-        contract.output.columns[0]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[0].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.l", "l", 1)];
-        contract.output.columns[1]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[1].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.r", "r", 2)];
-        contract.join = Some(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
-            predicates: vec![JoinPredicateLineage {
-                left: qualified_field("ice.db.l", "l", 1),
-                right: qualified_field("ice.db.r", "r", 1),
-            }],
-        });
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_s".to_string(),
-                    target_field_id: 200,
-                    type_signature: "binary".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-                AggregateStateColumnContract {
-                    column_name: "__agg_state___ivm_row_count".to_string(),
-                    target_field_id: 201,
-                    type_signature: "long".to_string(),
-                    nullable: false,
-                    role: AggregateStateRoleContract::RetractionCount,
-                },
-            ],
-        });
-        mutate(&mut contract);
-        mv_def.schema_contract = Some(contract.clone());
-        let mut target_fields = vec![
-            Arc::new(NestedField::required(
-                100,
-                "k",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                101,
-                "s",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::required(
-                999,
-                "__row_id__",
-                Type::Primitive(PrimitiveType::String),
-            )),
-            Arc::new(NestedField::optional(
-                200,
-                "__agg_state_s",
-                Type::Primitive(PrimitiveType::Binary),
-            )),
-            Arc::new(NestedField::required(
-                201,
-                "__agg_state___ivm_row_count",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-        ];
-        if let Some(branch) = &contract.branch {
-            target_fields.push(Arc::new(NestedField::required(
-                branch.branch_id_column.target_field_id,
-                branch.branch_id_column.column_name.clone(),
-                Type::Primitive(PrimitiveType::Int),
-            )));
-        }
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(target_fields)
-                .build()
-                .expect("build target schema"),
-        );
-        Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT l.k, sum(r.v) AS s FROM ice.db.l JOIN ice.db.r ON l.k = r.k GROUP BY l.k",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "l"), make_ref("ice", "db", "r")]),
-                Arc::new(make_pin(&[
-                    ("ice.db.l", 22, "uuid-l"),
-                    ("ice.db.r", 44, "uuid-r"),
-                ])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("join aggregate mv context must build"),
-        )
-    }
-
-    fn join_base_contract(table_fqn: &str, table_uuid: &str, alias: &str) -> BaseContract {
-        BaseContract {
-            table_fqn: table_fqn.to_string(),
-            table_uuid: table_uuid.to_string(),
-            alias_at_create: Some(alias.to_string()),
-            schema_id_at_create: 7,
-            schema_at_create: BaseSchemaSnapshot {
-                fields: vec![
-                    BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "k".to_string(),
-                        type_signature: "long".to_string(),
-                        required: true,
-                    },
-                    BaseFieldRecord {
-                        field_id: 2,
-                        name_at_create: "v".to_string(),
-                        type_signature: "long".to_string(),
-                        required: false,
-                    },
-                ],
-            },
-        }
-    }
-
-    fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
-        QualifiedFieldLineage {
-            table_fqn: table_fqn.to_string(),
-            qualifier_at_create: qualifier.to_string(),
-            field_id,
-        }
-    }
-
-    fn join_base_scan(table: &str, first_id: u32, current_snapshot_id: i64) -> LogicalPlanNode {
+    fn join_base_scan(table: &str, first_id: u32, _current_snapshot_id: i64) -> LogicalPlanNode {
         let columns = vec![
             ColumnDef {
                 name: "k".to_string(),
@@ -1137,39 +905,17 @@ pub(crate) mod tests {
                     name: table.to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        crate::sql::compiler::mv_rewrite::test_target_binding(),
+                        SqlTableIdentity {
                             catalog: "ice".to_string(),
                             namespace: "db".to_string(),
                             table: table.to_string(),
-                            table_uuid: Some(format!("uuid-{table}")),
-                            current_snapshot_id: Some(current_snapshot_id),
-                            schema_id: 7,
-                            location: format!("file:///tmp/ice/db/{table}"),
-                            schema: IcebergSchemaDef {
-                                fields: [(1, "k"), (2, "v")]
-                                    .into_iter()
-                                    .map(|(field_id, name)| {
-                                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-                                            field_id,
-                                            name: name.to_string(),
-                                            initial_default: None,
-                                            write_default: None,
-                                            initial_default_json: None,
-                                            write_default_json: None,
-                                            children: Vec::new(),
-                                        }
-                                    })
-                                    .collect(),
-                            },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
                         },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
                 },
                 alias: Some(table.to_string()),
                 columns: vec![
@@ -1444,7 +1190,7 @@ pub(crate) mod tests {
             let ext = ctx
                 .extension::<ImvExtension>()
                 .expect("ImvExtension installed");
-            let t = &ext.mv_ctx.target;
+            let t = &ext.snapshot.target;
             let fqn = format!("{}.{}.{}", t.catalog, t.namespace, t.table);
             if fqn == self.expected_target {
                 self.saw_mv_ctx.store(true, Ordering::SeqCst);
@@ -1467,7 +1213,7 @@ pub(crate) mod tests {
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: std::rc::Rc::clone(&factory),
@@ -1485,7 +1231,7 @@ pub(crate) mod tests {
         // of whether wrapping occurs.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1507,7 +1253,7 @@ pub(crate) mod tests {
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1524,8 +1270,8 @@ pub(crate) mod tests {
     fn imv_rewrite_context_visible_through_extension() {
         use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 
-        let mv_ctx = dummy_mv_ctx();
-        let t = &mv_ctx.target;
+        let snapshot = dummy_mv_ctx();
+        let t = &snapshot.target;
         let expected_target = format!("{}.{}.{}", t.catalog, t.namespace, t.table);
         let saw_mv_ctx = Arc::new(AtomicBool::new(false));
 
@@ -1540,7 +1286,7 @@ pub(crate) mod tests {
 
         let mut ctx_rw = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx,
+            snapshot,
             annotation: ImvPlanAnnotation::default(),
         });
 
@@ -1602,7 +1348,7 @@ pub(crate) mod tests {
 
         let mut ctx_rw = RewriteContext::for_mv_refresh(vec!["DummyImvRule".to_string()]);
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
         });
 
@@ -1624,7 +1370,7 @@ pub(crate) mod tests {
         // the pipeline can succeed and we can inspect the trace count.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1695,7 +1441,7 @@ pub(crate) mod tests {
 
         let mut ctx_rw = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx_rw.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             annotation: ImvPlanAnnotation::default(),
         });
 
@@ -1725,7 +1471,7 @@ pub(crate) mod tests {
         // the marker-rejection contract rather than identity.
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1744,7 +1490,7 @@ pub(crate) mod tests {
         // try_run_imv_rewrite_pipeline swallows the Err.
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1763,7 +1509,7 @@ pub(crate) mod tests {
         // wire-up reaches the new rule.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1778,7 +1524,7 @@ pub(crate) mod tests {
     fn imv_pipeline_traces_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1813,7 +1559,7 @@ pub(crate) mod tests {
         // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
@@ -1827,15 +1573,17 @@ pub(crate) mod tests {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
-            ScanSource::IcebergDeltaTable {
-                from_snapshot_id,
-                to_snapshot_id,
-                ..
-            } => {
-                assert_eq!(*from_snapshot_id, 11);
-                assert_eq!(*to_snapshot_id, 22);
-            }
-            other => panic!("expected IcebergDeltaTable, got {other:?}"),
+            ScanSource::Sql(source) => match source.kind {
+                SqlScanKind::Delta {
+                    from_snapshot_id,
+                    to_snapshot_id,
+                } => {
+                    assert_eq!(from_snapshot_id, 11);
+                    assert_eq!(to_snapshot_id, 22);
+                }
+                ref other => panic!("expected delta SQL source, got {other:?}"),
+            },
+            other => panic!("expected token-bound SQL source, got {other:?}"),
         }
     }
 
@@ -1850,7 +1598,7 @@ pub(crate) mod tests {
         );
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1861,10 +1609,13 @@ pub(crate) mod tests {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
-            ScanSource::IcebergVersionTable { snapshot_id, .. } => {
-                assert_eq!(*snapshot_id, 11);
-            }
-            other => panic!("expected IcebergVersionTable, got {other:?}"),
+            ScanSource::Sql(source) => match source.kind {
+                SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                } => assert_eq!(snapshot_id, 11),
+                ref other => panic!("expected frozen-input SQL source, got {other:?}"),
+            },
+            other => panic!("expected token-bound SQL source, got {other:?}"),
         }
     }
 
@@ -1879,7 +1630,7 @@ pub(crate) mod tests {
         );
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1890,10 +1641,13 @@ pub(crate) mod tests {
             panic!("expected scan outcome");
         };
         match &scan.table.source {
-            ScanSource::IcebergVersionTable { snapshot_id, .. } => {
-                assert_eq!(*snapshot_id, 22);
-            }
-            other => panic!("expected IcebergVersionTable, got {other:?}"),
+            ScanSource::Sql(source) => match source.kind {
+                SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                } => assert_eq!(snapshot_id, 22),
+                ref other => panic!("expected frozen-input SQL source, got {other:?}"),
+            },
+            other => panic!("expected token-bound SQL source, got {other:?}"),
         }
     }
 
@@ -1904,7 +1658,7 @@ pub(crate) mod tests {
         // requiring a Project wrapper above the Scan.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: iceberg_scan_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: vec![
                 "InjectApplyKeyProject".to_string(),
                 "ActionColumnValidation".to_string(),
@@ -1955,7 +1709,7 @@ pub(crate) mod tests {
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2012,7 +1766,7 @@ pub(crate) mod tests {
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory_reserved_until(100),
@@ -2090,7 +1844,7 @@ pub(crate) mod tests {
 
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: project,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory_reserved_until(100),
@@ -2107,7 +1861,7 @@ pub(crate) mod tests {
     fn imv_pipeline_rewrites_top_level_union_all_delta_end_to_end() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2183,7 +1937,7 @@ pub(crate) mod tests {
     fn imv_pipeline_annotates_partition_spec_for_partitioned_aggregate() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
-            mv_ctx: partitioned_aggregate_mv_ctx(),
+            snapshot: partitioned_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2205,7 +1959,7 @@ pub(crate) mod tests {
         assert_eq!(specs[0].fields[0].output_index, 0);
         assert_eq!(
             specs[0].fields[0].transform,
-            iceberg::spec::Transform::Identity
+            crate::sql::compiler::mv_rewrite::SqlImvPartitionTransform::Identity
         );
     }
 
@@ -2213,7 +1967,7 @@ pub(crate) mod tests {
     fn imv_pipeline_annotates_unpartitioned_for_plain_aggregate() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
-            mv_ctx: aggregate_mv_ctx(),
+            snapshot: aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2227,29 +1981,27 @@ pub(crate) mod tests {
 
     #[test]
     fn imv_pipeline_annotates_not_derivable_for_non_pure_partition_lineage() {
-        use crate::mv::persistence::schema::{
-            ExpressionKind, MvPartitionContract, MvPartitionFieldContract,
-            MvPartitionTransformContract,
-        };
-        let ctx = aggregate_mv_ctx_customized(|contract| {
-            contract.target.partition = Some(MvPartitionContract {
-                target_spec_id: 7,
-                fields: vec![MvPartitionFieldContract {
-                    partition_field_id: 1000,
-                    partition_field_name: "k".to_string(),
-                    source_target_field_id: 100,
-                    source_column_name: "k".to_string(),
-                    transform: MvPartitionTransformContract::Identity,
-                }],
-            });
-            contract.output.columns[0].expression.kind = ExpressionKind::Func;
-            contract.output.columns[0]
+        let ctx = aggregate_mv_ctx_customized(|snapshot| {
+            let contract = Arc::make_mut(&mut snapshot.schema_contract);
+            contract.target.partition =
+                Some(crate::sql::compiler::mv_rewrite::SqlImvPartitionContract {
+                    target_spec_id: 7,
+                    fields: vec![crate::sql::compiler::mv_rewrite::SqlImvPartitionField {
+                        partition_field_name: "k".to_string(),
+                        source_target_field_id: 100,
+                        transform:
+                            crate::sql::compiler::mv_rewrite::SqlImvPartitionTransform::Identity,
+                    }],
+                });
+            contract.output_columns[0].expression.kind =
+                crate::sql::compiler::mv_rewrite::SqlImvExpressionKind::Func;
+            contract.output_columns[0]
                 .expression
                 .referenced_base_field_ids = vec![1, 2];
         });
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
-            mv_ctx: ctx,
+            snapshot: ctx,
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2284,7 +2036,7 @@ pub(crate) mod tests {
         );
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: project,
-            mv_ctx: dummy_mv_ctx(),
+            snapshot: dummy_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2297,7 +2049,7 @@ pub(crate) mod tests {
     fn imv_pipeline_rewrites_aggregate_refresh_to_state_merge() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),
-            mv_ctx: aggregate_mv_ctx(),
+            snapshot: aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2318,7 +2070,10 @@ pub(crate) mod tests {
             panic!("expected bound delta scan under signed aggregate");
         };
         assert!(
-            matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }),
+            matches!(
+                &scan.table.source,
+                ScanSource::Sql(source) if matches!(source.kind, SqlScanKind::Delta { .. })
+            ),
             "signed aggregate input must be delta-bound"
         );
         assert!(
@@ -2350,7 +2105,7 @@ pub(crate) mod tests {
     fn imv_pipeline_rewrites_join_aggregate_refresh_to_bound_state_merge() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
-            mv_ctx: join_aggregate_mv_ctx(),
+            snapshot: join_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2392,7 +2147,7 @@ pub(crate) mod tests {
     fn join_aggregate_refresh_does_not_record_join_payload_descriptor() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
-            mv_ctx: join_aggregate_mv_ctx(),
+            snapshot: join_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2407,7 +2162,7 @@ pub(crate) mod tests {
     fn pure_join_refresh_pipeline_keeps_internal_outputs_above_projection() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
-            mv_ctx: join_projection_mv_ctx(),
+            snapshot: join_projection_mv_ctx(),
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory_reserved_until(30),
@@ -2480,7 +2235,7 @@ pub(crate) mod tests {
     fn pure_join_refresh_union_branches_match_declared_output_schema() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
-            mv_ctx: join_projection_mv_ctx(),
+            snapshot: join_projection_mv_ctx(),
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory_reserved_until(30),
@@ -2517,7 +2272,7 @@ pub(crate) mod tests {
         let factory_cell = test_column_ref_factory_reserved_until(30);
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_projection_plan(),
-            mv_ctx: join_projection_mv_ctx(),
+            snapshot: join_projection_mv_ctx(),
             disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
             deadline: None,
             column_ref_factory: Rc::clone(&factory_cell),
@@ -2535,6 +2290,7 @@ pub(crate) mod tests {
                 outcome.plan,
                 descriptor,
                 &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                    target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
                     target_table_uuid: "uuid-tgt".to_string(),
                     target_snapshot_id: Some(99),
                 },
@@ -2560,7 +2316,7 @@ pub(crate) mod tests {
                 let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_plan(),
-                    mv_ctx: join_projection_mv_ctx(),
+                    snapshot: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -2578,6 +2334,7 @@ pub(crate) mod tests {
                         outcome.plan,
                         descriptor,
                         &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
                             target_table_uuid: "uuid-tgt".to_string(),
                             target_snapshot_id: Some(99),
                         },
@@ -2608,7 +2365,7 @@ pub(crate) mod tests {
                 let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_filter_plan(),
-                    mv_ctx: join_projection_mv_ctx(),
+                    snapshot: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -2626,6 +2383,7 @@ pub(crate) mod tests {
                         outcome.plan,
                         descriptor,
                         &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
                             target_table_uuid: "uuid-tgt".to_string(),
                             target_snapshot_id: Some(99),
                         },
@@ -2660,7 +2418,7 @@ pub(crate) mod tests {
                 let factory_cell = test_column_ref_factory_reserved_until(30);
                 let outcome = run_imv_rewrite(ImvRewriteInput {
                     plan: join_projection_left_filter_plan(),
-                    mv_ctx: join_projection_mv_ctx(),
+                    snapshot: join_projection_mv_ctx(),
                     disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                     deadline: None,
                     column_ref_factory: Rc::clone(&factory_cell),
@@ -2678,6 +2436,7 @@ pub(crate) mod tests {
                         outcome.plan,
                         descriptor,
                         &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding {
+                            target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
                             target_table_uuid: "uuid-tgt".to_string(),
                             target_snapshot_id: Some(99),
                         },
@@ -2699,58 +2458,17 @@ pub(crate) mod tests {
             .expect("join side-filter physical scope test");
     }
 
-    fn bind_iceberg_scan_metadata_to_refresh_pin(
-        mut plan: LogicalPlanNode,
-        refresh_ctx: &IcebergMvRewriteContext,
-    ) -> LogicalPlanNode {
-        fn visit(plan: &mut LogicalPlanNode, refresh_ctx: &IcebergMvRewriteContext) {
-            if let LogicalPlanKind::Scan(scan) = &mut plan.kind
-                && let ScanSource::IcebergDataFiles { table, .. } = &mut scan.table.source
-            {
-                let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
-                if let Some(base_ref) = refresh_ctx
-                    .base_refs
-                    .iter()
-                    .find(|base_ref| base_ref.fqn().eq_ignore_ascii_case(&fqn))
-                {
-                    table.current_snapshot_id = Some(
-                        refresh_ctx
-                            .pin
-                            .get(base_ref)
-                            .expect("test refresh pin covers base"),
-                    );
-                    table.table_uuid = Some(
-                        refresh_ctx
-                            .pin
-                            .uuid(base_ref)
-                            .expect("test refresh pin carries base uuid")
-                            .to_string(),
-                    );
-                }
-            }
-            for child in &mut plan.children {
-                visit(child, refresh_ctx);
-            }
-        }
-
-        visit(&mut plan, refresh_ctx);
-        plan
-    }
-
     pub(crate) mod tests_support {
         use super::*;
 
-        pub(crate) fn build_join_refresh_coalesce_plan_for_lowering(
-            refresh_ctx: &Arc<IcebergMvRewriteContext>,
-        ) -> crate::sql::optimizer::OptimizedOperatorNode {
-            let plan = bind_iceberg_scan_metadata_to_refresh_pin(
-                join_projection_plan(),
-                refresh_ctx.as_ref(),
-            );
+        pub(crate) fn build_join_refresh_coalesce_plan_for_lowering()
+        -> crate::sql::optimizer::OptimizedOperatorNode {
+            let plan = join_projection_plan();
             let factory_cell = test_column_ref_factory_reserved_until(30);
+            let snapshot = crate::sql::compiler::mv_rewrite::test_join_snapshot(false);
             let outcome = run_imv_rewrite(ImvRewriteInput {
                 plan,
-                mv_ctx: Arc::clone(refresh_ctx),
+                snapshot: Arc::clone(&snapshot),
                 disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                 deadline: None,
                 column_ref_factory: Rc::clone(&factory_cell),
@@ -2767,7 +2485,7 @@ pub(crate) mod tests {
                 crate::sql::planner::imv_rewrite::join_refresh_builder::build_join_delta_coalesce_plan_with_locator(
                     outcome.plan,
                     descriptor,
-                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_rewrite_context(refresh_ctx),
+                    &crate::sql::planner::imv_rewrite::join_refresh_builder::JoinRefreshTargetLocatorBinding::from_snapshot(&snapshot),
                     &mut factory,
                     200,
                     201,
@@ -2783,21 +2501,17 @@ pub(crate) mod tests {
 
     #[test]
     fn imv_pipeline_uses_aggregate_change_stream_without_join_contract() {
-        let ctx = join_aggregate_mv_ctx_customized(|contract| {
+        let ctx = join_aggregate_mv_ctx_customized(|snapshot| {
+            let contract = Arc::make_mut(&mut snapshot.schema_contract);
             contract.join = None;
-            contract.branch = Some(BranchUnionContract {
-                branch_id_column: BranchIdColumnContract {
-                    column_name: BRANCH_ID_COLUMN_NAME.to_string(),
-                    target_field_id: 4242,
-                },
-                branch_count: 2,
-                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            contract.branch = Some(crate::sql::compiler::mv_rewrite::SqlImvBranchContract {
+                branch_id_column_name: BRANCH_ID_COLUMN_NAME.to_string(),
             });
         });
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
-            mv_ctx: ctx,
+            snapshot: ctx,
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2812,7 +2526,7 @@ pub(crate) mod tests {
     fn query_rewrite_preserves_join_aggregate_action_column() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: join_aggregate_plan(),
-            mv_ctx: join_aggregate_mv_ctx(),
+            snapshot: join_aggregate_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -3120,7 +2834,10 @@ pub(crate) mod tests {
             &plan.kind,
             LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
-                    source: ScanSource::MvTargetState(_),
+                    source: ScanSource::Sql(SqlScanSource {
+                        kind: SqlScanKind::MvTargetState { .. },
+                        ..
+                    }),
                     ..
                 },
                 ..
@@ -3203,11 +2920,7 @@ pub(crate) mod tests {
     ) {
         let scan = assert_project_scan_any_table(plan);
         match &scan.table.source {
-            ScanSource::IcebergDeltaTable {
-                table,
-                from_snapshot_id,
-                to_snapshot_id,
-            } => {
+            ScanSource::Sql(source) if matches!(source.kind, SqlScanKind::Delta { .. }) => {
                 let action = scan
                     .columns
                     .iter()
@@ -3215,14 +2928,29 @@ pub(crate) mod tests {
                     .expect("delta scan must carry action column")
                     .column_id;
                 assert_eq!(action, signed_action_id);
-                delta_windows.push((table.table.clone(), *from_snapshot_id, *to_snapshot_id));
+                let SqlScanKind::Delta {
+                    from_snapshot_id,
+                    to_snapshot_id,
+                } = source.kind
+                else {
+                    unreachable!("matched delta SQL scan")
+                };
+                delta_windows.push((source.table.table.clone(), from_snapshot_id, to_snapshot_id));
             }
-            ScanSource::IcebergVersionTable { table, snapshot_id } => {
+            ScanSource::Sql(source)
+                if matches!(source.kind, SqlScanKind::FrozenInputSet { .. }) =>
+            {
                 assert!(
                     !scan.columns.iter().any(ImvActionColumn::matches),
                     "version scan must not carry action column"
                 );
-                version_snapshots.push((table.table.clone(), *snapshot_id));
+                let SqlScanKind::FrozenInputSet {
+                    version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                } = source.kind
+                else {
+                    panic!("expected snapshot-bound frozen-input SQL scan");
+                };
+                version_snapshots.push((source.table.table.clone(), snapshot_id));
             }
             other => panic!("expected delta/version scan source, got {other:?}"),
         }

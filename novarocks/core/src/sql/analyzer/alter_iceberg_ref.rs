@@ -78,7 +78,7 @@ pub fn analyze_alter_iceberg_ref(
             replace,
             ignored_options,
         } => {
-            warn_ignored_options(ignored_options);
+            let _ = ignored_options;
             check_kind(table_metadata, name, IcebergRefKind::Branch)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateBranch {
@@ -95,7 +95,7 @@ pub fn analyze_alter_iceberg_ref(
             replace,
             ignored_options,
         } => {
-            warn_ignored_options(ignored_options);
+            let _ = ignored_options;
             check_kind(table_metadata, name, IcebergRefKind::Tag)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateTag {
@@ -135,15 +135,6 @@ fn action_name(a: &AlterIcebergRefAction) -> &str {
         | AlterIcebergRefAction::CreateTag { name, .. }
         | AlterIcebergRefAction::DropBranch { name, .. }
         | AlterIcebergRefAction::DropTag { name, .. } => name,
-    }
-}
-
-fn warn_ignored_options(opts: &[String]) {
-    if !opts.is_empty() {
-        tracing::warn!(
-            "iceberg ref: retention options ignored in phase 1: {}",
-            opts.join(" ")
-        );
     }
 }
 

@@ -41,8 +41,7 @@ fn slot_id_expr(arena: &mut ExprArena, slot: i32, data_type: DataType) -> ExprId
 }
 
 fn variant_primitive_serialized(type_id: u8, payload: &[u8]) -> Vec<u8> {
-    use novarocks::exec::variant::VariantMetadata;
-    use novarocks::exec::variant::VariantValue;
+    use novarocks_types::value::variant::{VariantMetadata, VariantValue};
     let metadata = VariantMetadata::empty();
     let mut value = vec![type_id << 2];
     value.extend_from_slice(payload);
@@ -226,7 +225,7 @@ fn test_variant_get_bigint_root() {
 
 #[test]
 fn test_variant_get_two_arg_returns_variant() {
-    use novarocks::exec::variant::{VariantValue, variant_to_i64};
+    use novarocks_types::value::variant::{VariantValue, variant_to_i64};
     let variant = variant_primitive_serialized(6, &123_i64.to_le_bytes());
     let (chunk, arg0, mut arena) = make_variant_chunk(variant);
     let arg1 = utf8_lit(&mut arena, "$");

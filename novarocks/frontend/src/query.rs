@@ -1408,6 +1408,12 @@ mod tests {
                     write_default: None,
                     logical_type: None,
                 }],
+                planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease::new(
+                    Arc::new(crate::connector::control_host::tests::test_control_binding(
+                        1,
+                    )),
+                    || {},
+                ),
             })
         }
 
@@ -1484,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_handles_insert_before_core_command() {
+    fn sqlx2_application_frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1514,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_passes_one_request_context_to_dml() {
+    fn sqlx2_application_frontend_router_passes_one_request_context_to_dml() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1549,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_handles_delete_before_core_command() {
+    fn sqlx2_application_frontend_router_handles_delete_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();

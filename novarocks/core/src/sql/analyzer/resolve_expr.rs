@@ -5345,8 +5345,13 @@ fn incompatible_complex_compare(left: &DataType, right: &DataType) -> Option<Str
 mod tests {
     use super::super::analyze;
     use crate::sql::analysis::QueryBody;
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::catalog::PlannerTableProvider;
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    };
     use arrow::datatypes::DataType;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     struct EmptyCatalog;
 
@@ -5384,7 +5389,20 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new(
+                        SqlTableBindingScopeId::new(NonZeroU64::new(43).expect("non-zero scope")),
+                        NonZeroU32::new(1).expect("non-zero binding ordinal"),
+                    ),
+                    SqlTableIdentity {
+                        catalog: catalog.unwrap_or("default_catalog").to_string(),
+                        namespace: database.to_string(),
+                        table: table.to_string(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,

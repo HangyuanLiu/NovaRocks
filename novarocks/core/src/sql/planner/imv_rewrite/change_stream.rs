@@ -36,7 +36,7 @@ use crate::sql::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshDescri
 use crate::sql::planner::imv_rewrite::opt_expr_to_plan;
 use crate::sql::planner::logical::{LogicalAggregateNode, LogicalPlanKind, LogicalPlanNode};
 use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-use crate::sql::planner::table::{ScanSource, TableDef};
+use crate::sql::planner::table::{ScanSource, TableDef, sql_mv_target_state_scan};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImvChangeStreamDescriptor {
@@ -464,16 +464,9 @@ fn contains_branch_marker_values(plan: &LogicalPlanNode) -> bool {
 }
 
 fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
-    matches!(
-        &plan.kind,
-        LogicalPlanKind::Scan(PlanScanNode {
-            table: TableDef {
-                source: ScanSource::MvTargetState(_),
-                ..
-            },
-            ..
-        })
-    ) || plan.children.iter().any(contains_target_state_scan)
+    matches!(&plan.kind, LogicalPlanKind::Scan(scan)
+        if sql_mv_target_state_scan(&scan.table.source).is_some())
+        || plan.children.iter().any(contains_target_state_scan)
 }
 
 fn contains_signed_state_aggregate(plan: &LogicalPlanNode) -> bool {
@@ -535,7 +528,7 @@ mod tests {
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode, PlanValuesNode,
     };
     use crate::sql::planner::table::{
-        SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
+        SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, SqlTableIdentity, TableDef,
     };
     use novarocks_catalog::schema::ColumnDef;
 
@@ -576,9 +569,12 @@ mod tests {
                     columns: columns.clone(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     source: build_target_state_scan_source(
-                        "ice".to_string(),
-                        "db".to_string(),
-                        "mv_target".to_string(),
+                        crate::sql::compiler::mv_rewrite::test_target_binding(),
+                        SqlTableIdentity {
+                            catalog: "ice".to_string(),
+                            namespace: "db".to_string(),
+                            table: "mv_target".to_string(),
+                        },
                         "target-uuid".to_string(),
                         Some(10),
                         1,

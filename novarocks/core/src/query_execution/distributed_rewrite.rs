@@ -26,6 +26,9 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
+use crate::engine::query_planning::bindings::{
+    QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+};
 use crate::query_execution::backend::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     ConnectorWriteExecutionRegistration, ConnectorWriteOperationRegistration,
@@ -34,6 +37,11 @@ use crate::query_execution::contract::{
 use crate::query_execution::outcome::ConnectorWriteCompletion;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::sql::binding::SqlTableBindingId;
+use crate::sql::catalog::ResolvedAnalyzerTable;
+use crate::sql::planner::table::{
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+};
 
 /// Plan one frozen source through the scan-planning capability retained by a
 /// composite rewrite lease.  The plan is opaque to this module: it has no
@@ -106,11 +114,72 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
     })
 }
 
+/// Admit the synthetic source used by one opaque frozen rewrite read.
+///
+/// The exact connector authority remains in `FrozenRewriteReadResolver`, but
+/// the physical SQL artifact still carries a request-local token from the
+/// same store retained through preparation.  This prevents the resolver-only
+/// path from reintroducing an unbound scan carrier after `ConnectorPinned`
+/// was removed.
+pub(crate) fn admit_frozen_rewrite_scan_binding(
+    bindings: &QueryTableBindingStore,
+    input_schema: &arrow::datatypes::SchemaRef,
+) -> Result<SqlTableBindingId, String> {
+    let columns = input_schema
+        .fields()
+        .iter()
+        .map(|field| novarocks_catalog::schema::ColumnDef {
+            name: field.name().to_string(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect::<Vec<_>>();
+    bindings.resolve_or_insert_with_id(
+        QueryTableBindingKey::strict_base(
+            "__distributed_rewrite",
+            "__distributed_rewrite",
+            "__connector_frozen_rewrite",
+        ),
+        |binding| {
+            let identity = SqlTableIdentity {
+                catalog: "__distributed_rewrite".to_string(),
+                namespace: "__distributed_rewrite".to_string(),
+                table: "__connector_frozen_rewrite".to_string(),
+            };
+            let catalog = identity.catalog.clone();
+            let namespace = identity.namespace.clone();
+            Ok(QueryTableBinding {
+                resolved: ResolvedAnalyzerTable::from_planner(
+                    Some(&catalog),
+                    &namespace,
+                    TableDef {
+                        name: identity.table.clone(),
+                        columns,
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: ScanSource::Sql(SqlScanSource::new(
+                            binding,
+                            identity,
+                            SqlScanKind::ConnectorRead,
+                        )),
+                    },
+                ),
+                statistics_pin: None,
+                planning_lease: None,
+                scan_materialization: None,
+            })
+        },
+    )
+}
+
 /// Build the minimal physical source for one opaque frozen rewrite read.
-/// Execution preparation replaces this `ConnectorPinned` node exactly once
-/// with the `PlannedConnectorRead` above; no normal table lookup may run.
+/// Execution preparation replaces this SQL-owned connector-read node exactly
+/// once with the `PlannedConnectorRead` above; no normal table lookup may
+/// run.
 pub(crate) fn frozen_rewrite_scan_physical_plan(
     input_schema: &arrow::datatypes::SchemaRef,
+    binding: SqlTableBindingId,
 ) -> crate::sql::planner::physical::PhysicalPlanNode {
     let mut factory = crate::sql::column_id::ColumnRefFactory::new();
     let mut output_columns = Vec::with_capacity(input_schema.fields().len());
@@ -143,7 +212,15 @@ pub(crate) fn frozen_rewrite_scan_physical_plan(
                     name: "__connector_frozen_rewrite".to_string(),
                     columns: table_columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        binding,
+                        SqlTableIdentity {
+                            catalog: "__distributed_rewrite".to_string(),
+                            namespace: "__distributed_rewrite".to_string(),
+                            table: "__connector_frozen_rewrite".to_string(),
+                        },
+                        SqlScanKind::ConnectorRead,
+                    )),
                 },
                 alias: None,
                 columns: output_columns.clone(),

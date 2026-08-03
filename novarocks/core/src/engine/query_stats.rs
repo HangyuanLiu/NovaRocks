@@ -31,6 +31,7 @@ use crate::connector::unified_statistics::{
 };
 use crate::engine::query_planning::bindings::{
     QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
+    parse_time_travel_overlay_identity,
 };
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
@@ -235,8 +236,8 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
         if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
-            let (mut planner, statistics_pin, planning_lease) =
-                crate::connector::iceberg::provider::load_time_travel_table_def_with_lease(
+            let materialization =
+                crate::connector::iceberg::provider::load_time_travel_materialization_with_lease(
                     self.controls,
                     self.connector_context.clone(),
                     catalog,
@@ -244,32 +245,31 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                     base_table,
                     snapshot_id,
                 )?;
-            planner.name = table.to_string();
-            let mut binding = QueryTableBinding {
-                resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-                statistics_pin,
-                planning_lease: Some(planning_lease),
-                scan_materialization: None,
-            };
-            binding.project_legacy_scan_for_sql(binding_id)?;
-            return Ok(binding);
+            return crate::engine::query_planning::catalog_materializer::
+                iceberg_query_binding_from_materialization(
+                    materialization,
+                    catalog,
+                    namespace,
+                    table,
+                    binding_id,
+                );
         }
-        let (planner, _schema_id, statistics_pin, planning_lease) =
-            crate::connector::iceberg::provider::load_schema_table_def_with_lease(
+        let materialization =
+            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
                 self.controls,
                 self.connector_context.clone(),
                 catalog,
                 namespace,
                 table,
             )?;
-        let mut binding = QueryTableBinding {
-            resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-            statistics_pin,
-            planning_lease: Some(planning_lease),
-            scan_materialization: None,
-        };
-        binding.project_legacy_scan_for_sql(binding_id)?;
-        Ok(binding)
+        crate::engine::query_planning::catalog_materializer::
+            iceberg_query_binding_from_materialization(
+                materialization,
+                catalog,
+                namespace,
+                table,
+                binding_id,
+            )
     }
 
     fn load_metadata_table(
@@ -303,8 +303,8 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
             }
         };
-        let (mut planner, statistics_pin, planning_lease) =
-            crate::connector::iceberg::provider::load_metadata_table_def_with_lease(
+        let materialization =
+            crate::connector::iceberg::provider::load_metadata_materialization_with_lease(
                 self.controls,
                 self.connector_context.clone(),
                 catalog,
@@ -312,20 +312,10 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 table,
                 iceberg_metadata_table_type,
             )?;
-        let ScanSource::IcebergDataFiles {
-            table: table_info,
-            files,
-            ..
-        } = &planner.source
-        else {
-            return Err(
-                "Iceberg metadata resolution did not produce a data-file descriptor".to_string(),
-            );
-        };
-        let table_info = table_info.clone();
-        let files = files.clone();
+        let table_info = materialization.table;
+        let files = materialization.files;
         let columns = metadata_columns_for_table(metadata_table_type, &table_info)?;
-        planner.columns = columns
+        let columns = columns
             .into_iter()
             .map(|column| novarocks_catalog::schema::ColumnDef {
                 name: column.name,
@@ -334,29 +324,35 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 write_default: None,
                 logical_type: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
         let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
             format!(
                 "iceberg metadata table {catalog}.{namespace}.{table} has no serialized metadata"
             )
         })?;
         let metadata_payload = metadata_payload(metadata_table_type, &table_info, &files)?;
-        planner.source = ScanSource::Sql(SqlScanSource::new(
-            binding_id,
-            SqlTableIdentity {
-                catalog: catalog.to_string(),
-                namespace: namespace.to_string(),
-                table: table.to_string(),
-            },
-            SqlScanKind::Metadata {
-                kind: metadata_table_type,
-                version: SqlTableVersionSelector::Current,
-            },
-        ));
+        let planner = crate::sql::planner::table::TableDef {
+            name: materialization.table_name,
+            columns,
+            iceberg_row_lineage_metadata_columns: materialization
+                .iceberg_row_lineage_metadata_columns,
+            source: ScanSource::Sql(SqlScanSource::new(
+                binding_id,
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: table.to_string(),
+                },
+                SqlScanKind::Metadata {
+                    kind: metadata_table_type,
+                    version: SqlTableVersionSelector::Current,
+                },
+            )),
+        };
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-            statistics_pin,
-            planning_lease: Some(planning_lease),
+            statistics_pin: materialization.statistics_pin,
+            planning_lease: Some(materialization.planning_lease),
             scan_materialization: Some(QueryScanMaterialization::IcebergMetadata {
                 table: table_info,
                 metadata_table_type,
@@ -586,18 +582,6 @@ fn partition_struct_type(
     Ok(DataType::Struct(Fields::from(fields)))
 }
 
-/// Query-prep encodes time-travel selectors as a synthetic analyzer identity.
-/// The identity is recognized only by this query-scoped binding loader, so it
-/// cannot leak into the global local catalog or another request's memo.
-fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
-    let encoded = table.strip_prefix("__sqlx1_tt_")?;
-    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
-    (!base_table.is_empty())
-        .then(|| snapshot_id.parse::<i64>().ok())
-        .flatten()
-        .map(|snapshot_id| (base_table, snapshot_id))
-}
-
 pub(crate) type QueryStatsPlan = crate::sql::compiler::SqlStatisticsPlan;
 
 pub(crate) struct QueryStatsCollector {
@@ -652,36 +636,8 @@ pub(super) fn collect_table_stats(
     table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
-    let binding_id = match &table_def.source {
-        ScanSource::Sql(source) => source.binding,
-        ScanSource::IcebergDataFiles { table, binding, .. } => {
-            let Some(bindings) = context.bindings.as_ref() else {
-                return (
-                    label,
-                    BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                        "query table bindings are not available".to_string(),
-                    )),
-                );
-            };
-            let Some(binding_id) = bindings.iceberg_data_file_binding_id(table, *binding) else {
-                return (
-                    label,
-                    BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                        "table resolution did not retain an exact query binding".to_string(),
-                    )),
-                );
-            };
-            binding_id
-        }
-        _ => {
-            return (
-                label,
-                BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                    "scan source does not expose connector statistics".to_string(),
-                )),
-            );
-        }
-    };
+    let ScanSource::Sql(source) = &table_def.source;
+    let binding_id = source.binding;
     let Some(bindings) = context.bindings.as_ref() else {
         return (
             label,
@@ -831,18 +787,12 @@ fn metric_f64(state: Option<&StatisticsMetricState>) -> Option<f64> {
 }
 
 fn table_label(database: &str, table_def: &crate::sql::planner::table::TableDef) -> String {
-    match &table_def.source {
-        ScanSource::Sql(source) => format!(
-            "{}.{}.{}",
-            source.table.catalog, source.table.namespace, source.table.table
-        ),
-        ScanSource::IcebergDataFiles { table, .. }
-        | ScanSource::IcebergVersionTable { table, .. }
-        | ScanSource::IcebergDeltaTable { table, .. } => {
-            format!("{}.{}.{}", table.catalog, table.namespace, table.table)
-        }
-        _ => format!("{}.{}", database, table_def.name),
-    }
+    let ScanSource::Sql(source) = &table_def.source;
+    let _ = database;
+    format!(
+        "{}.{}.{}",
+        source.table.catalog, source.table.namespace, source.table.table
+    )
 }
 
 #[cfg(test)]

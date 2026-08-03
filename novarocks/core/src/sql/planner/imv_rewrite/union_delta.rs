@@ -441,13 +441,10 @@ fn take_unary_child(children: &mut Vec<LogicalPlanNode>) -> LogicalPlanNode {
 mod tests {
     use crate::sql::planner::logical::*;
     use crate::sql::planner::payload::*;
-    use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -727,7 +724,7 @@ mod tests {
         factory.borrow_mut().reserve_until(100);
         ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
@@ -879,24 +876,7 @@ mod tests {
                     name: name.to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
-                            catalog: "ice".to_string(),
-                            namespace: "db".to_string(),
-                            table: name.to_string(),
-                            table_uuid: Some(format!("uuid-{name}")),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: format!("file:///tmp/ice/db/{name}"),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
-                        },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source(),
                 },
                 alias: None,
                 columns: vec![

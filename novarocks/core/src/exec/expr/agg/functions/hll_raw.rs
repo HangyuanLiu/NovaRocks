@@ -22,7 +22,9 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_types::value::hll::{MURMUR_SEED, murmur_hash64a};
+use novarocks_types::value::hll::{
+    HLL_DATA_EMPTY, HLL_DATA_EXPLICIT, MURMUR_SEED, encode_hll_empty, murmur_hash64a,
+};
 
 use crate::exec::node::aggregate::AggFunction;
 
@@ -31,8 +33,6 @@ use super::AggregateFunction;
 
 pub(super) struct HllRawAgg;
 
-const HLL_DATA_EMPTY: u8 = 0;
-const HLL_DATA_EXPLICIT: u8 = 1;
 const HLL_DATA_SPARSE: u8 = 2;
 const HLL_DATA_FULL: u8 = 3;
 
@@ -241,11 +241,11 @@ fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
     // HLL_DATA_EMPTY payload) is still a non-null observation, so emit a
     // valid empty HLL payload rather than NULL.
     let Some(registers) = state.registers.as_ref() else {
-        return Some(vec![HLL_DATA_EMPTY]);
+        return Some(encode_hll_empty());
     };
     let non_zero = registers.iter().filter(|v| **v > 0).count();
     if non_zero == 0 {
-        return Some(vec![HLL_DATA_EMPTY]);
+        return Some(encode_hll_empty());
     }
 
     if non_zero > HLL_SPARSE_THRESHOLD {
@@ -692,10 +692,11 @@ mod tests {
     use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array};
     use arrow::datatypes::DataType;
 
-    use super::{HLL_DATA_EMPTY, HllRawAgg};
+    use super::HllRawAgg;
     use crate::exec::expr::agg::functions::{
         AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction,
     };
+    use novarocks_types::value::hll::HLL_DATA_EMPTY;
 
     fn spec_hll_union() -> AggSpec {
         AggSpec {

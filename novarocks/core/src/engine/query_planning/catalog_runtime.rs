@@ -30,64 +30,39 @@ use novarocks_catalog::service::CatalogService;
 use novarocks_catalog::table::CatalogTable;
 
 use crate::sql::catalog::local::PlannerMemoryCatalog;
-use crate::sql::planner::table::{ScanSource, TableDef};
+use crate::sql::planner::table::TableDef;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CatalogRuntimeMetadata {
     table: CatalogTable,
-    planner: TableDef,
 }
 
 impl CatalogRuntimeMetadata {
-    fn from_table_def(identity: TableIdentity, table_def: &TableDef) -> Result<Self, String> {
-        match &table_def.source {
-            ScanSource::IcebergDataFiles {
-                table,
-                cloud_properties,
-                ..
-            } => {
-                // A registry cache stores schema identity only. It must not
-                // retain file lists or a current snapshot as a query's exact
-                // connector authority; request materialization later binds a
-                // fresh, generation-fenced lease in `QueryTableBindingStore`.
-                let mut table = table.clone();
-                table.current_snapshot_id = None;
-                table.serialized_metadata = None;
-                Ok(Self {
-                    table: CatalogTable {
-                        identity,
-                        columns: table_def.columns.clone(),
-                        hidden_columns: table_def.iceberg_row_lineage_metadata_columns.clone(),
-                    },
-                    planner: TableDef {
-                        name: table_def.name.clone(),
-                        columns: table_def.columns.clone(),
-                        iceberg_row_lineage_metadata_columns: table_def
-                            .iceberg_row_lineage_metadata_columns
-                            .clone(),
-                        source: ScanSource::IcebergDataFiles {
-                            table,
-                            files: Vec::new(),
-                            cloud_properties: cloud_properties.clone(),
-                            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                        },
-                    },
-                })
-            }
-            ScanSource::Sql(_)
-            | ScanSource::ConnectorPinned
-            | ScanSource::IcebergDeltaTable { .. }
-            | ScanSource::IcebergVersionTable { .. }
-            | ScanSource::MvTargetState { .. }
-            | ScanSource::MvTargetLocator { .. } => Err(format!(
-                "synthetic plan-time scan source is not a catalog base table: {}.{}.{}",
-                identity.catalog, identity.namespace, identity.table
-            )),
+    fn from_table_def(identity: TableIdentity, table_def: &TableDef) -> Self {
+        // Registry cache entries describe only durable SQL catalog facts.
+        // They intentionally retain neither a scan source nor a connector
+        // descriptor: every query receives fresh provider authority through
+        // the query-local materialization envelope and binding store.
+        Self {
+            table: CatalogTable {
+                identity,
+                columns: table_def.columns.clone(),
+                hidden_columns: table_def.iceberg_row_lineage_metadata_columns.clone(),
+            },
         }
     }
 
-    pub(crate) fn to_table_def(&self) -> TableDef {
-        self.planner.clone()
+    fn from_iceberg_materialization(
+        identity: TableIdentity,
+        materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+    ) -> Self {
+        Self {
+            table: CatalogTable {
+                identity,
+                columns: materialization.columns.clone(),
+                hidden_columns: materialization.iceberg_row_lineage_metadata_columns.clone(),
+            },
+        }
     }
 }
 
@@ -122,10 +97,10 @@ impl Catalog<CatalogRuntimeMetadata> for InternalCatalog {
             .read()
             .expect("internal catalog read lock")
             .get(namespace, table)?;
-        CatalogRuntimeMetadata::from_table_def(
+        Ok(CatalogRuntimeMetadata::from_table_def(
             TableIdentity::new(&self.name, namespace, table),
             &table_def,
-        )
+        ))
     }
 }
 
@@ -159,8 +134,8 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
         table: &str,
     ) -> Result<CatalogRuntimeMetadata, String> {
         let identity = TableIdentity::new(&self.name, namespace, table);
-        let (table_def, current_schema_id, _) =
-            crate::connector::iceberg::provider::load_schema_table_def(
+        let materialization =
+            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
                 self.controls.as_ref(),
                 crate::connector::connector_request_context(
                     None,
@@ -171,8 +146,11 @@ impl Catalog<CatalogRuntimeMetadata> for IcebergCatalog {
                 table,
             )?;
         self.cache
-            .get_or_build_validated(&identity, current_schema_id, || {
-                CatalogRuntimeMetadata::from_table_def(identity.clone(), &table_def)
+            .get_or_build_validated(&identity, materialization.schema_id, || {
+                Ok(CatalogRuntimeMetadata::from_iceberg_materialization(
+                    identity.clone(),
+                    &materialization,
+                ))
             })
     }
 
@@ -202,11 +180,11 @@ mod tests {
     use novarocks_catalog::schema::ColumnDef;
 
     use super::CatalogRuntimeMetadata;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::TableDef;
     use novarocks_catalog::identifier::TableIdentity;
 
     #[test]
-    fn sqlx2_resolution_runtime_catalog_rejects_synthetic_source() {
+    fn sqlx2_catalog_runtime_keeps_only_schema_facts() {
         let table = TableDef {
             name: "orders".to_string(),
             columns: vec![ColumnDef {
@@ -217,13 +195,15 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
-        let error = CatalogRuntimeMetadata::from_table_def(
+        let metadata = CatalogRuntimeMetadata::from_table_def(
             TableIdentity::new("default_catalog", "db", "orders"),
             &table,
-        )
-        .expect_err("synthetic connector source must not become a catalog base table");
-        assert!(error.contains("synthetic plan-time scan source"), "{error}");
+        );
+        assert_eq!(metadata.table.identity.fqn(), "default_catalog.db.orders");
+        assert_eq!(metadata.table.columns, table.columns);
     }
 }

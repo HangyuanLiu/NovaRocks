@@ -103,7 +103,7 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
             )
             .collect(),
     };
-    let iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
+    let _iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
         catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "sc2".to_string(),
@@ -119,12 +119,11 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
         name: "sc2".to_string(),
         columns,
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: iceberg_table,
-            files: Vec::new(),
-            cloud_properties: std::collections::BTreeMap::new(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        },
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ),
     }
 }
 

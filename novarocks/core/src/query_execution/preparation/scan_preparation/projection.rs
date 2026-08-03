@@ -55,7 +55,7 @@ pub(super) fn resolve_physical_columns(
             .collect();
     }
 
-    let keep_only_resolved = matches!(scan.table.source, ScanSource::IcebergVersionTable { .. });
+    let keep_only_resolved = false;
     scan.columns
         .iter()
         .filter(|planner| !is_variant_synthetic_column(scan, planner.column_id))
@@ -81,8 +81,14 @@ pub(super) fn resolve_physical_columns(
 
 fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
     match source {
-        ScanSource::MvTargetState(scan) => Some(projected_target_state_column_names(scan)),
-        ScanSource::MvTargetLocator(scan) => Some(projected_target_locator_column_names(scan)),
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+            kind: crate::sql::planner::table::SqlScanKind::MvTargetState { facts },
+            ..
+        }) => Some(projected_target_state_column_names(facts)),
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+            kind: crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts },
+            ..
+        }) => Some(projected_target_locator_column_names(facts)),
         _ => None,
     }
 }
@@ -156,10 +162,7 @@ pub(super) fn resolve_effective_required_reads(
         None => scan.required_columns.clone().unwrap_or_else(|| {
             scan.columns
                 .iter()
-                .filter(|column| {
-                    !matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
-                        || resolved_source_column(scan, &column.name).is_some()
-                })
+                .filter(|column| resolved_source_column(scan, &column.name).is_some())
                 .map(|column| column.name.clone())
                 .collect()
         }),

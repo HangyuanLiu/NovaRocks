@@ -21,27 +21,93 @@
 //! base table's current Iceberg schema, produce the field-id-based
 //! lineage that A11's contract persists.
 
-use crate::mv::persistence::schema::{
-    BaseFieldRecord, ExpressionKind, ExpressionLineage, FilterLineage, JoinContract,
-    JoinContractKind, JoinPredicateLineage, OutputColumnLineage, QualifiedFieldLineage,
-};
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect,
     TypedExpr,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) struct LineageResult {
-    pub base_fields: Vec<BaseFieldRecord>,
-    pub output_columns: Vec<OutputColumnLineage>,
-    pub filter: Option<FilterLineage>,
+/// Immutable SQL facts for one resolved base-table schema.
+///
+/// Application materialization projects provider metadata into this value
+/// before lineage analysis. The SQL analyzer deliberately neither retains nor
+/// reaches back to a connector schema object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvLineageSchema {
+    pub(crate) fields: Vec<SqlMvLineageField>,
 }
 
-pub(crate) struct JoinLineageResult {
-    pub base_fields_by_table: BTreeMap<String, Vec<BaseFieldRecord>>,
-    pub output_columns: Vec<OutputColumnLineage>,
-    pub filter: Option<FilterLineage>,
-    pub join: JoinContract,
+/// A field identity and type fact used by SQL MV lineage planning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvLineageField {
+    pub(crate) field_id: i32,
+    pub(crate) name_at_create: String,
+    pub(crate) type_signature: String,
+    pub(crate) required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlMvExpressionKind {
+    Column,
+    Cast,
+    Func,
+    Literal,
+    Mixed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvQualifiedFieldLineage {
+    pub(crate) table_fqn: String,
+    pub(crate) qualifier_at_create: String,
+    pub(crate) field_id: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvExpressionLineage {
+    pub(crate) kind: SqlMvExpressionKind,
+    pub(crate) referenced_base_field_ids: Vec<i32>,
+    pub(crate) referenced_base_fields: Vec<SqlMvQualifiedFieldLineage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvOutputColumnLineage {
+    pub(crate) expression: SqlMvExpressionLineage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvFilterLineage {
+    pub(crate) referenced_base_field_ids: Vec<i32>,
+    pub(crate) referenced_base_fields: Vec<SqlMvQualifiedFieldLineage>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlMvJoinContractKind {
+    InnerEquiJoin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvJoinPredicateLineage {
+    pub(crate) left: SqlMvQualifiedFieldLineage,
+    pub(crate) right: SqlMvQualifiedFieldLineage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlMvJoinContract {
+    pub(crate) kind: SqlMvJoinContractKind,
+    pub(crate) predicates: Vec<SqlMvJoinPredicateLineage>,
+}
+
+pub(crate) struct SqlMvLineageResult {
+    pub(crate) base_fields: Vec<SqlMvLineageField>,
+    pub(crate) output_columns: Vec<SqlMvOutputColumnLineage>,
+    pub(crate) filter: Option<SqlMvFilterLineage>,
+}
+
+pub(crate) struct SqlMvJoinLineageResult {
+    pub(crate) base_fields_by_table: BTreeMap<String, Vec<SqlMvLineageField>>,
+    pub(crate) output_columns: Vec<SqlMvOutputColumnLineage>,
+    pub(crate) filter: Option<SqlMvFilterLineage>,
+    pub(crate) join: SqlMvJoinContract,
 }
 
 /// Build A11 lineage for a single-base projection/filter MV. Caller
@@ -50,8 +116,8 @@ pub(crate) struct JoinLineageResult {
 /// SELECT over a single base scan and returns an error otherwise.
 pub(crate) fn build_projection_filter_lineage(
     resolved: &ResolvedQuery,
-    base_iceberg_schema: &iceberg::spec::Schema,
-) -> Result<LineageResult, String> {
+    base_schema: &SqlMvLineageSchema,
+) -> Result<SqlMvLineageResult, String> {
     let select = match &resolved.body {
         QueryBody::Select(s) => s,
         _ => return Err("A11 lineage builder requires a SELECT query".to_string()),
@@ -59,7 +125,7 @@ pub(crate) fn build_projection_filter_lineage(
     single_scan_or_err(select)?;
 
     let mut output_columns = Vec::with_capacity(select.projection.len());
-    let mut referenced: std::collections::BTreeMap<i32, BaseFieldRecord> =
+    let mut referenced: std::collections::BTreeMap<i32, SqlMvLineageField> =
         std::collections::BTreeMap::new();
 
     for item in &select.projection {
@@ -69,22 +135,22 @@ pub(crate) fn build_projection_filter_lineage(
 
         let mut field_ids = Vec::with_capacity(col_refs.len());
         for (_qualifier, name) in &col_refs {
-            let field = resolve_field(base_iceberg_schema, name)?;
-            field_ids.push(field.id);
+            let field = resolve_field(base_schema, name)?;
+            field_ids.push(field.field_id);
             referenced
-                .entry(field.id)
-                .or_insert_with(|| BaseFieldRecord {
-                    field_id: field.id,
-                    name_at_create: field.name.clone(),
-                    type_signature: format!("{}", field.field_type),
+                .entry(field.field_id)
+                .or_insert_with(|| SqlMvLineageField {
+                    field_id: field.field_id,
+                    name_at_create: field.name_at_create.clone(),
+                    type_signature: field.type_signature.clone(),
                     required: field.required,
                 });
         }
         field_ids.sort_unstable();
         field_ids.dedup();
 
-        output_columns.push(OutputColumnLineage {
-            expression: ExpressionLineage {
+        output_columns.push(SqlMvOutputColumnLineage {
+            expression: SqlMvExpressionLineage {
                 kind: kind_hint.into_kind(),
                 referenced_base_field_ids: field_ids,
                 referenced_base_fields: vec![],
@@ -99,20 +165,20 @@ pub(crate) fn build_projection_filter_lineage(
 
         let mut field_ids = Vec::with_capacity(col_refs.len());
         for (_qualifier, name) in &col_refs {
-            let field = resolve_field(base_iceberg_schema, name)?;
-            field_ids.push(field.id);
+            let field = resolve_field(base_schema, name)?;
+            field_ids.push(field.field_id);
             referenced
-                .entry(field.id)
-                .or_insert_with(|| BaseFieldRecord {
-                    field_id: field.id,
-                    name_at_create: field.name.clone(),
-                    type_signature: format!("{}", field.field_type),
+                .entry(field.field_id)
+                .or_insert_with(|| SqlMvLineageField {
+                    field_id: field.field_id,
+                    name_at_create: field.name_at_create.clone(),
+                    type_signature: field.type_signature.clone(),
                     required: field.required,
                 });
         }
         field_ids.sort_unstable();
         field_ids.dedup();
-        Some(FilterLineage {
+        Some(SqlMvFilterLineage {
             referenced_base_field_ids: field_ids,
             referenced_base_fields: vec![],
         })
@@ -121,7 +187,7 @@ pub(crate) fn build_projection_filter_lineage(
     };
 
     let base_fields = referenced.into_values().collect();
-    Ok(LineageResult {
+    Ok(SqlMvLineageResult {
         base_fields,
         output_columns,
         filter,
@@ -130,8 +196,8 @@ pub(crate) fn build_projection_filter_lineage(
 
 pub(crate) fn build_join_projection_filter_lineage(
     resolved: &ResolvedQuery,
-    base_schemas: &[(&str, &str, &iceberg::spec::Schema)],
-) -> Result<JoinLineageResult, String> {
+    base_schemas: &[(&str, &str, &SqlMvLineageSchema)],
+) -> Result<SqlMvJoinLineageResult, String> {
     let select = match &resolved.body {
         QueryBody::Select(s) => s,
         _ => return Err("join lineage builder requires a SELECT query".to_string()),
@@ -155,7 +221,7 @@ pub(crate) fn build_join_projection_filter_lineage(
         .transpose()?;
     let join_contract = collector.join_contract(join)?;
 
-    Ok(JoinLineageResult {
+    Ok(SqlMvJoinLineageResult {
         base_fields_by_table: collector.into_base_fields_by_table(),
         output_columns,
         filter,
@@ -164,12 +230,12 @@ pub(crate) fn build_join_projection_filter_lineage(
 }
 
 struct QualifiedLineageCollector<'a> {
-    schemas: BTreeMap<String, (&'a str, &'a iceberg::spec::Schema)>,
-    base_fields_by_table: BTreeMap<String, BTreeMap<i32, BaseFieldRecord>>,
+    schemas: BTreeMap<String, (&'a str, &'a SqlMvLineageSchema)>,
+    base_fields_by_table: BTreeMap<String, BTreeMap<i32, SqlMvLineageField>>,
 }
 
 impl<'a> QualifiedLineageCollector<'a> {
-    fn new(base_schemas: &[(&'a str, &'a str, &'a iceberg::spec::Schema)]) -> Self {
+    fn new(base_schemas: &[(&'a str, &'a str, &'a SqlMvLineageSchema)]) -> Self {
         let mut schemas = BTreeMap::new();
         for (table_fqn, alias, schema) in base_schemas {
             schemas.insert(alias.to_ascii_lowercase(), (*table_fqn, *schema));
@@ -180,12 +246,12 @@ impl<'a> QualifiedLineageCollector<'a> {
         }
     }
 
-    fn output_lineage(&mut self, expr: &TypedExpr) -> Result<OutputColumnLineage, String> {
+    fn output_lineage(&mut self, expr: &TypedExpr) -> Result<SqlMvOutputColumnLineage, String> {
         let mut refs = Vec::new();
         let mut kind_hint = ExpressionKindHint::default();
         self.collect_qualified_refs(expr, &mut refs, &mut kind_hint)?;
-        Ok(OutputColumnLineage {
-            expression: ExpressionLineage {
+        Ok(SqlMvOutputColumnLineage {
+            expression: SqlMvExpressionLineage {
                 kind: kind_hint.into_kind(),
                 referenced_base_field_ids: Vec::new(),
                 referenced_base_fields: refs,
@@ -193,11 +259,11 @@ impl<'a> QualifiedLineageCollector<'a> {
         })
     }
 
-    fn filter_lineage(&mut self, expr: &TypedExpr) -> Result<FilterLineage, String> {
+    fn filter_lineage(&mut self, expr: &TypedExpr) -> Result<SqlMvFilterLineage, String> {
         let mut refs = Vec::new();
         let mut kind_hint = ExpressionKindHint::default();
         self.collect_qualified_refs(expr, &mut refs, &mut kind_hint)?;
-        Ok(FilterLineage {
+        Ok(SqlMvFilterLineage {
             referenced_base_field_ids: Vec::new(),
             referenced_base_fields: refs,
         })
@@ -206,7 +272,7 @@ impl<'a> QualifiedLineageCollector<'a> {
     fn collect_qualified_refs(
         &mut self,
         expr: &TypedExpr,
-        out: &mut Vec<QualifiedFieldLineage>,
+        out: &mut Vec<SqlMvQualifiedFieldLineage>,
         kind: &mut ExpressionKindHint,
     ) -> Result<(), String> {
         match &expr.kind {
@@ -249,7 +315,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         &mut self,
         qualifier: &str,
         column: &str,
-    ) -> Result<QualifiedFieldLineage, String> {
+    ) -> Result<SqlMvQualifiedFieldLineage, String> {
         let key = qualifier.to_ascii_lowercase();
         let (table_fqn, schema) = self.schemas.get(&key).ok_or_else(|| {
             format!("join MV qualifier `{qualifier}` does not match a base table alias")
@@ -258,21 +324,21 @@ impl<'a> QualifiedLineageCollector<'a> {
         self.base_fields_by_table
             .entry((*table_fqn).to_string())
             .or_default()
-            .entry(field.id)
-            .or_insert_with(|| BaseFieldRecord {
-                field_id: field.id,
-                name_at_create: field.name.clone(),
-                type_signature: format!("{}", field.field_type),
+            .entry(field.field_id)
+            .or_insert_with(|| SqlMvLineageField {
+                field_id: field.field_id,
+                name_at_create: field.name_at_create.clone(),
+                type_signature: field.type_signature.clone(),
                 required: field.required,
             });
-        Ok(QualifiedFieldLineage {
+        Ok(SqlMvQualifiedFieldLineage {
             table_fqn: (*table_fqn).to_string(),
             qualifier_at_create: qualifier.to_string(),
-            field_id: field.id,
+            field_id: field.field_id,
         })
     }
 
-    fn join_contract(&mut self, join: &JoinRelation) -> Result<JoinContract, String> {
+    fn join_contract(&mut self, join: &JoinRelation) -> Result<SqlMvJoinContract, String> {
         if join.join_type != JoinKind::Inner {
             return Err("incremental join MV supports only inner equi-join lineage".to_string());
         }
@@ -286,8 +352,8 @@ impl<'a> QualifiedLineageCollector<'a> {
         if predicates.is_empty() {
             return Err("incremental join MV requires at least one join predicate".to_string());
         }
-        Ok(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
+        Ok(SqlMvJoinContract {
+            kind: SqlMvJoinContractKind::InnerEquiJoin,
             predicates,
         })
     }
@@ -296,7 +362,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         &mut self,
         expr: &TypedExpr,
         sides: &JoinSideQualifiers,
-        out: &mut Vec<JoinPredicateLineage>,
+        out: &mut Vec<SqlMvJoinPredicateLineage>,
     ) -> Result<(), String> {
         match &unwrap_nested_expr(expr).kind {
             ExprKind::BinaryOp {
@@ -326,7 +392,7 @@ impl<'a> QualifiedLineageCollector<'a> {
     fn single_qualified_column(
         &mut self,
         expr: &TypedExpr,
-    ) -> Result<QualifiedFieldLineage, String> {
+    ) -> Result<SqlMvQualifiedFieldLineage, String> {
         let ExprKind::ColumnRef {
             qualifier, column, ..
         } = &unwrap_nested_expr(expr).kind
@@ -341,7 +407,7 @@ impl<'a> QualifiedLineageCollector<'a> {
         self.resolve_field(qualifier, column)
     }
 
-    fn into_base_fields_by_table(self) -> BTreeMap<String, Vec<BaseFieldRecord>> {
+    fn into_base_fields_by_table(self) -> BTreeMap<String, Vec<SqlMvLineageField>> {
         self.base_fields_by_table
             .into_iter()
             .map(|(table, fields)| (table, fields.into_values().collect()))
@@ -385,18 +451,18 @@ fn one_qualifier(qualifier: &str) -> BTreeSet<String> {
 }
 
 fn normalize_join_predicate(
-    left_ref: QualifiedFieldLineage,
-    right_ref: QualifiedFieldLineage,
+    left_ref: SqlMvQualifiedFieldLineage,
+    right_ref: SqlMvQualifiedFieldLineage,
     sides: &JoinSideQualifiers,
-) -> Result<JoinPredicateLineage, String> {
+) -> Result<SqlMvJoinPredicateLineage, String> {
     let left_side = join_side_for_qualifier(&left_ref.qualifier_at_create, sides)?;
     let right_side = join_side_for_qualifier(&right_ref.qualifier_at_create, sides)?;
     match (left_side, right_side) {
-        (JoinSide::Left, JoinSide::Right) => Ok(JoinPredicateLineage {
+        (JoinSide::Left, JoinSide::Right) => Ok(SqlMvJoinPredicateLineage {
             left: left_ref,
             right: right_ref,
         }),
-        (JoinSide::Right, JoinSide::Left) => Ok(JoinPredicateLineage {
+        (JoinSide::Right, JoinSide::Left) => Ok(SqlMvJoinPredicateLineage {
             left: right_ref,
             right: left_ref,
         }),
@@ -492,15 +558,13 @@ fn single_scan_or_err(select: &ResolvedSelect) -> Result<(), String> {
 }
 
 fn resolve_field<'a>(
-    schema: &'a iceberg::spec::Schema,
+    schema: &'a SqlMvLineageSchema,
     column_name: &str,
-) -> Result<&'a iceberg::spec::NestedField, String> {
+) -> Result<&'a SqlMvLineageField, String> {
     schema
-        .as_struct()
-        .fields()
+        .fields
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(column_name))
-        .map(|f| f.as_ref())
+        .find(|field| field.name_at_create.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| {
             format!(
                 "base iceberg schema does not contain column {column_name}; cannot build A11 lineage"
@@ -625,20 +689,20 @@ impl ExpressionKindHint {
     fn saw_cast(&mut self) {
         self.saw_cast = true;
     }
-    fn into_kind(self) -> ExpressionKind {
+    fn into_kind(self) -> SqlMvExpressionKind {
         match (
             self.saw_column,
             self.saw_literal,
             self.saw_func,
             self.saw_cast,
         ) {
-            (true, false, false, false) => ExpressionKind::Column,
-            (false, true, false, false) => ExpressionKind::Literal,
-            (false, false, true, false) => ExpressionKind::Func,
+            (true, false, false, false) => SqlMvExpressionKind::Column,
+            (false, true, false, false) => SqlMvExpressionKind::Literal,
+            (false, false, true, false) => SqlMvExpressionKind::Func,
             // Cast over a column or literal with no other operations → Cast
-            (_, _, false, true) => ExpressionKind::Cast,
+            (_, _, false, true) => SqlMvExpressionKind::Cast,
             // All other combinations → Mixed
-            _ => ExpressionKind::Mixed,
+            _ => SqlMvExpressionKind::Mixed,
         }
     }
 }
@@ -646,43 +710,62 @@ impl ExpressionKindHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
-    use std::sync::Arc;
+    use std::num::{NonZeroU32, NonZeroU64};
 
-    fn base_schema() -> Schema {
-        Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![
-                Arc::new(NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Long),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "region",
-                    Type::Primitive(PrimitiveType::String),
-                )),
-                Arc::new(NestedField::optional(
-                    3,
-                    "amount",
-                    Type::Primitive(PrimitiveType::Double),
-                )),
-            ])
-            .build()
-            .expect("build schema")
+    fn sql_schema(fields: &[(i32, &str, &str, bool)]) -> SqlMvLineageSchema {
+        SqlMvLineageSchema {
+            fields: fields
+                .iter()
+                .map(
+                    |(field_id, name_at_create, type_signature, required)| SqlMvLineageField {
+                        field_id: *field_id,
+                        name_at_create: (*name_at_create).to_string(),
+                        type_signature: (*type_signature).to_string(),
+                        required: *required,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn base_schema() -> SqlMvLineageSchema {
+        sql_schema(&[
+            (1, "id", "long", true),
+            (2, "region", "string", true),
+            (3, "amount", "double", false),
+        ])
+    }
+
+    fn sql_scan_source(table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero scope")),
+                NonZeroU32::new(1).expect("non-zero ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "test".to_string(),
+                namespace: "ns".to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
     }
 
     struct JoinLineageFixture {
-        left_schema: Schema,
-        right_schema: Schema,
+        left_schema: SqlMvLineageSchema,
+        right_schema: SqlMvLineageSchema,
     }
 
     struct SingleLineageFixture {
-        schema: Schema,
+        schema: SqlMvLineageSchema,
     }
 
     impl SingleLineageFixture {
@@ -735,7 +818,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_scan_source(table),
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
@@ -759,43 +842,15 @@ mod tests {
     impl JoinLineageFixture {
         fn new() -> Self {
             Self {
-                left_schema: Schema::builder()
-                    .with_schema_id(0)
-                    .with_fields(vec![
-                        Arc::new(NestedField::required(
-                            10,
-                            "id",
-                            Type::Primitive(PrimitiveType::Long),
-                        )),
-                        Arc::new(NestedField::optional(
-                            11,
-                            "payload",
-                            Type::Primitive(PrimitiveType::String),
-                        )),
-                    ])
-                    .build()
-                    .expect("build left schema"),
-                right_schema: Schema::builder()
-                    .with_schema_id(0)
-                    .with_fields(vec![
-                        Arc::new(NestedField::required(
-                            20,
-                            "id",
-                            Type::Primitive(PrimitiveType::Long),
-                        )),
-                        Arc::new(NestedField::optional(
-                            21,
-                            "payload",
-                            Type::Primitive(PrimitiveType::String),
-                        )),
-                        Arc::new(NestedField::optional(
-                            22,
-                            "amount",
-                            Type::Primitive(PrimitiveType::Double),
-                        )),
-                    ])
-                    .build()
-                    .expect("build right schema"),
+                left_schema: sql_schema(&[
+                    (10, "id", "long", true),
+                    (11, "payload", "string", false),
+                ]),
+                right_schema: sql_schema(&[
+                    (20, "id", "long", true),
+                    (21, "payload", "string", false),
+                    (22, "amount", "double", false),
+                ]),
             }
         }
 
@@ -842,7 +897,7 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_scan_source(table),
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
@@ -864,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn single_base_aggregate_lineage_records_aggregate_input_columns() {
+    fn sqlx2_mv_lineage_uses_sql_owned_schema_facts() {
         let fixture = SingleLineageFixture::new();
         let resolved = fixture.analyze(
             "select region, sum(amount) as total, count(amount) as non_null_amounts, count(*) as rows \
@@ -909,7 +964,7 @@ mod tests {
     mod join_lineage {
         use super::*;
 
-        fn lineage_for_on(on_expr: &str) -> Result<JoinLineageResult, String> {
+        fn lineage_for_on(on_expr: &str) -> Result<SqlMvJoinLineageResult, String> {
             let sql = format!(
                 "select l.id as left_id, r.id as right_id \
                  from ns.left_tbl l join ns.right_tbl r on {on_expr} \
@@ -1018,7 +1073,7 @@ mod tests {
 
             assert_eq!(
                 result.output_columns[0].expression.referenced_base_fields,
-                vec![QualifiedFieldLineage {
+                vec![SqlMvQualifiedFieldLineage {
                     table_fqn: "ice.ns.left_tbl".to_string(),
                     qualifier_at_create: "l".to_string(),
                     field_id: 10,
@@ -1026,7 +1081,7 @@ mod tests {
             );
             assert_eq!(
                 result.output_columns[1].expression.referenced_base_fields,
-                vec![QualifiedFieldLineage {
+                vec![SqlMvQualifiedFieldLineage {
                     table_fqn: "ice.ns.right_tbl".to_string(),
                     qualifier_at_create: "r".to_string(),
                     field_id: 22,
@@ -1040,7 +1095,7 @@ mod tests {
         let mut h = ExpressionKindHint::default();
         h.saw_cast();
         h.saw_column();
-        assert_eq!(h.into_kind(), ExpressionKind::Cast);
+        assert_eq!(h.into_kind(), SqlMvExpressionKind::Cast);
     }
 
     #[test]
@@ -1048,7 +1103,7 @@ mod tests {
         let mut h = ExpressionKindHint::default();
         h.saw_cast();
         h.saw_literal();
-        assert_eq!(h.into_kind(), ExpressionKind::Cast);
+        assert_eq!(h.into_kind(), SqlMvExpressionKind::Cast);
     }
 
     #[test]
@@ -1057,29 +1112,29 @@ mod tests {
         h.saw_cast();
         h.saw_func();
         h.saw_column();
-        assert_eq!(h.into_kind(), ExpressionKind::Mixed);
+        assert_eq!(h.into_kind(), SqlMvExpressionKind::Mixed);
     }
 
     #[test]
     fn expression_kind_hint_pure_column_is_column() {
         let mut h = ExpressionKindHint::default();
         h.saw_column();
-        assert_eq!(h.into_kind(), ExpressionKind::Column);
+        assert_eq!(h.into_kind(), SqlMvExpressionKind::Column);
     }
 
     #[test]
     fn expression_kind_hint_pure_literal_is_literal() {
         let mut h = ExpressionKindHint::default();
         h.saw_literal();
-        assert_eq!(h.into_kind(), ExpressionKind::Literal);
+        assert_eq!(h.into_kind(), SqlMvExpressionKind::Literal);
     }
 
     #[test]
     fn resolve_field_finds_column_case_insensitive() {
         let s = base_schema();
         let f = resolve_field(&s, "REGION").expect("find region");
-        assert_eq!(f.id, 2);
-        assert_eq!(format!("{}", f.field_type), "string");
+        assert_eq!(f.field_id, 2);
+        assert_eq!(f.type_signature, "string");
     }
 
     #[test]

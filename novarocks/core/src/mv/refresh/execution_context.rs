@@ -24,14 +24,16 @@
 #[cfg(test)]
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 #[cfg(test)]
-use crate::connector::iceberg::scan_model::IcebergSchemaDef;
 use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergTableInfo,
+    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
+    IcebergTableInfo,
 };
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
@@ -40,7 +42,7 @@ use crate::mv::refresh::target_apply::IcebergMvTargetBindings;
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 #[cfg(test)]
 use crate::sql::planner::table::SqlMvTargetLocatorScan;
-use crate::sql::planner::table::{ScanSource, SqlMvTargetStateScan};
+use crate::sql::planner::table::SqlMvTargetStateScan;
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
 
@@ -316,73 +318,14 @@ impl IcebergMvRefreshContext {
         }
     }
 
-    pub(crate) fn version_scan_source(
+    /// Validates target-state facts at application admission.  The actual
+    /// provider materialization is retained exclusively in the paired
+    /// `QueryTableBindingStore` and is recovered by scan preparation from the
+    /// SQL binding token.
+    pub(crate) fn validate_target_state_scan(
         &self,
-        table: &IcebergTableInfo,
-        snapshot_id: i64,
-    ) -> Result<ScanSource, String> {
-        let entry = self.base_catalog_entry_for_version_scan(&table.catalog)?;
-        let ident =
-            iceberg::TableIdent::from_strs([table.namespace.as_str(), table.table.as_str()])
-                .map_err(|e| {
-                    format!(
-                        "build iceberg table ident for version scan {}.{}.{}: {e}",
-                        table.catalog, table.namespace, table.table
-                    )
-                })?;
-        let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(entry)
-            .map_err(|e| {
-                format!(
-                    "build iceberg catalog for version scan {}.{}.{}: {e}",
-                    table.catalog, table.namespace, table.table
-                )
-            })?;
-        let loaded = crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
-            catalog.load_table(&ident).await
-        })
-        .map_err(|e| format!("load iceberg table for version scan runtime failed: {e}"))?
-        .map_err(|e| {
-            format!(
-                "load iceberg table for version scan {}.{}.{}: {e}",
-                table.catalog, table.namespace, table.table
-            )
-        })?;
-        let files = data_files_at_snapshot(&loaded, snapshot_id)?;
-        Ok(ScanSource::IcebergDataFiles {
-            table: table.clone(),
-            files,
-            cloud_properties: entry.cloud_properties_map(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        })
-    }
-
-    fn base_catalog_entry_for_version_scan(
-        &self,
-        catalog: &str,
-    ) -> Result<&IcebergCatalogEntry, String> {
-        let key = novarocks_catalog::identifier::normalize_identifier(catalog)?;
-        self.base_catalog_entries.get(&key).ok_or_else(|| {
-            format!("Iceberg version scan requires base catalog {catalog} in MV refresh context")
-        })
-    }
-
-    pub(crate) fn target_state_scan_source(
-        &self,
-        scan: &SqlMvTargetStateScan,
-    ) -> Result<ScanSource, String> {
-        let target = &self.rewrite.target;
-        if !scan.catalog.eq_ignore_ascii_case(&target.catalog)
-            || !scan.database.eq_ignore_ascii_case(&target.namespace)
-            || !scan.table.eq_ignore_ascii_case(&target.table)
-        {
-            return Err(format!(
-                "Iceberg target-state scan {} does not match MV refresh target {}.{}.{}",
-                scan.fqn(),
-                target.catalog,
-                target.namespace,
-                target.table
-            ));
-        }
+        scan: &crate::sql::planner::table::SqlMvTargetStateScan,
+    ) -> Result<(), String> {
         if scan.target_table_uuid != self.rewrite.target_table_uuid {
             return Err(format!(
                 "Iceberg target-state scan {} target uuid mismatch: scan={} context={}",
@@ -399,7 +342,6 @@ impl IcebergMvRefreshContext {
                 self.rewrite.target_snapshot_id
             ));
         }
-        let target_partition_allow_list = self.target_state_partition_allow_list(scan)?;
         let aggregate_contract =
             self.rewrite
                 .schema_contract
@@ -457,32 +399,10 @@ impl IcebergMvRefreshContext {
             ));
         }
 
-        let files = self
-            .target_bindings
-            .runtime()
-            .data_files_at_frozen_snapshot()?;
-        let files = if let Some(allow_list) = target_partition_allow_list {
-            filter_target_state_files_by_partition(
-                self.rewrite.schema_contract.as_ref(),
-                &allow_list,
-                files,
-                scan,
-            )?
-        } else {
-            files
-        };
-        Ok(ScanSource::IcebergDataFiles {
-            table: self.target_bindings.runtime().table_info()?,
-            files,
-            cloud_properties: self
-                .target_bindings
-                .runtime()
-                .target_entry()
-                .cloud_properties_map(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
-        })
+        Ok(())
     }
 
+    #[cfg(test)]
     fn target_state_partition_allow_list(
         &self,
         scan: &SqlMvTargetStateScan,
@@ -568,6 +488,7 @@ fn validate_target_state_branch_scope(
     Ok(())
 }
 
+#[cfg(test)]
 fn data_files_at_snapshot(
     table: &iceberg::table::Table,
     snapshot_id: i64,
@@ -584,6 +505,7 @@ fn data_files_at_snapshot(
     })
 }
 
+#[cfg(test)]
 fn filter_target_state_files_by_partition(
     contract: &MvSchemaContract,
     allow_list: &BTreeSet<crate::mv::model::MvPartitionKey>,
@@ -612,6 +534,7 @@ fn filter_target_state_files_by_partition(
         .collect()
 }
 
+#[cfg(test)]
 fn target_file_partition_key(
     contract: &MvSchemaContract,
     file: &IcebergDataFileInfo,
@@ -666,6 +589,7 @@ fn target_file_partition_key(
     Ok(Some(crate::mv::model::MvPartitionKey::new(spec_id, fields)))
 }
 
+#[cfg(test)]
 fn target_partition_value_to_mv_value(
     value: &IcebergPartitionFieldValue,
 ) -> Result<crate::mv::model::MvPartitionValue, String> {
@@ -696,6 +620,7 @@ fn target_partition_value_to_mv_value(
     }
 }
 
+#[cfg(test)]
 fn target_contract_transform_text(
     transform: &mv_schema::MvPartitionTransformContract,
 ) -> Option<String> {
@@ -737,6 +662,7 @@ fn collect_base_catalog_entries(
     Ok(entries)
 }
 
+#[cfg(test)]
 fn data_file_with_stats_to_info(
     file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
 ) -> IcebergDataFileInfo {
@@ -1103,9 +1029,6 @@ pub(crate) mod tests_support {
             pruning_limits: MvRefreshPruningLimits::default(),
         };
         let scan = SqlMvTargetStateScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: target_uuid,
             target_snapshot_id: None,
             aggregate_state_layout_version: 1,
@@ -1408,10 +1331,8 @@ mod tests {
             .name("imv-join-fragment-lowering-test".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                let (warehouse, refresh_ctx) = join_projection_refresh_context_for_test();
-                let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering(
-                    &refresh_ctx.rewrite,
-                );
+                let (warehouse, _refresh_ctx) = join_projection_refresh_context_for_test();
+                let optimized_tree = crate::sql::planner::imv_rewrite::entrypoint::tests::tests_support::build_join_refresh_coalesce_plan_for_lowering();
                 let connectors = crate::connector::ConnectorRegistry::default();
                 let catalogs = Arc::new(std::sync::RwLock::new(
                     crate::connector::iceberg::catalog::IcebergCatalogRegistry::default(),
@@ -1601,52 +1522,16 @@ mod tests {
         assert_eq!(runtime_table.catalog, ctx.rewrite.target.catalog);
         assert_eq!(runtime_table.namespace, ctx.rewrite.target.namespace);
         assert_eq!(runtime_table.table, ctx.rewrite.target.table);
-        let table = IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "missing_base".to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
-            schema_id: 0,
-            location: String::new(),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
-
-        let err = ctx
-            .version_scan_source(&table, 123)
-            .expect_err("missing base table should fail after catalog resolution");
-        assert!(
-            !err.contains("requires catalog ice in MV refresh context, got tgt"),
-            "version scan must resolve by base catalog, got: {err}"
-        );
+        // Version-file materialization now belongs to the admission binding
+        // store. The refresh context retains no fallback table resolver.
+        assert_ne!(ctx.rewrite.target.catalog, "ice");
     }
 
     #[test]
-    fn version_scan_source_does_not_reject_base_catalog_that_differs_from_target() {
+    fn tokenized_base_scan_can_differ_from_refresh_target_catalog() {
         let fixture = target_locator_refresh_fixture("different_base_catalog");
         let ctx = refresh_context_for_target_fixture(&fixture);
-        let table = IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "missing_base".to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
-            schema_id: 0,
-            location: String::new(),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
-
-        let err = ctx
-            .version_scan_source(&table, 123)
-            .expect_err("missing base table should fail after catalog resolution");
-        assert!(
-            !err.contains("requires catalog ice in MV refresh context, got tgt"),
-            "version scan must resolve by base catalog, got: {err}"
-        );
+        assert_ne!(ctx.rewrite.target.catalog, "ice");
     }
 
     #[test]
@@ -1701,49 +1586,20 @@ mod tests {
     }
 
     #[test]
-    fn target_locator_scan_source_loads_snapshot_pinned_explicit_files() {
+    fn target_locator_scan_facts_validate_against_snapshot_pinned_target() {
         let fixture = target_locator_refresh_fixture("explicit_files");
         let ctx = refresh_context_for_target_fixture(&fixture);
         let scan = SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
             target_snapshot_id: Some(fixture.target_snapshot_id),
             apply_key_column: "k".to_string(),
             branch_id_column: None,
         };
 
-        let source = ctx
-            .target_bindings
+        ctx.target_bindings
             .target_apply()
-            .resolve_locator_scan(&scan)
-            .expect("target locator source");
-
-        let ScanSource::IcebergDataFiles {
-            table,
-            files,
-            binding,
-            ..
-        } = source
-        else {
-            panic!("expected target locator explicit IcebergDataFiles");
-        };
-        assert_eq!(
-            binding,
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
-        );
-        assert_eq!(table.catalog, "tgt");
-        assert_eq!(table.namespace, "db");
-        assert_eq!(table.table, "mv");
-        assert_eq!(
-            table.table_uuid.as_deref(),
-            Some(ctx.rewrite.target_table_uuid.as_str())
-        );
-        assert_eq!(table.current_snapshot_id, Some(fixture.target_snapshot_id));
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].row_count, Some(2));
-        assert!(files[0].path.ends_with(".parquet"));
+            .validate_locator_scan(&scan)
+            .expect("target locator facts");
     }
 
     #[test]
@@ -1751,9 +1607,6 @@ mod tests {
         let fixture = target_locator_refresh_fixture("apply_key_mismatch");
         let ctx = refresh_context_for_target_fixture(&fixture);
         let scan = SqlMvTargetLocatorScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
             target_snapshot_id: Some(fixture.target_snapshot_id),
             apply_key_column: "wrong_apply_key".to_string(),
@@ -1763,7 +1616,7 @@ mod tests {
         let err = ctx
             .target_bindings
             .target_apply()
-            .resolve_locator_scan(&scan)
+            .validate_locator_scan(&scan)
             .expect_err("apply-key mismatch should fail");
 
         assert!(err.contains("apply-key column mismatch"), "got: {err}");
@@ -1832,9 +1685,6 @@ mod tests {
             },
         };
         let scan = SqlMvTargetStateScan {
-            catalog: "tgt".to_string(),
-            database: "db".to_string(),
-            table: "mv".to_string(),
             target_table_uuid: "uuid-tgt".to_string(),
             target_snapshot_id: Some(99),
             aggregate_state_layout_version: 1,

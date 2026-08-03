@@ -56,17 +56,6 @@ pub(crate) fn build_statistics_distributed_plan_with_settings(
     crate::sql::planner::distributed::build::build_statistics_distributed_plan(&physical, metrics)
 }
 
-pub(crate) fn build_iceberg_write_distributed_plan(
-    physical: PhysicalPlanNode,
-    sink: crate::sql::planner::distributed::write::sink::IcebergWritePlanInput,
-) -> Result<DistributedPlan, String> {
-    build_iceberg_write_distributed_plan_with_settings(
-        physical,
-        sink,
-        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
-    )
-}
-
 pub(crate) fn build_connector_write_distributed_plan(
     mut physical: PhysicalPlanNode,
     sink: crate::sql::planner::distributed::write::sink::ConnectorWritePlanInput,
@@ -81,46 +70,44 @@ pub(crate) fn build_connector_write_distributed_plan(
     )
 }
 
-pub(crate) fn build_iceberg_write_distributed_plan_with_settings(
+/// Compile a SQL-owned terminal write contract.  Provider metadata and writer
+/// handles are intentionally absent; application code resolves those from the
+/// request-local binding token after this plan has been sealed.
+pub(crate) fn build_sql_write_distributed_plan_with_settings(
     mut physical: PhysicalPlanNode,
-    sink: crate::sql::planner::distributed::write::sink::IcebergWritePlanInput,
+    sink: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
     settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::sql::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    crate::sql::planner::distributed::write::plan::build_iceberg_write_distributed_plan(
-        &physical, sink,
-    )
+    crate::sql::planner::distributed::write::plan::build_sql_write_distributed_plan(&physical, sink)
 }
 
-pub(crate) fn build_iceberg_change_stream_distributed_plan(
+pub(crate) fn build_sql_change_stream_distributed_plan(
     physical: PhysicalPlanNode,
-    descriptor_database: &str,
     dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     keyed_assert: Option<PreExpandKeyedAssertSpec>,
 ) -> Result<
-    crate::sql::planner::distributed::write::plan::PlannedIcebergChangeStreamDistributedPlan,
+    crate::sql::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan,
     String,
 > {
-    build_iceberg_change_stream_distributed_plan_with_settings(
+    build_sql_change_stream_distributed_plan_with_settings(
         physical,
-        descriptor_database,
         dag,
         keyed_assert,
         &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
 }
 
-pub(crate) fn build_iceberg_change_stream_distributed_plan_with_settings(
+pub(crate) fn build_sql_change_stream_distributed_plan_with_settings(
     mut physical: PhysicalPlanNode,
-    descriptor_database: &str,
     dag: crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     keyed_assert: Option<PreExpandKeyedAssertSpec>,
     settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
 ) -> Result<
-    crate::sql::planner::distributed::write::plan::PlannedIcebergChangeStreamDistributedPlan,
+    crate::sql::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan,
     String,
 > {
     if let Some(keyed_assert) = keyed_assert {
@@ -130,10 +117,8 @@ pub(crate) fn build_iceberg_change_stream_distributed_plan_with_settings(
         &mut physical,
         settings,
     );
-    crate::sql::planner::distributed::write::plan::build_iceberg_change_stream_distributed_plan(
-        &physical,
-        descriptor_database,
-        dag,
+    crate::sql::planner::distributed::write::plan::build_sql_change_stream_distributed_plan(
+        &physical, dag,
     )
 }
 

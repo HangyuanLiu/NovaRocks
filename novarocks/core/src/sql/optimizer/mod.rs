@@ -352,7 +352,9 @@ fn optimizer_rejects_unbound_scan_stats() {
             name: "unbound_table".to_string(),
             columns: vec![],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         },
         alias: None,
         stats_ref: None,
@@ -498,15 +500,9 @@ fn explore(
             }
             // Stop if memo grew too large (exponential join enumeration). This
             // is a hard cap, not an error: explore returns early and the best
-            // plan is extracted from whatever groups exist. Log it so the
-            // truncation is observable instead of silent.
+            // plan is extracted from whatever groups exist. Application
+            // diagnostics, not the compiler, own observability of the cap.
             if memo.groups.len() > options.cbo_max_groups {
-                tracing::warn!(
-                    groups = memo.groups.len(),
-                    cap = options.cbo_max_groups,
-                    "optimizer exploration truncated at memo group cap; some \
-                     transformation rules may not have fired on this query"
-                );
                 return Ok(());
             }
         }
@@ -979,9 +975,13 @@ mod is_known_rule_name_tests {
     use arrow::datatypes::DataType;
 
     use crate::sql::analysis::OutputColumn;
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarNode};
     use crate::sql::optimizer::stats_input::{
@@ -1043,23 +1043,11 @@ mod is_known_rule_name_tests {
         )
     }
 
-    fn iceberg_info(
-        catalog: &str,
-        ns: &str,
-        tbl: &str,
-    ) -> crate::connector::iceberg::scan_model::IcebergTableInfo {
-        crate::connector::iceberg::scan_model::IcebergTableInfo {
-            catalog: catalog.to_string(),
-            namespace: ns.to_string(),
-            table: tbl.to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
-            schema_id: 0,
-            location: String::new(),
-            schema: crate::connector::iceberg::scan_model::IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn test_binding() -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero test scope")),
+            NonZeroU32::new(1).expect("non-zero test binding"),
+        )
     }
 
     fn iceberg_table(catalog: &str, ns: &str, tbl: &str, columns: &[&str]) -> TableDef {
@@ -1076,14 +1064,35 @@ mod is_known_rule_name_tests {
                 })
                 .collect(),
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: iceberg_info(catalog, ns, tbl),
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-            },
+            source: ScanSource::Sql(SqlScanSource::new(
+                test_binding(),
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: ns.to_string(),
+                    table: tbl.to_string(),
+                },
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            )),
         }
+    }
+
+    #[test]
+    fn sqlx2_planner_vocabulary_optimizer_uses_tokenized_scan_facts() {
+        let table = iceberg_table("cat", "ns", "t", &["value"]);
+        let ScanSource::Sql(source) = table.source else {
+            panic!("optimizer test table must use SQL-owned scan facts");
+        };
+        assert_eq!(source.table.catalog, "cat");
+        assert_eq!(source.table.namespace, "ns");
+        assert_eq!(source.table.table, "t");
+        assert_eq!(
+            source.kind,
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            }
+        );
     }
 
     fn int_col(id: u32, name: &str) -> OutputColumn {
@@ -1485,7 +1494,9 @@ mod is_known_rule_name_tests {
                             logical_type: None,
                         }],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::ConnectorPinned,
+                        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
@@ -1589,7 +1600,9 @@ mod is_known_rule_name_tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::ConnectorPinned,
+                        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
                     }),
                     other => Err(format!("table not found: {other}")),
                 }
@@ -1728,7 +1741,9 @@ mod is_known_rule_name_tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::ConnectorPinned,
+                        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
                     }),
                     other => Err(format!("table not found: {other}")),
                 }

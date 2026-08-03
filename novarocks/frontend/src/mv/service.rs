@@ -21,8 +21,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::mv::application::{
-    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
-    MvStatementResult,
+    MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine,
+    MvRefreshPreparationRequest, MvRefreshPreparationService, MvRequestContext, MvStatementResult,
+    PreparedMvRefresh,
 };
 use novarocks::mv::background::{
     MvBackgroundBindings, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
@@ -35,7 +36,6 @@ use novarocks::query_execution::request_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use novarocks::query_execution::service::QueryExecutionService;
-use novarocks::sql::mv_refresh::PreparedMvRefresh;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -251,7 +251,7 @@ impl MvApplicationService for FrontendMvService {
 
     fn prepare_and_execute_refresh(
         &self,
-        preparation: &dyn novarocks::sql::mv_refresh::MvRefreshPreparationService,
+        preparation: &dyn MvRefreshPreparationService,
         statement: MvApplicationStatement,
         target: novarocks::mv::repository::MvTarget,
         connector_context: ConnectorRequestContext,
@@ -295,7 +295,7 @@ impl MvApplicationService for FrontendMvService {
         };
         let attempt = self.reserve_refresh_attempt()?;
         let prepared = preparation
-            .prepare_step(novarocks::sql::mv_refresh::MvRefreshPreparationRequest {
+            .prepare_step(MvRefreshPreparationRequest {
                 statement,
                 target,
                 attempt: attempt.clone(),
@@ -331,7 +331,7 @@ impl MvApplicationService for FrontendMvService {
 impl FrontendMvService {
     fn reserve_refresh_attempt(
         &self,
-    ) -> Result<novarocks::sql::mv_refresh::MvRefreshAttemptIdentity, MvApplicationError> {
+    ) -> Result<novarocks::mv::application::MvRefreshAttemptIdentity, MvApplicationError> {
         let refresh_id = self
             .repository
             .reserve_frontend_refresh_id()
@@ -342,7 +342,7 @@ impl FrontendMvService {
                 )
             })?;
         let request_id = *uuid::Uuid::now_v7().as_bytes();
-        Ok(novarocks::sql::mv_refresh::MvRefreshAttemptIdentity {
+        Ok(novarocks::mv::application::MvRefreshAttemptIdentity {
             refresh_id,
             request_id,
             staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),

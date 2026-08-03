@@ -29,7 +29,9 @@ use novarocks::engine::table_maintenance::{
 };
 use novarocks_frontend::table_maintenance::FrontendTableMaintenanceService;
 use novarocks_frontend::table_maintenance::model::{OptimizeJob, OptimizeJobCreate};
-use novarocks_frontend::table_maintenance::repository::OptimizeJobRepository;
+use novarocks_frontend::table_maintenance::repository::{
+    DistributedRewriteOperationRepository, OptimizeJobRepository,
+};
 use novarocks_frontend::table_maintenance::worker::{OptimizeJobExecutor, OptimizeWorker};
 use novarocks_spi::state_store::{
     CommitOutcome, FeDeploymentView, Key, Precondition, StateStore, TransactionId, Value,
@@ -534,17 +536,22 @@ async fn expired_engine_weak_reference_ends_worker_without_a_reference_cycle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_worker_exits_autonomously_before_shutdown_when_engine_expires() {
-    let (_temp, _store, repository, _service) = fixture().await;
+    let (_temp, store, repository, _service) = fixture().await;
     create_job(&repository, "idle-exit", 71, 100).await;
     let dropped = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(FakeMaintenanceEngine::with_drop_flag(Arc::clone(&dropped)));
     let engine_port: Arc<dyn TableMaintenanceEngine> = engine.clone();
     let engine_weak = Arc::downgrade(&engine_port);
-    let mut worker = OptimizeWorker::start_with_executor(
+    let distributed_rewrite_repository = Arc::new(
+        DistributedRewriteOperationRepository::open(Arc::clone(&store))
+            .await
+            .expect("open distributed rewrite repository"),
+    );
+    let mut worker = OptimizeWorker::start(
         &tokio::runtime::Handle::current(),
         Arc::clone(&repository),
+        distributed_rewrite_repository,
         engine_weak,
-        Arc::new(LegacyFakeOptimizeExecutor),
     )
     .expect("start worker");
 

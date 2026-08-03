@@ -1068,15 +1068,10 @@ mod tests {
         let mut branch =
             crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
-        branch.sink_spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-        );
         let dag =
             crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        crate::sql::planner::distributed::write::plan::finalize_iceberg_change_stream_test_plan(
-            dp, "test_db", dag,
-        )
-        .expect("plan change-stream write")
+        crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
+            .expect("plan change-stream write")
     }
 
     fn cte_multicast_plan() -> DistributedPlan {

@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
+use crate::sql::binding::SqlTableBindingId;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::join_refresh_descriptor::{
     JoinRefreshDescriptor, JoinRefreshMode, JoinRefreshOutputMapping, JoinRefreshOutputSource,
@@ -30,7 +31,10 @@ use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
 };
 use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode};
-use crate::sql::planner::table::{ScanSource, SqlMvTargetLocatorScan, TableDef};
+use crate::sql::planner::table::{
+    ScanSource, SqlMvTargetLocatorScan, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+    sql_mv_target_locator_scan,
+};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn build_join_apply_key_project(
@@ -174,17 +178,19 @@ enum JoinApplyActionProjection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinRefreshTargetLocatorBinding {
+    pub(crate) target_binding: SqlTableBindingId,
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
 }
 
 impl JoinRefreshTargetLocatorBinding {
-    pub(crate) fn from_rewrite_context(
-        ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
+    pub(crate) fn from_snapshot(
+        snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     ) -> Self {
         Self {
-            target_table_uuid: ctx.target_table_uuid.clone(),
-            target_snapshot_id: ctx.target_snapshot_id,
+            target_binding: snapshot.target_binding,
+            target_table_uuid: snapshot.target_table_uuid.clone(),
+            target_snapshot_id: snapshot.target_snapshot_id,
         }
     }
 }
@@ -678,15 +684,22 @@ fn build_target_locator_scan(
                 name: desc.mv_identity.name.clone(),
                 columns,
                 iceberg_row_lineage_metadata_columns: metadata_columns,
-                source: ScanSource::MvTargetLocator(SqlMvTargetLocatorScan {
-                    catalog: desc.mv_identity.catalog.clone(),
-                    database: desc.mv_identity.database.clone(),
-                    table: desc.mv_identity.name.clone(),
-                    target_table_uuid: locator.target_table_uuid.clone(),
-                    target_snapshot_id: locator.target_snapshot_id,
-                    apply_key_column: apply_key.name.clone(),
-                    branch_id_column: None,
-                }),
+                source: ScanSource::Sql(SqlScanSource::new(
+                    locator.target_binding,
+                    SqlTableIdentity {
+                        catalog: desc.mv_identity.catalog.clone(),
+                        namespace: desc.mv_identity.database.clone(),
+                        table: desc.mv_identity.name.clone(),
+                    },
+                    SqlScanKind::MvTargetLocator {
+                        facts: SqlMvTargetLocatorScan {
+                            target_table_uuid: locator.target_table_uuid.clone(),
+                            target_snapshot_id: locator.target_snapshot_id,
+                            apply_key_column: apply_key.name.clone(),
+                            branch_id_column: None,
+                        },
+                    },
+                )),
             },
             alias: None,
             columns: scan_columns,
@@ -1231,6 +1244,7 @@ mod tests {
     use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode, LogicalUnionNode};
     use crate::sql::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::sql::planner::payload::PlanValuesNode;
+    use crate::sql::planner::table::sql_mv_target_locator_scan;
 
     #[test]
     fn apply_key_project_uses_output_mappings_and_validates_sources() {
@@ -1458,25 +1472,12 @@ mod tests {
         )
         .expect("coalesce plan");
         let optimized_tree = optimize_for_test(plan);
-        let connectors = crate::connector::ConnectorRegistry::default();
-        let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
 
-        let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
-            .and_then(crate::sql::planner::pipeline::build_distributed_plan)
-            .and_then(|distributed_plan| {
-                let prepared = crate::query_execution::preparation::prepare_fragments(
-                    &distributed_plan,
-                    &controls,
-                    &crate::connector::test_request_context(),
-                    None,
-                    None,
-                    crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
-                )?;
-                crate::protocol::native::encode::encode_native_fragment_bundle(
-                    &distributed_plan,
-                    &prepared,
-                )
-            });
+        // Fragment preparation and native encoding are application-owned
+        // integration concerns.  This SQL test stops at the compiler-owned
+        // physical boundary and verifies the aggregate arguments remain
+        // lowerable without a connector fixture or execution request.
+        let result = crate::sql::planner::optimizer_bridge::to_physical_plan(&optimized_tree);
 
         if let Err(err) = result {
             assert!(
@@ -1695,8 +1696,7 @@ mod tests {
         plan: &LogicalPlanNode,
     ) -> Option<&crate::sql::planner::table::SqlMvTargetLocatorScan> {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
-            && let crate::sql::planner::table::ScanSource::MvTargetLocator(locator) =
-                &scan.table.source
+            && let Some(locator) = sql_mv_target_locator_scan(&scan.table.source)
         {
             return Some(locator);
         }
@@ -1756,6 +1756,7 @@ mod tests {
 
     fn test_locator_binding() -> super::JoinRefreshTargetLocatorBinding {
         super::JoinRefreshTargetLocatorBinding {
+            target_binding: crate::sql::compiler::mv_rewrite::test_target_binding(),
             target_table_uuid: "target-uuid".to_string(),
             target_snapshot_id: Some(77),
         }

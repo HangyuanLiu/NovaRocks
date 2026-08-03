@@ -19,7 +19,8 @@ mod dispatch;
 mod iceberg;
 mod projection;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
@@ -48,14 +49,71 @@ fn prepare_scan_bindings(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    let query_bindings = fixture_query_table_bindings();
     super::prepare_scan_bindings(
         plan,
         &controls,
         &crate::connector::test_request_context(),
-        None,
+        Some(&query_bindings),
         resolver,
         super::ScanPreparationOptions::single_backend_fixture(),
     )
+}
+
+/// The shared fixture deliberately allocates the same token that the SQL
+/// test scan carrier embeds.  Concrete Iceberg files remain in the
+/// application-owned store, never in `TableDef::source`.
+fn fixture_query_table_bindings() -> crate::engine::query_planning::bindings::QueryTableBindingStore
+{
+    use crate::engine::query_planning::bindings::{
+        QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    };
+    use crate::sql::planner::table::{
+        SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    };
+
+    let store = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(1).expect("fixture scope"),
+    );
+    store
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::strict_base("test_catalog", "test_db", "test_table"),
+            |binding| {
+                let table = iceberg_table();
+                let planner = TableDef {
+                    name: "test_table".to_string(),
+                    columns: vec![source_column("id", DataType::Int32, false)],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        binding,
+                        SqlTableIdentity {
+                            catalog: "test_catalog".to_string(),
+                            namespace: "test_db".to_string(),
+                            table: "test_table".to_string(),
+                        },
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
+                };
+                Ok(QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some("test_catalog"),
+                        "test_db",
+                        planner,
+                    ),
+                    statistics_pin: None,
+                    planning_lease: None,
+                    scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
+                        table,
+                        files: vec![data_file("s3://bucket/explicit.parquet")],
+                        binding: IcebergDataFileBinding::CurrentSnapshot,
+                    }),
+                })
+            },
+        )
+        .expect("fixture query binding");
+    store
 }
 
 struct StaticResolver {
@@ -168,18 +226,17 @@ fn equality_delete_file(
     }
 }
 
-fn scan_node(node_id: i32, binding: IcebergDataFileBinding) -> DistributedNode {
+fn scan_node(node_id: i32, _binding: IcebergDataFileBinding) -> DistributedNode {
     let output = column(1, "id", DataType::Int32, false);
     let table = TableDef {
         name: "ice_t".to_string(),
         columns: vec![source_column("id", DataType::Int32, false)],
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: ScanSource::IcebergDataFiles {
-            table: iceberg_table(),
-            files: vec![data_file("s3://bucket/explicit.parquet")],
-            cloud_properties: BTreeMap::new(),
-            binding,
-        },
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ),
     };
     DistributedNode {
         node_id,

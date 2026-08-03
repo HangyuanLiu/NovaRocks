@@ -21,14 +21,14 @@ use crate::sql::planner::vocabulary::ApplyKeySource;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use arrow::datatypes::{DataType, Field};
 
 use crate::sql::analysis::expr_display::typed_expr_display_name;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
 use crate::sql::column_id::ColumnId;
+use crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -51,6 +51,7 @@ use crate::sql::planner::payload::{
 use crate::sql::planner::plan_output_columns as planner_plan_output_columns;
 use crate::sql::planner::table::{
     SqlMvTargetStatePartitionConstraint, SqlMvTargetStateRowFilter, TableDef,
+    sql_mv_target_state_scan,
 };
 use novarocks_catalog::schema::ColumnDef;
 
@@ -152,37 +153,36 @@ pub(crate) fn build_aggregate_state_merge(
     }
 
     let (aggregate_calls, aggregate_layout) =
-        ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
+        ext.snapshot.aggregate_shape_and_layout_for_execution()?;
     let group_key_names = group_key_names(&aggregate)?;
     let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)?;
     let row_id_column_name = aggregate_row_id_column_name(ext)?;
     let target_columns = target_columns(ext)?;
-    let target = &ext.mv_ctx.target;
+    let target = &ext.snapshot.target;
     let aggregate_contract = ext
-        .mv_ctx
+        .snapshot
         .schema_contract
         .aggregate
         .as_ref()
         .ok_or_else(|| {
             "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
         })?;
-    let physical_column_names = aggregate_layout
-        .physical_columns
-        .iter()
-        .map(|column| column.column.name.clone())
-        .collect::<Vec<_>>();
-    let partition_constraint = if is_unpartitioned_target_contract(&ext.mv_ctx.schema_contract) {
+    let physical_column_names = aggregate_layout.physical_column_names.clone();
+    let partition_constraint = if is_unpartitioned_target_contract(&ext.snapshot.schema_contract) {
         SqlMvTargetStatePartitionConstraint::Unpartitioned
     } else {
         SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
     };
 
     let old_source = build_target_state_scan_source(
-        target.catalog.clone(),
-        target.namespace.clone(),
-        target.table.clone(),
-        ext.mv_ctx.target_table_uuid.clone(),
-        ext.mv_ctx.target_snapshot_id,
+        ext.snapshot.target_binding,
+        crate::sql::planner::table::SqlTableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        ext.snapshot.target_table_uuid.clone(),
+        ext.snapshot.target_snapshot_id,
         aggregate_contract.state_layout_version,
         target_columns.clone(),
         group_key_names.clone(),
@@ -434,7 +434,7 @@ fn target_state_locator_metadata_columns() -> Vec<ColumnDef> {
 fn branch_scoped_old_input(
     old_scan: LogicalPlanNode,
     branch_scope: Option<crate::sql::planner::table::BranchScope>,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<LogicalPlanNode, String> {
     let Some(scope) = branch_scope else {
         return Ok(old_scan);
@@ -462,12 +462,12 @@ fn build_relational_aggregate_change_stream(
     signed_delta: LogicalPlanNode,
     branch_scope: Option<crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<LogicalPlanNode, String> {
     let old_outputs = plan_output_columns(&old_input)?;
     let delta_with_row_id = delta_state_with_row_id(signed_delta, layout, ctx)?;
     let delta_outputs = plan_output_columns(&delta_with_row_id)?;
-    let row_id_name = &layout.row_id_column.column.name;
+    let row_id_name = &layout.row_id_column_name;
     let delta_row_id = find_output_column_by_name(&delta_outputs, row_id_name)?.clone();
     let old_row_id = find_output_column_by_name(&old_outputs, row_id_name)?.clone();
 
@@ -635,7 +635,7 @@ fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
 
 fn delta_state_with_row_id(
     signed_delta: LogicalPlanNode,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     ctx: &RewriteContext,
 ) -> Result<LogicalPlanNode, String> {
     let delta_outputs = plan_output_columns(&signed_delta)?;
@@ -652,7 +652,7 @@ fn delta_state_with_row_id(
         )?));
     }
 
-    let row_id_name = layout.row_id_column.column.name.clone();
+    let row_id_name = layout.row_id_column_name.clone();
     let row_id_column_id = allocate_imv_column(ctx, &row_id_name, DataType::Utf8, false)?;
     let mut items = Vec::with_capacity(delta_outputs.len() + 1);
     items.push(ProjectItem {
@@ -688,19 +688,17 @@ fn delta_state_with_row_id(
 }
 
 fn merged_state_expr(
-    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     join_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
 ) -> Result<TypedExpr, String> {
-    use crate::mv::model::AggregateStateRole;
-
     let delta = find_output_column_by_name(delta_outputs, &state_column.name)?;
     let delta = find_output_column_by_id(join_outputs, delta.column_id)?;
     let old = find_output_column_by_name(old_outputs, &state_column.name)?;
     let old = find_output_column_by_id(join_outputs, old.column_id)?;
     match state_column.state_role {
-        AggregateStateRole::Single => Ok(TypedExpr {
+        SqlImvAggregateStateRole::Single => Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: crate::sql::functions::builtin_function_volatility(
                     state_union_function(state_column.function)?,
@@ -712,7 +710,7 @@ fn merged_state_expr(
             data_type: DataType::Binary,
             nullable: state_column.nullable,
         }),
-        AggregateStateRole::RetractionCount => Ok(TypedExpr {
+        SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
             kind: ExprKind::Case {
                 operand: None,
                 when_then: vec![(
@@ -749,7 +747,7 @@ fn aggregate_change_stream_project(
     old_outputs: &[OutputColumn],
     output_columns: &[OutputColumn],
     branch_scope: Option<&crate::sql::planner::table::BranchScope>,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<LogicalPlanNode, String> {
     let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
     let mut items = Vec::with_capacity(output_columns.len());
@@ -821,9 +819,9 @@ fn aggregate_delete_expr_for_output(
     input_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<TypedExpr, String> {
-    let row_id_name = &layout.row_id_column.column.name;
+    let row_id_name = &layout.row_id_column_name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
         return source_expr_by_name(input_outputs, old_outputs, row_id_name);
     }
@@ -863,9 +861,9 @@ fn aggregate_insert_expr_for_output(
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<TypedExpr, String> {
-    let row_id_name = &layout.row_id_column.column.name;
+    let row_id_name = &layout.row_id_column_name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
         return source_expr_by_name(input_outputs, delta_outputs, row_id_name);
     }
@@ -980,7 +978,7 @@ fn branch_case_requires_runtime_cast(target: &DataType) -> bool {
 }
 
 fn aggregate_change_stream_output_columns(
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     branch_scope: Option<&crate::sql::planner::table::BranchScope>,
     ctx: &RewriteContext,
 ) -> Result<Vec<OutputColumn>, String> {
@@ -993,7 +991,7 @@ fn aggregate_change_stream_output_columns(
     );
     columns.push(allocate_imv_output_column(
         ctx,
-        &layout.row_id_column.column.name,
+        &layout.row_id_column_name,
         DataType::Utf8,
         false,
         true,
@@ -1108,16 +1106,14 @@ fn find_output_column_by_id(
 }
 
 fn single_state_column_for_visible(
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     visible_index: usize,
-) -> Result<&crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn, String> {
-    use crate::mv::model::AggregateStateRole;
-
+) -> Result<&crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn, String> {
     layout
         .state_columns
         .iter()
         .find(|column| {
-            column.state_role == AggregateStateRole::Single
+            column.state_role == SqlImvAggregateStateRole::Single
                 && column.visible_source_index == visible_index
         })
         .ok_or_else(|| {
@@ -1128,18 +1124,17 @@ fn single_state_column_for_visible(
 }
 
 fn retraction_count_state_column(
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
-) -> Result<&crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn, String> {
-    use crate::mv::model::AggregateStateRole;
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
+) -> Result<&crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn, String> {
     use crate::sql::mv_refresh::AggregateFunctionKind;
 
     layout
         .state_columns
         .iter()
-        .find(|column| column.state_role == AggregateStateRole::RetractionCount)
+        .find(|column| column.state_role == SqlImvAggregateStateRole::RetractionCount)
         .or_else(|| {
             layout.state_columns.iter().find(|column| {
-                column.state_role == AggregateStateRole::Single
+                column.state_role == SqlImvAggregateStateRole::Single
                     && column.function == AggregateFunctionKind::Count
                     && column.count_star
             })
@@ -1189,9 +1184,9 @@ fn visible_state_function(
 }
 
 fn visible_state_args(
-    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     merged_state: TypedExpr,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<Vec<TypedExpr>, String> {
     use crate::sql::mv_refresh::AggregateFunctionKind;
 
@@ -1259,13 +1254,13 @@ fn branch_scope_predicate(
 }
 
 fn aggregate_old_state_passthrough_items(
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     outputs: &[OutputColumn],
 ) -> Result<Vec<ProjectItem>, String> {
     let mut names = Vec::with_capacity(
         1 + layout.group_key_source_indexes.len() + layout.state_columns.len() + 4,
     );
-    push_unique_name(&mut names, &layout.row_id_column.column.name);
+    push_unique_name(&mut names, &layout.row_id_column_name);
     for &visible_source_index in &layout.group_key_source_indexes {
         let visible = layout.visible_columns.get(visible_source_index).ok_or_else(|| {
             format!(
@@ -1312,7 +1307,7 @@ fn find_output_column_by_name<'a>(
 }
 
 fn is_unpartitioned_target_contract(
-    schema_contract: &crate::mv::persistence::schema::MvSchemaContract,
+    schema_contract: &crate::sql::compiler::mv_rewrite::SqlImvSchemaContract,
 ) -> bool {
     schema_contract
         .target
@@ -1368,10 +1363,10 @@ fn group_key_output_name(
 fn aggregate_state_names(
     ext: &ImvExtension,
     aggregate_node: &LogicalAggregateNode,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<Vec<String>, String> {
     let aggregate = ext
-        .mv_ctx
+        .snapshot
         .schema_contract
         .aggregate
         .as_ref()
@@ -1394,7 +1389,9 @@ fn aggregate_state_names(
     let single_state_count = layout
         .state_columns
         .iter()
-        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::Single)
+        .filter(|column| {
+            column.state_role == crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+        })
         .count();
     if single_state_count != aggregate_node.aggregates.len() {
         return Err(format!(
@@ -1419,11 +1416,11 @@ fn aggregate_state_names(
             ));
         }
         let expected_role = match layout_column.state_role {
-            crate::mv::model::AggregateStateRole::Single => {
-                crate::mv::persistence::schema::AggregateStateRoleContract::Single
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => {
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::Single
             }
-            crate::mv::model::AggregateStateRole::RetractionCount => {
-                crate::mv::persistence::schema::AggregateStateRoleContract::RetractionCount
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::RetractionCount
             }
         };
         if contract_column.role != expected_role {
@@ -1433,7 +1430,7 @@ fn aggregate_state_names(
             ));
         }
         match layout_column.state_role {
-            crate::mv::model::AggregateStateRole::Single => {
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => {
                 if !contract_column
                     .type_signature
                     .eq_ignore_ascii_case("binary")
@@ -1456,7 +1453,7 @@ fn aggregate_state_names(
                     })?;
                 signed_state_function(&call.name)?;
             }
-            crate::mv::model::AggregateStateRole::RetractionCount => {
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
                 if !contract_column.type_signature.eq_ignore_ascii_case("long")
                     && !contract_column
                         .type_signature
@@ -1479,7 +1476,7 @@ fn aggregate_state_names(
 
 fn aggregate_row_id_column_name(ext: &ImvExtension) -> Result<String, String> {
     let aggregate = ext
-        .mv_ctx
+        .snapshot
         .schema_contract
         .aggregate
         .as_ref()
@@ -1496,125 +1493,7 @@ fn aggregate_row_id_column_name(ext: &ImvExtension) -> Result<String, String> {
 }
 
 fn target_columns(ext: &ImvExtension) -> Result<Vec<ColumnDef>, String> {
-    ext.mv_ctx
-        .target_schema
-        .as_ref()
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|field| target_column_from_field(field.as_ref()))
-        .collect()
-}
-
-fn target_column_from_field(field: &NestedField) -> Result<ColumnDef, String> {
-    Ok(ColumnDef {
-        name: field.name.clone(),
-        data_type: iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
-        nullable: !field.required,
-        write_default: field
-            .write_default
-            .as_ref()
-            .map(|literal| {
-                crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
-                    literal,
-                    field.field_type.as_ref(),
-                )
-                .map_err(|e| {
-                    format!(
-                        "convert Iceberg IMV aggregate write-default for column `{}` failed: {e}",
-                        field.name
-                    )
-                })
-            })
-            .transpose()?,
-        logical_type: None,
-    })
-}
-
-fn iceberg_type_to_arrow(ty: &Type, column_name: &str) -> Result<DataType, String> {
-    Ok(match ty {
-        Type::Primitive(primitive) => primitive_type_to_arrow(primitive, column_name)?,
-        Type::Struct(struct_ty) => {
-            let fields = struct_ty
-                .fields()
-                .iter()
-                .map(|field| {
-                    Ok(Arc::new(Field::new(
-                        field.name.clone(),
-                        iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
-                        !field.required,
-                    )))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            DataType::Struct(fields.into())
-        }
-        Type::List(list_ty) => {
-            let element = list_ty.element_field.as_ref();
-            DataType::List(Arc::new(Field::new(
-                element.name.clone(),
-                iceberg_type_to_arrow(element.field_type.as_ref(), &element.name)?,
-                !element.required,
-            )))
-        }
-        Type::Map(map_ty) => {
-            let key = map_ty.key_field.as_ref();
-            let value = map_ty.value_field.as_ref();
-            let entries = DataType::Struct(
-                vec![
-                    Arc::new(Field::new(
-                        key.name.clone(),
-                        iceberg_type_to_arrow(key.field_type.as_ref(), &key.name)?,
-                        !key.required,
-                    )),
-                    Arc::new(Field::new(
-                        value.name.clone(),
-                        iceberg_type_to_arrow(value.field_type.as_ref(), &value.name)?,
-                        !value.required,
-                    )),
-                ]
-                .into(),
-            );
-            DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
-        }
-    })
-}
-
-fn primitive_type_to_arrow(
-    primitive: &PrimitiveType,
-    column_name: &str,
-) -> Result<DataType, String> {
-    Ok(match primitive {
-        PrimitiveType::Boolean => DataType::Boolean,
-        PrimitiveType::Int => DataType::Int32,
-        PrimitiveType::Long => DataType::Int64,
-        PrimitiveType::Float => DataType::Float32,
-        PrimitiveType::Double => DataType::Float64,
-        PrimitiveType::Decimal { precision, scale } => {
-            let precision = u8::try_from(*precision).map_err(|_| {
-                format!(
-                    "Iceberg IMV aggregate rewrite target column {column_name} has out-of-range decimal precision {precision}"
-                )
-            })?;
-            let scale = i8::try_from(*scale).map_err(|_| {
-                format!(
-                    "Iceberg IMV aggregate rewrite target column {column_name} has out-of-range decimal scale {scale}"
-                )
-            })?;
-            DataType::Decimal128(precision, scale)
-        }
-        PrimitiveType::Date => DataType::Date32,
-        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
-        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        PrimitiveType::String => DataType::Utf8,
-        PrimitiveType::Binary => DataType::Binary,
-        other => {
-            return Err(format!(
-                "Iceberg IMV aggregate rewrite does not support target column {column_name} with Iceberg type {other:?}"
-            ));
-        }
-    })
+    Ok(ext.snapshot.target_columns.as_ref().to_vec())
 }
 
 fn signed_aggregate(
@@ -1623,8 +1502,8 @@ fn signed_aggregate(
     aggregate_required_output_columns: Option<HashSet<ColumnId>>,
     action_column: ColumnId,
     ctx: &RewriteContext,
-    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::sql::compiler::mv_rewrite::SqlImvAggregateShape,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<LogicalPlanNode, String> {
     let input_columns = plan_output_columns(&aggregate_input)?;
     let mut signed_calls = aggregate
@@ -1635,10 +1514,10 @@ fn signed_aggregate(
             signed_aggregate_call(&call, action_column)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let hidden_retraction_call = layout
-        .state_columns
-        .iter()
-        .any(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount);
+    let hidden_retraction_call = layout.state_columns.iter().any(|column| {
+        column.state_role
+            == crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
+    });
     if hidden_retraction_call {
         signed_calls.push(retraction_count_aggregate_call(action_column));
     }
@@ -1912,12 +1791,12 @@ fn unique_input_column_by_name<'a>(
 
 fn signed_aggregate_output_columns(
     group_by: &[TypedExpr],
-    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::sql::compiler::mv_rewrite::SqlImvAggregateShape,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     ctx: &RewriteContext,
     signed_calls: &mut [AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
-    let mut output_columns = Vec::with_capacity(shape.group_keys.len() + signed_calls.len());
+    let mut output_columns = Vec::with_capacity(shape.group_key_count + signed_calls.len());
     for (group_key_index, &visible_source_index) in
         layout.group_key_source_indexes.iter().enumerate()
     {
@@ -1966,8 +1845,8 @@ fn signed_aggregate_output_columns(
 
 fn signed_aggregate_project_items(
     group_by: &[TypedExpr],
-    shape: &crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls,
-    layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+    shape: &crate::sql::compiler::mv_rewrite::SqlImvAggregateShape,
+    layout: &crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     ctx: &RewriteContext,
     aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
@@ -2029,7 +1908,7 @@ fn signed_aggregate_project_items(
                     .iter()
                     .find(|column| {
                         column.state_role
-                            == crate::mv::model::AggregateStateRole::Single
+                            == crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
                             && column.aggregate_index == *aggregate_index
                     })
                     .ok_or_else(|| {
@@ -2066,11 +1945,10 @@ fn signed_aggregate_project_items(
             }
         }
     }
-    for state_column in layout
-        .state_columns
-        .iter()
-        .filter(|column| column.state_role == crate::mv::model::AggregateStateRole::RetractionCount)
-    {
+    for state_column in layout.state_columns.iter().filter(|column| {
+        column.state_role
+            == crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
+    }) {
         let call = signed_calls.last().ok_or_else(|| {
             format!(
                 "Iceberg IMV aggregate rewrite missing hidden retraction state call for {}",
@@ -2102,7 +1980,7 @@ fn signed_aggregate_project_items(
 
 fn signed_aggregate_child_output<'a>(
     aggregate_output_columns: &'a [OutputColumn],
-    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn,
 ) -> Result<&'a OutputColumn, String> {
     aggregate_output_columns
         .iter()
@@ -2116,11 +1994,13 @@ fn signed_aggregate_child_output<'a>(
 }
 
 fn state_shaped_state_data_type(
-    state_column: &crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn,
+    state_column: &crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn,
 ) -> DataType {
     match state_column.state_role {
-        crate::mv::model::AggregateStateRole::Single => DataType::Binary,
-        crate::mv::model::AggregateStateRole::RetractionCount => state_column.data_type.clone(),
+        crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => DataType::Binary,
+        crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
+            state_column.data_type.clone()
+        }
     }
 }
 
@@ -2229,21 +2109,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::persistence::schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
-    };
-    use crate::mv::rewrite::context::IcebergMvRewriteContext;
-    use crate::mv::rewrite::context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
-    };
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
+    use crate::sql::compiler::mv_rewrite::{
+        SqlImvAggregateStateColumnContract, SqlImvAggregateStateRoleContract, SqlImvBranchContract,
+        SqlImvPartitionContract,
+    };
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -2288,23 +2162,19 @@ mod tests {
         );
     }
 
-    fn single_state_column(type_signature: &str) -> AggregateStateColumnContract {
-        AggregateStateColumnContract {
+    fn single_state_column(type_signature: &str) -> SqlImvAggregateStateColumnContract {
+        SqlImvAggregateStateColumnContract {
             column_name: "__agg_state_s".to_string(),
-            target_field_id: 200,
             type_signature: type_signature.to_string(),
-            nullable: true,
-            role: AggregateStateRoleContract::Single,
+            role: SqlImvAggregateStateRoleContract::Single,
         }
     }
 
-    fn retraction_count_state_column() -> AggregateStateColumnContract {
-        AggregateStateColumnContract {
+    fn retraction_count_state_column() -> SqlImvAggregateStateColumnContract {
+        SqlImvAggregateStateColumnContract {
             column_name: "__agg_state___ivm_row_count".to_string(),
-            target_field_id: 201,
             type_signature: "long".to_string(),
-            nullable: false,
-            role: AggregateStateRoleContract::RetractionCount,
+            role: SqlImvAggregateStateRoleContract::RetractionCount,
         }
     }
 
@@ -2316,14 +2186,14 @@ mod tests {
     }
 
     fn build_ctx_with_state_columns(
-        state_columns: Vec<AggregateStateColumnContract>,
+        state_columns: Vec<SqlImvAggregateStateColumnContract>,
     ) -> RewriteContext {
         build_ctx_with_state_columns_and_target_partition(state_columns, None)
     }
 
     fn build_ctx_with_state_columns_and_target_partition(
-        state_columns: Vec<AggregateStateColumnContract>,
-        target_partition: Option<MvPartitionContract>,
+        state_columns: Vec<SqlImvAggregateStateColumnContract>,
+        target_partition: Option<SqlImvPartitionContract>,
     ) -> RewriteContext {
         build_ctx_with_state_columns_target_partition_and_branch(
             state_columns,
@@ -2339,105 +2209,22 @@ mod tests {
                 retraction_count_state_column(),
             ],
             None,
-            Some(BranchUnionContract {
-                branch_id_column: BranchIdColumnContract {
-                    column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME.to_string(),
-                    target_field_id: 998,
-                },
-                branch_count: 2,
-                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            Some(SqlImvBranchContract {
+                branch_id_column_name: crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME
+                    .to_string(),
             }),
         )
     }
 
     fn build_ctx_with_state_columns_target_partition_and_branch(
-        state_columns: Vec<AggregateStateColumnContract>,
-        target_partition: Option<MvPartitionContract>,
-        branch_contract: Option<BranchUnionContract>,
+        state_columns: Vec<SqlImvAggregateStateColumnContract>,
+        target_partition: Option<SqlImvPartitionContract>,
+        branch_contract: Option<SqlImvBranchContract>,
     ) -> RewriteContext {
-        let mut mv_def = make_mv_definition();
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.target.partition = target_partition;
-        contract.branch = branch_contract.clone();
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: state_columns.clone(),
-        });
-        mv_def.schema_contract = Some(contract.clone());
-
-        let mut fields = vec![
-            Arc::new(NestedField::required(
-                100,
-                "k",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::optional(
-                101,
-                "v",
-                Type::Primitive(PrimitiveType::Long),
-            )),
-            Arc::new(NestedField::required(
-                999,
-                "__row_id__",
-                Type::Primitive(PrimitiveType::String),
-            )),
-        ];
-        if let Some(branch) = &branch_contract {
-            fields.push(Arc::new(NestedField::required(
-                branch.branch_id_column.target_field_id,
-                branch.branch_id_column.column_name.clone(),
-                Type::Primitive(PrimitiveType::Int),
-            )));
-        }
-        for column in &state_columns {
-            let primitive = if column.role == AggregateStateRoleContract::RetractionCount {
-                PrimitiveType::Long
-            } else {
-                PrimitiveType::Binary
-            };
-            fields.push(Arc::new(if column.nullable {
-                NestedField::optional(
-                    column.target_field_id,
-                    column.column_name.clone(),
-                    Type::Primitive(primitive),
-                )
-            } else {
-                NestedField::required(
-                    column.target_field_id,
-                    column.column_name.clone(),
-                    Type::Primitive(primitive),
-                )
-            }));
-        }
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(fields)
-                .build()
-                .expect("build schema"),
-        );
-        let mv_ctx = Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT k, sum(v) AS s FROM ice.db.b GROUP BY k",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "b")]),
-                Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("aggregate rewrite context must build"),
+        let snapshot = crate::sql::compiler::mv_rewrite::test_aggregate_snapshot(
+            state_columns,
+            target_partition,
+            branch_contract,
         );
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
@@ -2448,7 +2235,7 @@ mod tests {
         factory.borrow_mut().reserve_until(100);
         ctx.set_column_ref_factory(factory);
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx,
+            snapshot,
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
@@ -2457,7 +2244,7 @@ mod tests {
     fn aggregate_rewrite_test_context_with_factory() -> (
         RewriteContext,
         ImvExtension,
-        crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
+        crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout,
     ) {
         let mut ctx = build_ctx();
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
@@ -2467,7 +2254,7 @@ mod tests {
             .expect("build_ctx installs ImvExtension")
             .clone();
         let (_, layout) = ext
-            .mv_ctx
+            .snapshot
             .aggregate_shape_and_layout_for_execution()
             .expect("aggregate test context has layout");
         (ctx, ext, layout)
@@ -2504,42 +2291,43 @@ mod tests {
 
     #[test]
     fn visible_state_args_threads_avg_decimal_input_scale() {
-        let shape = crate::mv::aggregate_state::mv_shape::classify_incremental_mv_query(
-            &parse_query("select k, avg(d) as a from ice.db.b group by k"),
-        )
-        .expect("classify aggregate");
-        let crate::mv::aggregate_state::mv_shape::IncrementalMvShape::Aggregate(shape) = shape
-        else {
-            panic!("expected aggregate shape");
+        let layout = crate::sql::compiler::mv_rewrite::SqlImvAggregateLayout {
+            row_id_column_name: "_row_id".to_string(),
+            visible_columns: vec![
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateVisibleColumn {
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateVisibleColumn {
+                    name: "a".to_string(),
+                    data_type: DataType::Decimal128(38, 10),
+                    nullable: true,
+                },
+            ],
+            state_columns: vec![
+                crate::sql::compiler::mv_rewrite::SqlImvAggregateStateColumn {
+                    name: "a__state".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    visible_source_index: 1,
+                    aggregate_index: 0,
+                    function: crate::sql::mv_refresh::AggregateFunctionKind::Avg,
+                    state_role: crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single,
+                    count_star: false,
+                },
+            ],
+            group_key_source_indexes: vec![0],
+            physical_column_names: vec!["k".to_string(), "a__state".to_string()],
+            aggregate_input_types: vec![Some(DataType::Decimal128(20, 4))],
         };
-        let calls =
-            crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls::from(&shape);
-        let layout =
-            crate::mv::aggregate_state::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                &calls,
-                &[
-                    OutputColumn {
-                        column_id: ColumnId::new_for_test(1),
-                        name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                    OutputColumn {
-                        column_id: ColumnId::new_for_test(2),
-                        name: "a".to_string(),
-                        data_type: DataType::Decimal128(38, 10),
-                        nullable: true,
-                        is_internal: false,
-                    },
-                ],
-                &[Some(DataType::Decimal128(20, 4))],
-            )
-            .expect("AVG decimal layout");
         let state_column = layout
             .state_columns
             .iter()
-            .find(|column| column.state_role == crate::mv::model::AggregateStateRole::Single)
+            .find(|column| {
+                column.state_role
+                    == crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+            })
             .expect("single AVG state column");
         let merged_state = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -2599,24 +2387,7 @@ mod tests {
                     name: "b".to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
-                            catalog: "ice".to_string(),
-                            namespace: "db".to_string(),
-                            table: "b".to_string(),
-                            table_uuid: Some("uuid-b".to_string()),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: "file:///tmp/ice/db/b".to_string(),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
-                        },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source(),
                 },
                 alias: None,
                 columns: vec![
@@ -2776,7 +2547,7 @@ mod tests {
 
     fn find_target_state_scan(plan: &LogicalPlanNode) -> &PlanScanNode {
         if let LogicalPlanKind::Scan(scan) = &plan.kind
-            && matches!(&scan.table.source, ScanSource::MvTargetState(_))
+            && sql_mv_target_state_scan(&scan.table.source).is_some()
         {
             return scan;
         }
@@ -2793,16 +2564,9 @@ mod tests {
     }
 
     fn contains_target_state_scan(plan: &LogicalPlanNode) -> bool {
-        matches!(
-            &plan.kind,
-            LogicalPlanKind::Scan(PlanScanNode {
-                table: TableDef {
-                    source: ScanSource::MvTargetState(_),
-                    ..
-                },
-                ..
-            })
-        ) || plan.children.iter().any(contains_target_state_scan)
+        matches!(&plan.kind, LogicalPlanKind::Scan(scan)
+            if sql_mv_target_state_scan(&scan.table.source).is_some())
+            || plan.children.iter().any(contains_target_state_scan)
     }
 
     fn find_signed_delta_project(plan: &LogicalPlanNode) -> &LogicalPlanNode {
@@ -2846,7 +2610,7 @@ mod tests {
             let filter_plan = plan.unary_input();
             if let LogicalPlanKind::Filter(filter) = &filter_plan.kind
                 && let LogicalPlanKind::Scan(scan) = &filter_plan.unary_input().kind
-                && matches!(&scan.table.source, ScanSource::MvTargetState(_))
+                && sql_mv_target_state_scan(&scan.table.source).is_some()
             {
                 return (project, filter, scan);
             }
@@ -2872,13 +2636,8 @@ mod tests {
                     LogicalPlanKind::Filter(_)
                 ) && matches!(
                     &plan.unary_input().unary_input().kind,
-                    LogicalPlanKind::Scan(PlanScanNode {
-                        table: TableDef {
-                            source: ScanSource::MvTargetState(_),
-                            ..
-                        },
-                        ..
-                    })
+                    LogicalPlanKind::Scan(scan)
+                        if sql_mv_target_state_scan(&scan.table.source).is_some()
                 )
         ) || plan.children.iter().any(contains_branch_scoped_old_input)
     }
@@ -3021,10 +2780,15 @@ mod tests {
         let changed = expect_changed_merge(result, &arena_rc.borrow());
 
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
+        let Some(target_state) = sql_mv_target_state_scan(&old_scan.table.source) else {
             panic!("expected IcebergMvTargetState source");
         };
-        assert_eq!(target_state.fqn(), "tgt.db.mv");
+        let ScanSource::Sql(source) = &old_scan.table.source else {
+            panic!("expected SQL target-state source");
+        };
+        assert_eq!(source.table.catalog, "tgt");
+        assert_eq!(source.table.namespace, "db");
+        assert_eq!(source.table.table, "mv");
         assert_eq!(target_state.group_key_names, vec!["k"]);
         assert_eq!(
             target_state.aggregate_state_names,
@@ -3520,7 +3284,7 @@ mod tests {
                 single_state_column("binary"),
                 retraction_count_state_column(),
             ],
-            Some(MvPartitionContract {
+            Some(SqlImvPartitionContract {
                 target_spec_id: 0,
                 fields: Vec::new(),
             }),
@@ -3535,7 +3299,7 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
+        let Some(target_state) = sql_mv_target_state_scan(&old_scan.table.source) else {
             panic!("expected IcebergMvTargetState source");
         };
 
@@ -3572,7 +3336,7 @@ mod tests {
 
         let _ = aggregate_change_stream_project(&merge);
         let (project, filter, old_scan) = find_branch_scoped_old_input(&merge);
-        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
+        let Some(target_state) = sql_mv_target_state_scan(&old_scan.table.source) else {
             panic!("expected IcebergMvTargetState source");
         };
         assert!(matches!(
@@ -3773,7 +3537,7 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
         let old_scan = find_target_state_scan(&changed);
-        let ScanSource::MvTargetState(target_state) = &old_scan.table.source else {
+        let Some(target_state) = sql_mv_target_state_scan(&old_scan.table.source) else {
             panic!("expected IcebergMvTargetState source");
         };
         assert_eq!(target_state.group_key_names, vec!["k"]);

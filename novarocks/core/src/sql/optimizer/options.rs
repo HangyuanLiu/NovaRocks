@@ -78,6 +78,9 @@ pub struct SessionOptimizerSettings {
     /// `optimize()` when the session has not explicitly SET a backend count.
     /// `None` means no snapshot available (fall back to profile default).
     pub effective_backend_count: Option<f64>,
+    /// Query memory budget frozen at admission. SQL applies this only to
+    /// costing; it never consults the process-global runtime configuration.
+    pub optimizer_query_mem_limit_bytes: Option<f64>,
     /// Session override for `enable_global_runtime_filter_cross_exchange`
     /// (None = built-in default, which is true). Setting false disables
     /// placing probe runtime filters across shuffle exchanges, for bisecting
@@ -91,7 +94,7 @@ impl SessionOptimizerSettings {
         disabled_rules.sort();
         disabled_rules.dedup();
         format!(
-            "ukfk={};rewrite_prune={};cbo_prune={};update_prune={};elim_agg={};rules={:?};cse={:?};rf_max={:?};rf_min={:?};probe_min={:?};probe_sel={:?};global_rf={:?};mv={:?};static_pd={:?};dp={:?};greedy={:?};exhaustive={:?};dp_n={:?};greedy_n={:?};max_n={:?};broadcast_n={:?};broadcast_mem={:?};effective_n={:?};cross_rf={:?}",
+            "ukfk={};rewrite_prune={};cbo_prune={};update_prune={};elim_agg={};rules={:?};cse={:?};rf_max={:?};rf_min={:?};probe_min={:?};probe_sel={:?};global_rf={:?};mv={:?};static_pd={:?};dp={:?};greedy={:?};exhaustive={:?};dp_n={:?};greedy_n={:?};max_n={:?};broadcast_n={:?};broadcast_mem={:?};effective_n={:?};query_mem={:?};cross_rf={:?}",
             self.enable_ukfk_opt,
             self.enable_query_rewrite_table_prune,
             self.enable_cbo_table_prune,
@@ -115,6 +118,7 @@ impl SessionOptimizerSettings {
             self.cbo_broadcast_backend_count.map(f64::to_bits),
             self.cbo_broadcast_node_mem_budget_bytes.map(f64::to_bits),
             self.effective_backend_count.map(f64::to_bits),
+            self.optimizer_query_mem_limit_bytes.map(f64::to_bits),
             self.allow_cross_exchange_rf,
         )
         .into_bytes()
@@ -269,11 +273,11 @@ impl OptimizerOptions {
             opts.reorder.max_reorder_node = v;
         }
         // BC-1: cluster/resource profile overrides. Precedence: explicit
-        // session SET > engine live-registry snapshot > profile default.
+        // session SET > admission-frozen environment > profile default.
         let mut profile = opts.cost_options.profile.clone();
-        profile.apply_query_mem_limit_bytes(
-            crate::common::config::optimizer_query_mem_limit_bytes() as f64,
-        );
+        if let Some(query_mem_limit_bytes) = settings.optimizer_query_mem_limit_bytes {
+            profile.apply_query_mem_limit_bytes(query_mem_limit_bytes);
+        }
         if let Some(v) = settings
             .cbo_broadcast_backend_count
             .or(settings.effective_backend_count)
@@ -291,14 +295,6 @@ impl OptimizerOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct ConfigResetGuard;
-
-    impl Drop for ConfigResetGuard {
-        fn drop(&mut self) {
-            crate::common::app_config::install_default_for_test();
-        }
-    }
 
     #[test]
     fn default_enables_all_rules() {
@@ -470,13 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn from_session_uses_runtime_query_mem_limit_for_default_broadcast_budget() {
-        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
-        cfg.runtime.optimizer_query_mem_limit_bytes = 512 * 1024 * 1024;
-        crate::common::app_config::install_preloaded_config(cfg);
-        let _reset = ConfigResetGuard;
-
-        let opts = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
+    fn sqlx2_optimizer_uses_admission_frozen_query_mem_limit() {
+        let opts = OptimizerOptions::from_session(&SessionOptimizerSettings {
+            optimizer_query_mem_limit_bytes: Some(512.0 * 1024.0 * 1024.0),
+            ..Default::default()
+        });
 
         assert_eq!(
             opts.cost_options.profile.query_mem_limit_bytes,

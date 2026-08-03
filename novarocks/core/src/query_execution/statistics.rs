@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{
@@ -316,7 +316,7 @@ pub(crate) fn prepare_statistics_connector_read(
 /// the regular `ConnectorReadSource`, so BE execution has no statistics-only
 /// connector identity or reader path.
 pub(crate) fn build_statistics_collection_request(
-    connectors: &crate::connector::ConnectorRegistry,
+    _connectors: &crate::connector::ConnectorRegistry,
     controls: &dyn ConnectorControlResolver,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     context: ConnectorRequestContext,
@@ -330,7 +330,12 @@ pub(crate) fn build_statistics_collection_request(
         context.clone(),
         expected_statistics_lease,
     )?;
-    let physical = statistics_scan_physical_plan(&program)?;
+    let table_bindings = Arc::new(
+        crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+            .map_err(contract_violation)?,
+    );
+    let source_binding = admit_statistics_scan_binding(table_bindings.as_ref(), &program)?;
+    let physical = statistics_scan_physical_plan(&program, source_binding)?;
     let distributed =
         crate::sql::planner::pipeline::build_statistics_distributed_plan_with_settings(
             physical,
@@ -343,7 +348,7 @@ pub(crate) fn build_statistics_collection_request(
         &distributed,
         controls,
         &context,
-        None,
+        Some(table_bindings.as_ref()),
         Some(&resolver),
         crate::query_execution::preparation::ScanPreparationOptions::new(
             true,
@@ -370,6 +375,7 @@ pub(crate) fn build_statistics_collection_request(
 
 fn statistics_scan_physical_plan(
     program: &StatisticsCollectionProgram,
+    binding: crate::sql::binding::SqlTableBindingId,
 ) -> Result<crate::sql::planner::physical::PhysicalPlanNode, DistributedQueryError> {
     let mut factory = crate::sql::column_id::ColumnRefFactory::new();
     let mut scan_columns = Vec::with_capacity(program.plan.scan_columns().len());
@@ -402,7 +408,17 @@ fn statistics_scan_physical_plan(
                     name: "__connector_pinned_statistics".to_string(),
                     columns: table_columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                    source: crate::sql::planner::table::ScanSource::Sql(
+                        crate::sql::planner::table::SqlScanSource::new(
+                            binding,
+                            crate::sql::planner::table::SqlTableIdentity {
+                                catalog: "__statistics".to_string(),
+                                namespace: "__statistics".to_string(),
+                                table: "__connector_pinned_statistics".to_string(),
+                            },
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
+                    ),
                 },
                 alias: None,
                 columns: scan_columns.clone(),
@@ -423,6 +439,71 @@ fn statistics_scan_physical_plan(
         },
         probe_runtime_filters: Vec::new(),
     })
+}
+
+/// Retain a request-local SQL token even though the opaque statistics read is
+/// supplied by `PinnedStatisticsReadResolver`.  The resolver holds the exact
+/// statistics lease; the binding store keeps the synthetic compiler source
+/// scoped to this one submission and prevents a fallback catalog acquire.
+fn admit_statistics_scan_binding(
+    bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
+    program: &StatisticsCollectionProgram,
+) -> Result<crate::sql::binding::SqlTableBindingId, DistributedQueryError> {
+    use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
+    use crate::sql::catalog::ResolvedAnalyzerTable;
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+    };
+
+    let columns = program
+        .plan
+        .scan_columns()
+        .iter()
+        .map(|column| novarocks_catalog::schema::ColumnDef {
+            name: column.name().to_string(),
+            data_type: column.data_type().clone(),
+            nullable: column.nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect::<Vec<_>>();
+    bindings
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::strict_base(
+                "__statistics",
+                "__statistics",
+                "__connector_pinned_statistics",
+            ),
+            |binding| {
+                let identity = SqlTableIdentity {
+                    catalog: "__statistics".to_string(),
+                    namespace: "__statistics".to_string(),
+                    table: "__connector_pinned_statistics".to_string(),
+                };
+                let catalog = identity.catalog.clone();
+                let namespace = identity.namespace.clone();
+                Ok(QueryTableBinding {
+                    resolved: ResolvedAnalyzerTable::from_planner(
+                        Some(&catalog),
+                        &namespace,
+                        TableDef {
+                            name: identity.table.clone(),
+                            columns,
+                            iceberg_row_lineage_metadata_columns: Vec::new(),
+                            source: ScanSource::Sql(SqlScanSource::new(
+                                binding,
+                                identity,
+                                SqlScanKind::ConnectorRead,
+                            )),
+                        },
+                    ),
+                    statistics_pin: None,
+                    planning_lease: None,
+                    scan_materialization: None,
+                })
+            },
+        )
+        .map_err(contract_violation)
 }
 
 struct PinnedStatisticsReadResolver {

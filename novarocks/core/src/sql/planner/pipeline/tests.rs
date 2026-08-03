@@ -250,13 +250,12 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
         crate::sql::planner::distributed::DataSink::Result
     ));
 
-    let write = build_iceberg_write_distributed_plan(
+    let write = build_sql_write_distributed_plan_with_settings(
         physical_values_node(vec![id.clone()]),
-        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
-            descriptor_database: "test_db".to_string(),
-            spec: crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec(),
-            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
-        },
+        crate::sql::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+            crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        ),
+        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("write entrypoint seals after sink decoration");
     assert_sealed_plan(&write);
@@ -265,9 +264,8 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
         crate::sql::planner::distributed::DataSink::ConnectorWrite(_)
     ));
 
-    let change = build_iceberg_change_stream_distributed_plan(
+    let change = build_sql_change_stream_distributed_plan(
         physical_values_node(vec![id]),
-        "test_db",
         crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
             Some(0),
             None,
@@ -346,9 +344,8 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
         probe_runtime_filters: vec![],
     };
 
-    let planned = build_iceberg_change_stream_distributed_plan(
+    let planned = build_sql_change_stream_distributed_plan(
         physical,
-        "test_db",
         crate::sql::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec::for_test(
             Some(2),
             None,

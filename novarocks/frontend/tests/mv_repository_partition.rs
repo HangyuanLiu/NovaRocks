@@ -9,12 +9,13 @@ use novarocks::mv::persistence::partition::{
     ReplaceMvPartitionStatesRequest, UpdateMvPartitionContractRequest,
 };
 use novarocks::mv::persistence::schema::{
-    ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-    ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+    BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+    HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
     MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
     TargetContract, TargetVisibleColumn,
 };
 use novarocks::mv::repository::MvRepository;
+use novarocks::sql::planner::vocabulary::ApplyKeySource;
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::state_store::FeDeploymentView;
 use novarocks_state_store::{

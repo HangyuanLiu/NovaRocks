@@ -24,7 +24,9 @@ use crate::connector::iceberg::scan_model::{
     IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
+#[cfg(test)]
 use crate::sql::planner::table::{ScanSource, TableDef};
+#[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
 
 #[cfg(test)]
@@ -34,6 +36,7 @@ use super::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
 pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
 pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
 
+#[cfg(test)]
 pub(crate) fn build_iceberg_table_def_with_files(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
@@ -53,6 +56,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
     )
 }
 
+#[cfg(test)]
 fn iceberg_row_identity_metadata_columns() -> Vec<ColumnDef> {
     vec![
         ColumnDef {
@@ -72,6 +76,7 @@ fn iceberg_row_identity_metadata_columns() -> Vec<ColumnDef> {
     ]
 }
 
+#[cfg(test)]
 fn iceberg_v3_row_lineage_metadata_columns() -> Vec<ColumnDef> {
     vec![
         ColumnDef {
@@ -91,6 +96,7 @@ fn iceberg_v3_row_lineage_metadata_columns() -> Vec<ColumnDef> {
     ]
 }
 
+#[cfg(test)]
 fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
     let mut columns = iceberg_row_identity_metadata_columns();
     columns.extend(iceberg_v3_row_lineage_metadata_columns());
@@ -134,6 +140,7 @@ fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
 ///
 /// Returns Err if the table metadata does not declare v3 row-lineage; A1
 /// requires v3 row-lineage to compute the apply key.
+#[cfg(test)]
 pub(crate) fn build_iceberg_table_def_for_delta_scan(
     catalog_name: &str,
     namespace: &str,
@@ -172,6 +179,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_iceberg_schema_table_def_from_loaded(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
@@ -193,18 +201,21 @@ pub(crate) fn build_iceberg_schema_table_def_from_loaded(
     )
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IcebergTableDefMode {
     ScanBinding,
     SchemaOnly,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IcebergTableDefOptions {
     mode: IcebergTableDefMode,
     binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
 }
 
+#[cfg(test)]
 fn build_iceberg_table_def_with_data_files(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
@@ -228,6 +239,7 @@ fn build_iceberg_table_def_with_data_files(
     )
 }
 
+#[cfg(test)]
 fn build_iceberg_table_def_with_data_files_impl(
     entry: &IcebergCatalogEntry,
     catalog_name: &str,
@@ -250,33 +262,23 @@ fn build_iceberg_table_def_with_data_files_impl(
     let schema = iceberg_schema_def(loaded.table.metadata().current_schema());
     let iceberg_table_info =
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
-    let source = if entry.is_s3() {
-        let cloud_properties = entry.cloud_properties_map();
-        ScanSource::IcebergDataFiles {
-            table: iceberg_table_info.clone(),
-            files: data_files
-                .into_iter()
-                .map(data_file_with_stats_to_iceberg_data_file_info)
-                .collect(),
-            cloud_properties,
-            binding: options.binding,
+    let source = match options.binding {
+        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+            crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::Data {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                },
+            )
         }
-    } else if has_data_files {
-        // Local Iceberg tables can have multiple data files across snapshots.
-        // Keep the per-file lineage metadata by using the multi-file scan
-        // shape with empty cloud properties; file:// paths are handled by the
-        // local scan path and do not require object-store credentials.
-        ScanSource::IcebergDataFiles {
-            table: iceberg_table_info.clone(),
-            files: data_files
-                .into_iter()
-                .map(data_file_with_stats_to_iceberg_data_file_info)
-                .collect(),
-            cloud_properties: Default::default(),
-            binding: options.binding,
+        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+            crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
+                        iceberg_table_info.current_snapshot_id.unwrap_or_default(),
+                    ),
+                },
+            )
         }
-    } else {
-        empty_iceberg_scan_source(iceberg_table_info, options.binding)
     };
 
     let iceberg_row_lineage_metadata_columns = match options.mode {
@@ -320,6 +322,7 @@ fn build_iceberg_table_def_with_data_files_impl(
     })
 }
 
+#[cfg(test)]
 fn hide_novarocks_mv_internal_columns(
     metadata: &iceberg::spec::TableMetadata,
     columns: Vec<ColumnDef>,
@@ -337,6 +340,7 @@ fn hide_novarocks_mv_internal_columns(
     )
 }
 
+#[cfg(test)]
 fn hide_novarocks_mv_internal_columns_by_property(
     apply_key_column: Option<&str>,
     hidden_columns: Option<&str>,
@@ -530,6 +534,7 @@ fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef>
 /// Returns true when the table is Iceberg format-version=3 with
 /// `write.row-lineage=true`, meaning per-row `_row_id` and
 /// `_last_updated_sequence_number` metadata columns are available.
+#[cfg(test)]
 fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
     let v3 = matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3);
     let lineage = metadata
@@ -570,15 +575,26 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 /// ranges to read"; the runtime returns an empty result without ever
 /// touching the filesystem. This keeps empty Iceberg tables represented as
 /// catalog-owned scan sources instead of synthetic placeholder files.
+#[cfg(test)]
 fn empty_iceberg_scan_source(
-    table: IcebergTableInfo,
+    _table: IcebergTableInfo,
     binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
 ) -> ScanSource {
-    ScanSource::IcebergDataFiles {
-        table,
-        files: Vec::new(),
-        cloud_properties: Default::default(),
-        binding,
+    match binding {
+        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+            crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::Data {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                },
+            )
+        }
+        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+            crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+                    version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(0),
+                },
+            )
+        }
     }
 }
 
@@ -951,13 +967,6 @@ mod tests {
         .expect("schema-only table def");
 
         assert_row_lineage_metadata_columns(&table_def);
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected iceberg data-file scan source");
-        };
-        assert!(
-            files.is_empty(),
-            "schema-only registration must not carry scan-binding files"
-        );
     }
 
     #[test]
@@ -986,13 +995,6 @@ mod tests {
         .expect("schema-only table def");
 
         assert_row_lineage_metadata_columns(&table_def);
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected iceberg data-file scan source");
-        };
-        assert!(
-            files.is_empty(),
-            "schema-only registration must not carry scan-binding files"
-        );
     }
 
     #[test]
@@ -1062,13 +1064,6 @@ mod tests {
                 .expect("schema-only table def through connector metadata adapter");
 
         assert_row_lineage_metadata_columns(&table_def);
-        let ScanSource::IcebergDataFiles { files, .. } = &table_def.source else {
-            panic!("expected iceberg data-file scan source");
-        };
-        assert!(
-            files.is_empty(),
-            "schema-only table source must not bind snapshot data files"
-        );
     }
 
     #[test]
