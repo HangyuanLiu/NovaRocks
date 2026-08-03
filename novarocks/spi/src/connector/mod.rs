@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod cleanup_maintenance;
 mod context;
 mod control;
 mod data_mutation;
@@ -37,6 +38,17 @@ mod write;
 
 pub mod conformance;
 
+pub use cleanup_maintenance::{
+    BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
+    CandidatePage, ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
+    ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceLease,
+    ConnectorCleanupMaintenanceResolver, ConnectorCleanupOperation, ConnectorCleanupOperationId,
+    ConnectorCleanupPlan, ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest,
+    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest,
+    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
+    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
+    MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES, PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+};
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
     ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
