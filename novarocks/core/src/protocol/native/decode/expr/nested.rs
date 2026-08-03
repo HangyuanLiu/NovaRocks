@@ -21,8 +21,8 @@ use arrow::datatypes::DataType;
 
 use super::{decode_expr_at, decode_expr_type_at};
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 
 use super::super::layout::Layout;
 
@@ -59,8 +59,8 @@ pub(super) fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{lower_err_with_slots, scalar_expr, string_lit};
-    use crate::proto::expr;
     use arrow::datatypes::DataType;
+    use novarocks_protocol::expr;
 
     #[test]
     fn nested_requires_outer_and_inner_type_match() {

@@ -19,8 +19,8 @@ use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::filter::FilterNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_filter_node(
     node: &plan::DistributedNode,

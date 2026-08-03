@@ -128,17 +128,6 @@ impl ConnectorBindingInstallObserver for NoopConnectorBindingInstallObserver {
     }
 }
 
-/// Build the production gRPC control adapter for an immutable backend
-/// snapshot.  It shares the native fragment dispatch endpoints but does not
-/// share fragment payloads or fallback registries.
-pub fn new_grpc_connector_binding_dispatcher(
-    backends: &[(usize, SocketAddr)],
-) -> Result<Arc<dyn ConnectorBindingDispatcher>, String> {
-    Ok(Arc::new(
-        crate::service::grpc_fragment_dispatcher::GrpcConnectorBindingControl::new(backends)?,
-    ))
-}
-
 /// Linear evidence that the connector install barrier completed.  Connector
 /// instances are process-scoped and deliberately remain installed after one
 /// query; consuming this lease only records terminal query ownership.

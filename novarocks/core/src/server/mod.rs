@@ -101,23 +101,6 @@ pub struct StandaloneServerOptions {
     pub mysql_port: Option<u16>,
 }
 
-/// Ownership of the standalone coordinator gRPC endpoint.
-///
-/// The SQL/frontend process may host the report-only endpoint itself, or may
-/// use an endpoint already hosted by a backend application in an all-in-one
-/// composition. Full fragment execution is never a frontend responsibility.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StandaloneGrpcEndpointOwnership {
-    HostedReportOnly,
-    ExternallyHosted,
-}
-
-impl StandaloneGrpcEndpointOwnership {
-    const fn hosts_report_endpoint(self) -> bool {
-        matches!(self, Self::HostedReportOnly)
-    }
-}
-
 struct ResolvedStandaloneServerOptions {
     config_path: Option<PathBuf>,
     mysql_port: u16,
@@ -125,42 +108,6 @@ struct ResolvedStandaloneServerOptions {
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
-    /// Whether the frontend owns the report-only gRPC endpoint or expects an
-    /// externally-hosted endpoint from its composition root.
-    grpc_endpoint: StandaloneGrpcEndpointOwnership,
-    /// Host to bind the standalone NovaRocksGrpc report/exchange endpoint on.
-    grpc_bind_host: String,
-    /// Port to bind the standalone NovaRocksGrpc report/exchange endpoint on.
-    /// This is resolved from the same config snapshot as the rest of the
-    /// server options and never re-read through process-global config.
-    grpc_port: u16,
-}
-
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TestResolvedServerOptions {
-    pub(crate) grpc_endpoint: StandaloneGrpcEndpointOwnership,
-    pub(crate) grpc_bind_host: String,
-    pub(crate) grpc_port: u16,
-}
-
-#[cfg(test)]
-pub(crate) fn test_resolve_fe_server_options(
-    cfg: NovaRocksConfig,
-    port_override: Option<u16>,
-) -> Result<TestResolvedServerOptions, String> {
-    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
-    let resolved = ResolvedStandaloneServerOptions {
-        config_path: None,
-        preloaded_config: Some(cfg),
-        grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
-        ..resolved
-    };
-    Ok(TestResolvedServerOptions {
-        grpc_endpoint: resolved.grpc_endpoint,
-        grpc_bind_host: resolved.grpc_bind_host,
-        grpc_port: resolved.grpc_port,
-    })
 }
 
 /// Run a standalone server whose authenticated SQL sessions are supplied by
@@ -170,7 +117,6 @@ pub async fn run_standalone_server_with_config_until_shutdown_with_session_facto
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
     port_override: Option<u16>,
-    grpc_endpoint: StandaloneGrpcEndpointOwnership,
     services: StandaloneOpenServices,
     session_factory_builder: B,
     shutdown: F,
@@ -183,7 +129,6 @@ where
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
         preloaded_config: Some(cfg),
-        grpc_endpoint,
         ..resolved
     };
     run_with_resolved_options_until_shutdown_with_session_factory(
@@ -197,7 +142,7 @@ where
 
 async fn run_with_resolved_options_until_shutdown_with_session_factory<F, B>(
     resolved: ResolvedStandaloneServerOptions,
-    mut services: StandaloneOpenServices,
+    services: StandaloneOpenServices,
     session_factory_builder: B,
     shutdown: F,
 ) -> Result<(), String>
@@ -205,23 +150,12 @@ where
     F: Future<Output = ()> + Send,
     B: FnOnce(StandaloneNovaRocks) -> Result<Arc<dyn QuerySessionFactory>, String> + Send,
 {
-    let terminal_ingress = services.terminal_ingress.clone();
-    let grpc_endpoint = start_standalone_grpc_endpoint(
-        &resolved.grpc_bind_host,
-        resolved.grpc_port,
-        resolved.grpc_endpoint,
-        terminal_ingress,
-    )?;
-    let report_port = grpc_endpoint
-        .as_ref()
-        .map(StartedStandaloneGrpcEndpoint::bound_port)
-        .unwrap_or(resolved.grpc_port);
-    if resolved.grpc_endpoint == StandaloneGrpcEndpointOwnership::ExternallyHosted {
-        let endpoint = local_exchange_backend_endpoint(&resolved.grpc_bind_host, report_port)?;
-        services.backend_topology.add_backend(endpoint)?;
-        wait_for_local_exchange_backend(services.backend_topology.as_ref(), endpoint).await?;
+    let report_port = services.exchange_port;
+    if report_port == 0 {
+        return Err(
+            "standalone MySQL runner requires a role-owned nonzero report endpoint".to_string(),
+        );
     }
-    services.exchange_port = report_port;
     let opts = StandaloneOptions {
         config_path: resolved.config_path.clone(),
     };
@@ -232,12 +166,7 @@ where
     engine.publish_coordinator_report_bound_port(report_port);
     let session_factory = match session_factory_builder(engine.clone()) {
         Ok(factory) => factory,
-        Err(error) => {
-            if let Some(endpoint) = grpc_endpoint {
-                let _ = endpoint.stop();
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
 
     let server = async move {
@@ -264,19 +193,7 @@ where
         .await
     };
 
-    let server_result = server.await;
-    let grpc_stop_result = match grpc_endpoint {
-        Some(endpoint) => endpoint.stop(),
-        None => Ok(()),
-    };
-    match (server_result, grpc_stop_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(server_error), Ok(())) => Err(server_error),
-        (Ok(()), Err(stop_error)) => Err(stop_error),
-        (Err(server_error), Err(stop_error)) => Err(format!(
-            "{server_error}; standalone gRPC endpoint shutdown failed: {stop_error}"
-        )),
-    }
+    server.await
 }
 
 fn resolve_server_options(
@@ -285,23 +202,12 @@ fn resolve_server_options(
     let active_config_path = resolve_active_config_path(opts.config_path.as_deref());
     let file_cfg = load_active_config(active_config_path.as_deref())?;
     let standalone = file_cfg.as_ref().and_then(|c| c.standalone_server.as_ref());
-    let grpc_bind_host = file_cfg
-        .as_ref()
-        .map(|cfg| cfg.server.host.clone())
-        .unwrap_or_else(|| NovaRocksConfig::default().server.host);
-    let grpc_port = file_cfg
-        .as_ref()
-        .map(|cfg| cfg.server.grpc_port)
-        .unwrap_or_else(|| NovaRocksConfig::default().server.grpc_port);
     let (mysql_port, user) = extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
         preloaded_config: None,
-        grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
-        grpc_bind_host,
-        grpc_port,
     })
 }
 
@@ -352,9 +258,6 @@ fn resolve_server_options_from_config(
         mysql_port,
         user,
         preloaded_config: None,
-        grpc_endpoint: StandaloneGrpcEndpointOwnership::HostedReportOnly,
-        grpc_bind_host: cfg.server.host.clone(),
-        grpc_port: cfg.server.grpc_port,
     })
 }
 
@@ -364,113 +267,6 @@ fn load_active_config(path: Option<&Path>) -> Result<Option<NovaRocksConfig>, St
             .map(Some)
             .map_err(|e| format!("load config {} failed: {e}", path.display())),
         _ => Ok(None),
-    }
-}
-
-fn start_standalone_grpc_endpoint(
-    grpc_bind_host: &str,
-    grpc_port: u16,
-    ownership: StandaloneGrpcEndpointOwnership,
-    terminal_ingress: Option<Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>>,
-) -> Result<Option<StartedStandaloneGrpcEndpoint>, String> {
-    if !ownership.hosts_report_endpoint() {
-        return Ok(None);
-    }
-
-    let terminal_ingress = terminal_ingress.ok_or_else(|| {
-        "standalone coordinator grpc endpoint requires terminal fallback ingress".to_string()
-    })?;
-    crate::service::grpc_server::start_grpc_terminal_server(
-        grpc_bind_host,
-        grpc_port,
-        terminal_ingress,
-    )
-    .map_err(|error| {
-        format!(
-            "failed to start required standalone coordinator grpc terminal endpoint on {}:{}: {}",
-            grpc_bind_host, grpc_port, error
-        )
-    })?;
-    info!(
-        "standalone coordinator grpc terminal endpoint started on {}:{}",
-        grpc_bind_host, grpc_port
-    );
-    let bound_port = crate::service::grpc_server::grpc_server_bound_port()?;
-    Ok(Some(
-        StartedStandaloneGrpcEndpoint::new().with_bound_port(bound_port),
-    ))
-}
-
-struct StartedStandaloneGrpcEndpoint {
-    bound_port: u16,
-    stop_on_drop: bool,
-}
-
-impl StartedStandaloneGrpcEndpoint {
-    fn new() -> Self {
-        Self {
-            bound_port: 0,
-            stop_on_drop: true,
-        }
-    }
-
-    fn with_bound_port(mut self, bound_port: u16) -> Self {
-        self.bound_port = bound_port;
-        self
-    }
-
-    const fn bound_port(&self) -> u16 {
-        self.bound_port
-    }
-
-    fn stop(mut self) -> Result<(), String> {
-        self.stop_on_drop = false;
-        crate::service::grpc_server::stop_grpc_server()
-    }
-}
-
-impl Drop for StartedStandaloneGrpcEndpoint {
-    fn drop(&mut self) {
-        if self.stop_on_drop {
-            let _ = crate::service::grpc_server::stop_grpc_server();
-        }
-    }
-}
-
-fn local_exchange_backend_endpoint(bind_host: &str, port: u16) -> Result<SocketAddr, String> {
-    let bound_ip = bind_host
-        .parse::<IpAddr>()
-        .map_err(|error| format!("parse local exchange bind host '{bind_host}' failed: {error}"))?;
-    let advertised_ip = match bound_ip {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    Ok(SocketAddr::new(advertised_ip, port))
-}
-
-async fn wait_for_local_exchange_backend(
-    topology: &dyn crate::query_execution::backend::BackendTopologyPort,
-    endpoint: SocketAddr,
-) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if topology
-            .snapshot()
-            .map_err(|error| error.to_string())?
-            .targets()
-            .iter()
-            .copied()
-            .any(|backend| backend.endpoint() == endpoint)
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "local exchange backend {endpoint} did not become Live before startup timeout"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -490,17 +286,6 @@ fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
         bind_addr.port(),
         std::process::id()
     );
-}
-
-async fn await_server_with_coordinator_handles<C, F>(
-    coordinator_handles: C,
-    server: F,
-) -> Result<(), String>
-where
-    F: Future<Output = Result<(), String>>,
-{
-    let _coordinator_handles = coordinator_handles;
-    server.await
 }
 
 async fn serve_until_shutdown<F, H, HFut, R>(
@@ -2556,35 +2341,6 @@ mod legacy {
                 assert!(err.contains("bind standalone mysql server"), "{err}");
                 assert!(!ready_emitted.load(Ordering::SeqCst));
             }
-
-            #[tokio::test]
-            async fn serve_error_still_drops_coordinator_handles() {
-                let occupied = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                    .await
-                    .expect("reserve test address");
-                let addr = occupied.local_addr().expect("reserved address");
-                let refresh_dropped = Arc::new(AtomicBool::new(false));
-                let maintenance_dropped = Arc::new(AtomicBool::new(false));
-
-                let err = await_server_with_coordinator_handles(
-                    (
-                        DropProbe(Arc::clone(&refresh_dropped)),
-                        DropProbe(Arc::clone(&maintenance_dropped)),
-                    ),
-                    serve_until_shutdown(
-                        addr,
-                        pending::<()>(),
-                        |_stream, _peer_addr| async move {},
-                        |_addr| {},
-                    ),
-                )
-                .await
-                .expect_err("occupied address should fail to bind");
-
-                assert!(err.contains("bind standalone mysql server"), "{err}");
-                assert!(refresh_dropped.load(Ordering::SeqCst));
-                assert!(maintenance_dropped.load(Ordering::SeqCst));
-            }
         }
 
         #[test]
@@ -3216,32 +2972,6 @@ mod legacy {
                 resolved.mysql_port, DEFAULT_MYSQL_PORT,
                 "default port when no [standalone_server] section"
             );
-        }
-
-        #[test]
-        fn role_fe_server_options_host_a_report_only_endpoint() {
-            let mut cfg = NovaRocksConfig::default();
-            cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
-            cfg.cluster.backends = vec!["127.0.0.1:19070".to_string()];
-
-            let opts = test_resolve_fe_server_options(cfg, None).expect("resolve role=fe options");
-            assert_eq!(
-                opts.grpc_endpoint,
-                StandaloneGrpcEndpointOwnership::HostedReportOnly
-            );
-        }
-
-        #[test]
-        fn role_fe_server_options_use_configured_grpc_bind_host() {
-            let mut cfg = NovaRocksConfig::default();
-            cfg.server.host = "0.0.0.0".to_string();
-            cfg.server.grpc_port = 23456;
-            cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
-            cfg.cluster.backends = vec!["127.0.0.1:19070".to_string()];
-
-            let opts = test_resolve_fe_server_options(cfg, None).expect("resolve role=fe options");
-            assert_eq!(opts.grpc_bind_host, "0.0.0.0");
-            assert_eq!(opts.grpc_port, 23456);
         }
 
         #[test]

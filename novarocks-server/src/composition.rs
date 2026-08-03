@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
-use novarocks_frontend::{FrontendGrpcEndpointOwnership, FrontendServerConfig};
+use novarocks_frontend::FrontendServerConfig;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -62,7 +63,6 @@ where
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
-        grpc_endpoint: FrontendGrpcEndpointOwnership::ExternallyHosted,
     };
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
@@ -82,8 +82,15 @@ where
             ));
         }
     };
+    let endpoint = backend.connectable_native_endpoint();
     let dml = frontend.dml_service();
-    let services = novarocks_frontend::standalone_open_services_for_server(&frontend);
+    let mut services = novarocks_frontend::standalone_open_services_for_server(&frontend);
+    services
+        .backend_topology
+        .add_backend(endpoint)
+        .map_err(|error| anyhow::anyhow!("register all-in-one backend {endpoint}: {error}"))?;
+    wait_for_live_backend(services.backend_topology.as_ref(), endpoint).await?;
+    services.exchange_port = endpoint.port();
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let query_control = services.query_control.clone();
@@ -95,7 +102,6 @@ where
             config,
             config_path,
             port_override,
-            novarocks::server::StandaloneGrpcEndpointOwnership::ExternallyHosted,
             services,
             move |engine| {
                 let insert_engine = engine.insert_engine();
@@ -155,6 +161,31 @@ where
     let frontend_cleanup = frontend.shutdown().await.map_err(|error| error.to_string());
     combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, frontend_cleanup)
         .map_err(anyhow::Error::msg)
+}
+
+async fn wait_for_live_backend(
+    topology: &dyn BackendTopologyPort,
+    endpoint: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if topology
+            .snapshot()
+            .map_err(|error| anyhow::anyhow!("read all-in-one backend topology: {error}"))?
+            .targets()
+            .iter()
+            .copied()
+            .any(|backend| backend.endpoint() == endpoint)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "all-in-one backend {endpoint} did not become Live before startup timeout"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn combine_primary_and_cleanup(

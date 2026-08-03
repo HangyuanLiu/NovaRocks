@@ -26,8 +26,8 @@ use novarocks::exec::chunk::ChunkSchema;
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_nest_loop_join_node(
     node: &plan::DistributedNode,

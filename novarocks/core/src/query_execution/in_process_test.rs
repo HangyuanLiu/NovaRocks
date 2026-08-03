@@ -43,7 +43,6 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
     DistributedQueryRequest, QueryId,
 };
-use crate::query_execution::fragment_transport::FetchedQueryBatch;
 use crate::query_execution::lifecycle::{AttemptId, FragmentTerminalSnapshot, QueryExecutionId};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::write::WriteTerminalBuilder;
@@ -75,7 +74,7 @@ pub(crate) fn bind_empty_runtime_filter_tables_for_test(
                     "in-process native test execution does not support runtime-filter bindings",
                 ));
             }
-            Ok(crate::proto::plan::RuntimeFilterBindingTable {
+            Ok(novarocks_protocol::plan::RuntimeFilterBindingTable {
                 fragment_id: fragment.fragment_id(),
                 bindings: Vec::new(),
             })
@@ -299,18 +298,13 @@ pub(crate) fn execute(
             match wait_fetch_typed(artifact.root_fetch.fragment_instance_id(), 100) {
                 TryFetchTypedResult::Ready(result) if result.eos => break,
                 TryFetchTypedResult::Ready(result) => {
-                    let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
-                        &result.payload,
-                        Some(artifact.expected_output.fetch_view().chunk_schema()),
-                    )
-                    .map_err(failed)?;
-                    if chunks.len() != 1 {
-                        return Err(failed(format!(
-                            "in-process result batch decoded {} chunks, expected one",
-                            chunks.len()
-                        )));
-                    }
-                    batches.push(FetchedQueryBatch::new(chunks.remove(0)));
+                    let batch =
+                        crate::query_execution::fragment_transport::decode_fetched_query_batch(
+                            &result.payload,
+                            Some(artifact.expected_output.fetch_view()),
+                        )
+                        .map_err(failed)?;
+                    batches.push(batch);
                 }
                 TryFetchTypedResult::NotReady => continue,
                 TryFetchTypedResult::Error(error) => return Err(failed(error.message)),

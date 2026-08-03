@@ -22,8 +22,8 @@ use arrow::datatypes::DataType;
 use super::{decode_expr_at, lower_expr_list};
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::expr;
 
 use super::super::layout::Layout;
 
@@ -158,8 +158,8 @@ mod tests {
         int_lit, lower, lower_err_with_slots, null_lit, scalar_expr, string_lit,
     };
     use crate::exec::expr::{ExprNode, LiteralValue, function::FunctionKind};
-    use crate::proto::{common, expr};
     use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_protocol::{common, expr};
     use std::sync::Arc;
 
     #[test]

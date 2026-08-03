@@ -21,11 +21,11 @@ use std::collections::HashMap;
 
 use crate::common::types::UniqueId;
 use crate::exec::spill::{SpillConfig, SpillMode};
-use crate::proto::{common, novarocks};
 use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::scan_range;
+use novarocks_protocol::{common, novarocks};
 
 pub(crate) fn encode_instance_params(
     query_id: &UniqueId,

@@ -20,9 +20,9 @@
 use super::{decode_type, lower_required_child};
 use crate::common::ids::SlotId;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::proto::expr;
 use crate::protocol::common::error::FieldPath;
 use arrow::datatypes::DataType;
+use novarocks_protocol::expr;
 
 use super::super::layout::Layout;
 
@@ -82,8 +82,8 @@ mod tests {
     use super::super::tests::{col, lower, lower_with_slots, scalar_expr, type_desc};
     use crate::common::ids::SlotId;
     use crate::exec::expr::{ExprNode, function::FunctionKind};
-    use crate::proto::expr;
     use arrow::datatypes::{DataType, Field};
+    use novarocks_protocol::expr;
     use std::sync::Arc;
 
     #[test]

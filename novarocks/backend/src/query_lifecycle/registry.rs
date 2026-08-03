@@ -45,6 +45,7 @@ use novarocks_types::UniqueId;
 use prost::Message;
 
 use super::entry::{QueryLifecycleEntry, QueryLifecyclePhase};
+use crate::native::client::NativeGrpcClient;
 use crate::native::runtime_filter_install::decode_runtime_filter_contribution;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
@@ -331,16 +332,16 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
         snapshot: QueryTerminalSnapshot,
         timeout: Duration,
     ) -> Result<QueryTerminalReportAck, QueryLifecycleTransportError> {
-        let client = novarocks::service::grpc_client::NovaRocksGrpcRemoteClient::new_host_port(
-            endpoint.host().to_string(),
-            endpoint.port(),
-        )
-        .map_err(|error| {
-            QueryLifecycleTransportError::new(QueryLifecycleTransportErrorKind::Unavailable, error)
-        })?;
+        let client = NativeGrpcClient::new_host_port(endpoint.host().to_string(), endpoint.port())
+            .map_err(|error| {
+                QueryLifecycleTransportError::new(
+                    QueryLifecycleTransportErrorKind::Unavailable,
+                    error,
+                )
+            })?;
         let response = client
             .blocking_report_query_terminal_with_timeout(
-                novarocks::proto::novarocks::ReportQueryTerminalRequest {
+                novarocks_protocol::novarocks::ReportQueryTerminalRequest {
                     snapshot: Some(
                         novarocks::query_execution::lifecycle::encode_query_terminal_snapshot(
                             &snapshot,
@@ -355,22 +356,21 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
                     error,
                 )
             })?;
-        let outcome = match novarocks::proto::novarocks::ReportQueryTerminalOutcome::try_from(
+        let outcome = match novarocks_protocol::novarocks::ReportQueryTerminalOutcome::try_from(
             response.outcome,
         ) {
-            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Accepted) => {
+            Ok(novarocks_protocol::novarocks::ReportQueryTerminalOutcome::Accepted) => {
                 QueryTerminalReportOutcome::Accepted
             }
-            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted) => {
+            Ok(novarocks_protocol::novarocks::ReportQueryTerminalOutcome::AlreadyAccepted) => {
                 QueryTerminalReportOutcome::AlreadyAccepted
             }
-            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedConflict) => {
+            Ok(novarocks_protocol::novarocks::ReportQueryTerminalOutcome::RejectedConflict) => {
                 QueryTerminalReportOutcome::RejectedConflict
             }
-            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::RejectedGone) | Err(_) => {
-                QueryTerminalReportOutcome::RejectedGone
-            }
-            Ok(novarocks::proto::novarocks::ReportQueryTerminalOutcome::Unspecified) => {
+            Ok(novarocks_protocol::novarocks::ReportQueryTerminalOutcome::RejectedGone)
+            | Err(_) => QueryTerminalReportOutcome::RejectedGone,
+            Ok(novarocks_protocol::novarocks::ReportQueryTerminalOutcome::Unspecified) => {
                 QueryTerminalReportOutcome::RejectedGone
             }
         };

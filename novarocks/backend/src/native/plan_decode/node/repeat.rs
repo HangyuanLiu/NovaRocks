@@ -27,8 +27,8 @@ use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks::exec::node::repeat::RepeatNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::plan;
 
 pub(super) fn lower_repeat_node(
     node: &plan::DistributedNode,

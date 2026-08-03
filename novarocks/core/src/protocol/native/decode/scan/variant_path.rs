@@ -22,9 +22,9 @@ use arrow::datatypes::{DataType, Field};
 use super::common::{column_def_data_type, output_column_data_type};
 use crate::common::ids::SlotId;
 use crate::formats::parquet::VariantPathSpec;
-use crate::proto::{common, plan};
 use crate::protocol::common::error::ProtocolErrorKind;
 use crate::protocol::native::decode::error::NativeFragmentLeafDecodeError;
+use novarocks_protocol::{common, plan};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct NativeVariantPathPlan {

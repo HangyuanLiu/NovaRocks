@@ -14,26 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod cluster_heartbeat;
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) mod connector_binding;
 pub mod fragment_control;
-pub mod grpc_client;
-pub(crate) mod grpc_fragment_dispatcher;
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub(crate) mod grpc_query_lifecycle_adapter;
-pub mod grpc_query_lifecycle_client;
-pub mod grpc_server;
 pub mod internal_rpc;
 pub(crate) mod metrics_http;
 pub mod native_data_plane;
 pub use metrics_http::{
-    MetricsHttpServer, publish_backend_query_execution_resource,
-    publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,
-    publish_frontend_query_lifecycle_metrics, render_metrics, render_metrics_json,
+    MetricsHttpServer, handle_metrics, observe_backend_heartbeat_rtt,
+    publish_backend_query_execution_resource, publish_backend_query_lifecycle_metrics,
+    publish_backend_query_lifecycle_terminal_limits, publish_frontend_query_lifecycle_metrics,
+    render_metrics, render_metrics_json,
 };
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub mod native_fragment_ingress;
-#[cfg(test)]
-pub(crate) mod native_fragment_service_test_fixture;
 pub(crate) mod result_batch_wire;

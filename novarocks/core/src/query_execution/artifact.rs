@@ -30,7 +30,6 @@ use sha2::{Digest, Sha256};
 use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::proto::plan::RuntimeFilterBindingTable;
 use crate::protocol::native::encode::NativeFragmentBundle;
 use crate::query_execution::backend::LiveBackendTarget;
 use crate::query_execution::contract::{
@@ -58,12 +57,12 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::{
     FragmentEdgeKind, FragmentId as PlannerFragmentId, FragmentStreamKind, PartitionKind,
 };
+use novarocks_protocol::plan::RuntimeFilterBindingTable;
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
     ConnectorBindingInstallLease, ConnectorBindingInstallObserver, ConnectorBindingInstallPlan,
     DispatchingConnectorBindingBarrier, NoopConnectorBindingInstallObserver,
-    new_grpc_connector_binding_dispatcher,
 };
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
@@ -144,7 +143,7 @@ pub struct RuntimeFilterBindingAttachment {
 /// validated schedule. Core validates only artifact/topology membership.
 pub struct RuntimeFilterDeploymentAttachment {
     artifact_id: RuntimeFilterArtifactId,
-    contributions: BTreeMap<usize, crate::proto::novarocks::RuntimeFilterContribution>,
+    contributions: BTreeMap<usize, novarocks_protocol::novarocks::RuntimeFilterContribution>,
 }
 
 impl RuntimeFilterBindingAttachment {
@@ -354,7 +353,10 @@ impl ScheduleBoundDistributedQuery {
     pub fn seal_runtime_filter_deployment(
         &self,
         contributions: impl IntoIterator<
-            Item = (usize, crate::proto::novarocks::RuntimeFilterContribution),
+            Item = (
+                usize,
+                novarocks_protocol::novarocks::RuntimeFilterContribution,
+            ),
         >,
     ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
         self.runtime_filter_scheduled_view().seal(contributions)
@@ -524,8 +526,8 @@ impl<'a> RuntimeFilterScheduledView<'a> {
         self.execution_id
     }
 
-    pub fn query_id_wire(self) -> crate::proto::common::UniqueId {
-        crate::proto::common::UniqueId {
+    pub fn query_id_wire(self) -> novarocks_protocol::common::UniqueId {
+        novarocks_protocol::common::UniqueId {
             hi: self.execution_id.query_id().high(),
             lo: self.execution_id.query_id().low(),
         }
@@ -565,7 +567,10 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     pub fn seal(
         self,
         contributions: impl IntoIterator<
-            Item = (usize, crate::proto::novarocks::RuntimeFilterContribution),
+            Item = (
+                usize,
+                novarocks_protocol::novarocks::RuntimeFilterContribution,
+            ),
         >,
     ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
         let mut by_backend = BTreeMap::new();
@@ -628,7 +633,7 @@ pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     schedule: ValidatedFragmentSchedule,
     connector_write_plan: Option<ConnectorWritePlanAttachment>,
     runtime_filter_contributions:
-        BTreeMap<usize, crate::proto::novarocks::RuntimeFilterContribution>,
+        BTreeMap<usize, novarocks_protocol::novarocks::RuntimeFilterContribution>,
 }
 
 impl RuntimeFilterDeploymentReadyDistributedQuery {
@@ -1447,8 +1452,8 @@ pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
     execution_id: QueryExecutionId,
-    plan: crate::proto::plan::PlanFragment,
-    instance_params: crate::proto::novarocks::InstanceParams,
+    plan: novarocks_protocol::plan::PlanFragment,
+    instance_params: novarocks_protocol::novarocks::InstanceParams,
 }
 
 impl ValidatedNativeSubmission {
@@ -1603,8 +1608,8 @@ struct AssembledNativeExecution {
 
 #[cfg(test)]
 pub(crate) struct InProcessTestSubmission {
-    pub(crate) plan: crate::proto::plan::PlanFragment,
-    pub(crate) instance_params: crate::proto::novarocks::InstanceParams,
+    pub(crate) plan: novarocks_protocol::plan::PlanFragment,
+    pub(crate) instance_params: novarocks_protocol::novarocks::InstanceParams,
 }
 
 #[cfg(test)]
@@ -1833,7 +1838,7 @@ fn assemble_native_execution(
         Vec<(
             FragmentId,
             i32,
-            crate::proto::plan::DataPartition,
+            novarocks_protocol::plan::DataPartition,
             Vec<i32>,
             Vec<ColumnId>,
         )>,
@@ -1867,8 +1872,8 @@ fn assemble_native_execution(
                 consumers.push((
                     fragment.fragment_id(),
                     *exchange_node_id,
-                    crate::proto::plan::DataPartition {
-                        kind: crate::proto::plan::PartitionKind::Unpartitioned as i32,
+                    novarocks_protocol::plan::DataPartition {
+                        kind: novarocks_protocol::plan::PartitionKind::Unpartitioned as i32,
                         exprs: Vec::new(),
                     },
                     Vec::new(),

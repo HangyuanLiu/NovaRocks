@@ -32,8 +32,8 @@ use crate::exec::node::analytic::{
 };
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{expr, plan};
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_window_node(
     node: &plan::DistributedNode,
@@ -824,8 +824,8 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

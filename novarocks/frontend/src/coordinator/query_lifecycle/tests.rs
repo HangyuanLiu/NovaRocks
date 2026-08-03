@@ -16,14 +16,22 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::native::transport::new_query_lifecycle_transport;
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use novarocks::query_execution::contract::DistributedQueryIntent;
 use novarocks::query_execution::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
+};
+use novarocks::query_execution::lifecycle::contract::{
+    decode_abort_query_request, decode_query_control_attach, decode_query_control_command,
+    decode_query_init_request, decode_query_stage_request, decode_query_start_request,
+    encode_abort_query_response, encode_query_control_event, encode_query_init_response,
+    encode_query_stage_response, encode_query_start_response,
 };
 use novarocks::query_execution::lifecycle::{
     AttemptId, BackendQueryControl, FragmentLiveObservation, ParticipantBackendIdentity,
@@ -35,13 +43,11 @@ use novarocks::query_execution::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks::runtime::query_options::QueryOptions;
-use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
-use novarocks::service::grpc_server::GrpcService;
-use novarocks::service::native_fragment_ingress::{
-    NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
-};
+use novarocks_protocol::{filter, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 use super::barrier::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, PreReadyAttemptGuard,
@@ -1834,7 +1840,7 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
         .expect("live plan");
     let (registry, _query) = registry_for(&plan);
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     let live_config = FrontendQueryLifecycleConfig::new(
         Duration::from_millis(100),
         Duration::from_millis(300),
@@ -1902,7 +1908,7 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
     let execution_id = request.manifest().execution_id();
     let digest = request.digest();
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -1959,7 +1965,7 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     let execution_id = request.manifest().execution_id();
     let digest = request.digest();
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2029,7 +2035,7 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
     let execution_id = request.manifest().execution_id();
     let digest = request.digest();
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2126,7 +2132,7 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
     let execution_id = request.manifest().execution_id();
     let digest = request.digest();
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
     transport
         .init_query(target, request, Duration::from_secs(2))
         .expect("InitQuery");
@@ -2170,7 +2176,7 @@ async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_defin
     let target = QueryLifecycleTarget::new(7, endpoint, 92);
     let request = live_init_request(backend, 806);
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
 
     let error = transport
         .init_query(target, request, Duration::ZERO)
@@ -2189,7 +2195,7 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     let backend = LiveBackendTarget::new(7, endpoint, 93);
     let target = QueryLifecycleTarget::new(7, endpoint, 93);
     let transport =
-        new_grpc_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
+        new_query_lifecycle_transport(&[backend]).expect("production lifecycle transport");
 
     transport
         .init_query(
@@ -2236,6 +2242,192 @@ fn live_init_request(backend: LiveBackendTarget, finst_high: i64) -> QueryInitRe
     )
 }
 
+/// Test-only BE-shaped wire peer implemented with Frontend's generated stub.
+/// It exercises the same client codec, paths, and bidirectional lifecycle
+/// framing without recovering Core's former generic gRPC service.
+struct FrontendLifecycleWireService {
+    ingress: Arc<dyn QueryLifecycleIngress>,
+}
+
+type EmptyExchangeStream =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, Status>> + Send>>;
+type LifecycleResponseStream = ReceiverStream<Result<proto::QueryControlResponse, Status>>;
+
+impl FrontendLifecycleWireService {
+    fn rejected(rpc: &str) -> Status {
+        Status::failed_precondition(format!("lifecycle wire test peer rejects {rpc}"))
+    }
+
+    fn status(error: QueryLifecycleError) -> Status {
+        match error.code() {
+            QueryLifecycleErrorCode::InvalidManifest => Status::invalid_argument(error.detail()),
+            QueryLifecycleErrorCode::Conflict => Status::already_exists(error.detail()),
+            QueryLifecycleErrorCode::StaleBackend | QueryLifecycleErrorCode::Terminated => {
+                Status::failed_precondition(error.detail())
+            }
+            QueryLifecycleErrorCode::Capacity => Status::resource_exhausted(error.detail()),
+            QueryLifecycleErrorCode::Transport => Status::unavailable(error.detail()),
+            QueryLifecycleErrorCode::Internal => Status::internal(error.detail()),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
+    for FrontendLifecycleWireService
+{
+    type ExchangeStream = EmptyExchangeStream;
+    type QueryControlStreamStream = LifecycleResponseStream;
+
+    async fn exchange(
+        &self,
+        _request: Request<tonic::Streaming<proto::ExchangeRequest>>,
+    ) -> Result<Response<Self::ExchangeStream>, Status> {
+        Err(Self::rejected("Exchange"))
+    }
+
+    async fn exchange_unary(
+        &self,
+        _request: Request<proto::ExchangeRequest>,
+    ) -> Result<Response<proto::ExchangeResponse>, Status> {
+        Err(Self::rejected("ExchangeUnary"))
+    }
+
+    async fn transmit_runtime_filter_envelope(
+        &self,
+        _request: Request<filter::RuntimeFilterEnvelope>,
+    ) -> Result<Response<filter::RuntimeFilterEnvelopeResponse>, Status> {
+        Err(Self::rejected("TransmitRuntimeFilterEnvelope"))
+    }
+
+    async fn lookup(
+        &self,
+        _request: Request<filter::LookupRequest>,
+    ) -> Result<Response<filter::LookupResponse>, Status> {
+        Err(Self::rejected("Lookup"))
+    }
+
+    async fn fetch_result(
+        &self,
+        _request: Request<proto::FetchResultRequest>,
+    ) -> Result<Response<proto::FetchResultResponse>, Status> {
+        Err(Self::rejected("FetchResult"))
+    }
+
+    async fn init_query(
+        &self,
+        request: Request<proto::InitQueryRequest>,
+    ) -> Result<Response<proto::InitQueryResponse>, Status> {
+        let request = decode_query_init_request(&request.into_inner()).map_err(Self::status)?;
+        Ok(Response::new(encode_query_init_response(
+            &self.ingress.init_query(request),
+        )))
+    }
+
+    async fn stage_fragments(
+        &self,
+        request: Request<proto::StageFragmentsRequest>,
+    ) -> Result<Response<proto::StageFragmentsResponse>, Status> {
+        let request = decode_query_stage_request(&request.into_inner()).map_err(Self::status)?;
+        Ok(Response::new(encode_query_stage_response(
+            &self.ingress.stage_fragments(request),
+        )))
+    }
+
+    async fn start_prepared_query(
+        &self,
+        request: Request<proto::StartPreparedQueryRequest>,
+    ) -> Result<Response<proto::StartPreparedQueryResponse>, Status> {
+        let request = decode_query_start_request(&request.into_inner()).map_err(Self::status)?;
+        Ok(Response::new(encode_query_start_response(
+            &self.ingress.start_prepared_query(request),
+        )))
+    }
+
+    async fn abort_query(
+        &self,
+        request: Request<proto::AbortQueryRequest>,
+    ) -> Result<Response<proto::AbortQueryResponse>, Status> {
+        let request = decode_abort_query_request(&request.into_inner()).map_err(Self::status)?;
+        let response = self.ingress.abort_query(request).map_err(Self::status)?;
+        Ok(Response::new(encode_abort_query_response(&response)))
+    }
+
+    async fn query_control_stream(
+        &self,
+        request: Request<tonic::Streaming<proto::QueryControlRequest>>,
+    ) -> Result<Response<Self::QueryControlStreamStream>, Status> {
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await
+            .map_err(|error| Status::invalid_argument(format!("read attach frame: {error}")))?
+            .ok_or_else(|| Status::failed_precondition("first frame must be Attach"))?;
+        let attach = decode_query_control_attach(&first).map_err(Self::status)?;
+        let attachment = self.ingress.attach_control(attach).map_err(Self::status)?;
+        let (outbound, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            let control = attachment.control;
+            let mut events = attachment.events;
+            loop {
+                tokio::select! {
+                    inbound_message = inbound.message() => {
+                        let request = match inbound_message {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break,
+                            Err(error) => { let _ = outbound.send(Err(Status::invalid_argument(format!("read query control command: {error}")))).await; break; }
+                        };
+                        let command = match decode_query_control_command(&request) {
+                            Ok(command) => command,
+                            Err(error) => { let _ = outbound.send(Err(Self::status(error))).await; break; }
+                        };
+                        let result = match command {
+                            QueryControlCommand::Heartbeat { sequence, .. } => control.heartbeat(sequence),
+                            QueryControlCommand::Abort { reason } => control.abort(reason),
+                            QueryControlCommand::Finalize => control.finalize(),
+                            QueryControlCommand::TerminalAck { ack } => control.terminal_ack(ack),
+                        };
+                        if let Err(error) = result { let _ = outbound.send(Err(Self::status(error))).await; break; }
+                    }
+                    event = events.recv() => match event {
+                        Some(event) if outbound.send(Ok(encode_query_control_event(&event))).await.is_ok() => {}
+                        _ => break,
+                    },
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn report_query_terminal(
+        &self,
+        _request: Request<proto::ReportQueryTerminalRequest>,
+    ) -> Result<Response<proto::ReportQueryTerminalResponse>, Status> {
+        Err(Self::rejected("ReportQueryTerminal"))
+    }
+
+    async fn ensure_connector_execution_binding(
+        &self,
+        _request: Request<proto::EnsureConnectorExecutionBindingRequest>,
+    ) -> Result<Response<proto::EnsureConnectorExecutionBindingResponse>, Status> {
+        Err(Self::rejected("EnsureConnectorExecutionBinding"))
+    }
+
+    async fn retire_connector_execution_binding(
+        &self,
+        _request: Request<proto::RetireConnectorExecutionBindingRequest>,
+    ) -> Result<Response<proto::RetireConnectorExecutionBindingResponse>, Status> {
+        Err(Self::rejected("RetireConnectorExecutionBinding"))
+    }
+
+    async fn heartbeat(
+        &self,
+        _request: Request<proto::HeartbeatRequest>,
+    ) -> Result<Response<proto::HeartbeatResponse>, Status> {
+        Err(Self::rejected("Heartbeat"))
+    }
+}
+
 async fn spawn_frontend_live_server(
     ingress: Arc<dyn QueryLifecycleIngress>,
 ) -> (
@@ -2251,14 +2443,12 @@ async fn spawn_frontend_live_server(
         let item = listener.accept().await.map(|(stream, _)| stream);
         Some((item, listener))
     });
-    let service = GrpcService::with_fragment_execution(Arc::new(RejectNativeFragments), ingress);
+    let service = FrontendLifecycleWireService { ingress };
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(
-                novarocks::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(
-                    service,
-                ),
+                crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpcServer::new(service),
             )
             .serve_with_incoming_shutdown(incoming, async {
                 let _ = shutdown_rx.await;
@@ -2464,15 +2654,4 @@ fn live_control_error(
     error: tokio::sync::mpsc::error::TrySendError<QueryControlEvent>,
 ) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error.to_string())
-}
-
-struct RejectNativeFragments;
-
-impl NativeFragmentIngress for RejectNativeFragments {
-    fn cancel(
-        &self,
-        _request: NativeFragmentCancelRequest,
-    ) -> Result<(), NativeFragmentIngressError> {
-        Ok(())
-    }
 }

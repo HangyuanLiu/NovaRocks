@@ -26,7 +26,7 @@ pub use common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFam
 /// validate their `InstanceParams` before passing the resulting execution value
 /// to the core assembly kernel.
 pub fn decode_native_query_options(
-    src: &crate::proto::novarocks::QueryOptions,
+    src: &novarocks_protocol::novarocks::QueryOptions,
 ) -> Result<crate::runtime::query_options::QueryOptions, ProtocolError> {
     native::query_options_contract::decode_query_options(src)
 }
@@ -36,7 +36,7 @@ pub fn decode_native_query_options(
 /// This is transport validation shared by connector-binding and query-lifecycle
 /// handlers; it deliberately does not expose fragment-program assembly.
 pub fn decode_native_query_execution_id(
-    execution_id: &crate::proto::novarocks::QueryExecutionId,
+    execution_id: &novarocks_protocol::novarocks::QueryExecutionId,
 ) -> Result<crate::query_execution::lifecycle::QueryExecutionId, ProtocolError> {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::lifecycle::AttemptId;

@@ -29,8 +29,8 @@ use novarocks::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 use novarocks_types::wider_type;
 
 pub(super) fn lower_hash_join_node(

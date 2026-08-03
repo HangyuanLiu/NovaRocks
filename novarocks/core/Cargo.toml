@@ -19,7 +19,6 @@
 name = "novarocks"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [lib]
 doctest = false
@@ -82,9 +81,7 @@ hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
 prost-reflect = "0.14"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
-tokio-stream = "0.1"
 prometheus = "0.13"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -117,7 +114,3 @@ query-execution-contract-test-support = []
 mv-first-refresh-staging-test-support = []
 runtime-filter-test-support = []
 ssb = []
-
-[build-dependencies]
-protoc-bin-vendored = "3"
-tonic-build = "0.12"

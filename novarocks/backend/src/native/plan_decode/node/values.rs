@@ -29,8 +29,8 @@ use novarocks::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use novarocks::exec::expr::{ExprArena, cast_array_to_target};
 use novarocks::exec::node::values::ValuesNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{common as proto_common, plan};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_values_node(
     node: &plan::DistributedNode,

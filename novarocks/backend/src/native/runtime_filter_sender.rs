@@ -34,7 +34,9 @@ use novarocks::runtime_filter_transition::port::transport::{
     RuntimeFilterAcceptStatus, RuntimeFilterEnvelope, RuntimeFilterRouteIdentity,
     RuntimeFilterTransportEnvelope,
 };
-use novarocks::service::grpc_client::NovaRocksGrpcRemoteClient;
+use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
+
+use crate::native::client::NativeGrpcClient;
 
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;
@@ -92,7 +94,7 @@ impl RuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
     ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
         // The endpoint is install-owned route authority. The raw backend index never
         // crosses this seam and cannot be confused with participant (+1) identity.
-        let client = NovaRocksGrpcRemoteClient::new_runtime_endpoint(route.endpoint())
+        let client = NativeGrpcClient::new_runtime_endpoint(route.endpoint())
             .map_err(RuntimeFilterUnaryError::transport)?;
         // Deliberately encode at the unary boundary instead of retaining a second
         // protobuf copy beside the semantic envelope. The sink queues are bounded and
@@ -110,7 +112,7 @@ impl RuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryClient {
 }
 
 fn decode_runtime_filter_unary_ack(
-    response: novarocks::proto::filter::RuntimeFilterEnvelopeResponse,
+    response: RuntimeFilterEnvelopeResponse,
 ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
     decode_runtime_filter_envelope_response(response)
         .map(|(identity, status)| RuntimeFilterUnaryAck::new(identity, status))
@@ -320,6 +322,7 @@ mod tests {
         DeliveryRouteIdentity, RuntimeFilterAcceptStatus, RuntimeFilterEnvelope,
         RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity, RuntimeFilterTransportEnvelope,
     };
+    use novarocks_protocol::filter::RuntimeFilterEnvelopeResponse;
     use novarocks_types::UniqueId;
 
     struct FakeUnaryClient {
@@ -364,13 +367,13 @@ mod tests {
             envelope: Arc<RuntimeFilterEnvelope>,
             _deadline: Duration,
         ) -> Result<RuntimeFilterUnaryAck, RuntimeFilterUnaryError> {
-            let response = novarocks::proto::filter::RuntimeFilterEnvelopeResponse {
+            let response = RuntimeFilterEnvelopeResponse {
                 acked_route_identity:
                     crate::native::runtime_filter_adapter::encode_runtime_filter_envelope(
                         envelope.as_ref(),
                     )
                     .route_identity,
-                accept_status: novarocks::proto::filter::RuntimeFilterAcceptStatus::Unspecified
+                accept_status: novarocks_protocol::filter::RuntimeFilterAcceptStatus::Unspecified
                     as i32,
                 rejection_reason: String::new(),
             };

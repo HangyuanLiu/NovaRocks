@@ -19,8 +19,8 @@ use super::{DecodedNode, NativePlanDecodeContext};
 use crate::native::plan_decode::error::NativeFragmentDecodeError;
 use crate::native::plan_decode::layout::Layout;
 use novarocks::exec::expr::ExprArena;
-use novarocks::proto::plan;
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_redistribute_node(
     physical: &plan::PlanNode,

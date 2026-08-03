@@ -23,8 +23,8 @@ mod variant_path;
 use super::node::{DecodedNode, NativePlanDecodeContext};
 use super::{NativeFragmentDecodeError, error::NativeFragmentLeafDecodeError};
 use crate::exec::expr::ExprArena;
-use crate::proto::plan;
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::plan;
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -159,12 +159,12 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
     use crate::exec::node::scan::ScanMorsel;
-    use crate::proto::{common, expr, novarocks, plan};
     use crate::protocol::common::error::ProtocolErrorKind;
     use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+    use novarocks_protocol::{common, expr, novarocks, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

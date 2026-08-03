@@ -30,7 +30,6 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
 use crate::connector::iceberg::scan_model as iceberg_scan_model;
-use crate::proto::{common, plan};
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
@@ -39,6 +38,7 @@ use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
+use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
     src: &crate::sql::planner::payload::PlanScanNode,
@@ -1096,9 +1096,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::encode_connector_expected_schema_ipc;
-    use crate::proto::common;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use novarocks_protocol::common;
 
     #[test]
     fn connector_expected_schema_uses_domain_columns_not_encoded_type_desc() {

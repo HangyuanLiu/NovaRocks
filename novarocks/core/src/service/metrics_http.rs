@@ -16,7 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ impl MetricsHttpServer {
     }
 
     pub fn start(host: &str, port: u16) -> Result<Self, String> {
-        let bind_addr = crate::service::grpc_server::parse_grpc_bind_addr(host, port)
+        let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse metrics HTTP bind address failed: {error}"))?;
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
             format!("bind metrics HTTP listener on {bind_addr} failed: {error}")
@@ -230,8 +230,29 @@ pub(crate) fn observe_fragments_scheduled(count: usize) {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc_by(count as u64);
 }
 
-pub(crate) fn observe_heartbeat_rtt(duration: Duration) {
+/// Record an FE-owned backend heartbeat observation without coupling the
+/// heartbeat transport to Core's former gRPC client implementation.
+pub fn observe_backend_heartbeat_rtt(duration: Duration) {
     Lazy::force(&HEARTBEAT_RTT_SECONDS).observe(duration.as_secs_f64());
+}
+
+fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let bare = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let formatted = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    formatted
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("parse metrics bind addr '{formatted}' failed: {error}"))
 }
 
 pub(crate) fn publish_backend_topology_metrics(
@@ -401,7 +422,8 @@ pub fn publish_frontend_query_lifecycle_metrics(
     }
 }
 
-pub(crate) async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
+/// Shared metrics HTTP handler for role-owned native listeners.
+pub async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
     if params
         .get("type")
         .is_some_and(|value| value.eq_ignore_ascii_case("json"))
@@ -510,10 +532,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metrics_bind_addr_accepts_ipv4_and_ipv6_literals() {
+        assert_eq!(
+            parse_metrics_bind_addr("127.0.0.1", 9070).expect("parse IPv4"),
+            "127.0.0.1:9070"
+                .parse::<SocketAddr>()
+                .expect("IPv4 address")
+        );
+        assert_eq!(
+            parse_metrics_bind_addr("::1", 9070).expect("parse bare IPv6"),
+            "[::1]:9070".parse::<SocketAddr>().expect("IPv6 address")
+        );
+        assert_eq!(
+            parse_metrics_bind_addr("[::]", 9070).expect("parse bracketed IPv6"),
+            "[::]:9070".parse::<SocketAddr>().expect("IPv6 wildcard")
+        );
+    }
+
+    #[test]
     fn rendered_metrics_include_cluster_core_names() {
         observe_fragments_scheduled(1);
         crate::runtime::fragment::io::exchange_metrics::observe_exchange_shuffle_bytes(7);
-        observe_heartbeat_rtt(Duration::from_millis(5));
+        observe_backend_heartbeat_rtt(Duration::from_millis(5));
 
         let body = render_metrics().expect("render metrics");
         assert!(body.contains("novarocks_fragment_scheduled_total"));

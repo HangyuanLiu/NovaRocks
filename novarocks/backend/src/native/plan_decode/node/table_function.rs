@@ -29,8 +29,8 @@ use novarocks::exec::expr::{ExprArena, ExprNode};
 use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{common as proto_common, expr, plan};
 use novarocks::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, expr, plan};
 
 pub(super) fn lower_table_function_node(
     node: &plan::DistributedNode,

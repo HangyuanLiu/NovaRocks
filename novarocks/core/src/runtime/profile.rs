@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use crate::proto::novarocks;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_protocol::novarocks;
 
 #[derive(Clone, Debug)]
 struct CounterSnapshot {
@@ -932,7 +932,7 @@ mod tests {
         CounterAggregateType, CounterMergeType, CounterMinMaxType, CounterStrategy, ProfileUnit,
         ROOT_COUNTER, RuntimeProfile, RuntimeProfileTree, default_counter_strategy,
     };
-    use crate::proto::novarocks;
+    use novarocks_protocol::novarocks;
 
     #[test]
     fn native_profile_unit_roundtrips_proto_values() {

@@ -26,9 +26,9 @@ use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::sort::{SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::protocol::common::error::FieldPath;
 use crate::protocol::native::decode::layout::Layout;
+use novarocks_protocol::plan;
 
 pub(super) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
@@ -180,9 +180,9 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
     use crate::runtime::exchange::ExchangeKey;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

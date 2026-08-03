@@ -25,8 +25,8 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, plan};
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_set_op_node(
     node: &plan::DistributedNode,
@@ -254,7 +254,7 @@ mod tests {
     use super::super::tests::{lower, one_col_values_node_with, output_column, physical_node};
     use crate::common::ids::SlotId;
     use crate::exec::node::ExecNodeKind;
-    use crate::proto::plan;
+    use novarocks_protocol::plan;
 
     #[test]
     fn union_all_retags_child_slots_when_sidecar_is_missing() {

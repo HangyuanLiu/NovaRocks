@@ -16,14 +16,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Weak};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
-#[cfg(test)]
-use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -1171,10 +1167,6 @@ pub struct StandaloneOpenServices {
     pub backend_topology: crate::query_execution::backend::BackendTopologyService,
     pub coordinator_report_endpoint:
         std::sync::Arc<dyn crate::query_execution::backend::CoordinatorReportEndpointSink>,
-    /// FE-only ingress for retained terminal snapshot fallback reports. Backend
-    /// and compat composition deliberately leave this absent.
-    pub terminal_ingress:
-        Option<std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>>,
     pub query_control: crate::query_execution::control::QueryControlService,
     /// Frontend-owned lifecycle port for logical connector control bindings.
     pub connector_control: std::sync::Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
@@ -1227,20 +1219,9 @@ impl StandaloneOpenServices {
             backend_query_events,
             backend_topology,
             coordinator_report_endpoint,
-            terminal_ingress: None,
             query_control,
             exchange_port,
         }
-    }
-
-    /// Installs the FE-owned terminal fallback ingress before opening the
-    /// terminal-fallback gRPC endpoint.
-    pub fn with_terminal_ingress(
-        mut self,
-        ingress: std::sync::Arc<dyn crate::query_execution::lifecycle::QueryTerminalIngress>,
-    ) -> Self {
-        self.terminal_ingress = Some(ingress);
-        self
     }
 
     pub fn with_statistics_application(
@@ -1381,7 +1362,6 @@ impl StandaloneNovaRocks {
             backend_query_events,
             backend_topology,
             coordinator_report_endpoint,
-            terminal_ingress: _,
             query_control: _,
             exchange_port,
         } = services;
@@ -6446,95 +6426,21 @@ pub(crate) struct StandaloneLoopbackTestBackend {
 }
 
 #[cfg(test)]
-pub(crate) fn install_all_in_one_loopback_backend_for_test()
--> Result<StandaloneLoopbackTestBackend, String> {
+pub(crate) fn install_all_in_one_loopback_backend_for_test() -> StandaloneLoopbackTestBackend {
     let test_guard = acquire_standalone_test_guard();
     crate::novarocks_config::install_default_for_test();
-    let exchange_port = ensure_standalone_exchange_server()?;
-    Ok(StandaloneLoopbackTestBackend {
-        exchange_port,
+    StandaloneLoopbackTestBackend {
+        exchange_port: in_process_exchange_endpoint_sentinel(),
         _test_guard: test_guard,
-    })
+    }
 }
 
 #[cfg(test)]
-fn ensure_standalone_exchange_server() -> Result<u16, String> {
-    static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
-
-    if let Some(port) = STANDALONE_EXCHANGE_PORT.get() {
-        return Ok(*port);
-    }
-
-    let default_port = crate::common::config::grpc_port();
-    let started_port = match crate::service::grpc_server::start_grpc_exchange_server(
-        "127.0.0.1",
-        default_port,
-        crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
-        crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
-    ) {
-        Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
-            .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
-        Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
-                format!("reserve standalone grpc exchange port failed: {bind_err}")
-            })?;
-            let fallback_port = listener
-                .local_addr()
-                .map_err(|addr_err| {
-                    format!("read standalone grpc exchange port failed: {addr_err}")
-                })?
-                .port();
-            drop(listener);
-            crate::service::grpc_server::start_grpc_exchange_server(
-                "127.0.0.1",
-                fallback_port,
-                crate::service::grpc_server::rejecting_test_native_fragment_ingress(),
-                crate::service::grpc_server::rejecting_test_query_lifecycle_ingress(),
-            )
-            .map_err(|start_err| {
-                format!(
-                    "start standalone grpc exchange server failed on fallback port {}: {}",
-                    fallback_port, start_err
-                )
-            })?;
-            crate::service::grpc_server::grpc_server_bound_port().map_err(|e| {
-                format!("read standalone grpc exchange server fallback port failed: {e}")
-            })?
-        }
-        Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
-    };
-
-    wait_for_standalone_exchange_server(started_port)?;
-
-    if STANDALONE_EXCHANGE_PORT.set(started_port).is_err() {
-        return Ok(*STANDALONE_EXCHANGE_PORT
-            .get()
-            .expect("standalone exchange port initialized"));
-    }
-    Ok(started_port)
-}
-
-#[cfg(test)]
-fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(err) if Instant::now() < deadline => {
-                let _ = err;
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => {
-                return Err(format!(
-                    "standalone grpc exchange server on 127.0.0.1:{} did not become ready: {}",
-                    port, err
-                ));
-            }
-        }
-    }
+const fn in_process_exchange_endpoint_sentinel() -> u16 {
+    // The test coordinator is in-process and never opens a native listener.
+    // The lifetime-held TestSerializationGuard keeps this nonzero topology
+    // marker isolated from concurrent standalone semantic tests.
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -8517,9 +8423,12 @@ mysql_port = 47892
     }
 
     #[test]
-    fn query_with_loopback_exchange_backend_uses_distributed_path() {
-        let backend = super::install_all_in_one_loopback_backend_for_test()
-            .expect("install loopback backend");
+    fn query_with_in_process_exchange_endpoint_sentinel_uses_distributed_path() {
+        let backend = super::install_all_in_one_loopback_backend_for_test();
+        assert_ne!(
+            backend.exchange_port, 0,
+            "test topology requires an endpoint marker"
+        );
         let query = parse_query_for_engine_test("select 1");
         let catalog = super::PlannerMemoryCatalog::default();
         let connectors = crate::connector::ConnectorRegistry::default();
@@ -8746,8 +8655,7 @@ mysql_port = 47892
             "unexpected rewrite error: {rewrite_err}"
         );
 
-        let backend = super::install_all_in_one_loopback_backend_for_test()
-            .expect("install loopback backend");
+        let backend = super::install_all_in_one_loopback_backend_for_test();
         let result = super::execute_preexpanded_mv_refresh_query_with_options(
             &query,
             &catalog,

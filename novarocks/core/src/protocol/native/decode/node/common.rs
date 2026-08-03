@@ -25,8 +25,8 @@ use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::join::JoinType;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, plan};
 use crate::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(crate) fn unsupported<T>(kind: &str) -> Result<T, String> {
     Err(format!(

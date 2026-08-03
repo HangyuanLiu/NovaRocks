@@ -1409,6 +1409,8 @@ fn native_be_signal_shutdown_releases_port_for_restart() {
 
     let grpc = ReservedPort::new();
     let grpc_port = grpc.port();
+    let http = ReservedPort::new();
+    let http_port = http.port();
     let config = write_config(
         "native-be-signal-restart",
         &format!(
@@ -1416,6 +1418,7 @@ fn native_be_signal_shutdown_releases_port_for_restart() {
 [server]
 host = "127.0.0.1"
 grpc_port = {grpc_port}
+http_port = {http_port}
 
 [cluster]
 role = "be"
@@ -1424,6 +1427,7 @@ role = "be"
     );
 
     let _ = grpc.release();
+    let _ = http.release();
     let mut first = ProcessGuard::spawn(config.path());
     first.wait_for_ready("NOVAROCKS_READY role=be");
     first.shutdown_cleanly(Duration::from_secs(10));

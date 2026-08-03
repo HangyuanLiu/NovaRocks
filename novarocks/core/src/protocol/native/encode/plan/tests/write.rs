@@ -82,12 +82,13 @@ fn change_stream_router_encoder_materializes_partition_exprs() {
         .expect("branch output partition");
     assert_eq!(
         partition.kind,
-        crate::proto::plan::PartitionKind::Hash as i32
+        novarocks_protocol::plan::PartitionKind::Hash as i32
     );
     let [expr] = partition.exprs.as_slice() else {
         panic!("expected one materialized partition expr");
     };
-    let Some(crate::proto::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref() else {
+    let Some(novarocks_protocol::expr::expr::Kind::ColumnRef(column_ref)) = expr.kind.as_ref()
+    else {
         panic!("expected partition expr to be a column ref");
     };
     assert_eq!(column_ref.column_id, 3);
@@ -484,12 +485,12 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
     };
 
     let encoded = plan::encode_node(&scan).expect("encode scan node");
-    let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Physical(physical)) =
         encoded.payload.as_ref()
     else {
         panic!("expected physical node");
     };
-    let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+    let Some(novarocks_protocol::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
         panic!("expected scan node");
     };
     let table = scan.table.as_ref().expect("table");
@@ -499,7 +500,7 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
         Some("\"9.99\"")
     );
     let source = table.source.as_ref().expect("scan source");
-    let Some(crate::proto::plan::scan_source::Kind::IcebergDataFiles(iceberg)) =
+    let Some(novarocks_protocol::plan::scan_source::Kind::IcebergDataFiles(iceberg)) =
         source.kind.as_ref()
     else {
         panic!("expected Iceberg data-files source");
@@ -576,12 +577,12 @@ fn native_scan_encoder_preserves_iceberg_list_write_defaults_from_arrow_metadata
     };
 
     let encoded = plan::encode_node(&scan).expect("encode scan node");
-    let Some(crate::proto::plan::distributed_node::Payload::Physical(physical)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Physical(physical)) =
         encoded.payload.as_ref()
     else {
         panic!("expected physical node");
     };
-    let Some(crate::proto::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+    let Some(novarocks_protocol::plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
         panic!("expected scan node");
     };
     let table = scan.table.as_ref().expect("table");

@@ -31,8 +31,8 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, plan};
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, plan};
 
 pub(super) fn lower_values_node(
     node: &plan::DistributedNode,
@@ -237,8 +237,8 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::expr::ExprArena;
-    use crate::proto::{common, expr, plan};
     use crate::protocol::native::type_mapping::encode_type;
+    use novarocks_protocol::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

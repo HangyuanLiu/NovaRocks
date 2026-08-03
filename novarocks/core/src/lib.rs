@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-include!(concat!(env!("OUT_DIR"), "/proto_root_mod.rs"));
-
 #[cfg(test)]
 mod tests;
 
@@ -45,5 +43,3 @@ pub use common::logging as novarocks_logging;
 pub use connector as novarocks_connectors;
 
 pub use common::types::FetchResult;
-#[cfg(any(test, feature = "query-execution-contract-test-support"))]
-pub use service::grpc_server::start_grpc_exchange_server;

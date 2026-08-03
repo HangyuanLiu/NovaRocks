@@ -205,7 +205,7 @@ impl ExchangeRouteManifest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeFilterContribution {
-    wire: crate::proto::novarocks::RuntimeFilterContribution,
+    wire: novarocks_protocol::novarocks::RuntimeFilterContribution,
 }
 
 impl RuntimeFilterContribution {
@@ -213,7 +213,7 @@ impl RuntimeFilterContribution {
     /// lifecycle, install, routing, epoch, or digest semantics. The Backend is
     /// the only owner that decodes and validates those facts.
     pub fn from_wire(
-        wire: crate::proto::novarocks::RuntimeFilterContribution,
+        wire: novarocks_protocol::novarocks::RuntimeFilterContribution,
     ) -> Result<Self, QueryLifecycleError> {
         if wire.participant_id == 0 {
             return Err(QueryLifecycleError::invalid_manifest(
@@ -232,7 +232,7 @@ impl RuntimeFilterContribution {
         self.wire.participant_id
     }
 
-    pub fn wire(&self) -> &crate::proto::novarocks::RuntimeFilterContribution {
+    pub fn wire(&self) -> &novarocks_protocol::novarocks::RuntimeFilterContribution {
         &self.wire
     }
 
@@ -260,7 +260,7 @@ impl RuntimeFilterContribution {
         use sha2::Digest;
         digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
         digest.update(prost::Message::encode_to_vec(&envelope));
-        Self::from_wire(crate::proto::novarocks::RuntimeFilterContribution {
+        Self::from_wire(novarocks_protocol::novarocks::RuntimeFilterContribution {
             participant_id,
             lifecycle: envelope.lifecycle,
             install: envelope.install,
@@ -275,7 +275,7 @@ impl RuntimeFilterContribution {
         participant_id: u32,
     ) -> Result<Self, QueryLifecycleError> {
         let _ = execution_id;
-        Self::from_wire(crate::proto::novarocks::RuntimeFilterContribution {
+        Self::from_wire(novarocks_protocol::novarocks::RuntimeFilterContribution {
             participant_id,
             lifecycle: None,
             install: None,

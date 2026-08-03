@@ -41,10 +41,10 @@ fn main() {
     }
 
     // Native protobuf DTOs are generated exactly once by novarocks-protocol.
-    // The backend owns only the server-side Tonic transport stub and refers to
-    // every request and response through those canonical DTO modules.
+    // The backend owns its native ingress and outbound Tonic transport stubs
+    // and refers to every request and response through canonical DTO modules.
     tonic_build::configure()
-        .build_client(false)
+        .build_client(true)
         .build_server(true)
         .codec_path("crate::native::codec::NativeProstCodec")
         .extern_path(".novarocks.common", "::novarocks_protocol::common")
@@ -56,5 +56,5 @@ fn main() {
             &[PathBuf::from(IDL_DIR).join("service.proto")],
             &[PathBuf::from(IDL_DIR)],
         )
-        .expect("compile native backend Tonic server stubs against protocol DTOs");
+        .expect("compile native backend Tonic transport stubs against protocol DTOs");
 }

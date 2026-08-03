@@ -26,8 +26,8 @@ use novarocks::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, Chun
 use novarocks::exec::expr::ExprArena;
 use novarocks::exec::node::project::ProjectNode;
 use novarocks::exec::node::{ExecNode, ExecNodeKind};
-use novarocks::proto::{expr, plan};
 use novarocks::protocol::common::error::{FieldPath, ProtocolErrorKind};
+use novarocks_protocol::{expr, plan};
 
 pub(super) fn lower_project_node(
     node: &plan::DistributedNode,

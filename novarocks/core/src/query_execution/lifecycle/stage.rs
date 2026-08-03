@@ -28,8 +28,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 use crate::common::types::UniqueId;
-use crate::proto::{novarocks, plan};
 use crate::query_execution::contract::DistributedQueryError;
+use novarocks_protocol::{novarocks, plan};
 
 use super::contract::{QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleTarget};
 use super::identity::QueryExecutionId;
@@ -778,7 +778,7 @@ mod tests {
         StageFragment::new(
             plan::PlanFragment::default(),
             novarocks::InstanceParams {
-                fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 1, lo }),
+                fragment_instance_id: Some(novarocks_protocol::common::UniqueId { hi: 1, lo }),
                 ..Default::default()
             },
         )
@@ -808,7 +808,7 @@ mod tests {
         StageFragment::new(
             plan::PlanFragment::default(),
             novarocks::InstanceParams {
-                fragment_instance_id: Some(crate::proto::common::UniqueId { hi: 1, lo }),
+                fragment_instance_id: Some(novarocks_protocol::common::UniqueId { hi: 1, lo }),
                 per_node_scan_ranges,
                 per_exch_num_senders,
                 ..Default::default()

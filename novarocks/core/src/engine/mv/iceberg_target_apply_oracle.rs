@@ -2667,8 +2667,7 @@ mod tests {
     fn spike_framework_select_file_pos_on_target() {
         use arrow::array::{Int64Array, StringArray};
 
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()
@@ -2848,8 +2847,7 @@ mod tests {
     #[test]
     fn framework_locate_matches_direct_locator_partitioned() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()
@@ -2964,8 +2962,7 @@ mod tests {
     #[test]
     fn framework_locate_respects_existing_position_deletes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()
@@ -3101,8 +3098,7 @@ mod tests {
     #[test]
     fn framework_locate_branch_parity() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()
@@ -3193,8 +3189,7 @@ mod tests {
         use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()
@@ -3282,8 +3277,7 @@ mod tests {
 
     #[test]
     fn framework_locator_preserves_preexisting_synthetic_name_collision() {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let state = std::sync::Arc::new(crate::engine::StandaloneState {
             exchange_port: loopback_backend.exchange_port,
             ..crate::engine::StandaloneState::default()

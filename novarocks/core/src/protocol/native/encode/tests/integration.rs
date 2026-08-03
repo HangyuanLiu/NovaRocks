@@ -197,8 +197,9 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
 
     let encoded = plan::encode_distributed_plan(&plan, empty_scan_bindings())
         .expect("encode distributed plan");
-    let decoded = crate::proto::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
-        .expect("decode proto message");
+    let decoded =
+        novarocks_protocol::plan::DistributedPlan::decode(encoded.encode_to_vec().as_slice())
+            .expect("decode proto message");
 
     assert_eq!(decoded.root_fragment_id, 1);
     assert_eq!(decoded.fragments.len(), 2);
@@ -206,14 +207,16 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
     assert_eq!(decoded.edges[0].target_exchange_node_id, 42);
     assert_eq!(
         decoded.edges[0].output_partition,
-        crate::proto::plan::PartitionType::Hash as i32
+        novarocks_protocol::plan::PartitionType::Hash as i32
     );
     assert_eq!(
         decoded.edges[0]
             .edge_kind
             .as_ref()
             .and_then(|kind| kind.kind.as_ref()),
-        Some(&crate::proto::plan::fragment_edge_kind::Kind::Stream(true))
+        Some(&novarocks_protocol::plan::fragment_edge_kind::Kind::Stream(
+            true
+        ))
     );
 
     let root_fragment = decoded
@@ -226,7 +229,7 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
     // production plan can actually hold: fragments, edges, partitions, and
     // the exchange receiver.
     let root = root_fragment.root.as_ref().expect("root node");
-    let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
         root.payload.as_ref()
     else {
         panic!("expected exchange receiver payload");
@@ -235,7 +238,7 @@ fn distributed_plan_encoder_round_trips_fragments_edges_partitions_and_exchange(
     assert_eq!(exchange.output_qualifier.as_deref(), Some("recv"));
     assert_eq!(
         exchange.partition_type,
-        crate::proto::plan::PartitionType::Hash as i32
+        novarocks_protocol::plan::PartitionType::Hash as i32
     );
     assert_eq!(exchange.output_columns.len(), 1);
     assert_eq!(exchange.output_columns[0].column_id, 10);
@@ -336,7 +339,7 @@ fn stream_edge_projects_pruned_scan_columns_by_column_id() {
         .find(|fragment| fragment.fragment_id == 1)
         .expect("target fragment");
     let root = target_fragment.root.as_ref().expect("target root");
-    let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
         root.payload.as_ref()
     else {
         panic!("expected exchange receiver payload");
@@ -441,7 +444,7 @@ fn stream_edge_patches_exchange_columns_from_aggregate_layout_when_fragment_outp
         .find(|fragment| fragment.fragment_id == 1)
         .expect("target fragment");
     let root = target_fragment.root.as_ref().expect("target root");
-    let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
         root.payload.as_ref()
     else {
         panic!("expected exchange receiver");
@@ -555,7 +558,7 @@ fn stream_edge_patches_local_avg_exchange_schema_to_intermediate_type() {
         .find(|fragment| fragment.fragment_id == 1)
         .expect("target fragment");
     let root = target_fragment.root.as_ref().expect("target root");
-    let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
         root.payload.as_ref()
     else {
         panic!("expected exchange receiver");
@@ -638,7 +641,7 @@ fn stream_edge_allows_zero_column_source_when_no_slots_are_requested() {
         .find(|fragment| fragment.fragment_id == 1)
         .expect("target fragment");
     let root = target_fragment.root.as_ref().expect("target root");
-    let Some(crate::proto::plan::distributed_node::Payload::Exchange(exchange)) =
+    let Some(novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange)) =
         root.payload.as_ref()
     else {
         panic!("expected exchange receiver");

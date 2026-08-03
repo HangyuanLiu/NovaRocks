@@ -28,7 +28,6 @@ use novarocks::query_execution::ConnectorWriteCompletion;
 use novarocks::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
     DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
-    new_grpc_connector_binding_dispatcher,
 };
 use novarocks::query_execution::backend::LiveBackendTarget;
 use novarocks::query_execution::contract::{
@@ -36,15 +35,12 @@ use novarocks::query_execution::contract::{
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
     DistributedQueryRequest, ProfileTerminalBuilder,
 };
-use novarocks::query_execution::fragment_transport::{
-    FetchOutcome, FragmentDispatcher, new_grpc_fragment_dispatcher,
-};
+use novarocks::query_execution::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use novarocks::query_execution::lifecycle::{
     AttemptId, QueryExecutionId, QueryInitOptions, QueryLifecycleTransport,
 };
 use novarocks::query_execution::write::WriteTerminalBuilder;
 use novarocks::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks::service::grpc_query_lifecycle_client::new_grpc_query_lifecycle_transport;
 use novarocks_spi::connector::{ConnectorWriteLease, ConnectorWriteResolver};
 use novarocks_types::QueryId;
 
@@ -55,6 +51,9 @@ use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};
+use crate::native::transport::{
+    new_connector_binding_dispatcher, new_fragment_dispatcher, new_query_lifecycle_transport,
 };
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -147,7 +146,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
                 }
             })
             .collect::<Vec<_>>();
-        let dispatcher = match new_grpc_connector_binding_dispatcher(&endpoints) {
+        let dispatcher = match new_connector_binding_dispatcher(&endpoints) {
             Ok(dispatcher) => dispatcher,
             Err(error) => {
                 tracing::warn!(
@@ -504,11 +503,10 @@ fn production_backend_services(
     let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
-        dispatcher: new_grpc_fragment_dispatcher(&entries).map_err(failed)?,
-        lifecycle_transport: new_grpc_query_lifecycle_transport(topology).map_err(failed)?,
+        dispatcher: new_fragment_dispatcher(&entries).map_err(failed)?,
+        lifecycle_transport: new_query_lifecycle_transport(topology).map_err(failed)?,
         live_backends: topology.to_vec(),
-        connector_binding_dispatcher: new_grpc_connector_binding_dispatcher(&entries)
-            .map_err(failed)?,
+        connector_binding_dispatcher: new_connector_binding_dispatcher(&entries).map_err(failed)?,
     })
 }
 

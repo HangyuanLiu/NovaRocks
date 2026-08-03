@@ -20,11 +20,11 @@ use prost::Message;
 
 use super::super::expr::encode_expr;
 use super::{column_expr, int_expr};
-use crate::proto::{common, expr};
 use crate::sql::analysis::{ExprKind, SortItem, SubqueryKind, TypedExpr};
 use crate::sql::common::{
     BinOp, LambdaParam, LiteralValue, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
+use novarocks_protocol::{common, expr};
 
 fn literal_expr(value: LiteralValue, data_type: DataType) -> TypedExpr {
     TypedExpr {

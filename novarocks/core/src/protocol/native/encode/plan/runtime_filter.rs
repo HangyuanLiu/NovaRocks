@@ -18,7 +18,6 @@
 use std::num::NonZeroU32;
 
 use super::super::expr::encode_expr;
-use crate::proto::plan;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::runtime_filter_binding::{
     PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
@@ -39,6 +38,7 @@ use crate::runtime_filter::port::topk_summary::{
 };
 use crate::sql::planner::runtime_filter::contract as sql_contract;
 use crate::sql::planner::runtime_filter::graph::{ApplyPoint, ProducerBindingTarget};
+use novarocks_protocol::plan;
 
 pub(super) fn encode_runtime_filter_binding_table(
     enclosing_fragment_id: crate::sql::planner::distributed::FragmentId,
@@ -213,7 +213,13 @@ fn encode_runtime_filter_contract(
 #[allow(dead_code)] // Shared with the install codec before its Task 4/5 call sites land.
 pub(in crate::protocol::native) fn encode_runtime_filter_logical_domain(
     domain: &RuntimeFilterLogicalDomain,
-) -> Result<(crate::proto::common::TypeDesc, plan::RuntimeFilterContract), String> {
+) -> Result<
+    (
+        novarocks_protocol::common::TypeDesc,
+        plan::RuntimeFilterContract,
+    ),
+    String,
+> {
     use plan::runtime_filter_contract::Kind;
 
     match domain {

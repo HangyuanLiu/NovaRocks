@@ -248,7 +248,7 @@ mod tests {
 
     use super::*;
     use novarocks::common::ids::SlotId;
-    use novarocks::proto::common;
+    use novarocks_protocol::common;
     use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
 
     fn scalar_type(primitive: common::PrimitiveType) -> common::TypeDesc {

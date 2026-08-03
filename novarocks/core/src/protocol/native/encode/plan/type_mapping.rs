@@ -16,7 +16,6 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::proto::{common, plan};
 use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
 use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 use crate::sql::planner::physical::{
@@ -24,6 +23,7 @@ use crate::sql::planner::physical::{
     TopNPhase,
 };
 use novarocks_catalog::schema::SqlType;
+use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String> {
     use common::type_desc::Kind;

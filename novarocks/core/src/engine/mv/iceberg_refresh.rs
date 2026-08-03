@@ -20007,8 +20007,7 @@ mod tests {
     }
 
     fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
         let metadata_path = metadata_dir.path().join("standalone.sqlite");
@@ -20061,8 +20060,7 @@ mod tests {
         catalog: &str,
         current_db: &str,
     ) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
         let state = Arc::new(StandaloneState {
@@ -20110,8 +20108,7 @@ mod tests {
         catalog: &str,
         current_db: &str,
     ) -> IcebergMvTestState {
-        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test()
-            .expect("install all-in-one loopback backend");
+        let loopback_backend = crate::engine::install_all_in_one_loopback_backend_for_test();
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
         let metadata_path = metadata_dir.path().join("standalone.sqlite");

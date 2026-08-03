@@ -23,8 +23,8 @@ use crate::connector::iceberg::metadata::{
 use crate::connector::iceberg::plan_native_iceberg_metadata_read_source;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::plan;
 use crate::runtime::scan_range::{ScanRange, ScanRangeParams};
+use novarocks_protocol::plan;
 
 use super::super::node::{DecodedNode, NativePlanDecodeContext};
 use super::common::{

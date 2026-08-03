@@ -29,8 +29,8 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::proto::{common as proto_common, expr, plan};
 use crate::protocol::common::error::FieldPath;
+use novarocks_protocol::{common as proto_common, expr, plan};
 
 pub(super) fn lower_generate_series_node(
     node: &plan::DistributedNode,

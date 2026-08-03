@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use novarocks::proto;
 use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
 use novarocks::runtime_filter_transition::port::identity::{
     DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
@@ -28,6 +27,7 @@ use novarocks::runtime_filter_transition::port::transport::{
     RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind, RuntimeFilterRouteIdentity,
     RuntimeFilterTransportError,
 };
+use novarocks_protocol as proto;
 use novarocks_types::UniqueId;
 
 pub(crate) fn encode_runtime_filter_envelope(
@@ -316,7 +316,6 @@ mod tests {
 
     use tonic::Code;
 
-    use novarocks::proto;
     use novarocks::runtime_filter_transition::model::contract::{BindingId, ChannelId};
     use novarocks::runtime_filter_transition::port::identity::{
         DeploymentEpoch, PartitionId, ProducerSequence, RouteEdgeId,
@@ -325,6 +324,7 @@ mod tests {
         RuntimeFilterEnvelope, RuntimeFilterEnvelopeIngress, RuntimeFilterEnvelopeKind,
         RuntimeFilterIngressResult,
     };
+    use novarocks_protocol as proto;
     use novarocks_types::UniqueId;
 
     use super::handle_runtime_filter_envelope;

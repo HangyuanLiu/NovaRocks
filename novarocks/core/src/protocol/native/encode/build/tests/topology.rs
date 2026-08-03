@@ -284,7 +284,7 @@ fn fragment_build_preserves_finalized_router_edge() {
         .and_then(|sink| sink.kind.as_ref())
         .expect("router sink")
     {
-        crate::proto::plan::data_sink::Kind::ChangeStreamRouter(router) => router.branches[0]
+        novarocks_protocol::plan::data_sink::Kind::ChangeStreamRouter(router) => router.branches[0]
             .output_partition
             .as_ref()
             .expect("router route partition"),
@@ -292,7 +292,7 @@ fn fragment_build_preserves_finalized_router_edge() {
     };
     assert_eq!(
         route_partition.kind,
-        crate::proto::plan::PartitionKind::Hash as i32
+        novarocks_protocol::plan::PartitionKind::Hash as i32
     );
     assert_eq!(route_partition.exprs.len(), 1);
 
@@ -306,7 +306,7 @@ fn fragment_build_preserves_finalized_router_edge() {
         .and_then(|root| root.payload.as_ref())
         .expect("router target exchange receiver")
     {
-        crate::proto::plan::distributed_node::Payload::Exchange(exchange) => exchange,
+        novarocks_protocol::plan::distributed_node::Payload::Exchange(exchange) => exchange,
         other => panic!("expected router exchange receiver, got {other:?}"),
     };
     assert_eq!(receiver.partition_type, route_partition.kind);

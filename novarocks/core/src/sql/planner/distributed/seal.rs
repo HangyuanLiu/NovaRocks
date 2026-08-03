@@ -914,21 +914,23 @@ mod tests {
             .bindings
             .first()
             .expect("one encoded consumer binding");
-        let Some(crate::proto::plan::runtime_filter_binding::Role::Consumer(consumer)) =
+        let Some(novarocks_protocol::plan::runtime_filter_binding::Role::Consumer(consumer)) =
             binding.role.as_ref()
         else {
             panic!("encoded binding remains a consumer");
         };
         let activation = consumer.activation.as_ref().expect("encoded activation");
-        let Some(crate::proto::plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
-            late_apply,
-        )) = activation.kind.as_ref()
+        let Some(
+            novarocks_protocol::plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+                late_apply,
+            ),
+        ) = activation.kind.as_ref()
         else {
             panic!("cycle consumer encodes a non-blocking live activation");
         };
         assert_eq!(
             *late_apply,
-            i32::from(crate::proto::plan::RuntimeFilterLateApplyGranularity::Batch),
+            i32::from(novarocks_protocol::plan::RuntimeFilterLateApplyGranularity::Batch),
             "only the sealed concrete activation crosses the native wire boundary",
         );
 

@@ -19,7 +19,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::common::types::UniqueId;
-use crate::proto::{common, filter};
 use crate::protocol::common::error::{FieldPath, ProtocolError, ProtocolErrorKind, ProtocolFamily};
 use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::runtime_filter::deployment::install_validation::validate_participant_install;
@@ -44,6 +43,7 @@ use crate::runtime_filter::port::routing::{
     RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
 };
 use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+use novarocks_protocol::{common, filter};
 
 use super::encode::plan::{
     encode_runtime_filter_activation, encode_runtime_filter_capability,
@@ -1620,7 +1620,6 @@ mod tests {
 
     use super::*;
     use crate::common::types::UniqueId;
-    use crate::proto::filter;
     use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::runtime_filter::model::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
@@ -1648,6 +1647,7 @@ mod tests {
         RuntimeFilterRouteRole, RuntimeFilterRoutingEdgeView, RuntimeFilterRoutingShard,
     };
     use crate::runtime_filter::port::transport::RuntimeFilterEnvelopeKind;
+    use novarocks_protocol::filter;
 
     const QUERY: UniqueId = UniqueId::new(41, 42);
     const EPOCH: DeploymentEpoch = DeploymentEpoch::new(7);
@@ -2443,7 +2443,7 @@ mod tests {
             .expect("install")
             .core_channels[0]
             .allowed_contribution_kinds[0] =
-            crate::proto::plan::RuntimeFilterContributionKind::Unspecified as i32;
+            novarocks_protocol::plan::RuntimeFilterContributionKind::Unspecified as i32;
         assert!(decode_participant_install(&unspecified_contribution).is_err());
 
         let mut unspecified_completion = request.clone();
@@ -2453,7 +2453,7 @@ mod tests {
             .expect("install")
             .core_channels[0]
             .completion_requirement =
-            crate::proto::plan::RuntimeFilterCompletionRequirement::Unspecified as i32;
+            novarocks_protocol::plan::RuntimeFilterCompletionRequirement::Unspecified as i32;
         assert!(decode_participant_install(&unspecified_completion).is_err());
 
         let mut unspecified_capability = request.clone();
@@ -2464,7 +2464,7 @@ mod tests {
             .core_channels[0]
             .consumers[0]
             .capabilities[0] =
-            crate::proto::plan::RuntimeFilterArtifactCapability::Unspecified as i32;
+            novarocks_protocol::plan::RuntimeFilterArtifactCapability::Unspecified as i32;
         assert!(decode_participant_install(&unspecified_capability).is_err());
 
         let mut unspecified_artifact = request.clone();
@@ -2721,8 +2721,9 @@ mod tests {
             ("membership contribution matrix", |request| {
                 request.install.as_mut().expect("install").core_channels[0]
                     .allowed_contribution_kinds = vec![
-                    crate::proto::plan::RuntimeFilterContributionKind::FinalDomainShard as i32,
-                    crate::proto::plan::RuntimeFilterContributionKind::ProducerClosed as i32,
+                    novarocks_protocol::plan::RuntimeFilterContributionKind::FinalDomainShard
+                        as i32,
+                    novarocks_protocol::plan::RuntimeFilterContributionKind::ProducerClosed as i32,
                 ];
             }),
             ("zero max retries", |request| {

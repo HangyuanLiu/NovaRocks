@@ -274,7 +274,6 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
                 config: cfg,
                 config_path: frontend_config_path,
                 port_override: port,
-                grpc_endpoint: novarocks_frontend::FrontendGrpcEndpointOwnership::HostedReportOnly,
             })
             .map_err(|error| anyhow::anyhow!("{error}"))
         },
