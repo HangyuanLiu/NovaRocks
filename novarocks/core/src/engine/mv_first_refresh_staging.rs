@@ -789,7 +789,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 "MV first-refresh logical artifact is missing its admitted base bindings"
                     .to_string()
             })?;
-            let refresh_context = rebuild_frozen_mv_refresh_context(
+            let mut refresh_context = rebuild_frozen_mv_refresh_context(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
@@ -799,6 +799,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 &target_name,
                 &facts,
             )?;
+            refresh_context.connector_context = Some(connector_context.clone());
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let _target_binding =
                 crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store(

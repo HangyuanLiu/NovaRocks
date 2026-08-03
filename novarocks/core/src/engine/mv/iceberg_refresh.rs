@@ -13968,7 +13968,12 @@ pub(crate) fn compile_canonical_select_for_imv_with_frozen_base_overlays(
             "IMV logical intent did not produce logical SQL facts",
         ));
     };
-    Ok((output.logical_plan, output.factory))
+    Ok((
+        crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(
+            output.logical_plan,
+        ),
+        output.factory,
+    ))
 }
 
 /// Build the only compiler input used by a maintenance-owned join refresh.
