@@ -38,12 +38,62 @@ pub struct OptimizeWorker {
     join: Option<JoinHandle<Result<(), String>>>,
 }
 
+/// Executes a claimed OPTIMIZE job after the worker has established durable
+/// ownership. Keeping this port separate lets scheduler tests exercise claim,
+/// ordering, and shutdown behavior without fabricating a connector write
+/// session; production uses the distributed-rewrite implementation below.
+pub trait OptimizeJobExecutor: Send + Sync {
+    fn execute(
+        &self,
+        runtime: &Handle,
+        engine: &dyn TableMaintenanceEngine,
+        job: &OptimizeJob,
+    ) -> Result<MaintenanceActionOutcome, String>;
+}
+
+struct DistributedRewriteOptimizeJobExecutor {
+    repository: Arc<DistributedRewriteOperationRepository>,
+}
+
+impl OptimizeJobExecutor for DistributedRewriteOptimizeJobExecutor {
+    fn execute(
+        &self,
+        runtime: &Handle,
+        engine: &dyn TableMaintenanceEngine,
+        job: &OptimizeJob,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        FrontendTableMaintenanceService::execute_optimize_distributed_rewrite(
+            runtime,
+            Arc::clone(&self.repository),
+            engine,
+            job.target.clone(),
+            job.job_id,
+        )
+    }
+}
+
 impl OptimizeWorker {
     pub fn start(
         runtime: &Handle,
         repository: Arc<OptimizeJobRepository>,
         distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
         engine: Weak<dyn TableMaintenanceEngine>,
+    ) -> Result<Self, String> {
+        Self::start_with_executor(
+            runtime,
+            repository,
+            engine,
+            Arc::new(DistributedRewriteOptimizeJobExecutor {
+                repository: distributed_rewrite_repository,
+            }),
+        )
+    }
+
+    pub fn start_with_executor(
+        runtime: &Handle,
+        repository: Arc<OptimizeJobRepository>,
+        engine: Weak<dyn TableMaintenanceEngine>,
+        executor: Arc<dyn OptimizeJobExecutor>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wakeup = Arc::new(Notify::new());
@@ -54,8 +104,8 @@ impl OptimizeWorker {
             run_worker(
                 worker_runtime,
                 repository,
-                distributed_rewrite_repository,
                 engine,
+                executor,
                 worker_stop,
                 worker_wakeup,
             )
@@ -95,8 +145,8 @@ impl OptimizeWorker {
 async fn run_worker(
     runtime: Handle,
     repository: Arc<OptimizeJobRepository>,
-    distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
     engine: Weak<dyn TableMaintenanceEngine>,
+    executor: Arc<dyn OptimizeJobExecutor>,
     stop: Arc<AtomicBool>,
     wakeup: Arc<Notify>,
 ) -> Result<(), String> {
@@ -135,8 +185,8 @@ async fn run_worker(
             execute_claimed_job(
                 &runtime,
                 repository.as_ref(),
-                Arc::clone(&distributed_rewrite_repository),
                 engine,
+                Arc::clone(&executor),
                 claimed,
             )
             .await?;
@@ -155,25 +205,18 @@ async fn run_worker(
 async fn execute_claimed_job(
     runtime: &Handle,
     repository: &OptimizeJobRepository,
-    distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
     engine: Arc<dyn TableMaintenanceEngine>,
+    executor: Arc<dyn OptimizeJobExecutor>,
     job: OptimizeJob,
 ) -> Result<(), String> {
     let job_id = job.job_id;
-    let target = job.target;
     let runtime = runtime.clone();
-    let execution = tokio::task::spawn_blocking(move || {
-        FrontendTableMaintenanceService::execute_optimize_distributed_rewrite(
-            &runtime,
-            distributed_rewrite_repository,
-            engine.as_ref(),
-            target,
-        )
-    })
-    .await
-    .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
-    .and_then(|result| result)
-    .and_then(optimize_outcome);
+    let execution =
+        tokio::task::spawn_blocking(move || executor.execute(&runtime, engine.as_ref(), &job))
+            .await
+            .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
+            .and_then(|result| result)
+            .and_then(optimize_outcome);
 
     let outcome = match execution {
         Ok(outcome) => outcome,

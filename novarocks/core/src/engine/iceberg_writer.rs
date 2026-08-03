@@ -21,7 +21,7 @@
 //! orchestration over these primitives.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema};
 use bytes::Bytes;
@@ -66,7 +66,7 @@ use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
-    IcebergWriteTransactionExecutor, IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
+    IcebergWriteTransactionSpec, IcebergWriteValidationPolicy,
 };
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -738,6 +738,84 @@ pub(crate) fn commit_iceberg_connector_write(
     }
 }
 
+/// Make the terminal abort decision for an exact sealed connector operation.
+///
+/// A staging failure is not proof that the external mutation did not commit:
+/// preserve the provider's three-way truth for the frontend-owned lifecycle.
+pub(crate) fn abort_iceberg_connector_write(
+    commit_executor: &IcebergWriteCommitExecutor,
+    session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    stage_reason: String,
+) -> Result<CommitOutcome, CommitServiceError> {
+    use novarocks_spi::connector::{ConnectorWriteAbortOutcome, ExternalMutationFinalization};
+
+    match session.abort(context) {
+        Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup }) => {
+            let (cleanup, suffix) = match cleanup {
+                ExternalMutationFinalization::Complete => (
+                    crate::connector::iceberg::commit::CleanupAttempt::completed(Vec::new()),
+                    String::new(),
+                ),
+                ExternalMutationFinalization::Failed(failure) => (
+                    crate::connector::iceberg::commit::CleanupAttempt {
+                        attempted: true,
+                        error_count: 1,
+                        error_paths: Vec::new(),
+                    },
+                    format!("; connector cleanup failed: {}", failure.message()),
+                ),
+            };
+            Err(CommitServiceError::known_uncommitted(
+                format!("{stage_reason}{suffix}"),
+                cleanup,
+            ))
+        }
+        Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }) => decode_write_receipt(receipt.payload())
+            .map(|new_snapshot_id| CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths: Vec::new(),
+            })
+            .map_err(CommitServiceError::invalid_input),
+        Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Failed(failure),
+        }) => match decode_write_receipt(receipt.payload()) {
+            Ok(new_snapshot_id) => Err(CommitServiceError::finalize_failed_known_committed(
+                Some(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: Vec::new(),
+                }),
+                failure.message().to_string(),
+                crate::connector::iceberg::commit::RecoveryEvidence::from_collector(
+                    &commit_executor.collector,
+                ),
+            )),
+            Err(error) => Err(CommitServiceError::invalid_input(error)),
+        },
+        Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
+            Err(CommitServiceError::unknown(
+                format!(
+                    "{stage_reason}; connector abort outcome is unknown: {}",
+                    failure.message()
+                ),
+                crate::connector::iceberg::commit::RecoveryEvidence::from_collector(
+                    &commit_executor.collector,
+                ),
+            ))
+        }
+        Err(error) => Err(CommitServiceError::unknown(
+            format!("{stage_reason}; connector abort RPC failed: {error}"),
+            crate::connector::iceberg::commit::RecoveryEvidence::from_collector(
+                &commit_executor.collector,
+            ),
+        )),
+    }
+}
+
 pub(crate) struct PreparedIcebergWrite {
     executor: PreparedIcebergWriteExecutor,
     spec: IcebergWriteTransactionSpec,
@@ -761,7 +839,18 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
-        self.executor.run_coordinated_write(&self.spec)
+        crate::engine::execute_query_as_iceberg_write_with_connector_context(
+            &self.executor.state,
+            Some(&self.executor.target.catalog),
+            &self.executor.target.namespace,
+            &self.executor.query,
+            self.executor.sink_spec.clone(),
+            None,
+            crate::sql::compiler::RootDistributionRequirement::Any,
+            self.executor.execution.as_ref(),
+            &self.executor.connector_context,
+            Some(self.executor.connector_write.clone()),
+        )
     }
 
     /// Convert a validated Iceberg write into SQL's inert distributed-write
@@ -802,7 +891,109 @@ impl PreparedIcebergWrite {
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
-        self.executor.finalize(&self.spec)
+        self.executor.commit_executor.finalize()
+    }
+
+    /// Convert an inert prepared append into the mutation reverse-port
+    /// execution.  The returned object retains the exact connector session
+    /// created during request binding so a post-bind failure has a typed abort
+    /// capability instead of being silently abandoned.
+    pub(crate) fn into_mutation_execution(
+        self,
+    ) -> Result<Arc<dyn crate::engine::mutation_flow::MutationExecution>, String> {
+        let state = Arc::clone(&self.executor.state);
+        let commit_executor = Arc::clone(&self.executor.commit_executor);
+        let connector_context = self.executor.connector_context.clone();
+        let execution = self.executor.execution.clone().ok_or_else(|| {
+            "prepared Iceberg mutation write requires an admitted execution context".to_string()
+        })?;
+        let prepared_request = self.into_prepared_distributed_write()?;
+        Ok(Arc::new(PreparedIcebergWriteMutationExecution {
+            state,
+            execution,
+            prepared_request: Mutex::new(Some(prepared_request)),
+            commit_executor,
+            connector_context,
+            operation_session: Mutex::new(None),
+        }))
+    }
+}
+
+struct PreparedIcebergWriteMutationExecution {
+    state: Arc<StandaloneState>,
+    execution: QueryExecutionContext,
+    prepared_request:
+        Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
+    commit_executor: Arc<IcebergWriteCommitExecutor>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    operation_session:
+        Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
+}
+
+impl crate::engine::mutation_flow::MutationExecution for PreparedIcebergWriteMutationExecution {
+    fn stage(&self) -> Result<QueryExecutionResult, String> {
+        let prepared_request = self
+            .prepared_request
+            .lock()
+            .expect("prepared Iceberg mutation request lock poisoned")
+            .take()
+            .ok_or_else(|| "prepared Iceberg mutation request was already consumed".to_string())?;
+        let bound = crate::engine::bind_prepared_distributed_write_request(
+            &self.state.query_execution,
+            &self.execution,
+            prepared_request,
+        )?;
+        let bound = match bound {
+            crate::engine::BoundDistributedWriteBinding::Bound(bound) => bound,
+            crate::engine::BoundDistributedWriteBinding::AbortRequired { session, reason } => {
+                *self
+                    .operation_session
+                    .lock()
+                    .expect("prepared Iceberg mutation session lock poisoned") = Some(session);
+                return Err(reason);
+            }
+        };
+        *self
+            .operation_session
+            .lock()
+            .expect("prepared Iceberg mutation session lock poisoned") = Some(bound.session);
+        crate::engine::execute_bound_distributed_write_request(
+            &self.state.query_execution,
+            bound.request,
+        )
+    }
+
+    fn needs_abort_on_stage_error(&self) -> bool {
+        self.operation_session
+            .lock()
+            .expect("prepared Iceberg mutation session lock poisoned")
+            .is_some()
+    }
+
+    fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
+        let session = self
+            .operation_session
+            .lock()
+            .expect("prepared Iceberg mutation session lock poisoned")
+            .clone()
+            .expect("prepared Iceberg mutation abort requires a retained operation session");
+        abort_iceberg_connector_write(
+            &self.commit_executor,
+            &session,
+            self.connector_context.clone(),
+            reason,
+        )
+    }
+
+    fn commit(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        commit_iceberg_connector_write(&self.commit_executor, completion)
+    }
+
+    fn finalize(&self) -> Result<(), String> {
+        self.commit_executor.finalize()
     }
 }
 
@@ -819,41 +1010,6 @@ struct PreparedIcebergWriteExecutor {
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-}
-
-impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<QueryExecutionResult, String> {
-        crate::engine::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.query,
-            self.sink_spec.clone(),
-            None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
-            self.execution.as_ref(),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )
-    }
-
-    fn commit_connector_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
-        Some(commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        ))
-    }
-
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
-    }
 }
 
 /// Build the `(query, sink_spec)` pair for an iceberg INSERT/OVERWRITE write

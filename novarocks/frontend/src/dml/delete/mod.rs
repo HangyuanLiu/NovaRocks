@@ -18,6 +18,7 @@
 //! Frontend-owned DELETE statement recognition and application routing.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use novarocks::engine::delete_engine::{
@@ -41,6 +42,7 @@ struct DeleteWriteExecutor<'a> {
 
 impl WriteExecutor for DeleteWriteExecutor<'_> {
     type CommitHandle = Arc<dyn DeleteCommit>;
+    type AbortHandle = Infallible;
 
     fn run_coordinated_write(
         &self,
@@ -61,6 +63,14 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
                 }
             },
         )
+    }
+
+    fn abort(
+        &self,
+        _spec: &WriteTransactionSpec,
+        handle: &Self::AbortHandle,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        match *handle {}
     }
 
     fn commit(
@@ -87,6 +97,7 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
             ref_name: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
         },
         operation_kind: OperationKind::RowDelta,
+        operation_subkind: None,
         commit_op_kind: operation.commit_op_kind,
         attempt_id: operation.attempt_id.clone(),
         base_snapshot_id: operation.base_snapshot_id,

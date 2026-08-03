@@ -43,14 +43,9 @@ USE ${case_db};
 insert into t0 SELECT generate_series, NULL FROM TABLE(generate_series(1,  1500));
 
 -- query 5
--- @skip_result_check=true
-USE ${case_db};
-update information_schema.be_configs set value = "0" where name= "two_level_memory_threshold";
-
--- query 6
 USE ${case_db};
 select c1 from t0 where c1 is null group by c1;
 
--- query 7
+-- query 6
 USE ${case_db};
 select c1, count(*) from t0 where c1 is null group by c1;

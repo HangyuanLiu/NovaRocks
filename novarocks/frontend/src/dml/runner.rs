@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::convert::Infallible;
+
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -25,10 +27,10 @@ use crate::dml::now_unix_millis;
 use crate::dml::reconcile;
 
 /// The outcome shape of a coordinated write, as reported by the executor. `H` is
-/// the executor's commit handle carried from the write step into the commit step
-/// (unit `()` for the fake; the real payload for DML-2).
+/// the executor's commit handle carried from the write step into the commit step;
+/// `A` is an exact write-session handle retained for a typed abort decision.
 #[derive(Clone, Debug)]
-pub enum CoordinatedWriteReport<H> {
+pub enum CoordinatedWriteReport<H, A = Infallible> {
     /// Writer aborted before commit; `has_staged` drives cleanup next-action.
     Aborted { reason: String, has_staged: bool },
     /// The writer has no externally visible commit to perform.
@@ -36,6 +38,9 @@ pub enum CoordinatedWriteReport<H> {
     /// The writer produced a commit input. The handle is passed to `commit`,
     /// even when that input has no data files (for example, an overwrite).
     CommitRequired(H),
+    /// Staging reached an exact connector session and must preserve the typed
+    /// abort outcome rather than collapsing it into a generic writer failure.
+    AbortRequired { reason: String, handle: A },
 }
 
 /// Side-effecting dependencies of a write transaction. DML-1 ships only a fake;
@@ -44,12 +49,25 @@ pub enum CoordinatedWriteReport<H> {
 pub trait WriteExecutor {
     /// Opaque payload carried from `run_coordinated_write` to `commit`.
     type CommitHandle;
+    /// Opaque exact-session handle used only when staging requires a typed
+    /// abort. INSERT/DELETE use `Infallible` because their existing writers
+    /// retain the legacy abort report instead.
+    type AbortHandle;
 
     /// Run the coordinated writer plan.
     fn run_coordinated_write(
         &self,
         spec: &WriteTransactionSpec,
-    ) -> Result<CoordinatedWriteReport<Self::CommitHandle>, String>;
+    ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, String>;
+
+    /// Abort a staged operation. The returned certainty is persisted exactly:
+    /// known-uncommitted, known-committed, and unknown remain distinct.
+    #[allow(clippy::result_large_err)]
+    fn abort(
+        &self,
+        spec: &WriteTransactionSpec,
+        handle: &Self::AbortHandle,
+    ) -> Result<CommitOutcome, CommitServiceError>;
 
     /// Commit the collected writer output via the typed commit service.
     // The Err type is core's genuine `CommitServiceError` contract (also consumed
@@ -86,7 +104,7 @@ impl WriteAdmission for AlwaysAdmit {
 
 /// Drives one Iceberg write transaction through the operation state machine,
 /// persisting facts via the journal and delegating side effects to the executor.
-/// Re-authors core `IcebergWriteTransactionRunner::run`
+/// Owns the frontend durable write lifecycle.
 /// (`novarocks/core/src/engine/write_transaction.rs:256`) with narrow ports.
 pub struct WriteTransactionRunner<'a, E: WriteExecutor> {
     journal: &'a dyn OperationJournal,
@@ -112,7 +130,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
 
         let request = CreatePreparingRequest {
             operation_kind: spec.operation_kind,
-            operation_subkind: None,
+            operation_subkind: spec.operation_subkind.clone(),
             target: spec.target.clone(),
             attempt_id: spec.attempt_id.clone(),
             base_snapshot_id: spec.base_snapshot_id,
@@ -158,11 +176,30 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
                 });
             }
             CoordinatedWriteReport::CommitRequired(handle) => handle,
+            CoordinatedWriteReport::AbortRequired { reason: _, handle } => {
+                self.journal
+                    .transition(operation_id, OperationState::Aborting)?;
+                return self.complete_commit_result(
+                    operation_id,
+                    &spec,
+                    self.executor.abort(&spec, &handle),
+                );
+            }
         };
 
         self.journal
             .transition(operation_id, OperationState::Committing)?;
-        match self.executor.commit(&spec, &handle) {
+        self.complete_commit_result(operation_id, &spec, self.executor.commit(&spec, &handle))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn complete_commit_result(
+        &self,
+        operation_id: crate::dml::model::DmlOperationId,
+        spec: &WriteTransactionSpec,
+        result: Result<CommitOutcome, CommitServiceError>,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        match result {
             Ok(outcome) => {
                 let snapshot_id = outcome.new_snapshot_id;
                 if let Err(error) = self.journal.record_fact(
@@ -318,8 +355,9 @@ mod tests {
     };
 
     struct FakeExecutor {
-        write: Result<CoordinatedWriteReport<()>, String>,
+        write: Result<CoordinatedWriteReport<(), String>, String>,
         commit: Result<CommitOutcome, CommitServiceError>,
+        abort: Result<CommitOutcome, CommitServiceError>,
         finalize: Result<(), String>,
     }
 
@@ -331,6 +369,10 @@ mod tests {
                     new_snapshot_id: 42,
                     written_manifest_paths: vec![],
                 }),
+                abort: Ok(CommitOutcome {
+                    new_snapshot_id: 42,
+                    written_manifest_paths: vec![],
+                }),
                 finalize: Ok(()),
             }
         }
@@ -338,12 +380,21 @@ mod tests {
 
     impl WriteExecutor for FakeExecutor {
         type CommitHandle = ();
+        type AbortHandle = String;
 
         fn run_coordinated_write(
             &self,
             _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<()>, String> {
+        ) -> Result<CoordinatedWriteReport<(), String>, String> {
             self.write.clone()
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &String,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            self.abort.clone()
         }
 
         fn commit(
@@ -422,6 +473,7 @@ mod tests {
                 ref_name: None,
             },
             operation_kind: OperationKind::InsertAppend,
+            operation_subkind: None,
             commit_op_kind: CommitOpKind::FastAppend,
             attempt_id: "attempt-1".to_string(),
             base_snapshot_id: None,
@@ -522,6 +574,117 @@ mod tests {
         assert_eq!(
             stored.failure.unwrap().next_action,
             crate::dml::model::IcebergOperationNextAction::RetryAbort
+        );
+    }
+
+    #[test]
+    fn typed_abort_known_uncommitted_is_terminal_failure() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor {
+            write: Ok(CoordinatedWriteReport::AbortRequired {
+                reason: "staging failed".to_string(),
+                handle: "exact-session".to_string(),
+            }),
+            abort: Err(CommitServiceError::known_uncommitted(
+                "staging cleanup failed".to_string(),
+                CleanupAttempt {
+                    attempted: true,
+                    error_count: 1,
+                    error_paths: vec![],
+                },
+            )),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+
+        let error = runner.run(spec()).expect_err("abort result is a failure");
+        assert_eq!(error.kind(), DmlErrorKind::Commit);
+        let stored = journal.only_operation();
+        assert_eq!(stored.state, OperationState::FailedKnownUncommitted);
+        let cleanup = stored.cleanup_outcome.expect("cleanup result persisted");
+        assert!(cleanup.attempted);
+        assert_eq!(cleanup.error_count, 1);
+        assert!(cleanup.error_paths.is_empty());
+        assert_eq!(
+            stored.failure.expect("failure persisted").next_action,
+            crate::dml::model::IcebergOperationNextAction::RetryAbort
+        );
+    }
+
+    #[test]
+    fn typed_abort_known_committed_finalizes_without_commit_replay() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor {
+            write: Ok(CoordinatedWriteReport::AbortRequired {
+                reason: "staging reply lost".to_string(),
+                handle: "exact-session".to_string(),
+            }),
+            abort: Ok(CommitOutcome {
+                new_snapshot_id: 88,
+                written_manifest_paths: vec!["manifest.avro".to_string()],
+            }),
+            commit: Err(CommitServiceError::unknown(
+                "commit must not be replayed".to_string(),
+                evidence(),
+            )),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+
+        let outcome = runner.run(spec()).expect("known commit is finalized");
+        assert_eq!(outcome.committed_snapshot_id, Some(88));
+        let stored = journal.only_operation();
+        assert_eq!(stored.state, OperationState::Finalized);
+        assert_eq!(stored.commit_outcome.unwrap().snapshot_id, 88);
+    }
+
+    #[test]
+    fn typed_abort_unknown_remains_unresolved() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor {
+            write: Ok(CoordinatedWriteReport::AbortRequired {
+                reason: "staging cancellation".to_string(),
+                handle: "exact-session".to_string(),
+            }),
+            abort: Err(CommitServiceError::unknown(
+                "abort reply lost".to_string(),
+                evidence(),
+            )),
+            ..FakeExecutor::default()
+        };
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+
+        let error = runner
+            .run(spec())
+            .expect_err("unknown abort stays unresolved");
+        assert_eq!(error.kind(), DmlErrorKind::Commit);
+        let stored = journal.only_operation();
+        assert_eq!(stored.state, OperationState::CommitUnknown);
+        assert!(!stored.state.is_finished());
+    }
+
+    #[test]
+    fn operation_subkind_is_forwarded_to_preparing_record() {
+        let journal = InMemoryOperationJournal::default();
+        let executor = FakeExecutor::default();
+        let admit = AlwaysAdmit;
+        let runner = WriteTransactionRunner::new(&journal, &executor, &admit);
+        let mut row_delta = spec();
+        row_delta.operation_kind = OperationKind::RowDelta;
+        row_delta.operation_subkind = Some("UPDATE".to_string());
+
+        let outcome = runner.run(row_delta).expect("write succeeds");
+        assert_eq!(
+            journal
+                .load(outcome.operation_id.expect("operation id"))
+                .unwrap()
+                .expect("stored operation")
+                .operation_subkind
+                .as_deref(),
+            Some("UPDATE")
         );
     }
 

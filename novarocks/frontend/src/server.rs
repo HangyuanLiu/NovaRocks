@@ -165,6 +165,7 @@ where
                 move |engine| {
                     let insert_engine = engine.insert_engine();
                     let delete_engine = engine.delete_engine();
+                    let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
                     let truncate_engine = engine.truncate_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
@@ -176,6 +177,7 @@ where
                         dml,
                         insert_engine,
                         delete_engine,
+                        mutation_engine,
                         ctas_engine,
                         truncate_engine,
                     )))
@@ -228,6 +230,7 @@ where
                 move |engine| {
                     let insert_engine = engine.insert_engine();
                     let delete_engine = engine.delete_engine();
+                    let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
                     let truncate_engine = engine.truncate_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
@@ -239,6 +242,7 @@ where
                         dml,
                         insert_engine,
                         delete_engine,
+                        mutation_engine,
                         ctas_engine,
                         truncate_engine,
                     )))

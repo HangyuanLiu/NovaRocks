@@ -106,6 +106,7 @@ pub(crate) fn build_dml_change_stream_write_plan(
     producer: OptimizedOperatorNode,
     table_bindings: std::sync::Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
     execution: crate::query_execution::request_context::QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     branch_set: DmlChangeStreamBranchSet,
     target_ref: &str,
 ) -> Result<DmlChangeStreamWritePlan, String> {
@@ -126,10 +127,7 @@ pub(crate) fn build_dml_change_stream_write_plan(
     let resolved = {
         crate::connector::metadata_load_table(
             state.connector_control.as_ref(),
-            crate::connector::connector_request_context(
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?,
+            connector_context.clone(),
             &target.catalog,
             &target.namespace,
             &target.table,

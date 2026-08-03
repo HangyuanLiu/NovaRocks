@@ -171,6 +171,8 @@ pub fn validate_operation_transition(
                 OperationState::Finalizing
             )
             | (OperationState::Aborting, OperationState::Aborted)
+            | (OperationState::Aborting, OperationState::Committed)
+            | (OperationState::Aborting, OperationState::CommitUnknown)
             | (
                 OperationState::Aborting,
                 OperationState::FailedKnownUncommitted
@@ -495,6 +497,9 @@ pub struct OperationMutationRequest {
 pub struct WriteTransactionSpec {
     pub target: OperationTarget,
     pub operation_kind: OperationKind,
+    /// Stable statement refinement retained in the existing WriteV1 journal
+    /// envelope. `None` preserves INSERT/DELETE compatibility.
+    pub operation_subkind: Option<String>,
     pub commit_op_kind: CommitOpKind,
     pub attempt_id: String,
     pub base_snapshot_id: Option<i64>,
@@ -590,12 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn typed_abort_preserves_known_and_unknown_commit_certainty() {
+        assert!(
+            validate_operation_transition(OperationState::Aborting, OperationState::Committed,)
+                .is_ok()
+        );
+        assert!(
+            validate_operation_transition(OperationState::Aborting, OperationState::CommitUnknown,)
+                .is_ok()
+        );
+        assert!(
+            validate_operation_transition(OperationState::Aborting, OperationState::Finalized,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn ctas_unknown_and_cleanup_edges_do_not_widen_other_dml() {
         let ctas_edges = [
             (OperationState::Preparing, OperationState::CommitUnknown),
             (OperationState::Writing, OperationState::CommitUnknown),
             (OperationState::Committing, OperationState::Aborting),
-            (OperationState::Aborting, OperationState::CommitUnknown),
             (OperationState::CommitUnknown, OperationState::Aborting),
             (OperationState::CommitUnknown, OperationState::Writing),
             (OperationState::CommitUnknown, OperationState::Committing),

@@ -29,6 +29,7 @@ pub mod error;
 pub mod insert;
 pub mod journal;
 pub mod model;
+pub mod mutation;
 pub mod reconcile;
 pub mod runner;
 pub mod service;
