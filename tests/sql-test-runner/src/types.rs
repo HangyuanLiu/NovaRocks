@@ -95,6 +95,8 @@ pub struct QueryMeta {
     /// This is intentionally a post-statement control-plane failure, not a
     /// query-lifecycle injection, so durable background work can be recovered.
     pub restart_fe_after_step: bool,
+    /// One runner-owned, frontend-only connector-cleanup fault token.
+    pub cleanup_fault: Option<String>,
     pub drop_next_init_ack_be_index: Option<usize>,
     pub stop_query_control_heartbeat_be_index: Option<usize>,
     pub kill_fe_after_control_ready_count: Option<usize>,

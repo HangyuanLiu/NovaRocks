@@ -66,6 +66,16 @@ pub fn sql_test_query_lifecycle_fault_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Separate frontend-only fault scope for durable connector cleanup.  It must
+/// not be reused by query lifecycle/fragment tests because cleanup has no BE
+/// participation.
+pub fn sql_test_cleanup_fault_dir() -> Option<PathBuf> {
+    novarocks_app_config()
+        .ok()
+        .and_then(|config| config.debug.cleanup_fault_dir())
+        .map(PathBuf::from)
+}
+
 pub fn exchange_wait_ms() -> u64 {
     novarocks_app_config()
         .ok()

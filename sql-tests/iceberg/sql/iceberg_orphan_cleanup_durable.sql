@@ -18,7 +18,8 @@
 -- @sequential=true
 -- A cross-process FE durability smoke: cleanup uses the FE StateStore, has no
 -- BE fragment path, and remains terminal across an FE restart.  Candidate and
--- fault-matrix coverage lives in the provider and runner harness tests.
+-- response loss is injected after the provider deletes, so restart recovery
+-- can prove it reconciles the frozen batch without a second delete.
 
 -- query 1
 -- @skip_result_check=true
@@ -42,8 +43,9 @@ INSERT INTO cleanup_ice_${uuid0}.ns_${uuid0}.orders VALUES (1), (2);
 -- @db=cleanup_ice_${uuid0}.ns_${uuid0}
 -- @iceberg_orphan_fixture=ns_${uuid0}.orders
 -- @iceberg_orphan_fixture_absent=true
--- @result_contains=novarocks-orphan-fixture
 -- @skip_result_check=true
+-- @cleanup_fault=drop_delete_response
+-- @expect_error=orphan cleanup dispatch outcome is unknown
 -- @restart_fe_after_step=true
 -- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
 -- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED

@@ -37,6 +37,7 @@ use super::commit::remove_orphan_files::{
 };
 use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
+use crate::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
 
 const ARTIFACT_VERSION: u16 = 1;
 const MAX_ARTIFACT_PARTS: usize = 64;
@@ -320,6 +321,9 @@ impl IcebergCleanupMaintenanceAdapter {
         payload: &IcebergCleanupPlanPayloadV1,
         records: Vec<ReceiptRecordV1>,
     ) -> Result<BatchReceipt, ConnectorError> {
+        if claim_cleanup_fault(CleanupFaultKind::ReceiptWriteFailed).map_err(unavailable)? {
+            return Err(unavailable("debug cleanup receipt write failed"));
+        }
         let receipt_root = format!(
             "{}/receipts/{:04}",
             payload.artifact_root,
@@ -557,7 +561,30 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             return Ok(receipt);
         }
         let entry = self.entry()?;
-        let outcomes = execute_frozen_batch(&batch, entry.object_store_config())?;
+        let outcomes =
+            if claim_cleanup_fault(CleanupFaultKind::DeleteFailed).map_err(unavailable)? {
+                batch
+                    .iter()
+                    .map(|record| {
+                        receipt(
+                            record.ordinal,
+                            ObjectOutcomeV1::Failed,
+                            Some("debug cleanup delete failure".to_string()),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                execute_frozen_batch(&batch, entry.object_store_config())?
+            };
+        if claim_cleanup_fault(CleanupFaultKind::KillFeAfterDelete).map_err(unavailable)? {
+            tracing::error!("NOVAROCKS_CLEANUP_FAULT_KILL_FE_AFTER_DELETE");
+            // The destructive call returned, but no receipt has been
+            // persisted. Startup may only reconcile this frozen batch.
+            std::process::exit(97);
+        }
+        if claim_cleanup_fault(CleanupFaultKind::DropDeleteResponse).map_err(unavailable)? {
+            return Err(unavailable("debug cleanup delete response dropped"));
+        }
         self.receipt_for_records(&request.plan, &request.prepared, &payload, outcomes)
     }
 

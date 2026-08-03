@@ -1159,4 +1159,18 @@ mod tests {
             "unsupported scheme should be explicit, got: {err}"
         );
     }
+
+    #[test]
+    fn canonical_object_mtime_uses_restatable_second_precision() {
+        // MinIO list can preserve milliseconds while a later stat is second
+        // precision. Both observations must freeze the same object identity.
+        assert_eq!(
+            canonical_object_mtime_ms(1_785_760_461_050),
+            1_785_760_461_000
+        );
+        assert_eq!(
+            canonical_object_mtime_ms(1_785_760_461_000),
+            1_785_760_461_000
+        );
+    }
 }

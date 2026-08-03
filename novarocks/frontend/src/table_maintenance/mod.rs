@@ -21,6 +21,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use novarocks::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
 use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
@@ -347,6 +348,11 @@ impl FrontendTableMaintenanceService {
             match engine.execute_cleanup_batch(&session, prepared)? {
                 CleanupBatchExecution::Receipt(receipt) => {
                     let checkpoint = cleanup_receipt_checkpoint(prepared_checkpoint, &receipt);
+                    if claim_cleanup_fault(CleanupFaultKind::CheckpointFailed)
+                        .map_err(|error| format!("claim cleanup checkpoint fault: {error}"))?
+                    {
+                        return Err("debug cleanup checkpoint write failed; exact-generation reconciliation is required".to_string());
+                    }
                     let operation = self
                         .block_on(repository.checkpoint_batch(durable_id, checkpoint))
                         .map_err(|error| {

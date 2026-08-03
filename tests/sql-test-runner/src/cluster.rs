@@ -441,6 +441,12 @@ pub(crate) trait ServerHandle: Send {
     fn supports_fault_injection(&self) -> bool {
         false
     }
+    fn arm_cleanup_fault(&mut self, kind: &str) -> Result<()> {
+        bail!("connector cleanup fault is unsupported by this server mode (kind={kind})")
+    }
+    fn clear_cleanup_faults(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn supports_query_execution_resource_oracle(&self) -> bool {
         false
     }
@@ -672,6 +678,7 @@ pub(crate) fn launch_server(
     repo_root: &Path,
     runner_config: &RunnerConfig,
     query_lifecycle_faults_enabled: bool,
+    cleanup_faults_enabled: bool,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -680,6 +687,7 @@ pub(crate) fn launch_server(
             repo_root,
             runner_config,
             query_lifecycle_faults_enabled,
+            cleanup_faults_enabled,
         )?)),
     }
 }
@@ -895,6 +903,7 @@ fn render_cross_process_launch_config(
     runtime_dir: &Path,
     metadata_mode: CrossProcessMetadataMode<'_>,
     query_lifecycle_faults_enabled: bool,
+    cleanup_faults_enabled: bool,
 ) -> Result<String> {
     let rendered = match metadata_mode {
         CrossProcessMetadataMode::Isolated => {
@@ -987,6 +996,13 @@ fn render_cross_process_launch_config(
         runtime_table.insert(
             "query_control_terminal_retention_ms".to_string(),
             Value::Integer(2_000),
+        );
+    }
+    if cleanup_faults_enabled && role == ClusterProcessRole::Fe {
+        let debug = table_mut(root, "debug");
+        debug.insert(
+            "cleanup_fault_dir".to_string(),
+            Value::String(runtime_dir.join("connector-cleanup-faults").to_string_lossy().into_owned()),
         );
     }
     toml::to_string(&value).context("serialize cross-process launch config")
@@ -1234,6 +1250,49 @@ impl Drop for QueryLifecycleFaultFiles {
     }
 }
 
+struct CleanupFaultFiles {
+    root: PathBuf,
+}
+
+impl CleanupFaultFiles {
+    fn new(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root)
+            .with_context(|| format!("create connector cleanup fault scope {}", root.display()))?;
+        Ok(Self { root: root.to_path_buf() })
+    }
+
+    fn root(&self) -> &Path { &self.root }
+
+    fn arm(&self, kind: &str) -> Result<()> {
+        const ALLOWED: &[&str] = &[
+            "delete_failed", "drop_delete_response", "receipt_write_failed",
+            "checkpoint_failed", "kill_fe_after_delete",
+        ];
+        if !ALLOWED.contains(&kind) {
+            bail!("unsupported connector cleanup fault {kind}");
+        }
+        let stem = kind.replace('_', "-");
+        let path = self.root.join(format!("{stem}.trigger"));
+        let token = next_fragment_failure_token(0);
+        publish_query_lifecycle_fault_token(&path, &token, token.as_bytes())
+            .with_context(|| format!("publish connector cleanup fault {kind}"))
+    }
+
+    fn clear(&self) -> Result<()> {
+        match fs::remove_dir_all(&self.root) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).with_context(|| format!("clear connector cleanup fault scope {}", self.root.display())),
+        }
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("recreate connector cleanup fault scope {}", self.root.display()))
+    }
+}
+
+impl Drop for CleanupFaultFiles {
+    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+}
+
 pub(crate) struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
@@ -1244,6 +1303,8 @@ pub(crate) struct CrossProcessServerHandle {
     query_lifecycle_fault_files: QueryLifecycleFaultFiles,
     query_lifecycle_fault_tokens: BTreeMap<(usize, &'static str), String>,
     query_lifecycle_faults_enabled: bool,
+    cleanup_fault_files: Option<CleanupFaultFiles>,
+    cleanup_faults_enabled: bool,
     runtime_dir: PathBuf,
     runtime: CrossProcessRuntime,
     novarocks_bin: PathBuf,
@@ -1300,6 +1361,7 @@ impl CrossProcessServerHandle {
         repo_root: &Path,
         runner_config: &RunnerConfig,
         query_lifecycle_faults_enabled: bool,
+        cleanup_faults_enabled: bool,
     ) -> Result<Self> {
         Self::launch_impl(
             cluster_size,
@@ -1307,6 +1369,7 @@ impl CrossProcessServerHandle {
             runner_config,
             CrossProcessMetadataMode::Isolated,
             query_lifecycle_faults_enabled,
+            cleanup_faults_enabled,
         )
     }
 
@@ -1333,6 +1396,7 @@ impl CrossProcessServerHandle {
             runner_config,
             CrossProcessMetadataMode::Explicit(metadata_db_path),
             false,
+            false,
         )
     }
 
@@ -1342,6 +1406,7 @@ impl CrossProcessServerHandle {
         runner_config: &RunnerConfig,
         metadata_mode: CrossProcessMetadataMode<'_>,
         query_lifecycle_faults_enabled: bool,
+        cleanup_faults_enabled: bool,
     ) -> Result<Self> {
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(repo_root)?);
         let reserved = ReservedRuntimePorts::new(cluster_size)?;
@@ -1349,6 +1414,9 @@ impl CrossProcessServerHandle {
             &runtime_dir.path().join("query-lifecycle-faults"),
             cluster_size,
         )?;
+        let cleanup_fault_files = cleanup_faults_enabled
+            .then(|| CleanupFaultFiles::new(&runtime_dir.path().join("connector-cleanup-faults")))
+            .transpose()?;
 
         // Build runtime port record from reserved ports (before releasing any).
         let runtime = CrossProcessRuntime {
@@ -1394,6 +1462,7 @@ impl CrossProcessServerHandle {
                 runtime_dir.path(),
                 metadata_mode,
                 query_lifecycle_faults_enabled,
+                cleanup_faults_enabled,
             )
         };
 
@@ -1438,6 +1507,7 @@ impl CrossProcessServerHandle {
                 Some(&fragment_failure_trigger_paths[i]),
                 query_lifecycle_faults_enabled
                     .then_some((query_lifecycle_fault_files.root(), Some(i))),
+                None,
             )?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -1460,6 +1530,7 @@ impl CrossProcessServerHandle {
             runtime_dir.path().join("fe.log"),
             None,
             query_lifecycle_faults_enabled.then_some((query_lifecycle_fault_files.root(), None)),
+            cleanup_fault_files.as_ref().map(CleanupFaultFiles::root),
         )?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -1488,6 +1559,8 @@ impl CrossProcessServerHandle {
             query_lifecycle_fault_files,
             query_lifecycle_fault_tokens: BTreeMap::new(),
             query_lifecycle_faults_enabled,
+            cleanup_fault_files,
+            cleanup_faults_enabled,
             runtime_dir: runtime_dir.into_path(),
             runtime,
             novarocks_bin,
@@ -1647,6 +1720,22 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn supports_fault_injection(&self) -> bool {
         true
+    }
+
+    fn arm_cleanup_fault(&mut self, kind: &str) -> Result<()> {
+        let files = self.cleanup_fault_files.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("connector cleanup fault scope was not enabled for this selected SQL case")
+        })?;
+        files.arm(kind)?;
+        println!("armed connector cleanup fault {kind} root={}", files.root().display());
+        Ok(())
+    }
+
+    fn clear_cleanup_faults(&mut self) -> Result<()> {
+        if let Some(files) = &self.cleanup_fault_files {
+            files.clear()?;
+        }
+        Ok(())
     }
 
     fn supports_query_execution_resource_oracle(&self) -> bool {
@@ -2262,6 +2351,10 @@ impl ServerHandle for CrossProcessServerHandle {
                 self.query_lifecycle_fault_files.root(),
             );
         }
+        if self.cleanup_faults_enabled {
+            let files = self.cleanup_fault_files.as_ref().expect("cleanup fault scope enabled");
+            command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", files.root());
+        }
         self.fe_process
             .restart(
                 command,
@@ -2405,6 +2498,7 @@ fn spawn_novarocks_process(
     log_path: PathBuf,
     fragment_failure_trigger: Option<&Path>,
     query_lifecycle_fault_scope: Option<(&Path, Option<usize>)>,
+    cleanup_fault_dir: Option<&Path>,
 ) -> Result<ManagedProcess> {
     let mut command = build_novarocks_command(binary, role, config_path);
     if let Some(trigger_path) = fragment_failure_trigger {
@@ -2421,6 +2515,9 @@ fn spawn_novarocks_process(
                 backend_index.to_string(),
             );
         }
+    }
+    if let Some(fault_dir) = cleanup_fault_dir {
+        command.env("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR", fault_dir);
     }
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
@@ -3299,6 +3396,7 @@ exec_node_output = true
             first_runtime,
             CrossProcessMetadataMode::Isolated,
             false,
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -3310,6 +3408,7 @@ exec_node_output = true
             &runtime,
             second_runtime,
             CrossProcessMetadataMode::Isolated,
+            false,
             false,
         )
         .unwrap()
@@ -3358,6 +3457,7 @@ exec_node_output = true
             runtime_dir,
             CrossProcessMetadataMode::Isolated,
             true,
+            false,
         )
         .expect("render explicit lifecycle fault config")
         .parse::<Value>()
@@ -3384,6 +3484,7 @@ exec_node_output = true
             cluster_a_runtime,
             CrossProcessMetadataMode::Isolated,
             false,
+            false,
         )
         .unwrap()
         .parse::<Value>()
@@ -3395,6 +3496,7 @@ exec_node_output = true
             &runtime,
             Path::new("/tmp/novarocks-imv-l2-cluster-b"),
             CrossProcessMetadataMode::Explicit(cluster_b_metadata),
+            false,
             false,
         )
         .unwrap()

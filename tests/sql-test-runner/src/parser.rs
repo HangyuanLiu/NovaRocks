@@ -234,6 +234,22 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "restart_fe_after_step" => {
                 meta.restart_fe_after_step = parse_bool(&raw_value)?;
             }
+            "cleanup_fault" => {
+                const ALLOWED: &[&str] = &[
+                    "delete_failed",
+                    "drop_delete_response",
+                    "receipt_write_failed",
+                    "checkpoint_failed",
+                    "kill_fe_after_delete",
+                ];
+                if !ALLOWED.contains(&raw_value.as_str()) {
+                    bail!(
+                        "invalid cleanup_fault: {raw_value}; expected one of {}",
+                        ALLOWED.join(", ")
+                    );
+                }
+                meta.cleanup_fault = Some(raw_value);
+            }
             "drop_next_init_ack_be_index" => {
                 let value = raw_value
                     .parse::<usize>()
@@ -510,6 +526,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .restart_be_after_init_ack_index
             .or(base.restart_be_after_init_ack_index),
         restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
+        cleanup_fault: override_meta
+            .cleanup_fault
+            .clone()
+            .or_else(|| base.cleanup_fault.clone()),
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),

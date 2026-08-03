@@ -99,6 +99,32 @@ pub(crate) struct QueryLifecycleFaultStepGuard {
     server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
 }
 
+pub(crate) struct CleanupFaultStepGuard {
+    server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
+}
+
+pub(crate) fn cleanup_fault_step_guard(
+    meta: &QueryMeta,
+    server: Arc<Mutex<Box<dyn ServerHandle>>>,
+) -> CleanupFaultStepGuard {
+    CleanupFaultStepGuard {
+        server: meta.cleanup_fault.is_some().then_some(server),
+    }
+}
+
+impl Drop for CleanupFaultStepGuard {
+    fn drop(&mut self) {
+        let Some(server) = self.server.take() else { return; };
+        let mut server = match server.lock() {
+            Ok(server) => server,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Err(error) = server.clear_cleanup_faults() {
+            eprintln!("failed to clear connector cleanup fault triggers after SQL step: {error:#}");
+        }
+    }
+}
+
 pub(crate) fn query_lifecycle_fault_step_guard(
     meta: &QueryMeta,
     server: Arc<Mutex<Box<dyn ServerHandle>>>,
@@ -143,7 +169,8 @@ impl Drop for QueryLifecycleFaultStepGuard {
 }
 
 pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
-    meta.kill_be_index.is_some()
+    meta.cleanup_fault.is_some()
+        || meta.kill_be_index.is_some()
         || meta.kill_be_after_fragment_start.is_some()
         || meta.fail_fragment_after_start_be_index.is_some()
         || meta.network_partition_be.is_some()
@@ -178,6 +205,9 @@ pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
 }
 
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
+    if let Some(kind) = &meta.cleanup_fault {
+        server.arm_cleanup_fault(kind)?;
+    }
     let fragment_fault_count = [
         meta.kill_be_index.is_some(),
         meta.kill_be_after_fragment_start.is_some(),
