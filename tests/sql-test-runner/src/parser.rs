@@ -234,6 +234,22 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "restart_fe_after_step" => {
                 meta.restart_fe_after_step = parse_bool(&raw_value)?;
             }
+            "cleanup_fault" => {
+                const ALLOWED: &[&str] = &[
+                    "delete_failed",
+                    "drop_delete_response",
+                    "receipt_write_failed",
+                    "checkpoint_failed",
+                    "kill_fe_after_delete",
+                ];
+                if !ALLOWED.contains(&raw_value.as_str()) {
+                    bail!(
+                        "invalid cleanup_fault: {raw_value}; expected one of {}",
+                        ALLOWED.join(", ")
+                    );
+                }
+                meta.cleanup_fault = Some(raw_value);
+            }
             "drop_next_init_ack_be_index" => {
                 let value = raw_value
                     .parse::<usize>()
@@ -347,6 +363,15 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     format!("invalid query_control_fragment_backend_limit: {raw_value}")
                 })?;
                 meta.query_control_fragment_backend_limit = Some(value);
+            }
+            "iceberg_orphan_fixture" => {
+                if raw_value.is_empty() {
+                    bail!("@iceberg_orphan_fixture requires <namespace>.<table>");
+                }
+                meta.iceberg_orphan_fixture = Some(raw_value);
+            }
+            "iceberg_orphan_fixture_absent" => {
+                meta.iceberg_orphan_fixture_absent = parse_bool(&raw_value)?;
             }
             "wait_alter_column" => {
                 meta.wait_alter_column = Some(raw_value);
@@ -501,6 +526,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .restart_be_after_init_ack_index
             .or(base.restart_be_after_init_ack_index),
         restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
+        cleanup_fault: override_meta
+            .cleanup_fault
+            .clone()
+            .or_else(|| base.cleanup_fault.clone()),
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
@@ -539,6 +568,12 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         query_control_fragment_backend_limit: override_meta
             .query_control_fragment_backend_limit
             .or(base.query_control_fragment_backend_limit),
+        iceberg_orphan_fixture: override_meta
+            .iceberg_orphan_fixture
+            .clone()
+            .or_else(|| base.iceberg_orphan_fixture.clone()),
+        iceberg_orphan_fixture_absent: override_meta.iceberg_orphan_fixture_absent
+            || base.iceberg_orphan_fixture_absent,
         wait_alter_column: override_meta
             .wait_alter_column
             .clone()

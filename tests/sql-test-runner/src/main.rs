@@ -20,6 +20,7 @@ mod cluster;
 mod be_log_directive;
 mod config;
 mod fault_injection;
+mod iceberg_orphan_fixture;
 mod imv_stateless;
 mod managed_process;
 mod parser;
@@ -1538,6 +1539,29 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             &step.meta,
             Arc::clone(&ctx.server_handle),
         );
+        let _cleanup_fault_guard = fault_injection::cleanup_fault_step_guard(
+            &step.meta,
+            Arc::clone(&ctx.server_handle),
+        );
+        let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
+            Some(table) => match iceberg_orphan_fixture::install(table) {
+                Ok(fixture) => {
+                    let _ = writeln!(log, "    @iceberg_orphan_fixture installed {}", fixture.location());
+                    Some(fixture)
+                }
+                Err(error) => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ install orphan fixture: {error:#}");
+                    break;
+                }
+            },
+            None if step.meta.iceberg_orphan_fixture_absent => {
+                case_failed = true;
+                let _ = writeln!(log, "    ❌ @iceberg_orphan_fixture_absent requires @iceberg_orphan_fixture");
+                break;
+            }
+            None => None,
+        };
 
         let be_log_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => be_log_directive::snapshot_with_deadline(
@@ -1685,15 +1709,54 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 }
 
                 if step.meta.expect_error_code.is_some() || step.meta.expect_error.is_some() {
-                    if !finish_expected_error_step(
+                    let expected_ok = finish_expected_error_step(
                         step,
                         matched_expected_error,
                         &last_failure,
                         &ctx.server_handle,
                         &be_log_snapshot,
                         &mut log,
-                    ) {
+                    );
+                    if !expected_ok {
                         case_failed = true;
+                    } else {
+                        // A durable maintenance error can intentionally be
+                        // followed by an FE restart.  In particular cleanup
+                        // response-loss cases must prove startup reconciles
+                        // the frozen prepared batch rather than merely
+                        // returning the expected client error.
+                        if let Err(error) = restart_frontend_after_step(
+                            step,
+                            &ctx.server_handle,
+                            &mut target_session,
+                            &mut log,
+                        ) {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                        if step.meta.iceberg_orphan_fixture_absent {
+                            let Some(fixture) = orphan_fixture.as_ref() else {
+                                case_failed = true;
+                                let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                                continue;
+                            };
+                            if let Err(error) = fixture.assert_absent() {
+                                case_failed = true;
+                                let _ = writeln!(log, "    ❌ {error:#}");
+                                continue;
+                            }
+                            let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
+                        }
+                        if let Err(reason) = run_be_log_directives_for_successful_step(
+                            step,
+                            &ctx.server_handle,
+                            &be_log_snapshot,
+                            &mut log,
+                        ) {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ FAIL: {reason}");
+                        }
                     }
                 } else if let Some(execution) = passed_execution {
                     if let Err(error) = restart_frontend_after_step(
@@ -1706,6 +1769,19 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         case_failed = true;
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
+                    }
+                    if step.meta.iceberg_orphan_fixture_absent {
+                        let Some(fixture) = orphan_fixture.as_ref() else {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            continue;
+                        };
+                        if let Err(error) = fixture.assert_absent() {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                        let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(
@@ -2006,6 +2082,19 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let _ = writeln!(log, "    ❌ {error:#}");
                             continue;
                         }
+                    }
+                    if step.meta.iceberg_orphan_fixture_absent {
+                        let Some(fixture) = orphan_fixture.as_ref() else {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ orphan fixture was not installed");
+                            continue;
+                        };
+                        if let Err(error) = fixture.assert_absent() {
+                            case_failed = true;
+                            let _ = writeln!(log, "    ❌ {error:#}");
+                            continue;
+                        }
+                        let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
                     // Run wait_alter post-execution polling if annotated.
                     let (wait_ok, wait_elapsed) = run_step_wait_alters(
@@ -2714,6 +2803,12 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
     })
 }
 
+fn sql_text_has_cleanup_fault_directive(sql: &str) -> bool {
+    sql.lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with("-- @cleanup_fault="))
+}
+
 fn validate_selected_suite_cluster(
     suite_names: &[String],
     mode: ClusterMode,
@@ -2768,6 +2863,38 @@ fn selected_cases_require_query_lifecycle_faults(
             if sql_text_has_query_lifecycle_fault_directive(&sql) {
                 return Ok(true);
             }
+        }
+    }
+    Ok(false)
+}
+
+fn selected_cases_require_cleanup_faults(
+    cli: &Cli,
+    suite_names: &[String],
+    suite_configs: &BTreeMap<String, SuiteConfig>,
+    base_dir: &std::path::Path,
+) -> Result<bool> {
+    for suite_name in suite_names {
+        let suite = suite_configs
+            .get(suite_name)
+            .with_context(|| format!("selected suite {suite_name} is missing"))?;
+        let sql_dir = resolve_path(cli.sql_dir.as_deref(), base_dir)
+            .unwrap_or_else(|| suite.sql_dir.clone());
+        let sql_glob = cli.sql_glob.clone().unwrap_or_else(|| suite.sql_glob.clone());
+        let mut files = list_sql_files(&sql_dir, &sql_glob)?;
+        let available = files.iter().filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+            .map(ToOwned::to_owned).collect::<HashSet<_>>();
+        let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
+        let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
+        files.retain(|path| {
+            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else { return false; };
+            (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
+        });
+        if let Some(limit) = cli.limit { files.truncate(limit.min(files.len())); }
+        for path in files {
+            let sql = fs::read_to_string(&path)
+                .with_context(|| format!("read cleanup fault preflight {}", path.display()))?;
+            if sql_text_has_cleanup_fault_directive(&sql) { return Ok(true); }
         }
     }
     Ok(false)
@@ -2891,6 +3018,8 @@ fn run() -> Result<i32> {
             &suite_configs,
             &base_dir,
         )?;
+    let cleanup_faults_enabled = !cli.dry_run
+        && selected_cases_require_cleanup_faults(&cli, &suite_names, &suite_configs, &base_dir)?;
 
     let launch_cluster_mode = if cli.dry_run {
         ClusterMode::AllInOne
@@ -2908,6 +3037,7 @@ fn run() -> Result<i32> {
         &base_dir,
         &runner_config,
         query_lifecycle_faults_enabled,
+        cleanup_faults_enabled,
     )?;
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);

@@ -21,6 +21,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use novarocks::common::cleanup_fault::{CleanupFaultKind, claim_configured as claim_cleanup_fault};
+use novarocks::connector::cleanup_maintenance::CleanupBatchExecution;
 use novarocks::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use novarocks::connector::metadata_maintenance::MetadataMaintenanceIntent;
 use novarocks::engine::table_maintenance::{
@@ -29,15 +31,17 @@ use novarocks::engine::table_maintenance::{
     TableMaintenanceService,
 };
 use novarocks_spi::connector::{
+    BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
     ConnectorMutationOperationId, ConnectorWriteOperationId, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, PreparedBatch,
 };
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
 use self::model::{
+    CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
     DistributedRewriteOperationKind, DistributedRewritePlanPayload, MetadataMaintenanceExactOwner,
@@ -49,8 +53,9 @@ use self::parser::{
     parse_maintenance_statement, parse_show_optimize,
 };
 use self::repository::{
-    DistributedRewriteOperationRepository, MetadataMaintenanceOperationRepository,
-    OptimizeJobRepository, RepositoryErrorKind, distributed_rewrite_payload_digest,
+    CleanupOperationRepository, DistributedRewriteOperationRepository,
+    MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
+    cleanup_payload_digest, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
 };
 use self::result::{action_result, optimize_jobs_result};
@@ -70,6 +75,7 @@ const METADATA_MAINTENANCE_STATE_STORE_REQUIRED: &str =
     "connector metadata maintenance requires frontend StateStore";
 const DISTRIBUTED_REWRITE_STATE_STORE_REQUIRED: &str =
     "connector distributed rewrite requires frontend StateStore";
+const CLEANUP_STATE_STORE_REQUIRED: &str = "connector orphan cleanup requires frontend StateStore";
 
 enum WorkerLifecycle {
     NotStarted,
@@ -82,42 +88,56 @@ pub struct FrontendTableMaintenanceService {
     repository: Option<Arc<OptimizeJobRepository>>,
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
     distributed_rewrite_repository: Option<Arc<DistributedRewriteOperationRepository>>,
+    cleanup_repository: Option<Arc<CleanupOperationRepository>>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
 }
 
 impl FrontendTableMaintenanceService {
     pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
-        let (repository, metadata_repository, distributed_rewrite_repository) = match store {
-            Some(store) => (
-                Some(Arc::new(
-                    OptimizeJobRepository::open(Arc::clone(&store))
-                        .await
-                        .map_err(|error| {
-                            format!("open frontend optimize job repository failed: {error}")
-                        })?,
-                )),
-                Some(Arc::new(
-                    MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
-                        .await
-                        .map_err(|error| {
-                            format!("open frontend metadata maintenance repository failed: {error}")
-                        })?,
-                )),
-                Some(Arc::new(
-                    DistributedRewriteOperationRepository::open(store)
-                        .await
-                        .map_err(|error| {
-                            format!("open frontend distributed rewrite repository failed: {error}")
-                        })?,
-                )),
-            ),
-            None => (None, None, None),
-        };
+        let (repository, metadata_repository, distributed_rewrite_repository, cleanup_repository) =
+            match store {
+                Some(store) => (
+                    Some(Arc::new(
+                        OptimizeJobRepository::open(Arc::clone(&store))
+                            .await
+                            .map_err(|error| {
+                                format!("open frontend optimize job repository failed: {error}")
+                            })?,
+                    )),
+                    Some(Arc::new(
+                        MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "open frontend metadata maintenance repository failed: {error}"
+                                )
+                            })?,
+                    )),
+                    Some(Arc::new(
+                        DistributedRewriteOperationRepository::open(Arc::clone(&store))
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "open frontend distributed rewrite repository failed: {error}"
+                                )
+                            })?,
+                    )),
+                    Some(Arc::new(
+                        CleanupOperationRepository::open(Arc::clone(&store))
+                            .await
+                            .map_err(|error| {
+                                format!("open frontend cleanup repository failed: {error}")
+                            })?,
+                    )),
+                ),
+                None => (None, None, None, None),
+            };
         Ok(Self {
             repository,
             metadata_repository,
             distributed_rewrite_repository,
+            cleanup_repository,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
         })
@@ -220,6 +240,14 @@ impl FrontendTableMaintenanceService {
                 Ok(MaintenanceStatementResult::Ok)
             };
         }
+        if let ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms } = action.clone() {
+            let outcome = self.execute_durable_cleanup(engine, target, older_than_ms)?;
+            return if spark_result {
+                action_result(outcome)
+            } else {
+                Ok(MaintenanceStatementResult::Ok)
+            };
+        }
         let request = action.into_request(engine, target)?;
         let outcome = engine.execute_action(request)?;
         if spark_result {
@@ -227,6 +255,133 @@ impl FrontendTableMaintenanceService {
         } else {
             Ok(MaintenanceStatementResult::Ok)
         }
+    }
+
+    fn execute_durable_cleanup(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+        older_than_ms: i64,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        let repository = self
+            .cleanup_repository
+            .as_ref()
+            .ok_or_else(|| CLEANUP_STATE_STORE_REQUIRED.to_string())?;
+        let operation_id = ConnectorCleanupOperationId::new();
+        let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        let session = engine.plan_cleanup_maintenance(&target, operation_id, older_than_ms)?;
+        let plan = session.plan_ref();
+        let owner = MetadataMaintenanceExactOwner {
+            instance_id: plan.owner().instance_id.as_str().to_string(),
+            incarnation_id: uuid::Uuid::from_bytes(plan.owner().incarnation.to_bytes()),
+        };
+        self.block_on(repository.create(CleanupOperationCreate {
+            operation_id: durable_id,
+            target: target.clone(),
+            owner,
+            request_digest: plan.request_digest(),
+            older_than_ms,
+            created_at_ms: now_unix_millis(),
+        }))
+        .map_err(|error| format!("persist orphan cleanup pending operation failed: {error}"))?;
+        let candidate_count = u32::try_from(plan.summary().candidate_count())
+            .map_err(|_| "orphan cleanup candidate count exceeds durable limit".to_string())?;
+        let batch_count = u16::try_from(plan.summary().batch_count())
+            .map_err(|_| "orphan cleanup batch count exceeds durable limit".to_string())?;
+        let manifest_parts = u16::try_from(plan.summary().manifest_parts())
+            .map_err(|_| "orphan cleanup manifest part count exceeds durable limit".to_string())?;
+        let artifact_handle = plan.provider_payload().to_vec();
+        self.block_on(repository.plan(
+            durable_id,
+            CleanupPlanPayload {
+                plan_digest: plan.plan_digest(),
+                base_state_digest: plan.base_state_digest(),
+                manifest_digest: plan.manifest_digest(),
+                artifact_handle_digest: cleanup_payload_digest(&artifact_handle),
+                artifact_handle,
+                candidate_count,
+                total_bytes: plan.summary().total_bytes(),
+                manifest_parts,
+                batch_count,
+            },
+            now_unix_millis(),
+        ))
+        .map_err(|error| format!("persist orphan cleanup plan failed: {error}"))?;
+
+        if batch_count == 0 {
+            let locations = cleanup_candidate_locations(engine, &session)?;
+            self.block_on(repository.finish(durable_id, now_unix_millis()))
+                .map_err(|error| {
+                    format!("persist zero-candidate cleanup finish failed: {error}")
+                })?;
+            if let Err(error) = engine.finalize_cleanup_terminal(&session) {
+                tracing::warn!(%error, operation_id = %durable_id, "orphan cleanup terminal artifact finalization failed");
+            }
+            return Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
+                orphan_file_locations: locations,
+            });
+        }
+
+        for ordinal in 0..batch_count {
+            let prepared = engine.prepare_cleanup_batch(&session, u32::from(ordinal))?;
+            let prepared_handle = prepared
+                .try_to_wire_v1()
+                .map_err(|error| format!("encode orphan cleanup prepared evidence: {error}"))?
+                .to_vec();
+            let prepared_checkpoint = CleanupBatchCheckpoint {
+                ordinal,
+                prepared_handle_digest: cleanup_payload_digest(&prepared_handle),
+                prepared_handle,
+                receipt_handle_digest: None,
+                receipt_handle: None,
+                deleted_count: 0,
+                already_absent_count: 0,
+                failed_count: 0,
+                unknown_count: 0,
+            };
+            self.block_on(repository.prepare_batch(
+                durable_id,
+                prepared_checkpoint.clone(),
+                now_unix_millis(),
+            ))
+            .map_err(|error| format!("persist orphan cleanup prepared batch failed: {error}"))?;
+            match engine.execute_cleanup_batch(&session, prepared)? {
+                CleanupBatchExecution::Receipt(receipt) => {
+                    let checkpoint = cleanup_receipt_checkpoint(prepared_checkpoint, &receipt);
+                    if claim_cleanup_fault(CleanupFaultKind::CheckpointFailed)
+                        .map_err(|error| format!("claim cleanup checkpoint fault: {error}"))?
+                    {
+                        return Err("debug cleanup checkpoint write failed; exact-generation reconciliation is required".to_string());
+                    }
+                    let operation = self
+                        .block_on(repository.checkpoint_batch(durable_id, checkpoint))
+                        .map_err(|error| {
+                            format!("persist orphan cleanup batch receipt failed: {error}")
+                        })?;
+                    if operation.state == CleanupOperationState::ReconcilePending {
+                        return Err("orphan cleanup batch outcome is unknown and requires exact-generation reconciliation".to_string());
+                    }
+                }
+                CleanupBatchExecution::Uncertain(error) => {
+                    self.block_on(repository.mark_reconcile_pending(durable_id, now_unix_millis()))
+                        .map_err(|store| {
+                            format!("persist orphan cleanup uncertain dispatch failed: {store}")
+                        })?;
+                    return Err(format!(
+                        "orphan cleanup dispatch outcome is unknown: {error}"
+                    ));
+                }
+            }
+        }
+        let locations = cleanup_candidate_locations(engine, &session)?;
+        self.block_on(repository.finish(durable_id, now_unix_millis()))
+            .map_err(|error| format!("persist orphan cleanup terminal state failed: {error}"))?;
+        if let Err(error) = engine.finalize_cleanup_terminal(&session) {
+            tracing::warn!(%error, operation_id = %durable_id, "orphan cleanup terminal artifact finalization failed");
+        }
+        Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
+            orphan_file_locations: locations,
+        })
     }
 
     fn execute_durable_distributed_rewrite(
@@ -483,6 +638,7 @@ impl FrontendTableMaintenanceService {
             repository: None,
             metadata_repository: None,
             distributed_rewrite_repository: Some(distributed_rewrite_repository),
+            cleanup_repository: None,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime: runtime.clone(),
         };
@@ -832,12 +988,100 @@ impl FrontendTableMaintenanceService {
         }
         Ok(())
     }
+
+    fn recover_cleanup_operations(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+    ) -> Result<(), String> {
+        let Some(repository) = &self.cleanup_repository else {
+            return Ok(());
+        };
+        for operation in self
+            .block_on(repository.list_recovery_candidates())
+            .map_err(|error| format!("list orphan cleanup recovery candidates failed: {error}"))?
+        {
+            let result = (|| -> Result<(), String> {
+                let stored_plan = self
+                    .block_on(repository.load_plan(operation.operation_id))
+                    .map_err(|error| format!("load orphan cleanup recovery plan failed: {error}"))?
+                    .ok_or_else(|| "orphan cleanup recovery plan is missing".to_string())?;
+                let ordinal = if operation.state == CleanupOperationState::ReconcilePending {
+                    operation.next_batch_ordinal.saturating_sub(1)
+                } else {
+                    operation.next_batch_ordinal
+                };
+                let checkpoint = self
+                    .block_on(repository.load_batch(operation.operation_id, ordinal))
+                    .map_err(|error| {
+                        format!("load orphan cleanup recovery batch failed: {error}")
+                    })?;
+                let Some(checkpoint) = checkpoint else {
+                    // A Running operation can have completed a checkpoint and
+                    // not yet prepared its next batch when FE stops. There is
+                    // no destructive dispatch to reconcile in that state, and
+                    // startup must not manufacture an Unresolved fence for it.
+                    // ReconcilePending, by contrast, always denotes a durable
+                    // prepared batch and is corrupt without one.
+                    if operation.state == CleanupOperationState::Running {
+                        return Ok(());
+                    }
+                    return Err("orphan cleanup recovery has no prepared batch".to_string());
+                };
+                let plan = cleanup_plan_from_durable(&operation, stored_plan)?;
+                let prepared = PreparedBatch::try_from_wire_v1(bytes::Bytes::from(
+                    checkpoint.prepared_handle.clone(),
+                ))
+                .map_err(|error| format!("restore orphan cleanup prepared evidence: {error}"))?;
+                let session = engine.recover_cleanup_for_reconcile(
+                    &operation.target,
+                    plan,
+                    prepared.clone(),
+                )?;
+                let receipt = engine.reconcile_cleanup_batch(&session, prepared)?;
+                let resolved = cleanup_receipt_checkpoint(checkpoint, &receipt);
+                let operation = self
+                    .block_on(
+                        repository.checkpoint_reconciled_batch(operation.operation_id, resolved),
+                    )
+                    .map_err(|error| {
+                        format!("persist reconciled orphan cleanup receipt failed: {error}")
+                    })?;
+                if operation.state == CleanupOperationState::ReconcilePending {
+                    return Err("orphan cleanup reconcile outcome remains unknown".to_string());
+                }
+                if operation.next_batch_ordinal == operation.batch_count.unwrap_or(0) {
+                    self.block_on(repository.finish(operation.operation_id, now_unix_millis()))
+                        .map_err(|error| {
+                            format!(
+                                "persist recovered orphan cleanup terminal state failed: {error}"
+                            )
+                        })?;
+                    if let Err(error) = engine.finalize_cleanup_terminal(&session) {
+                        tracing::warn!(%error, operation_id = %operation.operation_id, "orphan cleanup recovered terminal artifact finalization failed");
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.block_on(repository.mark_unresolved(
+                    operation.operation_id,
+                    error,
+                    now_unix_millis(),
+                ))
+                .map_err(|store| {
+                    format!("mark orphan cleanup operation unresolved failed: {store}")
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         self.recover_metadata_operations(engine.as_ref())?;
         self.recover_distributed_rewrite_operations()?;
+        self.recover_cleanup_operations(engine.as_ref())?;
         let mut worker = self
             .worker
             .lock()
@@ -932,6 +1176,10 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 DistributedRewriteOperationKind::RewritePositionDeleteFiles,
                 None,
             ),
+            MaintenanceActionRequest::RemoveOrphanFiles {
+                target,
+                older_than_ms,
+            } => self.execute_durable_cleanup(engine, target, older_than_ms),
             other => engine.execute_action(other),
         }
     }
@@ -1025,6 +1273,69 @@ fn now_unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn cleanup_receipt_checkpoint(
+    mut checkpoint: CleanupBatchCheckpoint,
+    receipt: &BatchReceipt,
+) -> CleanupBatchCheckpoint {
+    let handle = receipt.provider_payload().to_vec();
+    let summary = receipt.summary();
+    checkpoint.receipt_handle_digest = Some(cleanup_payload_digest(&handle));
+    checkpoint.receipt_handle = Some(handle);
+    checkpoint.deleted_count = summary.deleted();
+    checkpoint.already_absent_count = summary.already_absent();
+    checkpoint.failed_count = summary.failed();
+    checkpoint.unknown_count = summary.unknown();
+    checkpoint
+}
+
+fn cleanup_candidate_locations(
+    engine: &dyn TableMaintenanceEngine,
+    session: &novarocks::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<String>, String> {
+    let mut offset = 0u64;
+    let mut locations = Vec::new();
+    loop {
+        let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
+        locations.extend(page.locations().iter().map(|location| location.to_string()));
+        if page.complete() {
+            return Ok(locations);
+        }
+        offset = offset
+            .checked_add(page.locations().len() as u64)
+            .ok_or_else(|| "orphan cleanup candidate page offset overflow".to_string())?;
+    }
+}
+
+fn cleanup_plan_from_durable(
+    operation: &self::model::CleanupOperation,
+    stored: CleanupPlanPayload,
+) -> Result<ConnectorCleanupPlan, String> {
+    let owner = ConnectorExecutionBindingKey {
+        instance_id: ConnectorInstanceId::parse(&operation.owner.instance_id)
+            .map_err(|error| error.to_string())?,
+        incarnation: ConnectorInstanceIncarnation::from_bytes(
+            *operation.owner.incarnation_id.as_bytes(),
+        ),
+    };
+    ConnectorCleanupPlan::try_restore(
+        owner,
+        ConnectorCleanupOperationId::from_bytes(*operation.operation_id.as_bytes()),
+        operation.request_digest,
+        stored.base_state_digest,
+        stored.manifest_digest,
+        ConnectorCleanupPlanSummary::try_new(
+            u64::from(stored.candidate_count),
+            stored.total_bytes,
+            u32::from(stored.manifest_parts),
+            u32::from(stored.batch_count),
+        )
+        .map_err(|error| error.to_string())?,
+        bytes::Bytes::from(stored.artifact_handle),
+        stored.plan_digest,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn distributed_data_rewrite_intent(

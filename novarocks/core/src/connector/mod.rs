@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub(crate) mod backend;
+pub mod cleanup_maintenance;
 pub(crate) mod data_mutation;
 pub mod distributed_rewrite_application;
 pub mod file_execution;

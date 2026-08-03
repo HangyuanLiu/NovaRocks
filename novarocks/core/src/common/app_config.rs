@@ -320,6 +320,7 @@ impl NovaRocksConfig {
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
         validate_query_lifecycle_fault_environment(&cfg)?;
+        validate_cleanup_fault_environment(&cfg)?;
         Ok(cfg)
     }
 
@@ -355,6 +356,37 @@ fn validate_query_lifecycle_fault_environment(cfg: &NovaRocksConfig) -> Result<(
         let _ = cfg;
         if environment.is_some() {
             bail!("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR is only available in debug builds");
+        }
+        Ok(())
+    }
+}
+
+fn validate_cleanup_fault_environment(cfg: &NovaRocksConfig) -> Result<()> {
+    let environment = std::env::var_os("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR").map(PathBuf::from);
+    #[cfg(debug_assertions)]
+    {
+        let configured = cfg.debug.cleanup_fault_dir().map(Path::to_path_buf);
+        match (configured, environment) {
+            (None, None) => Ok(()),
+            (Some(configured), Some(environment)) if configured == environment => Ok(()),
+            (Some(configured), Some(environment)) => bail!(
+                "debug.cleanup_fault_dir {} does not match runner-owned environment {}",
+                configured.display(),
+                environment.display()
+            ),
+            (Some(_), None) => {
+                bail!("debug.cleanup_fault_dir requires NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR")
+            }
+            (None, Some(_)) => {
+                bail!("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR requires debug.cleanup_fault_dir")
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = cfg;
+        if environment.is_some() {
+            bail!("NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR is only available in debug builds");
         }
         Ok(())
     }
@@ -1664,6 +1696,8 @@ pub struct DebugConfig {
     #[cfg(debug_assertions)]
     pub query_lifecycle_fault_dir: Option<PathBuf>,
     #[cfg(debug_assertions)]
+    pub cleanup_fault_dir: Option<PathBuf>,
+    #[cfg(debug_assertions)]
     pub emit_connector_reader_marker: bool,
 }
 
@@ -1676,6 +1710,7 @@ struct DebugConfigToml {
     emit_cancel_marker: bool,
     emit_grpc_fragment_marker: bool,
     query_lifecycle_fault_dir: Option<PathBuf>,
+    cleanup_fault_dir: Option<PathBuf>,
     emit_connector_reader_marker: bool,
 }
 
@@ -1688,6 +1723,7 @@ struct DebugConfigToml {
     emit_cancel_marker: Option<bool>,
     emit_grpc_fragment_marker: Option<bool>,
     query_lifecycle_fault_dir: Option<PathBuf>,
+    cleanup_fault_dir: Option<PathBuf>,
     emit_connector_reader_marker: Option<bool>,
 }
 
@@ -1705,6 +1741,7 @@ impl<'de> Deserialize<'de> for DebugConfig {
                 emit_cancel_marker: raw.emit_cancel_marker,
                 emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
                 query_lifecycle_fault_dir: raw.query_lifecycle_fault_dir,
+                cleanup_fault_dir: raw.cleanup_fault_dir,
                 emit_connector_reader_marker: raw.emit_connector_reader_marker,
             })
         }
@@ -1728,6 +1765,11 @@ impl<'de> Deserialize<'de> for DebugConfig {
             if raw.query_lifecycle_fault_dir.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.query_lifecycle_fault_dir is only available in debug builds",
+                ));
+            }
+            if raw.cleanup_fault_dir.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.cleanup_fault_dir is only available in debug builds",
                 ));
             }
             if raw.emit_connector_reader_marker.is_some() {
@@ -1776,6 +1818,16 @@ impl DebugConfig {
     #[cfg(debug_assertions)]
     pub fn query_lifecycle_fault_dir(&self) -> Option<&Path> {
         self.query_lifecycle_fault_dir.as_deref()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn cleanup_fault_dir(&self) -> Option<&Path> {
+        self.cleanup_fault_dir.as_deref()
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn cleanup_fault_dir(&self) -> Option<&Path> {
+        None
     }
 
     #[cfg(not(debug_assertions))]

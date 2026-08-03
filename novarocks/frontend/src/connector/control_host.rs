@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver, ConnectorControlBinding,
+    ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
+    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
     ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorDistributedRewriteLease,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
@@ -54,6 +55,7 @@ struct ControlGeneration {
     data_mutation_leases: usize,
     metadata_maintenance_leases: usize,
     distributed_rewrite_leases: usize,
+    cleanup_maintenance_leases: usize,
     write_leases: usize,
     statistics_leases: usize,
 }
@@ -65,6 +67,7 @@ impl ControlGeneration {
             && self.data_mutation_leases == 0
             && self.metadata_maintenance_leases == 0
             && self.distributed_rewrite_leases == 0
+            && self.cleanup_maintenance_leases == 0
             && self.write_leases == 0
             && self.statistics_leases == 0
     }
@@ -154,6 +157,7 @@ impl ConnectorControlHost {
                 data_mutation_leases: 0,
                 metadata_maintenance_leases: 0,
                 distributed_rewrite_leases: 0,
+                cleanup_maintenance_leases: 0,
                 write_leases: 0,
                 statistics_leases: 0,
             },
@@ -447,6 +451,91 @@ impl ConnectorControlHost {
                     &retirement_sink,
                     lease_key,
                     LeaseKind::MetadataMaintenance,
+                );
+            },
+        )
+    }
+
+    fn acquire_current_cleanup_maintenance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        let key = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
+        };
+        self.acquire_cleanup_maintenance(&key, true)
+    }
+
+    fn acquire_exact_cleanup_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        self.acquire_cleanup_maintenance(key, false)
+    }
+
+    /// Acquires metadata and cleanup from one exact control generation. Cleanup
+    /// is FE-only and its lease keeps a retiring generation alive for replay of
+    /// immutable prepared evidence; it never substitutes a current generation.
+    fn acquire_cleanup_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+        require_active: bool,
+    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        let (descriptor, metadata, cleanup) = {
+            let mut state = self.lock_state()?;
+            let generation = state.generations.get_mut(key).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "connector control generation is not registered",
+                )
+            })?;
+            if require_active && generation.state != ControlGenerationState::Active {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
+            }
+            let cleanup = generation
+                .binding
+                .cleanup_maintenance()
+                .cloned()
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "connector control generation has no cleanup maintenance capability",
+                    )
+                })?;
+            generation.cleanup_maintenance_leases =
+                generation.cleanup_maintenance_leases.saturating_add(1);
+            (
+                generation.binding.descriptor().clone(),
+                Arc::clone(generation.binding.metadata()),
+                cleanup,
+            )
+        };
+        let state = Arc::downgrade(&self.state);
+        let retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let lease_key = key.clone();
+        ConnectorCleanupMaintenanceLease::new(
+            descriptor,
+            key.clone(),
+            metadata,
+            cleanup,
+            move || {
+                release_lease(
+                    &state,
+                    &retirement_sink,
+                    lease_key,
+                    LeaseKind::CleanupMaintenance,
                 );
             },
         )
@@ -765,6 +854,22 @@ impl ConnectorMetadataMaintenanceResolver for ConnectorControlHost {
     }
 }
 
+impl ConnectorCleanupMaintenanceResolver for ConnectorControlHost {
+    fn acquire_current_cleanup_maintenance(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        Self::acquire_current_cleanup_maintenance(self, instance_id)
+    }
+
+    fn acquire_exact_cleanup_maintenance(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        Self::acquire_exact_cleanup_maintenance(self, key)
+    }
+}
+
 impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
     fn acquire_current_distributed_rewrite(
         &self,
@@ -816,6 +921,7 @@ enum LeaseKind {
     DataMutation,
     MetadataMaintenance,
     DistributedRewrite,
+    CleanupMaintenance,
     Write,
     Statistics,
 }
@@ -852,6 +958,10 @@ fn release_lease(
         LeaseKind::DistributedRewrite => {
             generation.distributed_rewrite_leases =
                 generation.distributed_rewrite_leases.saturating_sub(1);
+        }
+        LeaseKind::CleanupMaintenance => {
+            generation.cleanup_maintenance_leases =
+                generation.cleanup_maintenance_leases.saturating_sub(1);
         }
         LeaseKind::Write => {
             generation.write_leases = generation.write_leases.saturating_sub(1);

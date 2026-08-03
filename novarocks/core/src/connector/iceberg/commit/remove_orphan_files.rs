@@ -74,12 +74,64 @@ pub struct RemoveOrphanOutcome {
 /// `object_store_config` — when `Some`, the caller has an S3/OSS-backed
 /// catalog and the scan will use an opendal operator built from this config.
 /// When `None`, only `file://` and bare filesystem paths are supported.
-pub async fn run_remove_orphan_files(
+#[cfg(test)]
+pub(crate) async fn run_remove_orphan_files(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     older_than_ms: i64,
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<RemoveOrphanOutcome, String> {
+    let candidates =
+        collect_orphan_candidates(catalog, table_ident, older_than_ms, object_store_config).await?;
+    let scanned_count = candidates.scanned_count;
+    let mut deleted_count = 0;
+    let mut deleted_file_locations = Vec::new();
+    for path in &candidates.files {
+        // This compatibility entrypoint is intentionally retained only until
+        // the FE durable cleanup lifecycle removes its legacy caller.  New
+        // callers must use `IcebergCleanupMaintenanceAdapter`, which freezes
+        // object identity and never retries an uncertain delete.
+        match candidates.file_io.delete(&path.path).await {
+            Ok(()) => {
+                deleted_count += 1;
+                deleted_file_locations.push(path.path.clone());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.path,
+                    error = %e,
+                    "remove_orphan_files: best-effort file delete failed"
+                );
+            }
+        }
+    }
+    deleted_file_locations.sort();
+
+    Ok(RemoveOrphanOutcome {
+        deleted_count,
+        scanned_count,
+        deleted_file_locations,
+    })
+}
+
+/// Frozen planning input for the durable FE-owned cleanup lifecycle.  The
+/// helper retains every live-file and containment guard from the historical
+/// REMOVE ORPHAN FILES implementation while deliberately doing no deletion.
+pub(crate) struct OrphanCandidateCollection {
+    pub(crate) file_io: FileIO,
+    pub(crate) scanned_count: usize,
+    pub(crate) files: Vec<ScannedFile>,
+}
+
+/// Enumerate candidates once.  Callers must persist the returned object
+/// identity before attempting a destructive operation; they must never invoke
+/// this function again while recovering an existing operation.
+pub(crate) async fn collect_orphan_candidates(
+    catalog: Arc<dyn Catalog>,
+    table_ident: TableIdent,
+    older_than_ms: i64,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<OrphanCandidateCollection, String> {
     let table = catalog
         .load_table(&table_ident)
         .await
@@ -173,42 +225,37 @@ pub async fn run_remove_orphan_files(
         .map_err(|e| format!("build dv_index: {e}"))?;
     puffin_half_reference_protection(&mut candidates, &dv_index, &live_files);
 
-    // Step 5: best-effort physical delete.
-    let mut deleted_count = 0;
-    let mut deleted_file_locations = Vec::new();
-    for path in &candidates {
-        match file_io.delete(path).await {
-            Ok(()) => {
-                deleted_count += 1;
-                deleted_file_locations.push(path.clone());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "remove_orphan_files: best-effort file delete failed"
-                );
-            }
-        }
+    let mut selected: Vec<ScannedFile> = all_scanned
+        .into_iter()
+        .filter(|file| candidates.contains(&file.path))
+        .collect();
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    if selected.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err("REMOVE ORPHAN FILES candidate scan produced duplicate locations".to_string());
     }
-    deleted_file_locations.sort();
-
-    Ok(RemoveOrphanOutcome {
-        deleted_count,
+    Ok(OrphanCandidateCollection {
+        file_io: file_io.clone(),
         scanned_count,
-        deleted_file_locations,
+        files: selected,
     })
 }
 
 /// A file discovered during the warehouse scan.
-#[derive(Debug)]
-struct ScannedFile {
+#[derive(Clone, Debug)]
+pub(crate) struct ScannedFile {
     /// Full path to the file (absolute, with scheme prefix if any).
-    path: String,
+    pub(crate) path: String,
     /// Last-modified time in epoch milliseconds.
     /// `None` means the mtime could not be determined; such files are
     /// conservatively skipped (not deleted).
-    last_modified_ms: i64,
+    pub(crate) last_modified_ms: i64,
+    /// Exact content length captured during the one permitted list. `None`
+    /// means the provider must refuse destructive dispatch for this object.
+    pub(crate) size: Option<u64>,
+    /// Provider ETag, when stable and supplied by the adapter.
+    pub(crate) etag: Option<String>,
+    /// Version identifier, when the OpenDAL adapter supports versioned delete.
+    pub(crate) version: Option<String>,
 }
 
 /// List all files under `<location>/data/` and `<location>/metadata/`
@@ -312,12 +359,15 @@ async fn list_files_opendal(
             let last_modified_ms = entry
                 .metadata()
                 .last_modified()
-                .map(|dt| dt.into_inner().as_millisecond())
+                .map(|dt| canonical_object_mtime_ms(dt.into_inner().as_millisecond()))
                 .unwrap_or(i64::MAX); // i64::MAX → never older-than threshold
 
             result.push(ScannedFile {
                 path: full_path,
                 last_modified_ms,
+                size: Some(entry.metadata().content_length()),
+                etag: entry.metadata().etag().map(ToOwned::to_owned),
+                version: entry.metadata().version().map(ToOwned::to_owned),
             });
         }
     }
@@ -328,6 +378,15 @@ async fn list_files_opendal(
         "remove_orphan_files: adapter opendal scan complete"
     );
     Ok(result)
+}
+
+/// S3-compatible list and stat APIs may expose the same Last-Modified value
+/// at different sub-second precision.  Persist the strongest precision which
+/// is reliably re-readable across both calls.  ETag/version and byte size
+/// remain exact, while this keeps a frozen identity from spuriously changing
+/// merely because MinIO lists milliseconds but stats seconds.
+pub(crate) fn canonical_object_mtime_ms(value: i64) -> i64 {
+    value.div_euclid(1_000) * 1_000
 }
 
 /// Recursively walk a directory, appending `ScannedFile` entries to `out`.
@@ -376,11 +435,16 @@ fn walk_dir(
                 Err(_) => i64::MAX, // stat failed → skip
             };
 
+            let size = entry.metadata().ok().map(|meta| meta.len());
+
             let abs = path.to_string_lossy();
             let full_path = format!("{scheme_prefix}{abs}");
             out.push(ScannedFile {
                 path: full_path,
                 last_modified_ms,
+                size,
+                etag: None,
+                version: None,
             });
         }
         // Symlinks are skipped (not followed).
@@ -1093,6 +1157,20 @@ mod tests {
         assert!(
             err.contains("unsupported"),
             "unsupported scheme should be explicit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_object_mtime_uses_restatable_second_precision() {
+        // MinIO list can preserve milliseconds while a later stat is second
+        // precision. Both observations must freeze the same object identity.
+        assert_eq!(
+            canonical_object_mtime_ms(1_785_760_461_050),
+            1_785_760_461_000
+        );
+        assert_eq!(
+            canonical_object_mtime_ms(1_785_760_461_000),
+            1_785_760_461_000
         );
     }
 }

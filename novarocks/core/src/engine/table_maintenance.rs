@@ -27,6 +27,7 @@ use std::sync::Arc;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
+use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::{
     DistributedRewriteIntent, DistributedRewriteMaintenanceSession,
 };
@@ -37,10 +38,11 @@ use crate::query_execution::ConnectorWriteCompletion;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::dialect::StarRocksDialect;
 use novarocks_spi::connector::{
+    BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
     ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteReceipt,
     ConnectorMetadataMaintenancePlan, ConnectorMutationOperationId, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteReceipt, ExternalMutationEvidence,
-    ExternalMutationOutcome,
+    ExternalMutationOutcome, PreparedBatch,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -192,6 +194,67 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _target: &MaintenanceTarget,
         _plan: ConnectorMetadataMaintenancePlan,
     ) -> Result<CompletedMetadataMaintenance, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    /// Plan a provider-neutral FE-only orphan cleanup operation. The returned
+    /// session owns its exact connector generation for the durable frontend
+    /// operation; no BE or generic action route participates.
+    fn plan_cleanup_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        _operation_id: ConnectorCleanupOperationId,
+        _older_than_ms: i64,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn recover_cleanup_for_reconcile(
+        &self,
+        _target: &MaintenanceTarget,
+        _plan: ConnectorCleanupPlan,
+        _prepared: PreparedBatch,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn prepare_cleanup_batch(
+        &self,
+        _session: &CleanupMaintenanceSession,
+        _batch_ordinal: u32,
+    ) -> Result<PreparedBatch, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn execute_cleanup_batch(
+        &self,
+        _session: &CleanupMaintenanceSession,
+        _prepared: PreparedBatch,
+    ) -> Result<CleanupBatchExecution, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn reconcile_cleanup_batch(
+        &self,
+        _session: &CleanupMaintenanceSession,
+        _prepared: PreparedBatch,
+    ) -> Result<BatchReceipt, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn read_cleanup_candidate_page(
+        &self,
+        _session: &CleanupMaintenanceSession,
+        _offset: u64,
+        _limit: u32,
+    ) -> Result<CandidatePage, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn finalize_cleanup_terminal(
+        &self,
+        _session: &CleanupMaintenanceSession,
+    ) -> Result<(), String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
@@ -378,6 +441,12 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
+        if matches!(request, MaintenanceActionRequest::RemoveOrphanFiles { .. }) {
+            return Err(
+                "remove orphan files must be dispatched by the frontend durable cleanup owner"
+                    .to_string(),
+            );
+        }
         crate::engine::iceberg_maintenance::execute_action(
             &self.shared_for_table_maintenance()?,
             request,
@@ -438,6 +507,105 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )?,
         )
+    }
+
+    fn plan_cleanup_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        let state = self.shared_for_table_maintenance()?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        CleanupMaintenanceSession::plan(
+            state.connector_control.as_ref(),
+            &instance_id,
+            operation_id,
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            older_than_ms,
+            crate::connector::connector_request_context(
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+        )
+        .map_err(|error| format!("plan orphan cleanup operation: {error}"))
+    }
+
+    fn recover_cleanup_for_reconcile(
+        &self,
+        target: &MaintenanceTarget,
+        plan: ConnectorCleanupPlan,
+        prepared: PreparedBatch,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        let state = self.shared_for_table_maintenance()?;
+        CleanupMaintenanceSession::recover_for_reconcile(
+            state.connector_control.as_ref(),
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+                    .map_err(|error| error.to_string())?,
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            plan,
+            prepared,
+            crate::connector::connector_request_context(
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?,
+        )
+        .map_err(|error| format!("recover orphan cleanup operation: {error}"))
+    }
+
+    fn prepare_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        batch_ordinal: u32,
+    ) -> Result<PreparedBatch, String> {
+        session
+            .prepare_batch(batch_ordinal)
+            .map_err(|error| format!("prepare orphan cleanup batch: {error}"))
+    }
+
+    fn execute_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        prepared: PreparedBatch,
+    ) -> Result<CleanupBatchExecution, String> {
+        session
+            .execute_batch(prepared)
+            .map_err(|error| format!("execute orphan cleanup batch: {error}"))
+    }
+
+    fn reconcile_cleanup_batch(
+        &self,
+        session: &CleanupMaintenanceSession,
+        prepared: PreparedBatch,
+    ) -> Result<BatchReceipt, String> {
+        session
+            .reconcile_batch(prepared)
+            .map_err(|error| format!("reconcile orphan cleanup batch: {error}"))
+    }
+
+    fn read_cleanup_candidate_page(
+        &self,
+        session: &CleanupMaintenanceSession,
+        offset: u64,
+        limit: u32,
+    ) -> Result<CandidatePage, String> {
+        session
+            .read_candidate_page(offset, limit)
+            .map_err(|error| format!("read orphan cleanup candidate page: {error}"))
+    }
+
+    fn finalize_cleanup_terminal(&self, session: &CleanupMaintenanceSession) -> Result<(), String> {
+        session
+            .finalize_terminal()
+            .map_err(|error| format!("finalize orphan cleanup artifacts: {error}"))
     }
 
     fn plan_distributed_rewrite(

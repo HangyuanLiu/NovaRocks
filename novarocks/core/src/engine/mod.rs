@@ -661,6 +661,92 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
+    for TestConnectorControlRegistry
+{
+    fn acquire_current_cleanup_maintenance(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "test connector cleanup binding is not active",
+                )
+            })?;
+        test_cleanup_maintenance_lease(binding)
+    }
+
+    fn acquire_exact_cleanup_maintenance(
+        &self,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(&key.instance_id)
+            .filter(|binding| binding.incarnation() == key.incarnation)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact test connector cleanup generation is unavailable",
+                )
+            })?;
+        test_cleanup_maintenance_lease(binding)
+    }
+}
+
+#[cfg(test)]
+fn test_cleanup_maintenance_lease(
+    binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
+) -> Result<
+    novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let cleanup = binding.cleanup_maintenance().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no cleanup maintenance capability",
+        )
+    })?;
+    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    novarocks_spi::connector::ConnectorCleanupMaintenanceLease::new(
+        binding.descriptor().clone(),
+        key,
+        Arc::clone(binding.metadata()),
+        cleanup,
+        || {},
+    )
+}
+
+#[cfg(test)]
 fn test_metadata_maintenance_lease(
     binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
 ) -> Result<

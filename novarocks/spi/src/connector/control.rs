@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorDistributedRewrite,
+    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
+    ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
@@ -70,6 +71,7 @@ pub struct ConnectorControlBinding {
     data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
     metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
+    cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
     staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
@@ -252,6 +254,7 @@ impl ConnectorControlBinding {
             data_mutation,
             metadata_maintenance: None,
             distributed_rewrite: None,
+            cleanup_maintenance: None,
             staged_create: None,
             write,
             statistics,
@@ -377,11 +380,57 @@ impl ConnectorControlBinding {
         write: Option<Arc<dyn ConnectorWriteControl>>,
         statistics: Option<Arc<dyn ConnectorStatistics>>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
+            descriptor,
+            incarnation,
+            metadata,
+            planning,
+            distribution,
+            mutation,
+            data_mutation,
+            metadata_maintenance,
+            distributed_rewrite,
+            None,
+            staged_create,
+            write,
+            statistics,
+        )
+    }
+
+    /// Constructs a control binding with all FE-only maintenance facets.
+    /// Cleanup deliberately remains absent from BE execution bindings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        metadata: Arc<dyn ConnectorMetadata>,
+        planning: Arc<dyn ConnectorScanPlanning>,
+        distribution: Arc<dyn ConnectorExecutionDistribution>,
+        mutation: Option<Arc<dyn ConnectorCatalogMutation>>,
+        data_mutation: Option<Arc<dyn ConnectorDataMutation>>,
+        metadata_maintenance: Option<Arc<dyn ConnectorMetadataMaintenance>>,
+        distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
+        cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
+        staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
+        write: Option<Arc<dyn ConnectorWriteControl>>,
+        statistics: Option<Arc<dyn ConnectorStatistics>>,
+    ) -> Result<Self, ConnectorError> {
         if let Some(rewrite) = &distributed_rewrite {
             super::distributed_rewrite::validate_distributed_rewrite_owner(
                 &descriptor,
                 incarnation,
                 rewrite.as_ref(),
+            )?;
+        }
+        if let Some(cleanup) = &cleanup_maintenance {
+            let key = ConnectorExecutionBindingKey {
+                instance_id: descriptor.instance_id.clone(),
+                incarnation,
+            };
+            super::cleanup_maintenance::validate_cleanup_maintenance_owner(
+                &descriptor,
+                &key,
+                cleanup.as_ref(),
             )?;
         }
         let mut binding = Self::try_new_with_all_capabilities_and_staged_create(
@@ -398,6 +447,7 @@ impl ConnectorControlBinding {
             statistics,
         )?;
         binding.distributed_rewrite = distributed_rewrite;
+        binding.cleanup_maintenance = cleanup_maintenance;
         Ok(binding)
     }
 
@@ -431,6 +481,10 @@ impl ConnectorControlBinding {
 
     pub fn distributed_rewrite(&self) -> Option<&Arc<dyn ConnectorDistributedRewrite>> {
         self.distributed_rewrite.as_ref()
+    }
+
+    pub fn cleanup_maintenance(&self) -> Option<&Arc<dyn ConnectorCleanupMaintenance>> {
+        self.cleanup_maintenance.as_ref()
     }
 
     pub fn staged_create(&self) -> Option<&Arc<dyn ConnectorStagedCreate>> {
@@ -516,6 +570,7 @@ pub trait ConnectorControlRegistry:
     + ConnectorDataMutationResolver
     + ConnectorMetadataMaintenanceResolver
     + ConnectorDistributedRewriteResolver
+    + ConnectorCleanupMaintenanceResolver
     + ConnectorWriteResolver
     + ConnectorStatisticsResolver
 {

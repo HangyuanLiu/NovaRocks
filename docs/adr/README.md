@@ -161,3 +161,4 @@ engine port，connector 保留 catalog、snapshot、file 与 commit 等 external
 内存 fallback 模糊 owner 和故障语义。
 
 - ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（active）
+- ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）

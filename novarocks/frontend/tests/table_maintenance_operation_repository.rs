@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::MaintenanceTarget;
 use novarocks_frontend::table_maintenance::model::{
+    CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
     DistributedRewriteOperationKind, DistributedRewriteOperationState,
@@ -31,8 +32,9 @@ use novarocks_frontend::table_maintenance::model::{
     MetadataMaintenanceOperationState, MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use novarocks_frontend::table_maintenance::repository::{
-    DistributedRewriteOperationRepository, MetadataMaintenanceOperationRepository,
-    OptimizeJobRepository, RepositoryErrorKind, distributed_rewrite_payload_digest,
+    CleanupOperationRepository, DistributedRewriteOperationRepository,
+    MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
+    cleanup_payload_digest, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
@@ -116,6 +118,33 @@ async fn rewrite_fixture() -> (
     (temp, store, repository)
 }
 
+async fn cleanup_fixture() -> (TempDir, Arc<dyn StateStore>, CleanupOperationRepository) {
+    let temp = TempDir::new().unwrap();
+    let store = StateStoreHost::open(
+        &builtin_state_store_provider_registry().unwrap(),
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(&temp.path().join("state.sqlite")),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).unwrap(),
+            topology_revision: Bytes::from_static(b"cleanup-operation-test"),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+    .state_store()
+    .unwrap();
+    let repository = CleanupOperationRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    (temp, store, repository)
+}
+
 fn target() -> MaintenanceTarget {
     MaintenanceTarget {
         catalog: "rest".to_string(),
@@ -173,6 +202,50 @@ fn rewrite_opaque(payload: &[u8]) -> DistributedRewriteOpaquePayload {
     DistributedRewriteOpaquePayload {
         digest: distributed_rewrite_payload_digest(payload),
         payload: payload.to_vec(),
+    }
+}
+
+fn cleanup_create(operation_id: Uuid) -> CleanupOperationCreate {
+    CleanupOperationCreate {
+        operation_id,
+        target: target(),
+        owner: MetadataMaintenanceExactOwner {
+            instance_id: "iceberg_rest".to_string(),
+            incarnation_id: Uuid::now_v7(),
+        },
+        request_digest: [17; 32],
+        older_than_ms: 1,
+        created_at_ms: 10,
+    }
+}
+
+fn cleanup_plan() -> CleanupPlanPayload {
+    let artifact_handle = b"provider-artifact-handle".to_vec();
+    CleanupPlanPayload {
+        plan_digest: [18; 32],
+        base_state_digest: [19; 32],
+        manifest_digest: [19; 32],
+        artifact_handle_digest: cleanup_payload_digest(&artifact_handle),
+        artifact_handle,
+        candidate_count: 1,
+        total_bytes: 1,
+        manifest_parts: 1,
+        batch_count: 1,
+    }
+}
+
+fn prepared_cleanup_batch() -> CleanupBatchCheckpoint {
+    let prepared_handle = b"prepared-batch-artifact".to_vec();
+    CleanupBatchCheckpoint {
+        ordinal: 0,
+        prepared_handle_digest: cleanup_payload_digest(&prepared_handle),
+        prepared_handle,
+        receipt_handle_digest: None,
+        receipt_handle: None,
+        deleted_count: 0,
+        already_absent_count: 0,
+        failed_count: 0,
+        unknown_count: 0,
     }
 }
 
@@ -492,4 +565,98 @@ async fn claimed_running_optimize_job_may_create_only_its_own_rewrite() {
         .await
         .unwrap();
     assert_eq!(created.state, DistributedRewriteOperationState::Pending);
+}
+
+#[tokio::test]
+async fn cleanup_persists_only_bounded_artifact_handles_and_releases_terminal_fence() {
+    let (_temp, store, repository) = cleanup_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(cleanup_create(operation_id))
+        .await
+        .unwrap();
+    repository
+        .plan(operation_id, cleanup_plan(), 11)
+        .await
+        .unwrap();
+
+    let prepared = prepared_cleanup_batch();
+    repository
+        .prepare_batch(operation_id, prepared.clone(), 12)
+        .await
+        .unwrap();
+    let stored_prepared = repository
+        .load_batch(operation_id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_prepared.prepared_handle, prepared.prepared_handle);
+    assert!(stored_prepared.receipt_handle.is_none());
+
+    let receipt_handle = b"receipt-artifact".to_vec();
+    let checkpoint = CleanupBatchCheckpoint {
+        receipt_handle_digest: Some(cleanup_payload_digest(&receipt_handle)),
+        receipt_handle: Some(receipt_handle),
+        deleted_count: 1,
+        ..prepared
+    };
+    repository
+        .checkpoint_batch(operation_id, checkpoint)
+        .await
+        .unwrap();
+    let finished = repository.finish(operation_id, 13).await.unwrap();
+    assert_eq!(finished.state, CleanupOperationState::Finished);
+    assert!(!repository.has_active_target(&target()).await.unwrap());
+
+    let rewrite = DistributedRewriteOperationRepository::open(store)
+        .await
+        .unwrap();
+    rewrite
+        .create(rewrite_create(Uuid::now_v7()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_shared_fence_blocks_other_maintenance_and_unknown_requires_recovery() {
+    let (_temp, store, repository) = cleanup_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(cleanup_create(operation_id))
+        .await
+        .unwrap();
+    assert!(repository.has_active_target(&target()).await.unwrap());
+
+    let metadata = MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let error = metadata.create(create(Uuid::now_v7())).await.unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+
+    repository
+        .plan(operation_id, cleanup_plan(), 11)
+        .await
+        .unwrap();
+    let prepared = prepared_cleanup_batch();
+    repository
+        .prepare_batch(operation_id, prepared.clone(), 12)
+        .await
+        .unwrap();
+    let receipt_handle = b"unknown-receipt-artifact".to_vec();
+    repository
+        .checkpoint_batch(
+            operation_id,
+            CleanupBatchCheckpoint {
+                receipt_handle_digest: Some(cleanup_payload_digest(&receipt_handle)),
+                receipt_handle: Some(receipt_handle),
+                unknown_count: 1,
+                ..prepared
+            },
+        )
+        .await
+        .unwrap();
+    let candidates = repository.list_recovery_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].state, CleanupOperationState::ReconcilePending);
+    assert!(repository.has_active_target(&target()).await.unwrap());
 }

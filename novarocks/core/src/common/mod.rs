@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod app_config;
+pub mod cleanup_fault;
 pub mod config;
 pub mod datasketches;
 pub mod engine_error;

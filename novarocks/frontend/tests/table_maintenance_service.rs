@@ -594,11 +594,6 @@ async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
             ],
         ),
         (
-            "CALL ice.system.remove_orphan_files(\
-             table => 'db.orders', older_than => TIMESTAMP '2026-01-01 00:00:00')",
-            vec!["orphan_file_location"],
-        ),
-        (
             "CALL ice.system.rewrite_position_delete_files(\
              table => 'db.orders', options => map('rewrite-all', 'true'), \
              where => 'id > 10')",
@@ -622,7 +617,7 @@ async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
 
     assert_eq!(
         engine.resolved_name_parts(),
-        vec![vec!["ice".to_string(), "db".to_string(), "orders".to_string()]; 5]
+        vec![vec!["ice".to_string(), "db".to_string(), "orders".to_string()]; 4]
     );
     assert_eq!(
         engine.requests(),
@@ -645,10 +640,6 @@ async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
                 older_than_ms: Some(1_767_225_600_000),
                 retain_last: Some(2),
             },
-            MaintenanceActionRequest::RemoveOrphanFiles {
-                target: target("ice", "db", "orders"),
-                older_than_ms: 1_767_225_600_000,
-            },
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target: target("ice", "db", "orders"),
                 options: BTreeMap::from([("rewrite-all".to_string(), "true".to_string())]),
@@ -656,6 +647,29 @@ async fn spark_procedures_dispatch_typed_actions_and_preserve_result_schemas() {
             },
         ]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_orphan_files_requires_frontend_state_store_before_dispatch() {
+    let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    let engine = FakeMaintenanceEngine::default();
+
+    let error = service
+        .try_handle_statement(
+            &engine,
+            "CALL ice.system.remove_orphan_files(\
+             table => 'db.orders', older_than => TIMESTAMP '2026-01-01 00:00:00')",
+            context(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        "connector orphan cleanup requires frontend StateStore"
+    );
+    assert!(engine.requests().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
