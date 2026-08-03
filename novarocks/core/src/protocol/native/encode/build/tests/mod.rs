@@ -184,6 +184,7 @@ pub(super) fn fixture_query_table_bindings(
                         files: Vec::new(),
                         binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     }),
+                    delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },
         )

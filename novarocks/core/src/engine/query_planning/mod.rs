@@ -25,6 +25,7 @@
 pub(crate) mod bindings;
 pub(crate) mod catalog_materializer;
 pub(crate) mod catalog_runtime;
+pub(crate) mod delta_scan;
 pub(crate) mod write_sink;
 
 use std::{collections::HashMap, sync::Arc};

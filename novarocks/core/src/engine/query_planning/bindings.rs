@@ -23,7 +23,7 @@
 //! `SqlTableBindingId`; preparation and statistics must validate that token
 //! against this store rather than acquiring a current connector generation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -198,6 +198,13 @@ pub(crate) struct QueryTableBinding {
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
     pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+    /// Exact snapshot-window physical facts admitted for a SQL delta scan.
+    /// They remain application-owned and are retrieved only through this
+    /// binding's request-local token during preparation.
+    pub(crate) delta_runtime_plans: BTreeMap<
+        (i64, i64),
+        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
+    >,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg
@@ -260,6 +267,7 @@ impl QueryTableBinding {
             statistics_pin: None,
             planning_lease: None,
             scan_materialization: None,
+            delta_runtime_plans: BTreeMap::new(),
         }
     }
 

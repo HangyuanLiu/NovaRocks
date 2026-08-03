@@ -136,6 +136,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                             binding: IcebergDataFileBinding::CurrentSnapshot,
                         },
                     ),
+                    delta_runtime_plans: std::collections::BTreeMap::new(),
                 };
                 Ok(binding)
             },

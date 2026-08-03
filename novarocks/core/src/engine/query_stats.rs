@@ -359,6 +359,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 serialized_table,
                 metadata_payload,
             }),
+            delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     }
 }

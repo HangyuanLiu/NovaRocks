@@ -14175,6 +14175,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
                     .affected_partitions_to_target_partition_filter(),
                 target_partition_contract: refresh.rewrite.schema_contract.target.partition.clone(),
             }),
+            delta_runtime_plans: BTreeMap::new(),
         })
     })?;
     Ok(token)
@@ -14267,6 +14268,18 @@ pub(crate) fn freeze_imv_base_query_local_overlays(
         materialization.table.current_snapshot_id = Some(snapshot_id);
         materialization.files = files;
         materialization.binding = IcebergDataFileBinding::ExplicitFiles;
+        let mut delta_runtime_plans = BTreeMap::new();
+        if let Some(previous_snapshot_id) = refresh.rewrite.previous_snapshot_ids.get(&base.fqn()) {
+            let runtime_plan =
+                crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(
+                    &materialization.table,
+                    entry,
+                    &loaded.table,
+                    *previous_snapshot_id,
+                    snapshot_id,
+                )?;
+            delta_runtime_plans.insert((*previous_snapshot_id, snapshot_id), runtime_plan);
+        }
 
         let catalog = base.catalog.clone();
         let namespace = base.namespace.clone();
@@ -14278,12 +14291,13 @@ pub(crate) fn freeze_imv_base_query_local_overlays(
                 table.clone(),
                 key,
                 move |binding| {
-                    crate::engine::query_planning::catalog_materializer::iceberg_query_binding_from_materialization(
+                    crate::engine::query_planning::catalog_materializer::iceberg_query_binding_from_materialization_with_delta_plans(
                         materialization.clone(),
                         &catalog,
                         &namespace,
                         &table,
                         binding,
+                        delta_runtime_plans.clone(),
                     )
                 },
             ),

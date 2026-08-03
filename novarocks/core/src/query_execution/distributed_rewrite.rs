@@ -168,6 +168,7 @@ pub(crate) fn admit_frozen_rewrite_scan_binding(
                 statistics_pin: None,
                 planning_lease: None,
                 scan_materialization: None,
+                delta_runtime_plans: BTreeMap::new(),
             })
         },
     )

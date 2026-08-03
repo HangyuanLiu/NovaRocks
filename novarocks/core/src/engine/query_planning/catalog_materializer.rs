@@ -22,7 +22,7 @@
 //! preparation.  SQL sees the resulting neutral table facts solely through
 //! `PlannerTableProvider`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use novarocks_catalog::partition::LegacyRangePartition;
@@ -48,6 +48,30 @@ pub(crate) fn iceberg_query_binding_from_materialization(
     namespace: &str,
     sql_table_name: &str,
     binding: SqlTableBindingId,
+) -> Result<QueryTableBinding, String> {
+    iceberg_query_binding_from_materialization_with_delta_plans(
+        materialization,
+        catalog,
+        namespace,
+        sql_table_name,
+        binding,
+        BTreeMap::new(),
+    )
+}
+
+/// Equivalent to [`iceberg_query_binding_from_materialization`] with
+/// application-admitted snapshot-window delta facts.  SQL still receives only
+/// the binding token; preparation recovers this map from the same store.
+pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
+    materialization: crate::connector::iceberg::provider::IcebergQueryTableMaterialization,
+    catalog: &str,
+    namespace: &str,
+    sql_table_name: &str,
+    binding: SqlTableBindingId,
+    delta_runtime_plans: BTreeMap<
+        (i64, i64),
+        crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
+    >,
 ) -> Result<QueryTableBinding, String> {
     use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
     use crate::sql::planner::table::{
@@ -95,6 +119,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
             files: materialization.files,
             binding: materialization.binding,
         }),
+        delta_runtime_plans,
     })
 }
 
@@ -461,6 +486,7 @@ mod tests {
                 files: vec![],
                 binding: IcebergDataFileBinding::ExplicitFiles,
             }),
+            delta_runtime_plans: BTreeMap::new(),
         }
     }
 

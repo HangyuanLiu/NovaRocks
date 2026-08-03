@@ -5484,8 +5484,16 @@ pub(crate) fn build_physical_plan_as_iceberg_change_stream_write_with_connector_
     let distributed_plan = planned_dp.distributed_plan;
     let topology = planned_dp.topology;
     let maintenance_execution = capture_maintenance_execution(state)?;
-    let scan_binding_resolver = mv_refresh_ctx
-        .map(|ctx| ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver);
+    let scan_resolver = query_table_bindings
+        .map(crate::engine::query_planning::delta_scan::QueryTableBindingScanResolver::new);
+    let scan_binding_resolver = scan_resolver
+        .as_ref()
+        .map(|resolver| resolver as &dyn crate::query_execution::preparation::scan::ScanBindingResolver)
+        .or_else(|| {
+            mv_refresh_ctx.map(|ctx| {
+                ctx as &dyn crate::query_execution::preparation::scan::ScanBindingResolver
+            })
+        });
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         state.connector_control.as_ref(),
