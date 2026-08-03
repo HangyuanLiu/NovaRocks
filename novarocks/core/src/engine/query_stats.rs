@@ -18,6 +18,9 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use iceberg::spec::{PrimitiveType, TableMetadata, Type};
+
 use novarocks_spi::connector::{
     ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsProvenance,
@@ -321,10 +324,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         };
         let table_info = table_info.clone();
         let files = files.clone();
-        let columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_table(
-            metadata_table_type,
-            &table_info,
-        )?;
+        let columns = metadata_columns_for_table(metadata_table_type, &table_info)?;
         planner.columns = columns
             .into_iter()
             .map(|column| novarocks_catalog::schema::ColumnDef {
@@ -456,6 +456,134 @@ fn metadata_payload(
         | SqlMetadataTableKind::History
         | SqlMetadataTableKind::Refs => Ok(None),
     }
+}
+
+fn metadata_columns_for_table(
+    kind: SqlMetadataTableKind,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+) -> Result<Vec<crate::sql::analyzer::iceberg_metadata::MetadataColumn>, String> {
+    let mut columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema(kind);
+    if matches!(
+        kind,
+        SqlMetadataTableKind::Files | SqlMetadataTableKind::LogicalIcebergMetadata
+    ) {
+        let partition = partition_struct_type(table)?;
+        let column = columns
+            .iter_mut()
+            .find(|column| column.name.eq_ignore_ascii_case("partition"))
+            .ok_or_else(|| "Iceberg metadata schema is missing partition column".to_string())?;
+        column.data_type = partition;
+    }
+    Ok(columns)
+}
+
+fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
+    match ty {
+        Type::Primitive(primitive) => Ok(match primitive {
+            PrimitiveType::Boolean => DataType::Boolean,
+            PrimitiveType::Int => DataType::Int32,
+            PrimitiveType::Long => DataType::Int64,
+            PrimitiveType::Float => DataType::Float32,
+            PrimitiveType::Double => DataType::Float64,
+            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
+                u8::try_from(*precision)
+                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
+                i8::try_from(*scale)
+                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
+            ),
+            PrimitiveType::Date => DataType::Date32,
+            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            }
+            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
+            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
+                i32::try_from(*width)
+                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
+            ),
+            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
+        }),
+        other => Err(format!(
+            "iceberg metadata partition field must be primitive, got {other:?}"
+        )),
+    }
+}
+
+fn partition_source_type<'a>(metadata: &'a TableMetadata, source_id: i32) -> Option<&'a Type> {
+    metadata
+        .current_schema()
+        .field_by_id(source_id)
+        .map(|field| field.field_type.as_ref())
+        .or_else(|| {
+            metadata.schemas_iter().find_map(|schema| {
+                schema
+                    .field_by_id(source_id)
+                    .map(|field| field.field_type.as_ref())
+            })
+        })
+}
+
+fn partition_struct_type(
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+) -> Result<DataType, String> {
+    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
+        format!(
+            "iceberg metadata table {}.{} requires serialized metadata to type partition struct",
+            table.namespace, table.table
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        format!("parse iceberg table metadata for partition schema failed: {error}")
+    })?;
+    let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.spec_id());
+
+    let mut fields: Vec<Arc<Field>> = Vec::new();
+    for spec in specs {
+        for partition_field in spec.fields() {
+            let source_type = partition_source_type(&metadata, partition_field.source_id)
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg partition field {} references missing source field id {}",
+                        partition_field.name, partition_field.source_id
+                    )
+                })?;
+            let result_type =
+                partition_field
+                    .transform
+                    .result_type(source_type)
+                    .map_err(|error| {
+                        format!(
+                            "infer iceberg partition field {} type: {error}",
+                            partition_field.name
+                        )
+                    })?;
+            let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
+            if let Some(existing) = fields
+                .iter()
+                .find(|field| field.name().eq_ignore_ascii_case(&partition_field.name))
+            {
+                if existing.data_type() != &arrow_type {
+                    return Err(format!(
+                        "iceberg partition field {} has incompatible types across specs: {:?} vs {:?}",
+                        partition_field.name,
+                        existing.data_type(),
+                        arrow_type
+                    ));
+                }
+                continue;
+            }
+            fields.push(Arc::new(Field::new(
+                partition_field.name.clone(),
+                arrow_type,
+                true,
+            )));
+        }
+    }
+    Ok(DataType::Struct(Fields::from(fields)))
 }
 
 /// Query-prep encodes time-travel selectors as a synthetic analyzer identity.
