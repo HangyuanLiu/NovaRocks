@@ -639,14 +639,14 @@ pub(super) fn collect_table_stats(
     let label = table_label(database, table_def);
     let ScanSource::Sql(source) = &table_def.source;
     let binding_id = source.binding;
-    let Some(bindings) = context.bindings.as_ref() else {
+    if context.bindings.is_none() {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
                 "query table bindings are not available".to_string(),
             )),
         );
-    };
+    }
     match context.snapshot.get(binding_id) {
         Ok(evidence) => (evidence.label.clone(), evidence.statistics.clone()),
         // The legacy collector cannot return a compiler error.  The canonical

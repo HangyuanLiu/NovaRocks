@@ -525,10 +525,10 @@ impl QueryTableBindingStore {
             Some(
                 QueryScanMaterialization::IcebergDataFiles { .. }
                 | QueryScanMaterialization::IcebergMvTarget { .. },
-            ) => match &binding.resolved.planner.source {
-                ScanSource::Sql(source) => Ok(source.binding),
-                _ => Err("SQL write target binding is missing its SQL binding token".to_string()),
-            },
+            ) => {
+                let ScanSource::Sql(source) = &binding.resolved.planner.source;
+                Ok(source.binding)
+            }
             _ => Err(format!(
                 "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
             )),

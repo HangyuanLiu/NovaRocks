@@ -346,7 +346,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
 
 fn project_binding_for_sql(
     binding_id: SqlTableBindingId,
-    mut binding: QueryTableBinding,
+    binding: QueryTableBinding,
 ) -> Result<QueryTableBinding, String> {
     binding.validate_sql_scan_binding(binding_id)?;
     Ok(binding)
