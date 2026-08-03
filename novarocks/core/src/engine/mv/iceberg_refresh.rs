@@ -15810,6 +15810,10 @@ fn execute_imv_change_stream_writer(
             "Iceberg MV change-stream write is missing its caller connector context".to_string()
         })?;
     crate::connector::validate_request_context(connector_context)?;
+    let table_bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
+        "Iceberg MV change-stream write is missing admission-frozen query table bindings"
+            .to_string()
+    })?;
     let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
         target,
         &refresh_plan,
@@ -15821,7 +15825,7 @@ fn execute_imv_change_stream_writer(
             Some(&target.catalog),
             &target.namespace,
             &refresh_plan.optimized_tree,
-            refresh_plan.table_bindings.as_deref(),
+            Some(table_bindings),
             &mut dag,
             refresh_plan.mv_refresh_ctx,
             None,
@@ -15891,19 +15895,26 @@ fn execute_imv_change_stream_writer(
                 })
                 .flatten()
         });
+    let target_name = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
+    let binding =
+        crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+            crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                target: &target_name,
+                target_ref,
+                table: &commit_executor.table,
+                entry: &entry,
+                base_snapshot_id,
+                operation_id: refresh_plan.connector_operation_id,
+                topology: &planned.topology,
+                table_bindings,
+                commit_executor: Arc::clone(&commit_executor),
+            },
+        )?;
     let connector_write =
         crate::engine::iceberg_writer::register_iceberg_change_stream_provider_binding(
             state,
             target,
-            &planned.topology,
-            refresh_plan.table_bindings.as_deref().ok_or_else(|| {
-                "IMV change-stream write is missing admission-frozen query table bindings"
-                    .to_string()
-            })?,
-            planned.commit_plan.clone(),
-            Arc::clone(&commit_executor),
-            &entry,
-            base_snapshot_id,
+            &binding,
             refresh_plan.connector_operation_id,
             connector_context.clone(),
         )?;
@@ -15970,6 +15981,10 @@ fn prepare_imv_change_stream_writer(
             "Iceberg MV change-stream write is missing its caller connector context".to_string()
         })?;
     crate::connector::validate_request_context(connector_context)?;
+    let table_bindings = refresh_plan.table_bindings.as_deref().ok_or_else(|| {
+        "Iceberg MV change-stream write is missing admission-frozen query table bindings"
+            .to_string()
+    })?;
     let mut dag = iceberg_change_stream_write_dag_for_imv_refresh(
         target,
         &refresh_plan,
@@ -15981,7 +15996,7 @@ fn prepare_imv_change_stream_writer(
             Some(&target.catalog),
             &target.namespace,
             &refresh_plan.optimized_tree,
-            refresh_plan.table_bindings.as_deref(),
+            Some(table_bindings),
             &mut dag,
             refresh_plan.mv_refresh_ctx,
             None,
@@ -16034,11 +16049,7 @@ fn prepare_imv_change_stream_writer(
             state,
             target,
             &planned.topology,
-            refresh_plan.table_bindings.as_deref().ok_or_else(|| {
-                "prepared IMV change-stream write is missing admission-frozen query table bindings"
-                    .to_string()
-            })?,
-            planned.commit_plan,
+            table_bindings,
             commit_executor,
             &entry,
             base_snapshot_id,

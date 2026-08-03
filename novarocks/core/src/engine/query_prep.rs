@@ -23,8 +23,6 @@ use std::sync::Arc;
 
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::resolve_table_target;
-use crate::engine::statement::parse_add_files_sql;
-use crate::runtime::query_result::build_string_query_result;
 use crate::sql::analyzer::iceberg_ref::{
     IcebergRefKind, SqlIcebergNamedRef, SqlIcebergRefMetadata, SqlIcebergSnapshotLog,
     resolve_read_binding,
@@ -104,71 +102,6 @@ fn project_iceberg_ref_metadata(metadata: &iceberg::spec::TableMetadata) -> SqlI
     )
 }
 
-pub(crate) fn add_files(
-    state: &Arc<StandaloneState>,
-    sql: &str,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    let (table_parts, s3_path) = parse_add_files_sql(sql)?;
-
-    let (catalog_name, namespace, table_name) = match table_parts.len() {
-        1 => {
-            let cat =
-                current_catalog.ok_or("ADD FILES requires a catalog context (use SET catalog)")?;
-            (
-                cat.to_string(),
-                current_database.to_string(),
-                table_parts[0].clone(),
-            )
-        }
-        2 => {
-            let cat = current_catalog.ok_or("ADD FILES requires a catalog context")?;
-            (
-                cat.to_string(),
-                table_parts[0].clone(),
-                table_parts[1].clone(),
-            )
-        }
-        3 => (
-            table_parts[0].clone(),
-            table_parts[1].clone(),
-            table_parts[2].clone(),
-        ),
-        _ => return Err("invalid table name in ADD FILES".to_string()),
-    };
-
-    let target = crate::engine::backend_resolver::TargetBackend {
-        backend_name: "iceberg",
-        catalog: catalog_name.clone(),
-        namespace: namespace.clone(),
-        table: table_name.clone(),
-    };
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
-        &target,
-        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Insert,
-    )?;
-    let completed = crate::connector::data_mutation::execute_data_mutation(
-        state.connector_control.as_ref(),
-        state.as_ref(),
-        &novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
-            .map_err(|error| error.to_string())?,
-        novarocks_spi::connector::ConnectorMutationOperationId::new(),
-        novarocks_spi::connector::ConnectorTableIdentity {
-            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&catalog_name)
-                .map_err(|error| error.to_string())?,
-            namespace: namespace.clone().into(),
-            table: table_name.clone().into(),
-        },
-        crate::connector::data_mutation::DataMutationIntent::register_existing_files(s3_path),
-        connector_context.clone(),
-    )?;
-    let count = completed.receipt.summary().file_count();
-    let msg = format!("Added {count} file(s)");
-    build_string_query_result("status", vec![msg]).map(StatementResult::Query)
-}
 // ---------------------------------------------------------------------------
 // Time-travel (FOR VERSION/TIMESTAMP AS OF) AST rewrite
 // ---------------------------------------------------------------------------
@@ -503,6 +436,10 @@ fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     }
 }
 
+/// Remove a durable local catalog relation after DDL replaces or drops it.
+/// Query-local overlays never call this helper: they are scoped to their
+/// binding store and are not registered in the shared catalog in the first
+/// place.
 pub(crate) fn drop_local_table_registration_if_exists(
     state: &Arc<StandaloneState>,
     namespace: &str,
@@ -512,85 +449,12 @@ pub(crate) fn drop_local_table_registration_if_exists(
         .catalog_service
         .local()
         .write()
-        .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+        .map_err(|error| format!("standalone catalog write lock: {error}"))?;
     match guard.drop_table(namespace, table) {
         Ok(()) => Ok(()),
-        Err(err) if err.contains("unknown") => Ok(()),
-        Err(err) => Err(format!("drop local table metadata: {err}")),
+        Err(error) if error.contains("unknown") => Ok(()),
+        Err(error) => Err(format!("drop local table metadata: {error}")),
     }
-}
-
-/// IVM-A1 helper: build a local planner-catalog-compatible `TableDef` for the
-/// base table of an MV refresh without registering any data files.
-/// Advertises Iceberg v3 row-lineage virtual columns (`_row_id`, etc.) so
-/// the analyzer can resolve apply-key references; the actual per-snapshot
-/// files come from the `IcebergDeltaScan` operator at runtime.
-#[cfg(test)]
-pub(crate) fn build_iceberg_table_def_for_delta_scan(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-    namespace: &str,
-    table_name: &str,
-) -> Result<TableDef, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(catalog_name)?
-    };
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table_name)?;
-    crate::connector::iceberg::catalog::build_iceberg_table_def_for_delta_scan(
-        catalog_name,
-        namespace,
-        table_name,
-        loaded,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn build_iceberg_table_def_with_files(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
-    namespace: &str,
-    table_name: &str,
-    data_files: Vec<IcebergFileForQuery>,
-) -> Result<TableDef, String> {
-    let entry = {
-        let registry = state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(catalog_name)?
-    };
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table_name)?;
-    let data_files = data_files
-        .into_iter()
-        .map(
-            |file| crate::connector::iceberg::catalog::registry::DataFileWithStats {
-                path: file.path,
-                size: file.size,
-                record_count: file.record_count,
-                column_stats: None,
-                partition_spec_id: file.partition_spec_id,
-                partition_key: file.partition_key,
-                partition_values: None,
-                manifest_path: None,
-                partition_field_values: vec![],
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files: vec![],
-            },
-        )
-        .collect();
-    crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
-        &entry,
-        catalog_name,
-        namespace,
-        table_name,
-        loaded,
-        data_files,
-    )
 }
 
 #[cfg(test)]

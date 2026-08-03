@@ -42,8 +42,11 @@ use super::write_service::{
     IcebergChangeStreamWriteReportCommitter, IcebergWriteControlService,
     IcebergWriteControlServiceContext, IcebergWriteReportCommitter,
 };
-use crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology;
-use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::engine::query_planning::write_sink::{
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, iceberg_write_sink_spec_from_admitted_sql_input,
+};
+use crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology;
 use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 
 /// Frozen application input accepted by the Iceberg provider binding. It has
@@ -55,7 +58,8 @@ pub(crate) struct IcebergChangeStreamProviderRequest<'a> {
     pub(crate) entry: &'a IcebergCatalogEntry,
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) operation_id: ConnectorWriteOperationId,
-    pub(crate) topology: &'a IcebergChangeStreamWriteTopology,
+    pub(crate) topology: &'a SqlChangeStreamWriteTopology,
+    pub(crate) table_bindings: &'a QueryTableBindingStore,
     pub(crate) commit_executor: Arc<IcebergWriteCommitExecutor>,
 }
 
@@ -134,6 +138,7 @@ pub(crate) fn bind_iceberg_change_stream_provider(
         request.table,
         request.entry,
         request.base_snapshot_id,
+        request.table_bindings,
     )?;
     let plan_payload = IcebergWritePlanPayloadV1 {
         version: 1,
@@ -190,10 +195,11 @@ pub(crate) fn frozen_deletion_vector_handle_payload(
 }
 
 fn change_stream_writer_handle_payloads(
-    topology: &IcebergChangeStreamWriteTopology,
+    topology: &SqlChangeStreamWriteTopology,
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
+    table_bindings: &QueryTableBindingStore,
 ) -> Result<BTreeMap<i32, Bytes>, String> {
     let mut payloads = BTreeMap::new();
     for branch in &topology.writer_branches {
@@ -203,7 +209,8 @@ fn change_stream_writer_handle_payloads(
                 branch.writer_fragment_id
             )
         })?;
-        let mut sink_spec = branch.sink_spec.clone();
+        let mut sink_spec =
+            iceberg_write_sink_spec_from_admitted_sql_input(table_bindings, &branch.sink, entry)?;
         sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
         let payload = match sink_spec.mode {
             IcebergWriteSinkMode::DeletionVectors => {

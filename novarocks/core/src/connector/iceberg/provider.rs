@@ -6305,14 +6305,31 @@ pub(crate) fn load_schema_materialization_with_lease(
     namespace: &str,
     table: &str,
 ) -> Result<IcebergQueryTableMaterialization, String> {
-    use novarocks_spi::connector::{
-        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    };
-
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
     let planning_lease = controls
         .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
+    load_schema_materialization_from_exact_lease(planning_lease, context, namespace, table)
+}
+
+/// Materialize a base table from the caller's exact control generation.
+///
+/// This is an application-facing admission helper for flows which have already
+/// frozen a `ConnectorControlPlanningLease`. It deliberately does not accept a
+/// resolver or catalog identity, so it cannot reacquire a newer generation
+/// while resolving schema facts. The returned envelope retains the supplied
+/// lease through query-local binding and preparation.
+pub(crate) fn load_schema_materialization_from_exact_lease(
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<IcebergQueryTableMaterialization, String> {
+    use novarocks_spi::connector::{
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    };
+
+    let instance_id = planning_lease.binding().descriptor().instance_id.clone();
     let metadata = planning_lease
         .binding()
         .metadata()

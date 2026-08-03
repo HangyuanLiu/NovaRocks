@@ -531,7 +531,8 @@ pub(crate) fn activate_iceberg_change_stream_provider_binding_after_session(
 pub(crate) fn activate_iceberg_change_stream_connector_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
-    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    topology: &crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     entry: &IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
@@ -550,6 +551,7 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
                 base_snapshot_id,
                 operation_id,
                 topology,
+                table_bindings,
                 commit_executor: Arc::clone(&commit_executor),
             },
         )?;
@@ -867,7 +869,8 @@ impl PreparedIcebergWrite {
             Some(&self.executor.target.catalog),
             &self.executor.target.namespace,
             &self.executor.query,
-            self.executor.sink_spec.clone(),
+            self.executor.sql_write_input.clone(),
+            Arc::clone(&self.executor.table_bindings),
             None,
             crate::sql::compiler::RootDistributionRequirement::Any,
             self.executor.execution.as_ref(),
@@ -1047,41 +1050,6 @@ struct PreparedIcebergWriteExecutor {
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
 }
 
-impl IcebergWriteTransactionExecutor for PreparedIcebergWriteExecutor {
-    fn run_coordinated_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-    ) -> Result<QueryExecutionResult, String> {
-        crate::engine::execute_query_as_iceberg_write_with_connector_context(
-            &self.state,
-            Some(&self.target.catalog),
-            &self.target.namespace,
-            &self.query,
-            self.sql_write_input.clone(),
-            Arc::clone(&self.table_bindings),
-            None,
-            crate::sql::compiler::RootDistributionRequirement::Any,
-            self.execution.as_ref(),
-            &self.connector_context,
-            Some(self.connector_write.clone()),
-        )
-    }
-
-    fn commit_connector_write(
-        &self,
-        _spec: &IcebergWriteTransactionSpec,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Option<Result<CommitOutcome, CommitServiceError>> {
-        Some(commit_iceberg_connector_write(
-            &self.commit_executor,
-            completion,
-        ))
-    }
-
-    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
-        self.commit_executor.finalize()
-    }
-}
 /// Build the `(query, sink_spec)` pair for an iceberg INSERT/OVERWRITE write
 /// without driving a transaction. The frontend INSERT adapter consumes this
 /// plan through its DML-owned runner; the folded MERGE not-matched INSERT
