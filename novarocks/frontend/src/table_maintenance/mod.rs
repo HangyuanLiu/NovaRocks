@@ -1006,8 +1006,21 @@ impl FrontendTableMaintenanceService {
                 };
                 let checkpoint = self
                     .block_on(repository.load_batch(operation.operation_id, ordinal))
-                    .map_err(|error| format!("load orphan cleanup recovery batch failed: {error}"))?
-                    .ok_or_else(|| "orphan cleanup recovery has no prepared batch".to_string())?;
+                    .map_err(|error| {
+                        format!("load orphan cleanup recovery batch failed: {error}")
+                    })?;
+                let Some(checkpoint) = checkpoint else {
+                    // A Running operation can have completed a checkpoint and
+                    // not yet prepared its next batch when FE stops. There is
+                    // no destructive dispatch to reconcile in that state, and
+                    // startup must not manufacture an Unresolved fence for it.
+                    // ReconcilePending, by contrast, always denotes a durable
+                    // prepared batch and is corrupt without one.
+                    if operation.state == CleanupOperationState::Running {
+                        return Ok(());
+                    }
+                    return Err("orphan cleanup recovery has no prepared batch".to_string());
+                };
                 let plan = cleanup_plan_from_durable(&operation, stored_plan)?;
                 let prepared = PreparedBatch::try_from_wire_v1(bytes::Bytes::from(
                     checkpoint.prepared_handle.clone(),

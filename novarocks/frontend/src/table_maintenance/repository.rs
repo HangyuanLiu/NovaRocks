@@ -4990,6 +4990,7 @@ impl CleanupOperationRepository {
             action,
             "transition frontend connector cleanup operation",
             move |transaction, transaction_id| {
+                let error = error.clone();
                 Box::pin(async move {
                     apply_cleanup_transition(
                         transaction,
@@ -5389,10 +5390,11 @@ async fn apply_cleanup_checkpoint(
             "cleanup checkpoint changed prepared evidence",
         )));
     }
-    if prepared.receipt_handle.is_some() && cleanup_checkpoint_from_stored(prepared) == checkpoint {
+    let has_durable_receipt = prepared.receipt_handle.is_some();
+    if has_durable_receipt && cleanup_checkpoint_from_stored(prepared) == checkpoint {
         return Ok(Ok(CleanupOperation::from(&operation.stored)));
     }
-    if prepared.receipt_handle.is_some() {
+    if has_durable_receipt {
         return Ok(Err(RepositoryError::corruption(
             "cleanup checkpoint conflicts with durable receipt",
         )));
@@ -5681,9 +5683,9 @@ async fn require_cleanup_active(
 fn validate_cleanup_create(request: &CleanupOperationCreate) -> RepositoryResult<()> {
     validate_metadata_target(&request.target)?;
     validate_metadata_owner(&request.owner)?;
-    if request.older_than_ms < 0 {
+    if request.older_than_ms <= 0 {
         return Err(RepositoryError::corruption(
-            "cleanup older_than_ms must not be negative",
+            "cleanup older_than_ms must be positive",
         ));
     }
     Ok(())
@@ -5708,10 +5710,13 @@ fn validate_cleanup_plan(plan: &CleanupPlanPayload) -> RepositoryResult<()> {
         plan.artifact_handle_digest,
         "cleanup plan artifact handle",
     )?;
+    let maximum_candidates = u32::from(CLEANUP_MAX_BATCHES) * 1024;
     if plan.batch_count > CLEANUP_MAX_BATCHES
         || plan.manifest_parts > 64
+        || plan.candidate_count > maximum_candidates
         || (plan.candidate_count == 0 && plan.batch_count != 0)
-        || (plan.candidate_count > 0 && plan.batch_count == 0)
+        || (plan.candidate_count > 0 && (plan.batch_count == 0 || plan.manifest_parts == 0))
+        || plan.candidate_count > u32::from(plan.batch_count) * 1024
     {
         return Err(RepositoryError::corruption(
             "cleanup plan candidate and batch count are inconsistent",
