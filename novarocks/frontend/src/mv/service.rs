@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks::mv::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine,
-    MvRefreshPreparationRequest, MvRefreshPreparationService, MvRequestContext, MvStatementResult,
-    PreparedMvRefresh,
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    MvRequestContext, MvStatementResult, PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use novarocks::mv::background::{
     MvBackgroundBindings, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
@@ -635,10 +635,7 @@ fn execute_scheduled_refresh(
             Ok(prepared) => prepared,
             Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
         };
-        let no_op = matches!(
-            prepared.work,
-            novarocks::sql::mv_refresh::PreparedMvRefreshWork::NoOp
-        );
+        let no_op = matches!(prepared.work, PreparedMvRefreshWork::NoOp);
         if let Err(error) = refresh::execute(
             dependencies.repository.as_ref(),
             &dependencies.refresh,
@@ -689,12 +686,9 @@ fn scheduled_refresh_test_barrier(
 
 fn reserve_refresh_attempt(
     repository: &dyn MvRepository,
-) -> Result<
-    novarocks::sql::mv_refresh::MvRefreshAttemptIdentity,
-    novarocks::mv::repository::MvRepositoryError,
-> {
+) -> Result<MvRefreshAttemptIdentity, novarocks::mv::repository::MvRepositoryError> {
     let refresh_id = repository.reserve_frontend_refresh_id()?;
-    Ok(novarocks::sql::mv_refresh::MvRefreshAttemptIdentity {
+    Ok(MvRefreshAttemptIdentity {
         refresh_id,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),

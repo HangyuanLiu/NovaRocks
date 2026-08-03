@@ -1029,7 +1029,7 @@ fn execute_framework_locator_query(
         &connector_context,
         Some(bindings.as_ref()),
         None,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )?;
     let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
         &compiled.distributed_plan,

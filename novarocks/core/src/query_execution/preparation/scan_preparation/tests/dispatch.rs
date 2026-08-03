@@ -272,7 +272,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         &crate::connector::test_request_context(),
         Some(&bindings),
         Some(&JoinRefreshDeltaResolver),
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("tokenized coalesce scans must prepare from exact bindings");
     for node_id in &scan_node_ids {

@@ -210,7 +210,7 @@ fn sqlx2_scan_metadata_recovers_exact_request_local_materialization() {
         &crate::connector::test_request_context(),
         Some(&store),
         None,
-        super::super::ScanPreparationOptions::default(),
+        super::super::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare token-bound metadata scan");
 

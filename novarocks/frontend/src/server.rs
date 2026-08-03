@@ -514,6 +514,7 @@ mod tests {
     use super::{
         FrontendServerConfig, run_frontend_server, run_frontend_server_until_shutdown,
         run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
+        standalone_open_services,
     };
     use crate::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
