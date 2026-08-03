@@ -108,24 +108,40 @@ pub(crate) trait SqlStatisticsSnapshot {
     );
 }
 
-/// Application-frozen input for incremental-MV rewrite.  SQL invokes this at
-/// the logical boundary, but does not receive an application request context
-/// or an untyped callback.  The implementation owns any refresh-specific
-/// validation and returns only SQL facts.
-pub(crate) trait SqlImvRewriteInput {
-    fn rewrite(
-        &self,
-        logical_plan: crate::sql::planner::logical::LogicalPlanNode,
-        factory: crate::sql::column_id::ColumnRefFactory,
-        optimizer_settings: &SessionOptimizerSettings,
-    ) -> Result<SqlImvRewriteOutput, String>;
+/// Required evidence for an incremental-MV rewrite.  This is data frozen by
+/// application admission, not a callback that can re-enter application code
+/// while the compiler is running.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlImvRewriteValidation {
+    None,
+    Aggregate,
+    JoinAggregate,
+    BranchUnionAggregate,
 }
 
-pub(crate) struct SqlImvRewriteOutput {
-    pub(crate) logical_plan: crate::sql::planner::logical::LogicalPlanNode,
-    pub(crate) factory: crate::sql::column_id::ColumnRefFactory,
-    pub(crate) change_stream:
-        crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+/// Application-frozen incremental-MV planning input.  The compiler owns the
+/// rewrite pipeline and its validation; application provides only the exact
+/// immutable refresh facts captured for this statement.
+///
+/// `IcebergMvRewriteContext` remains a transitional carrier while the
+/// remaining schema-contract vocabulary is moved under SQL ownership.  It is
+/// a value here, never a behavior callback or request context.
+#[derive(Clone)]
+pub(crate) struct SqlImvPlanningInput {
+    pub(crate) rewrite_context: Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>,
+    pub(crate) validation: SqlImvRewriteValidation,
+}
+
+impl SqlImvPlanningInput {
+    pub(crate) fn new(
+        rewrite_context: Arc<crate::mv::rewrite::context::IcebergMvRewriteContext>,
+        validation: SqlImvRewriteValidation,
+    ) -> Self {
+        Self {
+            rewrite_context,
+            validation,
+        }
+    }
 }
 
 /// Immutable SQL function semantics used by analysis and optimization.
@@ -218,6 +234,10 @@ impl SqlCompileControl {
         }
         Ok(())
     }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
 }
 
 /// Complete immutable input consumed by the pure SQL compiler.
@@ -230,7 +250,7 @@ pub(crate) struct SqlCompileRequest<'a> {
     pub(crate) statistics: &'a dyn SqlStatisticsSnapshot,
     pub(crate) functions: &'a dyn SqlFunctionCatalog,
     pub(crate) mv_rewrite: Option<&'a mv_rewrite::MvRewriteDefinitionIndex>,
-    pub(crate) imv_rewrite: Option<&'a dyn SqlImvRewriteInput>,
+    pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
 }
 
@@ -265,7 +285,11 @@ impl<'a> SqlCompileRequest<'a> {
         self.control.check()
     }
 
-    pub(crate) fn with_imv_rewrite(mut self, input: &'a dyn SqlImvRewriteInput) -> Self {
+    fn deadline(&self) -> Option<Instant> {
+        self.control.deadline()
+    }
+
+    pub(crate) fn with_imv_rewrite(mut self, input: &'a SqlImvPlanningInput) -> Self {
         self.imv_rewrite = Some(input);
         self
     }
@@ -366,12 +390,27 @@ impl SqlCompiler {
                     "incremental MV rewrite requires ChangeStreamWrite intent".to_string(),
                 ));
             }
-            let rewritten = input
-                .rewrite(logical_plan, factory, &settings)
-                .map_err(SqlCompileError::Compilation)?;
-            logical_plan = rewritten.logical_plan;
-            factory = rewritten.factory;
-            change_stream = rewritten.change_stream;
+            let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
+            let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
+                crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
+                    plan: crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(logical_plan),
+                    mv_ctx: Arc::clone(&input.rewrite_context),
+                    disabled_rules: settings.disabled_rules.clone(),
+                    deadline: request.deadline(),
+                    column_ref_factory: std::rc::Rc::clone(&factory_cell),
+                },
+            )
+            .map_err(|error| SqlCompileError::Compilation(format!("imv rewrite: {error}")))?;
+            validate_imv_rewrite_outcome(input, &outcome)?;
+            logical_plan = outcome.plan;
+            change_stream = outcome.annotation.change_stream;
+            factory = std::rc::Rc::try_unwrap(factory_cell)
+                .map_err(|_| {
+                    SqlCompileError::Compilation(
+                        "IMV rewrite leaked ColumnRefFactory references".to_string(),
+                    )
+                })?
+                .into_inner();
             request.check_control()?;
         }
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
@@ -498,6 +537,61 @@ fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, S
             "SQL compiler requires a query statement after application preprocessing".to_string(),
         )),
     }
+}
+
+pub(crate) fn validate_imv_rewrite_outcome(
+    input: &SqlImvPlanningInput,
+    outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
+) -> Result<(), SqlCompileError> {
+    let target = input.rewrite_context.target.fqn();
+    let rule_changed = |rule_name: &str| {
+        outcome.trace.events().iter().any(|event| {
+            matches!(
+                event,
+                crate::sql::optimizer::rewrite::trace::RewriteTraceEvent::RuleChanged { rule, .. }
+                    if *rule == rule_name
+            )
+        })
+    };
+    if input.validation == SqlImvRewriteValidation::JoinAggregate
+        && !rule_changed("RewriteJoinDelta")
+    {
+        return Err(SqlCompileError::Compilation(format!(
+            "iceberg join aggregate MV {target} incremental refresh rewrite did not apply RewriteJoinDelta"
+        )));
+    }
+    if input.validation == SqlImvRewriteValidation::BranchUnionAggregate
+        && !rule_changed("RewriteBranchUnion")
+    {
+        return Err(SqlCompileError::Compilation(format!(
+            "iceberg branch UNION ALL aggregate MV {target} incremental refresh rewrite did not apply RewriteBranchUnion"
+        )));
+    }
+    if input.validation != SqlImvRewriteValidation::None
+        && input.validation != SqlImvRewriteValidation::BranchUnionAggregate
+        && !rule_changed("RewriteAggregateState")
+    {
+        let label = match input.validation {
+            SqlImvRewriteValidation::JoinAggregate => "join aggregate",
+            _ => "aggregate",
+        };
+        return Err(SqlCompileError::Compilation(format!(
+            "iceberg {label} MV {target} incremental refresh rewrite did not apply RewriteAggregateState"
+        )));
+    }
+    if input.validation != SqlImvRewriteValidation::None
+        && !outcome.annotation.change_stream.has_aggregate()
+    {
+        let label = match input.validation {
+            SqlImvRewriteValidation::JoinAggregate => "join aggregate",
+            SqlImvRewriteValidation::BranchUnionAggregate => "branch UNION ALL aggregate",
+            _ => "aggregate",
+        };
+        return Err(SqlCompileError::Compilation(format!(
+            "iceberg {label} MV {target} incremental refresh rewrite plan does not contain aggregate state change stream"
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_root_distribution_requirement(

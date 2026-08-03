@@ -13728,9 +13728,13 @@ fn plan_canonical_select_for_imv(
                 ctx.rewrite.target.catalog, ctx.rewrite.target.namespace, ctx.rewrite.target.table
             ))
         })?;
-    Ok((normalize_imv_rewrite_root_project(plan), factory))
+    Ok((
+        crate::sql::planner::imv_rewrite::entrypoint::normalize_imv_rewrite_root_project(plan),
+        factory,
+    ))
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_imv_rewrite_root_project(
     plan: crate::sql::planner::logical::LogicalPlanNode,
 ) -> crate::sql::planner::logical::LogicalPlanNode {
@@ -13862,6 +13866,7 @@ fn refresh_explain_rewrite_disabled_rules(
     disabled_rules
 }
 
+#[cfg(test)]
 fn validate_aggregate_refresh_rewrite_outcome(
     ctx: &crate::mv::rewrite::context::IcebergMvRewriteContext,
     outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
@@ -13915,59 +13920,30 @@ fn validate_aggregate_refresh_rewrite_outcome(
     Ok(())
 }
 
-/// Typed, application-owned input for the SQL compiler's incremental-MV
-/// rewrite phase.  This replaces the former raw outcome callback: the input
-/// names the exact refresh context and the evidence contract to enforce.
-pub(crate) struct IcebergImvRewriteInput<'a> {
-    refresh: &'a IcebergMvRefreshContext,
+/// Project the exact refresh facts admitted by application into the compiler
+/// input.  The compiler runs and validates the rewrite itself; this adapter
+/// cannot execute arbitrary application behavior during compilation.
+pub(crate) fn sql_imv_planning_input(
+    refresh: &IcebergMvRefreshContext,
     evidence: RewriteMergeRefreshEvidence,
-}
+) -> crate::sql::compiler::SqlImvPlanningInput {
+    use crate::sql::compiler::SqlImvRewriteValidation;
 
-impl<'a> IcebergImvRewriteInput<'a> {
-    pub(crate) fn new(
-        refresh: &'a IcebergMvRefreshContext,
-        evidence: RewriteMergeRefreshEvidence,
-    ) -> Self {
-        Self { refresh, evidence }
-    }
-}
-
-impl crate::sql::compiler::SqlImvRewriteInput for IcebergImvRewriteInput<'_> {
-    fn rewrite(
-        &self,
-        logical_plan: crate::sql::planner::logical::LogicalPlanNode,
-        factory: crate::sql::column_id::ColumnRefFactory,
-        optimizer_settings: &crate::sql::optimizer::options::SessionOptimizerSettings,
-    ) -> Result<crate::sql::compiler::SqlImvRewriteOutput, String> {
-        let factory_cell = std::rc::Rc::new(std::cell::RefCell::new(factory));
-        let outcome = crate::sql::planner::imv_rewrite::entrypoint::run_imv_rewrite(
-            crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteInput {
-                plan: normalize_imv_rewrite_root_project(logical_plan),
-                disabled_rules: optimizer_settings.disabled_rules.clone(),
-                mv_ctx: std::sync::Arc::clone(&self.refresh.rewrite),
-                deadline: None,
-                column_ref_factory: std::rc::Rc::clone(&factory_cell),
-            },
-        )
-        .map_err(|error| format!("imv rewrite: {error}"))?;
-        if self.evidence != RewriteMergeRefreshEvidence::None {
-            validate_aggregate_refresh_rewrite_outcome(
-                &self.refresh.rewrite,
-                &outcome,
-                self.evidence,
-            )?;
+    let validation = match evidence {
+        RewriteMergeRefreshEvidence::None => SqlImvRewriteValidation::None,
+        RewriteMergeRefreshEvidence::Aggregate => SqlImvRewriteValidation::Aggregate,
+        RewriteMergeRefreshEvidence::JoinAggregate => SqlImvRewriteValidation::JoinAggregate,
+        RewriteMergeRefreshEvidence::BranchUnionAggregate => {
+            SqlImvRewriteValidation::BranchUnionAggregate
         }
-        let factory = std::rc::Rc::try_unwrap(factory_cell)
-            .map_err(|_| "IMV rewrite leaked ColumnRefFactory references".to_string())?
-            .into_inner();
-        Ok(crate::sql::compiler::SqlImvRewriteOutput {
-            logical_plan: outcome.plan,
-            factory,
-            change_stream: outcome.annotation.change_stream,
-        })
-    }
+    };
+    crate::sql::compiler::SqlImvPlanningInput::new(
+        std::sync::Arc::clone(&refresh.rewrite),
+        validation,
+    )
 }
 
+#[cfg(test)]
 fn rewrite_outcome_rule_changed(
     outcome: &crate::sql::planner::imv_rewrite::entrypoint::ImvRewriteOutcome,
     rule_name: &str,
@@ -15802,7 +15778,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 alias_aggregate_refresh_group_key_projection(&mut query, &refresh_context)?;
             }
             crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut query);
-            let imv_rewrite_input = IcebergImvRewriteInput::new(&refresh_context, rewrite_evidence);
+            let imv_rewrite_input = sql_imv_planning_input(&refresh_context, rewrite_evidence);
             crate::engine::plan_query_for_iceberg_change_stream_refresh(
                 &query,
                 &catalog,
@@ -16807,7 +16783,7 @@ fn incremental_refresh_iceberg_mv_with_changes(
     } else {
         CommitOpKind::FastAppend
     };
-    let imv_rewrite_input = IcebergImvRewriteInput::new(&ctx, rewrite_evidence);
+    let imv_rewrite_input = sql_imv_planning_input(&ctx, rewrite_evidence);
     let execution = crate::engine::capture_maintenance_execution(state)?;
     let planned_query = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         &query,

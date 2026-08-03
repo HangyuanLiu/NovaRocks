@@ -103,6 +103,88 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     })
 }
 
+/// Normalize a transparent root projection before IMV rewrite.  This is SQL
+/// planning behavior, so application refresh adapters must not own a parallel
+/// normalization path.
+pub(crate) fn normalize_imv_rewrite_root_project(plan: LogicalPlanNode) -> LogicalPlanNode {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns,
+    } = plan;
+    let LogicalPlanKind::Project(project) = kind else {
+        return LogicalPlanNode::new(kind, children, required_output_columns);
+    };
+    let input = children.remove(0);
+    let LogicalPlanNode {
+        kind: input_kind,
+        children: aggregate_children,
+        required_output_columns: aggregate_required_output_columns,
+    } = input;
+    let LogicalPlanKind::Aggregate(mut aggregate) = input_kind else {
+        let input = LogicalPlanNode::new(
+            input_kind,
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            LogicalPlanKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
+    };
+    if project.items.len() != aggregate.output_columns.len() {
+        let input = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(aggregate),
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            LogicalPlanKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
+    }
+    let Some(output_columns) = project
+        .items
+        .iter()
+        .zip(aggregate.output_columns.iter())
+        .map(|(item, aggregate_output)| {
+            let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind else {
+                return None;
+            };
+            if *column_id != aggregate_output.column_id {
+                return None;
+            }
+            Some(OutputColumn {
+                column_id: *column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        let input = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(aggregate),
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            LogicalPlanKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
+    };
+    aggregate.output_columns = output_columns;
+    LogicalPlanNode::new(
+        LogicalPlanKind::Aggregate(aggregate),
+        aggregate_children,
+        aggregate_required_output_columns,
+    )
+}
+
 fn reserve_existing_plan_column_ids(
     column_ref_factory: &Rc<RefCell<ColumnRefFactory>>,
     plan: &LogicalPlanNode,
