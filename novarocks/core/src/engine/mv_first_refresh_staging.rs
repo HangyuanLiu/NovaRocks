@@ -26,9 +26,9 @@ use crate::engine::{
 };
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
-use crate::sql::mv_refresh::PreparedDistributedWriteRequest;
 use crate::sql::mv_refresh::first_refresh::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshPhysicalSql, MvFirstRefreshShape,
     MvFirstRefreshTargetContract, MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest,

@@ -254,7 +254,6 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
             ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
-                distributed_writes: Vec::new(),
                 first_refresh_writes: vec![prepare_frontend_first_refresh_write(
                     self.state,
                     self.current_catalog,
@@ -278,14 +277,12 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             )? {
                 PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
                     PreparedMvRefreshWork::DataProducing {
-                        distributed_writes: Vec::new(),
                         first_refresh_writes: Vec::new(),
                         incremental_writes: vec![incremental],
                     }
                 }
                 PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
                     PreparedMvRefreshWork::DataProducing {
-                        distributed_writes: Vec::new(),
                         first_refresh_writes: vec![rebuild],
                         incremental_writes: Vec::new(),
                     }

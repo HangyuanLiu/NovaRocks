@@ -24,13 +24,11 @@ use uuid::Uuid;
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
 use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
-use crate::sql::mv_refresh::{
-    MvRefreshPreparationService, MvRefreshStatement, PreparedDistributedWriteRequest,
-    PreparedMvRefresh,
-};
+use crate::sql::mv_refresh::{MvRefreshPreparationService, MvRefreshStatement, PreparedMvRefresh};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };

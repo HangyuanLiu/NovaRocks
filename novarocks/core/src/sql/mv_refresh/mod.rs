@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 
-pub use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
 pub mod first_refresh;
@@ -139,10 +138,9 @@ pub enum PreparedMvRefreshWork {
     NoOp,
     /// Source versions are unchanged; only durable MV metadata advances.
     MetadataOnly,
-    /// Each physical write request is already encoded for native execution but
-    /// remains unbound until the frontend holds the exact connector lease.
+    /// SQL artifacts remain unbound until the application holds the exact
+    /// connector lease and constructs its native execution request.
     DataProducing {
-        distributed_writes: Vec<PreparedDistributedWriteRequest>,
         /// SQL-shaped first-refresh artifacts whose provider activation and
         /// native fragment preparation are deferred until the frontend holds
         /// the exact retained write lease.
