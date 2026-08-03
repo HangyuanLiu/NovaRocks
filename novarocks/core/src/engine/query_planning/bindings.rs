@@ -165,6 +165,16 @@ pub(crate) enum QueryScanMaterialization {
         files: Vec<IcebergDataFileInfo>,
         binding: IcebergDataFileBinding,
     },
+    /// Exact provider facts for one metadata alias.  These are intentionally
+    /// retained outside the SQL plan: the compiler sees only `SqlMetadata`
+    /// plus this binding token, while preparation/native assembly recover the
+    /// unchanged Iceberg carrier from the same request-local store.
+    IcebergMetadata {
+        table: IcebergTableInfo,
+        metadata_table_type: SqlMetadataTableKind,
+        serialized_table: String,
+        metadata_payload: Option<String>,
+    },
 }
 
 impl QueryTableBinding {

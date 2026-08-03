@@ -26,7 +26,9 @@ use novarocks_spi::connector::{
 use crate::connector::unified_statistics::{
     ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
-use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingStore};
+use crate::engine::query_planning::bindings::{
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
+};
 use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;
@@ -37,7 +39,10 @@ use crate::sql::optimizer::stats_input::{
     SqlStatisticsSnapshot, SqlTableStatisticsEvidence, StatValue, StatsMissingReason, StatsRef,
     StatsSource,
 };
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{
+    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+    SqlTableVersionSelector,
+};
 
 #[derive(Clone, Default)]
 /// Query-scoped handles for the one unified statistics resolver.  This is not
@@ -270,9 +275,9 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         namespace: &str,
         table: &str,
         metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
-        _binding_id: crate::sql::binding::SqlTableBindingId,
+        binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
-        let metadata_table_type = match metadata_table_type {
+        let iceberg_metadata_table_type = match metadata_table_type {
             crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
                 crate::connector::iceberg::IcebergMetadataTableType::Snapshots
             }
@@ -295,21 +300,161 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
             }
         };
-        let (planner, statistics_pin, planning_lease) =
+        let (mut planner, statistics_pin, planning_lease) =
             crate::connector::iceberg::provider::load_metadata_table_def_with_lease(
                 self.controls,
                 self.connector_context.clone(),
                 catalog,
                 namespace,
                 table,
-                metadata_table_type,
+                iceberg_metadata_table_type,
             )?;
+        let ScanSource::IcebergDataFiles {
+            table: table_info,
+            files,
+            ..
+        } = &planner.source
+        else {
+            return Err(
+                "Iceberg metadata resolution did not produce a data-file descriptor".to_string(),
+            );
+        };
+        let table_info = table_info.clone();
+        let files = files.clone();
+        let columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_table(
+            metadata_table_type,
+            &table_info,
+        )?;
+        planner.columns = columns
+            .into_iter()
+            .map(|column| novarocks_catalog::schema::ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect();
+        let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
+            format!(
+                "iceberg metadata table {catalog}.{namespace}.{table} has no serialized metadata"
+            )
+        })?;
+        let metadata_payload = metadata_payload(metadata_table_type, &table_info, &files)?;
+        planner.source = ScanSource::Sql(SqlScanSource::new(
+            binding_id,
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Metadata {
+                kind: metadata_table_type,
+                version: SqlTableVersionSelector::Current,
+            },
+        ));
         Ok(QueryTableBinding {
             resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
             statistics_pin,
             planning_lease: Some(planning_lease),
-            scan_materialization: None,
+            scan_materialization: Some(QueryScanMaterialization::IcebergMetadata {
+                table: table_info,
+                metadata_table_type,
+                serialized_table,
+                metadata_payload,
+            }),
         })
+    }
+}
+
+fn metadata_payload(
+    kind: SqlMetadataTableKind,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+) -> Result<Option<String>, String> {
+    match kind {
+        SqlMetadataTableKind::Partitions => {
+            let mut groups = std::collections::BTreeMap::<
+                (i32, String),
+                (
+                    i64,
+                    i64,
+                    i64,
+                    std::collections::BTreeSet<String>,
+                    std::collections::BTreeSet<String>,
+                ),
+            >::new();
+            for file in files {
+                let spec_id = file.partition_spec_id.ok_or_else(|| {
+                    format!(
+                        "iceberg partitions metadata requires partition spec id for data file {}",
+                        file.path
+                    )
+                })?;
+                let rows = file.row_count.ok_or_else(|| {
+                    format!(
+                        "iceberg partitions metadata requires record_count for data file {}",
+                        file.path
+                    )
+                })?;
+                let entry = groups
+                    .entry((
+                        spec_id,
+                        file.partition_key
+                            .clone()
+                            .unwrap_or_else(|| "Struct([])".to_string()),
+                    ))
+                    .or_default();
+                entry.0 = entry.0.checked_add(rows).ok_or_else(|| {
+                    "iceberg partitions metadata record_count overflow".to_string()
+                })?;
+                entry.1 = entry
+                    .1
+                    .checked_add(1)
+                    .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
+                entry.2 = entry.2.checked_add(file.size).ok_or_else(|| {
+                    "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
+                })?;
+                for delete in &file.delete_files {
+                    match delete.file_content {
+                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                            entry.3.insert(delete.path.clone());
+                        }
+                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                            entry.4.insert(delete.path.clone());
+                        }
+                    }
+                }
+            }
+            let rows = groups.into_iter().map(|((spec_id, partition), (record_count, file_count, total_data_file_size_in_bytes, position_delete_files, equality_delete_files))| {
+                Ok(serde_json::json!({
+                    "spec_id": spec_id,
+                    "partition": partition,
+                    "record_count": record_count,
+                    "file_count": file_count,
+                    "total_data_file_size_in_bytes": total_data_file_size_in_bytes,
+                    "position_delete_file_count": i64::try_from(position_delete_files.len()).map_err(|_| "iceberg partitions metadata position_delete_file_count overflow".to_string())?,
+                    "equality_delete_file_count": i64::try_from(equality_delete_files.len()).map_err(|_| "iceberg partitions metadata equality_delete_file_count overflow".to_string())?,
+                }))
+            }).collect::<Result<Vec<_>, String>>()?;
+            serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
+                .map(Some)
+                .map_err(|error| {
+                    format!("serialize iceberg partitions metadata payload failed: {error}")
+                })
+        }
+        SqlMetadataTableKind::Files
+        | SqlMetadataTableKind::Manifests
+        | SqlMetadataTableKind::LogicalIcebergMetadata => table
+            .serialized_metadata_rows
+            .clone()
+            .map(Some)
+            .ok_or_else(|| {
+                "iceberg metadata rows were not resolved at catalog lookup time".to_string()
+            }),
+        SqlMetadataTableKind::Snapshots
+        | SqlMetadataTableKind::History
+        | SqlMetadataTableKind::Refs => Ok(None),
     }
 }
 

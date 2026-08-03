@@ -157,6 +157,96 @@ fn metadata_scan_uses_native_sentinel_range() {
 }
 
 #[test]
+fn sqlx2_scan_metadata_recovers_exact_request_local_materialization() {
+    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let mut table = iceberg_table();
+    table.serialized_metadata = Some("{}".to_string());
+    let store = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        .expect("query binding store");
+    let token = store
+        .resolve_or_insert_with_id(
+            crate::engine::query_planning::bindings::QueryTableBindingKey::metadata(
+                "test_catalog",
+                "test_db",
+                "test_table",
+                crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+            ),
+            |binding| {
+                let source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+                    binding,
+                    crate::sql::planner::table::SqlTableIdentity {
+                        catalog: "test_catalog".to_string(),
+                        namespace: "test_db".to_string(),
+                        table: "test_table".to_string(),
+                    },
+                    crate::sql::planner::table::SqlScanKind::Metadata {
+                        kind: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                        version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                    },
+                ));
+                let planner = TableDef {
+                    name: "test_table".to_string(),
+                    columns: vec![source_column("snapshot_id", DataType::Int64, false)],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source,
+                };
+                Ok(crate::engine::query_planning::bindings::QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some("test_catalog"),
+                        "test_db",
+                        planner,
+                    ),
+                    statistics_pin: None,
+                    planning_lease: None,
+                    scan_materialization: Some(
+                        crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergMetadata {
+                            table: table.clone(),
+                            metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                            serialized_table: "{}".to_string(),
+                            metadata_payload: None,
+                        },
+                    ),
+                })
+            },
+        )
+        .expect("metadata token");
+    replace_scan_source(
+        &mut root,
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+            token,
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "test_table".to_string(),
+            },
+            crate::sql::planner::table::SqlScanKind::Metadata {
+                kind: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        )),
+    );
+
+    let controls = crate::connector::FixtureControlResolver::new(ConnectorRegistry::new());
+    let bindings = super::super::prepare_scan_bindings(
+        &plan(root),
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::default(),
+    )
+    .expect("prepare token-bound metadata scan");
+
+    assert!(matches!(
+        &bindings.binding(10).expect("prepared binding").execution,
+        ResolvedScanExecution::IcebergMetadata(metadata)
+            if metadata.table.current_snapshot_id == Some(7)
+                && metadata.serialized_table == "{}"
+    ));
+    assert!(bindings.scan_ranges(0, 10).is_some());
+}
+
+#[test]
 fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
     let mut root = scan_node(10, IcebergDataFileBinding::CurrentSnapshot);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {

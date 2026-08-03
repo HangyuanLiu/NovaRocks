@@ -593,7 +593,9 @@ fn scan_binding_for_source<'a>(
             | table_model::SqlScanKind::MvTargetLocator { .. } => {
                 matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
             }
-            table_model::SqlScanKind::Metadata { .. } => false,
+            table_model::SqlScanKind::Metadata { .. } => {
+                matches!(binding.execution, ResolvedScanExecution::IcebergMetadata(_))
+            }
         },
         table_model::ScanSource::ConnectorPinned => {
             matches!(binding.execution, ResolvedScanExecution::ConnectorRead)
@@ -644,6 +646,7 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
+        ResolvedScanExecution::IcebergMetadata(_) => "IcebergMetadata",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
     }
 }
@@ -701,14 +704,48 @@ fn encode_scan_source(
 
     Ok(plan::ScanSource {
         kind: Some(match src {
-            table_model::ScanSource::Sql(_) => {
-                return Err(format!(
-                    "native SQL scan node_id={} must be materialized as ConnectorReadSource before encoding",
-                    scan_node_id
-                        .map(|node_id| node_id.to_string())
-                        .unwrap_or_else(|| "<none>".to_string())
-                ));
-            }
+            table_model::ScanSource::Sql(source) => match &source.kind {
+                table_model::SqlScanKind::Metadata { kind, .. } => {
+                    let binding = binding.ok_or_else(|| {
+                        format!(
+                            "native SQL metadata scan node_id={} has no prepared binding",
+                            scan_node_id
+                                .map(|node_id| node_id.to_string())
+                                .unwrap_or_else(|| "<none>".to_string())
+                        )
+                    })?;
+                    let ResolvedScanExecution::IcebergMetadata(metadata) = &binding.execution
+                    else {
+                        return Err(format!(
+                            "native SQL metadata scan node_id={} has non-metadata prepared execution",
+                            binding.node_id
+                        ));
+                    };
+                    if kind != &metadata.metadata_table_type {
+                        return Err(format!(
+                            "native SQL metadata scan node_id={} kind differs from its exact binding",
+                            binding.node_id
+                        ));
+                    }
+                    Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
+                        table: Some(encode_iceberg_table_info(&metadata.table)?),
+                        metadata_table_type: encode_iceberg_metadata_table_type(
+                            &metadata.metadata_table_type,
+                        ),
+                        serialized_table: metadata.serialized_table.clone(),
+                        cloud_properties: Default::default(),
+                        metadata_payload: metadata.metadata_payload.clone(),
+                    })
+                }
+                _ => {
+                    return Err(format!(
+                        "native SQL scan node_id={} must be materialized as ConnectorReadSource before encoding",
+                        scan_node_id
+                            .map(|node_id| node_id.to_string())
+                            .unwrap_or_else(|| "<none>".to_string())
+                    ));
+                }
+            },
             table_model::ScanSource::ConnectorPinned => {
                 return Err(format!(
                     "native ConnectorPinned node_id={} must be materialized as ConnectorReadSource before encoding",
