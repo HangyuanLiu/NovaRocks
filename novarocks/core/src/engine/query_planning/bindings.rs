@@ -54,6 +54,11 @@ pub(crate) struct QueryTableBindingKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum QueryTableBindingSelector {
     StrictBaseTable,
+    /// A terminal writer target. This remains separate from a read binding
+    /// for the same physical table because the writer's frozen physical
+    /// schema may include hidden lineage or MV state columns that a scan does
+    /// not expose.
+    WriteTarget,
     Snapshot(i64),
     TimestampMillis(i64),
     Metadata(SqlMetadataTableKind),
@@ -83,6 +88,18 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::StrictBaseTable,
+        )
+    }
+
+    /// Reserve an exact terminal writer target.  A write must never reuse a
+    /// same-name read binding: those bindings carry different SQL facts while
+    /// both remain valid for their independently frozen application roles.
+    pub(crate) fn write_target(catalog: &str, namespace: &str, table: &str) -> Self {
+        Self::new(
+            catalog,
+            namespace,
+            table,
+            QueryTableBindingSelector::WriteTarget,
         )
     }
 
@@ -480,43 +497,32 @@ impl QueryTableBindingStore {
         ))
     }
 
-    /// Return the only admitted Iceberg table binding for one write target.
-    ///
-    /// Write admission must name the target through the same request-local
-    /// token that analysis used.  Selecting an arbitrary matching table would
-    /// hide a self-join/time-travel ambiguity and could bind the writer to a
-    /// different generation, so ambiguity is a terminal submission error.
+    /// Return the explicitly admitted Iceberg writer binding for one target.
+    /// Read and write bindings for the same physical table are intentionally
+    /// distinct: the writer token owns its physical output schema and exact
+    /// lease, while scans retain their own selector and materialization.
     pub(crate) fn admitted_iceberg_write_binding_id(
         &self,
         catalog: &str,
         namespace: &str,
         table: &str,
     ) -> Result<SqlTableBindingId, String> {
-        let matches = self
-            .captured_bindings()
-            .into_iter()
-            .filter_map(|(id, binding)| {
-                let identity = &binding.resolved.catalog.identity;
-                (identity.catalog.eq_ignore_ascii_case(catalog)
-                    && identity.namespace.eq_ignore_ascii_case(namespace)
-                    && identity.table.eq_ignore_ascii_case(table)
-                    && matches!(
-                        binding.scan_materialization.as_ref(),
-                        Some(
-                            QueryScanMaterialization::IcebergDataFiles { .. }
-                                | QueryScanMaterialization::IcebergMvTarget { .. }
-                        )
-                    ))
-                .then_some(id)
-            })
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [binding] => Ok(*binding),
-            [] => Err(format!(
+        let key = QueryTableBindingKey::write_target(catalog, namespace, table);
+        let Some(binding) = self.binding_for_key(&key) else {
+            return Err(format!(
                 "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
-            )),
+            ));
+        };
+        match binding.scan_materialization.as_ref() {
+            Some(
+                QueryScanMaterialization::IcebergDataFiles { .. }
+                | QueryScanMaterialization::IcebergMvTarget { .. },
+            ) => match &binding.resolved.planner.source {
+                ScanSource::Sql(source) => Ok(source.binding),
+                _ => Err("SQL write target binding is missing its SQL binding token".to_string()),
+            },
             _ => Err(format!(
-                "SQL write target {catalog}.{namespace}.{table} has multiple admitted bindings; writer admission is ambiguous"
+                "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
             )),
         }
     }
@@ -798,6 +804,29 @@ mod tests {
 
         assert_ne!(base, metadata);
         assert_eq!(metadata, repeated);
+    }
+
+    #[test]
+    fn sqlx2_binding_writer_target_is_distinct_from_same_name_scan() {
+        let store = QueryTableBindingStore::try_new().expect("store");
+        let scan = store
+            .resolve_or_insert(
+                QueryTableBindingKey::strict_base("ice", "db", "orders"),
+                || Ok(local_binding()),
+            )
+            .expect("scan token");
+        let writer_key = QueryTableBindingKey::write_target("ice", "db", "orders");
+        let writer = store
+            .resolve_or_insert(writer_key.clone(), || Ok(local_binding()))
+            .expect("writer token");
+        let repeated = store
+            .resolve_or_insert(writer_key, || {
+                Err("must not rematerialize writer".to_string())
+            })
+            .expect("memoized writer token");
+
+        assert_ne!(scan, writer);
+        assert_eq!(writer, repeated);
     }
 
     #[test]

@@ -231,13 +231,13 @@ pub(crate) fn admit_frozen_iceberg_write_target(
         );
     }
     let table = sink_spec.iceberg.clone();
-    let columns = sink_spec
-        .target_columns
-        .iter()
-        .filter(|column| !column.name.starts_with("__"))
-        .cloned()
-        .collect::<Vec<_>>();
-    let key = QueryTableBindingKey::strict_base(&table.catalog, &table.namespace, &table.table);
+    // The binding carries the actual table schema, not the writer-input
+    // layout. Position/DV writers consume row-identity columns such as
+    // `_file` and `_pos`, while MV targets carry hidden apply/lineage/state
+    // fields in their physical table schema. Both facts are frozen in the
+    // admitted metadata and must remain distinct.
+    let columns = admitted_write_target_columns(sink_spec)?;
+    let key = QueryTableBindingKey::write_target(&table.catalog, &table.namespace, &table.table);
     bindings.resolve_or_insert_with_id(key, |binding| {
         let identity = SqlTableIdentity {
             catalog: table.catalog.clone(),
@@ -274,6 +274,24 @@ pub(crate) fn admit_frozen_iceberg_write_target(
             }),
         })
     })
+}
+
+/// Preserve the complete physical writer schema selected by admission.
+///
+/// SQL visibility is a catalog-resolution concern.  A terminal write instead
+/// needs every field the exact writer contract consumes, including SQL-owned
+/// hidden row-lineage and MV state columns.
+fn admitted_write_target_columns(
+    sink_spec: &IcebergWriteSinkSpec,
+) -> Result<Vec<ColumnDef>, String> {
+    let metadata = admitted_iceberg_metadata(&sink_spec.iceberg)?;
+    write_target_columns_from_iceberg_schema(metadata.current_schema())
+}
+
+fn write_target_columns_from_iceberg_schema(
+    schema: &iceberg::spec::Schema,
+) -> Result<Vec<ColumnDef>, String> {
+    crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(schema)
 }
 
 /// Rehydrate the provider-private writer carrier only after SQL planning has
@@ -614,6 +632,8 @@ fn sql_write_partition_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::engine::query_planning::bindings::{QueryTableBinding, QueryTableBindingKey};
     use crate::sql::catalog::ResolvedAnalyzerTable;
     use crate::sql::planner::table::{
@@ -669,5 +689,33 @@ mod tests {
         )
         .expect_err("foreign token must fail");
         assert!(error.contains("different request"));
+    }
+
+    #[test]
+    fn sqlx2_write_binding_preserves_hidden_mv_target_fields() {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "region",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    "__nova_base_row_id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("target schema");
+        let fields = write_target_columns_from_iceberg_schema(&schema).expect("target columns");
+
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["region", "__nova_base_row_id"]
+        );
     }
 }

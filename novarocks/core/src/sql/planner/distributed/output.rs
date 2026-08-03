@@ -1971,7 +1971,7 @@ pub(crate) fn finalize_connector_write_output(
                         target_columns: target_columns.len(),
                     });
                 }
-                input_columns.into_iter().map(column_ref_expr).collect()
+                connector_write_output_exprs(input_columns, target_columns)
             }
         },
     };
@@ -1999,6 +1999,36 @@ pub(crate) fn finalize_connector_write_output(
         output_exprs,
         target_schema,
     })
+}
+
+/// Freeze the root values that enter a connector writer against the target
+/// schema selected at admission.  The physical plan may produce an equivalent
+/// Arrow representation with a narrower offset type (notably `Binary` for an
+/// Iceberg `variant` field); the terminal SQL contract owns the explicit cast
+/// rather than asking the encoder or connector to repair it.
+fn connector_write_output_exprs(
+    input_columns: Vec<&OutputColumn>,
+    target_columns: &arrow::datatypes::Fields,
+) -> Vec<TypedExpr> {
+    input_columns
+        .into_iter()
+        .zip(target_columns)
+        .map(|(input, target)| {
+            let expr = column_ref_expr(input);
+            if input.data_type == *target.data_type() {
+                expr
+            } else {
+                TypedExpr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(expr),
+                        target: target.data_type().clone(),
+                    },
+                    data_type: target.data_type().clone(),
+                    nullable: input.nullable,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Select the fragment output columns that feed the write sink, per its input
@@ -3469,6 +3499,35 @@ mod tests {
                 target_columns: 1,
             }
         );
+    }
+
+    #[test]
+    fn sqlx2_write_contract_casts_narrow_binary_to_variant_target() {
+        let fragment = try_write_fragment(
+            vec![OutputColumn {
+                data_type: DataType::Binary,
+                nullable: true,
+                ..output_col(1, "variant_value")
+            }],
+            None,
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+            vec![target_column("variant_value", DataType::LargeBinary, true)],
+        )
+        .expect("SQL write contract must align the terminal variant representation");
+        let DataSink::ConnectorWrite(sink) = fragment.sink else {
+            panic!("write fixture must retain connector sink");
+        };
+        let contract = sink
+            .output_contract
+            .expect("write fixture must finalize output contract");
+        assert!(matches!(
+            contract.output_exprs.as_slice(),
+            [TypedExpr {
+                kind: ExprKind::Cast { target, .. },
+                data_type,
+                ..
+            }] if *target == DataType::LargeBinary && *data_type == DataType::LargeBinary
+        ));
     }
 
     #[test]
