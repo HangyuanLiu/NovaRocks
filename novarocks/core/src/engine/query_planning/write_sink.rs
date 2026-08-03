@@ -220,23 +220,40 @@ pub(crate) fn admit_frozen_iceberg_write_target(
     sink_spec: &IcebergWriteSinkSpec,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
+    admit_frozen_iceberg_write_target_materialization(
+        bindings,
+        sink_spec.iceberg.clone(),
+        planning_lease,
+    )
+}
+
+/// Admit a writer token from an already frozen target materialization.
+///
+/// MV refresh has a target-state locator scan before it constructs a terminal
+/// write.  The write must retain the same frozen table identity and planning
+/// lease, but it deliberately receives its own token so its physical schema
+/// cannot be confused with the locator scan's schema.
+pub(crate) fn admit_frozen_iceberg_write_target_materialization(
+    bindings: &QueryTableBindingStore,
+    table: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> Result<SqlTableBindingId, String> {
     let descriptor = planning_lease.binding().descriptor();
     if !descriptor
         .instance_id
         .as_str()
-        .eq_ignore_ascii_case(&sink_spec.iceberg.catalog)
+        .eq_ignore_ascii_case(&table.catalog)
     {
         return Err(
             "frozen Iceberg write target does not match its admission planning lease".to_string(),
         );
     }
-    let table = sink_spec.iceberg.clone();
     // The binding carries the actual table schema, not the writer-input
     // layout. Position/DV writers consume row-identity columns such as
     // `_file` and `_pos`, while MV targets carry hidden apply/lineage/state
     // fields in their physical table schema. Both facts are frozen in the
     // admitted metadata and must remain distinct.
-    let columns = admitted_write_target_columns(sink_spec)?;
+    let columns = admitted_write_target_columns(&table)?;
     let key = QueryTableBindingKey::write_target(&table.catalog, &table.namespace, &table.table);
     bindings.resolve_or_insert_with_id(key, |binding| {
         let identity = SqlTableIdentity {
@@ -282,9 +299,9 @@ pub(crate) fn admit_frozen_iceberg_write_target(
 /// needs every field the exact writer contract consumes, including SQL-owned
 /// hidden row-lineage and MV state columns.
 fn admitted_write_target_columns(
-    sink_spec: &IcebergWriteSinkSpec,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<ColumnDef>, String> {
-    let metadata = admitted_iceberg_metadata(&sink_spec.iceberg)?;
+    let metadata = admitted_iceberg_metadata(table)?;
     write_target_columns_from_iceberg_schema(metadata.current_schema())
 }
 

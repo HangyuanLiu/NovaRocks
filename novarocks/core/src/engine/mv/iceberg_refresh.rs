@@ -13904,6 +13904,12 @@ fn compile_canonical_select_for_imv_for_maintenance(
         Some(&target_planning_materialization.planning_lease),
     )
     .map_err(RefreshError::user)?;
+    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+        bindings.as_ref(),
+        target_planning_materialization.table.clone(),
+        target_planning_materialization.planning_lease.clone(),
+    )
+    .map_err(RefreshError::user)?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
         state,
         ctx,
@@ -15128,6 +15134,11 @@ fn execute_join_delta_branches_logical(
         &target_bindings,
         Some(&target_planning_materialization.planning_lease),
     )?;
+    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+        target_bindings.as_ref(),
+        target_planning_materialization.table.clone(),
+        target_planning_materialization.planning_lease.clone(),
+    )?;
     let (plan, factory) = compile_canonical_select_for_imv_with_bindings(
         state,
         ctx,
@@ -16109,6 +16120,15 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         &refresh_context,
         &target_bindings,
         Some(planning_lease),
+    )?;
+    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+        target_bindings.as_ref(),
+        refresh_context
+            .target_bindings
+            .runtime()
+            .table_info()?
+            .clone(),
+        planning_lease.clone(),
     )?;
     let rewrite_evidence = match evidence {
         crate::mv::application::MvIncrementalRewriteEvidence::None => {
@@ -17191,6 +17211,11 @@ fn incremental_refresh_iceberg_mv_with_changes(
         &ctx,
         &target_bindings,
         Some(&target_planning_materialization.planning_lease),
+    )?;
+    crate::engine::query_planning::write_sink::admit_frozen_iceberg_write_target_materialization(
+        target_bindings.as_ref(),
+        target_planning_materialization.table.clone(),
+        target_planning_materialization.planning_lease.clone(),
     )?;
     let imv_rewrite_input = sql_imv_planning_input(&ctx, target_binding, rewrite_evidence)?;
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
