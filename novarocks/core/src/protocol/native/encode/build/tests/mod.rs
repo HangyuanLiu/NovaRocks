@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::DataType;
@@ -34,7 +35,8 @@ use crate::sql::planner::distributed::{
 };
 use crate::sql::planner::payload::{PlanScanNode, PlanValuesNode};
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
-use crate::sql::planner::table::{ScanSource, TableDef};
+use crate::sql::planner::table::{ScanSource, SqlScanSource, SqlTableIdentity, TableDef};
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
 struct EmptyCatalog;
 
@@ -123,6 +125,70 @@ fn iceberg_table_info() -> crate::connector::iceberg::scan_model::IcebergTableIn
         serialized_metadata: None,
         serialized_metadata_rows: None,
     }
+}
+
+/// Build-only tests model the application admission boundary explicitly: the
+/// sealed SQL source carries a token, while the exact provider lease and scan
+/// facts stay in a request-local binding store.
+pub(super) fn fixture_query_table_bindings(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+) -> Option<crate::engine::query_planning::bindings::QueryTableBindingStore> {
+    use crate::engine::query_planning::bindings::{
+        QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    };
+
+    let scan = plan
+        .fragments()
+        .iter()
+        .find_map(|fragment| match &fragment.root.payload {
+            DistributedNodeKind::Scan(scan) => Some(scan),
+            _ => None,
+        })?;
+    let ScanSource::Sql(source) = &scan.table.source;
+    let planning_lease = controls
+        .acquire_current(
+            &ConnectorInstanceId::parse(&source.table.catalog)
+                .expect("fixture catalog must be a valid connector instance"),
+        )
+        .ok();
+    let source = source.clone();
+    let planner = scan.table.clone();
+    let store = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(1).expect("fixture scope"),
+    );
+    store
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::strict_base("test_catalog", "test_db", "test_table"),
+            |binding| {
+                let mut resolved_planner = planner.clone();
+                resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
+                    binding,
+                    SqlTableIdentity {
+                        catalog: source.table.catalog.clone(),
+                        namespace: source.table.namespace.clone(),
+                        table: source.table.table.clone(),
+                    },
+                    source.kind.clone(),
+                ));
+                Ok(QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some(&source.table.catalog),
+                        &source.table.namespace,
+                        resolved_planner,
+                    ),
+                    statistics_pin: None,
+                    planning_lease: planning_lease.clone(),
+                    scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
+                        table: iceberg_table_info(),
+                        files: Vec::new(),
+                        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    }),
+                })
+            },
+        )
+        .expect("fixture query binding");
+    Some(store)
 }
 
 fn iceberg_scan_plan(required_columns: Option<Vec<&str>>) -> DistributedPlan {

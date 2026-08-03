@@ -182,7 +182,7 @@ mod tests {
         ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx

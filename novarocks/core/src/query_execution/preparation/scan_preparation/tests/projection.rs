@@ -28,7 +28,7 @@ fn projected_required_column_merge_preserves_unicode_case_deduplication() {
 }
 
 #[test]
-fn version_scan_without_required_columns_reads_only_mappable_outputs_immutably() {
+fn version_scan_without_required_columns_rejects_unmaterializable_planner_output() {
     let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
@@ -47,26 +47,17 @@ fn version_scan_without_required_columns_reads_only_mappable_outputs_immutably()
         execution: resolved_files(vec![data_file("s3://bucket/version-6.parquet")]),
     };
 
-    let bindings = prepare_scan_bindings(
+    let error = match prepare_scan_bindings(
         &plan,
         &registry(vec![data_file("s3://bucket/version-6.parquet")]),
         Some(&resolver),
-    )
-    .expect("prepare version scan");
-    let binding = bindings.binding(37).expect("version binding");
+    ) {
+        Ok(_) => panic!("unmaterializable planner column must fail before submission"),
+        Err(error) => error,
+    };
 
-    assert_eq!(binding.physical_columns.len(), 1);
-    assert_eq!(
-        binding.physical_columns[0].planner.column_id,
-        ColumnId::new_for_test(1)
-    );
-    assert_eq!(binding.physical_columns[0].source.name, "id");
-    assert_eq!(binding.required_reads.len(), 1);
-    assert_eq!(binding.required_reads[0].source.name, "id");
-    assert_eq!(
-        binding.required_reads[0].planner_column_id,
-        Some(ColumnId::new_for_test(1))
-    );
+    assert!(error.contains("node_id=37"), "{error}");
+    assert!(error.contains("stale_planner_only"), "{error}");
     assert_eq!(format!("{plan:#?}"), before);
 }
 

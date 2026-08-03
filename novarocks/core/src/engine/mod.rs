@@ -1766,6 +1766,25 @@ impl StandaloneSession {
         request_context: &crate::query_execution::request_context::RequestContext,
         query_opts: Option<QueryOptions>,
     ) -> Result<PreparedQueryOperation, String> {
+        let connector_context = crate::connector::connector_request_context_for_query(
+            query_opts.as_ref(),
+            request_context.execution().cancellation().clone(),
+        )?;
+        self.prepare_query_with_context_and_connector_context(
+            sql,
+            request_context,
+            query_opts,
+            connector_context,
+        )
+    }
+
+    fn prepare_query_with_context_and_connector_context(
+        &self,
+        sql: &str,
+        request_context: &crate::query_execution::request_context::RequestContext,
+        query_opts: Option<QueryOptions>,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<PreparedQueryOperation, String> {
         if !Self::is_query_sql(sql) {
             return Err(
                 "non-query statements must be executed through StandaloneCommandExecutor".into(),
@@ -1776,10 +1795,6 @@ impl StandaloneSession {
 
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
-        let connector_context = crate::connector::connector_request_context_for_query(
-            query_opts.as_ref(),
-            request_context.execution().cancellation().clone(),
-        )?;
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
         let (parse_sql, forced_explain_level, force_logical_explain) =
             if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
@@ -2008,6 +2023,28 @@ impl StandaloneSession {
     ) -> Result<StatementResult, String> {
         let current_catalog = request_context.session().current_catalog();
         let current_database = request_context.session().current_database();
+        // Query compilation has one canonical admission path. Keep this legacy
+        // session seam for tests/embedded callers, but never rebuild a second
+        // analyzer/optimizer/preparation pipeline from it.
+        if Self::is_query_sql(sql) {
+            return match self.prepare_query_with_context_and_connector_context(
+                sql,
+                request_context,
+                query_opts,
+                connector_context,
+            )? {
+                PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
+                PreparedQueryOperation::Distributed(operation) => {
+                    let (request, completion) = operation.into_parts();
+                    let outcome = self
+                        .inner
+                        .query_execution
+                        .execute(request)
+                        .map_err(|error| error.to_string())?;
+                    completion.complete(outcome)
+                }
+            };
+        }
         use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
@@ -3148,7 +3185,7 @@ fn test_request_context_with_role(
     current_database: &str,
     role: crate::common::app_config::ClusterRole,
 ) -> crate::query_execution::request_context::RequestContext {
-    use crate::query_execution::backend::BackendTopologySnapshot;
+    use crate::query_execution::backend::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::query_execution::cancellation::QueryCancellationSource;
     use crate::query_execution::request_context::{
         QueryExecutionContext, RequestContext, RequestSessionContext,
@@ -3163,7 +3200,18 @@ fn test_request_context_with_role(
         ),
         QueryExecutionContext::new(
             role,
-            BackendTopologySnapshot::empty(0),
+            // Test composition supplies an admitted loopback backend explicitly.
+            // Production compilation still rejects an empty topology instead of
+            // inferring one from the all-in-one role.
+            BackendTopologySnapshot::try_new(
+                0,
+                vec![LiveBackendTarget::new(
+                    0,
+                    "127.0.0.1:9030".parse().expect("loopback test backend"),
+                    1,
+                )],
+            )
+            .expect("non-empty test topology"),
             None,
             cancellation.view(),
             crate::sql::optimizer::options::SessionOptimizerSettings::default(),

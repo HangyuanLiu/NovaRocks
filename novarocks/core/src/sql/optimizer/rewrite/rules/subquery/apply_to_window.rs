@@ -714,7 +714,10 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "lineitem",
                         crate::sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },
@@ -761,7 +764,10 @@ mod tests {
                     name: "part".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "part",
                         crate::sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },
@@ -801,7 +807,10 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "lineitem",
                         crate::sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },
@@ -1571,7 +1580,10 @@ mod tests {
                     name: "other".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "other",
                         crate::sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },

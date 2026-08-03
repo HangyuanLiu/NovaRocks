@@ -255,17 +255,30 @@ mod tests {
     use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind, LogicalPlanNode};
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::PlanScanNode;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::TableDef;
+
+    fn fixture_table_identity(table: &str) -> TableIdentity {
+        TableIdentity::Iceberg {
+            catalog: "test_catalog".to_string(),
+            namespace: "default".to_string(),
+            table: table.to_string(),
+            table_uuid: None,
+        }
+    }
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
+        let table_name = format!("t{table_id}");
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
-                    name: format!("t{table_id}"),
+                    name: table_name.clone(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        &table_name,
                         crate::sql::planner::table::SqlScanKind::ConnectorRead,
                     ),
                 },
@@ -358,7 +371,10 @@ mod tests {
                 name: "t".to_string(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                    "test_catalog",
+                    "default",
+                    "t",
                     crate::sql::planner::table::SqlScanKind::ConnectorRead,
                 ),
             },
@@ -376,13 +392,7 @@ mod tests {
             panic!("expected scan")
         };
         let id = TableIdentity::from_scan(scan);
-        assert_eq!(
-            id,
-            TableIdentity::Connector {
-                database: "default".to_string(),
-                table: "t".to_string(),
-            }
-        );
+        assert_eq!(id, fixture_table_identity("t"));
     }
 
     // -----------------------------------------------------------------
@@ -404,14 +414,8 @@ mod tests {
         assert_eq!(ids.len(), 2);
         let set: HashSet<_> = ids.iter().collect();
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&TableIdentity::Connector {
-            database: "default".to_string(),
-            table: "t1".to_string(),
-        }));
-        assert!(set.contains(&TableIdentity::Connector {
-            database: "default".to_string(),
-            table: "t2".to_string(),
-        }));
+        assert!(set.contains(&fixture_table_identity("t1")));
+        assert!(set.contains(&fixture_table_identity("t2")));
     }
 
     // -----------------------------------------------------------------
@@ -444,13 +448,7 @@ mod tests {
         let plan = make_scan(5, vec![(cid, "l_partkey")]);
         let map = collect_scan_column_map(&plan);
         let entry = map.get(&cid).expect("ColumnId(3) must be in the map");
-        assert_eq!(
-            entry.0,
-            TableIdentity::Connector {
-                database: "default".to_string(),
-                table: "t5".to_string(),
-            }
-        );
+        assert_eq!(entry.0, fixture_table_identity("t5"));
         assert_eq!(entry.1, "l_partkey");
     }
 

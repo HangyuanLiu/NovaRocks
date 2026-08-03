@@ -716,7 +716,7 @@ pub(crate) mod tests {
     }
 
     fn dummy_mv_ctx() -> Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
-        crate::sql::compiler::mv_rewrite::test_snapshot()
+        crate::sql::compiler::mv_rewrite::test_incremental_snapshot()
     }
 
     fn aggregate_mv_ctx_customized(

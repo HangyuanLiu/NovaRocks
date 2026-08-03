@@ -2786,7 +2786,7 @@ mod tests {
         let ScanSource::Sql(source) = &old_scan.table.source else {
             panic!("expected SQL target-state source");
         };
-        assert_eq!(source.table.catalog, "tgt");
+        assert_eq!(source.table.catalog, "ice");
         assert_eq!(source.table.namespace, "db");
         assert_eq!(source.table.table, "mv");
         assert_eq!(target_state.group_key_names, vec!["k"]);
@@ -2818,7 +2818,7 @@ mod tests {
                 .map(|columns| columns.iter().map(String::as_str).collect::<Vec<_>>()),
             Some(vec![
                 "k",
-                "v",
+                "s",
                 "__row_id__",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
@@ -2985,7 +2985,7 @@ mod tests {
             vec![
                 "__row_id__",
                 "k",
-                "v",
+                "s",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
                 crate::sql::common::ICEBERG_FILE_PATH_COL,
@@ -3595,7 +3595,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect_err("missing hidden retraction count state must fail");
         assert!(
-            err.contains("aggregate state contract/layout mismatch"),
+            err.contains("requires a retraction-count or COUNT(*) state column"),
             "unexpected error: {err}"
         );
     }

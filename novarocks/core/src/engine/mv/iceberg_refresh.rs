@@ -17694,6 +17694,10 @@ mod tests {
         TestMvRepositoryFailurePoint, after_next_mv_repository_create,
         fail_next_mv_repository_command,
     };
+    use crate::query_execution::backend::{
+        BackendTopologyError, BackendTopologyPort, BackendTopologySnapshot,
+        BackendTopologyValidationError, LiveBackendTarget,
+    };
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::logical::*;
     use crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr;
@@ -17701,6 +17705,7 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn aggregate_incremental_inserts_use_row_delta() {
@@ -17719,6 +17724,61 @@ mod tests {
     }
     use std::sync::Arc as StdArc;
     use tempfile::TempDir;
+
+    /// Test-only topology paired with the all-in-one loopback exchange server.
+    ///
+    /// Production admission must never invent a backend count. These refresh
+    /// fixtures do install one concrete loopback backend, so model that exact
+    /// endpoint explicitly instead of inheriting the default empty topology.
+    #[derive(Clone)]
+    struct LoopbackTestBackendTopology {
+        snapshot: BackendTopologySnapshot,
+    }
+
+    impl LoopbackTestBackendTopology {
+        fn new(exchange_port: u16) -> Self {
+            let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), exchange_port);
+            let snapshot =
+                BackendTopologySnapshot::try_new(0, vec![LiveBackendTarget::new(0, endpoint, 1)])
+                    .expect("single loopback backend forms a valid topology");
+            Self { snapshot }
+        }
+    }
+
+    impl BackendTopologyPort for LoopbackTestBackendTopology {
+        fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn validate_snapshot(
+            &self,
+            expected: &BackendTopologySnapshot,
+        ) -> Result<(), BackendTopologyValidationError> {
+            if expected == &self.snapshot {
+                Ok(())
+            } else {
+                Err(
+                    BackendTopologyValidationError::ContentChangedWithoutRevision {
+                        revision: expected.revision(),
+                    },
+                )
+            }
+        }
+
+        fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
+
+        fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
+            Err("loopback test topology is immutable".to_string())
+        }
+
+        fn drop_backend(&self, _endpoint: SocketAddr, _force: bool) -> Result<(), String> {
+            Err("loopback test topology is immutable".to_string())
+        }
+
+        fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
+            Err("loopback test topology does not expose backend management".to_string())
+        }
+    }
 
     #[test]
     fn explain_refresh_full_guard_rejects_full_with_disabled_message() {
@@ -20429,6 +20489,9 @@ mod tests {
             mv_repository: crate::engine::test_mv_repository(),
             metadata_provider: Some(metadata_provider),
             exchange_port: loopback_backend.exchange_port,
+            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
+                loopback_backend.exchange_port,
+            )),
             ..StandaloneState::default()
         });
         crate::connector::register_standalone_backends(&state);
@@ -20477,6 +20540,9 @@ mod tests {
         let state = Arc::new(StandaloneState {
             metadata_provider: None,
             exchange_port: loopback_backend.exchange_port,
+            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
+                loopback_backend.exchange_port,
+            )),
             ..StandaloneState::default()
         });
         crate::connector::register_standalone_backends(&state);
@@ -20530,6 +20596,9 @@ mod tests {
             mv_repository: crate::engine::test_mv_repository(),
             metadata_provider: Some(metadata_provider),
             exchange_port: loopback_backend.exchange_port,
+            backend_topology: Arc::new(LoopbackTestBackendTopology::new(
+                loopback_backend.exchange_port,
+            )),
             ..StandaloneState::default()
         });
         crate::connector::register_standalone_backends(&state);

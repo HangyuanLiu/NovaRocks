@@ -392,12 +392,20 @@ pub(crate) fn test_target_binding() -> SqlTableBindingId {
     )
 }
 
-/// Small SQL-only IMV fixture for rewrite-rule tests that need an extension
-/// payload but do not exercise application persistence conversion.
+/// SQL-only incremental IMV fixture for rewrite-rule tests that need an
+/// extension payload but do not exercise application persistence conversion.
+///
+/// The prior and admitted snapshots deliberately describe one exact
+/// incremental window. Tests that exercise delta or version rewriting must
+/// never rely on a synthetic first-refresh fallback.
 #[cfg(test)]
-pub(crate) fn test_snapshot() -> Arc<SqlImvRewriteSnapshot> {
+pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     let base = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "b");
     let target = novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv");
+    let mut previous_snapshot_ids = BTreeMap::new();
+    previous_snapshot_ids.insert(base.fqn(), 11);
+    let mut previous_table_uuids = BTreeMap::new();
+    previous_table_uuids.insert(base.fqn(), "uuid-b".to_string());
     Arc::new(
         SqlImvRewriteSnapshot::from_frozen_parts(
             target,
@@ -405,11 +413,11 @@ pub(crate) fn test_snapshot() -> Arc<SqlImvRewriteSnapshot> {
             1,
             Arc::from(vec![SqlImvBaseSnapshot {
                 table: base,
-                snapshot_id: 1,
-                table_uuid: "base-uuid".to_string(),
+                snapshot_id: 22,
+                table_uuid: "uuid-b".to_string(),
             }]),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            previous_snapshot_ids,
+            previous_table_uuids,
             Some(1),
             "target-uuid".to_string(),
             Arc::from(vec![novarocks_catalog::schema::ColumnDef {
@@ -445,12 +453,25 @@ pub(crate) fn test_snapshot() -> Arc<SqlImvRewriteSnapshot> {
 /// table metadata belongs to application-owned preparation tests.
 #[cfg(test)]
 pub(crate) fn test_scan_source(kind: crate::sql::planner::table::SqlScanKind) -> ScanSource {
+    test_scan_source_for("ice", "db", "b", kind)
+}
+
+/// SQL-only scan fixture with an explicit canonical table identity. Tests
+/// comparing physical table identity must not collapse unrelated tables into
+/// the shared default fixture identity.
+#[cfg(test)]
+pub(crate) fn test_scan_source_for(
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    kind: crate::sql::planner::table::SqlScanKind,
+) -> ScanSource {
     ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
         test_target_binding(),
         crate::sql::planner::table::SqlTableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "b".to_string(),
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
         },
         kind,
     ))
@@ -461,6 +482,18 @@ pub(crate) fn test_data_scan_source() -> ScanSource {
     test_scan_source(crate::sql::planner::table::SqlScanKind::Data {
         version: crate::sql::planner::table::SqlTableVersionSelector::Current,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_data_scan_source_for(catalog: &str, namespace: &str, table: &str) -> ScanSource {
+    test_scan_source_for(
+        catalog,
+        namespace,
+        table,
+        crate::sql::planner::table::SqlScanKind::Data {
+            version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -479,7 +512,7 @@ pub(crate) fn test_aggregate_snapshot(
     partition: Option<SqlImvPartitionContract>,
     branch: Option<SqlImvBranchContract>,
 ) -> Arc<SqlImvRewriteSnapshot> {
-    let mut snapshot = (*test_snapshot()).clone();
+    let mut snapshot = (*test_incremental_snapshot()).clone();
     snapshot.schema_contract = Arc::new(SqlImvSchemaContract {
         bases: vec![SqlImvBaseContract {
             table_fqn: "ice.db.b".to_string(),
@@ -510,7 +543,7 @@ pub(crate) fn test_aggregate_snapshot(
                     target_field_id: 100,
                 },
                 SqlImvTargetVisibleColumn {
-                    output_name: "v".to_string(),
+                    output_name: "s".to_string(),
                     target_field_id: 101,
                 },
             ],
@@ -524,7 +557,10 @@ pub(crate) fn test_aggregate_snapshot(
     snapshot.aggregate_execution = Some(SqlImvAggregateExecutionLayout {
         shape: SqlImvAggregateShape {
             group_key_count: 1,
-            visible_outputs: Vec::new(),
+            visible_outputs: vec![
+                crate::sql::mv_refresh::VisibleAggregateOutput::GroupKey(0),
+                crate::sql::mv_refresh::VisibleAggregateOutput::Aggregate(0),
+            ],
         },
         layout: SqlImvAggregateLayout {
             row_id_column_name: "__row_id__".to_string(),
@@ -535,7 +571,7 @@ pub(crate) fn test_aggregate_snapshot(
                     nullable: false,
                 },
                 SqlImvAggregateVisibleColumn {
-                    name: "v".to_string(),
+                    name: "s".to_string(),
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: true,
                 },
@@ -576,6 +612,52 @@ pub(crate) fn test_aggregate_snapshot(
                 .collect(),
         },
     });
+    let mut target_columns = vec![
+        novarocks_catalog::schema::ColumnDef {
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "s".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__row_id__".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ];
+    target_columns.extend(state_columns.iter().map(|column| {
+        novarocks_catalog::schema::ColumnDef {
+            name: column.column_name.clone(),
+            data_type: if column.type_signature == "long" {
+                arrow::datatypes::DataType::Int64
+            } else {
+                arrow::datatypes::DataType::Binary
+            },
+            nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+            write_default: None,
+            logical_type: None,
+        }
+    }));
+    if let Some(branch) = snapshot.schema_contract.branch.as_ref() {
+        target_columns.push(novarocks_catalog::schema::ColumnDef {
+            name: branch.branch_id_column_name.clone(),
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        });
+    }
+    snapshot.target_columns = Arc::from(target_columns);
     Arc::new(snapshot)
 }
 
@@ -672,7 +754,10 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
     let aggregate_execution = aggregate.then(|| SqlImvAggregateExecutionLayout {
         shape: SqlImvAggregateShape {
             group_key_count: 1,
-            visible_outputs: Vec::new(),
+            visible_outputs: vec![
+                crate::sql::mv_refresh::VisibleAggregateOutput::GroupKey(0),
+                crate::sql::mv_refresh::VisibleAggregateOutput::Aggregate(0),
+            ],
         },
         layout: SqlImvAggregateLayout {
             row_id_column_name: "__row_id__".to_string(),
@@ -724,6 +809,49 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                 .collect(),
         },
     });
+    let mut target_columns = vec![
+        novarocks_catalog::schema::ColumnDef {
+            name: "k".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "s".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__row_id__".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__branch_id__".to_string(),
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ];
+    target_columns.extend(state_columns.iter().map(|column| {
+        novarocks_catalog::schema::ColumnDef {
+            name: column.column_name.clone(),
+            data_type: if column.type_signature == "long" {
+                arrow::datatypes::DataType::Int64
+            } else {
+                arrow::datatypes::DataType::Binary
+            },
+            nullable: column.role == SqlImvAggregateStateRoleContract::Single,
+            write_default: None,
+            logical_type: None,
+        }
+    }));
     Arc::new(
         SqlImvRewriteSnapshot::from_frozen_parts(
             novarocks_catalog::identifier::TableIdentity::new("ice", "db", "mv"),
@@ -748,22 +876,7 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             ]),
             Some(99),
             "uuid-tgt".to_string(),
-            Arc::from(vec![
-                novarocks_catalog::schema::ColumnDef {
-                    name: "k".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                    write_default: None,
-                    logical_type: None,
-                },
-                novarocks_catalog::schema::ColumnDef {
-                    name: "s".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: true,
-                    write_default: None,
-                    logical_type: None,
-                },
-            ]),
+            Arc::from(target_columns),
             schema_contract,
             aggregate_execution,
         )
@@ -833,6 +946,79 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
         layout.layout.visible_columns[0].name = "region".to_string();
         layout.layout.visible_columns[1].name = "s".to_string();
     }
+    snapshot.target_columns = Arc::from(vec![
+        novarocks_catalog::schema::ColumnDef {
+            name: "region".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "s".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__row_id__".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__agg_state_s".to_string(),
+            data_type: arrow::datatypes::DataType::Binary,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__agg_state___ivm_row_count".to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        novarocks_catalog::schema::ColumnDef {
+            name: "__branch_id__".to_string(),
+            data_type: arrow::datatypes::DataType::Int32,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ]);
+    Arc::new(snapshot)
+}
+
+/// SQL-only aggregate join fixture whose visible group key follows the
+/// branch-union test plans. The base-table and target-state identities remain
+/// the same immutable join snapshot facts.
+#[cfg(test)]
+pub(crate) fn test_region_join_snapshot() -> Arc<SqlImvRewriteSnapshot> {
+    let mut snapshot = (*test_join_snapshot(true)).clone();
+    Arc::make_mut(&mut snapshot.schema_contract)
+        .target
+        .visible_columns[0]
+        .output_name = "region".to_string();
+    if let Some(layout) = snapshot.aggregate_execution.as_mut() {
+        layout.layout.visible_columns[0].name = "region".to_string();
+    }
+    snapshot.target_columns = Arc::from(
+        snapshot
+            .target_columns
+            .iter()
+            .cloned()
+            .map(|mut column| {
+                if column.name.eq_ignore_ascii_case("k") {
+                    column.name = "region".to_string();
+                }
+                column
+            })
+            .collect::<Vec<_>>(),
+    );
     Arc::new(snapshot)
 }
 

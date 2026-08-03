@@ -64,11 +64,13 @@ fn scan_preparation_propagates_caller_cancellation() {
             .expect("cancelled request context");
     let registry = registry(vec![data_file("s3://bucket/current.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
+    let plan = plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot));
+    let query_bindings = fixture_query_table_bindings(&plan, &controls);
     let err = match super::super::prepare_scan_bindings(
-        &plan(scan_node(10, IcebergDataFileBinding::CurrentSnapshot)),
+        &plan,
         &controls,
         &context,
-        None,
+        Some(&query_bindings),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
     ) {
@@ -201,7 +203,10 @@ fn sqlx1_preparation_rejects_missing_binding_instead_of_reacquiring_current() {
         Ok(_) => panic!("missing binding must fail before a current-generation acquire"),
         Err(error) => error,
     };
-    assert!(error.contains("has no exact query binding"), "{error}");
+    assert!(
+        error.contains("SQL table binding token is missing from this request"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -236,13 +241,14 @@ fn duplicate_scan_node_defense_reports_exact_error() {
     let mut bindings = crate::query_execution::preparation::scan::ScanExecutionBindings::default();
     let context = crate::connector::test_request_context();
     let controls = crate::connector::FixtureControlResolver::new(registry.clone());
+    let query_bindings = fixture_query_table_bindings(&plan(root.clone()), &controls);
 
     collect_scan_bindings(
         0,
         &root,
         &controls,
         &context,
-        None,
+        Some(&query_bindings),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
         &mut seen_scan_node_ids,
@@ -254,7 +260,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &root,
         &controls,
         &context,
-        None,
+        Some(&query_bindings),
         None,
         super::super::ScanPreparationOptions::single_backend_fixture(),
         &mut seen_scan_node_ids,
@@ -432,7 +438,13 @@ fn target_state_and_locator_reject_equality_deletes() {
             execution: resolved_files(vec![file.clone()]),
         };
 
-        let err = match prepare_scan_bindings(&plan(root), &registry(vec![file]), Some(&resolver)) {
+        let controls = crate::connector::FixtureControlResolver::new(registry(vec![file.clone()]));
+        let err = match prepare_scan_bindings_with_materialized_files(
+            &plan(root),
+            &controls,
+            Some(&resolver),
+            vec![file],
+        ) {
             Ok(_) => panic!("{expected_kind} equality-delete scan must fail"),
             Err(err) => err,
         };
@@ -448,10 +460,7 @@ fn resolver_execution_kind_must_match_semantic_source() {
     replace_scan_source(
         &mut version,
         crate::sql::planner::table::test_sql_scan_source(
-            crate::sql::planner::table::SqlScanKind::Delta {
-                from_snapshot_id: 6,
-                to_snapshot_id: 7,
-            },
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
         ),
     );
     let resolver = StaticResolver {
@@ -460,11 +469,11 @@ fn resolver_execution_kind_must_match_semantic_source() {
 
     let err =
         match prepare_scan_bindings(&plan(version), &ConnectorRegistry::new(), Some(&resolver)) {
-            Ok(_) => panic!("version scan must reject delta execution"),
+            Ok(_) => panic!("connector scan must reject delta execution"),
             Err(err) => err,
         };
 
-    assert!(err.contains("SqlDelta"), "{err}");
-    assert!(err.contains("requires IcebergFiles execution"), "{err}");
+    assert!(err.contains("SqlConnectorRead"), "{err}");
+    assert!(err.contains("requires ConnectorRead execution"), "{err}");
     assert!(err.contains("node_id=41"), "{err}");
 }

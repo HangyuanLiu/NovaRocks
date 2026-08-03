@@ -158,7 +158,7 @@ mod tests {
         let descriptor = valid_join_refresh_descriptor();
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation {
                 partition: None,
                 change_stream: ImvChangeStreamDescriptor {

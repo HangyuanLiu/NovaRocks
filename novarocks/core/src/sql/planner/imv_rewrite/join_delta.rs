@@ -1848,7 +1848,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         let plan = LogicalPlanNode::new(
@@ -2534,7 +2534,7 @@ mod tests {
 
         let mut ctx = build_ctx();
         let mut ext = ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_aggregate_snapshot(vec![], None, None),
             annotation: ImvPlanAnnotation::default(),
         };
         ext.annotation.change_stream = ImvChangeStreamDescriptor {

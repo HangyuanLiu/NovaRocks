@@ -532,7 +532,11 @@ mod tests {
 
         let err = with_sql_write_sink(plan.into_draft(), sink).expect_err("out-of-range ordinal");
 
-        assert!(err.contains("output ordinal 7 is out of range"));
+        assert!(
+            err.contains("sink input references output ordinal 7")
+                && err.contains("output columns exist"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

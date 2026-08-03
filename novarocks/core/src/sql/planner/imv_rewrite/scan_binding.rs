@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn resolve_window_uses_previous_snapshot_and_refresh_pin() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let window =
             resolve_snapshot_window(&snapshot, &base_identity("b")).expect("window should resolve");
         assert_eq!(window.base_fqn, "ice.db.b");
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn resolve_window_rejects_unbound_base_identity() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let err = resolve_snapshot_window(&snapshot, &base_identity("other"))
             .expect_err("unbound base must fail");
         assert!(
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn bind_delta_scan_replaces_source_with_sql_delta_fact() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let bound = bind_delta_scan(iceberg_scan(), &snapshot).expect("delta scan should bind");
         match bound.table.source {
             ScanSource::Sql(SqlScanSource {
@@ -361,7 +361,7 @@ mod tests {
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         let plan = LogicalPlanNode::new(
@@ -424,7 +424,7 @@ mod tests {
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         let mut scan = iceberg_scan();
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn bind_version_scan_uses_from_snapshot() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let bound = bind_version_scan(iceberg_scan(), &snapshot, ImvVersionRole::From)
             .expect("version scan should bind");
         match bound.table.source {
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn bind_version_scan_uses_to_snapshot() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let bound = bind_version_scan(iceberg_scan(), &snapshot, ImvVersionRole::To)
             .expect("version scan should bind");
         match bound.table.source {
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn bind_version_scan_strips_refresh_action_column() {
-        let snapshot = crate::sql::compiler::mv_rewrite::test_snapshot();
+        let snapshot = crate::sql::compiler::mv_rewrite::test_incremental_snapshot();
         let mut scan = iceberg_scan();
         scan.columns
             .push(ImvActionColumn::output_column(ColumnId::new_for_test(99)));

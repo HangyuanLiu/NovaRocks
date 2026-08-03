@@ -51,7 +51,7 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: test_scan_source(catalog.unwrap_or("default_catalog"), database, table),
+                source: test_scan_source(catalog.unwrap_or("ice"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
@@ -116,11 +116,7 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: test_connector_source(
-                    catalog.unwrap_or("default_catalog"),
-                    database,
-                    table,
-                ),
+                source: test_connector_source(catalog.unwrap_or("ice"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,

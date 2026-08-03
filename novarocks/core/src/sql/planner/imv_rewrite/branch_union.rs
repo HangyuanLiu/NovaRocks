@@ -844,7 +844,7 @@ mod tests {
     }
 
     fn build_two_base_join_ctx() -> RewriteContext {
-        rewrite_context(crate::sql::compiler::mv_rewrite::test_join_snapshot(true))
+        rewrite_context(crate::sql::compiler::mv_rewrite::test_region_join_snapshot())
     }
     fn root_delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
@@ -909,7 +909,9 @@ mod tests {
                     name: name.to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source(),
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source_for(
+                        "ice", "db", name,
+                    ),
                 },
                 alias: None,
                 columns: vec![

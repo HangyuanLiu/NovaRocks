@@ -724,7 +724,7 @@ mod tests {
         factory.borrow_mut().reserve_until(100);
         ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            snapshot: crate::sql::compiler::mv_rewrite::test_snapshot(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx

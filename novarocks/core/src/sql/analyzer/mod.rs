@@ -4062,6 +4062,19 @@ mod tests {
         ))
     }
 
+    fn metadata_table_columns(metadata_table_type: &SqlMetadataTableKind) -> Vec<ColumnDef> {
+        crate::sql::analyzer::iceberg_metadata::metadata_table_schema(metadata_table_type.clone())
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect()
+    }
+
     impl TestCatalog {
         fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
             match table {
@@ -4547,15 +4560,16 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            _metadata_table_type: SqlMetadataTableKind,
+            metadata_table_type: SqlMetadataTableKind,
         ) -> Result<TableDef, String> {
             let mut table_def = self.get_table(database, table)?;
+            table_def.columns = metadata_table_columns(&metadata_table_type);
             table_def.source = sql_test_scan_source(
                 catalog.unwrap_or("default_catalog"),
                 database,
                 table,
                 SqlScanKind::Metadata {
-                    kind: _metadata_table_type,
+                    kind: metadata_table_type,
                     version: SqlTableVersionSelector::Current,
                 },
             );
@@ -6726,6 +6740,7 @@ mod tests {
             metadata_table_type: SqlMetadataTableKind,
         ) -> TableDef {
             let mut table_def = Self::table_def(catalog, database, table);
+            table_def.columns = metadata_table_columns(&metadata_table_type);
             table_def.source = sql_test_scan_source(
                 catalog.unwrap_or("default_catalog"),
                 database,

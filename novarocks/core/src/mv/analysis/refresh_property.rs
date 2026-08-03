@@ -1005,11 +1005,19 @@ fn iceberg_ref_from_scan(
         // retain an Iceberg scan descriptor merely to rediscover the base
         // table; execution later obtains provider facts from this source's
         // request-local binding.
-        ScanSource::Sql(source) => Ok(TableIdentity {
-            catalog: source.table.catalog.clone(),
-            namespace: source.table.namespace.clone(),
-            table: source.table.table.clone(),
-        }),
+        ScanSource::Sql(source)
+            if matches!(
+                source.kind,
+                crate::sql::planner::table::SqlScanKind::Data { .. }
+                    | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+            ) =>
+        {
+            Ok(TableIdentity {
+                catalog: source.table.catalog.clone(),
+                namespace: source.table.namespace.clone(),
+                table: source.table.table.clone(),
+            })
+        }
         _ => Err(format!(
             "Iceberg IMV refresh contract requires Iceberg base tables, got non-Iceberg scan of `{}`",
             scan.table.name
@@ -1711,7 +1719,7 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: test_scan_source(catalog.unwrap_or("default_catalog"), database, table),
+                source: test_scan_source(catalog.unwrap_or("ice"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
