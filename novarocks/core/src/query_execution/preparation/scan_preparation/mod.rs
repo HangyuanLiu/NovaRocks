@@ -296,13 +296,6 @@ fn prepare_scan_node(
                 binding: *binding,
             }),
         },
-        ScanSource::IcebergMetadataTable { .. } => {
-            return bindings.insert_scan_ranges(
-                fragment_id,
-                node_id,
-                vec![build_iceberg_metadata_scan_range_params()],
-            );
-        }
         source if scan_source_requires_resolver(source) => {
             let source_context = scan_source_context(source);
             let resolver = resolver.ok_or_else(|| {
@@ -454,18 +447,6 @@ fn exact_query_binding_lease_for_source(
             table.catalog.as_str(),
             format!("'{}.{}.{}'", table.catalog, table.namespace, table.table),
         ),
-        ScanSource::IcebergMetadataTable {
-            table,
-            metadata_table_type,
-            ..
-        } => (
-            bindings.metadata_binding_id(table, *metadata_table_type),
-            table.catalog.as_str(),
-            format!(
-                "'{}.{}.{}${metadata_table_type:?}'",
-                table.catalog, table.namespace, table.table
-            ),
-        ),
         source => {
             return Err(format!(
                 "scan preparation cannot recover an exact query binding from source {}",
@@ -521,7 +502,6 @@ fn validate_resolved_execution_kind(
         | ScanSource::IcebergMvTargetLocator(_) => {
             matches!(execution, ResolvedScanExecution::IcebergFiles(_))
         }
-        ScanSource::IcebergMetadataTable { .. } => true,
     };
     if valid {
         return Ok(());
@@ -591,7 +571,6 @@ fn scan_source_kind(source: &ScanSource) -> &'static str {
         },
         ScanSource::ConnectorPinned => "ConnectorPinned",
         ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
-        ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
         ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
         ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
         ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",

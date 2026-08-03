@@ -61,7 +61,6 @@ impl TableIdentity {
                 table: scan.table.name.clone(),
             },
             ScanSource::IcebergDataFiles { table, .. }
-            | ScanSource::IcebergMetadataTable { table, .. }
             | ScanSource::IcebergDeltaTable { table, .. }
             | ScanSource::IcebergVersionTable { table, .. } => TableIdentity::Iceberg {
                 catalog: table.catalog.clone(),

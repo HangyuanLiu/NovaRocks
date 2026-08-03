@@ -239,9 +239,6 @@ impl IcebergMvTargetLocatorScan {
 /// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
 ///   parquet files — a concrete list of data files plus table identity,
 ///   optional cloud-store credentials, and scan-binding provenance.
-/// - `IcebergMetadataTable`: synthetic source for iceberg metadata
-///   tables (`t$snapshots` etc.); the operator reads
-///   `iceberg::spec::TableMetadata` natively in Rust.
 /// - `IcebergDeltaTable`: plan-time identity for IVM-A1 delta
 ///   scans; codegen expands it into an explicit change-file payload.
 #[derive(Clone, Debug)]
@@ -259,33 +256,6 @@ pub enum ScanSource {
         files: Vec<IcebergDataFileInfo>,
         cloud_properties: BTreeMap<String, String>,
         binding: IcebergDataFileBinding,
-    },
-    /// Synthetic scan source for an Iceberg metadata-table reference
-    /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
-    /// analyzer rewrites such references into a regular `Scan` over a
-    /// synthetic `TableDef` whose source is this variant; codegen then
-    /// emits an `HDFS_SCAN_NODE` whose lowering builds an Iceberg metadata
-    /// SPI reader that reads `iceberg::spec::TableMetadata`
-    /// natively in Rust (no JVM / JNI bridge — the embedded-JVM path
-    /// was removed in favor of iceberg-rust) — see
-    /// `src/connector/iceberg/metadata.rs`.
-    IcebergMetadataTable {
-        table: IcebergTableInfo,
-        metadata_table_type: SqlMetadataTableKind,
-        /// JSON-serialized iceberg-rust `TableMetadata` (produced by
-        /// `serde_json::to_string` in
-        /// `connector/iceberg/catalog/backend.rs`). The metadata-scan
-        /// operator parses it back into a `TableMetadata` and reads
-        /// snapshots / history / refs directly off it.
-        serialized_table: String,
-        /// Cloud properties from the underlying iceberg table's storage.
-        /// Forwarded onto `THdfsScanNode.cloud_configuration` for parity
-        /// with regular HDFS scans; the native metadata-scan path itself
-        /// does not need them today.
-        cloud_properties: BTreeMap<String, String>,
-        /// Native-Rust metadata table payload used by flavors that need
-        /// manifest-derived file aggregates after planning.
-        metadata_payload: Option<String>,
     },
     /// IVM-A1 plan-time Iceberg delta-scan placeholder. Produced by the
     /// analyzer/planner when it recognizes the

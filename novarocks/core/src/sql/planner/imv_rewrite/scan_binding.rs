@@ -171,7 +171,6 @@ fn iceberg_table_info_from_source(source: &ScanSource) -> Result<&IcebergTableIn
             Err("BindIcebergScan requires immutable Iceberg snapshot facts".to_string())
         }
         ScanSource::IcebergDataFiles { table, .. }
-        | ScanSource::IcebergMetadataTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. }
         | ScanSource::IcebergVersionTable { table, .. } => Ok(table),
         ScanSource::ConnectorPinned

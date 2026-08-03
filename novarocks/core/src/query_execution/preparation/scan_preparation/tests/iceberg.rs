@@ -130,30 +130,6 @@ fn metadata_scan_uses_native_sentinel_range() {
     };
     assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
     assert!(file.use_iceberg_jni_metadata_reader);
-
-    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
-    replace_scan_source(
-        &mut root,
-        ScanSource::IcebergMetadataTable {
-            table: iceberg_table(),
-            metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
-            serialized_table: "{}".to_string(),
-            cloud_properties: BTreeMap::new(),
-            metadata_payload: None,
-        },
-    );
-
-    let bindings = prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), None)
-        .expect("prepare metadata scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("metadata ranges");
-
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected metadata file range");
-    };
-    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
-    assert!(file.use_iceberg_jni_metadata_reader);
-    assert!(bindings.binding(10).is_none());
 }
 
 #[test]

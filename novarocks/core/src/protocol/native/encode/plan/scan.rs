@@ -609,7 +609,6 @@ fn scan_binding_for_source<'a>(
         | table_model::ScanSource::IcebergMvTargetLocator(_) => {
             matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
         }
-        table_model::ScanSource::IcebergMetadataTable { .. } => false,
     };
     if !valid_execution {
         return Err(format!(
@@ -634,7 +633,6 @@ fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
         },
         table_model::ScanSource::ConnectorPinned => "ConnectorPinned",
         table_model::ScanSource::IcebergDataFiles { .. } => "IcebergDataFiles",
-        table_model::ScanSource::IcebergMetadataTable { .. } => "IcebergMetadataTable",
         table_model::ScanSource::IcebergDeltaTable { .. } => "IcebergDeltaTable",
         table_model::ScanSource::IcebergVersionTable { .. } => "IcebergVersionTable",
         table_model::ScanSource::IcebergMvTargetState(_) => "IcebergMvTargetState",
@@ -773,19 +771,6 @@ fn encode_scan_source(
                         plan::IcebergDataFileBinding::ExplicitFiles as i32
                     }
                 },
-            }),
-            table_model::ScanSource::IcebergMetadataTable {
-                table,
-                metadata_table_type,
-                serialized_table,
-                cloud_properties: _,
-                metadata_payload,
-            } => Kind::IcebergMetadataTable(plan::IcebergMetadataTable {
-                table: Some(encode_iceberg_table_info(table)?),
-                metadata_table_type: encode_iceberg_metadata_table_type(metadata_table_type),
-                serialized_table: serialized_table.clone(),
-                cloud_properties: Default::default(),
-                metadata_payload: metadata_payload.clone(),
             }),
             table_model::ScanSource::IcebergDeltaTable { .. } => {
                 return Err(format!(

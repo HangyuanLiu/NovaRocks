@@ -76,7 +76,6 @@ impl CatalogRuntimeMetadata {
             }
             ScanSource::Sql(_)
             | ScanSource::ConnectorPinned
-            | ScanSource::IcebergMetadataTable { .. }
             | ScanSource::IcebergDeltaTable { .. }
             | ScanSource::IcebergVersionTable { .. }
             | ScanSource::IcebergMvTargetState { .. }

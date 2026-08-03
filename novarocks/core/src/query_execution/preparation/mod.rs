@@ -28,7 +28,6 @@ mod topology;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
-use crate::sql::planner::table::ScanSource;
 
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
@@ -139,23 +138,18 @@ pub(crate) fn prepare_fragments(
                     fragment.fragment_id
                 ));
             }
-            match source {
-                ScanSource::IcebergMetadataTable { .. } => {}
-                _ => {
-                    expected_binding_node_ids.insert(*node_id);
-                    if scan_bindings.binding(*node_id).is_none() {
-                        return Err(format!(
-                            "prepared fragment missing scan binding fragment_id={} node_id={node_id}",
-                            fragment.fragment_id
-                        ));
-                    }
-                    if scan_bindings
-                        .connector_read(fragment.fragment_id, *node_id)
-                        .is_some()
-                    {
-                        expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
-                    }
-                }
+            expected_binding_node_ids.insert(*node_id);
+            if scan_bindings.binding(*node_id).is_none() {
+                return Err(format!(
+                    "prepared fragment missing scan binding fragment_id={} node_id={node_id}",
+                    fragment.fragment_id
+                ));
+            }
+            if scan_bindings
+                .connector_read(fragment.fragment_id, *node_id)
+                .is_some()
+            {
+                expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();

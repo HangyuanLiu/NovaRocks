@@ -390,7 +390,6 @@ fn iceberg_scan_table_info(
 ) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
     match source {
         crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
         | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
         crate::sql::planner::table::ScanSource::Sql(_)
