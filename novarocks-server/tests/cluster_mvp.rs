@@ -3012,6 +3012,237 @@ enable_path_style_access = true
 
 #[cfg(unix)]
 #[test]
+fn cross_process_three_be_frontend_update_merge_lifecycle() {
+    let rest_uri = std::env::var("NOVAROCKS_ICEBERG_REST_URI")
+        .expect("UPDATE/MERGE lifecycle acceptance requires NOVAROCKS_ICEBERG_REST_URI");
+    let rest_warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE")
+        .expect("UPDATE/MERGE lifecycle acceptance requires NOVAROCKS_ICEBERG_REST_WAREHOUSE");
+    let s3_endpoint = std::env::var("AWS_S3_ENDPOINT")
+        .expect("UPDATE/MERGE lifecycle acceptance requires AWS_S3_ENDPOINT");
+    let s3_access_key = std::env::var("AWS_S3_ACCESS_KEY_ID")
+        .expect("UPDATE/MERGE lifecycle acceptance requires AWS_S3_ACCESS_KEY_ID");
+    let s3_secret_key = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+        .expect("UPDATE/MERGE lifecycle acceptance requires AWS_S3_SECRET_ACCESS_KEY");
+
+    let _guard = lock_cluster_mvp();
+    let fixture_dir = tempfile::tempdir_in(runtime_dir())
+        .expect("create UPDATE/MERGE lifecycle fixture directory");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let namespace = format!("dml5_cluster_{}", std::process::id());
+    let catalog = "update_merge_lifecycle_ice";
+    let cluster_id = "frontend-update-merge-lifecycle";
+    let be_object_store = format!(
+        r#"
+[connector.object_store]
+endpoint = "{s3_endpoint}"
+access_key_id = "{s3_access_key}"
+access_key_secret = "{s3_secret_key}"
+enable_path_style_access = true
+"#
+    );
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+            &state_store_path,
+            &metadata_path,
+            cluster_id,
+            &be_object_store,
+        );
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG {catalog} PROPERTIES(
+            "type"="iceberg",
+            "iceberg.catalog.type"="rest",
+            "uri"="{rest_uri}",
+            "warehouse"="{rest_warehouse}",
+            "aws.s3.endpoint"="{s3_endpoint}",
+            "aws.s3.access_key"="{s3_access_key}",
+            "aws.s3.secret_key"="{s3_secret_key}",
+            "aws.s3.region"="us-east-1",
+            "aws.s3.enable_path_style_access"="true")"#,
+    ))
+    .expect("create REST UPDATE/MERGE catalog");
+    conn.query_drop(format!(
+        "DROP DATABASE IF EXISTS {catalog}.{namespace} FORCE"
+    ))
+    .expect("remove stale UPDATE/MERGE namespace");
+    conn.query_drop(format!("CREATE DATABASE {catalog}.{namespace}"))
+        .expect("create UPDATE/MERGE namespace");
+    conn.query_drop(format!(
+        "CREATE TABLE {catalog}.{namespace}.target_orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+    ))
+    .expect("create UPDATE/MERGE target table");
+    conn.query_drop(format!(
+        "CREATE TABLE {catalog}.{namespace}.source_orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+    ))
+    .expect("create UPDATE/MERGE source table");
+    conn.query_drop(format!(
+        "INSERT INTO {catalog}.{namespace}.target_orders VALUES (1, 10), (2, 20)"
+    ))
+    .expect("seed UPDATE/MERGE target");
+    conn.query_drop(format!(
+        "INSERT INTO {catalog}.{namespace}.source_orders VALUES (2, 200), (3, 300)"
+    ))
+    .expect("seed UPDATE/MERGE source");
+
+    let scheduled_before_update = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "UPDATE {catalog}.{namespace}.target_orders SET amount = 100 WHERE id = 1"
+    ))
+    .expect("execute frontend UPDATE");
+    let scheduled_after_update = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_update > scheduled_before_update,
+        "UPDATE must schedule remote fragments: before={scheduled_before_update}, \
+         after={scheduled_after_update}"
+    );
+    let snapshots_before_merge: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots before MERGE");
+    let scheduled_before_merge = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "MERGE INTO {catalog}.{namespace}.target_orders AS t \
+         USING {catalog}.{namespace}.source_orders AS s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET amount = s.amount \
+         WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (s.id, s.amount)"
+    ))
+    .expect("execute frontend matched-update/not-matched-insert MERGE");
+    let scheduled_after_merge = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_merge > scheduled_before_merge,
+        "MERGE must schedule remote fragments: before={scheduled_before_merge}, \
+         after={scheduled_after_merge}"
+    );
+    let snapshots_after_merge: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots after MERGE");
+    assert_eq!(snapshots_after_merge.len(), 1);
+    assert_eq!(snapshots_before_merge.len(), 1);
+    assert_eq!(
+        snapshots_after_merge[0],
+        snapshots_before_merge[0] + 1,
+        "matched UPDATE and not-matched INSERT must produce one MERGE snapshot"
+    );
+    let rows: Vec<(i32, i32)> = conn
+        .query(format!(
+            "SELECT id, amount FROM {catalog}.{namespace}.target_orders ORDER BY id"
+        ))
+        .expect("read UPDATE/MERGE target rows");
+    assert_eq!(rows, vec![(1, 100), (2, 200), (3, 300)]);
+
+    let scheduled_before_compat = scheduled_fragments(&mut conn);
+    let compat_error = conn
+        .query_drop("UPDATE information_schema.be_configs SET Value = 'x'")
+        .expect_err("UPDATE information_schema.be_configs must not retain a compatibility no-op");
+    assert!(
+        compat_error.to_string().contains("Iceberg")
+            || compat_error.to_string().contains("unsupported")
+            || compat_error.to_string().contains("Unsupported"),
+        "be_configs UPDATE must fail as an unsupported/non-Iceberg target: {compat_error}"
+    );
+    assert_eq!(
+        scheduled_fragments(&mut conn),
+        scheduled_before_compat,
+        "rejected be_configs UPDATE must not schedule fragments"
+    );
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    cluster.restart_fe();
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored_rows: Vec<(i32, i32)> = conn
+        .query(format!(
+            "SELECT id, amount FROM {catalog}.{namespace}.target_orders ORDER BY id"
+        ))
+        .expect("read UPDATE/MERGE rows after FE restart");
+    assert_eq!(restored_rows, rows);
+    let restored_snapshots: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.target_orders$snapshots"
+        ))
+        .expect("count snapshots after FE restart");
+    assert_eq!(restored_snapshots, snapshots_after_merge);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build UPDATE/MERGE StateStore inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(&state_store_path, cluster_id)),
+            frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid UPDATE/MERGE inspection backend config"),
+        ))
+        .expect("reopen UPDATE/MERGE StateStore");
+    let dml = host.dml_service();
+    let row_deltas = dml
+        .list_operations()
+        .expect("list durable UPDATE/MERGE operations")
+        .into_iter()
+        .filter(|operation| {
+            operation.operation_kind == OperationKind::RowDelta
+                && operation.target.catalog == catalog
+                && operation.target.namespace == namespace
+                && operation.target.table == "target_orders"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        row_deltas.len(),
+        2,
+        "UPDATE and MERGE must each be journaled"
+    );
+    assert!(
+        row_deltas
+            .iter()
+            .all(|operation| operation.state == OperationState::Finalized),
+        "successful UPDATE/MERGE must be finalized: {row_deltas:?}"
+    );
+    assert!(
+        row_deltas
+            .iter()
+            .all(|operation| operation.commit_outcome.is_some()),
+        "successful UPDATE/MERGE must retain commit outcome: {row_deltas:?}"
+    );
+    assert!(
+        row_deltas
+            .iter()
+            .any(|operation| operation.operation_subkind.as_deref() == Some("UPDATE"))
+            && row_deltas
+                .iter()
+                .any(|operation| operation.operation_subkind.as_deref() == Some("MERGE")),
+        "RowDelta records must retain UPDATE and MERGE subkinds: {row_deltas:?}"
+    );
+    assert!(
+        dml.list_unfinished_operations()
+            .expect("list unfinished UPDATE/MERGE operations")
+            .is_empty(),
+        "successful UPDATE/MERGE must leave no unresolved StateStore record"
+    );
+    drop(dml);
+    runtime
+        .block_on(host.shutdown())
+        .expect("UPDATE/MERGE inspection host shutdown");
+}
+
+#[cfg(unix)]
+#[test]
 fn cross_process_three_be_insert_without_state_store_fails_before_side_effect() {
     let _guard = lock_cluster_mvp();
     let fixture_dir =

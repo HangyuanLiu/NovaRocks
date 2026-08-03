@@ -36,9 +36,7 @@ use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payl
 use crate::engine::StandaloneState;
 #[cfg(test)]
 use crate::engine::StatementResult;
-use crate::engine::write_transaction::{
-    IcebergWriteCommitExecutor, write_commit_has_files,
-};
+use crate::engine::write_transaction::{IcebergWriteCommitExecutor, write_commit_has_files};
 #[cfg(test)]
 use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionExecutor,
