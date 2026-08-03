@@ -3237,6 +3237,27 @@ impl DistributedRewriteOperationRepository {
         &self,
         request: DistributedRewriteOperationCreate,
     ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.create_inner(request, None).await
+    }
+
+    /// Create the rewrite operation owned by an already-claimed v1 OPTIMIZE
+    /// job. The v1 active-target index remains an external fence; this narrow
+    /// path merely proves, in the same transaction, that it belongs to the
+    /// running job that is creating its child rewrite operation.
+    pub async fn create_for_claimed_optimize_job(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.create_inner(request, Some(claimed_optimize_job_id))
+            .await
+    }
+
+    async fn create_inner(
+        &self,
+        request: DistributedRewriteOperationCreate,
+        claimed_optimize_job_id: Option<i64>,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
         validate_rewrite_create(&request)?;
         let transaction_operation_id = OperationId::new_v7();
         let operation_id = request.operation_id;
@@ -3248,7 +3269,13 @@ impl DistributedRewriteOperationRepository {
             |transaction| {
                 let request = request.clone();
                 Box::pin(async move {
-                    apply_rewrite_create(transaction, transaction_operation_id, request).await
+                    apply_rewrite_create(
+                        transaction,
+                        transaction_operation_id,
+                        request,
+                        claimed_optimize_job_id,
+                    )
+                    .await
                 })
             },
         )
@@ -3785,6 +3812,7 @@ async fn apply_rewrite_create(
     transaction: &mut dyn WriteTransaction,
     transaction_operation_id: OperationId,
     request: DistributedRewriteOperationCreate,
+    claimed_optimize_job_id: Option<i64>,
 ) -> TransactionResult<DistributedRewriteOperation> {
     if let Err(error) = validate_rewrite_create(&request) {
         return Ok(Err(error));
@@ -3816,15 +3844,41 @@ async fn apply_rewrite_create(
             "distributed rewrite operation conflicts with its durable request",
         )));
     }
-    if transaction
-        .get(&active_target_key(&request.target)?)
-        .await?
-        .is_some()
-    {
-        return Ok(Err(RepositoryError::new(
-            RepositoryErrorKind::AlreadyActive,
-            "distributed rewrite target has active optimize job",
-        )));
+    let active_key = active_target_key(&request.target)?;
+    if let Some(active) = transaction.get(&active_key).await? {
+        let active_job_id =
+            match decode_index_value(&active.value) {
+                Ok(job_id) => job_id,
+                Err(error) => return Ok(Err(error.with_context(
+                    "create distributed rewrite operation failed: decode active optimize job index",
+                ))),
+            };
+        if claimed_optimize_job_id != Some(active_job_id) {
+            return Ok(Err(RepositoryError::new(
+                RepositoryErrorKind::AlreadyActive,
+                "distributed rewrite target has active optimize job",
+            )));
+        }
+        let active_job = match load_job_from_transaction(transaction, active_job_id).await? {
+            Ok(Some(job)) => job.stored,
+            Ok(None) => {
+                return Ok(Err(RepositoryError::corruption(format!(
+                    "create distributed rewrite operation failed: active optimize job {active_job_id} is missing"
+                ))));
+            }
+            Err(error) => return Ok(Err(error)),
+        };
+        if active_job.target != StoredMaintenanceTargetV1::from(&request.target)
+            || active_job.state != StoredOptimizeJobStateV1::Running
+        {
+            return Ok(Err(RepositoryError::corruption(format!(
+                "create distributed rewrite operation failed: active optimize job {active_job_id} is not the claimed running target"
+            ))));
+        }
+    } else if let Some(claimed_job_id) = claimed_optimize_job_id {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "create distributed rewrite operation failed: claimed optimize job {claimed_job_id} has no active target index"
+        ))));
     }
     if transaction
         .get(&metadata_active_target_key(&request.target)?)

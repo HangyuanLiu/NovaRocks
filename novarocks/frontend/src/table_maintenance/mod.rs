@@ -193,6 +193,7 @@ impl FrontendTableMaintenanceService {
                 target,
                 intent,
                 DistributedRewriteOperationKind::RewriteDataFiles,
+                None,
             )?;
             return if spark_result {
                 action_result(outcome)
@@ -211,6 +212,7 @@ impl FrontendTableMaintenanceService {
                 target,
                 intent,
                 DistributedRewriteOperationKind::RewritePositionDeleteFiles,
+                None,
             )?;
             return if spark_result {
                 action_result(outcome)
@@ -233,6 +235,7 @@ impl FrontendTableMaintenanceService {
         target: MaintenanceTarget,
         intent: DistributedRewriteIntent,
         kind: DistributedRewriteOperationKind,
+        claimed_optimize_job_id: Option<i64>,
     ) -> Result<MaintenanceActionOutcome, String> {
         let repository = self
             .distributed_rewrite_repository
@@ -243,7 +246,7 @@ impl FrontendTableMaintenanceService {
         let request_payload = distributed_rewrite_request_payload(intent);
         let session = engine.plan_distributed_rewrite(&target, operation_id, intent)?;
         let plan = session.plan();
-        self.block_on(repository.create(DistributedRewriteOperationCreate {
+        let create = DistributedRewriteOperationCreate {
             operation_id: durable_id,
             target: target.clone(),
             owner: MetadataMaintenanceExactOwner {
@@ -256,8 +259,14 @@ impl FrontendTableMaintenanceService {
             request_payload_digest: distributed_rewrite_payload_digest(&request_payload),
             request_payload,
             created_at_ms: now_unix_millis(),
-        }))
-        .map_err(|error| {
+        };
+        let created = match claimed_optimize_job_id {
+            Some(job_id) => {
+                self.block_on(repository.create_for_claimed_optimize_job(create, job_id))
+            }
+            None => self.block_on(repository.create(create)),
+        };
+        created.map_err(|error| {
             format!("persist distributed rewrite pending operation failed: {error}")
         })?;
         let plan_payload = plan.provider_payload().to_vec();
@@ -468,6 +477,7 @@ impl FrontendTableMaintenanceService {
         distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
+        claimed_optimize_job_id: i64,
     ) -> Result<MaintenanceActionOutcome, String> {
         let service = Self {
             repository: None,
@@ -481,6 +491,7 @@ impl FrontendTableMaintenanceService {
             target,
             DistributedRewriteIntent::DataFiles { rewrite_all: true },
             DistributedRewriteOperationKind::RewriteDataFiles,
+            Some(claimed_optimize_job_id),
         )
     }
 
@@ -908,6 +919,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     where_clause.as_deref(),
                 )?,
                 DistributedRewriteOperationKind::RewriteDataFiles,
+                None,
             ),
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -918,6 +930,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 target,
                 distributed_position_rewrite_intent(&options, where_clause.as_deref())?,
                 DistributedRewriteOperationKind::RewritePositionDeleteFiles,
+                None,
             ),
             other => engine.execute_action(other),
         }

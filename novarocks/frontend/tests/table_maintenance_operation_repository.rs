@@ -466,3 +466,30 @@ async fn distributed_rewrite_rejects_active_legacy_fences() {
         .unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
 }
+
+#[tokio::test]
+async fn claimed_running_optimize_job_may_create_only_its_own_rewrite() {
+    let (_temp, store, repository) = rewrite_fixture().await;
+    let optimize = OptimizeJobRepository::open(store).await.unwrap();
+    let job = optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    optimize.claim(job.job_id, 11).await.unwrap().unwrap();
+
+    let error = repository
+        .create_for_claimed_optimize_job(rewrite_create(Uuid::now_v7()), job.job_id + 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+
+    let created = repository
+        .create_for_claimed_optimize_job(rewrite_create(Uuid::now_v7()), job.job_id)
+        .await
+        .unwrap();
+    assert_eq!(created.state, DistributedRewriteOperationState::Pending);
+}
