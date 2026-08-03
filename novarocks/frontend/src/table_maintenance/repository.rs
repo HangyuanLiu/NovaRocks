@@ -39,16 +39,21 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::model::{
-    DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES, DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES,
-    DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION, DistributedRewriteAttemptCheckpoint,
-    DistributedRewriteAttemptDisposition, DistributedRewriteOpaquePayload,
-    DistributedRewriteOperation, DistributedRewriteOperationCreate,
-    DistributedRewriteOperationState, DistributedRewritePlanPayload,
-    METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
-    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
+    CLEANUP_MAX_BATCHES, CLEANUP_MAX_PAYLOAD_BYTES, CLEANUP_OPERATION_SCHEMA_VERSION,
+    CleanupBatchCheckpoint, CleanupOperation, CleanupOperationCreate, CleanupOperationState,
+    CleanupPlanPayload, DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES,
+    DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES, DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
+    DistributedRewriteOpaquePayload, DistributedRewriteOperation,
+    DistributedRewriteOperationCreate, DistributedRewriteOperationState,
+    DistributedRewritePlanPayload, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
+    METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MetadataMaintenanceExactOwner,
+    MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
     MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
-    OptimizeJobOutcome, StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
+    OptimizeJobOutcome, StoredCleanupBatchV4, StoredCleanupOperationV4, StoredCleanupPlanV4,
+    StoredCleanupTransactionActionV4, StoredCleanupTransactionV4,
+    StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
     StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
     StoredDistributedRewriteTransactionActionV3, StoredDistributedRewriteTransactionV3,
     StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
@@ -82,6 +87,14 @@ const DISTRIBUTED_REWRITE_STATE_PREFIX: &str =
 const DISTRIBUTED_REWRITE_TRANSACTION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v3/rewrite/transactions/";
 const SHARED_ACTIVE_PREFIX: &str = "novarocks/frontend/table-maintenance/v3/active/";
+
+const CLEANUP_OPERATION_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v4/cleanup/operations/";
+const CLEANUP_PLAN_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/cleanup/plan/";
+const CLEANUP_BATCH_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/cleanup/batches/";
+const CLEANUP_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/cleanup/state/";
+const CLEANUP_TRANSACTION_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v4/cleanup/transactions/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorKind {
@@ -3189,6 +3202,7 @@ enum SharedMaintenanceOperationFamilyV3 {
     Optimize,
     Metadata,
     DistributedRewrite,
+    Cleanup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4586,6 +4600,1422 @@ fn shared_active_target_key(target: &MaintenanceTarget) -> RepositoryResult<Key>
             hex::encode(target.table.as_bytes())
         ),
         "build shared maintenance active key",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// V4 connector orphan cleanup repository.
+//
+// StateStore records deliberately contain only bounded artifact handles and
+// aggregate counters. Immutable candidate manifests and per-object receipts
+// are provider artifacts and must never be copied into the frontend catalog.
+
+#[derive(Clone)]
+pub struct CleanupOperationRepository {
+    store: Arc<dyn StateStore>,
+    metrics: Arc<StateStoreMetrics>,
+}
+
+impl fmt::Debug for CleanupOperationRepository {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CleanupOperationRepository")
+            .field("provider", &self.metrics.provider())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Domain-separated digest for the bounded handles held by v4 cleanup
+/// records. This is intentionally distinct from provider manifest and receipt
+/// digests.
+pub fn cleanup_payload_digest(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.connector-cleanup.payload.v1\0");
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+impl CleanupOperationRepository {
+    pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
+        let repository = Self {
+            metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
+            store,
+        };
+        repository.list().await?;
+        Ok(repository)
+    }
+
+    pub async fn create(
+        &self,
+        request: CleanupOperationCreate,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_create(&request)?;
+        self.cleanup_mutation(
+            request.operation_id,
+            StoredCleanupTransactionActionV4::Create,
+            "create frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                let request = request.clone();
+                Box::pin(
+                    async move { apply_cleanup_create(transaction, transaction_id, request).await },
+                )
+            },
+        )
+        .await
+    }
+
+    /// Persist the provider's frozen manifest before any batch can be
+    /// prepared. A zero-candidate plan is still durable and is finished by the
+    /// ordinary terminal transition.
+    pub async fn plan(
+        &self,
+        operation_id: Uuid,
+        plan: CleanupPlanPayload,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_plan(&plan)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Plan,
+            "persist frontend connector cleanup plan",
+            move |transaction, transaction_id| {
+                let plan = plan.clone();
+                Box::pin(async move {
+                    apply_cleanup_plan(transaction, transaction_id, operation_id, plan, now_ms)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Persist prepare evidence before dispatch. The returned RUNNING record
+    /// is the only record that authorizes a destructive provider call.
+    pub async fn prepare_batch(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, false)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Prepare,
+            "persist frontend connector cleanup prepared batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                Box::pin(async move {
+                    apply_cleanup_prepare(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Atomically records the provider receipt summary and advances the exact
+    /// batch ordinal. Any unknown count moves the operation to reconcile-only
+    /// state; a caller may not dispatch another batch from that state.
+    pub async fn checkpoint_batch(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "checkpoint frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                Box::pin(async move {
+                    apply_cleanup_checkpoint(transaction, transaction_id, operation_id, checkpoint)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Replace the receipt for the already-dispatched batch after an exact
+    /// generation reconcile. This transition never advances the ordinal and
+    /// therefore cannot authorize a second delete.
+    pub async fn checkpoint_reconciled_batch(
+        &self,
+        operation_id: Uuid,
+        checkpoint: CleanupBatchCheckpoint,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_checkpoint(&checkpoint, true)?;
+        self.cleanup_mutation(
+            operation_id,
+            StoredCleanupTransactionActionV4::Checkpoint,
+            "checkpoint reconciled frontend connector cleanup batch",
+            move |transaction, transaction_id| {
+                let checkpoint = checkpoint.clone();
+                Box::pin(async move {
+                    apply_cleanup_reconciled_checkpoint(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        checkpoint,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition(
+            operation_id,
+            StoredCleanupTransactionActionV4::ReconcilePending,
+            &[CleanupOperationState::Running],
+            CleanupOperationState::ReconcilePending,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn resume_running(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition(
+            operation_id,
+            StoredCleanupTransactionActionV4::Resume,
+            &[CleanupOperationState::ReconcilePending],
+            CleanupOperationState::Running,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn finish(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_transition(
+            operation_id,
+            StoredCleanupTransactionActionV4::Finish,
+            &[
+                CleanupOperationState::Planned,
+                CleanupOperationState::Running,
+            ],
+            CleanupOperationState::Finished,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    /// Failure is legal only before the first prepared batch. After prepare,
+    /// uncertain external effects are reconciled rather than failed closed.
+    pub async fn fail_before_dispatch(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition(
+            operation_id,
+            StoredCleanupTransactionActionV4::Fail,
+            &[
+                CleanupOperationState::Pending,
+                CleanupOperationState::Planned,
+            ],
+            CleanupOperationState::Failed,
+            Some(message),
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        validate_cleanup_error(&message)?;
+        self.cleanup_transition(
+            operation_id,
+            StoredCleanupTransactionActionV4::Unresolve,
+            &[
+                CleanupOperationState::Running,
+                CleanupOperationState::ReconcilePending,
+            ],
+            CleanupOperationState::Unresolved,
+            Some(message),
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn get(&self, operation_id: Uuid) -> RepositoryResult<Option<CleanupOperation>> {
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!("begin cleanup operation read failed: {e}"))
+        })?;
+        let operation = load_cleanup_operation(transaction.as_mut(), operation_id)
+            .await
+            .map_err(|e| RepositoryError::store(format!("read cleanup operation failed: {e}")))??;
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish cleanup operation read failed: {e}"))
+        })?;
+        Ok(operation.map(|value| CleanupOperation::from(&value.stored)))
+    }
+
+    pub async fn list(&self) -> RepositoryResult<Vec<CleanupOperation>> {
+        self.list_by_prefix(CLEANUP_OPERATION_PREFIX, None).await
+    }
+
+    /// Startup only returns operations with a pending prepared batch. Finished
+    /// checkpoints are never replay candidates, and Unresolved deliberately
+    /// remains fenced until an operator selects an exact-generation remedy.
+    pub async fn list_recovery_candidates(&self) -> RepositoryResult<Vec<CleanupOperation>> {
+        let mut operations = Vec::new();
+        for state in [
+            CleanupOperationState::Running,
+            CleanupOperationState::ReconcilePending,
+        ] {
+            operations.extend(
+                self.list_by_prefix(&cleanup_state_prefix(state), Some(state))
+                    .await?,
+            );
+        }
+        operations.retain(|operation| {
+            operation.state == CleanupOperationState::ReconcilePending
+                || operation.next_batch_ordinal < operation.batch_count.unwrap_or(0)
+        });
+        operations.sort_by_key(|value| value.operation_id);
+        Ok(operations)
+    }
+
+    pub async fn load_plan(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<CleanupPlanPayload>> {
+        let key = cleanup_plan_key(operation_id)?;
+        let mut transaction =
+            self.store.begin_read().await.map_err(|e| {
+                RepositoryError::store(format!("begin cleanup plan read failed: {e}"))
+            })?;
+        let value = transaction
+            .get(&key)
+            .await
+            .map_err(|e| RepositoryError::store(format!("read cleanup plan failed: {e}")))?;
+        transaction
+            .abort()
+            .await
+            .map_err(|e| RepositoryError::store(format!("finish cleanup plan read failed: {e}")))?;
+        value.map(decode_cleanup_plan).transpose().map(|value| {
+            value.map(|stored| CleanupPlanPayload {
+                plan_digest: stored.plan_digest,
+                base_state_digest: stored.base_state_digest,
+                manifest_digest: stored.manifest_digest,
+                artifact_handle_digest: stored.artifact_handle_digest,
+                artifact_handle: stored.artifact_handle,
+                candidate_count: stored.candidate_count,
+                total_bytes: stored.total_bytes,
+                manifest_parts: stored.manifest_parts,
+                batch_count: stored.batch_count,
+            })
+        })
+    }
+
+    pub async fn load_batch(
+        &self,
+        operation_id: Uuid,
+        ordinal: u16,
+    ) -> RepositoryResult<Option<CleanupBatchCheckpoint>> {
+        let key = cleanup_batch_key(operation_id, ordinal)?;
+        let mut transaction =
+            self.store.begin_read().await.map_err(|e| {
+                RepositoryError::store(format!("begin cleanup batch read failed: {e}"))
+            })?;
+        let value = transaction
+            .get(&key)
+            .await
+            .map_err(|e| RepositoryError::store(format!("read cleanup batch failed: {e}")))?;
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish cleanup batch read failed: {e}"))
+        })?;
+        value
+            .map(decode_cleanup_batch)
+            .transpose()
+            .map(|value| value.map(cleanup_checkpoint_from_stored))
+    }
+
+    pub async fn has_active_target(&self, target: &MaintenanceTarget) -> RepositoryResult<bool> {
+        let key = shared_active_target_key(target)?;
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!("begin cleanup active check failed: {e}"))
+        })?;
+        let value = transaction.get(&key).await.map_err(|e| {
+            RepositoryError::store(format!("read cleanup active check failed: {e}"))
+        })?;
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish cleanup active check failed: {e}"))
+        })?;
+        Ok(value.is_some())
+    }
+
+    async fn cleanup_transition(
+        &self,
+        operation_id: Uuid,
+        action: StoredCleanupTransactionActionV4,
+        allowed: &'static [CleanupOperationState],
+        next: CleanupOperationState,
+        error: Option<String>,
+        now_ms: i64,
+    ) -> RepositoryResult<CleanupOperation> {
+        self.cleanup_mutation(
+            operation_id,
+            action,
+            "transition frontend connector cleanup operation",
+            move |transaction, transaction_id| {
+                Box::pin(async move {
+                    apply_cleanup_transition(
+                        transaction,
+                        transaction_id,
+                        operation_id,
+                        action,
+                        allowed,
+                        next,
+                        error,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn cleanup_mutation<F>(
+        &self,
+        operation_id: Uuid,
+        _action: StoredCleanupTransactionActionV4,
+        description: &'static str,
+        mutate: F,
+    ) -> RepositoryResult<CleanupOperation>
+    where
+        F: for<'a> Fn(
+                &'a mut dyn WriteTransaction,
+                OperationId,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = TransactionResult<CleanupOperation>>
+                        + Send
+                        + 'a,
+                >,
+            > + Send
+            + 'static,
+    {
+        let transaction_id = OperationId::new_v7();
+        match run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_id,
+            description,
+            move |transaction| mutate(transaction, transaction_id),
+        )
+        .await
+        {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown { error, .. }) => Err(RepositoryError::new(
+                RepositoryErrorKind::CommitUnknown,
+                format!("{description} {operation_id} commit outcome is unknown: {error}"),
+            )),
+            Err(failure) => Err(format_run_failure(description, failure)),
+        }
+    }
+
+    async fn list_by_prefix(
+        &self,
+        prefix_text: &str,
+        expected: Option<CleanupOperationState>,
+    ) -> RepositoryResult<Vec<CleanupOperation>> {
+        let prefix = make_key(prefix_text, "build cleanup operation range")?;
+        let range = KeyRange::for_prefix(prefix).map_err(|e| {
+            RepositoryError::store(format!("build cleanup operation range failed: {e}"))
+        })?;
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!("begin cleanup operation list failed: {e}"))
+        })?;
+        let mut request = RangeRequest {
+            range,
+            direction: Direction::Forward,
+            page_size: self.store.limits().max_page_size,
+            continuation: None,
+        };
+        let mut result = Vec::new();
+        loop {
+            let page = transaction.range(&request).await.map_err(|e| {
+                RepositoryError::store(format!("list cleanup operations failed: {e}"))
+            })?;
+            for record in page.records {
+                let stored = if expected.is_some() {
+                    let operation_id =
+                        decode_uuid_index_key(prefix_text, &record.key, "cleanup state")?;
+                    if decode_uuid_index_value(&record.value, "cleanup state")? != operation_id {
+                        return Err(RepositoryError::corruption(
+                            "cleanup state index identity mismatch",
+                        ));
+                    }
+                    load_cleanup_operation(transaction.as_mut(), operation_id)
+                        .await
+                        .map_err(|e| {
+                            RepositoryError::store(format!(
+                                "read indexed cleanup operation failed: {e}"
+                            ))
+                        })??
+                        .ok_or_else(|| {
+                            RepositoryError::corruption(
+                                "cleanup state references missing operation",
+                            )
+                        })?
+                        .stored
+                } else {
+                    decode_cleanup_operation(record)?
+                };
+                if expected.is_some_and(|state| state != stored.state) {
+                    return Err(RepositoryError::corruption(
+                        "cleanup state index references wrong state",
+                    ));
+                }
+                result.push(CleanupOperation::from(&stored));
+            }
+            let Some(next) = page.continuation else { break };
+            request.continuation = Some(next);
+        }
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish cleanup operation list failed: {e}"))
+        })?;
+        result.sort_by_key(|value| value.operation_id);
+        Ok(result)
+    }
+}
+
+struct VersionedStoredCleanupOperation {
+    stored: StoredCleanupOperationV4,
+    version: VersionToken,
+}
+
+async fn apply_cleanup_create(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    request: CleanupOperationCreate,
+) -> TransactionResult<CleanupOperation> {
+    if let Err(error) = validate_cleanup_create(&request) {
+        return Ok(Err(error));
+    }
+    if let Some(existing) = load_cleanup_operation(transaction, request.operation_id).await?? {
+        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+            && existing.stored.owner == request.owner
+            && existing.stored.request_digest == request.request_digest
+            && existing.stored.older_than_ms == request.older_than_ms
+        {
+            return Ok(Ok(CleanupOperation::from(&existing.stored)));
+        }
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup operation conflicts with its durable request",
+        )));
+    }
+    if transaction
+        .get(&active_target_key(&request.target)?)
+        .await?
+        .is_some()
+        || transaction
+            .get(&metadata_active_target_key(&request.target)?)
+            .await?
+            .is_some()
+        || transaction
+            .get(&shared_active_target_key(&request.target)?)
+            .await?
+            .is_some()
+    {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            "cleanup target already has active maintenance operation",
+        )));
+    }
+    let stored = StoredCleanupOperationV4 {
+        schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+        operation_id: request.operation_id,
+        target: StoredMaintenanceTargetV1::from(&request.target),
+        owner: request.owner,
+        request_digest: request.request_digest,
+        older_than_ms: request.older_than_ms,
+        plan_digest: None,
+        manifest_digest: None,
+        candidate_count: None,
+        batch_count: None,
+        next_batch_ordinal: 0,
+        state: CleanupOperationState::Pending,
+        error_message: None,
+        created_at_ms: request.created_at_ms,
+        started_at_ms: None,
+        finished_at_ms: None,
+    };
+    let (marker_key, marker_value) = cleanup_transaction_record(
+        transaction_id,
+        StoredCleanupTransactionActionV4::Create,
+        &stored,
+    )?;
+    transaction
+        .put(
+            cleanup_operation_key(request.operation_id)?,
+            encode_cleanup_operation(&stored)?,
+            Precondition::Absent,
+        )
+        .await?;
+    transaction
+        .put(
+            cleanup_state_key(CleanupOperationState::Pending, request.operation_id)?,
+            encode_uuid_index_value(request.operation_id)?,
+            Precondition::Absent,
+        )
+        .await?;
+    transaction
+        .put(
+            shared_active_target_key(&request.target)?,
+            encode_cleanup_json(
+                &StoredSharedActiveFenceV3 {
+                    schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+                    family: SharedMaintenanceOperationFamilyV3::Cleanup,
+                    operation_id: request.operation_id,
+                },
+                "shared cleanup active fence",
+            )?,
+            Precondition::Absent,
+        )
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(CleanupOperation::from(&stored)))
+}
+
+async fn apply_cleanup_plan(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    plan: CleanupPlanPayload,
+    now_ms: i64,
+) -> TransactionResult<CleanupOperation> {
+    if let Err(error) = validate_cleanup_plan(&plan) {
+        return Ok(Err(error));
+    }
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if operation.stored.state == CleanupOperationState::Planned
+        && operation.stored.plan_digest == Some(plan.plan_digest)
+    {
+        return Ok(Ok(CleanupOperation::from(&operation.stored)));
+    }
+    if operation.stored.state != CleanupOperationState::Pending {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup plan requires PENDING operation",
+        )));
+    }
+    require_cleanup_active(
+        transaction,
+        &operation.stored,
+        CleanupOperationState::Pending,
+        "persist cleanup plan",
+    )
+    .await??;
+    operation.stored.plan_digest = Some(plan.plan_digest);
+    operation.stored.manifest_digest = Some(plan.manifest_digest);
+    operation.stored.candidate_count = Some(plan.candidate_count);
+    operation.stored.batch_count = Some(plan.batch_count);
+    operation.stored.started_at_ms = Some(now_ms);
+    operation.stored.state = CleanupOperationState::Planned;
+    cleanup_write_transition(
+        transaction,
+        transaction_id,
+        StoredCleanupTransactionActionV4::Plan,
+        operation,
+        CleanupOperationState::Pending,
+        CleanupOperationState::Planned,
+        Some((
+            cleanup_plan_key(operation_id)?,
+            encode_cleanup_plan(&plan, operation_id)?,
+            Precondition::Absent,
+        )),
+    )
+    .await
+}
+
+async fn apply_cleanup_prepare(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    checkpoint: CleanupBatchCheckpoint,
+    _now_ms: i64,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if !matches!(
+        operation.stored.state,
+        CleanupOperationState::Planned | CleanupOperationState::Running
+    ) {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup prepare requires PLANNED or RUNNING operation",
+        )));
+    }
+    if operation.stored.next_batch_ordinal != checkpoint.ordinal {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup prepare ordinal is not the next durable batch",
+        )));
+    }
+    let batch_count = operation.stored.batch_count.ok_or_else(|| {
+        StateStoreError::from(RepositoryError::corruption(
+            "cleanup prepare has no durable plan",
+        ))
+    })?;
+    if checkpoint.ordinal >= batch_count {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup prepare ordinal exceeds plan batch count",
+        )));
+    }
+    let prior = operation.stored.state;
+    require_cleanup_active(
+        transaction,
+        &operation.stored,
+        prior,
+        "persist cleanup prepare",
+    )
+    .await??;
+    let batch_key = cleanup_batch_key(operation_id, checkpoint.ordinal)?;
+    if let Some(existing) = transaction.get(&batch_key).await? {
+        let stored = decode_cleanup_batch(existing)?;
+        if cleanup_checkpoint_from_stored(stored) == checkpoint {
+            return Ok(Ok(CleanupOperation::from(&operation.stored)));
+        }
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup prepared batch conflicts with durable checkpoint",
+        )));
+    }
+    operation.stored.state = CleanupOperationState::Running;
+    cleanup_write_transition(
+        transaction,
+        transaction_id,
+        StoredCleanupTransactionActionV4::Prepare,
+        operation,
+        prior,
+        CleanupOperationState::Running,
+        Some((
+            batch_key,
+            encode_cleanup_batch(&checkpoint, operation_id)?,
+            Precondition::Absent,
+        )),
+    )
+    .await
+}
+
+async fn apply_cleanup_checkpoint(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    checkpoint: CleanupBatchCheckpoint,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if operation.stored.state != CleanupOperationState::Running {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup checkpoint requires RUNNING operation",
+        )));
+    }
+    if operation.stored.next_batch_ordinal != checkpoint.ordinal {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup checkpoint ordinal is not the prepared batch",
+        )));
+    }
+    require_cleanup_active(
+        transaction,
+        &operation.stored,
+        CleanupOperationState::Running,
+        "checkpoint cleanup batch",
+    )
+    .await??;
+    let key = cleanup_batch_key(operation_id, checkpoint.ordinal)?;
+    let Some(existing) = transaction.get(&key).await? else {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup checkpoint is missing prepared batch",
+        )));
+    };
+    let prepared_version = existing.version.clone();
+    let prepared = decode_cleanup_batch(existing)?;
+    if prepared.prepared_handle != checkpoint.prepared_handle
+        || prepared.prepared_handle_digest != checkpoint.prepared_handle_digest
+    {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup checkpoint changed prepared evidence",
+        )));
+    }
+    if prepared.receipt_handle.is_some() && cleanup_checkpoint_from_stored(prepared) == checkpoint {
+        return Ok(Ok(CleanupOperation::from(&operation.stored)));
+    }
+    if prepared.receipt_handle.is_some() {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup checkpoint conflicts with durable receipt",
+        )));
+    }
+    operation.stored.next_batch_ordinal = operation
+        .stored
+        .next_batch_ordinal
+        .checked_add(1)
+        .ok_or_else(|| {
+            StateStoreError::from(RepositoryError::corruption(
+                "cleanup batch ordinal overflow",
+            ))
+        })?;
+    let next = if checkpoint.unknown_count == 0 {
+        CleanupOperationState::Running
+    } else {
+        CleanupOperationState::ReconcilePending
+    };
+    operation.stored.state = next;
+    cleanup_write_transition(
+        transaction,
+        transaction_id,
+        StoredCleanupTransactionActionV4::Checkpoint,
+        operation,
+        CleanupOperationState::Running,
+        next,
+        Some((
+            key,
+            encode_cleanup_batch(&checkpoint, operation_id)?,
+            Precondition::Version(prepared_version),
+        )),
+    )
+    .await
+}
+
+async fn apply_cleanup_reconciled_checkpoint(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    checkpoint: CleanupBatchCheckpoint,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if operation.stored.state != CleanupOperationState::ReconcilePending
+        || !matches!(
+            operation.stored.next_batch_ordinal,
+            value if value == checkpoint.ordinal || value == checkpoint.ordinal.saturating_add(1)
+        )
+    {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup reconcile checkpoint does not match pending batch",
+        )));
+    }
+    require_cleanup_active(
+        transaction,
+        &operation.stored,
+        CleanupOperationState::ReconcilePending,
+        "checkpoint reconciled cleanup batch",
+    )
+    .await??;
+    let key = cleanup_batch_key(operation_id, checkpoint.ordinal)?;
+    let Some(existing) = transaction.get(&key).await? else {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup reconcile batch is missing",
+        )));
+    };
+    let version = existing.version.clone();
+    let prior = decode_cleanup_batch(existing)?;
+    if prior.prepared_handle != checkpoint.prepared_handle
+        || prior.prepared_handle_digest != checkpoint.prepared_handle_digest
+    {
+        return Ok(Err(RepositoryError::corruption(
+            "cleanup reconcile changed prepared evidence",
+        )));
+    }
+    let was_not_checkpointed = operation.stored.next_batch_ordinal == checkpoint.ordinal;
+    if was_not_checkpointed {
+        operation.stored.next_batch_ordinal = operation
+            .stored
+            .next_batch_ordinal
+            .checked_add(1)
+            .ok_or_else(|| {
+                StateStoreError::from(RepositoryError::corruption(
+                    "cleanup reconcile batch ordinal overflow",
+                ))
+            })?;
+    }
+    let next = if checkpoint.unknown_count == 0 {
+        CleanupOperationState::Running
+    } else {
+        CleanupOperationState::ReconcilePending
+    };
+    operation.stored.state = next;
+    cleanup_write_transition(
+        transaction,
+        transaction_id,
+        StoredCleanupTransactionActionV4::Checkpoint,
+        operation,
+        CleanupOperationState::ReconcilePending,
+        next,
+        Some((
+            key,
+            encode_cleanup_batch(&checkpoint, operation_id)?,
+            Precondition::Version(version),
+        )),
+    )
+    .await
+}
+
+async fn apply_cleanup_transition(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    operation_id: Uuid,
+    action: StoredCleanupTransactionActionV4,
+    allowed: &[CleanupOperationState],
+    next: CleanupOperationState,
+    error: Option<String>,
+    now_ms: i64,
+) -> TransactionResult<CleanupOperation> {
+    let Some(mut operation) = load_cleanup_operation(transaction, operation_id).await?? else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            "cleanup operation not found",
+        )));
+    };
+    if operation.stored.state == next {
+        return Ok(Ok(CleanupOperation::from(&operation.stored)));
+    }
+    if !allowed.contains(&operation.stored.state) {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "cleanup operation state transition is not allowed",
+        )));
+    }
+    if next == CleanupOperationState::Finished {
+        let batch_count = operation.stored.batch_count.ok_or_else(|| {
+            StateStoreError::from(RepositoryError::corruption(
+                "cleanup finish has no durable plan",
+            ))
+        })?;
+        if operation.stored.next_batch_ordinal != batch_count {
+            return Ok(Err(RepositoryError::new(
+                RepositoryErrorKind::InvalidTransition,
+                "cleanup cannot finish before every batch checkpoint",
+            )));
+        }
+    }
+    let prior = operation.stored.state;
+    require_cleanup_active(
+        transaction,
+        &operation.stored,
+        prior,
+        "transition cleanup operation",
+    )
+    .await??;
+    operation.stored.state = next;
+    operation.stored.error_message = error;
+    if next.is_terminal() || next == CleanupOperationState::Unresolved {
+        operation.stored.finished_at_ms = Some(now_ms);
+    }
+    cleanup_write_transition(
+        transaction,
+        transaction_id,
+        action,
+        operation,
+        prior,
+        next,
+        None,
+    )
+    .await
+}
+
+async fn cleanup_write_transition(
+    transaction: &mut dyn WriteTransaction,
+    transaction_id: OperationId,
+    action: StoredCleanupTransactionActionV4,
+    operation: VersionedStoredCleanupOperation,
+    prior: CleanupOperationState,
+    next: CleanupOperationState,
+    extra: Option<(Key, Value, Precondition)>,
+) -> TransactionResult<CleanupOperation> {
+    let operation_id = operation.stored.operation_id;
+    let (marker_key, marker_value) =
+        cleanup_transaction_record(transaction_id, action, &operation.stored)?;
+    transaction
+        .put(
+            cleanup_operation_key(operation_id)?,
+            encode_cleanup_operation(&operation.stored)?,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    if prior != next {
+        transaction
+            .delete(
+                cleanup_state_key(prior, operation_id)?,
+                Precondition::Present,
+            )
+            .await?;
+        transaction
+            .put(
+                cleanup_state_key(next, operation_id)?,
+                encode_uuid_index_value(operation_id)?,
+                Precondition::Absent,
+            )
+            .await?;
+    }
+    if let Some((key, value, precondition)) = extra {
+        transaction.put(key, value, precondition).await?;
+    }
+    if next.is_terminal() {
+        transaction
+            .delete(
+                shared_active_target_key(&operation.stored.target.clone().into())?,
+                Precondition::Present,
+            )
+            .await?;
+    }
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(CleanupOperation::from(&operation.stored)))
+}
+
+async fn load_cleanup_operation(
+    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    operation_id: Uuid,
+) -> TransactionResult<Option<VersionedStoredCleanupOperation>> {
+    let Some(record) = transaction
+        .get(&cleanup_operation_key(operation_id)?)
+        .await?
+    else {
+        return Ok(Ok(None));
+    };
+    let version = record.version.clone();
+    Ok(Ok(Some(VersionedStoredCleanupOperation {
+        stored: decode_cleanup_operation(record)?,
+        version,
+    })))
+}
+
+async fn require_cleanup_active(
+    transaction: &mut dyn WriteTransaction,
+    operation: &StoredCleanupOperationV4,
+    expected: CleanupOperationState,
+    context: &str,
+) -> TransactionResult<()> {
+    let Some(index) = transaction
+        .get(&cleanup_state_key(expected, operation.operation_id)?)
+        .await?
+    else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: cleanup state index missing"
+        ))));
+    };
+    if decode_uuid_index_value(&index.value, "cleanup state")? != operation.operation_id {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: cleanup state index mismatch"
+        ))));
+    }
+    let Some(active) = transaction
+        .get(&shared_active_target_key(&operation.target.clone().into())?)
+        .await?
+    else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: shared cleanup fence missing"
+        ))));
+    };
+    let fence: StoredSharedActiveFenceV3 =
+        decode_rewrite_json(active.value.as_bytes(), "shared cleanup active fence")?;
+    if fence.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+        || fence.family != SharedMaintenanceOperationFamilyV3::Cleanup
+        || fence.operation_id != operation.operation_id
+    {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: shared cleanup fence mismatch"
+        ))));
+    }
+    Ok(Ok(()))
+}
+
+fn validate_cleanup_create(request: &CleanupOperationCreate) -> RepositoryResult<()> {
+    validate_metadata_target(&request.target)?;
+    validate_metadata_owner(&request.owner)?;
+    if request.older_than_ms < 0 {
+        return Err(RepositoryError::corruption(
+            "cleanup older_than_ms must not be negative",
+        ));
+    }
+    Ok(())
+}
+fn validate_cleanup_handle(handle: &[u8], digest: [u8; 32], context: &str) -> RepositoryResult<()> {
+    if handle.is_empty() || handle.len() > CLEANUP_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!("{context} exceeds bounded StateStore handle limit"),
+        ));
+    }
+    if cleanup_payload_digest(handle) != digest {
+        return Err(RepositoryError::corruption(format!(
+            "{context} digest does not match handle"
+        )));
+    }
+    Ok(())
+}
+fn validate_cleanup_plan(plan: &CleanupPlanPayload) -> RepositoryResult<()> {
+    validate_cleanup_handle(
+        &plan.artifact_handle,
+        plan.artifact_handle_digest,
+        "cleanup plan artifact handle",
+    )?;
+    if plan.batch_count > CLEANUP_MAX_BATCHES
+        || plan.manifest_parts > 64
+        || (plan.candidate_count == 0 && plan.batch_count != 0)
+        || (plan.candidate_count > 0 && plan.batch_count == 0)
+    {
+        return Err(RepositoryError::corruption(
+            "cleanup plan candidate and batch count are inconsistent",
+        ));
+    }
+    Ok(())
+}
+fn validate_cleanup_checkpoint(
+    checkpoint: &CleanupBatchCheckpoint,
+    receipt_required: bool,
+) -> RepositoryResult<()> {
+    if checkpoint.ordinal >= CLEANUP_MAX_BATCHES {
+        return Err(RepositoryError::corruption(
+            "cleanup checkpoint ordinal exceeds batch limit",
+        ));
+    }
+    validate_cleanup_handle(
+        &checkpoint.prepared_handle,
+        checkpoint.prepared_handle_digest,
+        "cleanup prepared handle",
+    )?;
+    match (&checkpoint.receipt_handle, checkpoint.receipt_handle_digest) {
+        (Some(handle), Some(digest)) => {
+            validate_cleanup_handle(handle, digest, "cleanup receipt handle")?
+        }
+        (None, None) if !receipt_required => {}
+        _ => {
+            return Err(RepositoryError::corruption(
+                "cleanup checkpoint receipt handle is invalid",
+            ));
+        }
+    }
+    if receipt_required && checkpoint.receipt_handle.is_none() {
+        return Err(RepositoryError::corruption(
+            "cleanup checkpoint requires a receipt handle",
+        ));
+    }
+    Ok(())
+}
+fn validate_cleanup_error(error: &str) -> RepositoryResult<()> {
+    if error.is_empty() || error.len() > 8 * 1024 || error.contains('\0') {
+        return Err(RepositoryError::corruption("cleanup error is invalid"));
+    }
+    Ok(())
+}
+fn validate_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryResult<()> {
+    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "cleanup operation has unsupported schema version",
+        ));
+    }
+    validate_metadata_target(&stored.target.clone().into())?;
+    validate_metadata_owner(&stored.owner)?;
+    let planned = stored.plan_digest.is_some()
+        && stored.manifest_digest.is_some()
+        && stored.candidate_count.is_some()
+        && stored.batch_count.is_some();
+    match stored.state {
+        CleanupOperationState::Pending => {
+            if planned
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "pending cleanup operation has lifecycle fields",
+                ));
+            }
+        }
+        CleanupOperationState::Planned
+        | CleanupOperationState::Running
+        | CleanupOperationState::ReconcilePending => {
+            if !planned
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "active cleanup operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        CleanupOperationState::Finished => {
+            if !planned
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "finished cleanup operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        CleanupOperationState::Failed => {
+            if stored.finished_at_ms.is_none() || stored.error_message.is_none() {
+                return Err(RepositoryError::corruption(
+                    "failed cleanup operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        CleanupOperationState::Unresolved => {
+            if !planned || stored.finished_at_ms.is_none() || stored.error_message.is_none() {
+                return Err(RepositoryError::corruption(
+                    "unresolved cleanup operation has invalid lifecycle fields",
+                ));
+            }
+        }
+    }
+    if stored
+        .batch_count
+        .is_some_and(|count| count > CLEANUP_MAX_BATCHES)
+        || stored.next_batch_ordinal > stored.batch_count.unwrap_or(0)
+    {
+        return Err(RepositoryError::corruption(
+            "cleanup operation has invalid batch bounds",
+        ));
+    }
+    Ok(())
+}
+fn encode_cleanup_operation(stored: &StoredCleanupOperationV4) -> RepositoryResult<Value> {
+    validate_cleanup_operation(stored)?;
+    encode_cleanup_json(stored, "cleanup operation")
+}
+fn decode_cleanup_operation(record: StateRecord) -> RepositoryResult<StoredCleanupOperationV4> {
+    let operation_id =
+        decode_uuid_index_key(CLEANUP_OPERATION_PREFIX, &record.key, "cleanup operation")?;
+    let stored: StoredCleanupOperationV4 =
+        decode_cleanup_json(record.value.as_bytes(), "cleanup operation")?;
+    validate_cleanup_operation(&stored)?;
+    if stored.operation_id != operation_id {
+        return Err(RepositoryError::corruption(
+            "cleanup operation identity mismatch",
+        ));
+    }
+    Ok(stored)
+}
+fn encode_cleanup_plan(plan: &CleanupPlanPayload, operation_id: Uuid) -> RepositoryResult<Value> {
+    validate_cleanup_plan(plan)?;
+    encode_cleanup_json(
+        &StoredCleanupPlanV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            operation_id,
+            plan_digest: plan.plan_digest,
+            base_state_digest: plan.base_state_digest,
+            manifest_digest: plan.manifest_digest,
+            artifact_handle_digest: plan.artifact_handle_digest,
+            artifact_handle: plan.artifact_handle.clone(),
+            candidate_count: plan.candidate_count,
+            total_bytes: plan.total_bytes,
+            manifest_parts: plan.manifest_parts,
+            batch_count: plan.batch_count,
+        },
+        "cleanup plan",
+    )
+}
+fn decode_cleanup_plan(record: StateRecord) -> RepositoryResult<StoredCleanupPlanV4> {
+    let stored: StoredCleanupPlanV4 = decode_cleanup_json(record.value.as_bytes(), "cleanup plan")?;
+    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "cleanup plan has unsupported schema version",
+        ));
+    }
+    validate_cleanup_plan(&CleanupPlanPayload {
+        plan_digest: stored.plan_digest,
+        base_state_digest: stored.base_state_digest,
+        manifest_digest: stored.manifest_digest,
+        artifact_handle_digest: stored.artifact_handle_digest,
+        artifact_handle: stored.artifact_handle.clone(),
+        candidate_count: stored.candidate_count,
+        total_bytes: stored.total_bytes,
+        manifest_parts: stored.manifest_parts,
+        batch_count: stored.batch_count,
+    })?;
+    Ok(stored)
+}
+fn encode_cleanup_batch(
+    checkpoint: &CleanupBatchCheckpoint,
+    operation_id: Uuid,
+) -> RepositoryResult<Value> {
+    validate_cleanup_checkpoint(checkpoint, checkpoint.receipt_handle.is_some())?;
+    encode_cleanup_json(
+        &StoredCleanupBatchV4 {
+            schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+            operation_id,
+            ordinal: checkpoint.ordinal,
+            prepared_handle_digest: checkpoint.prepared_handle_digest,
+            prepared_handle: checkpoint.prepared_handle.clone(),
+            receipt_handle_digest: checkpoint.receipt_handle_digest,
+            receipt_handle: checkpoint.receipt_handle.clone(),
+            deleted_count: checkpoint.deleted_count,
+            already_absent_count: checkpoint.already_absent_count,
+            failed_count: checkpoint.failed_count,
+            unknown_count: checkpoint.unknown_count,
+        },
+        "cleanup batch",
+    )
+}
+fn decode_cleanup_batch(record: StateRecord) -> RepositoryResult<StoredCleanupBatchV4> {
+    let stored: StoredCleanupBatchV4 =
+        decode_cleanup_json(record.value.as_bytes(), "cleanup batch")?;
+    if stored.schema_version != CLEANUP_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "cleanup batch has unsupported schema version",
+        ));
+    }
+    validate_cleanup_checkpoint(
+        &cleanup_checkpoint_from_stored(stored.clone()),
+        stored.receipt_handle.is_some(),
+    )?;
+    Ok(stored)
+}
+fn cleanup_checkpoint_from_stored(value: StoredCleanupBatchV4) -> CleanupBatchCheckpoint {
+    CleanupBatchCheckpoint {
+        ordinal: value.ordinal,
+        prepared_handle_digest: value.prepared_handle_digest,
+        prepared_handle: value.prepared_handle,
+        receipt_handle_digest: value.receipt_handle_digest,
+        receipt_handle: value.receipt_handle,
+        deleted_count: value.deleted_count,
+        already_absent_count: value.already_absent_count,
+        failed_count: value.failed_count,
+        unknown_count: value.unknown_count,
+    }
+}
+fn encode_cleanup_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| RepositoryError::corruption(format!("encode {context} failed: {e}")))?;
+    if bytes.len() > CLEANUP_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!("encode {context} exceeds StateStore payload limit"),
+        ));
+    }
+    Value::try_from(Bytes::from(bytes))
+        .map_err(|e| RepositoryError::store(format!("encode {context} failed: {e}")))
+}
+fn decode_cleanup_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let decoded: T = serde_json::from_slice(bytes)
+        .map_err(|e| RepositoryError::corruption(format!("decode {context} failed: {e}")))?;
+    let canonical = serde_json::to_vec(&decoded)
+        .map_err(|e| RepositoryError::corruption(format!("re-encode {context} failed: {e}")))?;
+    if canonical != bytes {
+        return Err(RepositoryError::corruption(format!(
+            "decode {context} failed: non-canonical JSON"
+        )));
+    }
+    Ok(decoded)
+}
+fn cleanup_transaction_record(
+    transaction_id: OperationId,
+    action: StoredCleanupTransactionActionV4,
+    post_operation: &StoredCleanupOperationV4,
+) -> RepositoryResult<(Key, Value)> {
+    let marker = StoredCleanupTransactionV4 {
+        schema_version: CLEANUP_OPERATION_SCHEMA_VERSION,
+        transaction_operation_id: *transaction_id.as_uuid(),
+        action,
+        operation_id: post_operation.operation_id,
+        post_operation: post_operation.clone(),
+    };
+    Ok((
+        cleanup_transaction_key(transaction_id)?,
+        encode_cleanup_json(&marker, "cleanup transaction marker")?,
+    ))
+}
+fn cleanup_operation_key(operation_id: Uuid) -> RepositoryResult<Key> {
+    make_key(
+        format!("{CLEANUP_OPERATION_PREFIX}{operation_id}"),
+        "build cleanup operation key",
+    )
+}
+fn cleanup_plan_key(operation_id: Uuid) -> RepositoryResult<Key> {
+    make_key(
+        format!("{CLEANUP_PLAN_PREFIX}{operation_id}"),
+        "build cleanup plan key",
+    )
+}
+fn cleanup_batch_key(operation_id: Uuid, ordinal: u16) -> RepositoryResult<Key> {
+    if ordinal >= CLEANUP_MAX_BATCHES {
+        return Err(RepositoryError::corruption(
+            "cleanup batch ordinal exceeds limit",
+        ));
+    }
+    make_key(
+        format!("{CLEANUP_BATCH_PREFIX}{operation_id}/{ordinal:03}"),
+        "build cleanup batch key",
+    )
+}
+fn cleanup_state_prefix(state: CleanupOperationState) -> String {
+    format!("{CLEANUP_STATE_PREFIX}{}/", state.as_key_component())
+}
+fn cleanup_state_key(state: CleanupOperationState, operation_id: Uuid) -> RepositoryResult<Key> {
+    make_key(
+        format!("{}{operation_id}", cleanup_state_prefix(state)),
+        "build cleanup state key",
+    )
+}
+fn cleanup_transaction_key(transaction_id: OperationId) -> RepositoryResult<Key> {
+    make_key(
+        format!("{CLEANUP_TRANSACTION_PREFIX}{}", transaction_id.as_uuid()),
+        "build cleanup transaction key",
     )
 }
 

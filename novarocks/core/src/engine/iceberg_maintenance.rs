@@ -27,7 +27,6 @@ use iceberg::Catalog;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
-use crate::connector::iceberg::commit::remove_orphan_files::run_remove_orphan_files;
 use crate::engine::StandaloneState;
 use crate::engine::table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
@@ -58,10 +57,10 @@ pub(crate) fn execute_action(
             older_than_ms,
             retain_last,
         } => run_expire_snapshots_action(state, target, older_than_ms, retain_last),
-        MaintenanceActionRequest::RemoveOrphanFiles {
-            target,
-            older_than_ms,
-        } => run_remove_orphan_files_action(state, target, older_than_ms),
+        MaintenanceActionRequest::RemoveOrphanFiles { .. } => Err(
+            "remove orphan files must be dispatched by the frontend durable cleanup owner"
+                .to_string(),
+        ),
     }
 }
 
@@ -176,44 +175,6 @@ fn run_expire_snapshots_action(
         deleted_manifest_files_count: None,
         deleted_manifest_lists_count: None,
         deleted_statistics_files_count: None,
-    })
-}
-
-fn run_remove_orphan_files_action(
-    state: &Arc<StandaloneState>,
-    target: MaintenanceTarget,
-    older_than_ms: i64,
-) -> Result<MaintenanceActionOutcome, String> {
-    let (catalog, table_ident, object_store_config) =
-        resolve_maintenance_catalog(state, &target.catalog, &target.namespace, &target.table)?;
-    let outcome = block_on_iceberg(async move {
-        run_remove_orphan_files(
-            catalog,
-            table_ident,
-            older_than_ms,
-            object_store_config.as_ref(),
-        )
-        .await
-    })?
-    .map_err(|error| {
-        format!(
-            "REMOVE ORPHAN FILES failed for {}: {error}",
-            action_target(&target)
-        )
-    })?;
-
-    tracing::info!(
-        deleted_count = outcome.deleted_count,
-        scanned_count = outcome.scanned_count,
-        catalog = %target.catalog,
-        namespace = %target.namespace,
-        table = %target.table,
-        older_than_ms,
-        "remove_orphan_files: completed"
-    );
-
-    Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
-        orphan_file_locations: outcome.deleted_file_locations,
     })
 }
 

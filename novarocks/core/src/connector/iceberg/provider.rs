@@ -78,6 +78,7 @@ use super::catalog::registry::{
     extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
 };
 use super::catalog::views;
+use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
@@ -1087,6 +1088,11 @@ impl IcebergControlProvider {
             )?,
         );
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new_registered(
+            write_key.clone(),
+            descriptor.instance_id.clone(),
+            Arc::clone(&registry),
+        )?);
+        let cleanup_maintenance = Arc::new(IcebergCleanupMaintenanceAdapter::new_registered(
             write_key,
             descriptor.instance_id.clone(),
             Arc::clone(&registry),
@@ -1100,7 +1106,7 @@ impl IcebergControlProvider {
                     services,
                 )) as Arc<dyn novarocks_spi::connector::ConnectorStagedCreate>
             });
-        ConnectorControlBinding::try_new_with_all_maintenance_capabilities_and_staged_create(
+        ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -1113,6 +1119,7 @@ impl IcebergControlProvider {
             Some(data_mutation),
             Some(metadata_maintenance),
             Some(distributed_rewrite),
+            Some(cleanup_maintenance),
             staged_create,
             Some(write),
             Some(provider.clone()),

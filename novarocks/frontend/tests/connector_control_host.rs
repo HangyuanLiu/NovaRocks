@@ -24,9 +24,12 @@ use novarocks_frontend::connector::{
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorCatalogMutationResolver, ConnectorControlBinding, ConnectorControlResolver,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
-    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
+    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
+    ConnectorCleanupMaintenanceResolver, ConnectorCleanupPlan, ConnectorCleanupPlanningRequest,
+    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest, ConnectorControlBinding,
+    ConnectorControlResolver, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
+    ConnectorDataMutationPlan, ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
     ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
@@ -251,6 +254,93 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
         Some(Arc::new(TestDataMutation { descriptor, key })),
     )
     .expect("control binding with data mutation")
+}
+
+struct TestCleanupMaintenance {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_cleanup(
+        &self,
+        _request: ConnectorCleanupPlanningRequest,
+    ) -> Result<ConnectorCleanupPlan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn prepare_batch(
+        &self,
+        _request: ConnectorCleanupPrepareRequest,
+    ) -> Result<novarocks_spi::connector::PreparedBatch, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn execute_batch(
+        &self,
+        _request: ConnectorCleanupExecuteRequest,
+    ) -> Result<novarocks_spi::connector::BatchReceipt, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn reconcile_batch(
+        &self,
+        _request: ConnectorCleanupReconcileRequest,
+    ) -> Result<novarocks_spi::connector::BatchReceipt, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn read_candidate_page(
+        &self,
+        _request: ConnectorCleanupCandidatePageRequest,
+    ) -> Result<novarocks_spi::connector::CandidatePage, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn finalize_terminal(
+        &self,
+        _request: ConnectorCleanupFinalizeRequest,
+    ) -> Result<(), ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+fn binding_with_cleanup_maintenance(incarnation_byte: u8) -> ConnectorControlBinding {
+    let binding = binding(incarnation_byte);
+    let descriptor = binding.descriptor().clone();
+    let incarnation = binding.incarnation();
+    let key = ConnectorExecutionBindingKey {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    };
+    let provider = Arc::new(TestControl {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    });
+    ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
+        descriptor.clone(),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(TestCleanupMaintenance { descriptor, key })),
+        None,
+        None,
+        None,
+    )
+    .expect("control binding with cleanup maintenance")
 }
 
 struct TestMetadataMaintenance {
@@ -735,6 +825,92 @@ fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready[0].key, old_key);
 
     let error = match host.acquire_exact_metadata_maintenance(&old_key) {
+        Ok(_) => panic!("retired generation must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
+}
+
+#[test]
+fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7))
+        .expect("register no-cleanup-maintenance generation");
+    let error = match host.acquire_current_cleanup_maintenance(&instance_id) {
+        Ok(_) => panic!("missing capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire no-cleanup-maintenance generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_cleanup_maintenance(8))
+        .expect("register cleanup-maintenance generation");
+    let lease = host
+        .acquire_current_cleanup_maintenance(&instance_id)
+        .expect("cleanup-maintenance lease");
+    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.metadata().instance_id(), &instance_id);
+    host.retire_current(&instance_id)
+        .expect("retire cleanup-maintenance generation");
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(lease);
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    host.register(binding_with_cleanup_maintenance(7))
+        .expect("register old generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let error = match host.acquire_current_cleanup_maintenance(&instance_id) {
+        Ok(_) => panic!("retiring generation must not accept current acquisition"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    host.register(binding_with_cleanup_maintenance(8))
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_cleanup_maintenance(&instance_id)
+        .expect("replacement cleanup-maintenance lease");
+    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+
+    let exact_old = host
+        .acquire_exact_cleanup_maintenance(&old_key)
+        .expect("exact retiring generation lease");
+    assert_eq!(exact_old.binding_key(), &old_key);
+
+    let unknown_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+    };
+    let error = match host.acquire_exact_cleanup_maintenance(&unknown_key) {
+        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_cleanup_maintenance(&old_key) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

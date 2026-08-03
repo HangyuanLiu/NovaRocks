@@ -27,7 +27,8 @@ use uuid::Uuid;
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
+    ConnectorTableHandle,
 };
 
 pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
@@ -43,6 +44,7 @@ const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.request.
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.plan.v1\0";
 const PREPARED_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.prepared.v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.receipt.v1\0";
+const PREPARED_WIRE_MAGIC: &[u8; 8] = b"NRCLEAN1";
 
 /// Durable identity selected by the frontend operation owner.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -496,6 +498,129 @@ impl PreparedBatch {
             ));
         }
         Ok(())
+    }
+
+    /// Bounded opaque durable carrier for the frontend operation owner. It
+    /// contains no candidate locations or object identities; only the exact
+    /// binding, frozen digests, and provider-produced prepare evidence needed
+    /// to reconcile the same batch after a restart.
+    pub fn try_to_wire_v1(&self) -> Result<Bytes, ConnectorError> {
+        self.validate()?;
+        let instance = self.owner.instance_id.as_str().as_bytes();
+        let instance_len = u16::try_from(instance.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "cleanup owner exceeds durable wire limit",
+            )
+        })?;
+        let evidence_len = u32::try_from(self.evidence_payload.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "cleanup evidence exceeds durable wire limit",
+            )
+        })?;
+        let mut output = Vec::with_capacity(
+            8 + 2 + instance.len() + 16 + 16 + 32 * 4 + 4 + self.evidence_payload.len(),
+        );
+        output.extend_from_slice(PREPARED_WIRE_MAGIC);
+        output.extend_from_slice(&CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION.to_be_bytes());
+        output.extend_from_slice(&instance_len.to_be_bytes());
+        output.extend_from_slice(instance);
+        output.extend_from_slice(&self.owner.incarnation.to_bytes());
+        output.extend_from_slice(&self.operation_id.to_bytes());
+        output.extend_from_slice(&self.plan_digest);
+        output.extend_from_slice(&self.manifest_digest);
+        output.extend_from_slice(&self.batch_ordinal.to_be_bytes());
+        output.extend_from_slice(&self.batch_digest);
+        output.extend_from_slice(&self.evidence_digest);
+        output.extend_from_slice(&evidence_len.to_be_bytes());
+        output.extend_from_slice(&self.evidence_payload);
+        if output.len() > MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "cleanup prepared wire exceeds the hard limit",
+            ));
+        }
+        Ok(Bytes::from(output))
+    }
+
+    pub fn try_from_wire_v1(value: Bytes) -> Result<Self, ConnectorError> {
+        if value.len() > MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES
+            || value.len() < 8 + 2 + 2 + 16 + 16 + 32 * 4 + 4 + 4
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "cleanup prepared wire length is invalid",
+            ));
+        }
+        let mut cursor = 0usize;
+        let take = |count: usize, cursor: &mut usize| -> Result<&[u8], ConnectorError> {
+            let end = cursor.checked_add(count).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "cleanup prepared wire overflows",
+                )
+            })?;
+            let part = value.get(*cursor..end).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "cleanup prepared wire is truncated",
+                )
+            })?;
+            *cursor = end;
+            Ok(part)
+        };
+        if take(8, &mut cursor)? != PREPARED_WIRE_MAGIC
+            || take(2, &mut cursor)? != CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION.to_be_bytes()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "cleanup prepared wire version is invalid",
+            ));
+        }
+        let instance_len = u16::from_be_bytes(take(2, &mut cursor)?.try_into().unwrap()) as usize;
+        let instance = std::str::from_utf8(take(instance_len, &mut cursor)?).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "cleanup prepared owner is not UTF-8",
+            )
+        })?;
+        let incarnation =
+            ConnectorInstanceIncarnation::from_bytes(take(16, &mut cursor)?.try_into().unwrap());
+        let operation_id =
+            ConnectorCleanupOperationId::from_bytes(take(16, &mut cursor)?.try_into().unwrap());
+        let plan_digest = take(32, &mut cursor)?.try_into().unwrap();
+        let manifest_digest = take(32, &mut cursor)?.try_into().unwrap();
+        let batch_ordinal = u32::from_be_bytes(take(4, &mut cursor)?.try_into().unwrap());
+        let batch_digest = take(32, &mut cursor)?.try_into().unwrap();
+        let evidence_digest: [u8; 32] = take(32, &mut cursor)?.try_into().unwrap();
+        let evidence_len = u32::from_be_bytes(take(4, &mut cursor)?.try_into().unwrap()) as usize;
+        let evidence_payload = Bytes::copy_from_slice(take(evidence_len, &mut cursor)?);
+        if cursor != value.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "cleanup prepared wire has trailing bytes",
+            ));
+        }
+        let prepared = Self::try_new(
+            ConnectorExecutionBindingKey {
+                instance_id: ConnectorInstanceId::parse(instance)?,
+                incarnation,
+            },
+            operation_id,
+            plan_digest,
+            manifest_digest,
+            batch_ordinal,
+            batch_digest,
+            evidence_payload,
+        )?;
+        if prepared.evidence_digest != evidence_digest {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "cleanup prepared wire evidence digest is invalid",
+            ));
+        }
+        Ok(prepared)
     }
 }
 
@@ -1028,6 +1153,7 @@ impl ConnectorCleanupMaintenanceLease {
             || page.operation_id != request.plan.operation_id
             || page.manifest_digest != request.plan.manifest_digest
             || page.offset != request.offset
+            || page.locations.len() > request.limit as usize
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,

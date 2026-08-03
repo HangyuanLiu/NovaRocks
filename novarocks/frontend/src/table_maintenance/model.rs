@@ -28,6 +28,11 @@ pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 3;
 pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 64 * 1024;
+/// V4 cleanup records retain only bounded, credential-free provider artifact
+/// handles. Candidate locations and object identities remain provider-owned.
+pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 4;
+pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const CLEANUP_MAX_BATCHES: u16 = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobCreate {
@@ -586,6 +591,195 @@ impl From<&StoredDistributedRewriteOperationV3> for DistributedRewriteOperation 
             manifest_digest: value.manifest_digest,
             cohort_set_digest: value.cohort_set_digest,
             cohort_count: value.cohort_count,
+            state: value.state,
+            error_message: value.error_message.clone(),
+            created_at_ms: value.created_at_ms,
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+/// Durable state for a frontend-owned connector orphan cleanup. The state
+/// machine intentionally keeps a fence on unresolved dispatch so that a later
+/// connector incarnation cannot take over an exact-generation operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CleanupOperationState {
+    Pending,
+    Planned,
+    Running,
+    ReconcilePending,
+    Finished,
+    Failed,
+    Unresolved,
+}
+
+impl CleanupOperationState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed)
+    }
+
+    pub const fn holds_active_fence(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub const fn as_key_component(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Planned => "planned",
+            Self::Running => "running",
+            Self::ReconcilePending => "reconcile-pending",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupOperationCreate {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub request_digest: [u8; 32],
+    pub older_than_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupPlanPayload {
+    pub plan_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub artifact_handle_digest: [u8; 32],
+    pub artifact_handle: Vec<u8>,
+    pub candidate_count: u32,
+    pub total_bytes: u64,
+    pub manifest_parts: u16,
+    pub batch_count: u16,
+}
+
+/// The batch checkpoint has no paths, identity fields, or per-object errors.
+/// Those remain in the immutable provider manifest and receipt artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupBatchCheckpoint {
+    pub ordinal: u16,
+    pub prepared_handle_digest: [u8; 32],
+    pub prepared_handle: Vec<u8>,
+    pub receipt_handle_digest: Option<[u8; 32]>,
+    pub receipt_handle: Option<Vec<u8>>,
+    pub deleted_count: u32,
+    pub already_absent_count: u32,
+    pub failed_count: u32,
+    pub unknown_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupOperation {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub request_digest: [u8; 32],
+    pub older_than_ms: i64,
+    pub plan_digest: Option<[u8; 32]>,
+    pub manifest_digest: Option<[u8; 32]>,
+    pub candidate_count: Option<u32>,
+    pub batch_count: Option<u16>,
+    pub next_batch_ordinal: u16,
+    pub state: CleanupOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredCleanupOperationV4 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub target: StoredMaintenanceTargetV1,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub request_digest: [u8; 32],
+    pub older_than_ms: i64,
+    pub plan_digest: Option<[u8; 32]>,
+    pub manifest_digest: Option<[u8; 32]>,
+    pub candidate_count: Option<u32>,
+    pub batch_count: Option<u16>,
+    pub next_batch_ordinal: u16,
+    pub state: CleanupOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredCleanupPlanV4 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub plan_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub artifact_handle_digest: [u8; 32],
+    pub artifact_handle: Vec<u8>,
+    pub candidate_count: u32,
+    pub total_bytes: u64,
+    pub manifest_parts: u16,
+    pub batch_count: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredCleanupBatchV4 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub ordinal: u16,
+    pub prepared_handle_digest: [u8; 32],
+    pub prepared_handle: Vec<u8>,
+    pub receipt_handle_digest: Option<[u8; 32]>,
+    pub receipt_handle: Option<Vec<u8>>,
+    pub deleted_count: u32,
+    pub already_absent_count: u32,
+    pub failed_count: u32,
+    pub unknown_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StoredCleanupTransactionActionV4 {
+    Create,
+    Plan,
+    Prepare,
+    Checkpoint,
+    ReconcilePending,
+    Resume,
+    Finish,
+    Fail,
+    Unresolve,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredCleanupTransactionV4 {
+    pub schema_version: u8,
+    pub transaction_operation_id: Uuid,
+    pub action: StoredCleanupTransactionActionV4,
+    pub operation_id: Uuid,
+    pub post_operation: StoredCleanupOperationV4,
+}
+
+impl From<&StoredCleanupOperationV4> for CleanupOperation {
+    fn from(value: &StoredCleanupOperationV4) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            target: value.target.clone().into(),
+            owner: value.owner.clone(),
+            request_digest: value.request_digest,
+            older_than_ms: value.older_than_ms,
+            plan_digest: value.plan_digest,
+            manifest_digest: value.manifest_digest,
+            candidate_count: value.candidate_count,
+            batch_count: value.batch_count,
+            next_batch_ordinal: value.next_batch_ordinal,
             state: value.state,
             error_message: value.error_message.clone(),
             created_at_ms: value.created_at_ms,
