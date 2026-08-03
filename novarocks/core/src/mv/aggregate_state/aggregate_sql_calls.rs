@@ -25,7 +25,7 @@ use super::mv_shape::{
     AggregateCallShape, AggregateMvShape, GroupKeyShape, classify_aggregate_select_outputs,
     table_factor_name_and_alias,
 };
-use crate::mv::model::VisibleAggregateOutput;
+use crate::sql::mv_refresh::VisibleAggregateOutput;
 
 /// The focused aggregate-call surface extracted from a stored MV SELECT.
 ///
@@ -218,7 +218,7 @@ pub(crate) fn extract_aggregate_sql_calls(
 mod tests {
     use super::*;
     use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
+    use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =

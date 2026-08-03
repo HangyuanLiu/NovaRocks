@@ -812,7 +812,8 @@ mod tests {
         AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
     };
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
-    use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
+    use crate::mv::model::AggregateStateRole;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_catalog::schema::SqlType;

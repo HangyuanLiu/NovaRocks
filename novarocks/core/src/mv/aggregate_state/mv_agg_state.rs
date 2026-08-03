@@ -51,9 +51,10 @@ use crate::mv::aggregate_state::state_codec::{
     KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
     decode_sum_int64,
 };
-use crate::mv::model::{AggregateFunctionKind, AggregateStateRole, VisibleAggregateOutput};
+use crate::mv::model::AggregateStateRole;
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
 use crate::sql::analysis::OutputColumn;
+use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use novarocks_catalog::schema::SqlType;
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
@@ -2880,7 +2881,7 @@ mod tests {
         use crate::mv::aggregate_state::mv_shape::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
         };
-        use crate::mv::model::VisibleAggregateOutput;
+        use crate::sql::mv_refresh::VisibleAggregateOutput;
         use sqlparser::ast::ObjectName;
 
         let shape = AggregateMvShape {

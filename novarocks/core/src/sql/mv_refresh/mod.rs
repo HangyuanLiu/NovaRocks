@@ -17,6 +17,27 @@ use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 pub mod first_refresh;
 pub mod incremental;
 
+/// SQL classification of an aggregate state expression in an IMV plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateFunctionKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    BoolOr,
+    BoolAnd,
+    CountDistinct,
+    ApproxCountDistinct,
+}
+
+/// Stable visible-output ordering for an aggregate IMV plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VisibleAggregateOutput {
+    GroupKey(usize),
+    Aggregate(usize),
+}
+
 /// SQL identity of a materialized-view target.
 ///
 /// This value is shared with the application lifecycle, but it is canonical
@@ -71,6 +92,20 @@ impl MvRefreshStatement {
             return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aggregate_vocabulary_tests {
+    use super::*;
+
+    #[test]
+    fn sqlx2_mv_aggregate_vocabulary_is_sql_owned() {
+        assert_eq!(AggregateFunctionKind::Count, AggregateFunctionKind::Count);
+        assert_eq!(
+            VisibleAggregateOutput::GroupKey(0),
+            VisibleAggregateOutput::GroupKey(0)
+        );
     }
 }
 

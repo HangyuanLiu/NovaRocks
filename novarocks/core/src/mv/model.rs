@@ -227,33 +227,6 @@ impl AffectedTargetPartitions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateFunctionKind {
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-    /// `BOOL_OR(col)` / `boolor_agg(col)`. Uses `Map<Boolean, Int64>` detail
-    /// state, same framework as `MIN/MAX`.
-    BoolOr,
-    /// `BOOL_AND(col)` / `booland_agg(col)`. Uses `Map<Boolean, Int64>` detail
-    /// state, same framework as `MIN/MAX`.
-    BoolAnd,
-    /// `count(DISTINCT col)` / `count_distinct(col)` / `multi_distinct_count(col)`.
-    /// Uses shared multiset state encoding; visible counts positive entries.
-    CountDistinct,
-    /// `approx_count_distinct(col)` / `ndv(col)` / `hll_ndv(col)`.
-    /// Shares multiset state with CountDistinct; visible computes an HLL estimate.
-    ApproxCountDistinct,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum VisibleAggregateOutput {
-    GroupKey(usize),
-    Aggregate(usize),
-}
-
 /// Identifies a state column's role within its logical aggregate.
 ///
 /// Cardinality contract: one opaque `Single` state per aggregate.

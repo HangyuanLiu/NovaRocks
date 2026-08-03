@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
+use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IncrementalMvShape {

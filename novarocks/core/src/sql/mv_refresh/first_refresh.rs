@@ -14,7 +14,6 @@ use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::aggregate_state::mv_agg_state::{
     AGG_RETRACTION_COUNT_STATE_COLUMN, AGG_STATE_PREFIX, ROW_ID_COLUMN, sanitize_state_column_name,
 };
-use crate::mv::model::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::mv::refresh::aggregate_first_refresh::{
     prepare_aggregate_first_refresh_state_sql,
     prepare_branch_union_aggregate_first_refresh_state_sqls,
@@ -24,6 +23,7 @@ use crate::mv::refresh::projection_first_refresh::{
     prepare_projection_full_read_sql, prepare_union_projection_full_read_sql,
 };
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::sql::planner::logical::LogicalPlanNode;
 use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 use arrow::datatypes::{DataType, Schema, SchemaRef};

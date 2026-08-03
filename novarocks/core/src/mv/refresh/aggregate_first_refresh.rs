@@ -32,9 +32,10 @@ use crate::mv::aggregate_state::aggregate_sql_calls::AggregateSqlCalls;
 use crate::mv::aggregate_state::mv_agg_state::{
     AggregateMvLayout, materialize_aggregate_result_chunks,
 };
-use crate::mv::model::{AggregateStateRole, VisibleAggregateOutput};
+use crate::mv::model::AggregateStateRole;
 use crate::mv::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
 use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
+use crate::sql::mv_refresh::VisibleAggregateOutput;
 
 pub(crate) struct AggregateStateRead {
     pub(crate) result: QueryResult,
@@ -692,8 +693,9 @@ mod tests {
     use crate::mv::aggregate_state::mv_agg_state::{AggregateStateColumn, AggregateVisibleColumn};
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::aggregate_state::state_codec::encode_count_state;
-    use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
+    use crate::mv::model::AggregateStateRole;
     use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
+    use crate::sql::mv_refresh::AggregateFunctionKind;
     use novarocks_catalog::schema::SqlType;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {

@@ -11398,7 +11398,7 @@ fn alias_aggregate_refresh_group_key_projection(
     };
     for (projection_index, output) in calls.visible_outputs.iter().enumerate() {
         match output {
-            crate::mv::model::VisibleAggregateOutput::GroupKey(group_key_index) => {
+            crate::sql::mv_refresh::VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = layout
                     .group_key_source_indexes
                     .get(*group_key_index)
@@ -11432,7 +11432,7 @@ fn alias_aggregate_refresh_group_key_projection(
                     ));
                 }
             }
-            crate::mv::model::VisibleAggregateOutput::Aggregate(_) => {}
+            crate::sql::mv_refresh::VisibleAggregateOutput::Aggregate(_) => {}
         }
     }
     Ok(())
@@ -28430,7 +28430,8 @@ mod tests {
             AggregateMvLayout, AggregateStateColumn, AggregateVisibleColumn,
         };
         use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
-        use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
+        use crate::mv::model::AggregateStateRole;
+        use crate::sql::mv_refresh::AggregateFunctionKind;
         use arrow::datatypes::DataType;
         use novarocks_catalog::schema::SqlType;
 

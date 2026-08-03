@@ -1127,8 +1127,8 @@ fn single_state_column_for_visible(
 fn retraction_count_state_column(
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<&crate::mv::aggregate_state::mv_agg_state::AggregateStateColumn, String> {
-    use crate::mv::model::AggregateFunctionKind;
     use crate::mv::model::AggregateStateRole;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
 
     layout
         .state_columns
@@ -1148,9 +1148,9 @@ fn retraction_count_state_column(
 }
 
 fn state_union_function(
-    function: crate::mv::model::AggregateFunctionKind,
+    function: crate::sql::mv_refresh::AggregateFunctionKind,
 ) -> Result<&'static str, String> {
-    use crate::mv::model::AggregateFunctionKind;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
 
     match function {
         AggregateFunctionKind::Count => Ok("count_state_union"),
@@ -1167,9 +1167,9 @@ fn state_union_function(
 }
 
 fn visible_state_function(
-    function: crate::mv::model::AggregateFunctionKind,
+    function: crate::sql::mv_refresh::AggregateFunctionKind,
 ) -> Result<&'static str, String> {
-    use crate::mv::model::AggregateFunctionKind;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
 
     match function {
         AggregateFunctionKind::Count => Ok("count_state_visible"),
@@ -1190,7 +1190,7 @@ fn visible_state_args(
     merged_state: TypedExpr,
     layout: &crate::mv::aggregate_state::mv_agg_state::AggregateMvLayout,
 ) -> Result<Vec<TypedExpr>, String> {
-    use crate::mv::model::AggregateFunctionKind;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
 
     let visible = layout
         .visible_columns
@@ -1969,7 +1969,7 @@ fn signed_aggregate_project_items(
     aggregate_output_columns: &[OutputColumn],
     signed_calls: &[AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::ProjectItem>, String> {
-    use crate::mv::model::VisibleAggregateOutput;
+    use crate::sql::mv_refresh::VisibleAggregateOutput;
 
     let mut items = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
     for output in &shape.visible_outputs {
