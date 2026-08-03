@@ -156,10 +156,18 @@ pub(crate) trait SqlFunctionCatalog: Send + Sync {
 }
 
 /// Statement material already owned by the SQL boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum SqlStatementInput {
     Sql(String),
     ParsedQuery(Box<sqlparser::ast::Query>),
+    /// A SQL-owned logical transformation that must re-enter the canonical
+    /// optimizer kernel without reopening catalog resolution.  Application
+    /// code uses this only after compiler-produced logical facts have been
+    /// transformed by SQL-owned MV planning.
+    LogicalPlan {
+        plan: crate::sql::planner::logical::LogicalPlanNode,
+        factory: crate::sql::column_id::ColumnRefFactory,
+    },
 }
 
 /// The compiler result shape required by the caller.
@@ -208,6 +216,14 @@ pub(crate) struct SqlCompileControl {
     cancellation: Arc<dyn SqlCancellationObservation>,
 }
 
+struct SqlNeverCancelled;
+
+impl SqlCancellationObservation for SqlNeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 impl SqlCompileControl {
     pub(crate) fn new(
         deadline: Option<Instant>,
@@ -216,6 +232,16 @@ impl SqlCompileControl {
         Self {
             deadline,
             cancellation,
+        }
+    }
+
+    /// Explicitly unbounded control for an already-admitted SQL logical
+    /// transformation.  It is not an execution fallback: callers that have
+    /// a request control must still pass its deadline and cancellation view.
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            deadline: None,
+            cancellation: Arc::new(SqlNeverCancelled),
         }
     }
 
@@ -234,6 +260,62 @@ impl SqlCompileControl {
 
     fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+}
+
+/// A logical request cannot resolve another table or function.  These values
+/// exist only to keep the request shape uniform; any accidental use is a
+/// compiler contract violation rather than an application fallback.
+struct SqlLogicalInputCatalog;
+
+impl SqlCatalogSnapshot for SqlLogicalInputCatalog {
+    fn planner_table_provider(&self) -> &dyn crate::sql::catalog::PlannerTableProvider {
+        panic!("logical SQL compiler input must not resolve catalog tables")
+    }
+}
+
+struct SqlLogicalInputFunctions;
+
+impl SqlFunctionCatalog for SqlLogicalInputFunctions {
+    fn resolve_scalar_signature(
+        &self,
+        _name: &str,
+        _arg_types: &[arrow::datatypes::DataType],
+    ) -> Result<crate::sql::functions::ResolvedScalarFunction, crate::sql::functions::ResolveError>
+    {
+        panic!("logical SQL compiler input must not resolve functions")
+    }
+
+    fn volatility(&self, _name: &str) -> crate::sql::functions::FunctionVolatility {
+        panic!("logical SQL compiler input must not resolve functions")
+    }
+}
+
+static SQL_LOGICAL_INPUT_CATALOG: SqlLogicalInputCatalog = SqlLogicalInputCatalog;
+static SQL_LOGICAL_INPUT_FUNCTIONS: SqlLogicalInputFunctions = SqlLogicalInputFunctions;
+
+/// Conservative statistics source for SQL-owned logical transformations that
+/// cannot admit a new catalog binding.  Missing evidence remains missing; it
+/// is never guessed as an empty table.
+pub(crate) struct SqlUnavailableStatisticsSnapshot;
+
+impl SqlStatisticsSnapshot for SqlUnavailableStatisticsSnapshot {
+    fn collect_table_statistics(
+        &self,
+        database: &str,
+        table: &crate::sql::planner::table::TableDef,
+    ) -> (
+        String,
+        crate::sql::optimizer::stats_input::BaseTableStatistics,
+    ) {
+        (
+            format!("{database}.{}", table.name),
+            crate::sql::optimizer::stats_input::BaseTableStatistics::missing(
+                crate::sql::optimizer::stats_input::StatsMissingReason::ConnectorUnsupported(
+                    "logical SQL compiler input has no additional statistics evidence".to_string(),
+                ),
+            ),
+        )
     }
 }
 
@@ -273,6 +355,33 @@ impl<'a> SqlCompileRequest<'a> {
             statistics,
             functions,
             mv_rewrite,
+            imv_rewrite: None,
+            control,
+        }
+    }
+
+    /// Build a request for an already SQL-owned logical plan.  It deliberately
+    /// has no catalog, function, or MV-candidate callback: the input has
+    /// already crossed analysis and the compiler may only optimize its frozen
+    /// SQL facts.
+    pub(crate) fn new_logical(
+        plan: crate::sql::planner::logical::LogicalPlanNode,
+        factory: crate::sql::column_id::ColumnRefFactory,
+        intent: SqlCompileIntent,
+        session: SqlSessionContext,
+        environment: SqlPlanningEnvironment,
+        statistics: &'a dyn SqlStatisticsSnapshot,
+        control: SqlCompileControl,
+    ) -> Self {
+        Self {
+            statement: SqlStatementInput::LogicalPlan { plan, factory },
+            intent,
+            session,
+            environment,
+            catalog: &SQL_LOGICAL_INPUT_CATALOG,
+            statistics,
+            functions: &SQL_LOGICAL_INPUT_FUNCTIONS,
+            mv_rewrite: None,
             imv_rewrite: None,
             control,
         }
@@ -351,18 +460,27 @@ impl SqlCompiler {
         request: SqlCompileRequest<'_>,
     ) -> Result<SqlCompileOutput, SqlCompileError> {
         request.check_control()?;
-        let query = parse_query(&request.statement)?;
-        let catalog = request.catalog.planner_table_provider();
-        let (resolved, ctes, mut factory) = crate::sql::analyzer::analyze_with_function_catalog(
-            &query,
-            catalog,
-            &request.session.current_database,
-            request.functions,
-        )
-        .map_err(SqlCompileError::Compilation)?;
-        request.check_control()?;
-        let mut logical_plan = crate::sql::planner::plan_query(resolved, ctes, &mut factory)
-            .map_err(SqlCompileError::Compilation)?;
+        let (mut logical_plan, mut factory, logical_input) = match &request.statement {
+            SqlStatementInput::LogicalPlan { plan, factory } => {
+                (plan.clone(), factory.clone(), true)
+            }
+            _ => {
+                let query = parse_query(&request.statement)?;
+                let catalog = request.catalog.planner_table_provider();
+                let (resolved, ctes, mut factory) =
+                    crate::sql::analyzer::analyze_with_function_catalog(
+                        &query,
+                        catalog,
+                        &request.session.current_database,
+                        request.functions,
+                    )
+                    .map_err(SqlCompileError::Compilation)?;
+                request.check_control()?;
+                let logical_plan = crate::sql::planner::plan_query(resolved, ctes, &mut factory)
+                    .map_err(SqlCompileError::Compilation)?;
+                (logical_plan, factory, false)
+            }
+        };
         request.check_control()?;
 
         if matches!(request.intent, SqlCompileIntent::AnalyzeOnly) {
@@ -379,11 +497,19 @@ impl SqlCompiler {
             }));
         }
         let mut settings = request.session.optimizer_settings.clone();
-        if !matches!(request.intent, SqlCompileIntent::LogicalOnly) {
+        if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
+            && !(logical_input
+                && matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
+        {
             apply_planning_environment(&mut settings, request.environment)?;
         }
-        let mut change_stream =
-            crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default();
+        let mut change_stream = logical_input
+            .then(|| {
+                crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(
+                    &logical_plan,
+                )
+            })
+            .unwrap_or_default();
         if let Some(input) = request.imv_rewrite {
             if !matches!(
                 request.intent,
@@ -437,6 +563,7 @@ impl SqlCompiler {
         let mv_rewrite = request
             .mv_rewrite
             .map(|definitions| {
+                let catalog = request.catalog.planner_table_provider();
                 mv_rewrite::prepare_candidates(
                     definitions,
                     catalog,
@@ -538,6 +665,11 @@ fn parse_query(statement: &SqlStatementInput) -> Result<sqlparser::ast::Query, S
     let sql = match statement {
         SqlStatementInput::Sql(sql) => sql,
         SqlStatementInput::ParsedQuery(query) => return Ok((**query).clone()),
+        SqlStatementInput::LogicalPlan { .. } => {
+            return Err(SqlCompileError::InvalidRequest(
+                "logical SQL compiler input must bypass parsing".to_string(),
+            ));
+        }
     };
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(SqlCompileError::Compilation)?;

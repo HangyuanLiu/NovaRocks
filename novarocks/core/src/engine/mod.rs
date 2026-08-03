@@ -5965,30 +5965,33 @@ pub(crate) fn plan_logical_for_iceberg_change_stream_refresh(
     logical_plan: crate::sql::planner::logical::LogicalPlanNode,
     factory: crate::sql::column_id::ColumnRefFactory,
 ) -> Result<PlannedIcebergChangeStreamRefreshQuery, String> {
-    let change_stream =
-        crate::sql::planner::imv_rewrite::change_stream::build_change_stream_descriptor(
-            &logical_plan,
-        );
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let mut optimizer_expr = crate::sql::planner::optimizer_bridge::logical::try_to_optimizer_expr(
-        &logical_plan,
-        &mut scalar_arena,
-    )?;
-    let providers = query_stats::QueryStatisticsContext::unavailable();
-    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut optimizer_expr);
-    let optimized_tree = crate::sql::optimizer::optimize(
-        optimizer_expr,
-        scalar_arena,
-        &query_stats.snapshot,
+    let statistics = crate::sql::compiler::SqlUnavailableStatisticsSnapshot;
+    let request = crate::sql::compiler::SqlCompileRequest::new_logical(
+        logical_plan,
         factory,
-        Vec::new(),
-        &crate::sql::optimizer::options::SessionOptimizerSettings::default(),
-    )?;
+        crate::sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: None,
+            current_database: String::new(),
+            optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::NotApplicable,
+        &statistics,
+        crate::sql::compiler::SqlCompileControl::unbounded(),
+    );
+    let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err(
+            "logical change-stream input did not produce an optimized SQL plan".to_string(),
+        );
+    };
+    let optimized_tree = compiled.optimized_tree;
     let output_columns = optimized_tree.output_columns.clone();
     Ok(PlannedIcebergChangeStreamRefreshQuery {
         optimized_tree,
         output_columns,
-        change_stream,
+        change_stream: compiled.change_stream,
         table_bindings: None,
     })
 }
