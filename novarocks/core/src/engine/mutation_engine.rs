@@ -485,7 +485,100 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_merge_statement, parse_update_statement};
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        CoreMutationAbort, CoreMutationPrepared, MutationAbort, MutationEngine, MutationOperation,
+        MutationStatementKind, STAGED, parse_merge_statement, parse_update_statement,
+    };
+    use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+    use crate::engine::mutation_flow::MutationExecution;
+    use crate::query_execution::ConnectorWriteCompletion;
+    use crate::query_execution::outcome::QueryExecutionResult;
+
+    struct TestExecution {
+        abort_outcome: Mutex<Option<Result<CommitOutcome, CommitServiceError>>>,
+        abort_calls: AtomicUsize,
+    }
+
+    impl TestExecution {
+        fn known_uncommitted() -> Self {
+            Self {
+                abort_outcome: Mutex::new(Some(Ok(CommitOutcome {
+                    new_snapshot_id: 0,
+                    written_manifest_paths: Vec::new(),
+                }))),
+                abort_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MutationExecution for TestExecution {
+        fn stage(&self) -> Result<QueryExecutionResult, String> {
+            Err("test execution must not stage".to_string())
+        }
+
+        fn abort(&self, _reason: String) -> Result<CommitOutcome, CommitServiceError> {
+            self.abort_calls.fetch_add(1, Ordering::AcqRel);
+            self.abort_outcome
+                .lock()
+                .expect("test abort outcome lock")
+                .take()
+                .expect("abort called only once")
+        }
+
+        fn commit(
+            &self,
+            _completion: &ConnectorWriteCompletion,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            panic!("test execution must not commit")
+        }
+
+        fn finalize(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct ForeignAbort;
+
+    impl MutationAbort for ForeignAbort {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn prepared(kind: MutationStatementKind, attempt_id: &str) -> CoreMutationPrepared {
+        CoreMutationPrepared {
+            operation: MutationOperation {
+                kind,
+                catalog: "iceberg".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                target_ref: "main".to_string(),
+                attempt_id: attempt_id.to_string(),
+                journal_commit_kind: CommitOpKind::RowDelta,
+                base_snapshot_id: Some(7),
+            },
+            kernel: Mutex::new(None),
+            finalizer: Mutex::new(None),
+            state: super::AtomicU8::new(STAGED),
+        }
+    }
+
+    fn abort_handle(
+        kind: MutationStatementKind,
+        attempt_id: &str,
+        execution: Arc<TestExecution>,
+    ) -> CoreMutationAbort {
+        CoreMutationAbort {
+            kind,
+            attempt_id: attempt_id.to_string(),
+            execution,
+            reason: "test staging failure".to_string(),
+        }
+    }
 
     #[test]
     fn recognition_is_statement_specific() {
@@ -504,5 +597,44 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn abort_rejects_foreign_and_cross_statement_handles_without_consuming_prepared_state() {
+        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
+        let execution = Arc::new(TestExecution::known_uncommitted());
+
+        let foreign = ForeignAbort;
+        let error = engine.abort_mutation(&prepared, &foreign).unwrap_err();
+        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
+
+        let merge_abort = abort_handle(MutationStatementKind::Merge, "update-attempt", execution);
+        let error = engine.abort_mutation(&prepared, &merge_abort).unwrap_err();
+        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        assert_eq!(prepared.state.load(Ordering::Acquire), STAGED);
+    }
+
+    #[test]
+    fn abort_consumes_the_exact_handle_once_and_keeps_its_execution_for_finalization() {
+        let engine = Arc::new(crate::engine::StandaloneState::default());
+        let prepared = prepared(MutationStatementKind::Update, "update-attempt");
+        let execution = Arc::new(TestExecution::known_uncommitted());
+        let abort = abort_handle(
+            MutationStatementKind::Update,
+            "update-attempt",
+            Arc::clone(&execution),
+        );
+
+        let outcome = engine.abort_mutation(&prepared, &abort).unwrap();
+        assert_eq!(outcome.new_snapshot_id, 0);
+        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
+        assert_eq!(prepared.state.load(Ordering::Acquire), super::TERMINAL);
+        engine.finalize_mutation(&prepared).unwrap();
+
+        let error = engine.abort_mutation(&prepared, &abort).unwrap_err();
+        assert!(matches!(error, CommitServiceError::InvalidInput { .. }));
+        assert_eq!(execution.abort_calls.load(Ordering::Acquire), 1);
     }
 }
