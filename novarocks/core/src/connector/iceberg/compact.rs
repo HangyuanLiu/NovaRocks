@@ -276,6 +276,7 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
         file_io,
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
+        selected_rewrite: None,
         target_ref: "main".to_string(),
         snapshot_properties: BTreeMap::new(),
     }))

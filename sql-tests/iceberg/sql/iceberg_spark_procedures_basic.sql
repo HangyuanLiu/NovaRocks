@@ -53,6 +53,9 @@ CALL proc_ice_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.orders');
 
 -- query 3
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- @be_log_not_contains=NOVAROCKS_QUERY_INIT_APPLIED
+-- @be_log_not_contains=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED
+-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders');
 
 -- query 4
@@ -68,6 +71,7 @@ CALL proc_ice_${uuid0}.system.expire_snapshots(table => 'ns_${uuid0}.orders', re
 
 -- query 6
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @skip_result_check=true
 CALL proc_ice_${uuid0}.system.rewrite_data_files(table => 'ns_${uuid0}.orders', options => map('rewrite-all', 'true'));
 

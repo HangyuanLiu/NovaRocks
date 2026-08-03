@@ -47,6 +47,7 @@ mod row_delta_dv;
 mod row_delta_dv_from_files;
 mod row_delta_dv_metadata;
 mod run;
+mod selected_rewrite;
 mod service;
 pub mod snapshot_lifecycle_helpers;
 pub(crate) mod statistics;
@@ -88,6 +89,7 @@ pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};
+pub(crate) use selected_rewrite::{SelectedRewriteFiles, SelectedRewriteKind};
 pub use service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, CommitServiceOutcome, RecoveryEvidence,
     classify_commit_error,

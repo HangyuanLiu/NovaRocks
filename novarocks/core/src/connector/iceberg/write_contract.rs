@@ -388,6 +388,96 @@ pub(crate) fn encode_data_sink_spec_handle_payload(
     })
 }
 
+/// Build the secret-free data writer handle for a provider-frozen rewrite
+/// without reconstructing a SQL-layer sink specification.  E2 has already
+/// frozen the target metadata and Arrow schema before this call; the BE still
+/// receives only this bounded handle and resolves storage access locally.
+pub(crate) fn encode_frozen_data_rewrite_handle_payload(
+    metadata: &TableMetadata,
+    target_snapshot_id: Option<i64>,
+    row_lineage_data: bool,
+) -> Result<Bytes, String> {
+    let partition_spec = metadata.default_partition_spec();
+    let mut partition_source_column_names = Vec::with_capacity(partition_spec.fields().len());
+    let mut partition_column_names = Vec::with_capacity(partition_spec.fields().len());
+    let mut transform_exprs = Vec::with_capacity(partition_spec.fields().len());
+    for field in partition_spec.fields() {
+        let source = metadata
+            .current_schema()
+            .field_by_id(field.source_id)
+            .ok_or_else(|| {
+                format!(
+                    "Iceberg frozen rewrite partition field {} has unknown source column {}",
+                    field.name, field.source_id
+                )
+            })?;
+        partition_source_column_names.push(source.name.clone());
+        partition_column_names.push(field.name.clone());
+        transform_exprs.push(field.transform.to_string());
+    }
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let mut data_input_schema =
+        crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen(
+            metadata.current_schema(),
+        )
+        .fields;
+    if row_lineage_data {
+        data_input_schema.extend([
+            IcebergSchemaFieldDef {
+                field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+            IcebergSchemaFieldDef {
+                field_id:
+                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            },
+        ]);
+    }
+    canonical_json(&IcebergWriteHandlePayloadV1 {
+        version: ICEBERG_WRITE_PAYLOAD_VERSION,
+        mode: IcebergSinkModeV1::Data,
+        table_location: metadata.location().to_string(),
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        target_snapshot_id,
+        file_format: IcebergFileFormatV1::Parquet,
+        report_file_format: "parquet".to_string(),
+        compression: "SNAPPY".to_string(),
+        equality_delete_columns: Vec::new(),
+        row_lineage_data,
+        partition_source_column_names,
+        partition_column_names,
+        transform_exprs,
+        // Native connector output columns intentionally carry only generic
+        // Arrow facts. Preserve the Iceberg field-ID tree in this private
+        // handle so the BE can re-annotate that generic schema before writing
+        // Parquet; the frozen source schema itself never crosses the wire.
+        data_input_schema: Some(
+            data_input_schema
+                .iter()
+                .map(IcebergWriterSchemaFieldV1::from)
+                .collect(),
+        ),
+        position_delete_binding: None,
+        position_delete_partitions: Vec::new(),
+    })
+}
+
 /// Build the secret-free equality-delete handle from the FE-owned sink spec.
 /// C1 intentionally admits only the existing unpartitioned equality-delete
 /// path; partitioned delete semantics require a later provider adapter.
@@ -686,6 +776,86 @@ pub(crate) fn encode_deletion_vector_sink_handle_payload(
     existing_vectors: &HashMap<String, DeletionVector>,
 ) -> Result<Bytes, String> {
     encode_position_delete_handle_payload(spec, metadata, partitions, Some(existing_vectors))
+}
+
+/// Encode a DV rewrite writer handle from provider-frozen partition facts.
+/// Unlike ordinary row-level DELETE, the frozen rewrite source has already
+/// materialized every old position into the Arrow stream, so this handle must
+/// not include an `existing_deletion_vector_payload` that would merge a stale
+/// second copy on the BE.
+pub(crate) fn encode_frozen_deletion_vector_rewrite_handle_payload(
+    metadata: &TableMetadata,
+    target_snapshot_id: Option<i64>,
+    partitions: &HashMap<String, PositionDeleteDataFilePartition>,
+) -> Result<Bytes, String> {
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location().trim_end_matches('/')));
+    let mut encoded_partitions = partitions
+        .iter()
+        .map(|(data_file_path, partition)| {
+            validate_secret_free_text("referenced data file", data_file_path)?;
+            let partition_spec = metadata
+                .partition_spec_by_id(partition.partition_spec_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Iceberg frozen DV rewrite references unknown partition spec {}",
+                        partition.partition_spec_id
+                    )
+                })?;
+            let (partition_path, null_fingerprint) =
+                partition_path_from_struct(&partition.partition_values, partition_spec)?;
+            let descriptor = encode_partition_descriptor(
+                &partition.partition_values,
+                partition.partition_spec_id,
+                metadata,
+            )
+            .map_err(|error| format!("encode frozen DV rewrite partition: {error}"))?;
+            Ok(IcebergPositionDeletePartitionV1 {
+                data_file_path: data_file_path.clone(),
+                partition_path,
+                null_fingerprint,
+                partition_spec_id: partition.partition_spec_id,
+                values: descriptor
+                    .values
+                    .into_iter()
+                    .map(|value| IcebergPartitionValueV1 {
+                        is_null: value.is_null,
+                        datum_base64: value.datum_bytes.map(base64_encode),
+                    })
+                    .collect(),
+                existing_deletion_vector_payload_base64: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    encoded_partitions.sort_by(|left, right| left.data_file_path.cmp(&right.data_file_path));
+    if encoded_partitions
+        .windows(2)
+        .any(|pair| pair[0].data_file_path == pair[1].data_file_path)
+    {
+        return Err("Iceberg frozen DV rewrite handle has duplicate data-file paths".to_string());
+    }
+    canonical_json(&IcebergWriteHandlePayloadV1 {
+        version: ICEBERG_WRITE_PAYLOAD_VERSION,
+        mode: IcebergSinkModeV1::DeletionVectors,
+        table_location: metadata.location().to_string(),
+        data_location,
+        target_partition_spec_id: metadata.default_partition_spec_id(),
+        target_snapshot_id,
+        file_format: IcebergFileFormatV1::Puffin,
+        report_file_format: "puffin".to_string(),
+        compression: "SNAPPY".to_string(),
+        equality_delete_columns: Vec::new(),
+        row_lineage_data: false,
+        partition_source_column_names: Vec::new(),
+        partition_column_names: Vec::new(),
+        transform_exprs: Vec::new(),
+        data_input_schema: None,
+        position_delete_binding: None,
+        position_delete_partitions: encoded_partitions,
+    })
 }
 
 fn encode_position_delete_handle_payload(
@@ -1776,6 +1946,69 @@ mod tests {
                 .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
                 .map(String::as_str),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn frozen_data_rewrite_handle_restores_iceberg_field_ids_on_generic_input() {
+        let metadata: TableMetadata = serde_json::from_str(
+            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        )
+        .expect("decode metadata");
+        let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, false)
+            .expect("encode frozen data rewrite handle");
+        let raw_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+        let plan = data_sink_plan_from_handle_payload(&payload, raw_schema, None)
+            .expect("reconstruct annotated frozen data rewrite plan");
+        assert_eq!(
+            plan.output_schema.fields()[0]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn frozen_row_lineage_rewrite_handle_preserves_reserved_field_ids() {
+        let metadata: TableMetadata = serde_json::from_str(
+            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
+        )
+        .expect("decode metadata");
+        let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, true)
+            .expect("encode frozen row-lineage rewrite handle");
+        let raw_schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_ROW_ID_COL,
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        ]));
+        let plan = data_sink_plan_from_handle_payload(&payload, raw_schema, None)
+            .expect("reconstruct row-lineage rewrite plan");
+        assert_eq!(
+            plan.output_schema.fields()[1]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(|value| value.parse::<i32>().expect("field id")),
+            Some(crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID)
+        );
+        assert_eq!(
+            plan.output_schema.fields()[2]
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(|value| value.parse::<i32>().expect("field id")),
+            Some(crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
         );
     }
 

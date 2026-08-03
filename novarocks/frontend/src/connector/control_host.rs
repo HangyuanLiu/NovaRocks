@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, Weak};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver, ConnectorControlBinding,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
-    ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorDistributedRewriteLease,
+    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceResolver, ConnectorStatisticsLease, ConnectorStatisticsResolver,
     ConnectorWriteLease, ConnectorWriteResolver,
@@ -52,6 +53,7 @@ struct ControlGeneration {
     mutation_leases: usize,
     data_mutation_leases: usize,
     metadata_maintenance_leases: usize,
+    distributed_rewrite_leases: usize,
     write_leases: usize,
     statistics_leases: usize,
 }
@@ -62,6 +64,7 @@ impl ControlGeneration {
             && self.mutation_leases == 0
             && self.data_mutation_leases == 0
             && self.metadata_maintenance_leases == 0
+            && self.distributed_rewrite_leases == 0
             && self.write_leases == 0
             && self.statistics_leases == 0
     }
@@ -150,6 +153,7 @@ impl ConnectorControlHost {
                 mutation_leases: 0,
                 data_mutation_leases: 0,
                 metadata_maintenance_leases: 0,
+                distributed_rewrite_leases: 0,
                 write_leases: 0,
                 statistics_leases: 0,
             },
@@ -448,6 +452,119 @@ impl ConnectorControlHost {
         )
     }
 
+    fn acquire_current_distributed_rewrite(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        let key = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
+        };
+        self.acquire_distributed_rewrite(&key, true)
+    }
+
+    fn acquire_exact_distributed_rewrite(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        self.acquire_distributed_rewrite(key, false)
+    }
+
+    /// Acquire the metadata, rewrite planning, write-control, and execution
+    /// distribution capabilities from exactly one registered generation. The
+    /// resulting lease intentionally owns a single retirement counter: a
+    /// derived C1 writer lease retains this parent rather than acquiring a
+    /// separate current write generation.
+    fn acquire_distributed_rewrite(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+        require_active: bool,
+    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        let (binding, descriptor, metadata, planning, rewrite, write, distribution) = {
+            let mut state = self.lock_state()?;
+            let generation = state.generations.get_mut(key).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "connector control generation is not registered",
+                )
+            })?;
+            if require_active && generation.state != ControlGenerationState::Active {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
+            }
+            let rewrite = generation
+                .binding
+                .distributed_rewrite()
+                .cloned()
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "connector control generation has no distributed rewrite capability",
+                    )
+                })?;
+            let write = generation.binding.write().cloned().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no distributed write capability",
+                )
+            })?;
+            generation.distributed_rewrite_leases =
+                generation.distributed_rewrite_leases.saturating_add(1);
+            generation.planning_leases = generation.planning_leases.saturating_add(1);
+            (
+                Arc::clone(&generation.binding),
+                generation.binding.descriptor().clone(),
+                Arc::clone(generation.binding.metadata()),
+                Arc::clone(generation.binding.planning()),
+                rewrite,
+                write,
+                Arc::clone(generation.binding.execution_distribution()),
+            )
+        };
+        let state = Arc::downgrade(&self.state);
+        let retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let lease_key = key.clone();
+        let planning_state = Arc::downgrade(&self.state);
+        let planning_retirement_sink = Arc::downgrade(&self.retirement_sink);
+        let planning_key = key.clone();
+        let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
+            release_lease(
+                &planning_state,
+                &planning_retirement_sink,
+                planning_key,
+                LeaseKind::Planning,
+            );
+        });
+        ConnectorDistributedRewriteLease::new(
+            descriptor,
+            key.clone(),
+            planning_lease,
+            metadata,
+            planning,
+            rewrite,
+            write,
+            distribution,
+            move || {
+                release_lease(
+                    &state,
+                    &retirement_sink,
+                    lease_key,
+                    LeaseKind::DistributedRewrite,
+                );
+            },
+        )
+    }
+
     fn acquire_write(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -648,6 +765,22 @@ impl ConnectorMetadataMaintenanceResolver for ConnectorControlHost {
     }
 }
 
+impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
+    fn acquire_current_distributed_rewrite(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        Self::acquire_current_distributed_rewrite(self, instance_id)
+    }
+
+    fn acquire_exact_distributed_rewrite(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        Self::acquire_exact_distributed_rewrite(self, key)
+    }
+}
+
 impl ConnectorWriteResolver for ConnectorControlHost {
     fn acquire_current_write(
         &self,
@@ -682,6 +815,7 @@ enum LeaseKind {
     Mutation,
     DataMutation,
     MetadataMaintenance,
+    DistributedRewrite,
     Write,
     Statistics,
 }
@@ -714,6 +848,10 @@ fn release_lease(
         LeaseKind::MetadataMaintenance => {
             generation.metadata_maintenance_leases =
                 generation.metadata_maintenance_leases.saturating_sub(1);
+        }
+        LeaseKind::DistributedRewrite => {
+            generation.distributed_rewrite_leases =
+                generation.distributed_rewrite_leases.saturating_sub(1);
         }
         LeaseKind::Write => {
             generation.write_leases = generation.write_leases.saturating_sub(1);

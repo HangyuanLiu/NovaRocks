@@ -502,7 +502,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
     }
 }
 
-fn dv_descriptor_from_written(file: &WrittenFile) -> Result<WrittenDvFile, String> {
+pub(super) fn dv_descriptor_from_written(file: &WrittenFile) -> Result<WrittenDvFile, String> {
     if file.format != DataFileFormat::Puffin {
         return Err(format!(
             "RowDeltaDvFromFilesCommit expected Puffin DV file {}, got format {:?}",

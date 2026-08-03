@@ -43,7 +43,7 @@ use crate::exec::row_position::{
 };
 
 use super::abort::AbortLog;
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
@@ -116,6 +116,7 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             row_lineage_added_rows,
             preserve_row_lineage,
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let prev_snapshot_id = ctx
@@ -176,6 +177,7 @@ struct RewriteDataFilesTxnAction {
     /// is skipped because the two no longer reflect the same accounting.
     preserve_row_lineage: bool,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -352,11 +354,15 @@ impl TransactionAction for RewriteDataFilesTxnAction {
 
         let summary = Summary {
             operation: Operation::Replace,
-            additional_properties: finalize_snapshot_summary(
-                rewrite_summary(&self.written, &live),
-                m.current_snapshot().map(|s| s.summary()),
-                false,
-            ),
+            additional_properties: merge_snapshot_summary_properties(
+                finalize_snapshot_summary(
+                    rewrite_summary(&self.written, &live),
+                    m.current_snapshot().map(|s| s.summary()),
+                    false,
+                ),
+                &self.snapshot_properties,
+            )
+            .map_err(to_iceberg_unexpected)?,
         };
         let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
             Snapshot::builder()

@@ -15,22 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use novarocks::engine::table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, TableMaintenanceEngine,
-};
+use novarocks::engine::table_maintenance::{MaintenanceActionOutcome, TableMaintenanceEngine};
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use super::FrontendTableMaintenanceService;
 use super::model::{OptimizeJob, OptimizeJobOutcome};
 use super::now_unix_millis;
-use super::repository::OptimizeJobRepository;
+use super::repository::{DistributedRewriteOperationRepository, OptimizeJobRepository};
 
 const OPTIMIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -44,14 +42,25 @@ impl OptimizeWorker {
     pub fn start(
         runtime: &Handle,
         repository: Arc<OptimizeJobRepository>,
+        distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
         engine: Weak<dyn TableMaintenanceEngine>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wakeup = Arc::new(Notify::new());
         let worker_stop = Arc::clone(&stop);
         let worker_wakeup = Arc::clone(&wakeup);
-        let join = runtime
-            .spawn(async move { run_worker(repository, engine, worker_stop, worker_wakeup).await });
+        let worker_runtime = runtime.clone();
+        let join = runtime.spawn(async move {
+            run_worker(
+                worker_runtime,
+                repository,
+                distributed_rewrite_repository,
+                engine,
+                worker_stop,
+                worker_wakeup,
+            )
+            .await
+        });
         Ok(Self {
             stop,
             wakeup,
@@ -84,7 +93,9 @@ impl OptimizeWorker {
 }
 
 async fn run_worker(
+    runtime: Handle,
     repository: Arc<OptimizeJobRepository>,
+    distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
     engine: Weak<dyn TableMaintenanceEngine>,
     stop: Arc<AtomicBool>,
     wakeup: Arc<Notify>,
@@ -121,7 +132,14 @@ async fn run_worker(
             else {
                 continue;
             };
-            execute_claimed_job(repository.as_ref(), engine, claimed).await?;
+            execute_claimed_job(
+                &runtime,
+                repository.as_ref(),
+                Arc::clone(&distributed_rewrite_repository),
+                engine,
+                claimed,
+            )
+            .await?;
         }
         if engine.upgrade().is_none() {
             return Ok(());
@@ -135,24 +153,27 @@ async fn run_worker(
 }
 
 async fn execute_claimed_job(
+    runtime: &Handle,
     repository: &OptimizeJobRepository,
+    distributed_rewrite_repository: Arc<DistributedRewriteOperationRepository>,
     engine: Arc<dyn TableMaintenanceEngine>,
     job: OptimizeJob,
 ) -> Result<(), String> {
     let job_id = job.job_id;
-    let request = MaintenanceActionRequest::RewriteDataFiles {
-        target: job.target,
-        base_snapshot_id: job.base_snapshot_id,
-        job_id: Some(job_id),
-        options: BTreeMap::new(),
-        branch: None,
-        where_clause: None,
-    };
-    let execution = tokio::task::spawn_blocking(move || engine.execute_action(request))
-        .await
-        .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
-        .and_then(|result| result)
-        .and_then(optimize_outcome);
+    let target = job.target;
+    let runtime = runtime.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        FrontendTableMaintenanceService::execute_optimize_distributed_rewrite(
+            &runtime,
+            distributed_rewrite_repository,
+            engine.as_ref(),
+            target,
+        )
+    })
+    .await
+    .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
+    .and_then(|result| result)
+    .and_then(optimize_outcome);
 
     let outcome = match execution {
         Ok(outcome) => outcome,

@@ -21,7 +21,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
-use novarocks_spi::connector::ConnectorInstanceId;
+use novarocks_spi::connector::{
+    ConnectorDistributedRewriteAttemptCheckpoint as SpiRewriteCheckpoint,
+    ConnectorDistributedRewriteAttemptDisposition as SpiRewriteDisposition, ConnectorInstanceId,
+    ConnectorWriteCohortId, ConnectorWriteExecutionId,
+};
 use novarocks_spi::state_store::{
     CommitResolution, Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord,
     StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
@@ -29,17 +33,25 @@ use novarocks_spi::state_store::{
 };
 use novarocks_state_store::metrics::StateStoreMetrics;
 use novarocks_state_store::{OperationId, RunFailure, run_side_effect_free};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::model::{
+    DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES, DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES,
+    DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION, DistributedRewriteAttemptCheckpoint,
+    DistributedRewriteAttemptDisposition, DistributedRewriteOpaquePayload,
+    DistributedRewriteOperation, DistributedRewriteOperationCreate,
+    DistributedRewriteOperationState, DistributedRewritePlanPayload,
     METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES, METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION,
     MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
     MetadataMaintenancePlanPayload, OPTIMIZE_JOB_SCHEMA_VERSION, OptimizeJob, OptimizeJobCreate,
-    OptimizeJobOutcome, StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
+    OptimizeJobOutcome, StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
+    StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
+    StoredDistributedRewriteTransactionActionV3, StoredDistributedRewriteTransactionV3,
+    StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
     StoredMetadataMaintenancePayloadKindV2, StoredMetadataMaintenancePayloadV2,
     StoredMetadataMaintenanceTransactionActionV2, StoredMetadataMaintenanceTransactionV2,
     StoredOptimizeCounterV1, StoredOptimizeJobStateV1, StoredOptimizeJobV1,
@@ -58,6 +70,18 @@ const METADATA_PAYLOAD_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/p
 const METADATA_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/state/";
 const METADATA_ACTIVE_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/active/";
 const METADATA_TRANSACTION_PREFIX: &str = "novarocks/frontend/table-maintenance/v2/transactions/";
+
+const DISTRIBUTED_REWRITE_OPERATION_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v3/rewrite/operations/";
+const DISTRIBUTED_REWRITE_PAYLOAD_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v3/rewrite/payloads/";
+const DISTRIBUTED_REWRITE_ATTEMPT_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v3/rewrite/attempts/";
+const DISTRIBUTED_REWRITE_STATE_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v3/rewrite/state/";
+const DISTRIBUTED_REWRITE_TRANSACTION_PREFIX: &str =
+    "novarocks/frontend/table-maintenance/v3/rewrite/transactions/";
+const SHARED_ACTIVE_PREFIX: &str = "novarocks/frontend/table-maintenance/v3/active/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryErrorKind {
@@ -107,6 +131,19 @@ impl fmt::Display for RepositoryError {
 }
 
 impl std::error::Error for RepositoryError {}
+
+// Stateful transaction closures return StateStoreError at their outer layer.
+// Repository validation failures are intentionally translated to a stable
+// corruption marker so a closure can return the original typed error through
+// its inner RepositoryResult without leaking a partial write.
+impl From<RepositoryError> for StateStoreError {
+    fn from(_: RepositoryError) -> Self {
+        StateStoreError::new(
+            StateStoreErrorKind::Corruption,
+            "table maintenance repository invariant failed",
+        )
+    }
+}
 
 type RepositoryResult<T> = Result<T, RepositoryError>;
 type TransactionResult<T> = Result<RepositoryResult<T>, StateStoreError>;
@@ -719,6 +756,26 @@ async fn apply_create(
             format!(
                 "create optimize job for {} failed: target has active metadata maintenance operation {operation_id}",
                 target_context(&request.target)
+            ),
+        )));
+    }
+    let shared_active_key = match shared_active_target_key(&request.target) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(active) = transaction.get(&shared_active_key).await? {
+        let fence: StoredSharedActiveFenceV3 =
+            match decode_rewrite_json(active.value.as_bytes(), "shared maintenance active fence") {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            format!(
+                "create optimize job for {} failed: target has active {:?} maintenance operation {}",
+                target_context(&request.target),
+                fence.family,
+                fence.operation_id
             ),
         )));
     }
@@ -2185,6 +2242,26 @@ async fn apply_metadata_create(
             ),
         )));
     }
+    let shared_active_key = match shared_active_target_key(&request.target) {
+        Ok(key) => key,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(active) = transaction.get(&shared_active_key).await? {
+        let fence: StoredSharedActiveFenceV3 =
+            match decode_rewrite_json(active.value.as_bytes(), "shared maintenance active fence") {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            format!(
+                "create metadata maintenance operation for {} failed: target has active {:?} maintenance operation {}",
+                target_context(&request.target),
+                fence.family,
+                fence.operation_id
+            ),
+        )));
+    }
     let active_key = match metadata_active_target_key(&request.target) {
         Ok(key) => key,
         Err(error) => return Ok(Err(error)),
@@ -3097,6 +3174,1365 @@ fn decode_uuid_index_value(value: &Value, context: &str) -> RepositoryResult<Uui
     }
     Uuid::parse_str(text)
         .map_err(|_| RepositoryError::corruption(format!("{context} index has invalid UUID")))
+}
+
+// -------------------------------------------------------------------------
+// V3 distributed rewrite durable repository.
+//
+// V3 intentionally has its own record namespace: changing the E1 v2 JSON
+// shape would make a merged recovery format needlessly risky.  The shared
+// fence below is the compatibility boundary between v1, v2, and v3.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SharedMaintenanceOperationFamilyV3 {
+    Optimize,
+    Metadata,
+    DistributedRewrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredSharedActiveFenceV3 {
+    schema_version: u8,
+    family: SharedMaintenanceOperationFamilyV3,
+    operation_id: Uuid,
+}
+
+#[derive(Clone)]
+pub struct DistributedRewriteOperationRepository {
+    store: Arc<dyn StateStore>,
+    metrics: Arc<StateStoreMetrics>,
+}
+
+impl fmt::Debug for DistributedRewriteOperationRepository {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DistributedRewriteOperationRepository")
+            .field("provider", &self.metrics.provider())
+            .finish_non_exhaustive()
+    }
+}
+
+/// SHA-256 v1 digest for bounded StateStore payloads and external artifact
+/// handles.  It is deliberately separate from provider and C1 digests.
+pub fn distributed_rewrite_payload_digest(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.distributed-rewrite.payload.v1\0");
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+impl DistributedRewriteOperationRepository {
+    pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
+        let repository = Self {
+            metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
+            store,
+        };
+        repository.list().await?;
+        Ok(repository)
+    }
+
+    pub async fn create(
+        &self,
+        request: DistributedRewriteOperationCreate,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_create(&request)?;
+        let transaction_operation_id = OperationId::new_v7();
+        let operation_id = request.operation_id;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "create frontend distributed rewrite operation",
+            |transaction| {
+                let request = request.clone();
+                Box::pin(async move {
+                    apply_rewrite_create(transaction, transaction_operation_id, request).await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            StoredDistributedRewriteTransactionActionV3::Create,
+            operation_id,
+            "create distributed rewrite operation",
+        )
+        .await
+    }
+
+    pub async fn plan(
+        &self,
+        operation_id: Uuid,
+        plan: DistributedRewritePlanPayload,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &plan.payload,
+            plan.payload_digest,
+            "distributed rewrite plan payload",
+        )?;
+        if plan.cohort_count as usize
+            > novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
+        {
+            return Err(RepositoryError::new(
+                RepositoryErrorKind::Store,
+                "distributed rewrite plan exceeds cohort limit",
+            ));
+        }
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Plan,
+            &[DistributedRewriteOperationState::Pending],
+            DistributedRewriteOperationState::Planned,
+            Some(RewriteTransitionPayload::Plan(plan)),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn start_staging(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::StartStaging,
+            &[DistributedRewriteOperationState::Planned],
+            DistributedRewriteOperationState::Staging,
+            None,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn checkpoint_attempt(
+        &self,
+        operation_id: Uuid,
+        checkpoint: DistributedRewriteAttemptCheckpoint,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_checkpoint(&checkpoint)?;
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Checkpoint,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::Staging,
+            None,
+            Some(checkpoint),
+            0,
+        )
+        .await
+    }
+
+    pub async fn mark_abort_pending(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::AbortPending,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::AbortPending,
+            None,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_commit_pending(
+        &self,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::CommitPending,
+            &[DistributedRewriteOperationState::Staging],
+            DistributedRewriteOperationState::CommitPending,
+            None,
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_reconcile_pending(
+        &self,
+        operation_id: Uuid,
+        evidence: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &evidence.payload,
+            evidence.digest,
+            "distributed rewrite evidence",
+        )?;
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::ReconcilePending,
+            &[DistributedRewriteOperationState::CommitPending],
+            DistributedRewriteOperationState::ReconcilePending,
+            Some(RewriteTransitionPayload::Evidence(evidence)),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn finish(
+        &self,
+        operation_id: Uuid,
+        receipt: DistributedRewriteOpaquePayload,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_payload(
+            &receipt.payload,
+            receipt.digest,
+            "distributed rewrite receipt",
+        )?;
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Finish,
+            &[
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::AbortPending,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+            ],
+            DistributedRewriteOperationState::Finished,
+            Some(RewriteTransitionPayload::Receipt(receipt)),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn fail(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Fail,
+            &[
+                DistributedRewriteOperationState::Pending,
+                DistributedRewriteOperationState::Planned,
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Failed,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn mark_unresolved(
+        &self,
+        operation_id: Uuid,
+        message: String,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        validate_rewrite_error(&message)?;
+        self.rewrite_transition(
+            operation_id,
+            StoredDistributedRewriteTransactionActionV3::Unresolve,
+            &[
+                DistributedRewriteOperationState::Staging,
+                DistributedRewriteOperationState::CommitPending,
+                DistributedRewriteOperationState::ReconcilePending,
+                DistributedRewriteOperationState::AbortPending,
+            ],
+            DistributedRewriteOperationState::Unresolved,
+            Some(RewriteTransitionPayload::Error(message)),
+            None,
+            now_ms,
+        )
+        .await
+    }
+
+    pub async fn get(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<DistributedRewriteOperation>> {
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!("begin distributed rewrite read failed: {e}"))
+        })?;
+        let result = load_rewrite_operation(transaction.as_mut(), operation_id)
+            .await
+            .map_err(|e| {
+                RepositoryError::store(format!("read distributed rewrite operation failed: {e}"))
+            })??;
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish distributed rewrite read failed: {e}"))
+        })?;
+        Ok(result.map(|item| DistributedRewriteOperation::from(&item.stored)))
+    }
+
+    pub async fn list(&self) -> RepositoryResult<Vec<DistributedRewriteOperation>> {
+        self.list_with_prefix(DISTRIBUTED_REWRITE_OPERATION_PREFIX, None)
+            .await
+    }
+
+    pub async fn list_recovery_candidates(
+        &self,
+    ) -> RepositoryResult<Vec<DistributedRewriteOperation>> {
+        let mut result = Vec::new();
+        for state in [
+            DistributedRewriteOperationState::Staging,
+            DistributedRewriteOperationState::AbortPending,
+            DistributedRewriteOperationState::CommitPending,
+            DistributedRewriteOperationState::ReconcilePending,
+        ] {
+            result.extend(
+                self.list_with_prefix(&rewrite_state_prefix(state), Some(state))
+                    .await?,
+            );
+        }
+        result.sort_by_key(|operation| operation.operation_id);
+        Ok(result)
+    }
+
+    pub async fn load_plan(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Option<DistributedRewritePlanPayload>> {
+        let Some(payload) = self
+            .load_payload(operation_id, StoredDistributedRewritePayloadKindV3::Plan)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(operation) = self.get(operation_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(DistributedRewritePlanPayload {
+            plan_digest: operation.plan_digest.ok_or_else(|| {
+                RepositoryError::corruption("distributed rewrite plan has no digest")
+            })?,
+            manifest_digest: operation.manifest_digest.ok_or_else(|| {
+                RepositoryError::corruption("distributed rewrite plan has no manifest digest")
+            })?,
+            cohort_set_digest: operation.cohort_set_digest.ok_or_else(|| {
+                RepositoryError::corruption("distributed rewrite plan has no cohort set digest")
+            })?,
+            payload_digest: payload.digest,
+            payload: payload.payload,
+            cohort_count: operation.cohort_count.ok_or_else(|| {
+                RepositoryError::corruption("distributed rewrite plan has no cohort count")
+            })?,
+        }))
+    }
+
+    pub async fn load_attempts(
+        &self,
+        operation_id: Uuid,
+    ) -> RepositoryResult<Vec<DistributedRewriteAttemptCheckpoint>> {
+        let prefix = make_key(
+            format!("{DISTRIBUTED_REWRITE_ATTEMPT_PREFIX}{operation_id}/"),
+            "build distributed rewrite attempt range",
+        )?;
+        let range = KeyRange::for_prefix(prefix).map_err(|e| {
+            RepositoryError::store(format!(
+                "build distributed rewrite attempt range failed: {e}"
+            ))
+        })?;
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!(
+                "begin distributed rewrite attempt list failed: {e}"
+            ))
+        })?;
+        let mut request = RangeRequest {
+            range,
+            direction: Direction::Forward,
+            page_size: self.store.limits().max_page_size,
+            continuation: None,
+        };
+        let mut checkpoints = Vec::new();
+        loop {
+            let page = transaction.range(&request).await.map_err(|e| {
+                RepositoryError::store(format!("list distributed rewrite attempts failed: {e}"))
+            })?;
+            for record in page.records {
+                checkpoints.push(decode_rewrite_attempt(record)?.into_checkpoint());
+            }
+            let Some(next) = page.continuation else { break };
+            request.continuation = Some(next);
+        }
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!(
+                "finish distributed rewrite attempt list failed: {e}"
+            ))
+        })?;
+        checkpoints
+            .sort_by(|a, b| (a.cohort_id, &a.execution_id).cmp(&(b.cohort_id, &b.execution_id)));
+        Ok(checkpoints)
+    }
+
+    async fn load_payload(
+        &self,
+        operation_id: Uuid,
+        kind: StoredDistributedRewritePayloadKindV3,
+    ) -> RepositoryResult<Option<DistributedRewriteOpaquePayload>> {
+        let key = rewrite_payload_key(operation_id, kind)?;
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!(
+                "begin distributed rewrite payload read failed: {e}"
+            ))
+        })?;
+        let record = transaction.get(&key).await.map_err(|e| {
+            RepositoryError::store(format!("read distributed rewrite payload failed: {e}"))
+        })?;
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!(
+                "finish distributed rewrite payload read failed: {e}"
+            ))
+        })?;
+        record.map(decode_rewrite_payload).transpose().map(|item| {
+            item.map(|payload| DistributedRewriteOpaquePayload {
+                digest: payload.digest,
+                payload: payload.payload,
+            })
+        })
+    }
+
+    async fn list_with_prefix(
+        &self,
+        prefix_text: &str,
+        expected_state: Option<DistributedRewriteOperationState>,
+    ) -> RepositoryResult<Vec<DistributedRewriteOperation>> {
+        let prefix = make_key(prefix_text, "build distributed rewrite range")?;
+        let range = KeyRange::for_prefix(prefix).map_err(|e| {
+            RepositoryError::store(format!("build distributed rewrite range failed: {e}"))
+        })?;
+        let mut transaction = self.store.begin_read().await.map_err(|e| {
+            RepositoryError::store(format!("begin distributed rewrite list failed: {e}"))
+        })?;
+        let mut request = RangeRequest {
+            range,
+            direction: Direction::Forward,
+            page_size: self.store.limits().max_page_size,
+            continuation: None,
+        };
+        let mut result = Vec::new();
+        loop {
+            let page = transaction.range(&request).await.map_err(|e| {
+                RepositoryError::store(format!("list distributed rewrite operations failed: {e}"))
+            })?;
+            for record in page.records {
+                let stored = if expected_state.is_some() {
+                    let id = decode_uuid_index_key(
+                        prefix_text,
+                        &record.key,
+                        "distributed rewrite state",
+                    )?;
+                    let id_value =
+                        decode_uuid_index_value(&record.value, "distributed rewrite state")?;
+                    if id != id_value {
+                        return Err(RepositoryError::corruption(
+                            "distributed rewrite state index identity mismatch",
+                        ));
+                    }
+                    load_rewrite_operation(transaction.as_mut(), id)
+                        .await
+                        .map_err(|e| {
+                            RepositoryError::store(format!(
+                                "load distributed rewrite state operation failed: {e}"
+                            ))
+                        })??
+                        .ok_or_else(|| {
+                            RepositoryError::corruption(
+                                "distributed rewrite state index references missing operation",
+                            )
+                        })?
+                        .stored
+                } else {
+                    decode_rewrite_operation(record)?
+                };
+                if expected_state.is_some_and(|state| stored.state != state) {
+                    return Err(RepositoryError::corruption(
+                        "distributed rewrite state index references wrong state",
+                    ));
+                }
+                result.push(DistributedRewriteOperation::from(&stored));
+            }
+            let Some(next) = page.continuation else { break };
+            request.continuation = Some(next);
+        }
+        transaction.abort().await.map_err(|e| {
+            RepositoryError::store(format!("finish distributed rewrite list failed: {e}"))
+        })?;
+        result.sort_by_key(|operation| operation.operation_id);
+        Ok(result)
+    }
+
+    async fn rewrite_transition(
+        &self,
+        operation_id: Uuid,
+        action: StoredDistributedRewriteTransactionActionV3,
+        allowed: &[DistributedRewriteOperationState],
+        next: DistributedRewriteOperationState,
+        payload: Option<RewriteTransitionPayload>,
+        checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
+        now_ms: i64,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        let transaction_operation_id = OperationId::new_v7();
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            transaction_operation_id,
+            "transition frontend distributed rewrite operation",
+            |transaction| {
+                let payload = payload.clone();
+                let checkpoint = checkpoint.clone();
+                let allowed = allowed.to_vec();
+                Box::pin(async move {
+                    apply_rewrite_transition(
+                        transaction,
+                        transaction_operation_id,
+                        operation_id,
+                        action,
+                        &allowed,
+                        next,
+                        payload,
+                        checkpoint,
+                        now_ms,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        self.resolve_rewrite_result(
+            result,
+            transaction_operation_id,
+            action,
+            operation_id,
+            "transition distributed rewrite operation",
+        )
+        .await
+    }
+
+    async fn resolve_rewrite_result(
+        &self,
+        result: Result<
+            novarocks_state_store::RunSuccess<RepositoryResult<DistributedRewriteOperation>>,
+            RunFailure,
+        >,
+        _transaction_operation_id: OperationId,
+        _action: StoredDistributedRewriteTransactionActionV3,
+        _operation_id: Uuid,
+        context: &str,
+    ) -> RepositoryResult<DistributedRewriteOperation> {
+        match result {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown { error, .. }) => Err(RepositoryError::new(
+                RepositoryErrorKind::CommitUnknown,
+                format!("{context} commit outcome is unknown: {error}"),
+            )),
+            Err(failure) => Err(format_run_failure(context, failure)),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RewriteTransitionPayload {
+    Plan(DistributedRewritePlanPayload),
+    Evidence(DistributedRewriteOpaquePayload),
+    Receipt(DistributedRewriteOpaquePayload),
+    Error(String),
+}
+
+struct VersionedStoredRewriteOperation {
+    stored: StoredDistributedRewriteOperationV3,
+    version: VersionToken,
+}
+
+impl StoredDistributedRewriteAttemptV3 {
+    fn into_checkpoint(self) -> DistributedRewriteAttemptCheckpoint {
+        DistributedRewriteAttemptCheckpoint {
+            cohort_id: self.cohort_id,
+            execution_id: ConnectorWriteExecutionId::new(
+                self.execution_query_id,
+                self.execution_attempt_id,
+            ),
+            disposition: self.disposition,
+            attempt_digest: self.attempt_digest,
+            artifact_digest: self.artifact_digest,
+            artifact_handle: self.artifact_handle,
+            checkpoint_digest: self.checkpoint_digest,
+        }
+    }
+}
+
+async fn apply_rewrite_create(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    request: DistributedRewriteOperationCreate,
+) -> TransactionResult<DistributedRewriteOperation> {
+    if let Err(error) = validate_rewrite_create(&request) {
+        return Ok(Err(error));
+    }
+    let existing = match load_rewrite_operation(transaction, request.operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(existing) = existing {
+        if existing.stored.target == StoredMaintenanceTargetV1::from(&request.target)
+            && existing.stored.owner == request.owner
+            && existing.stored.kind == request.kind
+            && existing.stored.request_digest == request.request_digest
+            && existing.stored.base_state_digest == request.base_state_digest
+            && existing.stored.request_payload_digest == request.request_payload_digest
+            && rewrite_payload_matches(
+                transaction,
+                request.operation_id,
+                StoredDistributedRewritePayloadKindV3::Request,
+                request.request_payload_digest,
+                &request.request_payload,
+            )
+            .await?
+        {
+            return Ok(Ok(DistributedRewriteOperation::from(&existing.stored)));
+        }
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            "distributed rewrite operation conflicts with its durable request",
+        )));
+    }
+    if transaction
+        .get(&active_target_key(&request.target)?)
+        .await?
+        .is_some()
+    {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            "distributed rewrite target has active optimize job",
+        )));
+    }
+    if transaction
+        .get(&metadata_active_target_key(&request.target)?)
+        .await?
+        .is_some()
+    {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            "distributed rewrite target has active metadata maintenance operation",
+        )));
+    }
+    let shared_key = shared_active_target_key(&request.target)?;
+    if transaction.get(&shared_key).await?.is_some() {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::AlreadyActive,
+            "distributed rewrite target has active shared maintenance operation",
+        )));
+    }
+    let stored = StoredDistributedRewriteOperationV3 {
+        schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+        operation_id: request.operation_id,
+        target: StoredMaintenanceTargetV1::from(&request.target),
+        owner: request.owner,
+        kind: request.kind,
+        request_digest: request.request_digest,
+        base_state_digest: request.base_state_digest,
+        request_payload_digest: request.request_payload_digest,
+        plan_digest: None,
+        manifest_digest: None,
+        cohort_set_digest: None,
+        cohort_count: None,
+        state: DistributedRewriteOperationState::Pending,
+        error_message: None,
+        created_at_ms: request.created_at_ms,
+        started_at_ms: None,
+        finished_at_ms: None,
+    };
+    let operation_key = rewrite_operation_key(request.operation_id)?;
+    let pending_key = rewrite_state_key(
+        DistributedRewriteOperationState::Pending,
+        request.operation_id,
+    )?;
+    let request_key = rewrite_payload_key(
+        request.operation_id,
+        StoredDistributedRewritePayloadKindV3::Request,
+    )?;
+    let index_value = encode_uuid_index_value(request.operation_id)?;
+    let shared_value = encode_rewrite_json(
+        &StoredSharedActiveFenceV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            family: SharedMaintenanceOperationFamilyV3::DistributedRewrite,
+            operation_id: request.operation_id,
+        },
+        "shared maintenance active fence",
+    )?;
+    let (marker_key, marker_value) = rewrite_transaction_record(
+        transaction_operation_id,
+        StoredDistributedRewriteTransactionActionV3::Create,
+        &stored,
+    )?;
+    transaction
+        .put(
+            operation_key,
+            encode_rewrite_operation(&stored)?,
+            Precondition::Absent,
+        )
+        .await?;
+    transaction
+        .put(
+            request_key,
+            encode_rewrite_payload(
+                StoredDistributedRewritePayloadKindV3::Request,
+                request.request_payload_digest,
+                request.request_payload,
+            )?,
+            Precondition::Absent,
+        )
+        .await?;
+    transaction
+        .put(pending_key, index_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(shared_key, shared_value, Precondition::Absent)
+        .await?;
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(DistributedRewriteOperation::from(&stored)))
+}
+
+async fn apply_rewrite_transition(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    operation_id: Uuid,
+    action: StoredDistributedRewriteTransactionActionV3,
+    allowed: &[DistributedRewriteOperationState],
+    next: DistributedRewriteOperationState,
+    payload: Option<RewriteTransitionPayload>,
+    checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
+    now_ms: i64,
+) -> TransactionResult<DistributedRewriteOperation> {
+    let loaded = match load_rewrite_operation(transaction, operation_id).await? {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(mut operation) = loaded else {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::NotFound,
+            format!("distributed rewrite operation {operation_id} not found"),
+        )));
+    };
+    if operation.stored.state == next {
+        if let Some(RewriteTransitionPayload::Plan(plan)) = &payload {
+            if operation.stored.plan_digest == Some(plan.plan_digest)
+                && rewrite_payload_matches(
+                    transaction,
+                    operation_id,
+                    StoredDistributedRewritePayloadKindV3::Plan,
+                    plan.payload_digest,
+                    &plan.payload,
+                )
+                .await?
+            {
+                return Ok(Ok(DistributedRewriteOperation::from(&operation.stored)));
+            }
+        } else if checkpoint.is_none() {
+            return Ok(Ok(DistributedRewriteOperation::from(&operation.stored)));
+        }
+    }
+    if !allowed.contains(&operation.stored.state) {
+        return Ok(Err(RepositoryError::new(
+            RepositoryErrorKind::InvalidTransition,
+            format!(
+                "distributed rewrite operation {operation_id} cannot transition from {:?}",
+                operation.stored.state
+            ),
+        )));
+    }
+    let prior = operation.stored.state;
+    if let Err(error) = require_rewrite_state_and_active(
+        transaction,
+        &operation.stored,
+        prior,
+        "transition distributed rewrite operation",
+    )
+    .await?
+    {
+        return Ok(Err(error));
+    }
+    let mut extra = None;
+    match payload {
+        Some(RewriteTransitionPayload::Plan(plan)) => {
+            operation.stored.plan_digest = Some(plan.plan_digest);
+            operation.stored.manifest_digest = Some(plan.manifest_digest);
+            operation.stored.cohort_set_digest = Some(plan.cohort_set_digest);
+            operation.stored.cohort_count = Some(plan.cohort_count);
+            operation.stored.started_at_ms = Some(now_ms);
+            extra = Some((
+                rewrite_payload_key(operation_id, StoredDistributedRewritePayloadKindV3::Plan)?,
+                encode_rewrite_payload(
+                    StoredDistributedRewritePayloadKindV3::Plan,
+                    plan.payload_digest,
+                    plan.payload,
+                )?,
+            ));
+        }
+        Some(RewriteTransitionPayload::Evidence(evidence)) => {
+            extra = Some((
+                rewrite_payload_key(
+                    operation_id,
+                    StoredDistributedRewritePayloadKindV3::Evidence,
+                )?,
+                encode_rewrite_payload(
+                    StoredDistributedRewritePayloadKindV3::Evidence,
+                    evidence.digest,
+                    evidence.payload,
+                )?,
+            ))
+        }
+        Some(RewriteTransitionPayload::Receipt(receipt)) => {
+            extra = Some((
+                rewrite_payload_key(operation_id, StoredDistributedRewritePayloadKindV3::Receipt)?,
+                encode_rewrite_payload(
+                    StoredDistributedRewritePayloadKindV3::Receipt,
+                    receipt.digest,
+                    receipt.payload,
+                )?,
+            ))
+        }
+        Some(RewriteTransitionPayload::Error(message)) => {
+            operation.stored.error_message = Some(message);
+            operation.stored.finished_at_ms = Some(now_ms);
+        }
+        None => {}
+    }
+    if next == DistributedRewriteOperationState::Finished {
+        operation.stored.finished_at_ms = Some(now_ms);
+    }
+    if next == DistributedRewriteOperationState::AbortPending
+        || next == DistributedRewriteOperationState::CommitPending
+        || next == DistributedRewriteOperationState::ReconcilePending
+        || next == DistributedRewriteOperationState::Staging
+    {
+        if operation.stored.started_at_ms.is_none() {
+            return Ok(Err(RepositoryError::corruption(
+                "active distributed rewrite operation has no durable plan",
+            )));
+        }
+    }
+    operation.stored.state = next;
+    rewrite_transition_state(
+        transaction,
+        transaction_operation_id,
+        action,
+        operation,
+        prior,
+        next,
+        extra,
+        checkpoint,
+    )
+    .await
+}
+
+async fn rewrite_transition_state(
+    transaction: &mut dyn WriteTransaction,
+    transaction_operation_id: OperationId,
+    action: StoredDistributedRewriteTransactionActionV3,
+    operation: VersionedStoredRewriteOperation,
+    prior: DistributedRewriteOperationState,
+    next: DistributedRewriteOperationState,
+    payload: Option<(Key, Value)>,
+    checkpoint: Option<DistributedRewriteAttemptCheckpoint>,
+) -> TransactionResult<DistributedRewriteOperation> {
+    let operation_id = operation.stored.operation_id;
+    let operation_key = rewrite_operation_key(operation_id)?;
+    let old_state_key = rewrite_state_key(prior, operation_id)?;
+    let next_state_key = rewrite_state_key(next, operation_id)?;
+    let (marker_key, marker_value) =
+        rewrite_transaction_record(transaction_operation_id, action, &operation.stored)?;
+    transaction
+        .put(
+            operation_key,
+            encode_rewrite_operation(&operation.stored)?,
+            Precondition::Version(operation.version),
+        )
+        .await?;
+    if prior != next {
+        transaction
+            .delete(old_state_key, Precondition::Present)
+            .await?;
+        transaction
+            .put(
+                next_state_key,
+                encode_uuid_index_value(operation_id)?,
+                Precondition::Absent,
+            )
+            .await?;
+    }
+    if let Some((key, value)) = payload {
+        transaction.put(key, value, Precondition::Absent).await?;
+    }
+    if let Some(checkpoint) = checkpoint {
+        let key = rewrite_attempt_key(operation_id, checkpoint.cohort_id, checkpoint.execution_id)?;
+        let stored = StoredDistributedRewriteAttemptV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            operation_id,
+            cohort_id: checkpoint.cohort_id,
+            execution_query_id: checkpoint.execution_id.query_id(),
+            execution_attempt_id: checkpoint.execution_id.attempt_id(),
+            disposition: checkpoint.disposition,
+            attempt_digest: checkpoint.attempt_digest,
+            artifact_digest: checkpoint.artifact_digest,
+            artifact_handle: checkpoint.artifact_handle,
+            checkpoint_digest: checkpoint.checkpoint_digest,
+        };
+        transaction
+            .put(
+                key,
+                encode_rewrite_json(&stored, "distributed rewrite attempt")?,
+                Precondition::Absent,
+            )
+            .await?;
+    }
+    if next.is_terminal() {
+        transaction
+            .delete(
+                shared_active_target_key(&operation.stored.target.clone().into())?,
+                Precondition::Present,
+            )
+            .await?;
+    }
+    transaction
+        .put(marker_key, marker_value, Precondition::Absent)
+        .await?;
+    Ok(Ok(DistributedRewriteOperation::from(&operation.stored)))
+}
+
+async fn load_rewrite_operation(
+    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    operation_id: Uuid,
+) -> TransactionResult<Option<VersionedStoredRewriteOperation>> {
+    let key = rewrite_operation_key(operation_id)?;
+    let Some(record) = transaction.get(&key).await? else {
+        return Ok(Ok(None));
+    };
+    let version = record.version.clone();
+    let stored = decode_rewrite_operation(record)?;
+    Ok(Ok(Some(VersionedStoredRewriteOperation {
+        stored,
+        version,
+    })))
+}
+
+async fn require_rewrite_state_and_active(
+    transaction: &mut dyn WriteTransaction,
+    operation: &StoredDistributedRewriteOperationV3,
+    expected: DistributedRewriteOperationState,
+    context: &str,
+) -> TransactionResult<()> {
+    let key = rewrite_state_key(expected, operation.operation_id)?;
+    let Some(index) = transaction.get(&key).await? else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: state index missing"
+        ))));
+    };
+    if decode_uuid_index_value(&index.value, "distributed rewrite state")? != operation.operation_id
+    {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: state index mismatch"
+        ))));
+    }
+    let active_key = shared_active_target_key(&operation.target.clone().into())?;
+    let Some(active) = transaction.get(&active_key).await? else {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: shared active fence missing"
+        ))));
+    };
+    let decoded: StoredSharedActiveFenceV3 =
+        decode_rewrite_json(active.value.as_bytes(), "shared maintenance active fence")?;
+    if decoded.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION
+        || decoded.family != SharedMaintenanceOperationFamilyV3::DistributedRewrite
+        || decoded.operation_id != operation.operation_id
+    {
+        return Ok(Err(RepositoryError::corruption(format!(
+            "{context}: shared active fence mismatch"
+        ))));
+    }
+    Ok(Ok(()))
+}
+
+async fn rewrite_payload_matches(
+    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    operation_id: Uuid,
+    kind: StoredDistributedRewritePayloadKindV3,
+    digest: [u8; 32],
+    payload: &[u8],
+) -> Result<bool, StateStoreError> {
+    let key = rewrite_payload_key(operation_id, kind).map_err(repository_error_as_store)?;
+    let Some(record) = transaction.get(&key).await? else {
+        return Ok(false);
+    };
+    let stored = decode_rewrite_payload(record).map_err(repository_error_as_store)?;
+    Ok(stored.digest == digest && stored.payload == payload)
+}
+
+fn validate_rewrite_create(request: &DistributedRewriteOperationCreate) -> RepositoryResult<()> {
+    validate_metadata_target(&request.target)?;
+    validate_metadata_owner(&request.owner)?;
+    validate_rewrite_payload(
+        &request.request_payload,
+        request.request_payload_digest,
+        "distributed rewrite request payload",
+    )
+}
+
+fn validate_rewrite_checkpoint(
+    checkpoint: &DistributedRewriteAttemptCheckpoint,
+) -> RepositoryResult<()> {
+    if checkpoint.artifact_handle.len() > DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            "distributed rewrite checkpoint artifact handle exceeds StateStore payload limit",
+        ));
+    }
+    let disposition = match checkpoint.disposition {
+        DistributedRewriteAttemptDisposition::Accepted => SpiRewriteDisposition::Accepted,
+        DistributedRewriteAttemptDisposition::Superseded => SpiRewriteDisposition::Superseded,
+    };
+    let expected = SpiRewriteCheckpoint::try_new(
+        ConnectorWriteCohortId::from_bytes(checkpoint.cohort_id),
+        checkpoint.execution_id,
+        disposition,
+        checkpoint.attempt_digest,
+        checkpoint.artifact_digest,
+        Bytes::copy_from_slice(&checkpoint.artifact_handle),
+    )
+    .map_err(|error| {
+        RepositoryError::corruption(format!(
+            "distributed rewrite checkpoint is invalid: {error}"
+        ))
+    })?;
+    if expected.checkpoint_digest != checkpoint.checkpoint_digest {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite checkpoint digest does not match durable fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rewrite_payload(
+    payload: &[u8],
+    digest: [u8; 32],
+    context: &str,
+) -> RepositoryResult<()> {
+    if payload.len() > DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!(
+                "{context} exceeds {DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES} byte StateStore payload limit"
+            ),
+        ));
+    }
+    if distributed_rewrite_payload_digest(payload) != digest {
+        return Err(RepositoryError::corruption(format!(
+            "{context} digest does not match payload"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_rewrite_error(message: &str) -> RepositoryResult<()> {
+    if message.is_empty() || message.len() > 8 * 1024 || message.contains('\0') {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite error message is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rewrite_operation(
+    stored: &StoredDistributedRewriteOperationV3,
+) -> RepositoryResult<()> {
+    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite operation has unsupported schema version",
+        ));
+    }
+    validate_metadata_target(&stored.target.clone().into())?;
+    validate_metadata_owner(&stored.owner)?;
+    let planned = stored.plan_digest.is_some()
+        && stored.manifest_digest.is_some()
+        && stored.cohort_set_digest.is_some()
+        && stored.cohort_count.is_some();
+    match stored.state {
+        DistributedRewriteOperationState::Pending => {
+            if planned
+                || stored.started_at_ms.is_some()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "pending distributed rewrite operation has lifecycle fields",
+                ));
+            }
+        }
+        DistributedRewriteOperationState::Planned
+        | DistributedRewriteOperationState::Staging
+        | DistributedRewriteOperationState::AbortPending
+        | DistributedRewriteOperationState::CommitPending
+        | DistributedRewriteOperationState::ReconcilePending => {
+            if !planned
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_some()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "active distributed rewrite operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        DistributedRewriteOperationState::Finished => {
+            if !planned
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_some()
+            {
+                return Err(RepositoryError::corruption(
+                    "finished distributed rewrite operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        DistributedRewriteOperationState::Failed => {
+            if stored.finished_at_ms.is_none() || stored.error_message.is_none() {
+                return Err(RepositoryError::corruption(
+                    "failed distributed rewrite operation has invalid lifecycle fields",
+                ));
+            }
+        }
+        DistributedRewriteOperationState::Unresolved => {
+            if !planned
+                || stored.started_at_ms.is_none()
+                || stored.finished_at_ms.is_none()
+                || stored.error_message.is_none()
+            {
+                return Err(RepositoryError::corruption(
+                    "unresolved distributed rewrite operation has invalid lifecycle fields",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_rewrite_operation(
+    stored: &StoredDistributedRewriteOperationV3,
+) -> RepositoryResult<Value> {
+    validate_rewrite_operation(stored)?;
+    encode_rewrite_json(stored, "distributed rewrite operation")
+}
+fn decode_rewrite_operation(
+    record: StateRecord,
+) -> RepositoryResult<StoredDistributedRewriteOperationV3> {
+    let key_id = decode_uuid_index_key(
+        DISTRIBUTED_REWRITE_OPERATION_PREFIX,
+        &record.key,
+        "distributed rewrite operation",
+    )?;
+    let stored: StoredDistributedRewriteOperationV3 =
+        decode_rewrite_json(record.value.as_bytes(), "distributed rewrite operation")?;
+    validate_rewrite_operation(&stored)?;
+    if stored.operation_id != key_id {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite operation identity mismatch",
+        ));
+    }
+    Ok(stored)
+}
+fn encode_rewrite_payload(
+    kind: StoredDistributedRewritePayloadKindV3,
+    digest: [u8; 32],
+    payload: Vec<u8>,
+) -> RepositoryResult<Value> {
+    validate_rewrite_payload(&payload, digest, "distributed rewrite payload")?;
+    encode_rewrite_json(
+        &StoredDistributedRewritePayloadV3 {
+            schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+            kind,
+            digest,
+            payload,
+        },
+        "distributed rewrite payload",
+    )
+}
+fn decode_rewrite_payload(
+    record: StateRecord,
+) -> RepositoryResult<StoredDistributedRewritePayloadV3> {
+    let stored: StoredDistributedRewritePayloadV3 =
+        decode_rewrite_json(record.value.as_bytes(), "distributed rewrite payload")?;
+    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite payload has unsupported schema version",
+        ));
+    }
+    validate_rewrite_payload(
+        &stored.payload,
+        stored.digest,
+        "distributed rewrite payload",
+    )?;
+    Ok(stored)
+}
+fn decode_rewrite_attempt(
+    record: StateRecord,
+) -> RepositoryResult<StoredDistributedRewriteAttemptV3> {
+    let stored: StoredDistributedRewriteAttemptV3 =
+        decode_rewrite_json(record.value.as_bytes(), "distributed rewrite attempt")?;
+    if stored.schema_version != DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION {
+        return Err(RepositoryError::corruption(
+            "distributed rewrite attempt has unsupported schema version",
+        ));
+    }
+    validate_rewrite_checkpoint(&DistributedRewriteAttemptCheckpoint {
+        cohort_id: stored.cohort_id,
+        execution_id: ConnectorWriteExecutionId::new(
+            stored.execution_query_id,
+            stored.execution_attempt_id,
+        ),
+        disposition: stored.disposition,
+        attempt_digest: stored.attempt_digest,
+        artifact_digest: stored.artifact_digest,
+        artifact_handle: stored.artifact_handle.clone(),
+        checkpoint_digest: stored.checkpoint_digest,
+    })?;
+    Ok(stored)
+}
+fn encode_rewrite_json<T: Serialize>(value: &T, context: &str) -> RepositoryResult<Value> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| RepositoryError::corruption(format!("encode {context} failed: {e}")))?;
+    if bytes.len() > DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Store,
+            format!("encode {context} exceeds StateStore payload limit"),
+        ));
+    }
+    Value::try_from(Bytes::from(bytes))
+        .map_err(|e| RepositoryError::store(format!("encode {context} failed: {e}")))
+}
+fn decode_rewrite_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let decoded: T = serde_json::from_slice(bytes)
+        .map_err(|e| RepositoryError::corruption(format!("decode {context} failed: {e}")))?;
+    let canonical = serde_json::to_vec(&decoded)
+        .map_err(|e| RepositoryError::corruption(format!("re-encode {context} failed: {e}")))?;
+    if canonical != bytes {
+        return Err(RepositoryError::corruption(format!(
+            "decode {context} failed: non-canonical JSON"
+        )));
+    }
+    Ok(decoded)
+}
+fn rewrite_transaction_record(
+    transaction_operation_id: OperationId,
+    action: StoredDistributedRewriteTransactionActionV3,
+    post_operation: &StoredDistributedRewriteOperationV3,
+) -> RepositoryResult<(Key, Value)> {
+    let marker = StoredDistributedRewriteTransactionV3 {
+        schema_version: DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION,
+        transaction_operation_id: *transaction_operation_id.as_uuid(),
+        action,
+        operation_id: post_operation.operation_id,
+        post_operation: post_operation.clone(),
+    };
+    Ok((
+        rewrite_transaction_key(transaction_operation_id)?,
+        encode_rewrite_json(&marker, "distributed rewrite transaction marker")?,
+    ))
+}
+fn rewrite_operation_key(operation_id: Uuid) -> RepositoryResult<Key> {
+    make_key(
+        format!("{DISTRIBUTED_REWRITE_OPERATION_PREFIX}{operation_id}"),
+        "build distributed rewrite operation key",
+    )
+}
+fn rewrite_payload_key(
+    operation_id: Uuid,
+    kind: StoredDistributedRewritePayloadKindV3,
+) -> RepositoryResult<Key> {
+    let name = match kind {
+        StoredDistributedRewritePayloadKindV3::Request => "request",
+        StoredDistributedRewritePayloadKindV3::Plan => "plan",
+        StoredDistributedRewritePayloadKindV3::Receipt => "receipt",
+        StoredDistributedRewritePayloadKindV3::Evidence => "evidence",
+    };
+    make_key(
+        format!("{DISTRIBUTED_REWRITE_PAYLOAD_PREFIX}{operation_id}/{name}"),
+        "build distributed rewrite payload key",
+    )
+}
+fn rewrite_attempt_key(
+    operation_id: Uuid,
+    cohort_id: [u8; 32],
+    execution_id: ConnectorWriteExecutionId,
+) -> RepositoryResult<Key> {
+    make_key(
+        format!(
+            "{DISTRIBUTED_REWRITE_ATTEMPT_PREFIX}{operation_id}/{}/{}/{}",
+            hex::encode(cohort_id),
+            hex::encode(execution_id.query_id()),
+            execution_id.attempt_id(),
+        ),
+        "build distributed rewrite attempt key",
+    )
+}
+fn rewrite_state_prefix(state: DistributedRewriteOperationState) -> String {
+    format!(
+        "{DISTRIBUTED_REWRITE_STATE_PREFIX}{}/",
+        state.as_key_component()
+    )
+}
+fn rewrite_state_key(
+    state: DistributedRewriteOperationState,
+    operation_id: Uuid,
+) -> RepositoryResult<Key> {
+    make_key(
+        format!("{}{operation_id}", rewrite_state_prefix(state)),
+        "build distributed rewrite state key",
+    )
+}
+fn rewrite_transaction_key(transaction_operation_id: OperationId) -> RepositoryResult<Key> {
+    make_key(
+        format!(
+            "{DISTRIBUTED_REWRITE_TRANSACTION_PREFIX}{}",
+            transaction_operation_id.as_uuid()
+        ),
+        "build distributed rewrite transaction key",
+    )
+}
+fn shared_active_target_key(target: &MaintenanceTarget) -> RepositoryResult<Key> {
+    make_key(
+        format!(
+            "{SHARED_ACTIVE_PREFIX}{}/{}/{}",
+            hex::encode(target.catalog.as_bytes()),
+            hex::encode(target.namespace.as_bytes()),
+            hex::encode(target.table.as_bytes())
+        ),
+        "build shared maintenance active key",
+    )
 }
 
 fn decode_uuid_index_key(

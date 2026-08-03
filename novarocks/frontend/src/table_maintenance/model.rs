@@ -16,12 +16,18 @@
 // under the License.
 
 use novarocks::engine::table_maintenance::{MaintenanceTarget, OptimizeJobState};
+use novarocks_spi::connector::ConnectorWriteExecutionId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const OPTIMIZE_JOB_SCHEMA_VERSION: u8 = 1;
 pub const METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION: u8 = 2;
 pub const METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+/// E2 stores only bounded, credential-free handles in StateStore.  The
+/// provider-owned immutable manifest and reports live in object storage.
+pub const DISTRIBUTED_REWRITE_OPERATION_SCHEMA_VERSION: u8 = 3;
+pub const DISTRIBUTED_REWRITE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const DISTRIBUTED_REWRITE_MAX_ATTEMPT_HANDLE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobCreate {
@@ -368,6 +374,218 @@ impl From<&StoredMetadataMaintenanceOperationV2> for MetadataMaintenanceOperatio
             base_state_digest: value.base_state_digest,
             plan_digest: value.plan_digest,
             plan_summary: value.plan_summary,
+            state: value.state,
+            error_message: value.error_message.clone(),
+            created_at_ms: value.created_at_ms,
+            started_at_ms: value.started_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
+}
+
+/// Durable frontend state for a C1-backed connector rewrite operation.  The
+/// record deliberately contains digests and bounded artifact handles only;
+/// it never persists an Iceberg file list, credentials, or writer report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DistributedRewriteOperationKind {
+    RewriteDataFiles,
+    RewritePositionDeleteFiles,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DistributedRewriteOperationState {
+    Pending,
+    Planned,
+    Staging,
+    AbortPending,
+    CommitPending,
+    ReconcilePending,
+    Finished,
+    Failed,
+    Unresolved,
+}
+
+impl DistributedRewriteOperationState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Failed)
+    }
+
+    pub const fn holds_active_fence(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub const fn as_key_component(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Planned => "planned",
+            Self::Staging => "staging",
+            Self::AbortPending => "abort-pending",
+            Self::CommitPending => "commit-pending",
+            Self::ReconcilePending => "reconcile-pending",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedRewriteOperationCreate {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: DistributedRewriteOperationKind,
+    pub request_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub request_payload_digest: [u8; 32],
+    pub request_payload: Vec<u8>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedRewritePlanPayload {
+    pub plan_digest: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub cohort_set_digest: [u8; 32],
+    pub payload_digest: [u8; 32],
+    pub payload: Vec<u8>,
+    pub cohort_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedRewriteOpaquePayload {
+    pub digest: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DistributedRewriteAttemptDisposition {
+    Accepted,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedRewriteAttemptCheckpoint {
+    pub cohort_id: [u8; 32],
+    pub execution_id: ConnectorWriteExecutionId,
+    pub disposition: DistributedRewriteAttemptDisposition,
+    pub attempt_digest: [u8; 32],
+    pub artifact_digest: [u8; 32],
+    pub artifact_handle: Vec<u8>,
+    pub checkpoint_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DistributedRewriteOperation {
+    pub operation_id: Uuid,
+    pub target: MaintenanceTarget,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: DistributedRewriteOperationKind,
+    pub request_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub plan_digest: Option<[u8; 32]>,
+    pub manifest_digest: Option<[u8; 32]>,
+    pub cohort_set_digest: Option<[u8; 32]>,
+    pub cohort_count: Option<u32>,
+    pub state: DistributedRewriteOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredDistributedRewriteOperationV3 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub target: StoredMaintenanceTargetV1,
+    pub owner: MetadataMaintenanceExactOwner,
+    pub kind: DistributedRewriteOperationKind,
+    pub request_digest: [u8; 32],
+    pub base_state_digest: [u8; 32],
+    pub request_payload_digest: [u8; 32],
+    pub plan_digest: Option<[u8; 32]>,
+    pub manifest_digest: Option<[u8; 32]>,
+    pub cohort_set_digest: Option<[u8; 32]>,
+    pub cohort_count: Option<u32>,
+    pub state: DistributedRewriteOperationState,
+    pub error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StoredDistributedRewritePayloadKindV3 {
+    Request,
+    Plan,
+    Receipt,
+    Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredDistributedRewritePayloadV3 {
+    pub schema_version: u8,
+    pub kind: StoredDistributedRewritePayloadKindV3,
+    pub digest: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredDistributedRewriteAttemptV3 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub cohort_id: [u8; 32],
+    pub execution_query_id: [u8; 16],
+    pub execution_attempt_id: u64,
+    pub disposition: DistributedRewriteAttemptDisposition,
+    pub attempt_digest: [u8; 32],
+    pub artifact_digest: [u8; 32],
+    pub artifact_handle: Vec<u8>,
+    pub checkpoint_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum StoredDistributedRewriteTransactionActionV3 {
+    Create,
+    Plan,
+    StartStaging,
+    Checkpoint,
+    AbortPending,
+    CommitPending,
+    ReconcilePending,
+    Finish,
+    Fail,
+    Unresolve,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredDistributedRewriteTransactionV3 {
+    pub schema_version: u8,
+    pub transaction_operation_id: Uuid,
+    pub action: StoredDistributedRewriteTransactionActionV3,
+    pub operation_id: Uuid,
+    pub post_operation: StoredDistributedRewriteOperationV3,
+}
+
+impl From<&StoredDistributedRewriteOperationV3> for DistributedRewriteOperation {
+    fn from(value: &StoredDistributedRewriteOperationV3) -> Self {
+        Self {
+            operation_id: value.operation_id,
+            target: value.target.clone().into(),
+            owner: value.owner.clone(),
+            kind: value.kind,
+            request_digest: value.request_digest,
+            base_state_digest: value.base_state_digest,
+            plan_digest: value.plan_digest,
+            manifest_digest: value.manifest_digest,
+            cohort_set_digest: value.cohort_set_digest,
+            cohort_count: value.cohort_count,
             state: value.state,
             error_message: value.error_message.clone(),
             created_at_ms: value.created_at_ms,

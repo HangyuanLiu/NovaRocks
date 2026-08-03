@@ -23,12 +23,16 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks::engine::table_maintenance::MaintenanceTarget;
 use novarocks_frontend::table_maintenance::model::{
-    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
+    DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
+    DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
+    DistributedRewriteOperationKind, DistributedRewriteOperationState,
+    DistributedRewritePlanPayload, MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
     MetadataMaintenanceOperationState, MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use novarocks_frontend::table_maintenance::repository::{
-    MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
+    DistributedRewriteOperationRepository, MetadataMaintenanceOperationRepository,
+    OptimizeJobRepository, RepositoryErrorKind, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
 };
 use novarocks_spi::state_store::{FeDeploymentView, StateStore};
@@ -81,6 +85,37 @@ async fn fixture() -> (
     (temp, store, repository)
 }
 
+async fn rewrite_fixture() -> (
+    TempDir,
+    Arc<dyn StateStore>,
+    DistributedRewriteOperationRepository,
+) {
+    let temp = TempDir::new().unwrap();
+    let store = StateStoreHost::open(
+        &builtin_state_store_provider_registry().unwrap(),
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: sqlite_config(&temp.path().join("state.sqlite")),
+                mysql_client: None,
+            },
+            foundationdb_client: None,
+        },
+        FeDeploymentView {
+            active_fe_count: NonZeroUsize::new(1).unwrap(),
+            topology_revision: Bytes::from_static(b"distributed-rewrite-operation-test"),
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+    .state_store()
+    .unwrap();
+    let repository = DistributedRewriteOperationRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    (temp, store, repository)
+}
+
 fn target() -> MaintenanceTarget {
     MaintenanceTarget {
         catalog: "rest".to_string(),
@@ -112,6 +147,31 @@ fn create(operation_id: Uuid) -> MetadataMaintenanceOperationCreate {
 fn opaque(payload: &[u8]) -> MetadataMaintenanceOpaquePayload {
     MetadataMaintenanceOpaquePayload {
         digest: metadata_maintenance_payload_digest(payload),
+        payload: payload.to_vec(),
+    }
+}
+
+fn rewrite_create(operation_id: Uuid) -> DistributedRewriteOperationCreate {
+    let request_payload = br#"{"operation":"rewrite-data-files"}"#.to_vec();
+    DistributedRewriteOperationCreate {
+        operation_id,
+        target: target(),
+        owner: MetadataMaintenanceExactOwner {
+            instance_id: "iceberg_rest".to_string(),
+            incarnation_id: Uuid::now_v7(),
+        },
+        kind: DistributedRewriteOperationKind::RewriteDataFiles,
+        request_digest: [11; 32],
+        base_state_digest: [12; 32],
+        request_payload_digest: distributed_rewrite_payload_digest(&request_payload),
+        request_payload,
+        created_at_ms: 10,
+    }
+}
+
+fn rewrite_opaque(payload: &[u8]) -> DistributedRewriteOpaquePayload {
+    DistributedRewriteOpaquePayload {
+        digest: distributed_rewrite_payload_digest(payload),
         payload: payload.to_vec(),
     }
 }
@@ -234,5 +294,175 @@ async fn v1_optimize_and_v2_metadata_operations_are_mutually_exclusive() {
         .await
         .unwrap();
     let error = repository.create(create(Uuid::now_v7())).await.unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+}
+
+#[tokio::test]
+async fn distributed_rewrite_persists_plan_attempts_and_terminal_fence() {
+    let (_temp, _store, repository) = rewrite_fixture().await;
+    let operation_id = Uuid::now_v7();
+    let created = repository
+        .create(rewrite_create(operation_id))
+        .await
+        .unwrap();
+    assert_eq!(created.state, DistributedRewriteOperationState::Pending);
+    let plan_payload = br#"{"artifact":"provider-owned"}"#.to_vec();
+    let planned = repository
+        .plan(
+            operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload.clone(),
+                cohort_count: 2,
+            },
+            11,
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.state, DistributedRewriteOperationState::Planned);
+    repository.start_staging(operation_id, 12).await.unwrap();
+    let handle = b"provider-artifact-handle".to_vec();
+    let checkpoint =
+        novarocks_spi::connector::ConnectorDistributedRewriteAttemptCheckpoint::try_new(
+            novarocks_spi::connector::ConnectorWriteCohortId::from_bytes([4; 32]),
+            novarocks_spi::connector::ConnectorWriteExecutionId::new([5; 16], 0),
+            novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition::Accepted,
+            [6; 32],
+            [7; 32],
+            bytes::Bytes::copy_from_slice(&handle),
+        )
+        .unwrap();
+    repository
+        .checkpoint_attempt(
+            operation_id,
+            DistributedRewriteAttemptCheckpoint {
+                cohort_id: [4; 32],
+                execution_id: novarocks_spi::connector::ConnectorWriteExecutionId::new([5; 16], 0),
+                disposition: DistributedRewriteAttemptDisposition::Accepted,
+                attempt_digest: [6; 32],
+                artifact_digest: [7; 32],
+                artifact_handle: handle,
+                checkpoint_digest: checkpoint.checkpoint_digest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_attempts(operation_id).await.unwrap().len(),
+        1
+    );
+    repository
+        .mark_commit_pending(operation_id, 13)
+        .await
+        .unwrap();
+    let finished = repository
+        .finish(operation_id, rewrite_opaque(b"receipt"), 14)
+        .await
+        .unwrap();
+    assert_eq!(finished.state, DistributedRewriteOperationState::Finished);
+}
+
+#[tokio::test]
+async fn distributed_rewrite_can_abort_after_known_uncommitted_commit() {
+    let (_temp, _store, repository) = rewrite_fixture().await;
+    let operation_id = Uuid::now_v7();
+    repository
+        .create(rewrite_create(operation_id))
+        .await
+        .unwrap();
+    let plan_payload = br#"{"artifact":"provider-owned"}"#.to_vec();
+    repository
+        .plan(
+            operation_id,
+            DistributedRewritePlanPayload {
+                plan_digest: [1; 32],
+                manifest_digest: [2; 32],
+                cohort_set_digest: [3; 32],
+                payload_digest: distributed_rewrite_payload_digest(&plan_payload),
+                payload: plan_payload,
+                cohort_count: 1,
+            },
+            11,
+        )
+        .await
+        .unwrap();
+    repository.start_staging(operation_id, 12).await.unwrap();
+    repository
+        .mark_commit_pending(operation_id, 13)
+        .await
+        .unwrap();
+    let abort_pending = repository
+        .mark_abort_pending(operation_id, 14)
+        .await
+        .unwrap();
+    assert_eq!(
+        abort_pending.state,
+        DistributedRewriteOperationState::AbortPending
+    );
+    let failed = repository
+        .fail(operation_id, "known uncommitted commit".to_string(), 15)
+        .await
+        .unwrap();
+    assert_eq!(failed.state, DistributedRewriteOperationState::Failed);
+}
+
+#[tokio::test]
+async fn distributed_rewrite_and_legacy_maintenance_are_mutually_exclusive() {
+    let (_temp, store, repository) = rewrite_fixture().await;
+    repository
+        .create(rewrite_create(Uuid::now_v7()))
+        .await
+        .unwrap();
+    let optimize = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let error = optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+    let metadata = MetadataMaintenanceOperationRepository::open(store)
+        .await
+        .unwrap();
+    let error = metadata.create(create(Uuid::now_v7())).await.unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+}
+
+#[tokio::test]
+async fn distributed_rewrite_rejects_active_legacy_fences() {
+    let (_temp, store, repository) = rewrite_fixture().await;
+    let optimize = OptimizeJobRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    optimize
+        .create(OptimizeJobCreate {
+            target: target(),
+            base_snapshot_id: 1,
+            created_at_ms: 10,
+        })
+        .await
+        .unwrap();
+    let error = repository
+        .create(rewrite_create(Uuid::now_v7()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
+
+    let (_temp, store, repository) = rewrite_fixture().await;
+    let metadata = MetadataMaintenanceOperationRepository::open(store)
+        .await
+        .unwrap();
+    metadata.create(create(Uuid::now_v7())).await.unwrap();
+    let error = repository
+        .create(rewrite_create(Uuid::now_v7()))
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::AlreadyActive);
 }

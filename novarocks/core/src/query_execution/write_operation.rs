@@ -41,6 +41,7 @@ struct ConnectorWriteOperationSessionInner {
 struct OperationState {
     cohorts: BTreeMap<ConnectorWriteCohortId, CohortState>,
     terminal: Option<TerminalDecision>,
+    recovery_only: bool,
 }
 
 #[derive(Default)]
@@ -96,6 +97,7 @@ impl ConnectorWriteOperationSession {
                 .map(|cohort_id| (cohort_id, CohortState::default()))
                 .collect(),
             terminal: None,
+            recovery_only: false,
         };
         Ok(Self {
             inner: Arc::new(ConnectorWriteOperationSessionInner {
@@ -151,6 +153,11 @@ impl ConnectorWriteOperationSession {
                     "connector write staging is forbidden after a terminal operation decision",
                 ));
             }
+            if state.recovery_only {
+                return Err(invalid(
+                    "connector write recovery session cannot stage a new execution",
+                ));
+            }
             let cohort = state
                 .cohorts
                 .get_mut(&manifest.cohort_id())
@@ -200,6 +207,11 @@ impl ConnectorWriteOperationSession {
                 "connector write attempt completed after a terminal operation decision",
             ));
         }
+        if state.recovery_only {
+            return Err(invalid(
+                "connector write recovery session cannot accept a new execution",
+            ));
+        }
         let cohort = state
             .cohorts
             .get_mut(&attempt.cohort_id())
@@ -221,6 +233,18 @@ impl ConnectorWriteOperationSession {
         Ok(attempt)
     }
 
+    /// Rebuild the immutable attempt completion after the query coordinator
+    /// has accepted its reports.  Maintenance orchestration uses this to
+    /// checkpoint the exact opaque report set through its provider facet; it
+    /// deliberately does not mutate accepted/superseded state.
+    pub(crate) fn completed_attempt(
+        &self,
+        attachment: &ConnectorWritePlanAttachment,
+        input: &ConnectorWriteCommitInput,
+    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
+        self.attempt_completion(attachment, input)
+    }
+
     pub(crate) fn supersede_attempt(
         &self,
         attachment: &ConnectorWritePlanAttachment,
@@ -231,6 +255,11 @@ impl ConnectorWriteOperationSession {
         if state.terminal.is_some() {
             return Err(invalid(
                 "connector write attempt was superseded after a terminal operation decision",
+            ));
+        }
+        if state.recovery_only {
+            return Err(invalid(
+                "connector write recovery session cannot supersede a new execution",
             ));
         }
         let cohort = state
@@ -265,6 +294,11 @@ impl ConnectorWriteOperationSession {
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let completion = {
             let mut state = self.lock_state()?;
+            if state.recovery_only {
+                return Err(invalid(
+                    "connector write recovery session cannot submit a new commit",
+                ));
+            }
             let completion = self.operation_completion(&state)?;
             match state.terminal {
                 Some(TerminalDecision::Commit(digest))
@@ -342,6 +376,93 @@ impl ConnectorWriteOperationSession {
                 evidence,
                 context,
             })
+    }
+
+    /// Restore an opaque provider-durable attempt solely so operation-wide
+    /// abort can clean up staged files after FE recovery.  Recovery sessions
+    /// become abort-only; they cannot plan, accept, supersede or commit new
+    /// work under an old execution generation.
+    pub(crate) fn restore_for_abort(
+        &self,
+        disposition: novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition,
+        attempt: ConnectorWriteAttemptCompletion,
+    ) -> Result<(), ConnectorError> {
+        if attempt.owner() != &self.inner.owner || attempt.operation_id() != self.inner.operation_id
+        {
+            return Err(invalid(
+                "connector write restored attempt does not belong to this operation",
+            ));
+        }
+        let mut state = self.lock_state()?;
+        if state.terminal.is_some() {
+            return Err(invalid(
+                "connector write cannot restore attempts after a terminal decision",
+            ));
+        }
+        let cohort = state.cohorts.get_mut(&attempt.cohort_id()).ok_or_else(|| {
+            invalid("connector write restored attempt references an unknown cohort")
+        })?;
+        match disposition {
+            novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition::Accepted => {
+                if cohort.superseded.contains_key(&attempt.execution_id()) {
+                    return Err(invalid(
+                        "connector write restored attempt cannot be both accepted and superseded",
+                    ));
+                }
+                match &cohort.accepted {
+                    Some(existing) if existing == &attempt => {}
+                    Some(_) => {
+                        return Err(invalid(
+                            "connector write restored cohort has a conflicting accepted attempt",
+                        ));
+                    }
+                    None => cohort.accepted = Some(attempt),
+                }
+            }
+            novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition::Superseded => {
+                if cohort
+                    .accepted
+                    .as_ref()
+                    .map(ConnectorWriteAttemptCompletion::execution_id)
+                    == Some(attempt.execution_id())
+                {
+                    cohort.accepted = None;
+                }
+                match cohort.superseded.get(&attempt.execution_id()) {
+                    Some(existing) if existing == &attempt => {}
+                    Some(_) => {
+                        return Err(invalid(
+                            "connector write restored superseded attempt conflicts with durable facts",
+                        ));
+                    }
+                    None => {
+                        cohort.superseded.insert(attempt.execution_id(), attempt);
+                    }
+                }
+            }
+        }
+        state.recovery_only = true;
+        Ok(())
+    }
+
+    /// Restore the durable C1 aggregate decision for marker-only reconcile.
+    /// No report set is accepted and no new write execution can follow it.
+    pub(crate) fn restore_for_reconcile(
+        &self,
+        aggregate_digest: [u8; 32],
+    ) -> Result<(), ConnectorError> {
+        let mut state = self.lock_state()?;
+        match state.terminal {
+            Some(TerminalDecision::Commit(existing)) if existing == aggregate_digest => {}
+            Some(_) => {
+                return Err(invalid(
+                    "connector write recovery aggregate conflicts with terminal decision",
+                ));
+            }
+            None => state.terminal = Some(TerminalDecision::Commit(aggregate_digest)),
+        }
+        state.recovery_only = true;
+        Ok(())
     }
 
     fn attempt_completion(

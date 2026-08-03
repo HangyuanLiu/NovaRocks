@@ -26,6 +26,7 @@ use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use crate::runtime::profile::RuntimeProfileTree;
 use crate::runtime::query_result::QueryResult;
+use novarocks_spi::connector::ConnectorError;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
@@ -237,6 +238,16 @@ impl ConnectorWriteCompletion {
 
     pub(crate) fn input(&self) -> &ConnectorWriteCommitInput {
         &self.input
+    }
+
+    /// Return the exact accepted staged reports as an SPI attempt completion.
+    /// This is crate-visible because only core orchestration may hand the
+    /// opaque reports to a provider-owned durable checkpoint.
+    pub(crate) fn attempt_completion(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorWriteAttemptCompletion, ConnectorError> {
+        self.session
+            .completed_attempt(&self.attachment, &self.input)
     }
 
     pub fn session(&self) -> &ConnectorWriteOperationSession {

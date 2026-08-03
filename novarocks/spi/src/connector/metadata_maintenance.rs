@@ -16,7 +16,7 @@
 // under the License.
 
 //! FE-only provider-neutral metadata maintenance contract.
-//! Design: ADR-0025 (docs/adr/ADR-0025-connector-metadata-maintenance-control-contract.md)
+//! Design: ADR-0028 (docs/adr/ADR-0028-connector-metadata-maintenance-control-contract.md)
 
 use std::fmt;
 use std::sync::{Arc, Mutex};

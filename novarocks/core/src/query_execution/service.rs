@@ -23,8 +23,12 @@ use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryOutcome, DistributedQueryRequest,
 };
+use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_spi::connector::ConnectorWriteLease;
+use novarocks_spi::connector::{
+    ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
+    ConnectorWriteLease,
+};
 
 #[derive(Clone)]
 pub struct QueryExecutionService {
@@ -67,6 +71,22 @@ impl QueryExecutionService {
             DistributedQueryError::new(
                 crate::query_execution::contract::DistributedQueryErrorKind::Failed,
                 format!("seal connector write operation cohorts: {error}"),
+            )
+        })
+    }
+
+    /// Seal a provider-frozen distributed rewrite against the composite lease
+    /// that selected its metadata, rewrite and C1 write capabilities together.
+    pub fn begin_distributed_rewrite_operation_with_lease(
+        &self,
+        plan: ConnectorDistributedRewritePlan,
+        lease: ConnectorDistributedRewriteLease,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorDistributedRewriteSession, DistributedQueryError> {
+        ConnectorDistributedRewriteSession::try_begin(plan, lease, context).map_err(|error| {
+            DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                format!("seal distributed rewrite operation cohorts: {error}"),
             )
         })
     }

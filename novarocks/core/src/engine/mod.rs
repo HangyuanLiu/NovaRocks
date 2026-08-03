@@ -686,6 +686,105 @@ fn test_metadata_maintenance_lease(
 }
 
 #[cfg(test)]
+impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
+    for TestConnectorControlRegistry
+{
+    fn acquire_current_distributed_rewrite(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDistributedRewriteLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` has no active distributed rewrite binding",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        test_distributed_rewrite_lease(binding)
+    }
+
+    fn acquire_exact_distributed_rewrite(
+        &self,
+        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDistributedRewriteLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(&key.instance_id)
+            .filter(|binding| binding.incarnation() == key.incarnation)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector distributed rewrite generation is unavailable",
+                )
+            })?;
+        test_distributed_rewrite_lease(binding)
+    }
+}
+
+#[cfg(test)]
+fn test_distributed_rewrite_lease(
+    binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
+) -> Result<
+    novarocks_spi::connector::ConnectorDistributedRewriteLease,
+    novarocks_spi::connector::ConnectorError,
+> {
+    let rewrite = binding.distributed_rewrite().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no distributed rewrite capability",
+        )
+    })?;
+    let write = binding.write().cloned().ok_or_else(|| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "test connector control binding has no distributed write capability",
+        )
+    })?;
+    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    novarocks_spi::connector::ConnectorDistributedRewriteLease::new(
+        binding.descriptor().clone(),
+        key,
+        novarocks_spi::connector::ConnectorControlPlanningLease::new(binding.clone(), || {}),
+        Arc::clone(binding.metadata()),
+        Arc::clone(binding.planning()),
+        rewrite,
+        write,
+        binding.execution_distribution().clone(),
+        || {},
+    )
+}
+
+#[cfg(test)]
 impl novarocks_spi::connector::ConnectorWriteResolver for TestConnectorControlRegistry {
     fn acquire_current_write(
         &self,
@@ -4642,6 +4741,68 @@ pub(crate) fn prepare_logical_plan_as_iceberg_write_with_connector_binding(
         execution,
         Some(DistributedConnectorWrite::Begin(connector_write)),
     )
+}
+
+/// Execute one provider-frozen rewrite source through the ordinary C1 sink.
+/// The physical source is deliberately `ConnectorPinned`: its one-shot
+/// resolver supplies opaque splits already planned by the exact composite
+/// rewrite lease, so this path cannot reopen a current catalog binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_frozen_rewrite_physical_plan_as_iceberg_staging(
+    state: &Arc<StandaloneState>,
+    physical_plan: crate::sql::planner::physical::PhysicalPlanNode,
+    sink_spec: crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec,
+    execution: Option<&crate::query_execution::request_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
+    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+) -> Result<
+    (
+        crate::query_execution::ConnectorWriteCompletion,
+        crate::query_execution::ConnectorWriteStagingSummary,
+    ),
+    String,
+> {
+    crate::connector::validate_request_context(connector_context)?;
+    let maintenance_execution;
+    let execution = match execution {
+        Some(execution) => execution,
+        None => {
+            maintenance_execution = capture_maintenance_execution(state)?;
+            &maintenance_execution
+        }
+    };
+    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let distributed_plan = crate::sql::planner::pipeline::build_iceberg_write_distributed_plan_with_settings(
+        physical_plan,
+        crate::sql::planner::distributed::write::sink::IcebergWritePlanInput {
+            descriptor_database: "__distributed_rewrite".to_string(),
+            spec: sink_spec,
+            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        },
+        &optimizer_settings,
+    )?;
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &distributed_plan,
+        state.connector_control.as_ref(),
+        connector_context,
+        None,
+        Some(scan_resolver),
+        scan_preparation_options(&optimizer_settings),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &distributed_plan,
+        &prepared,
+    )?;
+    let result = execute_distributed_write_with_execution(
+        &state.query_execution,
+        prepared,
+        native_bundle,
+        None,
+        execution,
+        Some(DistributedConnectorWrite::Sealed(connector_write)),
+    )?;
+    connector_staging_completion_from_result(result)
 }
 
 fn root_distribution_output_name(

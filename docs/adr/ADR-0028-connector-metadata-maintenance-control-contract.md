@@ -1,5 +1,5 @@
 ---
-id: ADR-0025
+id: ADR-0028
 title: "Connector metadata maintenance control contract"
 domain: [provider-spi, table-maintenance]
 status: active

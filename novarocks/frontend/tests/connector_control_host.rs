@@ -27,19 +27,26 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationResolver, ConnectorControlBinding, ConnectorControlResolver,
     ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
-    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReconcileRequest,
-    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderId,
-    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
-    ConnectorStatistics, ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ExternalMutationOutcome, StatisticsAccuracy, StatisticsCoverage,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsProvenance,
-    StatisticsReadRequest, StatisticsReader,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
+    ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
+    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
+    ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
+    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
+    ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest, ConnectorWriteControl,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
+    ConnectorWriteReconcileRequest, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsProvenance, StatisticsReadRequest, StatisticsReader,
 };
 
 struct TestControl {
@@ -307,6 +314,135 @@ fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBi
         None,
     )
     .expect("control binding with metadata maintenance")
+}
+
+struct TestDistributedRewrite {
+    descriptor: ConnectorInstanceDescriptor,
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorDistributedRewrite for TestDistributedRewrite {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_rewrite(
+        &self,
+        _request: ConnectorDistributedRewritePlanningRequest,
+    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn activate_rewrite(
+        &self,
+        _plan: &ConnectorDistributedRewritePlan,
+    ) -> Result<(), ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn checkpoint_attempt(
+        &self,
+        _plan: &ConnectorDistributedRewritePlan,
+        _disposition: ConnectorDistributedRewriteAttemptDisposition,
+        _completion: &ConnectorWriteAttemptCompletion,
+    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn restore_attempt(
+        &self,
+        _plan: &ConnectorDistributedRewritePlan,
+        _checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
+    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn finalize_rewrite(
+        &self,
+        _plan: &ConnectorDistributedRewritePlan,
+        _receipt: &ConnectorWriteReceipt,
+    ) -> Result<ConnectorDistributedRewriteReceipt, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+struct TestWrite {
+    key: ConnectorExecutionBindingKey,
+}
+
+impl ConnectorWriteControl for TestWrite {
+    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        &self.key
+    }
+
+    fn plan_write(
+        &self,
+        _request: ConnectorWritePlanningRequest,
+    ) -> Result<ConnectorWritePlan, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn commit(
+        &self,
+        _request: ConnectorWriteCommitRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn abort(
+        &self,
+        _request: ConnectorWriteAbortRequest,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        Err(unsupported())
+    }
+
+    fn reconcile(
+        &self,
+        _request: ConnectorWriteReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        Err(unsupported())
+    }
+}
+
+fn binding_with_distributed_rewrite(
+    incarnation_byte: u8,
+    include_write: bool,
+) -> ConnectorControlBinding {
+    let binding = binding(incarnation_byte);
+    let descriptor = binding.descriptor().clone();
+    let incarnation = binding.incarnation();
+    let key = ConnectorExecutionBindingKey {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    };
+    let provider = Arc::new(TestControl {
+        instance_id: descriptor.instance_id.clone(),
+        incarnation,
+    });
+    let rewrite: Arc<dyn ConnectorDistributedRewrite> = Arc::new(TestDistributedRewrite {
+        descriptor: descriptor.clone(),
+        key: key.clone(),
+    });
+    let write = include_write
+        .then(|| Arc::new(TestWrite { key: key.clone() }) as Arc<dyn ConnectorWriteControl>);
+    ConnectorControlBinding::try_new_with_all_maintenance_capabilities(
+        descriptor,
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        provider,
+        None,
+        None,
+        None,
+        Some(rewrite),
+        write,
+        None,
+    )
+    .expect("control binding with distributed rewrite")
 }
 
 struct TestStatistics {
@@ -599,6 +735,107 @@ fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready[0].key, old_key);
 
     let error = match host.acquire_exact_metadata_maintenance(&old_key) {
+        Ok(_) => panic!("retired generation must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
+}
+
+#[test]
+fn distributed_rewrite_lease_requires_both_capabilities_and_fences_retirement() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    host.register(binding(7))
+        .expect("register no-rewrite generation");
+    let error = match host.acquire_current_distributed_rewrite(&instance_id) {
+        Ok(_) => panic!("missing rewrite capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire no-rewrite generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_distributed_rewrite(8, false))
+        .expect("register rewrite-only generation");
+    let error = match host.acquire_current_distributed_rewrite(&instance_id) {
+        Ok(_) => panic!("missing write capability must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    host.retire_current(&instance_id)
+        .expect("retire rewrite-only generation");
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+
+    host.register(binding_with_distributed_rewrite(9, true))
+        .expect("register complete generation");
+    let lease = host
+        .acquire_current_distributed_rewrite(&instance_id)
+        .expect("distributed rewrite lease");
+    assert_eq!(lease.binding_key().incarnation.to_bytes(), [9; 16]);
+    assert_eq!(lease.metadata().instance_id(), &instance_id);
+    let writer = lease.derive_write_lease().expect("derived write lease");
+
+    host.retire_current(&instance_id)
+        .expect("retire distributed rewrite generation");
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(lease);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(writer);
+    assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
+}
+
+#[test]
+fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    host.register(binding_with_distributed_rewrite(7, true))
+        .expect("register old generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let error = match host.acquire_current_distributed_rewrite(&instance_id) {
+        Ok(_) => panic!("retiring generation must not accept current acquisition"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    host.register(binding_with_distributed_rewrite(8, true))
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_distributed_rewrite(&instance_id)
+        .expect("replacement distributed rewrite lease");
+    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+
+    let exact_old = host
+        .acquire_exact_distributed_rewrite(&old_key)
+        .expect("exact retiring generation lease");
+    assert_eq!(exact_old.binding_key(), &old_key);
+
+    let unknown_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+    };
+    let error = match host.acquire_exact_distributed_rewrite(&unknown_key) {
+        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_distributed_rewrite(&old_key) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

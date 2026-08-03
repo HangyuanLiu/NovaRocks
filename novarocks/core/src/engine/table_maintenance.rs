@@ -27,13 +27,21 @@ use std::sync::Arc;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
+use crate::connector::distributed_rewrite_application::{
+    DistributedRewriteIntent, DistributedRewriteMaintenanceSession,
+};
 use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
+use crate::query_execution::ConnectorWriteCompletion;
 use crate::runtime::query_result::QueryResult;
 use crate::sql::parser::dialect::StarRocksDialect;
-use novarocks_spi::connector::ConnectorMetadataMaintenancePlan;
-use novarocks_spi::connector::ConnectorMutationOperationId;
+use novarocks_spi::connector::{
+    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteReceipt,
+    ConnectorMetadataMaintenancePlan, ConnectorMutationOperationId, ConnectorWriteAbortOutcome,
+    ConnectorWriteCohortId, ConnectorWriteReceipt, ExternalMutationEvidence,
+    ExternalMutationOutcome,
+};
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
@@ -184,6 +192,61 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _target: &MaintenanceTarget,
         _plan: ConnectorMetadataMaintenancePlan,
     ) -> Result<CompletedMetadataMaintenance, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn plan_distributed_rewrite(
+        &self,
+        _target: &MaintenanceTarget,
+        _operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        _intent: DistributedRewriteIntent,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn stage_distributed_rewrite_cohort(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+        _cohort_id: ConnectorWriteCohortId,
+    ) -> Result<ConnectorWriteCompletion, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn checkpoint_distributed_rewrite_attempt(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+        _completion: &ConnectorWriteCompletion,
+    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn commit_distributed_rewrite(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn abort_distributed_rewrite(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ConnectorWriteAbortOutcome, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn reconcile_distributed_rewrite(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+        _evidence: ExternalMutationEvidence,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn finalize_distributed_rewrite(
+        &self,
+        _session: &DistributedRewriteMaintenanceSession,
+        _receipt: &ConnectorWriteReceipt,
+    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 }
@@ -375,6 +438,102 @@ impl TableMaintenanceEngine for crate::engine::StandaloneState {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )?,
         )
+    }
+
+    fn plan_distributed_rewrite(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        intent: DistributedRewriteIntent,
+    ) -> Result<DistributedRewriteMaintenanceSession, String> {
+        let state = self.shared_for_table_maintenance()?;
+        let execution = crate::engine::capture_maintenance_execution(&state)?;
+        let context = crate::connector::connector_request_context_for_execution(None, &execution)?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
+            &state.query_execution,
+            state.connector_control.as_ref(),
+            &instance_id,
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: target.namespace.clone().into(),
+                table: target.table.clone().into(),
+            },
+            operation_id,
+            intent,
+            execution,
+            context,
+        )
+    }
+
+    fn stage_distributed_rewrite_cohort(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        cohort_id: ConnectorWriteCohortId,
+    ) -> Result<ConnectorWriteCompletion, String> {
+        let state = self.shared_for_table_maintenance()?;
+        crate::connector::iceberg::distributed_rewrite_execution::stage_frozen_rewrite_cohort(
+            &state,
+            session.session(),
+            cohort_id,
+            session.execution(),
+            session.context(),
+        )
+        .map(|(completion, _summary)| completion)
+    }
+
+    fn checkpoint_distributed_rewrite_attempt(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        completion: &ConnectorWriteCompletion,
+    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        session
+            .session()
+            .checkpoint_accepted(completion)
+            .map_err(|error| format!("checkpoint distributed rewrite attempt: {error}"))
+    }
+
+    fn commit_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        session
+            .session()
+            .commit(session.context().clone())
+            .map_err(|error| format!("commit distributed rewrite operation: {error}"))
+    }
+
+    fn abort_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+    ) -> Result<ConnectorWriteAbortOutcome, String> {
+        session
+            .session()
+            .abort(session.context().clone())
+            .map_err(|error| format!("abort distributed rewrite operation: {error}"))
+    }
+
+    fn reconcile_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        evidence: ExternalMutationEvidence,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        session
+            .session()
+            .reconcile(evidence, session.context().clone())
+            .map_err(|error| format!("reconcile distributed rewrite operation: {error}"))
+    }
+
+    fn finalize_distributed_rewrite(
+        &self,
+        session: &DistributedRewriteMaintenanceSession,
+        receipt: &ConnectorWriteReceipt,
+    ) -> Result<ConnectorDistributedRewriteReceipt, String> {
+        session
+            .session()
+            .finalize_committed(receipt)
+            .map_err(|error| format!("finalize distributed rewrite operation: {error}"))
     }
 }
 

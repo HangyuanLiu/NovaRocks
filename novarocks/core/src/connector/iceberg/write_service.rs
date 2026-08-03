@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use iceberg::spec::TableMetadata;
+use iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorStagedReport, ConnectorWriteAbortRequest, ConnectorWriteCohortId,
@@ -37,7 +38,8 @@ use sha2::{Digest, Sha256};
 use super::change_stream_routing::ChangeStreamWriterCommitPlan;
 use super::commit::{
     CleanupAttempt, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    RecoveryEvidence, RunInput, WrittenFile, run_iceberg_commit,
+    RecoveryEvidence, RunInput, SelectedRewriteFiles, SelectedRewriteKind, WrittenFile,
+    run_iceberg_commit,
 };
 use super::report::IcebergWriterReport;
 use super::sink_plan::IcebergSinkPlan;
@@ -272,6 +274,18 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
         )
     }
 
+    /// The generic write adapter owns the aggregate digest.  Most providers
+    /// do not need it, but a distributed-rewrite snapshot marker binds the
+    /// one external commit to the exact sealed C1 aggregate for later
+    /// marker-only reconciliation.
+    fn commit_connector_operation_with_request(
+        &self,
+        _request: &ConnectorWriteCommitRequest,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_connector_operation(cohorts)
+    }
+
     fn commit_iceberg_writer_reports(
         &self,
         reports: Vec<IcebergWriterReport>,
@@ -283,6 +297,20 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     ) -> Result<CleanupAttempt, String>;
 
     fn recovery_evidence(&self) -> RecoveryEvidence;
+
+    /// Provider-private, marker-based reconciliation for a commit response
+    /// that may have been lost after the catalog accepted the single external
+    /// mutation. Ordinary writer services do not infer commit state.
+    fn reconcile_connector_operation(
+        &self,
+        _evidence: &IcebergWriteReconcileEvidenceV1,
+    ) -> Result<Option<CommitOutcome>, CommitServiceError> {
+        Err(CommitServiceError::unknown(
+            "Iceberg connector-write reconciliation is unsupported without a marker-aware operation scope"
+                .to_string(),
+            self.recovery_evidence(),
+        ))
+    }
 }
 
 /// Empty-input policy for a single primary MV staging cohort. First refresh
@@ -506,6 +534,412 @@ pub(crate) struct IcebergCowWriteReportCommitter {
     executor: Arc<IcebergWriteCommitExecutor>,
 }
 
+/// Aggregate committer for a frozen distributed rewrite.  It retains the
+/// provider-owned old-file set next to each C1 cohort until all reports are
+/// decoded, so neither generic core nor a query caller can accidentally merge
+/// a replacement from one cohort into another cohort's ownership.
+pub(crate) struct IcebergDistributedRewriteReportCommitter {
+    executor: Arc<IcebergWriteCommitExecutor>,
+    marker_base: IcebergDistributedRewriteMarkerBase,
+}
+
+#[derive(Clone)]
+pub(crate) struct IcebergDistributedRewriteMarkerBase {
+    pub operation_id: ConnectorWriteOperationId,
+    pub plan_digest: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub target_ref: String,
+    pub incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+    pub operation_kind: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcebergDistributedRewriteSnapshotMarkerV1 {
+    version: u16,
+    operation_id_hex: String,
+    plan_digest_hex: String,
+    manifest_digest_hex: String,
+    aggregate_digest_hex: String,
+    target_ref: String,
+    incarnation_hex: String,
+    operation_kind: String,
+}
+
+impl IcebergDistributedRewriteReportCommitter {
+    pub(crate) fn new(
+        executor: Arc<IcebergWriteCommitExecutor>,
+        marker_base: IcebergDistributedRewriteMarkerBase,
+    ) -> Self {
+        Self {
+            executor,
+            marker_base,
+        }
+    }
+
+    fn decode_and_convert(
+        &self,
+        reports: &[ConnectorStagedReport],
+    ) -> Result<Vec<WrittenFile>, CommitServiceError> {
+        let mut decoded = Vec::new();
+        for staged in reports {
+            staged.validate().map_err(|error| {
+                CommitServiceError::invalid_input(format!(
+                    "validate distributed rewrite connector staged report: {error}"
+                ))
+            })?;
+            decoded.extend(
+                decode_writer_reports(staged.payload(), self.table_metadata())
+                    .map_err(CommitServiceError::invalid_input)?,
+            );
+        }
+        let mut converted = Vec::with_capacity(decoded.len());
+        for report in decoded {
+            let file = self
+                .executor
+                .collector
+                .convert_writer_report(report)
+                .map_err(|message| {
+                    CommitServiceError::known_uncommitted(
+                        message,
+                        self.executor.cleanup_converted_writer_files(&converted),
+                    )
+                })?;
+            converted.push(file);
+        }
+        Ok(converted)
+    }
+
+    fn run_selected_commit(
+        &self,
+        files: Vec<WrittenFile>,
+        selected_rewrite: SelectedRewriteFiles,
+        snapshot_properties: BTreeMap<String, String>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.executor.collector.inject_written_files(files);
+        let input = RunInput {
+            collector: Arc::clone(&self.executor.collector),
+            catalog: Arc::clone(&self.executor.catalog),
+            table: self.executor.table.clone(),
+            fs: self.executor.fs.clone(),
+            file_io: self.executor.table.file_io().clone(),
+            cleanup_path_mapper: self.executor.cleanup_path_mapper.clone(),
+            cow_update_rewrite: None,
+            selected_rewrite: Some(selected_rewrite),
+            target_ref: self.executor.target_ref.clone(),
+            snapshot_properties,
+        };
+        match crate::runtime::global_async_runtime::data_block_on(async {
+            run_iceberg_commit(input).await
+        }) {
+            Ok(result) => result,
+            Err(message) => Err(CommitServiceError::known_uncommitted(
+                message,
+                CleanupAttempt::not_attempted(),
+            )),
+        }
+    }
+}
+
+impl IcebergDistributedRewriteReportCommitter {
+    fn commit_distributed_rewrite(
+        &self,
+        aggregate_digest: [u8; 32],
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        let mut kind = None;
+        let mut selected_data_paths = BTreeSet::new();
+        let mut selected_delete_paths = BTreeSet::new();
+        let mut output_paths = HashSet::new();
+        let mut all_files = Vec::new();
+
+        for cohort in cohorts {
+            let files = self.decode_and_convert(&cohort.reports)?;
+            if files.is_empty() {
+                return Err(CommitServiceError::invalid_input(format!(
+                    "Iceberg distributed rewrite cohort {:?} produced no staged files",
+                    cohort.cohort_id.to_bytes()
+                )));
+            }
+            let (cohort_kind, data_paths, delete_paths) = match cohort.role {
+                IcebergWriteCohortRole::DistributedRewriteData {
+                    data_paths,
+                    delete_paths,
+                } => (SelectedRewriteKind::Data, data_paths, delete_paths),
+                IcebergWriteCohortRole::DistributedRewritePosition {
+                    data_paths,
+                    delete_paths,
+                } => (
+                    SelectedRewriteKind::PositionDeletes,
+                    data_paths,
+                    delete_paths,
+                ),
+                _ => {
+                    return Err(CommitServiceError::invalid_input(
+                        "Iceberg distributed rewrite aggregate contains a non-rewrite cohort"
+                            .to_string(),
+                    ));
+                }
+            };
+            match kind {
+                Some(expected) if expected != cohort_kind => {
+                    return Err(CommitServiceError::invalid_input(
+                        "Iceberg distributed rewrite aggregate mixes data and position-delete cohorts"
+                            .to_string(),
+                    ));
+                }
+                None => kind = Some(cohort_kind),
+                Some(_) => {}
+            }
+            if data_paths.is_empty()
+                || (cohort_kind == SelectedRewriteKind::PositionDeletes && delete_paths.is_empty())
+                || data_paths
+                    .iter()
+                    .any(|path| !selected_data_paths.insert(path.clone()))
+                || delete_paths
+                    .iter()
+                    .any(|path| !selected_delete_paths.insert(path.clone()))
+            {
+                return Err(CommitServiceError::invalid_input(
+                    "Iceberg distributed rewrite cohorts have empty or overlapping frozen ownership"
+                        .to_string(),
+                ));
+            }
+            match cohort_kind {
+                SelectedRewriteKind::Data => {
+                    if files.iter().any(|file| {
+                        file.content != iceberg::spec::DataContentType::Data
+                            || !output_paths.insert(file.path.clone())
+                    }) {
+                        return Err(CommitServiceError::invalid_input(
+                            "Iceberg data rewrite wrote a duplicate or non-data replacement"
+                                .to_string(),
+                        ));
+                    }
+                }
+                SelectedRewriteKind::PositionDeletes => {
+                    let references = files
+                        .iter()
+                        .map(|file| {
+                            if file.content != iceberg::spec::DataContentType::PositionDeletes
+                                || file.format != iceberg::spec::DataFileFormat::Puffin
+                                || !output_paths.insert(file.path.clone())
+                            {
+                                return Err(CommitServiceError::invalid_input(
+                                    "Iceberg position-delete rewrite wrote a duplicate or non-Puffin DV"
+                                        .to_string(),
+                                ));
+                            }
+                            file.referenced_data_file.clone().ok_or_else(|| {
+                                CommitServiceError::invalid_input(
+                                    "Iceberg position-delete rewrite DV has no referenced data file"
+                                        .to_string(),
+                                )
+                            })
+                        })
+                        .collect::<Result<BTreeSet<_>, _>>()?;
+                    if references != data_paths {
+                        return Err(CommitServiceError::invalid_input(
+                            "Iceberg position-delete rewrite outputs do not exactly match their frozen data-file cohort"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            all_files.extend(files);
+        }
+        let selected_rewrite = SelectedRewriteFiles {
+            kind: kind.ok_or_else(|| {
+                CommitServiceError::invalid_input(
+                    "Iceberg distributed rewrite aggregate has no cohorts".to_string(),
+                )
+            })?,
+            data_paths: selected_data_paths,
+            delete_paths: selected_delete_paths,
+        };
+        selected_rewrite
+            .validate()
+            .map_err(CommitServiceError::invalid_input)?;
+        let marker = IcebergDistributedRewriteSnapshotMarkerV1 {
+            version: 1,
+            operation_id_hex: hex::encode(self.marker_base.operation_id.to_bytes()),
+            plan_digest_hex: hex::encode(self.marker_base.plan_digest),
+            manifest_digest_hex: hex::encode(self.marker_base.manifest_digest),
+            aggregate_digest_hex: hex::encode(aggregate_digest),
+            target_ref: self.marker_base.target_ref.clone(),
+            incarnation_hex: hex::encode(self.marker_base.incarnation.to_bytes()),
+            operation_kind: self.marker_base.operation_kind.clone(),
+        };
+        let marker = super::distributed_rewrite::canonical_payload(&marker).map_err(|error| {
+            CommitServiceError::invalid_input(format!(
+                "encode Iceberg distributed rewrite snapshot marker: {error}"
+            ))
+        })?;
+        let marker = String::from_utf8(marker.to_vec()).map_err(|error| {
+            CommitServiceError::invalid_input(format!(
+                "Iceberg distributed rewrite marker is not UTF-8 JSON: {error}"
+            ))
+        })?;
+        let mut properties = self.executor.snapshot_properties.clone();
+        if properties
+            .insert(
+                "novarocks.connector.distributed-rewrite.v1".to_string(),
+                marker,
+            )
+            .is_some()
+        {
+            return Err(CommitServiceError::invalid_input(
+                "Iceberg distributed rewrite marker conflicts with snapshot properties".to_string(),
+            ));
+        }
+        self.run_selected_commit(all_files, selected_rewrite, properties)
+    }
+}
+
+impl IcebergWriteReportCommitter for IcebergDistributedRewriteReportCommitter {
+    fn table_metadata(&self) -> &TableMetadata {
+        self.executor.table.metadata()
+    }
+
+    fn commit_connector_operation(
+        &self,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_distributed_rewrite([0; 32], cohorts)
+    }
+
+    fn commit_connector_operation_with_request(
+        &self,
+        request: &ConnectorWriteCommitRequest,
+        cohorts: Vec<IcebergAcceptedCohortReports>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        if request.operation_id() != self.marker_base.operation_id {
+            return Err(CommitServiceError::invalid_input(
+                "Iceberg distributed rewrite marker operation does not match C1 commit request"
+                    .to_string(),
+            ));
+        }
+        self.commit_distributed_rewrite(request.aggregate_digest(), cohorts)
+    }
+
+    fn commit_iceberg_writer_reports(
+        &self,
+        _reports: Vec<IcebergWriterReport>,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        Err(CommitServiceError::invalid_input(
+            "Iceberg distributed rewrite commit requires cohort-attributed staged reports"
+                .to_string(),
+        ))
+    }
+
+    fn abort_iceberg_writer_reports(
+        &self,
+        reports: Vec<IcebergWriterReport>,
+    ) -> Result<CleanupAttempt, String> {
+        self.executor.abort_iceberg_writer_reports(reports)
+    }
+
+    fn recovery_evidence(&self) -> RecoveryEvidence {
+        RecoveryEvidence::from_collector(&self.executor.collector)
+    }
+
+    fn reconcile_connector_operation(
+        &self,
+        evidence: &IcebergWriteReconcileEvidenceV1,
+    ) -> Result<Option<CommitOutcome>, CommitServiceError> {
+        let operation_id = evidence
+            .operation_id()
+            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
+        let aggregate_digest = evidence
+            .aggregate_digest()
+            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
+        if operation_id != self.marker_base.operation_id {
+            return Err(CommitServiceError::invalid_input(
+                "Iceberg distributed rewrite reconcile operation does not match marker scope"
+                    .to_string(),
+            ));
+        }
+        let ident = TableIdent::new(
+            NamespaceIdent::new(self.executor.target.namespace.clone()),
+            self.executor.target.table.clone(),
+        );
+        let table = crate::runtime::global_async_runtime::data_block_on(async {
+            self.executor.catalog.load_table(&ident).await
+        })
+        .map_err(|error| {
+            CommitServiceError::unknown(
+                format!("reload Iceberg distributed rewrite marker table: {error}"),
+                self.recovery_evidence(),
+            )
+        })?
+        .map_err(|error| {
+            CommitServiceError::unknown(
+                format!("load Iceberg distributed rewrite marker table: {error}"),
+                self.recovery_evidence(),
+            )
+        })?;
+        let expected = IcebergDistributedRewriteSnapshotMarkerV1 {
+            version: 1,
+            operation_id_hex: hex::encode(self.marker_base.operation_id.to_bytes()),
+            plan_digest_hex: hex::encode(self.marker_base.plan_digest),
+            manifest_digest_hex: hex::encode(self.marker_base.manifest_digest),
+            aggregate_digest_hex: hex::encode(aggregate_digest),
+            target_ref: self.marker_base.target_ref.clone(),
+            incarnation_hex: hex::encode(self.marker_base.incarnation.to_bytes()),
+            operation_kind: self.marker_base.operation_kind.clone(),
+        };
+        let mut saw_foreign_operation_marker = false;
+        for snapshot in table.metadata().snapshots() {
+            let Some(raw) = snapshot
+                .summary()
+                .additional_properties
+                .get("novarocks.connector.distributed-rewrite.v1")
+            else {
+                continue;
+            };
+            let marker: IcebergDistributedRewriteSnapshotMarkerV1 = serde_json::from_str(raw)
+                .map_err(|error| {
+                    CommitServiceError::unknown(
+                        format!("decode Iceberg distributed rewrite snapshot marker: {error}"),
+                        self.recovery_evidence(),
+                    )
+                })?;
+            let canonical =
+                super::distributed_rewrite::canonical_payload(&marker).map_err(|error| {
+                    CommitServiceError::unknown(
+                        format!("canonicalize Iceberg distributed rewrite marker: {error}"),
+                        self.recovery_evidence(),
+                    )
+                })?;
+            if canonical.as_ref() != raw.as_bytes() {
+                return Err(CommitServiceError::unknown(
+                    "Iceberg distributed rewrite snapshot marker is not canonical JSON v1"
+                        .to_string(),
+                    self.recovery_evidence(),
+                ));
+            }
+            if marker.operation_id_hex == expected.operation_id_hex {
+                if marker == expected {
+                    return Ok(Some(CommitOutcome {
+                        new_snapshot_id: snapshot.snapshot_id(),
+                        written_manifest_paths: Vec::new(),
+                    }));
+                }
+                saw_foreign_operation_marker = true;
+            }
+        }
+        Err(CommitServiceError::unknown(
+            if saw_foreign_operation_marker {
+                "Iceberg distributed rewrite found a conflicting operation marker".to_string()
+            } else {
+                "Iceberg distributed rewrite marker is absent; commit state remains unknown"
+                    .to_string()
+            },
+            self.recovery_evidence(),
+        ))
+    }
+}
+
 impl IcebergCowWriteReportCommitter {
     pub(crate) fn new(executor: Arc<IcebergWriteCommitExecutor>) -> Self {
         Self { executor }
@@ -565,6 +999,7 @@ impl IcebergCowWriteReportCommitter {
             file_io: self.executor.table.file_io().clone(),
             cleanup_path_mapper: self.executor.cleanup_path_mapper.clone(),
             cow_update_rewrite: Some(rewrite),
+            selected_rewrite: None,
             target_ref: self.executor.target_ref.clone(),
             snapshot_properties: self.executor.snapshot_properties.clone(),
         };
@@ -662,6 +1097,12 @@ fn build_cow_rewrite_set(
                     "Iceberg COW aggregate contains a primary-role cohort".to_string(),
                 ));
             }
+            IcebergWriteCohortRole::DistributedRewriteData { .. }
+            | IcebergWriteCohortRole::DistributedRewritePosition { .. } => {
+                return Err(CommitServiceError::invalid_input(
+                    "Iceberg COW aggregate contains a distributed-rewrite cohort".to_string(),
+                ));
+            }
             IcebergWriteCohortRole::CowRewrite {
                 base_snapshot_id: cohort_base,
                 old_file,
@@ -740,6 +1181,20 @@ fn ensure_same_cow_base(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum IcebergWriteCohortRole {
     Primary,
+    /// Provider-frozen data-file rewrite cohort.  Paths remain entirely in
+    /// the FE control service and never enter a C1 handle or generic report.
+    DistributedRewriteData {
+        data_paths: BTreeSet<String>,
+        delete_paths: BTreeSet<String>,
+    },
+    /// Provider-frozen Puffin DV rewrite cohort.  `data_paths` contains the
+    /// one referenced data file for the current E2 planner, but the contract
+    /// remains set-shaped so a future bounded provider plan need not change
+    /// this role's semantics.
+    DistributedRewritePosition {
+        data_paths: BTreeSet<String>,
+        delete_paths: BTreeSet<String>,
+    },
     CowRewrite {
         base_snapshot_id: i64,
         old_file: String,
@@ -834,6 +1289,48 @@ impl IcebergWriteCohortContext {
                 old_file,
                 matched_row_ids,
             },
+        })
+    }
+
+    pub(crate) fn distributed_rewrite(
+        writer_handle_payload: bytes::Bytes,
+        control_payload: bytes::Bytes,
+        kind: SelectedRewriteKind,
+        data_paths: BTreeSet<String>,
+        delete_paths: BTreeSet<String>,
+    ) -> Result<Self, ConnectorError> {
+        if data_paths.is_empty()
+            || data_paths.iter().any(|path| path.is_empty())
+            || delete_paths.iter().any(|path| path.is_empty())
+        {
+            return Err(invalid(
+                "Iceberg distributed rewrite cohort has invalid frozen paths",
+            ));
+        }
+        if kind == SelectedRewriteKind::PositionDeletes && delete_paths.is_empty() {
+            return Err(invalid(
+                "Iceberg position-delete rewrite cohort has no frozen Puffin inputs",
+            ));
+        }
+        validate_writer_handle_payloads(&IcebergWriterHandlePayloads::Uniform(
+            writer_handle_payload.clone(),
+        ))?;
+        let role = match kind {
+            SelectedRewriteKind::Data => IcebergWriteCohortRole::DistributedRewriteData {
+                data_paths,
+                delete_paths,
+            },
+            SelectedRewriteKind::PositionDeletes => {
+                IcebergWriteCohortRole::DistributedRewritePosition {
+                    data_paths,
+                    delete_paths,
+                }
+            }
+        };
+        Ok(Self {
+            writer_handle_payloads: IcebergWriterHandlePayloads::Uniform(writer_handle_payload),
+            control_payload,
+            role,
         })
     }
 
@@ -1170,7 +1667,7 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
         }
         self.context
             .commit_executor
-            .commit_connector_operation(cohorts)
+            .commit_connector_operation_with_request(request, cohorts)
     }
 
     fn abort(
@@ -1222,17 +1719,11 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
 
     fn reconcile(
         &self,
-        _: &IcebergWriteReconcileEvidenceV1,
+        evidence: &IcebergWriteReconcileEvidenceV1,
     ) -> Result<Option<CommitOutcome>, CommitServiceError> {
-        // This operation-scoped service does not try to locate a newer
-        // generation, reopen a catalog transaction, or infer a snapshot from
-        // another FE incarnation.  The adapter will retain the original
-        // evidence as CommitUnknown for explicit later recovery.
-        Err(CommitServiceError::unknown(
-            "Iceberg connector-write reconciliation is unsupported without the original FE operation scope"
-                .to_string(),
-            self.context.commit_executor.recovery_evidence(),
-        ))
+        self.context
+            .commit_executor
+            .reconcile_connector_operation(evidence)
     }
 }
 

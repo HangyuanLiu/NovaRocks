@@ -73,6 +73,11 @@ pub(super) struct SnapshotIndex {
     pub touched_delete_existing: Vec<LiveFile>,
     /// Live DV files removed because a replacement DV was written.
     pub replaced_delete_files: usize,
+    /// Exact paths of the live Puffin DV files removed from touched delete
+    /// manifests.  A distributed rewrite uses this to prove that its frozen
+    /// input set has neither shrunk nor grown before it submits the one
+    /// replacement snapshot.
+    pub replaced_delete_paths: HashSet<String>,
     /// Position deletes already represented by removed DV files.
     pub replaced_delete_records: u64,
     /// Total file_size_in_bytes of replaced DV files.
@@ -109,6 +114,7 @@ async fn build_snapshot_index(
     let mut untouched_manifests = Vec::new();
     let mut touched_delete_existing = Vec::new();
     let mut replaced_delete_files = 0usize;
+    let mut replaced_delete_paths = HashSet::new();
     let mut replaced_delete_files_size = 0u64;
     let mut replaced_delete_records = 0u64;
     let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
@@ -185,6 +191,12 @@ async fn build_snapshot_index(
                         )
                     })?;
                     if touched_files.contains(&referenced) {
+                        if !replaced_delete_paths.insert(file.file_path().to_string()) {
+                            return Err(format!(
+                                "duplicate live Puffin DV path {} in Iceberg manifest list",
+                                file.file_path()
+                            ));
+                        }
                         if vectors_to_merge.is_some() {
                             let offset = file.content_offset().ok_or_else(|| {
                                 format!("Puffin DV {} missing content_offset", file.file_path())
@@ -255,6 +267,7 @@ async fn build_snapshot_index(
         untouched_manifests,
         touched_delete_existing,
         replaced_delete_files,
+        replaced_delete_paths,
         replaced_delete_records,
         replaced_delete_files_size,
     })
