@@ -27,8 +27,8 @@ use crate::sql::planner::vocabulary::ApplyKeySource;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, TimeUnit};
-use iceberg::spec::Schema;
+use arrow::datatypes::{DataType, Field, TimeUnit};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
@@ -487,31 +487,110 @@ impl IcebergMvRewriteContext {
 fn sql_target_columns(
     target_schema: &Schema,
 ) -> Result<Arc<[novarocks_catalog::schema::ColumnDef]>, String> {
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
-        .map_err(|e| format!("convert IMV target Iceberg schema to Arrow schema: {e}"))?;
-    let iceberg_fields = target_schema.as_struct().fields();
-    if iceberg_fields.len() != arrow_schema.fields().len() {
-        return Err(format!(
-            "IMV target schema conversion changed field count: iceberg={}, arrow={}",
-            iceberg_fields.len(),
-            arrow_schema.fields().len()
-        ));
-    }
     Ok(Arc::from(
-        iceberg_fields
+        target_schema
+            .as_struct()
+            .fields()
             .iter()
-            .zip(arrow_schema.fields().iter())
-            .map(
-                |(field, arrow_field)| novarocks_catalog::schema::ColumnDef {
-                    name: field.name.clone(),
-                    data_type: arrow_field.data_type().clone(),
-                    nullable: !field.required,
-                    write_default: None,
-                    logical_type: None,
-                },
-            )
-            .collect::<Vec<_>>(),
+            .map(|field| sql_target_column_from_field(field.as_ref()))
+            .collect::<Result<Vec<_>, String>>()?,
     ))
+}
+
+fn sql_target_column_from_field(
+    field: &NestedField,
+) -> Result<novarocks_catalog::schema::ColumnDef, String> {
+    Ok(novarocks_catalog::schema::ColumnDef {
+        name: field.name.clone(),
+        data_type: sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
+        nullable: !field.required,
+        write_default: None,
+        logical_type: None,
+    })
+}
+
+fn sql_iceberg_type_to_arrow(ty: &Type, column_name: &str) -> Result<DataType, String> {
+    Ok(match ty {
+        Type::Primitive(primitive) => sql_primitive_type_to_arrow(primitive, column_name)?,
+        Type::Struct(struct_ty) => {
+            let fields = struct_ty
+                .fields()
+                .iter()
+                .map(|field| {
+                    Ok(Arc::new(Field::new(
+                        field.name.clone(),
+                        sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
+                        !field.required,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            DataType::Struct(fields.into())
+        }
+        Type::List(list_ty) => {
+            let element = list_ty.element_field.as_ref();
+            DataType::List(Arc::new(Field::new(
+                element.name.clone(),
+                sql_iceberg_type_to_arrow(element.field_type.as_ref(), &element.name)?,
+                !element.required,
+            )))
+        }
+        Type::Map(map_ty) => {
+            let key = map_ty.key_field.as_ref();
+            let value = map_ty.value_field.as_ref();
+            let entries = DataType::Struct(
+                vec![
+                    Arc::new(Field::new(
+                        key.name.clone(),
+                        sql_iceberg_type_to_arrow(key.field_type.as_ref(), &key.name)?,
+                        !key.required,
+                    )),
+                    Arc::new(Field::new(
+                        value.name.clone(),
+                        sql_iceberg_type_to_arrow(value.field_type.as_ref(), &value.name)?,
+                        !value.required,
+                    )),
+                ]
+                .into(),
+            );
+            DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+        }
+    })
+}
+
+fn sql_primitive_type_to_arrow(
+    primitive: &PrimitiveType,
+    column_name: &str,
+) -> Result<DataType, String> {
+    Ok(match primitive {
+        PrimitiveType::Boolean => DataType::Boolean,
+        PrimitiveType::Int => DataType::Int32,
+        PrimitiveType::Long => DataType::Int64,
+        PrimitiveType::Float => DataType::Float32,
+        PrimitiveType::Double => DataType::Float64,
+        PrimitiveType::Decimal { precision, scale } => {
+            let precision = u8::try_from(*precision).map_err(|_| {
+                format!(
+                    "IMV target column {column_name} has out-of-range decimal precision {precision}"
+                )
+            })?;
+            let scale = i8::try_from(*scale).map_err(|_| {
+                format!("IMV target column {column_name} has out-of-range decimal scale {scale}")
+            })?;
+            DataType::Decimal128(precision, scale)
+        }
+        PrimitiveType::Date => DataType::Date32,
+        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        PrimitiveType::String => DataType::Utf8,
+        PrimitiveType::Binary => DataType::Binary,
+        other => {
+            return Err(format!(
+                "IMV target column {column_name} has unsupported Iceberg type {other:?}"
+            ));
+        }
+    })
 }
 
 fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContract, String> {
@@ -1875,5 +1954,24 @@ mod tests {
             Some(contract),
         )
         .expect("ctx must accept aggregate state columns in target schema");
+    }
+
+    #[test]
+    fn sqlx2_binary_target_column_remains_binary() {
+        let schema = Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(NestedField::required(
+                200,
+                "__agg_state_v",
+                Type::Primitive(PrimitiveType::Binary),
+            ))])
+            .build()
+            .expect("build schema");
+
+        let columns = sql_target_columns(&schema).expect("project SQL target columns");
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "__agg_state_v");
+        assert_eq!(columns[0].data_type, DataType::Binary);
     }
 }
