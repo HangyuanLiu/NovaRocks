@@ -64,6 +64,7 @@ pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub mod insert_engine;
+pub mod mutation_engine;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_first_refresh_staging;
@@ -1435,6 +1436,13 @@ impl StandaloneNovaRocks {
         Arc::new(Arc::clone(&self.inner))
     }
 
+    /// UPDATE/MERGE's narrow reverse port.  Frontend owns the durable DML
+    /// lifecycle; the returned core capability keeps parser-private mutation
+    /// planning and exact connector sessions opaque.
+    pub fn mutation_engine(&self) -> Arc<dyn mutation_engine::MutationEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
     pub fn ctas_engine(&self) -> Arc<dyn ctas_engine::CtasEngine> {
         Arc::new(Arc::clone(&self.inner))
     }
@@ -2317,33 +2325,11 @@ impl StandaloneSession {
             sqlast::Statement::Truncate(_) => {
                 Err("TRUNCATE must be routed by frontend DML service".to_string())
             }
-            ref update_stmt @ sqlast::Statement::Update(_) => {
-                if let Some(result) = self::information_schema::try_update_be_configs(update_stmt)?
-                {
-                    return Ok(result);
-                }
-                let stmt =
-                    crate::engine::statement::convert_sqlparser_update_to_custom(update_stmt)?;
-                let result = crate::engine::mutation_flow::execute_update_statement(
-                    &self.inner,
-                    &stmt,
-                    current_catalog,
-                    current_database,
-                    request_context.execution(),
-                    &connector_context,
-                )?;
-                Ok(result)
+            sqlast::Statement::Update(_) => {
+                Err("UPDATE must be routed by frontend DML service".to_string())
             }
-            ref merge_stmt @ sqlast::Statement::Merge(_) => {
-                let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(merge_stmt)?;
-                crate::engine::mutation_flow::execute_merge_statement(
-                    &self.inner,
-                    &stmt,
-                    current_catalog,
-                    current_database,
-                    request_context.execution(),
-                    &connector_context,
-                )
+            sqlast::Statement::Merge(_) => {
+                Err("MERGE must be routed by frontend DML service".to_string())
             }
             _ => Err(format!(
                 "unsupported sql: {}",
@@ -5317,12 +5303,20 @@ pub(crate) fn execute_planned_iceberg_change_stream_write(
         execution,
         connector_write.map(DistributedConnectorWrite::Begin),
     )?;
-    let request = bind_prepared_distributed_write_request(
+    let bound = match bind_prepared_distributed_write_request(
         &state.query_execution,
         execution,
         prepared_request,
-    )?;
-    execute_bound_distributed_write_request(&state.query_execution, request)
+    )? {
+        BoundDistributedWriteBinding::Bound(bound) => bound,
+        BoundDistributedWriteBinding::AbortRequired { session, reason } => {
+            let _ = session.abort(crate::connector::connector_request_context_for_execution(
+                None, execution,
+            )?);
+            return Err(reason);
+        }
+    };
+    execute_bound_distributed_write_request(&state.query_execution, bound.request)
 }
 
 /// Convert an already planned change-stream writer into SQL's inert native
@@ -5366,23 +5360,60 @@ fn prepare_distributed_write_request_with_execution(
     .map_err(|error| error.to_string())
 }
 
-fn bind_prepared_distributed_write_request(
+/// The request is bound to a newly-created exact connector operation session.
+/// Callers that need typed abort certainty retain `session` until a terminal
+/// commit or abort decision instead of letting an intermediate error discard
+/// that provider-owned capability.
+pub(crate) struct BoundDistributedWriteRequest {
+    pub(crate) request: crate::query_execution::contract::DistributedQueryRequest,
+    pub(crate) session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
+}
+
+/// A request-construction failure after `begin_write_operation` still owns an
+/// exact provider session.  The caller must issue its terminal abort through
+/// that session rather than dropping it as an ordinary planning error.
+pub(crate) enum BoundDistributedWriteBinding {
+    Bound(BoundDistributedWriteRequest),
+    AbortRequired {
+        session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
+        reason: String,
+    },
+}
+
+pub(crate) fn bind_prepared_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     prepared: PreparedDistributedWriteRequest,
-) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+) -> Result<BoundDistributedWriteBinding, String> {
     let cohort_id = prepared.write_cohort_id();
     let session = query_execution
         .begin_write_operation(prepared.registration())
         .map_err(|error| error.to_string())?;
     let registration =
-        crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-            session, cohort_id,
-        )
-        .map_err(|error| error.to_string())?;
-    prepared
-        .into_request(execution, registration)
-        .map_err(|error| error.to_string())
+        match crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+            session.clone(),
+            cohort_id,
+        ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                return Ok(BoundDistributedWriteBinding::AbortRequired {
+                    session,
+                    reason: error.to_string(),
+                });
+            }
+        };
+    let request = match prepared.into_request(execution, registration) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(BoundDistributedWriteBinding::AbortRequired {
+                session,
+                reason: error.to_string(),
+            });
+        }
+    };
+    Ok(BoundDistributedWriteBinding::Bound(
+        BoundDistributedWriteRequest { request, session },
+    ))
 }
 
 fn execute_bound_distributed_write_request(

@@ -27,6 +27,7 @@ use novarocks::common::engine_error::{EngineError, EngineErrorCode};
 use novarocks::engine::ctas_engine::CtasEngine;
 use novarocks::engine::delete_engine::DeleteEngine;
 use novarocks::engine::insert_engine::InsertEngine;
+use novarocks::engine::mutation_engine::MutationEngine;
 use novarocks::engine::truncate_engine::TruncateEngine;
 use novarocks::engine::{
     PreparedQueryOperation, StandaloneCommandExecutor, StandaloneNovaRocks, StatementResult,
@@ -78,6 +79,7 @@ fn execute_frontend_command<C, T>(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
     delete_engine: &dyn DeleteEngine,
+    mutation_engine: Option<&dyn MutationEngine>,
     ctas_route: C,
     truncate_route: T,
     command: &dyn CoreCommandRoute,
@@ -94,14 +96,43 @@ where
         Ok(None) => match dml.try_execute_delete(delete_engine, sql, context, Some(&query_options))
         {
             Ok(Some(())) => Ok(StatementResult::Ok),
-            Ok(None) => match ctas_route(sql, context, &query_options) {
-                Ok(Some(())) => Ok(StatementResult::Ok),
-                Ok(None) => match truncate_route(sql, context, &query_options) {
+            Ok(None) => match mutation_engine {
+                Some(mutation_engine) => match dml.try_execute_update(
+                    mutation_engine,
+                    sql,
+                    context,
+                    Some(&query_options),
+                ) {
                     Ok(Some(())) => Ok(StatementResult::Ok),
-                    Ok(None) => command.execute(sql, context, query_options),
+                    Ok(None) => match dml.try_execute_merge(
+                        mutation_engine,
+                        sql,
+                        context,
+                        Some(&query_options),
+                    ) {
+                        Ok(Some(())) => Ok(StatementResult::Ok),
+                        Ok(None) => match ctas_route(sql, context, &query_options) {
+                            Ok(Some(())) => Ok(StatementResult::Ok),
+                            Ok(None) => match truncate_route(sql, context, &query_options) {
+                                Ok(Some(())) => Ok(StatementResult::Ok),
+                                Ok(None) => command.execute(sql, context, query_options),
+                                Err(error) => Err(error.to_string()),
+                            },
+                            Err(error) => Err(error.to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    },
                     Err(error) => Err(error.to_string()),
                 },
-                Err(error) => Err(error.to_string()),
+                None => match ctas_route(sql, context, &query_options) {
+                    Ok(Some(())) => Ok(StatementResult::Ok),
+                    Ok(None) => match truncate_route(sql, context, &query_options) {
+                        Ok(Some(())) => Ok(StatementResult::Ok),
+                        Ok(None) => command.execute(sql, context, query_options),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                },
             },
             Err(error) => Err(error.to_string()),
         },
@@ -120,6 +151,7 @@ pub struct FrontendQueryService {
     dml: Arc<DmlService>,
     insert_engine: Arc<dyn InsertEngine>,
     delete_engine: Arc<dyn DeleteEngine>,
+    mutation_engine: Arc<dyn MutationEngine>,
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
 }
@@ -134,6 +166,7 @@ impl FrontendQueryService {
         dml: Arc<DmlService>,
         insert_engine: Arc<dyn InsertEngine>,
         delete_engine: Arc<dyn DeleteEngine>,
+        mutation_engine: Arc<dyn MutationEngine>,
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
     ) -> Self {
@@ -146,6 +179,7 @@ impl FrontendQueryService {
             dml,
             insert_engine,
             delete_engine,
+            mutation_engine,
             ctas_engine,
             truncate_engine,
         }
@@ -475,6 +509,7 @@ impl FrontendQuerySession {
         let dml = Arc::clone(&self.service.dml);
         let insert_engine = Arc::clone(&self.service.insert_engine);
         let delete_engine = Arc::clone(&self.service.delete_engine);
+        let mutation_engine = Arc::clone(&self.service.mutation_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let mut query_options = state.execution_settings.query_options();
@@ -500,6 +535,7 @@ impl FrontendQuerySession {
                     dml.as_ref(),
                     insert_engine.as_ref(),
                     delete_engine.as_ref(),
+                    Some(mutation_engine.as_ref()),
                     |sql, context, query_options| {
                         dml.try_execute_ctas(
                             ctas_engine.as_ref(),
@@ -532,6 +568,7 @@ impl FrontendQuerySession {
                     dml.as_ref(),
                     insert_engine.as_ref(),
                     delete_engine.as_ref(),
+                    Some(mutation_engine.as_ref()),
                     |sql, context, query_options| {
                         dml.try_execute_ctas(
                             ctas_engine.as_ref(),
@@ -1130,6 +1167,10 @@ mod tests {
         IcebergInsertCommit, IcebergPreparedInsert, IcebergWriteReport, PrepareIcebergInsert,
         PreparedIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
     };
+    use novarocks::engine::mutation_engine::{
+        MutationAbort, MutationCommit, MutationEngine, MutationPrepared, MutationStageOutcome,
+        PrepareMutationRequest, PreparedMutation,
+    };
     use novarocks::engine::statistics::{
         CollectedColumnStatistics, EmptyStatisticsService, StatisticsColumn, StatisticsEngine,
         StatisticsTableTarget,
@@ -1150,6 +1191,44 @@ mod tests {
     #[derive(Default)]
     struct RecordingDeleteEngine {
         executions: Mutex<Vec<QueryExecutionContext>>,
+    }
+
+    struct RejectingMutationEngine;
+
+    impl MutationEngine for RejectingMutationEngine {
+        fn prepare_mutation(
+            &self,
+            _request: PrepareMutationRequest<'_>,
+        ) -> Result<PreparedMutation, String> {
+            Err("mutation validation failed".to_string())
+        }
+
+        fn stage_mutation(
+            &self,
+            _prepared: &dyn MutationPrepared,
+        ) -> Result<MutationStageOutcome, String> {
+            unreachable!("rejected mutation must not stage")
+        }
+
+        fn abort_mutation(
+            &self,
+            _prepared: &dyn MutationPrepared,
+            _abort: &dyn MutationAbort,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            unreachable!("rejected mutation must not abort")
+        }
+
+        fn commit_mutation(
+            &self,
+            _prepared: &dyn MutationPrepared,
+            _commit: &dyn MutationCommit,
+        ) -> Result<CommitOutcome, CommitServiceError> {
+            unreachable!("rejected mutation must not commit")
+        }
+
+        fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
+            unreachable!("rejected mutation must not finalize")
+        }
     }
 
     struct TestDeletePrepared;
@@ -1347,6 +1426,7 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            None,
             not_ctas,
             not_truncate,
             &command,
@@ -1375,6 +1455,7 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            None,
             not_ctas,
             not_truncate,
             &command,
@@ -1410,6 +1491,7 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            None,
             not_ctas,
             not_truncate,
             &command,
@@ -1440,6 +1522,7 @@ mod tests {
             &dml,
             &engine,
             &delete_engine,
+            None,
             not_ctas,
             not_truncate,
             &command,
@@ -1472,6 +1555,7 @@ mod tests {
             &dml,
             &insert,
             &delete,
+            None,
             |_, _, _| {
                 ctas_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(()))
@@ -1505,6 +1589,7 @@ mod tests {
             &dml,
             &insert,
             &delete,
+            None,
             |_, _, _| Err(crate::dml::DmlError::executor("CTAS failed")),
             |_, _, _| panic!("TRUNCATE route must not follow a CTAS error"),
             &command,
@@ -1521,6 +1606,7 @@ mod tests {
             &dml,
             &insert,
             &delete,
+            None,
             |_, _, _| Ok(None),
             |_, _, _| Err(crate::dml::DmlError::executor("TRUNCATE failed")),
             &command,
@@ -1530,6 +1616,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("TRUNCATE failed"));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frontend_router_recognized_mutations_never_fall_back_to_core() {
+        let insert = RecordingInsertEngine::default();
+        let delete = RecordingDeleteEngine::default();
+        let mutation = RejectingMutationEngine;
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::new(Arc::new(
+            crate::dml::journal::testing::InMemoryOperationJournal::default(),
+        ));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(95, Instant::now() + Duration::from_secs(30), &cancellation);
+
+        for sql in [
+            "UPDATE t SET k = 1",
+            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
+            "UPDATE information_schema.be_configs SET value = '0'",
+        ] {
+            let error = execute_frontend_command(
+                &dml,
+                &insert,
+                &delete,
+                Some(&mutation),
+                not_ctas,
+                not_truncate,
+                &command,
+                sql,
+                &context,
+                QueryOptions::default(),
+            )
+            .expect_err("recognized mutation must terminate frontend route");
+            assert!(
+                error.contains("mutation validation failed"),
+                "error={error}"
+            );
+        }
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1549,6 +1674,7 @@ mod tests {
             &dml,
             &insert,
             &delete,
+            None,
             |_, _, _| {
                 ctas_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(None)
