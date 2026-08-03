@@ -54,21 +54,9 @@ impl MvStorageEngine {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvTarget {
-    pub catalog: Option<String>,
-    pub database: String,
-    pub name: String,
-}
-
-impl MvTarget {
-    pub fn display_name(&self) -> String {
-        match self.catalog.as_deref() {
-            Some(catalog) => format!("{catalog}.{}.{}", self.database, self.name),
-            None => format!("{}.{}", self.database, self.name),
-        }
-    }
-}
+/// Compatibility path for the SQL-owned target identity. Application model
+/// and repository users retain this import while lifecycle adapters migrate.
+pub use crate::sql::mv_refresh::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshMode {

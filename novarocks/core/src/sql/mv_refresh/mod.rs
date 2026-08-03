@@ -12,12 +12,33 @@ use std::collections::BTreeMap;
 
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 
-use crate::mv::model::MvTarget;
 pub use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::sql::parser::ast::RefreshMaterializedViewStmt;
 
 pub mod first_refresh;
 pub mod incremental;
+
+/// SQL identity of a materialized-view target.
+///
+/// This value is shared with the application lifecycle, but it is canonical
+/// planning vocabulary: it has no repository, connector, or execution
+/// authority. Application code may re-export it for compatibility while its
+/// persistence and lifecycle adapters are migrated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvTarget {
+    pub catalog: Option<String>,
+    pub database: String,
+    pub name: String,
+}
+
+impl SqlMvTarget {
+    pub fn display_name(&self) -> String {
+        match self.catalog.as_deref() {
+            Some(catalog) => format!("{catalog}.{}.{}", self.database, self.name),
+            None => format!("{}.{}", self.database, self.name),
+        }
+    }
+}
 
 pub(crate) const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
      its previous behavior (drop target + delete definition + recreate empty target) \
@@ -60,7 +81,7 @@ impl MvRefreshStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshFinalizeFacts {
     pub mv_id: i64,
-    pub target: MvTarget,
+    pub target: SqlMvTarget,
     pub base_snapshots: BTreeMap<String, Option<i64>>,
     pub base_table_uuids: BTreeMap<String, String>,
     pub expected_target_snapshot_id: Option<i64>,
@@ -89,7 +110,7 @@ pub struct MvRefreshAttemptIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshPreparationRequest {
     pub statement: MvRefreshStatement,
-    pub target: MvTarget,
+    pub target: SqlMvTarget,
     pub attempt: MvRefreshAttemptIdentity,
 }
 
@@ -156,12 +177,21 @@ pub trait MvRefreshPreparationService: Send + Sync {
 mod tests {
     use novarocks_spi::connector::ConnectorWriteOperationId;
 
-    use crate::mv::model::MvTarget;
-
     use super::{
         FULL_REFRESH_DISABLED_MESSAGE, MvRefreshAttemptIdentity, MvRefreshPreparationRequest,
-        MvRefreshStatement,
+        MvRefreshStatement, SqlMvTarget,
     };
+
+    #[test]
+    fn sqlx2_mv_target_identity_is_sql_owned() {
+        let target = SqlMvTarget {
+            catalog: Some("iceberg".to_string()),
+            database: "analytics".to_string(),
+            name: "daily_orders".to_string(),
+        };
+
+        assert_eq!(target.display_name(), "iceberg.analytics.daily_orders");
+    }
 
     #[test]
     fn full_refresh_remains_an_explicitly_unsupported_request() {
@@ -203,7 +233,7 @@ mod tests {
                 name_parts: vec!["mv".to_string()],
                 full: false,
             },
-            target: MvTarget {
+            target: SqlMvTarget {
                 catalog: Some("iceberg".to_string()),
                 database: "db".to_string(),
                 name: "mv".to_string(),
