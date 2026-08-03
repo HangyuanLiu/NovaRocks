@@ -15599,9 +15599,11 @@ fn execute_imv_change_stream_writer(
     let completion = result.connector_completion.as_ref().ok_or_else(|| {
         "Iceberg MV change-stream write completed without generic connector completion".to_string()
     })?;
-    let outcome =
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(&commit_executor, completion)
-            .map_err(|error| format!("commit generic Iceberg MV staged reports: {error:?}"))?;
+    let outcome = crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
+        &commit_executor,
+        completion,
+    )
+    .map_err(|error| format!("commit generic Iceberg MV staged reports: {error:?}"))?;
     Ok(
         crate::mv::refresh::change_stream_write::ExecutedChangeStreamWrite {
             write_commit: None,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ExternalMutationFinalization,
+    ConnectorWriteAbortOutcome, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use opendal::Operator;
 
@@ -23,6 +23,125 @@ use super::commit::{
     CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
 };
 use super::report::IcebergWriterReport;
+use super::write_contract::decode_write_receipt;
+
+/// Convert a sealed provider commit decision into the application-neutral
+/// durable outcome consumed by the frontend lifecycle runner.
+pub(crate) fn commit_iceberg_connector_write(
+    commit_executor: &IcebergWriteCommitExecutor,
+    completion: &crate::query_execution::ConnectorWriteCompletion,
+) -> Result<CommitOutcome, CommitServiceError> {
+    match crate::query_execution::connector_write_transaction::commit(completion) {
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+            ..
+        }) => decode_write_receipt(receipt.payload())
+            .map(|new_snapshot_id| CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths: Vec::new(),
+            })
+            .map_err(CommitServiceError::invalid_input),
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Failed(failure),
+            ..
+        }) => match decode_write_receipt(receipt.payload()) {
+            Ok(new_snapshot_id) => Err(CommitServiceError::finalize_failed_known_committed(
+                Some(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: Vec::new(),
+                }),
+                failure.message().to_string(),
+                super::commit::RecoveryEvidence::from_collector(&commit_executor.collector),
+            )),
+            Err(error) => Err(CommitServiceError::invalid_input(error)),
+        },
+        Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
+            Err(CommitServiceError::known_uncommitted(
+                failure.message().to_string(),
+                super::commit::CleanupAttempt::not_attempted(),
+            ))
+        }
+        Ok(ExternalMutationOutcome::CommitUnknown { failure, .. }) => {
+            Err(CommitServiceError::unknown(
+                failure.message().to_string(),
+                super::commit::RecoveryEvidence::from_collector(&commit_executor.collector),
+            ))
+        }
+        Err(error) => Err(CommitServiceError::invalid_input(error.to_string())),
+    }
+}
+
+/// Make the terminal abort decision for an exact sealed connector operation.
+///
+/// A staging failure is not proof that the external mutation did not commit:
+/// preserve the provider's three-way truth for the frontend-owned lifecycle.
+pub(crate) fn abort_iceberg_connector_write(
+    commit_executor: &IcebergWriteCommitExecutor,
+    session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    stage_reason: String,
+) -> Result<CommitOutcome, CommitServiceError> {
+    match session.abort(context) {
+        Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup }) => {
+            let (cleanup, suffix) = match cleanup {
+                ExternalMutationFinalization::Complete => (
+                    super::commit::CleanupAttempt::completed(Vec::new()),
+                    String::new(),
+                ),
+                ExternalMutationFinalization::Failed(failure) => (
+                    super::commit::CleanupAttempt {
+                        attempted: true,
+                        error_count: 1,
+                        error_paths: Vec::new(),
+                    },
+                    format!("; connector cleanup failed: {}", failure.message()),
+                ),
+            };
+            Err(CommitServiceError::known_uncommitted(
+                format!("{stage_reason}{suffix}"),
+                cleanup,
+            ))
+        }
+        Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }) => decode_write_receipt(receipt.payload())
+            .map(|new_snapshot_id| CommitOutcome {
+                new_snapshot_id,
+                written_manifest_paths: Vec::new(),
+            })
+            .map_err(CommitServiceError::invalid_input),
+        Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt,
+            finalization: ExternalMutationFinalization::Failed(failure),
+        }) => match decode_write_receipt(receipt.payload()) {
+            Ok(new_snapshot_id) => Err(CommitServiceError::finalize_failed_known_committed(
+                Some(CommitOutcome {
+                    new_snapshot_id,
+                    written_manifest_paths: Vec::new(),
+                }),
+                failure.message().to_string(),
+                super::commit::RecoveryEvidence::from_collector(&commit_executor.collector),
+            )),
+            Err(error) => Err(CommitServiceError::invalid_input(error)),
+        },
+        Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
+            Err(CommitServiceError::unknown(
+                format!(
+                    "{stage_reason}; connector abort outcome is unknown: {}",
+                    failure.message()
+                ),
+                super::commit::RecoveryEvidence::from_collector(&commit_executor.collector),
+            ))
+        }
+        Err(error) => Err(CommitServiceError::unknown(
+            format!("{stage_reason}; connector abort RPC failed: {error}"),
+            super::commit::RecoveryEvidence::from_collector(&commit_executor.collector),
+        )),
+    }
+}
 
 /// Provider-private commit context for one coordinated Iceberg writer.
 ///

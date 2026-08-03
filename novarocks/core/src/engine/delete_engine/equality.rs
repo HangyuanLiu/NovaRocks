@@ -168,7 +168,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )

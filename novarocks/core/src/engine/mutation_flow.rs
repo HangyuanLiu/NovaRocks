@@ -625,14 +625,24 @@ pub(crate) fn stage_prepared_update_mutation(
             let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
             let mut write = write;
             let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
+            let provider_binding = Arc::new(
+                crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+                    crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                        target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                        target_ref: &target_ref,
+                        table: &commit_executor.table,
+                        entry: &entry,
+                        base_snapshot_id: read_snapshot_id,
+                        operation_id,
+                        topology: &planned.topology,
+                        commit_executor: Arc::clone(&commit_executor),
+                    },
+                )?,
+            );
             let connector_write =
-                crate::engine::iceberg_writer::register_iceberg_change_stream_connector_write(
-                    state,
+                crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
                     &target,
-                    &planned.topology,
-                    Arc::clone(&commit_executor),
-                    &entry,
-                    read_snapshot_id,
+                    &provider_binding,
                     operation_id,
                     connector_context.clone(),
                 )?;
@@ -641,6 +651,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 target: target.clone(),
                 planned: Mutex::new(Some(planned)),
                 connector_write,
+                provider_binding,
                 commit_executor,
                 execution,
                 connector_context,
@@ -658,8 +669,28 @@ pub(crate) fn stage_prepared_update_mutation(
                     return Err(reason);
                 }
             };
-            if result.connector_completion.is_none()
-                && let Some(commit) = result.write_commit.as_ref()
+            if let Some(completion) = result.connector_completion.as_ref() {
+                let known_empty = match completion.is_known_empty() {
+                    Ok(known_empty) => known_empty,
+                    Err(error) => {
+                        return Ok(MutationStagedWrite::AbortRequired {
+                            reason: format!(
+                                "summarize MOR UPDATE change-stream aggregate: {error}"
+                            ),
+                            execution: execution_handle,
+                        });
+                    }
+                };
+                if known_empty {
+                    if let Err(reason) = execution_handle.finish_known_empty_noop(completion) {
+                        return Ok(MutationStagedWrite::AbortRequired {
+                            reason,
+                            execution: execution_handle,
+                        });
+                    }
+                    return Ok(MutationStagedWrite::NoOp);
+                }
+            } else if let Some(commit) = result.write_commit.as_ref()
                 && !write_commit_has_files(commit)
             {
                 if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
@@ -670,13 +701,11 @@ pub(crate) fn stage_prepared_update_mutation(
                         execution: execution_handle,
                     });
                 }
-                if let Err(reason) = execution_handle.finish_known_empty_noop() {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason,
-                        execution: execution_handle,
-                    });
-                }
-                return Ok(MutationStagedWrite::NoOp);
+                return Ok(MutationStagedWrite::AbortRequired {
+                    reason: "MOR UPDATE missing connector completion for an empty aggregate"
+                        .to_string(),
+                    execution: execution_handle,
+                });
             }
             let Some(completion) = result.connector_completion else {
                 return Ok(MutationStagedWrite::AbortRequired {
@@ -1530,6 +1559,8 @@ struct MorUpdateChangeStreamExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    provider_binding:
+        Arc<crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1542,6 +1573,8 @@ struct MorMergeChangeStreamExecutor {
     target: crate::engine::backend_resolver::TargetBackend,
     planned: Mutex<Option<crate::engine::PlannedIcebergChangeStreamWrite>>,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    provider_binding:
+        Arc<crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderBinding>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1550,14 +1583,11 @@ struct MorMergeChangeStreamExecutor {
 }
 
 impl MorUpdateChangeStreamExecutor {
-    fn finish_known_empty_noop(&self) -> Result<(), String> {
-        self.operation_session
-            .lock()
-            .map_err(|_| "MOR UPDATE operation session lock poisoned".to_string())?
-            .as_ref()
-            .ok_or_else(|| {
-                "MOR UPDATE known-empty stage has no retained operation session".to_string()
-            })?
+    fn finish_known_empty_noop(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<(), String> {
+        completion
             .finish_known_empty_noop()
             .map_err(|error| format!("terminalize MOR UPDATE known-empty session: {error}"))
     }
@@ -1588,29 +1618,32 @@ impl MorUpdateChangeStreamExecutor {
                 self.connector_write.clone(),
             )),
         )?;
-        let bound = crate::engine::bind_prepared_distributed_write_request(
-            &self.state.query_execution,
-            &self.execution,
-            prepared_request,
-        )?;
-        let bound = match bound {
-            crate::engine::BoundDistributedWriteBinding::Bound(bound) => bound,
-            crate::engine::BoundDistributedWriteBinding::AbortRequired { session, reason } => {
-                *self
-                    .operation_session
-                    .lock()
-                    .expect("MOR UPDATE operation session lock poisoned") = Some(session);
-                return Err(reason);
-            }
-        };
+        let session = self
+            .state
+            .query_execution
+            .begin_write_operation(prepared_request.registration())
+            .map_err(|error| error.to_string())?;
         *self
             .operation_session
             .lock()
-            .expect("MOR UPDATE operation session lock poisoned") = Some(bound.session);
-        crate::engine::execute_bound_distributed_write_request(
-            &self.state.query_execution,
-            bound.request,
-        )
+            .expect("MOR UPDATE operation session lock poisoned") = Some(session.clone());
+        crate::engine::iceberg_writer::activate_iceberg_change_stream_provider_binding_after_session(
+            &self.state,
+            &self.target,
+            &self.provider_binding,
+            session.operation_id(),
+            &session,
+        )?;
+        let registration =
+            crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                session,
+                prepared_request.write_cohort_id(),
+            )
+            .map_err(|error| error.to_string())?;
+        let request = prepared_request
+            .into_request(&self.execution, registration)
+            .map_err(|error| error.to_string())?;
+        crate::engine::execute_bound_distributed_write_request(&self.state.query_execution, request)
     }
 }
 
@@ -1633,7 +1666,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
             .expect("MOR UPDATE operation session lock poisoned")
             .clone()
             .expect("MOR UPDATE abort requires a retained operation session");
-        crate::engine::iceberg_writer::abort_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
             &self.commit_executor,
             &session,
             self.connector_context.clone(),
@@ -1645,7 +1678,7 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )
@@ -1657,14 +1690,11 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
 }
 
 impl MorMergeChangeStreamExecutor {
-    fn finish_known_empty_noop(&self) -> Result<(), String> {
-        self.operation_session
-            .lock()
-            .map_err(|_| "MOR MERGE operation session lock poisoned".to_string())?
-            .as_ref()
-            .ok_or_else(|| {
-                "MOR MERGE known-empty stage has no retained operation session".to_string()
-            })?
+    fn finish_known_empty_noop(
+        &self,
+        completion: &crate::query_execution::ConnectorWriteCompletion,
+    ) -> Result<(), String> {
+        completion
             .finish_known_empty_noop()
             .map_err(|error| format!("terminalize MOR MERGE known-empty session: {error}"))
     }
@@ -1695,29 +1725,32 @@ impl MorMergeChangeStreamExecutor {
                 self.connector_write.clone(),
             )),
         )?;
-        let bound = crate::engine::bind_prepared_distributed_write_request(
-            &self.state.query_execution,
-            &self.execution,
-            prepared_request,
-        )?;
-        let bound = match bound {
-            crate::engine::BoundDistributedWriteBinding::Bound(bound) => bound,
-            crate::engine::BoundDistributedWriteBinding::AbortRequired { session, reason } => {
-                *self
-                    .operation_session
-                    .lock()
-                    .expect("MOR MERGE operation session lock poisoned") = Some(session);
-                return Err(reason);
-            }
-        };
+        let session = self
+            .state
+            .query_execution
+            .begin_write_operation(prepared_request.registration())
+            .map_err(|error| error.to_string())?;
         *self
             .operation_session
             .lock()
-            .expect("MOR MERGE operation session lock poisoned") = Some(bound.session);
-        crate::engine::execute_bound_distributed_write_request(
-            &self.state.query_execution,
-            bound.request,
-        )
+            .expect("MOR MERGE operation session lock poisoned") = Some(session.clone());
+        crate::engine::iceberg_writer::activate_iceberg_change_stream_provider_binding_after_session(
+            &self.state,
+            &self.target,
+            &self.provider_binding,
+            session.operation_id(),
+            &session,
+        )?;
+        let registration =
+            crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                session,
+                prepared_request.write_cohort_id(),
+            )
+            .map_err(|error| error.to_string())?;
+        let request = prepared_request
+            .into_request(&self.execution, registration)
+            .map_err(|error| error.to_string())?;
+        crate::engine::execute_bound_distributed_write_request(&self.state.query_execution, request)
     }
 }
 
@@ -1740,7 +1773,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
             .expect("MOR MERGE operation session lock poisoned")
             .clone()
             .expect("MOR MERGE abort requires a retained operation session");
-        crate::engine::iceberg_writer::abort_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
             &self.commit_executor,
             &session,
             self.connector_context.clone(),
@@ -1752,7 +1785,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )
@@ -2112,7 +2145,7 @@ impl MutationExecution for DistributedCowUpdateExecutor {
     }
 
     fn abort(&self, reason: String) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::abort_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
             &self.commit_executor,
             &self.operation_session,
             self.connector_context.clone(),
@@ -2124,7 +2157,7 @@ impl MutationExecution for DistributedCowUpdateExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )
@@ -2787,14 +2820,24 @@ pub(crate) fn stage_prepared_merge_mutation(
         let operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
         let mut write = write;
         let planned = plan_dml_change_stream_write(state, &target, &mut write)?;
+        let provider_binding = Arc::new(
+            crate::connector::iceberg::change_stream_write::bind_iceberg_change_stream_provider(
+                crate::connector::iceberg::change_stream_write::IcebergChangeStreamProviderRequest {
+                    target: &format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                    target_ref: "main",
+                    table: &commit_executor.table,
+                    entry: &entry,
+                    base_snapshot_id,
+                    operation_id,
+                    topology: &planned.topology,
+                    commit_executor: Arc::clone(&commit_executor),
+                },
+            )?,
+        );
         let connector_write =
-            crate::engine::iceberg_writer::register_iceberg_change_stream_connector_write(
-                state,
+            crate::engine::iceberg_writer::iceberg_change_stream_provider_binding_template(
                 &target,
-                &planned.topology,
-                Arc::clone(&commit_executor),
-                &entry,
-                base_snapshot_id,
+                &provider_binding,
                 operation_id,
                 connector_context.clone(),
             )?;
@@ -2803,6 +2846,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             target: target.clone(),
             planned: Mutex::new(Some(planned)),
             connector_write,
+            provider_binding,
             commit_executor,
             execution,
             connector_context,
@@ -2820,8 +2864,26 @@ pub(crate) fn stage_prepared_merge_mutation(
                 return Err(reason);
             }
         };
-        if result.connector_completion.is_none()
-            && let Some(commit) = result.write_commit.as_ref()
+        if let Some(completion) = result.connector_completion.as_ref() {
+            let known_empty = match completion.is_known_empty() {
+                Ok(known_empty) => known_empty,
+                Err(error) => {
+                    return Ok(MutationStagedWrite::AbortRequired {
+                        reason: format!("summarize MOR MERGE change-stream aggregate: {error}"),
+                        execution: execution_handle,
+                    });
+                }
+            };
+            if known_empty {
+                if let Err(reason) = execution_handle.finish_known_empty_noop(completion) {
+                    return Ok(MutationStagedWrite::AbortRequired {
+                        reason,
+                        execution: execution_handle,
+                    });
+                }
+                return Ok(MutationStagedWrite::NoOp);
+            }
+        } else if let Some(commit) = result.write_commit.as_ref()
             && !write_commit_has_files(commit)
         {
             if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
@@ -2831,13 +2893,10 @@ pub(crate) fn stage_prepared_merge_mutation(
                     execution: execution_handle,
                 });
             }
-            if let Err(reason) = execution_handle.finish_known_empty_noop() {
-                return Ok(MutationStagedWrite::AbortRequired {
-                    reason,
-                    execution: execution_handle,
-                });
-            }
-            return Ok(MutationStagedWrite::NoOp);
+            return Ok(MutationStagedWrite::AbortRequired {
+                reason: "MOR MERGE missing connector completion for an empty aggregate".to_string(),
+                execution: execution_handle,
+            });
         }
         let Some(completion) = result.connector_completion else {
             return Ok(MutationStagedWrite::AbortRequired {
@@ -4091,7 +4150,7 @@ impl MutationExecution for DistributedMergeExecutor {
             .cow_operation
             .as_ref()
             .expect("MERGE typed abort requires a sealed connector operation");
-        crate::engine::iceberg_writer::abort_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::abort_iceberg_connector_write(
             &self.commit_executor,
             &cow.session,
             self.connector_context.clone(),
@@ -4103,7 +4162,7 @@ impl MutationExecution for DistributedMergeExecutor {
         &self,
         completion: &crate::query_execution::ConnectorWriteCompletion,
     ) -> Result<CommitOutcome, CommitServiceError> {
-        crate::engine::iceberg_writer::commit_iceberg_connector_write(
+        crate::connector::iceberg::write_commit::commit_iceberg_connector_write(
             &self.commit_executor,
             completion,
         )

@@ -32,7 +32,8 @@ CREATE TABLE iceberg_rest_${suite_uuid0}.iceberg_rest_update_merge_db_${uuid0}.t
 )
 TBLPROPERTIES (
   "format-version" = "3",
-  "write.row-lineage" = "true"
+  "write.row-lineage" = "true",
+  "novarocks.update.mode" = "merge-on-read"
 );
 
 -- query 3

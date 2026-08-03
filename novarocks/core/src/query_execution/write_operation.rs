@@ -277,6 +277,49 @@ impl ConnectorWriteOperationSession {
         Ok(attempt)
     }
 
+    /// Withdraw an accepted metadata-only attempt before the operation makes
+    /// any provider terminal decision. This is reserved for a caller that has
+    /// independently proved every report has zero input, bytes and artifacts.
+    pub(crate) fn discard_known_empty_attempt(
+        &self,
+        attachment: &ConnectorWritePlanAttachment,
+        input: &ConnectorWriteCommitInput,
+    ) -> Result<(), ConnectorError> {
+        let attempt = self.attempt_completion(attachment, input)?;
+        let mut state = self.lock_state()?;
+        if state.terminal.is_some() {
+            return Err(invalid(
+                "connector write attempt cannot be discarded after a terminal operation decision",
+            ));
+        }
+        if state.recovery_only {
+            return Err(invalid(
+                "connector write recovery session cannot discard an accepted attempt",
+            ));
+        }
+        let cohort = state
+            .cohorts
+            .get_mut(&attempt.cohort_id())
+            .ok_or_else(|| invalid("connector write attempt references an unknown cohort"))?;
+        if !cohort.superseded.is_empty() {
+            return Err(invalid(
+                "connector write attempt cannot be discarded after a superseded attempt",
+            ));
+        }
+        match &cohort.accepted {
+            Some(accepted) if accepted == &attempt => {
+                cohort.accepted = None;
+                Ok(())
+            }
+            Some(_) => Err(invalid(
+                "connector write attempt cannot discard a different accepted attempt",
+            )),
+            None => Err(invalid(
+                "connector write attempt is not an accepted attempt of this session",
+            )),
+        }
+    }
+
     /// Rebuild the immutable attempt completion after the query coordinator
     /// has accepted its reports.  Maintenance orchestration uses this to
     /// checkpoint the exact opaque report set through its provider facet; it
