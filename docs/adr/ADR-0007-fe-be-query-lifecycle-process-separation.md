@@ -9,9 +9,9 @@ date: 2026-07-27
 provenance:
   - "discussion: 2026-07-27 FE/BE query lifecycle process separation"
 code-anchors:
-  - "novarocks/core/src/coordinator/execution.rs (ExecutionCoordinator)"
-  - "novarocks/core/src/runtime/query_context.rs (QueryContextManager)"
-  - "novarocks/core/src/engine/mod.rs (current direct coordinator call)"
+  - "novarocks/frontend/src/native/transport.rs (LifecycleTransport)"
+  - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry)"
+  - "novarocks-server/src/composition.rs (run_all_in_one_until)"
 ---
 
 ## 问题

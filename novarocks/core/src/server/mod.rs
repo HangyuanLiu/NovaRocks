@@ -2341,7 +2341,6 @@ mod legacy {
                 assert!(err.contains("bind standalone mysql server"), "{err}");
                 assert!(!ready_emitted.load(Ordering::SeqCst));
             }
-
         }
 
         #[test]
