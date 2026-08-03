@@ -640,6 +640,14 @@ mod tests {
                 &request,
                 [3; 32],
                 ConnectorDataMutationPlanSummary::try_new(1, 2, 3)?,
+                match request.operation() {
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
+                        novarocks_spi::connector::ConnectorDataMutationSourceScope::try_new_directory(
+                            [4; 32],
+                        )?,
+                    ),
+                    ConnectorDataMutationOperation::Truncate { .. } => None,
+                },
                 Bytes::from_static(b"plan"),
             )
         }

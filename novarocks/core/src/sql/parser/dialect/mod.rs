@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod add_files;
 pub(crate) mod alter_iceberg_ref;
 pub(crate) mod backend;
 pub(crate) mod create_catalog;

@@ -755,8 +755,19 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         }
         let (private, state_digest, summary) = self.backend.plan(&request)?;
         let provider_payload = canonical_json(private.payload(), "Iceberg data mutation plan")?;
-        let plan =
-            ConnectorDataMutationPlan::try_new(&request, state_digest, summary, provider_payload)?;
+        let source_scope = match &private {
+            PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => {
+                Some(manifest.source_scope)
+            }
+            PlannedIcebergMutation::Truncate { .. } => None,
+        };
+        let plan = ConnectorDataMutationPlan::try_new(
+            &request,
+            state_digest,
+            summary,
+            source_scope,
+            provider_payload,
+        )?;
         self.preflight_durable_truncate_evidence(&plan, private.payload())?;
         plans.insert(
             request.operation_id(),

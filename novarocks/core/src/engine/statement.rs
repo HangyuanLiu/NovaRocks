@@ -1445,44 +1445,6 @@ pub(crate) fn looks_like_show_alter_table_optimize(sql: &str) -> bool {
         && peek_token_word_eq(&parser, "OPTIMIZE")
 }
 
-/// Check if SQL looks like ALTER TABLE ... ADD FILES FROM ...
-pub(crate) fn looks_like_add_files(sql: &str) -> bool {
-    let upper = sql.trim().to_ascii_uppercase();
-    upper.starts_with("ALTER TABLE") && upper.contains("ADD FILES FROM")
-}
-
-/// Parse: ALTER TABLE [catalog.db.]table ADD FILES FROM 's3://...'
-pub(crate) fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
-    // Extract the part between ALTER TABLE and ADD FILES FROM
-    let upper = sql.to_ascii_uppercase();
-    let alter_idx = upper.find("ALTER TABLE").ok_or("missing ALTER TABLE")?;
-    let add_files_idx = upper
-        .find("ADD FILES FROM")
-        .ok_or("missing ADD FILES FROM")?;
-
-    let table_str = sql[alter_idx + 11..add_files_idx].trim();
-    let table_parts: Vec<String> = table_str
-        .split('.')
-        .map(|s| s.trim().trim_matches('`').to_lowercase())
-        .collect();
-
-    // Extract the path after ADD FILES FROM
-    let after_from = &sql[add_files_idx + 14..];
-    let path = after_from
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .to_string();
-
-    if path.is_empty() {
-        return Err("ADD FILES FROM requires a path".to_string());
-    }
-
-    Ok((table_parts, path))
-}
-
 pub(crate) fn looks_like_alter_iceberg_schema(sql: &str) -> bool {
     let Ok(normalized) = crate::sql::parser::dialect::normalize_for_raw_parse(sql) else {
         return false;

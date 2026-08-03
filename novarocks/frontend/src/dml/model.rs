@@ -25,7 +25,8 @@ pub use novarocks::connector::iceberg::commit::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, RecoveryEvidence,
 };
 
-pub const DML_OPERATION_SCHEMA_VERSION: u8 = 2;
+pub const DML_OPERATION_SCHEMA_VERSION: u8 = 3;
+pub const DML_PREVIOUS_OPERATION_SCHEMA_VERSION: u8 = 2;
 pub const DML_LEGACY_OPERATION_SCHEMA_VERSION: u8 = 1;
 pub const DML_UNFINISHED_SCHEMA_VERSION: u8 = 1;
 pub const DML_EXTERNAL_FACT_ENCODED_LIMIT: usize = 16 * 1024;
@@ -73,6 +74,7 @@ pub enum OperationKind {
     Maintenance,
     CreateTableAsSelect,
     Truncate,
+    AddFiles,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,6 +402,89 @@ pub enum TruncateLifecyclePhase {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AddFilesLifecyclePhase {
+    Preparing,
+    Planned,
+    Executing,
+    CommitUnknown,
+    Reconciling,
+    Committed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AddFilesArtifactKind {
+    Plan,
+    Receipt,
+    Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AddFilesArtifactDescriptor {
+    pub kind: AddFilesArtifactKind,
+    pub codec_version: u16,
+    pub total_length: u32,
+    pub chunk_count: u16,
+    pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AddFilesDispatchCertainty {
+    ConfirmedNotDispatched,
+    PossiblyDispatched,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceScopeOwnership {
+    Unclaimed,
+    ReservedImmutable,
+    Frozen,
+    TableOwned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AddFilesLifecycleRecord {
+    pub phase: AddFilesLifecyclePhase,
+    pub connector_operation_id: Uuid,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub connector_instance_id: Option<String>,
+    #[serde(default)]
+    pub connector_incarnation: Option<String>,
+    pub source_location: String,
+    #[serde(default)]
+    pub source_scope_version: Option<u16>,
+    #[serde(default)]
+    pub source_scope_kind: Option<String>,
+    #[serde(default)]
+    pub source_scope_digest: Option<String>,
+    #[serde(default)]
+    pub request_digest: Option<String>,
+    #[serde(default)]
+    pub plan_digest: Option<String>,
+    #[serde(default)]
+    pub state_digest: Option<String>,
+    #[serde(default)]
+    pub plan_summary: Option<DurableMutationSummary>,
+    #[serde(default)]
+    pub plan_artifact: Option<AddFilesArtifactDescriptor>,
+    #[serde(default)]
+    pub receipt_artifact: Option<AddFilesArtifactDescriptor>,
+    #[serde(default)]
+    pub evidence_artifact: Option<AddFilesArtifactDescriptor>,
+    pub dispatch_certainty: AddFilesDispatchCertainty,
+    pub source_ownership: SourceScopeOwnership,
+    #[serde(default)]
+    pub outcome: Option<DurableExternalFact>,
+    pub next_action: StatementNextAction,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TruncateLifecycleRecord {
     pub phase: TruncateLifecyclePhase,
@@ -430,6 +515,39 @@ pub enum OperationPayload {
     WriteV1,
     CtasSaga(CtasSagaRecord),
     TruncateLifecycle(TruncateLifecycleRecord),
+    AddFilesLifecycle(AddFilesLifecycleRecord),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddFilesArtifact {
+    pub descriptor: AddFilesArtifactDescriptor,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AddFilesSourceAction {
+    Reserve {
+        provider_id: String,
+        scope_digest: String,
+        ownership: SourceScopeOwnership,
+    },
+    Transition {
+        provider_id: String,
+        scope_digest: String,
+        expected: SourceScopeOwnership,
+        ownership: SourceScopeOwnership,
+    },
+    Release {
+        provider_id: String,
+        scope_digest: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddFilesMutationRequest {
+    pub operation: OperationMutationRequest,
+    pub artifacts: Vec<AddFilesArtifact>,
+    pub source_action: Option<AddFilesSourceAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -574,6 +692,56 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<OperationPayload>(&encoded).unwrap(),
             truncate
+        );
+
+        let add_files = OperationPayload::AddFilesLifecycle(AddFilesLifecycleRecord {
+            phase: AddFilesLifecyclePhase::CommitUnknown,
+            connector_operation_id: Uuid::now_v7(),
+            provider_id: Some("iceberg".to_string()),
+            connector_instance_id: Some("rest".to_string()),
+            connector_incarnation: Some("05".repeat(16)),
+            source_location: "s3://warehouse/import".to_string(),
+            source_scope_version: Some(1),
+            source_scope_kind: Some("DIRECTORY".to_string()),
+            source_scope_digest: Some("06".repeat(32)),
+            request_digest: Some("request".to_string()),
+            plan_digest: Some("plan".to_string()),
+            state_digest: Some("state".to_string()),
+            plan_summary: Some(DurableMutationSummary {
+                file_count: 1,
+                row_count: 2,
+                total_bytes: 3,
+            }),
+            plan_artifact: Some(AddFilesArtifactDescriptor {
+                kind: AddFilesArtifactKind::Plan,
+                codec_version: 1,
+                total_length: 4,
+                chunk_count: 1,
+                sha256: "07".repeat(32),
+            }),
+            receipt_artifact: None,
+            evidence_artifact: Some(AddFilesArtifactDescriptor {
+                kind: AddFilesArtifactKind::Evidence,
+                codec_version: 1,
+                total_length: 5,
+                chunk_count: 1,
+                sha256: "08".repeat(32),
+            }),
+            dispatch_certainty: AddFilesDispatchCertainty::PossiblyDispatched,
+            source_ownership: SourceScopeOwnership::Frozen,
+            outcome: Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::CommitUnknown,
+                receipt: None,
+                evidence: None,
+                finalization_failure: None,
+                failure: Some("provider response lost".to_string()),
+            }),
+            next_action: StatementNextAction::ManualInspect,
+        });
+        let encoded = serde_json::to_vec(&add_files).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<OperationPayload>(&encoded).unwrap(),
+            add_files
         );
     }
 

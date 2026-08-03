@@ -139,6 +139,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0030 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
 - ADR-0031 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
 - ADR-0032 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（active）
+- ADR-0033 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
 
 ### frontend-mv
 

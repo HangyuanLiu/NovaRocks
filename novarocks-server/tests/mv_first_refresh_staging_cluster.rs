@@ -471,6 +471,7 @@ query_lifecycle_fault_dir = "{}"
                 let insert_engine = engine.insert_engine();
                 let delete_engine = engine.delete_engine();
                 let mutation_engine = engine.mutation_engine();
+                let add_files_engine = engine.add_files_engine();
                 let ctas_engine = engine.ctas_engine();
                 let truncate_engine = engine.truncate_engine();
                 Ok(std::sync::Arc::new(FrontendQueryService::new(
@@ -483,6 +484,7 @@ query_lifecycle_fault_dir = "{}"
                     insert_engine,
                     delete_engine,
                     mutation_engine,
+                    add_files_engine,
                     ctas_engine,
                     truncate_engine,
                 )))

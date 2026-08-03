@@ -18,6 +18,7 @@
 //! Provider-private ADD FILES planning and revalidation primitives.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
@@ -27,18 +28,20 @@ use iceberg::table::Table;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::connector::iceberg::catalog::registry::block_on_iceberg;
 use crate::connector::iceberg::fs_io;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_spi::connector::{
-    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    ConnectorDataMutationSourceScope, MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
 };
 
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.add-files-manifest.v1\0";
 const SCHEMA_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.add-files-schema.v1\0";
+const SOURCE_SCOPE_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.add-files-source-scope.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddFilesSchemaIdentityMode {
@@ -59,6 +62,7 @@ pub(crate) struct AddFilesManifestRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AddFilesManifest {
+    pub(crate) source_scope: ConnectorDataMutationSourceScope,
     pub(crate) records: Vec<AddFilesManifestRecord>,
     pub(crate) digest: [u8; 32],
     pub(crate) total_bytes: u64,
@@ -123,8 +127,10 @@ pub(crate) fn revalidate_manifest_for_table(
     expected: &AddFilesManifest,
 ) -> Result<AddFilesManifest, String> {
     let actual = plan_manifest_for_table(table, source_directory, object_store_config)?;
-    if actual.digest != expected.digest {
-        return Err("ADD FILES source manifest changed after planning".to_string());
+    if actual.digest != expected.digest || actual.source_scope != expected.source_scope {
+        return Err(
+            "ADD FILES source manifest or physical scope changed after planning".to_string(),
+        );
     }
     Ok(actual)
 }
@@ -144,6 +150,7 @@ fn plan_manifest(
     if let Some(mapping) = mapping.as_ref() {
         validate_name_mapping_for_target(mapping, target_schema)?;
     }
+    let source_scope = canonical_directory_source_scope(source_directory, object_store_config)?;
     let files = list_direct_files(source_directory, object_store_config)?;
     if files.is_empty() {
         return Err(format!(
@@ -214,6 +221,7 @@ fn plan_manifest(
             .ok_or_else(|| "ADD FILES row total overflow".to_string())
     })?;
     Ok(AddFilesManifest {
+        source_scope,
         records,
         digest,
         total_bytes,
@@ -222,6 +230,174 @@ fn plan_manifest(
         schema_identity_mode: expected_mode.expect("nonempty manifest has a schema mode"),
         canonical_name_mapping,
     })
+}
+
+/// Derives the provider-owned physical directory identity used by the frontend
+/// ownership lifecycle. The digest deliberately excludes credentials and every
+/// per-operation fact; it is only a stable filesystem location identity.
+pub(crate) fn canonical_directory_source_scope(
+    source_directory: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<ConnectorDataMutationSourceScope, String> {
+    let access = fs_io::resolve_access_for_location(source_directory, object_store_config)
+        .map_err(|error| format!("resolve ADD FILES source scope {source_directory}: {error}"))?;
+    let handle = access.handle();
+    let relative_path = access.single_relative_path()?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_SCOPE_DIGEST_DOMAIN);
+    match handle.scheme() {
+        novarocks_fs::FsScheme::Local => {
+            hasher.update(b"local\0");
+            let root = handle
+                .root()
+                .ok_or_else(|| "local ADD FILES source scope is missing root".to_string())?;
+            let path =
+                std::fs::canonicalize(Path::new(root).join(relative_path)).map_err(|error| {
+                    format!("canonicalize local ADD FILES source directory: {error}")
+                })?;
+            digest_bytes(&mut hasher, path.to_string_lossy().as_bytes());
+        }
+        novarocks_fs::FsScheme::ObjectStore => {
+            hasher.update(b"object-store\0");
+            let config = object_store_config.ok_or_else(|| {
+                "object-store ADD FILES source scope is missing object store config".to_string()
+            })?;
+            digest_bytes(
+                &mut hasher,
+                normalized_object_store_endpoint(&config.endpoint)?.as_bytes(),
+            );
+            let bucket = handle.authority().ok_or_else(|| {
+                "object-store ADD FILES source scope is missing bucket".to_string()
+            })?;
+            digest_bytes(&mut hasher, bucket.trim().to_ascii_lowercase().as_bytes());
+            digest_bytes(
+                &mut hasher,
+                canonical_nonlocal_directory_path(relative_path)?.as_bytes(),
+            );
+        }
+        novarocks_fs::FsScheme::Hdfs => {
+            hasher.update(b"hdfs\0");
+            let authority = handle
+                .authority()
+                .ok_or_else(|| "HDFS ADD FILES source scope is missing authority".to_string())?;
+            digest_bytes(
+                &mut hasher,
+                normalized_hdfs_authority(authority)?.as_bytes(),
+            );
+            digest_bytes(
+                &mut hasher,
+                canonical_nonlocal_directory_path(relative_path)?.as_bytes(),
+            );
+        }
+    }
+    ConnectorDataMutationSourceScope::try_new_directory(hasher.finalize().into())
+        .map_err(|error| format!("build ADD FILES source scope: {error}"))
+}
+
+fn normalized_object_store_endpoint(raw_endpoint: &str) -> Result<String, String> {
+    let raw_endpoint = raw_endpoint.trim().trim_end_matches('/');
+    if raw_endpoint.is_empty() {
+        return Err("empty object-store endpoint for ADD FILES source scope".to_string());
+    }
+    let endpoint = if raw_endpoint.starts_with("http://") || raw_endpoint.starts_with("https://") {
+        raw_endpoint.to_string()
+    } else if is_local_object_store_endpoint(raw_endpoint) {
+        format!("http://{raw_endpoint}")
+    } else {
+        format!("https://{raw_endpoint}")
+    };
+    normalized_url_identity(&endpoint, "object-store endpoint")
+}
+
+fn normalized_hdfs_authority(raw_authority: &str) -> Result<String, String> {
+    let authority = raw_authority.trim().trim_end_matches('/');
+    if authority.is_empty() {
+        return Err("empty HDFS authority for ADD FILES source scope".to_string());
+    }
+    let authority = if authority.contains("://") {
+        authority.to_string()
+    } else {
+        format!("hdfs://{authority}")
+    };
+    normalized_url_identity(&authority, "HDFS authority")
+}
+
+fn normalized_url_identity(raw: &str, label: &str) -> Result<String, String> {
+    let url = Url::parse(raw).map_err(|error| format!("parse {label}: {error}"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!(
+            "{label} must not include credentials, query, or fragment"
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("{label} is missing host"))?
+        .to_ascii_lowercase();
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let path = canonical_url_path(url.path())?;
+    Ok(format!(
+        "{}://{host}{port}{path}",
+        url.scheme().to_ascii_lowercase()
+    ))
+}
+
+fn is_local_object_store_endpoint(raw: &str) -> bool {
+    let host = raw
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn canonical_nonlocal_directory_path(path: &str) -> Result<String, String> {
+    let path = canonical_path_components(path)?;
+    if path.is_empty() {
+        return Err("ADD FILES source directory resolves to filesystem root".to_string());
+    }
+    Ok(path)
+}
+
+fn canonical_url_path(path: &str) -> Result<String, String> {
+    let path = canonical_path_components(path)?;
+    Ok(if path.is_empty() {
+        String::new()
+    } else {
+        format!("/{path}")
+    })
+}
+
+fn canonical_path_components(path: &str) -> Result<String, String> {
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir | Component::RootDir => {}
+            Component::Normal(component) => {
+                components.push(component.to_string_lossy().into_owned())
+            }
+            Component::ParentDir => {
+                components.pop().ok_or_else(|| {
+                    "ADD FILES source directory escapes its storage root".to_string()
+                })?;
+            }
+            Component::Prefix(_) => {
+                return Err("ADD FILES nonlocal source path has a platform prefix".to_string());
+            }
+        }
+    }
+    Ok(components.join("/"))
 }
 
 #[derive(Debug)]
@@ -685,9 +861,30 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use super::{
-        canonical_name_mapping, list_direct_files, read_parquet_footer, read_type_compatible,
-        validate_name_mapping_for_target, validate_schema,
+        canonical_directory_source_scope, canonical_name_mapping, list_direct_files,
+        read_parquet_footer, read_type_compatible, validate_name_mapping_for_target,
+        validate_schema,
     };
+
+    fn object_store_config(
+        endpoint: &str,
+        access_key_id: &str,
+        access_key_secret: &str,
+    ) -> novarocks_fs::ObjectStoreConfig {
+        novarocks_fs::ObjectStoreConfig {
+            endpoint: endpoint.to_string(),
+            access_key_id: access_key_id.to_string(),
+            access_key_secret: access_key_secret.to_string(),
+            session_token: Some("session-token".to_string()),
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
 
     fn field_with_id(name: &str, id: i32, data_type: DataType, nullable: bool) -> Field {
         Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
@@ -710,6 +907,54 @@ mod tests {
             list_direct_files(&directory, None)
                 .expect_err("visible non-Parquet must fail")
                 .contains("not a Parquet")
+        );
+    }
+
+    #[test]
+    fn source_scope_uses_canonical_physical_directory_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw_path = dir.path().to_string_lossy();
+        let file_uri = format!("file://{}", dir.path().display());
+
+        let raw = canonical_directory_source_scope(&raw_path, None).expect("raw scope");
+        let uri = canonical_directory_source_scope(&file_uri, None).expect("URI scope");
+        assert_eq!(raw, uri);
+    }
+
+    #[test]
+    fn source_scope_is_secret_free_and_stable_across_object_store_config_instances() {
+        let first = object_store_config("localhost:9000/", "first-key", "first-secret");
+        let second = object_store_config("http://LOCALHOST:9000", "second-key", "second-secret");
+
+        let first_scope = canonical_directory_source_scope(
+            "s3://source-bucket/warehouse/./incoming",
+            Some(&first),
+        )
+        .expect("first scope");
+        let second_scope = canonical_directory_source_scope(
+            "s3a://SOURCE-BUCKET/warehouse/incoming/",
+            Some(&second),
+        )
+        .expect("second scope");
+        let different_path =
+            canonical_directory_source_scope("s3://source-bucket/warehouse/other", Some(&first))
+                .expect("different path scope");
+        let different_bucket =
+            canonical_directory_source_scope("s3://other-bucket/warehouse/incoming", Some(&first))
+                .expect("different bucket scope");
+
+        assert_eq!(first_scope, second_scope);
+        assert_ne!(first_scope, different_path);
+        assert_ne!(first_scope, different_bucket);
+    }
+
+    #[test]
+    fn source_scope_rejects_credentials_in_endpoint_identity() {
+        let config = object_store_config("http://access:secret@localhost:9000", "ak", "sk");
+        assert!(
+            canonical_directory_source_scope("s3://bucket/incoming", Some(&config))
+                .expect_err("endpoint credentials must not enter scope")
+                .contains("credentials")
         );
     }
 

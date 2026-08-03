@@ -21,9 +21,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::common::engine_error::{EngineError, EngineErrorCode};
+use novarocks::engine::add_files_engine::AddFilesEngine;
 use novarocks::engine::ctas_engine::CtasEngine;
 use novarocks::engine::delete_engine::DeleteEngine;
 use novarocks::engine::insert_engine::InsertEngine;
@@ -47,6 +51,7 @@ use novarocks::query_execution::session::{
     QuerySessionOpenRequest, SessionExecutionSettings,
 };
 use novarocks::runtime::query_options::QueryOptions;
+use novarocks::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 use tokio::task;
@@ -75,13 +80,14 @@ impl CoreCommandRoute for StandaloneCommandExecutor {
     }
 }
 
-fn execute_frontend_command<C, T>(
+fn execute_frontend_command<C, T, A>(
     dml: &DmlService,
     insert_engine: &dyn InsertEngine,
     delete_engine: &dyn DeleteEngine,
     mutation_engine: Option<&dyn MutationEngine>,
     ctas_route: C,
     truncate_route: T,
+    add_files_route: A,
     command: &dyn CoreCommandRoute,
     sql: &str,
     context: &RequestContext,
@@ -90,6 +96,7 @@ fn execute_frontend_command<C, T>(
 where
     C: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
     T: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<()>, crate::dml::DmlError>,
+    A: FnOnce(&str, &RequestContext, &QueryOptions) -> Result<Option<u32>, crate::dml::DmlError>,
 {
     match dml.try_execute_insert(insert_engine, sql, context, Some(&query_options)) {
         Ok(Some(())) => Ok(StatementResult::Ok),
@@ -115,7 +122,13 @@ where
                             Ok(Some(())) => Ok(StatementResult::Ok),
                             Ok(None) => match truncate_route(sql, context, &query_options) {
                                 Ok(Some(())) => Ok(StatementResult::Ok),
-                                Ok(None) => command.execute(sql, context, query_options),
+                                Ok(None) => match add_files_route(sql, context, &query_options) {
+                                    Ok(Some(file_count)) => {
+                                        add_files_status(file_count).map(StatementResult::Query)
+                                    }
+                                    Ok(None) => command.execute(sql, context, query_options),
+                                    Err(error) => Err(error.to_string()),
+                                },
                                 Err(error) => Err(error.to_string()),
                             },
                             Err(error) => Err(error.to_string()),
@@ -128,7 +141,13 @@ where
                     Ok(Some(())) => Ok(StatementResult::Ok),
                     Ok(None) => match truncate_route(sql, context, &query_options) {
                         Ok(Some(())) => Ok(StatementResult::Ok),
-                        Ok(None) => command.execute(sql, context, query_options),
+                        Ok(None) => match add_files_route(sql, context, &query_options) {
+                            Ok(Some(file_count)) => {
+                                add_files_status(file_count).map(StatementResult::Query)
+                            }
+                            Ok(None) => command.execute(sql, context, query_options),
+                            Err(error) => Err(error.to_string()),
+                        },
                         Err(error) => Err(error.to_string()),
                     },
                     Err(error) => Err(error.to_string()),
@@ -138,6 +157,30 @@ where
         },
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
+    let column = QueryResultColumn {
+        name: "status".to_string(),
+        data_type: DataType::Utf8,
+        nullable: false,
+        logical_type: None,
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec![format!(
+            "Added {file_count} file(s)"
+        )]))],
+    )
+    .map_err(|error| format!("build ADD FILES status result failed: {error}"))?;
+    Ok(QueryResult {
+        columns: vec![column],
+        chunks: vec![record_batch_to_chunk(batch)?],
+    })
 }
 
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
@@ -152,6 +195,7 @@ pub struct FrontendQueryService {
     insert_engine: Arc<dyn InsertEngine>,
     delete_engine: Arc<dyn DeleteEngine>,
     mutation_engine: Arc<dyn MutationEngine>,
+    add_files_engine: Arc<dyn AddFilesEngine>,
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
 }
@@ -167,6 +211,7 @@ impl FrontendQueryService {
         insert_engine: Arc<dyn InsertEngine>,
         delete_engine: Arc<dyn DeleteEngine>,
         mutation_engine: Arc<dyn MutationEngine>,
+        add_files_engine: Arc<dyn AddFilesEngine>,
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
     ) -> Self {
@@ -180,6 +225,7 @@ impl FrontendQueryService {
             insert_engine,
             delete_engine,
             mutation_engine,
+            add_files_engine,
             ctas_engine,
             truncate_engine,
         }
@@ -510,6 +556,7 @@ impl FrontendQuerySession {
         let insert_engine = Arc::clone(&self.service.insert_engine);
         let delete_engine = Arc::clone(&self.service.delete_engine);
         let mutation_engine = Arc::clone(&self.service.mutation_engine);
+        let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let mut query_options = state.execution_settings.query_options();
@@ -552,6 +599,14 @@ impl FrontendQuerySession {
                             Some(query_options),
                         )
                     },
+                    |sql, context, query_options| {
+                        dml.try_execute_add_files(
+                            add_files_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
                     &command_executor,
                     &sql,
                     &context,
@@ -580,6 +635,14 @@ impl FrontendQuerySession {
                     |sql, context, query_options| {
                         dml.try_execute_truncate(
                             truncate_engine.as_ref(),
+                            sql,
+                            context,
+                            Some(query_options),
+                        )
+                    },
+                    |sql, context, query_options| {
+                        dml.try_execute_add_files(
+                            add_files_engine.as_ref(),
                             sql,
                             context,
                             Some(query_options),
@@ -1412,6 +1475,14 @@ mod tests {
         Ok(None)
     }
 
+    fn not_add_files(
+        _sql: &str,
+        _context: &RequestContext,
+        _query_options: &QueryOptions,
+    ) -> Result<Option<u32>, crate::dml::DmlError> {
+        Ok(None)
+    }
+
     #[test]
     fn frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
@@ -1429,6 +1500,7 @@ mod tests {
             None,
             not_ctas,
             not_truncate,
+            not_add_files,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1458,6 +1530,7 @@ mod tests {
             None,
             not_ctas,
             not_truncate,
+            not_add_files,
             &command,
             "INSERT INTO t VALUES (1)",
             &context,
@@ -1494,6 +1567,7 @@ mod tests {
             None,
             not_ctas,
             not_truncate,
+            not_add_files,
             &command,
             "DELETE FROM t WHERE a = 1",
             &context,
@@ -1525,6 +1599,7 @@ mod tests {
             None,
             not_ctas,
             not_truncate,
+            not_add_files,
             &command,
             "CREATE DATABASE db2",
             &context,
@@ -1564,6 +1639,7 @@ mod tests {
                 truncate_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(None)
             },
+            not_add_files,
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
@@ -1592,6 +1668,7 @@ mod tests {
             None,
             |_, _, _| Err(crate::dml::DmlError::executor("CTAS failed")),
             |_, _, _| panic!("TRUNCATE route must not follow a CTAS error"),
+            not_add_files,
             &command,
             "CREATE TABLE ice.db.dst AS SELECT 1",
             &context,
@@ -1609,6 +1686,7 @@ mod tests {
             None,
             |_, _, _| Ok(None),
             |_, _, _| Err(crate::dml::DmlError::executor("TRUNCATE failed")),
+            not_add_files,
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
@@ -1616,6 +1694,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("TRUNCATE failed"));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frontend_router_add_files_returns_status_and_never_falls_back() {
+        let insert = RecordingInsertEngine::default();
+        let delete = RecordingDeleteEngine::default();
+        let command = RecordingCoreCommand::default();
+        let dml = DmlService::compose(None, Arc::new(EmptyStatisticsService));
+        let cancellation = QueryCancellationSource::new();
+        let context =
+            router_test_context(94, Instant::now() + Duration::from_secs(30), &cancellation);
+
+        let result = execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            None,
+            not_ctas,
+            not_truncate,
+            |_, _, _| Ok(Some(7)),
+            &command,
+            "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
+            &context,
+            QueryOptions::default(),
+        )
+        .expect("ADD FILES frontend route");
+        assert!(matches!(result, StatementResult::Query(_)));
+        assert_eq!(command.calls.load(Ordering::SeqCst), 0);
+
+        let error = execute_frontend_command(
+            &dml,
+            &insert,
+            &delete,
+            None,
+            not_ctas,
+            not_truncate,
+            |_, _, _| Err(crate::dml::DmlError::executor("ADD FILES failed")),
+            &command,
+            "ALTER TABLE ice.db.dst ADD FILES FROM 's3://warehouse/staged'",
+            &context,
+            QueryOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("ADD FILES failed"));
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1644,6 +1767,7 @@ mod tests {
                 Some(&mutation),
                 not_ctas,
                 not_truncate,
+                not_add_files,
                 &command,
                 sql,
                 &context,
@@ -1683,6 +1807,7 @@ mod tests {
                 truncate_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Some(()))
             },
+            not_add_files,
             &command,
             "TRUNCATE TABLE ice.db.dst",
             &context,
