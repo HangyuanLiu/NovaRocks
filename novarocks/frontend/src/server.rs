@@ -168,6 +168,7 @@ where
                     let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
                     let truncate_engine = engine.truncate_engine();
+                    let add_files_engine = engine.add_files_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
@@ -178,6 +179,7 @@ where
                         insert_engine,
                         delete_engine,
                         mutation_engine,
+                        add_files_engine,
                         ctas_engine,
                         truncate_engine,
                     )))
@@ -233,6 +235,7 @@ where
                     let mutation_engine = engine.mutation_engine();
                     let ctas_engine = engine.ctas_engine();
                     let truncate_engine = engine.truncate_engine();
+                    let add_files_engine = engine.add_files_engine();
                     Ok(Arc::new(crate::query::FrontendQueryService::new(
                         engine,
                         query_control,
@@ -243,6 +246,7 @@ where
                         insert_engine,
                         delete_engine,
                         mutation_engine,
+                        add_files_engine,
                         ctas_engine,
                         truncate_engine,
                     )))

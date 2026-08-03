@@ -26,15 +26,15 @@ use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
     ConnectorDataMutationLease, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
+    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
 };
 
 struct NeverCancelled;
@@ -193,6 +193,7 @@ impl ConnectorDataMutation for FakeDataMutation {
             &request,
             [7; 32],
             ConnectorDataMutationPlanSummary::try_new(2, 11, 101).expect("summary"),
+            Some(source_scope()),
             Bytes::from_static(b"secret-plan"),
         )?;
         plans.insert(
@@ -273,6 +274,10 @@ fn planning_request(
         context(),
     )
     .expect("planning request")
+}
+
+fn source_scope() -> ConnectorDataMutationSourceScope {
+    ConnectorDataMutationSourceScope::try_new_directory([7; 32]).expect("source scope")
 }
 
 #[test]
@@ -373,6 +378,7 @@ fn bounds_and_exact_generation_fail_closed() {
             &request,
             [0; 32],
             ConnectorDataMutationPlanSummary::default(),
+            Some(source_scope()),
             Bytes::from(vec![
                 0;
                 MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES + 1

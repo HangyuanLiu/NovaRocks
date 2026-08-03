@@ -17,8 +17,9 @@
 
 use crate::dml::error::DmlError;
 use crate::dml::model::{
-    CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, OperationFact,
-    OperationMutationRequest, OperationState, StoredOperation,
+    AddFilesArtifact, AddFilesMutationRequest, CreatePreparingRequest,
+    CreateStatementOperationRequest, DmlOperationId, OperationFact, OperationMutationRequest,
+    OperationState, StoredOperation,
 };
 
 pub trait OperationJournal: Send + Sync {
@@ -61,6 +62,37 @@ pub trait OperationJournal: Send + Sync {
     fn preflight_statement_operation(&self, _operation: &StoredOperation) -> Result<(), DmlError> {
         Err(DmlError::journal_unavailable(
             "statement-specific DML operation preflight is not supported by this journal",
+        ))
+    }
+
+    /// ADD FILES requires a single atomic publication of its operation change,
+    /// bounded raw artifacts, and source-scope ownership transition. Generic
+    /// journals must reject it rather than silently degrade to a second store.
+    fn apply_add_files_mutation(
+        &self,
+        _request: AddFilesMutationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "ADD FILES atomic mutation is not supported by this journal",
+        ))
+    }
+
+    fn load_add_files_artifact(
+        &self,
+        _operation_id: DmlOperationId,
+        _artifact: &crate::dml::model::AddFilesArtifactDescriptor,
+    ) -> Result<AddFilesArtifact, DmlError> {
+        Err(DmlError::journal_unavailable(
+            "ADD FILES artifact loading is not supported by this journal",
+        ))
+    }
+
+    fn preflight_add_files_mutation(
+        &self,
+        _request: &AddFilesMutationRequest,
+    ) -> Result<(), DmlError> {
+        Err(DmlError::journal_unavailable(
+            "ADD FILES atomic mutation preflight is not supported by this journal",
         ))
     }
 }

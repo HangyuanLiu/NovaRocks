@@ -64,7 +64,10 @@ FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0
 ORDER BY new_id;
 
 -- query 4
--- @expect_error=already exists in the target table
+-- The frontend-owned source scope is permanently TableOwned after the first
+-- successful registration, so a second statement is rejected before it can
+-- re-enter provider listing/commit.
+-- @expect_error=source scope is owned by operation
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
   ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
 

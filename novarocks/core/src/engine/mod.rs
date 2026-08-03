@@ -53,6 +53,7 @@ use crate::sql::catalog::{StandaloneCatalogService, TableLookupMode};
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::memory::DEFAULT_DATABASE;
 
+pub mod add_files_engine;
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub mod ctas_engine;
@@ -88,7 +89,7 @@ pub use mv_first_refresh_staging::MvFirstRefreshStagingTestOutcome;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
-    looks_like_add_equality_delete, looks_like_add_files, looks_like_alter_iceberg_properties,
+    looks_like_add_equality_delete, looks_like_alter_iceberg_properties,
     looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
     looks_like_show_create_table, parse_alter_iceberg_properties_sql,
     parse_alter_partition_column_sql, parse_show_create_table,
@@ -1448,6 +1449,13 @@ impl StandaloneNovaRocks {
         Arc::new(Arc::clone(&self.inner))
     }
 
+    /// ADD FILES' narrow reverse port. The frontend owns durable operation
+    /// lifecycle and source-scope policy; core retains target resolution and
+    /// the exact connector data-mutation session.
+    pub fn add_files_engine(&self) -> Arc<dyn add_files_engine::AddFilesEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
     /// Resolve an ANALYZE target once through the current connector control
     /// generation. The frontend persists the returned opaque pin before it
     /// creates a durable job; workers never receive this resolver.
@@ -2123,16 +2131,6 @@ impl StandaloneSession {
             );
         }
 
-        // ALTER TABLE ... ADD FILES FROM '...'
-        if looks_like_add_files(&normalized) {
-            return self.handle_add_files(
-                &normalized,
-                current_catalog,
-                current_database,
-                &connector_context,
-            );
-        }
-
         // Standard SQL: let sqlparser parse the full statement
         let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
             .map_err(|e| format_parser_error(&e.to_string()))?;
@@ -2351,23 +2349,6 @@ impl StandaloneSession {
             }
             _ => false,
         }
-    }
-
-    /// Handle ALTER TABLE ... ADD FILES FROM '...'
-    fn handle_add_files(
-        &self,
-        sql: &str,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
-        crate::engine::query_prep::add_files(
-            &self.inner,
-            sql,
-            current_catalog,
-            current_database,
-            connector_context,
-        )
     }
 
     fn handle_show_create_table(

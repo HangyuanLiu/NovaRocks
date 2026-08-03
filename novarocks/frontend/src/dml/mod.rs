@@ -23,6 +23,7 @@
 //! contract. DML-1 ships the runner + fake-backed tests; the real executor and
 //! SQL routing land in DML-2.
 
+pub mod add_files;
 pub mod ctas;
 mod delete;
 pub mod error;
@@ -40,14 +41,16 @@ pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
 pub use journal::OperationJournal;
 pub use model::{
+    AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
+    AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
     CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
     DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
     IcebergCommitOutcomeRecord, IcebergOperationFailureKind, IcebergOperationFailureRecord,
     IcebergOperationNextAction, IcebergRecoveryEvidenceRecord, OperationFact, OperationKind,
     OperationMutationRequest, OperationPayload, OperationState, OperationTarget, RecoveryEvidence,
-    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
-    WriteTransactionOutcome, WriteTransactionSpec,
+    SourceScopeOwnership, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
+    TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
 };
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,

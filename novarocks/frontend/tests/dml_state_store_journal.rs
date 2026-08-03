@@ -29,12 +29,14 @@ use novarocks_frontend::dml::model::{
     DML_OPERATION_SCHEMA_VERSION,
 };
 use novarocks_frontend::dml::{
+    AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
+    AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
     CreatePreparingRequest, CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
     DmlErrorKind, DmlOperationId, DurableExternalFact, DurableMutationSummary, ExternalFactOutcome,
     IcebergCommitOutcomeRecord, OperationFact, OperationJournal, OperationKind,
     OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    StateStoreOperationJournal, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
-    TruncateLifecycleRecord,
+    SourceScopeOwnership, StateStoreOperationJournal, StatementNextAction, StoredOperation,
+    TruncateLifecyclePhase, TruncateLifecycleRecord,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitOutcome as StateStoreCommitOutcome, CommitResolution,
@@ -47,6 +49,7 @@ use novarocks_state_store::{
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::{Uuid, Version};
 
@@ -552,7 +555,7 @@ async fn illegal_transition_is_rejected() {
 async fn unknown_schema_version_fails_open() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
-    let (host, store, journal) = open_store(&path).await;
+    let (_host, store, journal) = open_store(&path).await;
     drop(journal);
     let operation_id = Uuid::now_v7();
     raw_put(
@@ -567,7 +570,6 @@ async fn unknown_schema_version_fails_open() {
             .err()
             .expect("unknown schema must fail open");
     assert_eq!(error.kind(), DmlErrorKind::JournalCorruption);
-    drop(host);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -877,6 +879,196 @@ fn stored_statement_operation(
     }
 }
 
+fn add_files_artifact(kind: AddFilesArtifactKind, bytes: &[u8]) -> AddFilesArtifact {
+    AddFilesArtifact {
+        descriptor: AddFilesArtifactDescriptor {
+            kind,
+            codec_version: 1,
+            total_length: u32::try_from(bytes.len()).unwrap(),
+            chunk_count: u16::try_from(bytes.len().div_ceil(8 * 1024)).unwrap(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+        },
+        bytes: bytes.to_vec(),
+    }
+}
+
+fn add_files_preparing() -> OperationPayload {
+    OperationPayload::AddFilesLifecycle(AddFilesLifecycleRecord {
+        phase: AddFilesLifecyclePhase::Preparing,
+        connector_operation_id: Uuid::now_v7(),
+        provider_id: None,
+        connector_instance_id: None,
+        connector_incarnation: None,
+        source_location: "s3://warehouse/staged".to_string(),
+        source_scope_version: None,
+        source_scope_kind: None,
+        source_scope_digest: None,
+        request_digest: None,
+        plan_digest: None,
+        state_digest: None,
+        plan_summary: None,
+        plan_artifact: None,
+        receipt_artifact: None,
+        evidence_artifact: None,
+        dispatch_certainty: AddFilesDispatchCertainty::ConfirmedNotDispatched,
+        source_ownership: SourceScopeOwnership::Unclaimed,
+        outcome: None,
+        next_action: StatementNextAction::None,
+    })
+}
+
+fn add_files_planned(plan: &AddFilesArtifactDescriptor, scope_digest: &str) -> OperationPayload {
+    OperationPayload::AddFilesLifecycle(AddFilesLifecycleRecord {
+        phase: AddFilesLifecyclePhase::Planned,
+        connector_operation_id: Uuid::now_v7(),
+        provider_id: Some("iceberg".to_string()),
+        connector_instance_id: Some("rest".to_string()),
+        connector_incarnation: Some("11".repeat(16)),
+        source_location: "s3://warehouse/staged".to_string(),
+        source_scope_version: Some(1),
+        source_scope_kind: Some("DIRECTORY".to_string()),
+        source_scope_digest: Some(scope_digest.to_string()),
+        request_digest: Some("22".repeat(32)),
+        plan_digest: Some("33".repeat(32)),
+        state_digest: Some("44".repeat(32)),
+        plan_summary: Some(DurableMutationSummary {
+            file_count: 1,
+            row_count: 1,
+            total_bytes: 1,
+        }),
+        plan_artifact: Some(plan.clone()),
+        receipt_artifact: None,
+        evidence_artifact: None,
+        dispatch_certainty: AddFilesDispatchCertainty::ConfirmedNotDispatched,
+        source_ownership: SourceScopeOwnership::ReservedImmutable,
+        outcome: None,
+        next_action: StatementNextAction::None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_files_atomic_reservation_rejects_conflicts_and_restart_releases_undispatched_work() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let (host, store, journal) = open_store(&path).await;
+    let scope_digest = "aa".repeat(32);
+    let plan = add_files_artifact(AddFilesArtifactKind::Plan, b"durable public plan");
+
+    let first_id = DmlOperationId::new_v7();
+    let first = journal
+        .create_statement_operation(statement_request(
+            first_id,
+            Uuid::now_v7(),
+            OperationKind::AddFiles,
+            add_files_preparing(),
+        ))
+        .unwrap();
+    let first_reservation = AddFilesMutationRequest {
+        operation: OperationMutationRequest {
+            operation_id: first_id,
+            expected_revision: first.revision,
+            mutation_id: Uuid::now_v7(),
+            state: OperationState::Committing,
+            payload: add_files_planned(&plan.descriptor, &scope_digest),
+        },
+        artifacts: vec![plan.clone()],
+        source_action: Some(AddFilesSourceAction::Reserve {
+            provider_id: "iceberg".to_string(),
+            scope_digest: scope_digest.clone(),
+            ownership: SourceScopeOwnership::ReservedImmutable,
+        }),
+    };
+    journal
+        .preflight_add_files_mutation(&first_reservation)
+        .unwrap();
+    let first_planned = journal.apply_add_files_mutation(first_reservation).unwrap();
+    assert_eq!(first_planned.state, OperationState::Committing);
+    assert_eq!(
+        journal
+            .load_add_files_artifact(first_id, &plan.descriptor)
+            .unwrap()
+            .bytes,
+        plan.bytes
+    );
+
+    let second_id = DmlOperationId::new_v7();
+    let second = journal
+        .create_statement_operation(statement_request(
+            second_id,
+            Uuid::now_v7(),
+            OperationKind::AddFiles,
+            add_files_preparing(),
+        ))
+        .unwrap();
+    let conflict = journal
+        .apply_add_files_mutation(AddFilesMutationRequest {
+            operation: OperationMutationRequest {
+                operation_id: second_id,
+                expected_revision: second.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::Committing,
+                payload: add_files_planned(&plan.descriptor, &scope_digest),
+            },
+            artifacts: vec![plan.clone()],
+            source_action: Some(AddFilesSourceAction::Reserve {
+                provider_id: "iceberg".to_string(),
+                scope_digest: scope_digest.clone(),
+                ownership: SourceScopeOwnership::ReservedImmutable,
+            }),
+        })
+        .unwrap_err();
+    assert_eq!(conflict.kind(), DmlErrorKind::JournalUnresolved);
+
+    drop(journal);
+    drop(store);
+    drop(host);
+    let (_host, _store, recovered) = open_store(&path).await;
+    let recovered_first = recovered.load(first_id).unwrap().unwrap();
+    assert_eq!(
+        recovered_first.state,
+        OperationState::FailedKnownUncommitted
+    );
+    assert!(
+        recovered
+            .list_unfinished()
+            .unwrap()
+            .iter()
+            .all(|op| op.operation_id != first_id)
+    );
+
+    let second_after_recovery = recovered.load(second_id).unwrap().unwrap();
+    assert_eq!(
+        second_after_recovery.state,
+        OperationState::FailedKnownUncommitted
+    );
+    let third_id = DmlOperationId::new_v7();
+    let third = recovered
+        .create_statement_operation(statement_request(
+            third_id,
+            Uuid::now_v7(),
+            OperationKind::AddFiles,
+            add_files_preparing(),
+        ))
+        .unwrap();
+    recovered
+        .apply_add_files_mutation(AddFilesMutationRequest {
+            operation: OperationMutationRequest {
+                operation_id: third_id,
+                expected_revision: third.revision,
+                mutation_id: Uuid::now_v7(),
+                state: OperationState::Committing,
+                payload: add_files_planned(&plan.descriptor, &scope_digest),
+            },
+            artifacts: vec![plan],
+            source_action: Some(AddFilesSourceAction::Reserve {
+                provider_id: "iceberg".to_string(),
+                scope_digest,
+                ownership: SourceScopeOwnership::ReservedImmutable,
+            }),
+        })
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn literal_v1_record_decodes_to_normalized_write_payload() {
     let temp = TempDir::new().unwrap();
@@ -1125,7 +1317,7 @@ async fn statement_create_replay_is_idempotent_and_conflict_is_unresolved() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn literal_v1_mutation_upgrades_record_to_v2() {
+async fn literal_v1_mutation_upgrades_record_to_current_schema() {
     let temp = TempDir::new().unwrap();
     let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
     let operation_uuid = Uuid::now_v7();
@@ -1151,7 +1343,7 @@ async fn literal_v1_mutation_upgrades_record_to_v2() {
             payload: OperationPayload::WriteV1,
         })
         .unwrap();
-    assert_eq!(upgraded.schema_version, 2);
+    assert_eq!(upgraded.schema_version, DML_OPERATION_SCHEMA_VERSION);
     assert_eq!(journal.load(operation_id).unwrap().unwrap(), upgraded);
 }
 
