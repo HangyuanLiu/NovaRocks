@@ -139,6 +139,53 @@ pub(crate) struct QueryTableBindingStore {
 }
 
 impl QueryTableBindingStore {
+    /// Canonical query-local snapshot used only to bind a prepared compiler
+    /// artifact to the exact metadata facts it observed. Secrets and provider
+    /// clients are excluded; keys are sorted before encoding.
+    pub(crate) fn stable_digest_material(&self) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let entries = self.entries.lock().expect("query table binding lock");
+        let mut material = entries
+            .iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    Ok(binding) => {
+                        let mut digest = Sha256::new();
+                        digest.update(b"ok\0");
+                        if let Some(pin) = &binding.statistics_pin {
+                            digest.update(pin.table.owner().as_str().as_bytes());
+                            digest.update([0]);
+                            digest.update(Sha256::digest(pin.table.payload().as_ref()));
+                            digest.update(pin.data_version.as_bytes().as_ref());
+                        }
+                        if let Some(lease) = &binding.planning_lease {
+                            digest.update(lease.binding().incarnation().to_bytes());
+                            digest.update(
+                                lease.binding().descriptor().provider_id.as_str().as_bytes(),
+                            );
+                            digest.update([0]);
+                            digest.update(
+                                lease.binding().descriptor().instance_id.as_str().as_bytes(),
+                            );
+                        }
+                        format!("ok|{:x}", digest.finalize())
+                    }
+                    Err(error) => format!("err|{:x}", Sha256::digest(error.as_bytes())),
+                };
+                (format!("{key:?}"), value)
+            })
+            .collect::<Vec<_>>();
+        material.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut bytes = Vec::new();
+        for (key, value) in material {
+            bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        bytes
+    }
+
     fn resolve_or_insert(
         &self,
         key: TableBindingKey,

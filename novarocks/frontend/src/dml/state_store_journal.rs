@@ -32,8 +32,15 @@ use uuid::Uuid;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
-    CreatePreparingRequest, DML_OPERATION_SCHEMA_VERSION, DmlOperationId, OperationFact,
-    OperationState, StoredOperation, validate_operation_transition,
+    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS, CreatePreparingRequest,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
+    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
+    DML_LEGACY_OPERATION_SCHEMA_VERSION, DML_OPERATION_SCHEMA_VERSION,
+    DML_UNFINISHED_SCHEMA_VERSION, DmlOperationId, DurableExternalFact, ExternalFactOutcome,
+    IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord, IcebergOperationFailureRecord,
+    IcebergRecoveryEvidenceRecord, OperationFact, OperationKind, OperationMutationRequest,
+    OperationPayload, OperationState, OperationTarget, StatementNextAction, StoredOperation,
+    validate_operation_transition, validate_statement_operation_transition,
 };
 use crate::dml::now_unix_millis;
 
@@ -44,6 +51,66 @@ const UNFINISHED_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/unfinished/";
 struct StoredUnfinishedOperationV1 {
     schema_version: u8,
     operation_id: DmlOperationId,
+}
+
+#[derive(Deserialize)]
+struct OperationSchemaProbe {
+    schema_version: u8,
+}
+
+#[derive(Deserialize)]
+struct StoredOperationV1 {
+    schema_version: u8,
+    operation_id: DmlOperationId,
+    revision: u64,
+    last_mutation_id: Uuid,
+    operation_kind: OperationKind,
+    #[serde(default)]
+    operation_subkind: Option<String>,
+    target: OperationTarget,
+    state: OperationState,
+    attempt_id: String,
+    base_snapshot_id: Option<i64>,
+    base_snapshot_map: std::collections::BTreeMap<String, i64>,
+    staged_artifacts: Vec<String>,
+    #[serde(default)]
+    commit_outcome: Option<IcebergCommitOutcomeRecord>,
+    #[serde(default)]
+    cleanup_outcome: Option<IcebergCleanupOutcomeRecord>,
+    #[serde(default)]
+    recovery_evidence: Option<IcebergRecoveryEvidenceRecord>,
+    #[serde(default)]
+    failure: Option<IcebergOperationFailureRecord>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    finished_at_ms: Option<i64>,
+}
+
+impl From<StoredOperationV1> for StoredOperation {
+    fn from(value: StoredOperationV1) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            operation_id: value.operation_id,
+            revision: value.revision,
+            last_mutation_id: value.last_mutation_id,
+            operation_kind: value.operation_kind,
+            operation_subkind: value.operation_subkind,
+            target: value.target,
+            state: value.state,
+            attempt_id: value.attempt_id,
+            base_snapshot_id: value.base_snapshot_id,
+            base_snapshot_map: value.base_snapshot_map,
+            staged_artifacts: value.staged_artifacts,
+            commit_outcome: value.commit_outcome,
+            cleanup_outcome: value.cleanup_outcome,
+            recovery_evidence: value.recovery_evidence,
+            failure: value.failure,
+            payload: OperationPayload::WriteV1,
+            created_at_ms: value.created_at_ms,
+            updated_at_ms: value.updated_at_ms,
+            finished_at_ms: value.finished_at_ms,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +201,7 @@ impl StateStoreOperationJournal {
             cleanup_outcome: None,
             recovery_evidence: None,
             failure: None,
+            payload: OperationPayload::WriteV1,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             finished_at_ms: None,
@@ -141,6 +209,7 @@ impl StateStoreOperationJournal {
         let operation_key = operation_key(operation_id)?;
         let unfinished_key = unfinished_key(operation_id)?;
         let stored = operation.clone();
+        let max_value_bytes = self.store.limits().max_value_bytes;
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -159,10 +228,11 @@ impl StateStoreOperationJournal {
                             stored.operation_id
                         ))));
                     }
-                    let operation_value = match encode_operation(&stored) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    let operation_value =
+                        match encode_operation_with_limit(&stored, max_value_bytes) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
                     let unfinished_value = match encode_unfinished(stored.operation_id) {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
@@ -179,6 +249,268 @@ impl StateStoreOperationJournal {
         )
         .await;
         self.finish_mutation(result, operation_key, mutation_id, operation_id, "create")
+            .await
+    }
+
+    async fn create_statement_operation_async(
+        &self,
+        request: CreateStatementOperationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        let operation = StoredOperation {
+            schema_version: DML_OPERATION_SCHEMA_VERSION,
+            operation_id: request.operation_id,
+            revision: 1,
+            last_mutation_id: request.mutation_id,
+            operation_kind: request.operation_kind,
+            operation_subkind: None,
+            target: request.target,
+            state: OperationState::Preparing,
+            attempt_id: request.attempt_id,
+            base_snapshot_id: None,
+            base_snapshot_map: std::collections::BTreeMap::new(),
+            staged_artifacts: Vec::new(),
+            commit_outcome: None,
+            cleanup_outcome: None,
+            recovery_evidence: None,
+            failure: None,
+            payload: request.payload,
+            created_at_ms: request.created_at_ms,
+            updated_at_ms: request.created_at_ms,
+            finished_at_ms: None,
+        };
+        validate_operation(&operation)?;
+        let operation_id = operation.operation_id;
+        let mutation_id = operation.last_mutation_id;
+        let operation_key = operation_key(operation_id)?;
+        let unfinished_key = unfinished_key(operation_id)?;
+        let stored = operation.clone();
+        let max_value_bytes = self.store.limits().max_value_bytes;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            OperationId::from(mutation_id),
+            "create statement-specific frontend DML operation",
+            |transaction| {
+                let operation_key = operation_key.clone();
+                let unfinished_key = unfinished_key.clone();
+                let stored = stored.clone();
+                Box::pin(async move {
+                    let existing_operation = transaction.get(&operation_key).await?;
+                    let existing_unfinished = transaction.get(&unfinished_key).await?;
+                    if let Some(record) = existing_operation {
+                        let existing = match decode_operation(record.key, record.value) {
+                            Ok(existing) => existing,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        match (existing.state.is_finished(), existing_unfinished) {
+                            (false, Some(index)) => {
+                                let indexed_id = match decode_unfinished(index.key, index.value) {
+                                    Ok(indexed_id) => indexed_id,
+                                    Err(error) => return Ok(Err(error)),
+                                };
+                                if indexed_id != stored.operation_id {
+                                    return Ok(Err(DmlError::journal_corruption(format!(
+                                        "unfinished DML operation index identity mismatch for {}",
+                                        stored.operation_id
+                                    ))));
+                                }
+                            }
+                            (false, None) => {
+                                return Ok(Err(DmlError::journal_corruption(format!(
+                                    "unfinished DML operation {} is missing its index",
+                                    stored.operation_id
+                                ))));
+                            }
+                            (true, Some(_)) => {
+                                return Ok(Err(DmlError::journal_corruption(format!(
+                                    "terminal DML operation {} remains in the unfinished index",
+                                    stored.operation_id
+                                ))));
+                            }
+                            (true, None) => {}
+                        }
+                        if existing == stored {
+                            return Ok(Ok(existing));
+                        }
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "conflicting DML statement create replay for operation {}",
+                            stored.operation_id
+                        ))));
+                    }
+                    if existing_unfinished.is_some() {
+                        return Ok(Err(DmlError::journal_corruption(format!(
+                            "unfinished DML operation index {} has no operation record",
+                            stored.operation_id
+                        ))));
+                    }
+                    let operation_value =
+                        match encode_operation_with_limit(&stored, max_value_bytes) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    let unfinished_value = match encode_unfinished(stored.operation_id) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    transaction
+                        .put(operation_key, operation_value, Precondition::Absent)
+                        .await?;
+                    transaction
+                        .put(unfinished_key, unfinished_value, Precondition::Absent)
+                        .await?;
+                    Ok(Ok(stored))
+                })
+            },
+        )
+        .await;
+        self.finish_statement_mutation(result, operation_key, mutation_id, "create")
+            .await
+    }
+
+    async fn mutate_statement_operation_async(
+        &self,
+        request: OperationMutationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        let operation_id = request.operation_id;
+        let mutation_id = request.mutation_id;
+        let operation_key = operation_key(operation_id)?;
+        let unfinished_key = unfinished_key(operation_id)?;
+        let max_value_bytes = self.store.limits().max_value_bytes;
+        let result = run_side_effect_free(
+            self.store.as_ref(),
+            self.metrics.as_ref(),
+            OperationId::from(mutation_id),
+            "mutate statement-specific frontend DML operation",
+            |transaction| {
+                let operation_key = operation_key.clone();
+                let unfinished_key = unfinished_key.clone();
+                let request = request.clone();
+                Box::pin(async move {
+                    let Some(record) = transaction.get(&operation_key).await? else {
+                        return Ok(Err(DmlError::journal_unavailable(format!(
+                            "DML operation {operation_id} not found"
+                        ))));
+                    };
+                    let operation_version = record.version.clone();
+                    let mut operation = match decode_operation(record.key, record.value) {
+                        Ok(operation) => operation,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if operation.last_mutation_id == request.mutation_id {
+                        let expected_applied_revision =
+                            request.expected_revision.checked_add(1).ok_or_else(|| {
+                                DmlError::journal_corruption(format!(
+                                    "DML operation {operation_id} revision overflow"
+                                ))
+                            });
+                        let expected_applied_revision = match expected_applied_revision {
+                            Ok(revision) => revision,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if operation.revision == expected_applied_revision
+                            && operation.state == request.state
+                            && operation.payload == request.payload
+                        {
+                            return Ok(Ok(operation));
+                        }
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "conflicting DML statement mutation replay for operation {operation_id}"
+                        ))));
+                    }
+                    if operation.revision != request.expected_revision {
+                        return Ok(Err(DmlError::journal_unresolved(format!(
+                            "DML operation {operation_id} revision changed from expected {} to {}",
+                            request.expected_revision, operation.revision
+                        ))));
+                    }
+                    if let Err(error) = validate_statement_operation_transition(
+                        operation.operation_kind,
+                        operation.state,
+                        request.state,
+                    )
+                    .map_err(DmlError::journal_unavailable)
+                    {
+                        return Ok(Err(error));
+                    }
+                    operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
+                    operation.revision = match operation.revision.checked_add(1) {
+                        Some(revision) => revision,
+                        None => {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} revision overflow"
+                            ))));
+                        }
+                    };
+                    operation.last_mutation_id = request.mutation_id;
+                    operation.state = request.state;
+                    operation.payload = request.payload;
+                    operation.updated_at_ms = now_unix_millis();
+                    if operation.state.is_finished() {
+                        operation.finished_at_ms = Some(operation.updated_at_ms);
+                    }
+                    let operation_value =
+                        match encode_operation_with_limit(&operation, max_value_bytes) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    transaction
+                        .put(
+                            operation_key,
+                            operation_value,
+                            Precondition::Version(operation_version),
+                        )
+                        .await?;
+                    if operation.state.is_finished() {
+                        let Some(index) = transaction.get(&unfinished_key).await? else {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} is missing its unfinished index"
+                            ))));
+                        };
+                        let indexed_id = match decode_unfinished(index.key, index.value) {
+                            Ok(indexed_id) => indexed_id,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if indexed_id != operation_id {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "unfinished DML operation index identity mismatch for {operation_id}"
+                            ))));
+                        }
+                        transaction
+                            .delete(unfinished_key, Precondition::Version(index.version))
+                            .await?;
+                    } else {
+                        let Some(index) = transaction.get(&unfinished_key).await? else {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "DML operation {operation_id} is missing its unfinished index"
+                            ))));
+                        };
+                        let indexed_id = match decode_unfinished(index.key, index.value) {
+                            Ok(indexed_id) => indexed_id,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if indexed_id != operation_id {
+                            return Ok(Err(DmlError::journal_corruption(format!(
+                                "unfinished DML operation index identity mismatch for {operation_id}"
+                            ))));
+                        }
+                        let value = match encode_unfinished(operation_id) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        transaction
+                            .put(
+                                unfinished_key,
+                                value,
+                                Precondition::Version(index.version),
+                            )
+                            .await?;
+                    }
+                    Ok(Ok(operation))
+                })
+            },
+        )
+        .await;
+        self.finish_statement_mutation(result, operation_key, mutation_id, "mutate")
             .await
     }
 
@@ -250,6 +582,7 @@ impl StateStoreOperationJournal {
         let mutation_id = Uuid::now_v7();
         let operation_key = operation_key(operation_id)?;
         let unfinished_key = unfinished_key(operation_id)?;
+        let max_value_bytes = self.store.limits().max_value_bytes;
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
@@ -281,9 +614,10 @@ impl StateStoreOperationJournal {
                             ))));
                         }
                     };
+                    operation.schema_version = DML_OPERATION_SCHEMA_VERSION;
                     operation.last_mutation_id = mutation_id;
                     operation.updated_at_ms = now_unix_millis();
-                    let operation_value = match encode_operation(&operation) {
+                    let operation_value = match encode_operation_with_limit(&operation, max_value_bytes) {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
                     };
@@ -360,6 +694,31 @@ impl StateStoreOperationJournal {
                     }
                     _ => Err(DmlError::journal_unresolved(format!(
                         "DML journal {action} commit outcome is unresolved"
+                    ))),
+                }
+            }
+            Err(failure) => Err(format_run_failure(action, failure)),
+        }
+    }
+
+    async fn finish_statement_mutation(
+        &self,
+        result: Result<
+            novarocks_state_store::RunSuccess<Result<StoredOperation, DmlError>>,
+            RunFailure,
+        >,
+        operation_key: Key,
+        mutation_id: Uuid,
+        action: &str,
+    ) -> Result<StoredOperation, DmlError> {
+        match result {
+            Ok(success) => success.value,
+            Err(RunFailure::CommitUnknown { .. }) => {
+                let authoritative = self.load_by_key(&operation_key).await?;
+                match authoritative {
+                    Some(operation) if operation.last_mutation_id == mutation_id => Ok(operation),
+                    _ => Err(DmlError::journal_unresolved(format!(
+                        "DML journal statement {action} commit outcome is unresolved"
                     ))),
                 }
             }
@@ -494,6 +853,24 @@ impl OperationJournal for StateStoreOperationJournal {
     fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.blocking(self.list_unfinished_async())
     }
+
+    fn create_statement_operation(
+        &self,
+        request: CreateStatementOperationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.create_statement_operation_async(request))
+    }
+
+    fn mutate_statement_operation(
+        &self,
+        request: OperationMutationRequest,
+    ) -> Result<StoredOperation, DmlError> {
+        self.blocking(self.mutate_statement_operation_async(request))
+    }
+
+    fn preflight_statement_operation(&self, operation: &StoredOperation) -> Result<(), DmlError> {
+        encode_operation_with_limit(operation, self.store.limits().max_value_bytes).map(|_| ())
+    }
 }
 
 fn operation_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
@@ -535,15 +912,51 @@ fn decode_key(prefix: &[u8], key: &Key) -> Result<DmlOperationId, DmlError> {
 }
 
 fn encode_operation(operation: &StoredOperation) -> Result<Value, DmlError> {
+    if operation.schema_version != DML_OPERATION_SCHEMA_VERSION {
+        return Err(DmlError::journal_corruption(format!(
+            "cannot encode frontend DML operation schema version {}",
+            operation.schema_version
+        )));
+    }
     validate_operation(operation)?;
     let bytes = serde_json::to_vec(operation).map_err(DmlError::journal_corruption)?;
     Value::try_from(Bytes::from(bytes)).map_err(DmlError::journal_unavailable)
 }
 
+fn encode_operation_with_limit(
+    operation: &StoredOperation,
+    max_value_bytes: usize,
+) -> Result<Value, DmlError> {
+    let value = encode_operation(operation)?;
+    if value.as_bytes().len() > max_value_bytes {
+        return Err(DmlError::journal_unavailable(format!(
+            "DML operation {} encoded size {} exceeds StateStore value limit {max_value_bytes}",
+            operation.operation_id,
+            value.as_bytes().len()
+        )));
+    }
+    Ok(value)
+}
+
 fn decode_operation(key: Key, value: Value) -> Result<StoredOperation, DmlError> {
     let key_id = decode_key(OPERATION_PREFIX, &key)?;
-    let operation: StoredOperation =
+    let probe: OperationSchemaProbe =
         serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+    let operation = match probe.schema_version {
+        DML_LEGACY_OPERATION_SCHEMA_VERSION => {
+            let legacy: StoredOperationV1 =
+                serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
+            StoredOperation::from(legacy)
+        }
+        DML_OPERATION_SCHEMA_VERSION => {
+            serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?
+        }
+        version => {
+            return Err(DmlError::journal_corruption(format!(
+                "unsupported frontend DML operation schema version: {version}"
+            )));
+        }
+    };
     validate_operation(&operation)?;
     if operation.operation_id != key_id {
         return Err(DmlError::journal_corruption(format!(
@@ -556,7 +969,7 @@ fn decode_operation(key: Key, value: Value) -> Result<StoredOperation, DmlError>
 
 fn encode_unfinished(operation_id: DmlOperationId) -> Result<Value, DmlError> {
     let record = StoredUnfinishedOperationV1 {
-        schema_version: DML_OPERATION_SCHEMA_VERSION,
+        schema_version: DML_UNFINISHED_SCHEMA_VERSION,
         operation_id,
     };
     let bytes = serde_json::to_vec(&record).map_err(DmlError::journal_corruption)?;
@@ -567,7 +980,7 @@ fn decode_unfinished(key: Key, value: Value) -> Result<DmlOperationId, DmlError>
     let key_id = decode_key(UNFINISHED_PREFIX, &key)?;
     let record: StoredUnfinishedOperationV1 =
         serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
-    if record.schema_version != DML_OPERATION_SCHEMA_VERSION {
+    if record.schema_version != DML_UNFINISHED_SCHEMA_VERSION {
         return Err(DmlError::journal_corruption(format!(
             "unsupported frontend DML unfinished schema version: {}",
             record.schema_version
@@ -583,12 +996,24 @@ fn decode_unfinished(key: Key, value: Value) -> Result<DmlOperationId, DmlError>
 }
 
 fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
-    if operation.schema_version != DML_OPERATION_SCHEMA_VERSION {
+    if !matches!(
+        operation.schema_version,
+        DML_LEGACY_OPERATION_SCHEMA_VERSION | DML_OPERATION_SCHEMA_VERSION
+    ) {
         return Err(DmlError::journal_corruption(format!(
             "unsupported frontend DML operation schema version: {}",
             operation.schema_version
         )));
     }
+    if operation.schema_version == DML_LEGACY_OPERATION_SCHEMA_VERSION
+        && operation.payload != OperationPayload::WriteV1
+    {
+        return Err(DmlError::journal_corruption(format!(
+            "legacy DML operation {} has a non-write payload",
+            operation.operation_id
+        )));
+    }
+    validate_payload_shape(operation)?;
     if operation.operation_id.as_uuid().get_version_num() != 7 {
         return Err(DmlError::journal_corruption(format!(
             "DML operation {} does not use a UUIDv7 operation id",
@@ -620,6 +1045,334 @@ fn validate_operation(operation: &StoredOperation) -> Result<(), DmlError> {
         )));
     }
     validate_fact_shape(operation)?;
+    Ok(())
+}
+
+fn validate_payload_shape(operation: &StoredOperation) -> Result<(), DmlError> {
+    match (&operation.operation_kind, &operation.payload) {
+        (
+            OperationKind::InsertAppend
+            | OperationKind::InsertOverwrite
+            | OperationKind::RowDelta
+            | OperationKind::MvRefresh
+            | OperationKind::Maintenance,
+            OperationPayload::WriteV1,
+        )
+        | (OperationKind::CreateTableAsSelect, OperationPayload::CtasSaga(_))
+        | (OperationKind::Truncate, OperationPayload::TruncateLifecycle(_)) => {}
+        _ => {
+            return Err(DmlError::journal_corruption(format!(
+                "DML operation {} kind and payload disagree",
+                operation.operation_id
+            )));
+        }
+    }
+    match &operation.payload {
+        OperationPayload::WriteV1 => Ok(()),
+        OperationPayload::CtasSaga(record) => {
+            validate_exact_connector_owner(
+                record.provider_id.as_deref(),
+                record.connector_instance_id.as_deref(),
+                record.connector_incarnation.as_deref(),
+            )?;
+            validate_ctas_record(record)
+        }
+        OperationPayload::TruncateLifecycle(record) => {
+            validate_exact_connector_owner(
+                record.provider_id.as_deref(),
+                record.connector_instance_id.as_deref(),
+                record.connector_incarnation.as_deref(),
+            )?;
+            validate_external_fact(record.outcome.as_ref())
+        }
+    }
+}
+
+fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
+    let child_ids = [
+        record.prepare_operation_id,
+        record.write_operation_id,
+        record.publish_operation_id,
+        record.abort_staging_operation_id,
+    ];
+    if child_ids.iter().any(Uuid::is_nil)
+        || child_ids.iter().copied().collect::<BTreeSet<_>>().len() != child_ids.len()
+    {
+        return Err(DmlError::journal_corruption(
+            "CTAS child operation IDs must be non-nil and pairwise distinct",
+        ));
+    }
+    if !matches!(
+        record.create_policy.as_str(),
+        CTAS_CREATE_POLICY_FAIL_IF_EXISTS | CTAS_CREATE_POLICY_NO_OP_IF_EXISTS
+    ) {
+        return Err(DmlError::journal_corruption(
+            "CTAS create policy must be FAIL_IF_EXISTS or NO_OP_IF_EXISTS",
+        ));
+    }
+    for (label, value) in [
+        ("source plan digest", record.source_plan_digest.as_deref()),
+        (
+            "source schema digest",
+            record.source_schema_digest.as_deref(),
+        ),
+        (
+            "source execution identity",
+            record.source_execution_identity.as_deref(),
+        ),
+        ("write cohort ID", record.write_cohort_id.as_deref()),
+        (
+            "staged handle digest",
+            record.staged_handle_digest.as_deref(),
+        ),
+        (
+            "aggregate write digest",
+            record.aggregate_write_digest.as_deref(),
+        ),
+    ] {
+        if value.is_some_and(str::is_empty) {
+            return Err(DmlError::journal_corruption(format!(
+                "CTAS {label} must not be empty"
+            )));
+        }
+    }
+
+    let facts = [
+        ("prepare", record.prepare_fact.as_ref()),
+        ("write", record.write_fact.as_ref()),
+        ("publish", record.publish_fact.as_ref()),
+        ("abort staging", record.abort_staging_fact.as_ref()),
+    ];
+    let mut total_fact_bytes = 0usize;
+    for (label, fact) in facts {
+        validate_external_fact(fact)?;
+        let Some(fact) = fact else {
+            continue;
+        };
+        validate_ctas_external_fact_shape(label, fact)?;
+        if fact.outcome == ExternalFactOutcome::CommitUnknown
+            && fact.evidence.is_none()
+            && record.next_action != StatementNextAction::ManualInspect
+        {
+            return Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact without provider evidence requires MANUAL_INSPECT"
+            )));
+        }
+        let encoded = serde_json::to_vec(fact).map_err(DmlError::journal_corruption)?;
+        if encoded.len() > DML_CTAS_FACT_ENCODED_LIMIT {
+            return Err(DmlError::journal_unavailable(format!(
+                "CTAS {label} fact encoded size {} exceeds per-fact limit {DML_CTAS_FACT_ENCODED_LIMIT}",
+                encoded.len()
+            )));
+        }
+        total_fact_bytes = total_fact_bytes.checked_add(encoded.len()).ok_or_else(|| {
+            DmlError::journal_unavailable("CTAS total fact encoded size overflow")
+        })?;
+    }
+    if total_fact_bytes > DML_CTAS_TOTAL_FACT_ENCODED_LIMIT {
+        return Err(DmlError::journal_unavailable(format!(
+            "CTAS total fact encoded size {total_fact_bytes} exceeds limit {DML_CTAS_TOTAL_FACT_ENCODED_LIMIT}"
+        )));
+    }
+
+    match record.phase {
+        CtasSagaPhase::PrepareUnknown => require_ctas_outcome(
+            "prepare unknown",
+            record.prepare_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Staged | CtasSagaPhase::Writing => require_ctas_outcome(
+            "prepared target",
+            record.prepare_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::WriteUnknown => require_ctas_outcome(
+            "write unknown",
+            record.write_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Publishing => require_ctas_outcome(
+            "completed write",
+            record.write_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::PublishUnknown => require_ctas_outcome(
+            "publish unknown",
+            record.publish_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::AbortUnknown => require_ctas_outcome(
+            "abort unknown",
+            record.abort_staging_fact.as_ref(),
+            ExternalFactOutcome::CommitUnknown,
+        ),
+        CtasSagaPhase::Committed => require_ctas_outcome(
+            "committed publish",
+            record.publish_fact.as_ref(),
+            ExternalFactOutcome::KnownCommitted,
+        ),
+        CtasSagaPhase::NoOp
+            if record
+                .publish_fact
+                .as_ref()
+                .is_some_and(|fact| fact.outcome == ExternalFactOutcome::NoOp) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::NoOp
+            if record.create_policy == CTAS_CREATE_POLICY_NO_OP_IF_EXISTS
+                && record
+                    .prepare_fact
+                    .as_ref()
+                    .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::NoOp => Err(DmlError::journal_corruption(
+            "CTAS no-op phase requires publish NO_OP or NO_OP_IF_EXISTS prepare CONFLICT fact",
+        )),
+        CtasSagaPhase::Conflict
+            if record
+                .prepare_fact
+                .as_ref()
+                .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict)
+                || record
+                    .publish_fact
+                    .as_ref()
+                    .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::Conflict => Err(DmlError::journal_corruption(
+            "CTAS conflict phase requires prepare or publish CONFLICT fact",
+        )),
+        CtasSagaPhase::PreparingSource
+        | CtasSagaPhase::PreparingStagedTable
+        | CtasSagaPhase::AbortingStaging
+        | CtasSagaPhase::Failed
+        | CtasSagaPhase::Unsupported => Ok(()),
+    }
+}
+
+fn require_ctas_outcome(
+    label: &str,
+    fact: Option<&DurableExternalFact>,
+    expected: ExternalFactOutcome,
+) -> Result<(), DmlError> {
+    if fact.is_some_and(|fact| fact.outcome == expected) {
+        Ok(())
+    } else {
+        Err(DmlError::journal_corruption(format!(
+            "CTAS {label} phase requires {expected:?} fact"
+        )))
+    }
+}
+
+fn validate_ctas_external_fact_shape(
+    label: &str,
+    fact: &DurableExternalFact,
+) -> Result<(), DmlError> {
+    if fact.receipt.as_deref().is_some_and(str::is_empty)
+        || fact.evidence.as_deref().is_some_and(str::is_empty)
+        || fact
+            .finalization_failure
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || fact.failure.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(DmlError::journal_corruption(format!(
+            "CTAS {label} fact contains an empty durable field"
+        )));
+    }
+    if fact.receipt.is_some() && fact.evidence.is_some() {
+        return Err(DmlError::journal_corruption(format!(
+            "CTAS {label} fact cannot contain both receipt and evidence"
+        )));
+    }
+    match fact.outcome {
+        ExternalFactOutcome::CommitUnknown if fact.evidence.is_none() && fact.failure.is_none() => {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact requires provider evidence or a durable failure"
+            )))
+        }
+        ExternalFactOutcome::KnownCommitted | ExternalFactOutcome::NoOp
+            if fact.receipt.is_none() =>
+        {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} committed/no-op fact requires a receipt"
+            )))
+        }
+        ExternalFactOutcome::KnownUncommitted
+        | ExternalFactOutcome::Unsupported
+        | ExternalFactOutcome::Conflict
+            if fact.failure.is_none() =>
+        {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} uncommitted fact requires a failure"
+            )))
+        }
+        ExternalFactOutcome::CommitUnknown if fact.finalization_failure.is_some() => {
+            Err(DmlError::journal_corruption(format!(
+                "CTAS {label} unknown fact cannot contain finalization failure"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_exact_connector_owner(
+    provider_id: Option<&str>,
+    instance_id: Option<&str>,
+    incarnation_hex: Option<&str>,
+) -> Result<(), DmlError> {
+    let present = [
+        provider_id.is_some(),
+        instance_id.is_some(),
+        incarnation_hex.is_some(),
+    ];
+    if present.iter().any(|present| *present) && !present.iter().all(|present| *present) {
+        return Err(DmlError::journal_corruption(
+            "DML connector owner must include provider, instance, and incarnation together",
+        ));
+    }
+    if provider_id.is_some_and(str::is_empty) || instance_id.is_some_and(str::is_empty) {
+        return Err(DmlError::journal_corruption(
+            "DML connector provider and instance IDs must not be empty",
+        ));
+    }
+    if incarnation_hex.is_some_and(|value| {
+        value.len() != 32
+            || !value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+    }) {
+        return Err(DmlError::journal_corruption(
+            "DML connector incarnation must be 32 lowercase hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_external_fact(fact: Option<&DurableExternalFact>) -> Result<(), DmlError> {
+    let Some(fact) = fact else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("receipt", &fact.receipt),
+        ("evidence", &fact.evidence),
+        ("finalization failure", &fact.finalization_failure),
+        ("failure", &fact.failure),
+    ] {
+        if value
+            .as_ref()
+            .is_some_and(|value| value.len() > DML_EXTERNAL_FACT_ENCODED_LIMIT)
+        {
+            return Err(DmlError::journal_unavailable(format!(
+                "DML external {label} exceeds encoded limit {DML_EXTERNAL_FACT_ENCODED_LIMIT}"
+            )));
+        }
+    }
     Ok(())
 }
 

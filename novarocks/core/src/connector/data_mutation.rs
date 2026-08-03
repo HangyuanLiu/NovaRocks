@@ -129,7 +129,7 @@ pub(crate) enum DataMutationDispatchState {
     PossiblyDispatched,
 }
 
-/// Terminal application view after at most one execute and one reconciliation.
+/// Application view after one execute or one explicit reconciliation.
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedDataMutation {
     KnownCommitted(CompletedDataMutation),
@@ -205,7 +205,7 @@ pub(crate) fn resolve_data_mutation(
     intent: DataMutationIntent,
     context: ConnectorRequestContext,
 ) -> ResolvedDataMutation {
-    let session = match DataMutationSession::plan(
+    let mut session = match DataMutationSession::plan(
         resolver,
         instance_id,
         operation_id,
@@ -216,7 +216,11 @@ pub(crate) fn resolve_data_mutation(
         Ok(session) => session,
         Err(failure) => return failure,
     };
-    session.execute(cache_finalizer)
+    let executed = session.execute_once(cache_finalizer);
+    let ResolvedDataMutation::CommitUnknown { evidence, .. } = &executed else {
+        return executed;
+    };
+    session.reconcile_once(evidence.clone(), cache_finalizer)
 }
 
 pub(crate) struct DataMutationSession {
@@ -224,6 +228,13 @@ pub(crate) struct DataMutationSession {
     table: ConnectorTableIdentity,
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
     context: ConnectorRequestContext,
+    phase: DataMutationSessionPhase,
+}
+
+enum DataMutationSessionPhase {
+    Planned,
+    AwaitingReconcile(ExternalMutationEvidence),
+    Terminal,
 }
 
 impl DataMutationSession {
@@ -294,20 +305,91 @@ impl DataMutationSession {
             table,
             plan,
             context,
+            phase: DataMutationSessionPhase::Planned,
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
         &self.plan
     }
 
-    pub(crate) fn execute(
-        self,
+    pub(crate) fn descriptor_ref(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+        self.lease.descriptor()
+    }
+
+    /// Dispatch the retained plan exactly once.
+    ///
+    /// A commit-unknown outcome is deliberately returned without reconciling.
+    /// The caller must first durably persist the evidence and then explicitly
+    /// pass that same evidence to [`Self::reconcile_once`].
+    pub(crate) fn execute_once(
+        &mut self,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
+        if !matches!(self.phase, DataMutationSessionPhase::Planned) {
+            return contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector data mutation session execute was already attempted",
+                ),
+                DataMutationDispatchState::ConfirmedNotDispatched,
+            );
+        }
         let request = match ConnectorDataMutationExecuteRequest::try_new(
             self.plan.clone(),
+            self.context.clone(),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.phase = DataMutationSessionPhase::Terminal;
+                return contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched);
+            }
+        };
+        let outcome = match self.lease.execute(request) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.phase = DataMutationSessionPhase::Terminal;
+                return contract_failure(error, DataMutationDispatchState::PossiblyDispatched);
+            }
+        };
+        self.phase = match &outcome {
+            ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
+                DataMutationSessionPhase::AwaitingReconcile(evidence.clone())
+            }
+            _ => DataMutationSessionPhase::Terminal,
+        };
+        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
+    }
+
+    /// Reconcile one previously returned unknown outcome on the retained exact
+    /// lease. Passing the evidence back explicitly is the durable-barrier seam:
+    /// core cannot silently reconcile before the frontend records it.
+    pub(crate) fn reconcile_once(
+        &mut self,
+        evidence: ExternalMutationEvidence,
+        cache_finalizer: &dyn DataMutationCacheFinalizer,
+    ) -> ResolvedDataMutation {
+        let DataMutationSessionPhase::AwaitingReconcile(expected) = &self.phase else {
+            return contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector data mutation session is not awaiting reconciliation",
+                ),
+                DataMutationDispatchState::ConfirmedNotDispatched,
+            );
+        };
+        if expected != &evidence {
+            return contract_failure(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector data mutation evidence does not match the execute outcome",
+                ),
+                DataMutationDispatchState::ConfirmedNotDispatched,
+            );
+        }
+        let reconcile = match ConnectorDataMutationReconcileRequest::try_new(
+            &self.plan,
+            evidence,
             self.context.clone(),
         ) {
             Ok(request) => request,
@@ -315,33 +397,14 @@ impl DataMutationSession {
                 return contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched);
             }
         };
-        let outcome = match self.lease.execute(request) {
+        let outcome = match self.lease.reconcile(reconcile) {
             Ok(outcome) => outcome,
             Err(error) => {
+                self.phase = DataMutationSessionPhase::Terminal;
                 return contract_failure(error, DataMutationDispatchState::PossiblyDispatched);
             }
         };
-        let outcome = match outcome {
-            ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
-                let reconcile = match ConnectorDataMutationReconcileRequest::try_new(
-                    &self.plan,
-                    evidence.clone(),
-                    self.context,
-                ) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        return ResolvedDataMutation::CommitUnknown { failure, evidence };
-                    }
-                };
-                match self.lease.reconcile(reconcile) {
-                    Ok(outcome) => outcome,
-                    Err(_) => {
-                        return ResolvedDataMutation::CommitUnknown { failure, evidence };
-                    }
-                }
-            }
-            outcome => outcome,
-        };
+        self.phase = DataMutationSessionPhase::Terminal;
         resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
     }
 }
@@ -778,7 +841,7 @@ mod tests {
         };
         let operation_id = ConnectorMutationOperationId::from_bytes([8; 16]);
         let resolver = Resolver::new(provider.clone());
-        let session = DataMutationSession::plan(
+        let mut session = DataMutationSession::plan(
             &resolver,
             &provider.descriptor.instance_id,
             operation_id,
@@ -790,9 +853,11 @@ mod tests {
         assert_eq!(session.plan_ref().operation_id(), operation_id);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.execute(&finalizer),
+            session.execute_once(&finalizer),
             ResolvedDataMutation::KnownCommitted(_)
         ));
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+        drop(session);
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 1);
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
@@ -802,6 +867,95 @@ mod tests {
             provider.events.lock().expect("events").as_slice(),
             ["provider", "generic"]
         );
+    }
+
+    #[test]
+    fn unknown_waits_for_explicit_reconcile_on_the_same_session() {
+        let provider = FakeProvider::new(Mode::UnknownThenCommitted);
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+            fail: false,
+        };
+        let resolver = Resolver::new(provider.clone());
+        let mut session = DataMutationSession::plan(
+            &resolver,
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::from_bytes([11; 16]),
+            table(&provider.descriptor.instance_id),
+            truncate_intent(),
+            context(),
+        )
+        .expect("planned session");
+
+        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once(&finalizer)
+        else {
+            panic!("expected commit unknown");
+        };
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            session.reconcile_once(evidence, &finalizer),
+            ResolvedDataMutation::KnownCommitted(_)
+        ));
+        assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            session.execute_once(&finalizer),
+            ResolvedDataMutation::ContractFailure {
+                dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
+                ..
+            }
+        ));
+        assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mismatched_evidence_fails_before_reconcile_dispatch() {
+        let provider = FakeProvider::new(Mode::UnknownThenCommitted);
+        let finalizer = Finalizer {
+            events: provider.events.clone(),
+            fail: false,
+        };
+        let mut session = DataMutationSession::plan(
+            &Resolver::new(provider.clone()),
+            &provider.descriptor.instance_id,
+            ConnectorMutationOperationId::from_bytes([12; 16]),
+            table(&provider.descriptor.instance_id),
+            truncate_intent(),
+            context(),
+        )
+        .expect("planned session");
+        let ResolvedDataMutation::CommitUnknown { evidence, .. } = session.execute_once(&finalizer)
+        else {
+            panic!("expected commit unknown");
+        };
+        let mismatched = ExternalMutationEvidence::try_new(
+            evidence.schema_version(),
+            evidence.descriptor().clone(),
+            evidence.incarnation(),
+            ConnectorMutationOperationId::from_bytes([99; 16]),
+            evidence.operation_kind(),
+            evidence.provider_payload().clone(),
+        )
+        .expect("mismatched evidence");
+
+        assert!(matches!(
+            session.reconcile_once(mismatched, &finalizer),
+            ResolvedDataMutation::ContractFailure {
+                dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
+                ..
+            }
+        ));
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            session.reconcile_once(evidence, &finalizer),
+            ResolvedDataMutation::KnownCommitted(_)
+        ));
+        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

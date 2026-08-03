@@ -123,6 +123,21 @@ impl ConnectorWriteOperationSession {
         &self.inner.sealed
     }
 
+    /// Materialize the complete accepted aggregate without choosing commit or
+    /// abort. CTAS binds this read-only completion to its exact staged target;
+    /// only the later frontend publish intent may cross the catalog boundary.
+    pub fn sealed_operation_completion(
+        &self,
+    ) -> Result<ConnectorWriteOperationCompletion, ConnectorError> {
+        let state = self.lock_state()?;
+        if state.terminal.is_some() {
+            return Err(invalid(
+                "connector write completion is unavailable after a terminal decision",
+            ));
+        }
+        self.operation_completion(&state)
+    }
+
     pub fn contains_cohort(&self, cohort_id: ConnectorWriteCohortId) -> bool {
         self.inner.cohorts.contains_key(&cohort_id)
     }

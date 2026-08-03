@@ -55,6 +55,11 @@ const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
 const EVIDENCE_PAYLOAD_VERSION: u16 = 1;
 const MARKER_VALUE_VERSION: u16 = 1;
+const TRUNCATE_OPERATION_KIND: &str = "truncate";
+const MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_DURABLE_ICEBERG_TRUNCATE_EVIDENCE_WIRE_BYTES: usize =
+    MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES / 2;
+const MAX_DURABLE_ICEBERG_TRUNCATE_RECEIPT_PROVIDER_PAYLOAD_BYTES: usize = 64;
 const MARKER_PROPERTY: &str = "novarocks.connector.data-mutation.v1";
 const IDENTITY_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.data-mutation.identity.v1\0";
 const TRUNCATE_STATE_DIGEST_DOMAIN: &[u8] = b"novarocks.iceberg.data-mutation.truncate-state.v1\0";
@@ -613,13 +618,7 @@ impl IcebergDataMutationAdapter {
             plan.plan_digest(),
             plan.state_digest(),
             plan.summary(),
-            canonical_json(
-                &IcebergDataMutationReceiptV1 {
-                    version: RECEIPT_PAYLOAD_VERSION,
-                    snapshot_id,
-                },
-                "Iceberg data mutation receipt",
-            )?,
+            durable_receipt_payload(snapshot_id)?,
         )
     }
 
@@ -656,6 +655,34 @@ impl IcebergDataMutationAdapter {
         )
     }
 
+    fn preflight_durable_truncate_evidence(
+        &self,
+        plan: &ConnectorDataMutationPlan,
+        payload: &IcebergDataMutationPlanPayloadV1,
+    ) -> Result<(), ConnectorError> {
+        if plan.operation_kind() != TRUNCATE_OPERATION_KIND {
+            return Ok(());
+        }
+        let wire = self.evidence(plan, payload)?.try_to_wire_v1()?;
+        let hex_bytes = wire.len().checked_mul(2).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg TRUNCATE evidence hex size overflow",
+            )
+        })?;
+        if hex_bytes > MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                format!(
+                    "Iceberg TRUNCATE evidence wire exceeds durable {} byte cap for a {} byte lowercase-hex journal field",
+                    MAX_DURABLE_ICEBERG_TRUNCATE_EVIDENCE_WIRE_BYTES,
+                    MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn committed(
         &self,
         plan: &ConnectorDataMutationPlan,
@@ -689,13 +716,7 @@ impl IcebergDataMutationAdapter {
             request.plan_digest,
             request.state_digest,
             summary,
-            canonical_json(
-                &IcebergDataMutationReceiptV1 {
-                    version: RECEIPT_PAYLOAD_VERSION,
-                    snapshot_id,
-                },
-                "Iceberg data mutation receipt",
-            )?,
+            durable_receipt_payload(snapshot_id)?,
         )?;
         Ok(ExternalMutationOutcome::KnownCommitted {
             effect: ExternalMutationEffect::Applied,
@@ -736,6 +757,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         let provider_payload = canonical_json(private.payload(), "Iceberg data mutation plan")?;
         let plan =
             ConnectorDataMutationPlan::try_new(&request, state_digest, summary, provider_payload)?;
+        self.preflight_durable_truncate_evidence(&plan, private.payload())?;
         plans.insert(
             request.operation_id(),
             CachedPlan {
@@ -882,6 +904,23 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             }),
         }
     }
+}
+
+fn durable_receipt_payload(snapshot_id: i64) -> Result<Bytes, ConnectorError> {
+    let payload = canonical_json(
+        &IcebergDataMutationReceiptV1 {
+            version: RECEIPT_PAYLOAD_VERSION,
+            snapshot_id,
+        },
+        "Iceberg data mutation receipt",
+    )?;
+    if payload.len() > MAX_DURABLE_ICEBERG_TRUNCATE_RECEIPT_PROVIDER_PAYLOAD_BYTES {
+        return Err(internal(format!(
+            "Iceberg TRUNCATE receipt provider payload exceeds fixed {} byte durable bound",
+            MAX_DURABLE_ICEBERG_TRUNCATE_RECEIPT_PROVIDER_PAYLOAD_BYTES
+        )));
+    }
+    Ok(payload)
 }
 
 fn marker_target(planned: &PlannedIcebergMutation) -> (String, String) {
@@ -1175,6 +1214,7 @@ mod tests {
     struct FakeBackend {
         lookup: Mutex<MarkerLookup>,
         execute_count: AtomicUsize,
+        namespace: String,
     }
 
     impl FakeBackend {
@@ -1182,6 +1222,14 @@ mod tests {
             Self {
                 lookup: Mutex::new(MarkerLookup::Missing),
                 execute_count: AtomicUsize::new(0),
+                namespace: "db".to_string(),
+            }
+        }
+
+        fn with_namespace(namespace: impl Into<String>) -> Self {
+            Self {
+                namespace: namespace.into(),
+                ..Self::new()
             }
         }
     }
@@ -1202,7 +1250,7 @@ mod tests {
                 PlannedIcebergMutation::Truncate {
                     payload: IcebergDataMutationPlanPayloadV1 {
                         version: PLAN_PAYLOAD_VERSION,
-                        namespace: "db".to_string(),
+                        namespace: self.namespace.clone(),
                         table: "orders".to_string(),
                         table_uuid: "table-uuid".to_string(),
                         target_ref: "main".to_string(),
@@ -1347,6 +1395,87 @@ mod tests {
     }
 
     #[test]
+    fn truncate_evidence_wire_fits_exact_durable_hex_boundary_and_rejects_one_over() {
+        fn planned_evidence_wire_len(
+            adapter: &IcebergDataMutationAdapter,
+            plan: &ConnectorDataMutationPlan,
+        ) -> usize {
+            let plans = adapter.plans.lock().expect("plans");
+            let cached = plans.get(&plan.operation_id()).expect("cached plan");
+            adapter
+                .evidence(plan, cached.private.payload())
+                .expect("evidence")
+                .try_to_wire_v1()
+                .expect("wire")
+                .len()
+        }
+
+        assert_eq!(
+            MAX_DURABLE_ICEBERG_TRUNCATE_EVIDENCE_WIRE_BYTES
+                .checked_mul(2)
+                .expect("hex size"),
+            MAX_DURABLE_TRUNCATE_EVIDENCE_HEX_BYTES
+        );
+
+        let empty_backend = Arc::new(FakeBackend::with_namespace(""));
+        let (empty_adapter, key, instance_id) = test_adapter(empty_backend);
+        let base_plan = empty_adapter
+            .plan_mutation(truncate_request(
+                key,
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([11; 16]),
+                "main",
+            ))
+            .expect("base plan");
+        let base_wire_len = planned_evidence_wire_len(&empty_adapter, &base_plan);
+        let boundary_namespace_len = MAX_DURABLE_ICEBERG_TRUNCATE_EVIDENCE_WIRE_BYTES
+            .checked_sub(base_wire_len)
+            .expect("evidence base must fit durable cap");
+
+        let boundary_backend = Arc::new(FakeBackend::with_namespace(
+            "n".repeat(boundary_namespace_len),
+        ));
+        let (boundary_adapter, key, instance_id) = test_adapter(Arc::clone(&boundary_backend));
+        let boundary_plan = boundary_adapter
+            .plan_mutation(truncate_request(
+                key,
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([12; 16]),
+                "main",
+            ))
+            .expect("evidence exactly at durable cap must plan");
+        assert_eq!(
+            planned_evidence_wire_len(&boundary_adapter, &boundary_plan),
+            MAX_DURABLE_ICEBERG_TRUNCATE_EVIDENCE_WIRE_BYTES
+        );
+        assert_eq!(boundary_backend.execute_count.load(Ordering::SeqCst), 0);
+
+        let over_backend = Arc::new(FakeBackend::with_namespace(
+            "n".repeat(boundary_namespace_len + 1),
+        ));
+        let (over_adapter, key, instance_id) = test_adapter(Arc::clone(&over_backend));
+        let error = over_adapter
+            .plan_mutation(truncate_request(
+                key,
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([13; 16]),
+                "main",
+            ))
+            .expect_err("over-budget evidence must fail during planning");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert!(over_adapter.plans.lock().expect("plans").is_empty());
+        assert_eq!(over_backend.execute_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn truncate_receipt_provider_payload_has_a_fixed_small_durable_bound() {
+        for snapshot_id in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let payload = durable_receipt_payload(snapshot_id).expect("receipt payload");
+            assert!(payload.len() <= MAX_DURABLE_ICEBERG_TRUNCATE_RECEIPT_PROVIDER_PAYLOAD_BYTES);
+        }
+    }
+
+    #[test]
     fn operation_replay_is_idempotent_and_conflicting_request_is_rejected() {
         let backend = Arc::new(FakeBackend::new());
         let (adapter, key, instance_id) = test_adapter(backend);
@@ -1395,5 +1524,56 @@ mod tests {
             ExternalMutationOutcome::KnownCommitted { receipt, .. }
                 if receipt.summary() == ConnectorDataMutationPlanSummary::default()
         ));
+    }
+
+    #[test]
+    fn reconcile_marker_matrix_is_typed_and_never_reexecutes() {
+        let backend = Arc::new(FakeBackend::new());
+        let (adapter, key, instance_id) = test_adapter(Arc::clone(&backend));
+        let plan = adapter
+            .plan_mutation(truncate_request(
+                key.clone(),
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([10; 16]),
+                "main",
+            ))
+            .expect("plan");
+        let execute = ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
+            .expect("execute");
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+            adapter.execute(execute).expect("unknown")
+        else {
+            panic!("expected unknown");
+        };
+
+        let reconcile = || {
+            ConnectorDataMutationReconcileRequest::try_new(&plan, evidence.clone(), test_context())
+                .expect("reconcile request")
+        };
+        let restarted = IcebergDataMutationAdapter::new(
+            key.clone(),
+            Arc::clone(&backend) as Arc<dyn IcebergDataMutationBackend>,
+        )
+        .expect("restart adapter");
+        assert!(matches!(
+            restarted.reconcile(reconcile()).expect("missing marker"),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+
+        *backend.lookup.lock().expect("lookup") = MarkerLookup::Conflicting;
+        assert!(matches!(
+            restarted
+                .reconcile(reconcile())
+                .expect("conflicting marker"),
+            ExternalMutationOutcome::CommitUnknown { failure, .. }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
+
+        *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 43 };
+        assert!(matches!(
+            restarted.reconcile(reconcile()).expect("matching marker"),
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(backend.execute_count.load(Ordering::SeqCst), 1);
     }
 }

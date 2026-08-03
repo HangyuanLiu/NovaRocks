@@ -55,6 +55,7 @@ use novarocks_catalog::memory::DEFAULT_DATABASE;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
+pub mod ctas_engine;
 pub mod delete_engine;
 pub(crate) mod dml_change_stream;
 pub(crate) mod iceberg_change_stream_write;
@@ -77,6 +78,7 @@ pub mod statistics;
 pub mod statistics_application;
 pub mod system_catalog;
 pub mod table_maintenance;
+pub mod truncate_engine;
 pub mod view;
 pub(crate) mod virtual_table;
 pub(crate) mod write_operation_lifecycle;
@@ -88,10 +90,10 @@ pub(crate) use write_transaction::IcebergWriteCommitExecutor;
 use self::statement::{
     execute_create_database_statement, execute_create_table_statement,
     execute_drop_catalog_statement, execute_drop_database_statement, execute_drop_table_statement,
-    execute_truncate_table_statement, looks_like_add_equality_delete, looks_like_add_files,
-    looks_like_alter_iceberg_properties, looks_like_alter_iceberg_schema,
-    looks_like_alter_partition_column, looks_like_show_create_table,
-    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql, parse_show_create_table,
+    looks_like_add_equality_delete, looks_like_add_files, looks_like_alter_iceberg_properties,
+    looks_like_alter_iceberg_schema, looks_like_alter_partition_column,
+    looks_like_show_create_table, parse_alter_iceberg_properties_sql,
+    parse_alter_partition_column_sql, parse_show_create_table,
 };
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 #[cfg(test)]
@@ -1433,6 +1435,14 @@ impl StandaloneNovaRocks {
         Arc::new(Arc::clone(&self.inner))
     }
 
+    pub fn ctas_engine(&self) -> Arc<dyn ctas_engine::CtasEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
+    pub fn truncate_engine(&self) -> Arc<dyn truncate_engine::TruncateEngine> {
+        Arc::new(Arc::clone(&self.inner))
+    }
+
     /// Resolve an ANALYZE target once through the current connector control
     /// generation. The frontend persists the returned opaque pin before it
     /// creates a durable job; workers never receive this resolver.
@@ -2304,6 +2314,9 @@ impl StandaloneSession {
             sqlast::Statement::Delete(_) => {
                 Err("DELETE must be routed by frontend DML service".to_string())
             }
+            sqlast::Statement::Truncate(_) => {
+                Err("TRUNCATE must be routed by frontend DML service".to_string())
+            }
             ref update_stmt @ sqlast::Statement::Update(_) => {
                 if let Some(result) = self::information_schema::try_update_be_configs(update_stmt)?
                 {
@@ -2331,22 +2344,6 @@ impl StandaloneSession {
                     request_context.execution(),
                     &connector_context,
                 )
-            }
-            sqlast::Statement::Truncate(truncate) => {
-                for truncate_table in &truncate.table_names {
-                    let table_name = crate::sql::parser::dialect::convert_object_name(
-                        truncate_table.name.clone(),
-                    )?;
-                    execute_truncate_table_statement(
-                        &self.inner,
-                        &table_name,
-                        "main",
-                        current_catalog,
-                        current_database,
-                        &connector_context,
-                    )?;
-                }
-                Ok(StatementResult::Ok)
             }
             _ => Err(format!(
                 "unsupported sql: {}",
@@ -3243,7 +3240,6 @@ fn build_iceberg_create_table_ddl(
 // ---------------------------------------------------------------------------
 
 pub(crate) mod delete_predicate_translate;
-pub(crate) mod iceberg_truncate;
 pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
@@ -3327,15 +3323,8 @@ pub(crate) fn dispatch_statement(
             &stmt,
             connector_context,
         ),
-        Statement::Truncate { name, target_ref } => {
-            crate::engine::statement::execute_truncate_table_statement(
-                state,
-                &name,
-                &target_ref,
-                current_catalog,
-                current_database,
-                connector_context,
-            )
+        Statement::Truncate { .. } => {
+            Err("TRUNCATE must be routed by frontend DML service".to_string())
         }
         Statement::AddBackend(stmt) => {
             require_backend_management_role("ADD BACKEND", request_context.execution().role())?;

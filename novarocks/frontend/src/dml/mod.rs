@@ -23,6 +23,7 @@
 //! contract. DML-1 ships the runner + fake-backed tests; the real executor and
 //! SQL routing land in DML-2.
 
+pub mod ctas;
 mod delete;
 pub mod error;
 pub mod insert;
@@ -32,16 +33,20 @@ pub mod reconcile;
 pub mod runner;
 pub mod service;
 pub mod state_store_journal;
+pub mod truncate;
 
 pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
 pub use journal::OperationJournal;
 pub use model::{
     CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest,
-    DmlOperationId, IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord,
-    IcebergOperationFailureKind, IcebergOperationFailureRecord, IcebergOperationNextAction,
-    IcebergRecoveryEvidenceRecord, OperationFact, OperationKind, OperationState, OperationTarget,
-    RecoveryEvidence, StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlOperationId,
+    DurableExternalFact, DurableMutationSummary, ExternalFactOutcome, IcebergCleanupOutcomeRecord,
+    IcebergCommitOutcomeRecord, IcebergOperationFailureKind, IcebergOperationFailureRecord,
+    IcebergOperationNextAction, IcebergRecoveryEvidenceRecord, OperationFact, OperationKind,
+    OperationMutationRequest, OperationPayload, OperationState, OperationTarget, RecoveryEvidence,
+    StatementNextAction, StoredOperation, TruncateLifecyclePhase, TruncateLifecycleRecord,
+    WriteTransactionOutcome, WriteTransactionSpec,
 };
 pub use runner::{
     AlwaysAdmit, CoordinatedWriteReport, WriteAdmission, WriteExecutor, WriteTransactionRunner,

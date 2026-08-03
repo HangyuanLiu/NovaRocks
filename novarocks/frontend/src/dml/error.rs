@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use crate::dml::model::{CommitOutcome, DmlOperationId};
+use crate::dml::model::{CommitOutcome, DmlOperationId, StatementNextAction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlErrorKind {
@@ -35,6 +35,7 @@ pub struct DmlError {
     kind: DmlErrorKind,
     message: String,
     operation_id: Option<DmlOperationId>,
+    next_action: Option<StatementNextAction>,
     committed_outcome: Option<CommitOutcome>,
 }
 
@@ -44,6 +45,7 @@ impl DmlError {
             kind,
             message: error.to_string(),
             operation_id: None,
+            next_action: None,
             committed_outcome: None,
         }
     }
@@ -68,6 +70,16 @@ impl DmlError {
         Self::new(DmlErrorKind::Commit, error)
     }
 
+    pub(crate) fn with_operation_id(mut self, operation_id: DmlOperationId) -> Self {
+        self.operation_id = Some(operation_id);
+        self
+    }
+
+    pub(crate) fn with_next_action(mut self, next_action: StatementNextAction) -> Self {
+        self.next_action = Some(next_action);
+        self
+    }
+
     pub(crate) fn committed_but_unfinalized(
         operation_id: DmlOperationId,
         committed_outcome: Option<CommitOutcome>,
@@ -77,6 +89,7 @@ impl DmlError {
             kind: DmlErrorKind::CommittedButUnfinalized,
             message: format!("{error}; do not retry commit"),
             operation_id: Some(operation_id),
+            next_action: Some(StatementNextAction::RetryFinalize),
             committed_outcome,
         }
     }
@@ -94,6 +107,10 @@ impl DmlError {
         self.operation_id
     }
 
+    pub const fn next_action(&self) -> Option<StatementNextAction> {
+        self.next_action
+    }
+
     pub const fn committed_outcome(&self) -> Option<&CommitOutcome> {
         self.committed_outcome.as_ref()
     }
@@ -104,6 +121,9 @@ impl fmt::Display for DmlError {
         write!(formatter, "{:?}: {}", self.kind, self.message)?;
         if let Some(operation_id) = self.operation_id {
             write!(formatter, " (operation {operation_id})")?;
+        }
+        if let Some(next_action) = self.next_action {
+            write!(formatter, " (next action {next_action:?})")?;
         }
         if let Some(outcome) = &self.committed_outcome {
             write!(
@@ -124,8 +144,21 @@ mod tests {
 
     #[test]
     fn display_includes_kind_and_message() {
-        let error = DmlError::journal_unavailable("boom");
+        let operation_id = DmlOperationId::new_v7();
+        let error = DmlError::journal_unavailable("boom")
+            .with_operation_id(operation_id)
+            .with_next_action(StatementNextAction::ManualInspect);
         assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
-        assert_eq!(error.to_string(), "JournalUnavailable: boom");
+        assert_eq!(error.operation_id(), Some(operation_id));
+        assert_eq!(
+            error.next_action(),
+            Some(StatementNextAction::ManualInspect)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "JournalUnavailable: boom (operation {operation_id}) (next action ManualInspect)"
+            )
+        );
     }
 }

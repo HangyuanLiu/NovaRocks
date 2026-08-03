@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ExternalMutationFinalization,
+};
 use opendal::Operator;
 
 use crate::common::engine_error::EngineError;
@@ -128,6 +132,97 @@ pub(crate) struct IcebergWriteCommitExecutor {
 }
 
 impl IcebergWriteCommitExecutor {
+    /// Convert one sealed connector write aggregate into provider-private
+    /// snapshot changes against this executor's table without publishing it.
+    /// CTAS uses the returned action in its single assert-create table commit.
+    pub(crate) fn build_staged_create_action(
+        &self,
+        completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<AbortLog>,
+    ) -> Result<
+        crate::connector::iceberg::commit::StagedFastAppendAction,
+        crate::connector::iceberg::write_service::StagedCreateActionBuildFailure,
+    > {
+        use crate::connector::iceberg::write_service::StagedCreateActionBuildFailure;
+
+        let reports = crate::connector::iceberg::write_service::decode_primary_write_completion(
+            completion,
+            self.table.metadata(),
+        )
+        .map_err(|error| StagedCreateActionBuildFailure {
+            error,
+            abort_handle: Arc::clone(abort_handle),
+        })?;
+        let mut writer_files = Vec::new();
+        self.convert_iceberg_writer_reports(reports, &mut writer_files)
+            .map_err(|error| StagedCreateActionBuildFailure {
+                error,
+                abort_handle: Arc::clone(abort_handle),
+            })?;
+        self.collector.inject_written_files(writer_files);
+        let file_io = self.table.file_io().clone();
+        let context = crate::connector::iceberg::commit::CommitCtx {
+            collector: &self.collector,
+            table: &self.table,
+            catalog: self.catalog.as_ref(),
+            file_io: &file_io,
+            commit_uuid: uuid::Uuid::new_v4(),
+            abort_handle: Arc::clone(abort_handle),
+            target_ref: &self.target_ref,
+            snapshot_properties: &self.snapshot_properties,
+        };
+        block_on_iceberg(
+            crate::connector::iceberg::commit::build_staged_fast_append_action(context),
+        )
+        .map_err(|error| StagedCreateActionBuildFailure {
+            error: CommitServiceError::known_uncommitted(error, CleanupAttempt::not_attempted()),
+            abort_handle: Arc::clone(abort_handle),
+        })?
+        .map_err(|error| StagedCreateActionBuildFailure {
+            error: CommitServiceError::known_uncommitted(error, CleanupAttempt::not_attempted()),
+            abort_handle: Arc::clone(abort_handle),
+        })
+    }
+
+    pub(crate) fn abort_staged_create_action(
+        &self,
+        completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
+        abort_handle: &Arc<AbortLog>,
+    ) -> Result<ExternalMutationFinalization, ConnectorError> {
+        let reports = crate::connector::iceberg::write_service::decode_primary_write_completion(
+            completion,
+            self.table.metadata(),
+        )
+        .map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, format!("{error:?}"))
+                .with_retryable_before_progress()
+        })?;
+        let data_cleanup = self
+            .abort_iceberg_writer_reports(reports)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        let fs = self.fs.clone();
+        let mapper = self.cleanup_path_mapper.clone();
+        let manifest_errors = block_on_iceberg(async {
+            if let Some(mapper) = mapper {
+                abort_handle
+                    .cleanup_with_path_mapper(&fs, |path| mapper(path))
+                    .await
+            } else {
+                abort_handle.cleanup(&fs).await
+            }
+        })
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        let error_count = data_cleanup.error_count + manifest_errors.len();
+        Ok(if error_count == 0 {
+            ExternalMutationFinalization::Complete
+        } else {
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Internal,
+                format!("staged table cleanup completed with {error_count} deletion error(s)"),
+            ))
+        })
+    }
+
     /// Commit provider-private reports that were reconstructed by a connector
     /// control binding.  This is the narrow bridge from the generic writer
     /// contract into Iceberg's existing collector and commit service: generic

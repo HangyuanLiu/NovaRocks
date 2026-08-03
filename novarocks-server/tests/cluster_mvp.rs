@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row};
-use novarocks_frontend::dml::{OperationKind, OperationState};
+use novarocks_frontend::dml::{
+    CtasSagaPhase, ExternalFactOutcome, OperationKind, OperationPayload, OperationState,
+    StatementNextAction, TruncateLifecyclePhase,
+};
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
 };
@@ -2688,6 +2691,323 @@ fn cross_process_three_be_frontend_delete_service_lifecycle() {
     runtime
         .block_on(host.shutdown())
         .expect("inspection host shutdown");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_process_three_be_frontend_ctas_truncate_lifecycle() {
+    let Ok(rest_uri) = std::env::var("NOVAROCKS_ICEBERG_REST_URI") else {
+        eprintln!(
+            "SKIP cross_process_three_be_frontend_ctas_truncate_lifecycle: \
+             NOVAROCKS_ICEBERG_REST_URI is not configured"
+        );
+        return;
+    };
+    let rest_warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE")
+        .expect("REST lifecycle acceptance requires NOVAROCKS_ICEBERG_REST_WAREHOUSE");
+    let s3_endpoint = std::env::var("AWS_S3_ENDPOINT")
+        .expect("REST lifecycle acceptance requires AWS_S3_ENDPOINT");
+    let s3_access_key = std::env::var("AWS_S3_ACCESS_KEY_ID")
+        .expect("REST lifecycle acceptance requires AWS_S3_ACCESS_KEY_ID");
+    let s3_secret_key = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+        .expect("REST lifecycle acceptance requires AWS_S3_SECRET_ACCESS_KEY");
+
+    let _guard = lock_cluster_mvp();
+    let fixture_dir = tempfile::tempdir_in(runtime_dir())
+        .expect("create CTAS/TRUNCATE lifecycle fixture directory");
+    let state_store_path = fixture_dir.path().join("frontend-state.sqlite");
+    let metadata_path = fixture_dir.path().join("frontend-metadata.sqlite");
+    let namespace = format!("dml3_cluster_{}", std::process::id());
+    let catalog = "ctas_truncate_lifecycle_ice";
+    let cluster_id = "frontend-ctas-truncate-lifecycle";
+    let be_object_store = format!(
+        r#"
+[connector.object_store]
+endpoint = "{s3_endpoint}"
+access_key_id = "{s3_access_key}"
+access_key_secret = "{s3_secret_key}"
+enable_path_style_access = true
+"#
+    );
+    let mut cluster =
+        MultiBeClusterHarness::start_three_be_sqlite_state_store_with_metadata_and_be_extra(
+            &state_store_path,
+            &metadata_path,
+            cluster_id,
+            &be_object_store,
+        );
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    conn.query_drop(format!(
+        r#"CREATE EXTERNAL CATALOG {catalog} PROPERTIES(
+            "type"="iceberg",
+            "iceberg.catalog.type"="rest",
+            "uri"="{rest_uri}",
+            "warehouse"="{rest_warehouse}",
+            "aws.s3.endpoint"="{s3_endpoint}",
+            "aws.s3.access_key"="{s3_access_key}",
+            "aws.s3.secret_key"="{s3_secret_key}",
+            "aws.s3.region"="us-east-1",
+            "aws.s3.enable_path_style_access"="true")"#,
+    ))
+    .expect("create REST CTAS/TRUNCATE lifecycle catalog");
+    conn.query_drop(format!(
+        "DROP DATABASE IF EXISTS {catalog}.{namespace} FORCE"
+    ))
+    .expect("remove stale REST lifecycle namespace");
+    conn.query_drop(format!("CREATE DATABASE {catalog}.{namespace}"))
+        .expect("create REST lifecycle namespace");
+    conn.query_drop(format!(
+        "CREATE TABLE {catalog}.{namespace}.source_orders (id INT, amount INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+    ))
+    .expect("create CTAS source table");
+    conn.query_drop(format!(
+        "INSERT INTO {catalog}.{namespace}.source_orders VALUES (1, 10), (2, 20), (3, 30)"
+    ))
+    .expect("seed CTAS source exactly once");
+
+    let scheduled_before_ctas = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "CREATE TABLE {catalog}.{namespace}.published_orders AS \
+         SELECT id, amount FROM {catalog}.{namespace}.source_orders"
+    ))
+    .expect("execute REST staged-publication CTAS through frontend DML service");
+    let scheduled_after_ctas = scheduled_fragments(&mut conn);
+    assert!(
+        scheduled_after_ctas > scheduled_before_ctas,
+        "CTAS must schedule real remote fragments: before={scheduled_before_ctas}, \
+         after={scheduled_after_ctas}"
+    );
+    let ctas_rows: Vec<(i32, i32)> = conn
+        .query(format!(
+            "SELECT id, amount FROM {catalog}.{namespace}.published_orders ORDER BY id"
+        ))
+        .expect("read atomically published CTAS table");
+    assert_eq!(
+        ctas_rows,
+        vec![(1, 10), (2, 20), (3, 30)],
+        "the admitted CTAS source must execute exactly once"
+    );
+
+    conn.query_drop(format!(
+        "CREATE TABLE {catalog}.{namespace}.protected_orders (id INT) \
+         TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
+    ))
+    .expect("create visible table protected from CTAS failure compensation");
+    conn.query_drop(format!(
+        "INSERT INTO {catalog}.{namespace}.protected_orders VALUES (99)"
+    ))
+    .expect("seed protected visible table");
+    let conflict = conn
+        .query_drop(format!(
+            "CREATE TABLE {catalog}.{namespace}.protected_orders AS \
+             SELECT id FROM {catalog}.{namespace}.source_orders"
+        ))
+        .expect_err("CTAS must reject an existing target without destructive compensation");
+    assert!(
+        conflict.to_string().contains("already exists"),
+        "unexpected CTAS conflict error: {conflict}"
+    );
+    let protected_rows: Vec<i32> = conn
+        .query(format!(
+            "SELECT id FROM {catalog}.{namespace}.protected_orders ORDER BY id"
+        ))
+        .expect("read protected visible table after CTAS conflict");
+    assert_eq!(
+        protected_rows,
+        vec![99],
+        "CTAS failure must never drop the visible target"
+    );
+
+    let rows_before_truncate: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders"
+        ))
+        .expect("count CTAS rows before TRUNCATE");
+    assert_eq!(rows_before_truncate, vec![3]);
+    let snapshots_before_truncate: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders$snapshots"
+        ))
+        .expect("count snapshots before TRUNCATE");
+    let scheduled_before_truncate = scheduled_fragments(&mut conn);
+    conn.query_drop(format!(
+        "TRUNCATE TABLE {catalog}.{namespace}.published_orders"
+    ))
+    .expect("execute frontend direct-mutation TRUNCATE");
+    let scheduled_after_truncate = scheduled_fragments(&mut conn);
+    assert_eq!(
+        scheduled_after_truncate, scheduled_before_truncate,
+        "TRUNCATE must not initialize or schedule backend fragments"
+    );
+    let rows_after_truncate: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders"
+        ))
+        .expect("count rows after TRUNCATE");
+    assert_eq!(rows_after_truncate, vec![0]);
+    let snapshots_after_truncate: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders$snapshots"
+        ))
+        .expect("count snapshots after TRUNCATE");
+    assert_eq!(snapshots_before_truncate.len(), 1);
+    assert_eq!(snapshots_after_truncate.len(), 1);
+    assert_eq!(
+        snapshots_after_truncate[0],
+        snapshots_before_truncate[0] + 1,
+        "TRUNCATE must commit exactly one audit snapshot"
+    );
+
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+    assert!(state_store_path.is_file(), "DML StateStore must persist");
+    assert!(metadata_path.is_file(), "frontend metadata must persist");
+    cluster.restart_fe();
+
+    let mut conn = connect_mysql(cluster.fe_mysql_port());
+    assert_exact_live_backends(&mut conn, 3);
+    let restored_rows: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders"
+        ))
+        .expect("read truncated CTAS table after FE restart");
+    assert_eq!(restored_rows, vec![0]);
+    let restored_snapshots: Vec<i64> = conn
+        .query(format!(
+            "SELECT count(*) FROM {catalog}.{namespace}.published_orders$snapshots"
+        ))
+        .expect("read TRUNCATE snapshot chain after FE restart");
+    assert_eq!(restored_snapshots, snapshots_after_truncate);
+    drop(conn);
+    cluster.shutdown_fe_cleanly(Duration::from_secs(10));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build CTAS/TRUNCATE StateStore inspection runtime");
+    let host = runtime
+        .block_on(FrontendApplicationHost::open(
+            Some(sqlite_state_store_config(&state_store_path, cluster_id)),
+            frontend_execution_config(),
+            ClusterBackendOpenConfig::new(
+                novarocks::common::app_config::ClusterRole::AllInOne,
+                Vec::new(),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("valid CTAS/TRUNCATE inspection backend config"),
+        ))
+        .expect("reopen CTAS/TRUNCATE DML StateStore");
+    let dml = host.dml_service();
+    let operations = dml
+        .list_operations()
+        .expect("list durable CTAS/TRUNCATE operations");
+    let committed_ctas = operations
+        .iter()
+        .find(|operation| {
+            operation.operation_kind == OperationKind::CreateTableAsSelect
+                && operation.target.table == "published_orders"
+        })
+        .expect("durable successful CTAS operation");
+    assert_eq!(committed_ctas.state, OperationState::Finalized);
+    let OperationPayload::CtasSaga(ctas) = &committed_ctas.payload else {
+        panic!("successful CTAS must persist a CTAS saga payload")
+    };
+    assert_eq!(ctas.phase, CtasSagaPhase::Committed);
+    assert_eq!(ctas.next_action, StatementNextAction::None);
+    assert!(
+        ctas.source_plan_digest
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        ctas.source_schema_digest
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        ctas.source_execution_identity
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        ctas.write_cohort_id
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        ctas.aggregate_write_digest
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        ctas.prepare_fact.is_some() && ctas.write_fact.is_some() && ctas.publish_fact.is_some()
+    );
+    for fact in [
+        ctas.prepare_fact.as_ref(),
+        ctas.write_fact.as_ref(),
+        ctas.publish_fact.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(fact.outcome, ExternalFactOutcome::KnownCommitted);
+        for encoded in [
+            fact.receipt.as_ref(),
+            fact.evidence.as_ref(),
+            fact.finalization_failure.as_ref(),
+            fact.failure.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                encoded.len() <= 8 * 1024,
+                "durable CTAS fact must stay bounded"
+            );
+        }
+    }
+    let child_ids = [
+        ctas.prepare_operation_id,
+        ctas.write_operation_id,
+        ctas.publish_operation_id,
+        ctas.abort_staging_operation_id,
+    ];
+    for (index, child_id) in child_ids.iter().enumerate() {
+        assert!(
+            child_ids[index + 1..].iter().all(|other| other != child_id),
+            "CTAS child operation IDs must be stable and distinct"
+        );
+    }
+
+    let truncate = operations
+        .iter()
+        .find(|operation| operation.operation_kind == OperationKind::Truncate)
+        .expect("durable TRUNCATE operation");
+    assert_eq!(truncate.state, OperationState::Finalized);
+    let OperationPayload::TruncateLifecycle(truncate_record) = &truncate.payload else {
+        panic!("TRUNCATE must persist a direct-mutation lifecycle payload")
+    };
+    assert_eq!(truncate_record.phase, TruncateLifecyclePhase::Committed);
+    assert_eq!(truncate_record.next_action, StatementNextAction::None);
+    assert_eq!(
+        truncate_record.outcome.as_ref().map(|fact| fact.outcome),
+        Some(ExternalFactOutcome::KnownCommitted)
+    );
+    assert!(
+        dml.list_unfinished_operations()
+            .expect("list unfinished CTAS/TRUNCATE operations")
+            .is_empty(),
+        "successful lifecycle plus terminal conflict must leave no recovery work"
+    );
+    drop(dml);
+    runtime
+        .block_on(host.shutdown())
+        .expect("CTAS/TRUNCATE inspection host shutdown");
 }
 
 #[cfg(unix)]

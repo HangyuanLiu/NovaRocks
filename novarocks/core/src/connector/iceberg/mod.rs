@@ -54,6 +54,7 @@ pub mod scan_model;
 pub mod schema;
 pub mod sink;
 pub mod sink_plan;
+pub(crate) mod staged_create;
 pub(crate) mod stats;
 pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;

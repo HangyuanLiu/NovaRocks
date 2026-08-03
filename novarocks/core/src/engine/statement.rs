@@ -666,24 +666,8 @@ pub(crate) fn execute_create_table_statement(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
     let legacy_range_partitions = stmt.legacy_range_partitions.clone();
-    // CTAS dispatch: when the statement carries an AS SELECT clause, route
-    // targets to the iceberg helper. The parser already rejected non-iceberg-
-    // compatible CTAS forms (branch target / format-version=2 / explicit
-    // columns / etc.).
     if stmt.as_select.is_some() {
-        crate::engine::backend_resolver::resolve_table_target(
-            state,
-            &stmt.name,
-            current_catalog,
-            current_database,
-        )?;
-        return crate::engine::iceberg_ctas::execute_iceberg_ctas(
-            state,
-            stmt,
-            current_catalog,
-            current_database,
-            connector_context,
-        );
+        return Err("CTAS must be routed by frontend DML service".to_string());
     }
     match stmt.kind {
         CreateTableKind::Iceberg {
@@ -1274,39 +1258,6 @@ fn drop_local_catalog_table(
 // ---------------------------------------------------------------------------
 // DML handlers
 // ---------------------------------------------------------------------------
-
-pub(crate) fn execute_truncate_table_statement(
-    state: &Arc<StandaloneState>,
-    name: &ObjectName,
-    target_ref: &str,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
-    let target = crate::engine::backend_resolver::resolve_existing_table_target(
-        state,
-        name,
-        current_catalog,
-        current_database,
-    )?;
-    if target.backend_name != "iceberg" {
-        return Err(format!(
-            "TRUNCATE TABLE only supports iceberg tables: {}.{}",
-            target.namespace, target.table
-        ));
-    }
-    crate::engine::mv::iceberg_guard::reject_if_iceberg_mv_table(
-        state,
-        &target,
-        crate::engine::mv::iceberg_guard::IcebergMvUserMutation::Truncate,
-    )?;
-    crate::engine::iceberg_truncate::execute_iceberg_truncate_table(
-        state,
-        &target,
-        target_ref,
-        connector_context,
-    )
-}
 
 // ---------------------------------------------------------------------------
 // ADD FILES SQL parsing

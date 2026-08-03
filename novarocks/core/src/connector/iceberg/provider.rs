@@ -897,6 +897,19 @@ impl IcebergControlProvider {
             instance_id: instance_id.clone(),
         };
         let incarnation = ConnectorInstanceIncarnation::new();
+        let (control_entry, services) = {
+            let registry = registry.read().map_err(|error| {
+                internal(format!("Iceberg catalog registry read lock: {error}"))
+            })?;
+            (
+                registry.get(instance_id.as_str()).map_err(internal)?,
+                registry.write_services(),
+            )
+        };
+        let staged_create_supported = matches!(
+            control_entry.kind,
+            super::catalog::registry::IcebergCatalogKind::Rest
+        );
         let write_key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
@@ -912,10 +925,6 @@ impl IcebergControlProvider {
             )),
             recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
         });
-        let services = registry
-            .read()
-            .map_err(|error| internal(format!("Iceberg catalog registry read lock: {error}")))?
-            .write_services();
         let write = Arc::new(IcebergWriteControlAdapter::new(
             write_key.clone(),
             Arc::new(RegisteredIcebergWriteControlBackend::new(services.clone())),
@@ -936,9 +945,18 @@ impl IcebergControlProvider {
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new_registered(
             write_key,
             descriptor.instance_id.clone(),
-            registry,
+            Arc::clone(&registry),
         )?);
-        ConnectorControlBinding::try_new_with_all_maintenance_capabilities(
+        let staged_create: Option<Arc<dyn novarocks_spi::connector::ConnectorStagedCreate>> =
+            staged_create_supported.then(|| {
+                Arc::new(super::staged_create::IcebergStagedCreateAdapter::new(
+                    descriptor.clone(),
+                    incarnation,
+                    control_entry,
+                    services,
+                )) as Arc<dyn novarocks_spi::connector::ConnectorStagedCreate>
+            });
+        ConnectorControlBinding::try_new_with_all_maintenance_capabilities_and_staged_create(
             descriptor.clone(),
             incarnation,
             provider.clone(),
@@ -951,6 +969,7 @@ impl IcebergControlProvider {
             Some(data_mutation),
             Some(metadata_maintenance),
             Some(distributed_rewrite),
+            staged_create,
             Some(write),
             Some(provider.clone()),
         )?
@@ -3302,7 +3321,7 @@ fn publication_guard_digest_from_snapshot(
     )
 }
 
-fn lower_column(
+pub(crate) fn lower_column(
     column: &ConnectorColumnDefinition,
 ) -> Result<crate::sql::parser::ast::TableColumnDef, ConnectorError> {
     Ok(crate::sql::parser::ast::TableColumnDef {
@@ -3419,7 +3438,7 @@ fn lower_key(
     })
 }
 
-fn lower_partition(
+pub(crate) fn lower_partition(
     transform: &ConnectorPartitionTransform,
 ) -> Result<crate::sql::parser::ast::IcebergPartitionFieldExpr, ConnectorError> {
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
