@@ -31,3 +31,5 @@ pub fn open_file_reader(request: FileReadRequest) -> FileResult<Box<dyn FileBatc
     };
     Ok(Box::new(budget::BudgetedFileReader::new(reader, budget)))
 }
+
+pub use parquet::{ParquetRowGroupLayout, inspect_parquet_layout};

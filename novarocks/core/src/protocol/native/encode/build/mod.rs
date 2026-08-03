@@ -66,7 +66,7 @@ fn build_for_test(
         &crate::connector::test_request_context(),
         None,
         request.scan_binding_resolver,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )?;
     let native_bundle = super::encode_native_fragment_bundle(request.distributed_plan, &prepared)?;
     Ok((

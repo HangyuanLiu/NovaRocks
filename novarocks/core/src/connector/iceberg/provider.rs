@@ -21,6 +21,7 @@
 //! them as opaque bytes and never downcasts into Iceberg objects.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -29,8 +30,9 @@ use bytes::Bytes;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_catalog::schema::SqlType;
 use novarocks_fs::{
-    FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
-    FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FileCancellation, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner,
+    FsAccessHandle, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+    inspect_parquet_layout,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCatalogMutation,
@@ -45,10 +47,11 @@ use novarocks_spi::connector::{
     ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
     ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorReadSelector, ConnectorRefAction,
-    ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorReadSelector, ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
+    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
@@ -629,35 +632,43 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
     }
 }
 
-/// BE-only instance installed through the binding control plane.  Metadata and
-/// planning are deliberately unsupported; once the provider reader is wired,
-/// `open_reader` will consume the opaque, fully planned Iceberg split.
+/// BE-only instance installed through the binding control plane. Metadata and
+/// planning are deliberately unsupported: it materializes only the frozen
+/// membership carried by one FE split into sealed local units.
 struct IcebergReadOnlyConnectorInstance {
     key: ConnectorExecutionBindingKey,
     binding: IcebergReadBinding,
 }
 
 impl IcebergReadOnlyConnectorInstance {
-    fn open_reader(
+    fn validate_context(
         &self,
-        split: &ConnectorSplit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        if request.context.cancellation().is_cancelled() {
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<(), ConnectorError> {
+        if context.cancellation().is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",
             ));
         }
-        if Instant::now() >= request.context.deadline() {
+        if Instant::now() >= context.deadline() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::DeadlineExceeded,
                 "connector request deadline elapsed",
             ));
         }
+        Ok(())
+    }
+
+    fn prepare_split(
+        &self,
+        split: &ConnectorSplit,
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        request.check_active()?;
         ensure_owner(split.owner(), &self.key.instance_id)?;
-        let mut payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
-        validate_and_normalize_split_payload(&mut payload)?;
+        let payload: SplitPayload = decode_payload(split.payload(), "Iceberg split")?;
+        validate_split_payload(&payload)?;
         if payload.owner_instance_id != self.key.instance_id.as_str()
             || payload.incarnation != self.key.incarnation.to_bytes()
         {
@@ -666,7 +677,131 @@ impl IcebergReadOnlyConnectorInstance {
                 "Iceberg split does not belong to this installed instance incarnation",
             ));
         }
-        if let Some(delta) = payload.delta {
+        if payload.units.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg split has no frozen scan units",
+            ));
+        }
+        if (payload.delta.is_some() || payload.distributed_rewrite_position.is_some())
+            && payload.units.len() != 1
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg special scan split must carry exactly one frozen unit",
+            ));
+        }
+        let special_unit =
+            payload.delta.is_some() || payload.distributed_rewrite_position.is_some();
+        let shared_payload = encode_payload(
+            &IcebergPreparedSplitSharedPayload {
+                version: ICEBERG_PREPARED_SPLIT_SHARED_V1,
+                owner_instance_id: payload.owner_instance_id,
+                incarnation: payload.incarnation,
+                namespace: payload.namespace,
+                table: payload.table,
+                snapshot_id: payload.snapshot_id,
+                table_uuid: payload.table_uuid,
+                schema_id: payload.schema_id,
+                projection: payload.projection,
+                limit: payload.limit,
+                physical_predicates: payload.physical_predicates,
+                name_mapping: payload.name_mapping,
+                delta: payload.delta,
+                distributed_rewrite_position: payload.distributed_rewrite_position,
+            },
+            "prepared split shared payload",
+            request.context.max_handle_payload_bytes(),
+        )?;
+        let units =
+            materialize_local_scan_units(&self.binding, payload.units, special_unit, &request)?;
+        let unit_count = units.len();
+        let leaf_kind = if units.iter().any(|unit| unit.row_groups.is_some()) {
+            "row_group"
+        } else {
+            "file"
+        };
+        let descriptors = units
+            .into_iter()
+            .map(|unit| {
+                request.check_active()?;
+                ConnectorPreparedScanUnitDescriptor::try_new(
+                    encode_payload(
+                        &IcebergPreparedUnitPayload {
+                            version: ICEBERG_PREPARED_SCAN_UNIT_V1,
+                            data_file: unit.data_file,
+                            row_groups: unit.row_groups,
+                        },
+                        "prepared scan unit payload",
+                        request.context.max_handle_payload_bytes(),
+                    )?,
+                    unit.estimated_bytes,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let prepared = ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
+            self.key.clone(),
+            split,
+            shared_payload,
+            descriptors,
+            Some(leaf_kind),
+            &request,
+        )?;
+        tracing::info!(
+            split_id = prepared.split_id(),
+            unit_count,
+            shape = if unit_count == 1 { "single" } else { "one_to_many" },
+            leaf_kind,
+            membership_digest = %hex::encode(prepared.membership_digest()),
+            "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED"
+        );
+        if crate::common::config::debug_emit_connector_reader_marker() {
+            println!(
+                "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED instance={} split_id={} unit_count={} shape={} leaf_kind={} membership_digest={}",
+                self.key.instance_id.as_str(),
+                prepared.split_id(),
+                unit_count,
+                if unit_count == 1 {
+                    "single"
+                } else {
+                    "one_to_many"
+                },
+                leaf_kind,
+                hex::encode(prepared.membership_digest()),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        Ok(prepared)
+    }
+
+    fn open_unit_reader(
+        &self,
+        unit: &ConnectorPreparedScanUnit,
+        request: ConnectorOpenReaderRequest,
+    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        if unit.binding_key() != &self.key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg prepared scan unit belongs to another installed instance incarnation",
+            ));
+        }
+        let shared: IcebergPreparedSplitSharedPayload = decode_payload(
+            unit.shared_payload(),
+            "Iceberg prepared split shared payload",
+        )?;
+        let prepared: IcebergPreparedUnitPayload =
+            decode_payload(unit.payload(), "Iceberg prepared scan unit")?;
+        validate_prepared_payload(&shared, &prepared)?;
+        if shared.owner_instance_id != self.key.instance_id.as_str()
+            || shared.incarnation != self.key.incarnation.to_bytes()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg prepared scan unit does not belong to this installed instance incarnation",
+            ));
+        }
+        if let Some(delta) = shared.delta {
             return super::delta_reader::IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
@@ -675,9 +810,9 @@ impl IcebergReadOnlyConnectorInstance {
             )
             .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
         }
-        if let Some(rewrite_position) = payload.distributed_rewrite_position {
+        if let Some(rewrite_position) = shared.distributed_rewrite_position {
             return super::distributed_rewrite_reader::IcebergRewritePositionBatchReader::try_new(
-                payload.data_file,
+                prepared.data_file,
                 rewrite_position,
                 self.binding.clone(),
                 request,
@@ -693,18 +828,19 @@ impl IcebergReadOnlyConnectorInstance {
         // root up front so partitioned data and sibling delete staging paths
         // remain inside the same explicit capability.
         let access = self.binding.resolve_access_for_locations(
-            std::iter::once(payload.data_file.path.as_str()).chain(
-                payload
+            std::iter::once(prepared.data_file.path.as_str()).chain(
+                prepared
                     .data_file
                     .delete_files
                     .iter()
                     .map(|delete| delete.path.as_str()),
             ),
         )?;
-        IcebergBatchReader::try_new_with_name_mapping(
-            &payload.data_file,
-            &payload.physical_predicates,
-            payload.name_mapping.as_deref(),
+        IcebergBatchReader::try_new_with_name_mapping_and_row_groups(
+            &prepared.data_file,
+            &shared.physical_predicates,
+            shared.name_mapping.as_deref(),
+            prepared.row_groups.as_deref(),
             access,
             request,
             file_context,
@@ -718,12 +854,20 @@ impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
         &self.key
     }
 
-    fn open_reader(
+    fn prepare_split(
         &self,
         split: &ConnectorSplit,
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        self.prepare_split(split, request)
+    }
+
+    fn open_unit_reader(
+        &self,
+        unit: &ConnectorPreparedScanUnit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        self.open_reader(split, request)
+        self.open_unit_reader(unit, request)
     }
 }
 
@@ -4736,10 +4880,9 @@ impl ConnectorScanPlanning for IcebergControlProvider {
             })
             .collect::<Vec<_>>();
         let mut remaining = scan.limit;
-        let mut splits = Vec::new();
-        let mut total_payload_bytes = 0usize;
+        let mut leaves = Vec::new();
         let name_mapping = split_name_mapping(&scan.table)?;
-        for (index, file) in files.into_iter().enumerate() {
+        for file in files {
             if let Some(remaining_rows) = remaining.as_mut() {
                 if *remaining_rows == 0 {
                     break;
@@ -4749,9 +4892,131 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                     *remaining_rows = remaining_rows.saturating_sub(row_count);
                 }
             }
-            let estimated_bytes = u64::try_from(file.size).ok();
+            let estimated_bytes = u64::try_from(file.size).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!("Iceberg data file {} has a negative size", file.path),
+                )
+            })?;
+            leaves.push(IcebergFrozenScanUnitPayload {
+                data_file: file,
+                row_groups: None,
+                estimated_bytes: Some(estimated_bytes),
+            });
+        }
+        // Freeze row-group membership at the FE while the catalog snapshot and
+        // object-store capability are still pinned. BE preparation preserves a
+        // non-empty `row_groups` selection verbatim and never re-plans it.
+        let planning_binding = IcebergReadBinding::default_binding(
+            self.entry(self.instance_id.as_str())?
+                .object_store_config()
+                .cloned(),
+        )?;
+        let leaves = materialize_local_scan_units(
+            &planning_binding,
+            leaves,
+            false,
+            &ConnectorPrepareSplitRequest {
+                context: request.context.clone(),
+            },
+        )?;
+        let scan_units_planned = u64::try_from(leaves.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg composite scan unit count overflows u64",
+            )
+        })?;
+        let total_leaf_bytes = leaves
+            .iter()
+            .try_fold(0_u64, |total, leaf| {
+                total.checked_add(leaf.estimated_bytes.expect("Iceberg leaf cost is known"))
+            })
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg composite split cost overflowed",
+                )
+            })?;
+        let derived_target = total_leaf_bytes
+            .checked_add(request.target_parallelism.get() as u64 - 1)
+            .and_then(|bytes| bytes.checked_div(request.target_parallelism.get() as u64))
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let target_bytes = request
+            .max_split_bytes
+            .map(NonZeroU64::get)
+            .unwrap_or(derived_target);
+        let hard_limit = request.max_split_bytes.map(NonZeroU64::get);
+        let mut splits = Vec::new();
+        let mut total_payload_bytes = 0usize;
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0_u64;
+        for leaf in leaves {
+            let leaf_bytes = leaf.estimated_bytes.expect("Iceberg leaf cost is known");
+            if hard_limit.is_some_and(|limit| leaf_bytes > limit) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    format!(
+                        "Iceberg physical leaf {} exceeds explicit split byte limit {target_bytes}",
+                        leaf.data_file.path
+                    ),
+                ));
+            }
+            let exceeds_target = !pending.is_empty()
+                && pending_bytes
+                    .checked_add(leaf_bytes)
+                    .is_none_or(|bytes| bytes > target_bytes);
+            if exceeds_target
+                || pending.len()
+                    >= novarocks_spi::connector::MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT
+            {
+                let estimated_bytes = pending_bytes;
+                let payload = SplitPayload {
+                    version: ICEBERG_SPLIT_V4,
+                    owner_instance_id: self.instance_id.as_str().to_string(),
+                    incarnation: self.incarnation.to_bytes(),
+                    namespace: scan.table.namespace.clone(),
+                    table: scan.table.table.clone(),
+                    snapshot_id: scan.snapshot_id,
+                    table_uuid: scan.table_uuid.clone(),
+                    schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
+                    units: std::mem::take(&mut pending),
+                    projection: scan.projection.clone(),
+                    limit: scan.limit,
+                    physical_predicates: scan.physical_predicates.clone(),
+                    name_mapping: name_mapping.clone(),
+                    delta: None,
+                    distributed_rewrite_position: None,
+                };
+                let index = splits.len();
+                push_split_with_budget(
+                    &mut splits,
+                    &mut total_payload_bytes,
+                    self.instance_id.clone(),
+                    format!(
+                        "{}-{index}",
+                        scan.snapshot_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "explicit".to_string())
+                    ),
+                    &payload,
+                    Some(estimated_bytes),
+                    &request.context,
+                )?;
+                pending_bytes = 0;
+            }
+            pending_bytes = pending_bytes.checked_add(leaf_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg composite split cost overflowed",
+                )
+            })?;
+            pending.push(leaf);
+        }
+        if !pending.is_empty() {
+            let index = splits.len();
             let payload = SplitPayload {
-                version: ICEBERG_SPLIT_V3,
+                version: ICEBERG_SPLIT_V4,
                 owner_instance_id: self.instance_id.as_str().to_string(),
                 incarnation: self.incarnation.to_bytes(),
                 namespace: scan.table.namespace.clone(),
@@ -4759,7 +5024,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 snapshot_id: scan.snapshot_id,
                 table_uuid: scan.table_uuid.clone(),
                 schema_id: scan.table.table_info.as_ref().map(|table| table.schema_id),
-                data_file: file,
+                units: pending,
                 projection: scan.projection.clone(),
                 limit: scan.limit,
                 physical_predicates: scan.physical_predicates.clone(),
@@ -4774,14 +5039,15 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 format!(
                     "{}-{index}",
                     scan.snapshot_id
-                        .map(|snapshot_id| snapshot_id.to_string())
+                        .map(|id| id.to_string())
                         .unwrap_or_else(|| "explicit".to_string())
                 ),
                 &payload,
-                estimated_bytes,
+                Some(pending_bytes),
                 &request.context,
             )?;
         }
+        let composite_splits_planned = splits.len() as u64;
         ConnectorSplitPlanningResult::try_new(
             splits,
             ConnectorSplitPlanningMetrics {
@@ -4789,6 +5055,8 @@ impl ConnectorScanPlanning for IcebergControlProvider {
                 candidate_units_pruned: u64::try_from(pruning_counters.files_pruned)
                     .unwrap_or(u64::MAX)
                     .min(candidate_units_considered),
+                composite_splits_planned,
+                scan_units_planned,
             },
         )
     }
@@ -4850,8 +5118,14 @@ impl IcebergControlProvider {
                 "Iceberg rewrite-position artifact selects invalid Puffin files",
             ));
         }
+        let estimated_bytes = u64::try_from(file.size).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg rewrite-position source has a negative size",
+            )
+        })?;
         let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V3,
+            version: ICEBERG_SPLIT_V4,
             owner_instance_id: self.instance_id.as_str().to_string(),
             incarnation: self.incarnation.to_bytes(),
             namespace: scan.table.namespace,
@@ -4859,7 +5133,11 @@ impl IcebergControlProvider {
             snapshot_id: None,
             table_uuid: None,
             schema_id: None,
-            data_file: file,
+            units: vec![IcebergFrozenScanUnitPayload {
+                estimated_bytes: Some(estimated_bytes),
+                data_file: file,
+                row_groups: None,
+            }],
             projection: Vec::new(),
             limit: None,
             physical_predicates: Vec::new(),
@@ -4878,7 +5156,7 @@ impl IcebergControlProvider {
             self.instance_id.clone(),
             format!("rewrite-position-{}", frozen.group.group_digest_hex),
             &payload,
-            None,
+            Some(estimated_bytes),
             &request.context,
         )?;
         ConnectorSplitPlanningResult::try_new(
@@ -4886,6 +5164,8 @@ impl IcebergControlProvider {
             ConnectorSplitPlanningMetrics {
                 candidate_units_considered: 1,
                 candidate_units_pruned: 0,
+                composite_splits_planned: 1,
+                scan_units_planned: 1,
             },
         )
     }
@@ -5215,11 +5495,8 @@ struct ScanPayload {
 
 #[derive(Deserialize, Serialize)]
 struct SplitPayload {
-    #[serde(default = "default_iceberg_split_version")]
     version: u16,
-    #[serde(default)]
     owner_instance_id: String,
-    #[serde(default)]
     incarnation: [u8; 16],
     namespace: String,
     table: String,
@@ -5228,7 +5505,7 @@ struct SplitPayload {
     table_uuid: Option<String>,
     #[serde(default)]
     schema_id: Option<i32>,
-    data_file: IcebergDataFileInfo,
+    units: Vec<IcebergFrozenScanUnitPayload>,
     projection: Vec<usize>,
     limit: Option<u64>,
     #[serde(default)]
@@ -5239,6 +5516,42 @@ struct SplitPayload {
     delta: Option<IcebergDeltaSplitPayload>,
     #[serde(default)]
     distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
+}
+
+/// FE-frozen physical leaf. The outer split is intentionally a composite
+/// carrier; only this provider interprets the leaf membership.
+#[derive(Deserialize, Serialize)]
+struct IcebergFrozenScanUnitPayload {
+    data_file: IcebergDataFileInfo,
+    /// `Some` selects exactly those Parquet row groups. `None` denotes one
+    /// whole-file leaf (ORC and special Iceberg roles).
+    row_groups: Option<Vec<usize>>,
+    estimated_bytes: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct IcebergPreparedSplitSharedPayload {
+    version: u16,
+    owner_instance_id: String,
+    incarnation: [u8; 16],
+    namespace: String,
+    table: String,
+    snapshot_id: Option<i64>,
+    table_uuid: Option<String>,
+    schema_id: Option<i32>,
+    projection: Vec<usize>,
+    limit: Option<u64>,
+    physical_predicates: Vec<IcebergPhysicalPredicate>,
+    name_mapping: Option<String>,
+    delta: Option<IcebergDeltaSplitPayload>,
+    distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct IcebergPreparedUnitPayload {
+    version: u16,
+    data_file: IcebergDataFileInfo,
+    row_groups: Option<Vec<usize>>,
 }
 
 /// Provider-private maintenance split.  The C1 carrier only transports this
@@ -5252,13 +5565,9 @@ pub(crate) struct IcebergRewritePositionSplitPayloadV1 {
 
 const ICEBERG_REWRITE_POSITION_SPLIT_V1: u16 = 1;
 
-const ICEBERG_SPLIT_V1: u16 = 1;
-const ICEBERG_SPLIT_V2: u16 = 2;
-const ICEBERG_SPLIT_V3: u16 = 3;
-
-fn default_iceberg_split_version() -> u16 {
-    ICEBERG_SPLIT_V1
-}
+const ICEBERG_SPLIT_V4: u16 = 4;
+const ICEBERG_PREPARED_SPLIT_SHARED_V1: u16 = 1;
+const ICEBERG_PREPARED_SCAN_UNIT_V1: u16 = 1;
 
 fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorError> {
     let Some(serialized_metadata) = table
@@ -5310,21 +5619,17 @@ fn validate_split_name_mapping(mapping: Option<&str>) -> Result<(), ConnectorErr
     Ok(())
 }
 
-fn validate_and_normalize_split_payload(payload: &mut SplitPayload) -> Result<(), ConnectorError> {
-    match payload.version {
-        ICEBERG_SPLIT_V1 => {
-            payload.physical_predicates.clear();
-            payload.name_mapping = None;
-        }
-        ICEBERG_SPLIT_V2 => payload.name_mapping = None,
-        ICEBERG_SPLIT_V3 => validate_split_name_mapping(payload.name_mapping.as_deref())?,
-        version => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!("unsupported Iceberg split version {version}"),
-            ));
-        }
+fn validate_split_payload(payload: &SplitPayload) -> Result<(), ConnectorError> {
+    if payload.version != ICEBERG_SPLIT_V4 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "unsupported Iceberg composite split version {}",
+                payload.version
+            ),
+        ));
     }
+    validate_split_name_mapping(payload.name_mapping.as_deref())?;
     if let Some(rewrite_position) = payload.distributed_rewrite_position.as_ref() {
         if rewrite_position.version != ICEBERG_REWRITE_POSITION_SPLIT_V1
             || rewrite_position.selected_delete_files.is_empty()
@@ -5336,6 +5641,163 @@ fn validate_and_normalize_split_payload(payload: &mut SplitPayload) -> Result<()
         }
     }
     Ok(())
+}
+
+fn validate_prepared_payload(
+    shared: &IcebergPreparedSplitSharedPayload,
+    unit: &IcebergPreparedUnitPayload,
+) -> Result<(), ConnectorError> {
+    if shared.version != ICEBERG_PREPARED_SPLIT_SHARED_V1
+        || unit.version != ICEBERG_PREPARED_SCAN_UNIT_V1
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "unsupported Iceberg prepared scan unit payload version",
+        ));
+    }
+    validate_split_name_mapping(shared.name_mapping.as_deref())?;
+    if let Some(row_groups) = unit.row_groups.as_ref() {
+        if row_groups.is_empty() || row_groups.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg prepared scan unit row groups must be non-empty and strictly ordered",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Materialize Parquet leaves locally from the exact FE-frozen file list.
+/// This never consults catalog metadata: footer reads only refine the physical
+/// membership of an already-authorized file, and all resulting unit costs add
+/// back to the frozen file cost exactly.
+fn materialize_local_scan_units(
+    binding: &IcebergReadBinding,
+    frozen_units: Vec<IcebergFrozenScanUnitPayload>,
+    special_unit: bool,
+    request: &ConnectorPrepareSplitRequest,
+) -> Result<Vec<IcebergFrozenScanUnitPayload>, ConnectorError> {
+    if special_unit {
+        return Ok(frozen_units);
+    }
+    let mut materialized = Vec::with_capacity(frozen_units.len());
+    for unit in frozen_units {
+        request.check_active()?;
+        if unit.row_groups.is_some() || !is_parquet_path(&unit.data_file.path) {
+            materialized.push(unit);
+            continue;
+        }
+        let file_size = u64::try_from(unit.data_file.size).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!(
+                    "Iceberg data file {} has a negative size",
+                    unit.data_file.path
+                ),
+            )
+        })?;
+        let access = binding.resolve_access(&unit.data_file.path)?;
+        let file = access
+            .bind_location(
+                &unit.data_file.path,
+                FileIdentity::new(&unit.data_file.path, file_size, None),
+            )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })?;
+        let context =
+            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
+        let layout = inspect_parquet_layout(file, None, context).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
+        })?;
+        request.check_active()?;
+        if layout.is_empty() {
+            materialized.push(unit);
+            continue;
+        }
+        // A one-row-group Parquet file is already exactly one local unit.
+        // Retain it as a whole-file unit so small-file packing remains visible
+        // and the reader does not need a redundant row-group selector.
+        if layout.len() == 1 {
+            materialized.push(unit);
+            continue;
+        }
+        let file_cost = unit.estimated_bytes.ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg Parquet split unit must carry a known frozen cost",
+            )
+        })?;
+        let costs = distribute_unit_cost(file_cost, &layout)?;
+        for (row_group, estimated_bytes) in layout.into_iter().zip(costs) {
+            materialized.push(IcebergFrozenScanUnitPayload {
+                data_file: unit.data_file.clone(),
+                row_groups: Some(vec![row_group.ordinal as usize]),
+                estimated_bytes: Some(estimated_bytes),
+            });
+        }
+    }
+    Ok(materialized)
+}
+
+fn distribute_unit_cost(
+    total: u64,
+    layout: &[novarocks_fs::ParquetRowGroupLayout],
+) -> Result<Vec<u64>, ConnectorError> {
+    let weight_total = layout.iter().try_fold(0_u64, |sum, row_group| {
+        sum.checked_add(row_group.compressed_bytes)
+    });
+    let mut costs = Vec::with_capacity(layout.len());
+    if let Some(weight_total) = weight_total.filter(|total| *total > 0) {
+        let mut assigned = 0_u64;
+        for (index, row_group) in layout.iter().enumerate() {
+            let cost = if index + 1 == layout.len() {
+                total.checked_sub(assigned).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "Iceberg row-group cost accounting underflowed",
+                    )
+                })?
+            } else {
+                total
+                    .checked_mul(row_group.compressed_bytes)
+                    .and_then(|value| value.checked_div(weight_total))
+                    .ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::ResourceExhausted,
+                            "Iceberg row-group cost accounting overflowed",
+                        )
+                    })?
+            };
+            assigned = assigned.checked_add(cost).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg row-group cost accounting overflowed",
+                )
+            })?;
+            costs.push(cost);
+        }
+    } else {
+        let count = u64::try_from(layout.len()).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "Iceberg row-group count overflows u64",
+            )
+        })?;
+        let base = total / count;
+        let mut remainder = total % count;
+        for _ in layout {
+            let extra = u64::from(remainder > 0);
+            remainder = remainder.saturating_sub(extra);
+            costs.push(base + extra);
+        }
+    }
+    Ok(costs)
+}
+
+fn is_parquet_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
+    path.ends_with(".parquet") || path.ends_with(".parq")
 }
 
 fn rewrite_position_output_schema() -> SchemaRef {
@@ -5715,16 +6177,25 @@ pub(crate) fn plan_scan_files(
         file_override,
         projection,
         Vec::new(),
+        NonZeroUsize::new(1).expect("metadata file enumeration parallelism is nonzero"),
+        None,
     )?;
     planned
         .splits
         .iter()
         .map(|split| {
             decode_payload::<SplitPayload>(split.payload(), "split")
-                .map(|payload| payload.data_file)
+                .map(|payload| {
+                    payload
+                        .units
+                        .into_iter()
+                        .map(|unit| unit.data_file)
+                        .collect::<Vec<_>>()
+                })
                 .map_err(|error| error.to_string())
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|groups| groups.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -5732,7 +6203,19 @@ pub(crate) fn planned_split_data_file_for_test(
     split: &ConnectorSplit,
 ) -> Result<IcebergDataFileInfo, String> {
     decode_payload::<SplitPayload>(split.payload(), "test Iceberg split")
-        .map(|payload| payload.data_file)
+        .and_then(|payload| {
+            payload
+                .units
+                .into_iter()
+                .next()
+                .map(|unit| unit.data_file)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "test Iceberg split has no units",
+                    )
+                })
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -5749,6 +6232,8 @@ pub(crate) fn plan_native_iceberg_read(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     plan_native_iceberg_read_with_file_override(
         controls,
@@ -5758,6 +6243,8 @@ pub(crate) fn plan_native_iceberg_read(
         Some(explicit_files),
         projection,
         static_predicates,
+        target_parallelism,
+        max_split_bytes,
     )
 }
 
@@ -5773,6 +6260,8 @@ pub(crate) fn plan_native_iceberg_read_with_lease(
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     plan_native_iceberg_read_with_bound_lease(
         lease,
@@ -5782,6 +6271,8 @@ pub(crate) fn plan_native_iceberg_read_with_lease(
         Some(explicit_files),
         projection,
         static_predicates,
+        target_parallelism,
+        max_split_bytes,
     )
 }
 
@@ -5793,6 +6284,8 @@ fn plan_native_iceberg_read_with_file_override(
     explicit_files: Option<&[IcebergDataFileInfo]>,
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
@@ -5807,6 +6300,8 @@ fn plan_native_iceberg_read_with_file_override(
         explicit_files,
         projection,
         static_predicates,
+        target_parallelism,
+        max_split_bytes,
     )
 }
 
@@ -5818,9 +6313,9 @@ fn plan_native_iceberg_read_with_bound_lease(
     explicit_files: Option<&[IcebergDataFileInfo]>,
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
-    use std::num::NonZeroUsize;
-
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
     let control_binding = lease.binding();
@@ -5902,8 +6397,8 @@ fn plan_native_iceberg_read_with_bound_lease(
         .plan_splits(
             &scan.handle,
             ConnectorSplitPlanningRequest {
-                target_parallelism: NonZeroUsize::new(1).expect("parallelism is nonzero"),
-                max_split_bytes: None,
+                target_parallelism,
+                max_split_bytes,
                 context,
             },
         )
@@ -5940,13 +6435,23 @@ pub(crate) fn plan_native_iceberg_delta_read(
     table: &super::scan_model::IcebergTableInfo,
     sources: &[super::delta::DeltaSourceFile],
     delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     let instance_id =
         ConnectorInstanceId::parse(&table.catalog).map_err(|error| error.to_string())?;
     let lease = controls
         .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
-    plan_native_iceberg_delta_read_with_lease(lease, context, table, sources, delete_side)
+    plan_native_iceberg_delta_read_with_lease(
+        lease,
+        context,
+        table,
+        sources,
+        delete_side,
+        target_parallelism,
+        max_split_bytes,
+    )
 }
 
 /// Equivalent to [`plan_native_iceberg_delta_read`] but uses the exact
@@ -5957,6 +6462,8 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
     table: &super::scan_model::IcebergTableInfo,
     sources: &[super::delta::DeltaSourceFile],
     delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+    target_parallelism: NonZeroUsize,
+    max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
     let mut planned = plan_native_iceberg_read_with_lease(
         lease,
@@ -5966,6 +6473,8 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
         &[],
         &[],
         Vec::new(),
+        target_parallelism,
+        max_split_bytes,
     )?;
     let owner = planned.declaration.descriptor().instance_id.clone();
     let incarnation = planned.declaration.incarnation().to_bytes();
@@ -5987,8 +6496,10 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
             manifest_path: None,
             partition_values: Vec::new(),
         };
+        let estimated_bytes = u64::try_from(data_file.size)
+            .map_err(|_| "Iceberg delta source has a negative size".to_string())?;
         let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V1,
+            version: ICEBERG_SPLIT_V4,
             owner_instance_id: owner.as_str().to_string(),
             incarnation,
             namespace: table.namespace.clone(),
@@ -5996,7 +6507,11 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
             snapshot_id: table.current_snapshot_id,
             table_uuid: table.table_uuid.clone(),
             schema_id: Some(table.schema_id),
-            data_file,
+            units: vec![IcebergFrozenScanUnitPayload {
+                data_file,
+                row_groups: None,
+                estimated_bytes: Some(estimated_bytes),
+            }],
             projection: Vec::new(),
             limit: None,
             physical_predicates: Vec::new(),
@@ -6013,7 +6528,7 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
             owner.clone(),
             format!("delta-{index}"),
             &payload,
-            u64::try_from(payload.data_file.size).ok(),
+            Some(estimated_bytes),
             &context,
         )
         .map_err(|error| error.to_string())?;
@@ -6154,6 +6669,15 @@ fn internal(message: String) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::num::NonZeroUsize;
+    use std::path::Path;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
     use super::*;
     use crate::connector::iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
@@ -6226,6 +6750,311 @@ mod tests {
             max_total_payload_bytes,
         )
         .expect("connector request context")
+    }
+
+    fn write_single_row_group_parquet(path: &Path, row_count: usize) -> i64 {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(
+                0..i32::try_from(row_count).expect("row count fits i32"),
+            ))],
+        )
+        .expect("single-row-group batch");
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).expect("create single-row-group Parquet"),
+            schema,
+            None,
+        )
+        .expect("single-row-group writer");
+        writer.write(&batch).expect("write single row group");
+        writer.close().expect("close single-row-group Parquet");
+        i64::try_from(std::fs::metadata(path).expect("Parquet metadata").len())
+            .expect("Parquet size fits i64")
+    }
+
+    fn write_two_row_group_parquet(path: &Path) -> i64 {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("first row-group batch");
+        let second = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![4, 5, 6, 7, 8]))],
+        )
+        .expect("second row-group batch");
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).expect("create two-row-group Parquet"),
+            schema,
+            None,
+        )
+        .expect("two-row-group writer");
+        writer.write(&first).expect("write first row group");
+        writer.flush().expect("flush first row group");
+        writer.write(&second).expect("write second row group");
+        writer.close().expect("close two-row-group Parquet");
+        i64::try_from(std::fs::metadata(path).expect("Parquet metadata").len())
+            .expect("Parquet size fits i64")
+    }
+
+    fn local_planning_provider(warehouse: &Path) -> IcebergControlProvider {
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let mut catalog_registry = IcebergCatalogRegistry::default();
+        catalog_registry
+            .create_catalog(
+                instance_id.as_str(),
+                &[(
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse.to_string_lossy().into_owned(),
+                )],
+            )
+            .expect("local catalog registration");
+        let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
+        IcebergControlProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider ID"),
+                instance_id: instance_id.clone(),
+            },
+            binding_key: ConnectorExecutionBindingKey {
+                instance_id: instance_id.clone(),
+                incarnation,
+            },
+            instance_id,
+            incarnation,
+            registry: Arc::new(RwLock::new(catalog_registry)),
+            snapshot_memberships: Arc::new(SnapshotMembershipCache::new(
+                MAX_CACHED_SNAPSHOT_MEMBERSHIPS,
+            )),
+            recovery_cleanup_outcomes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn explicit_file_scan_handle(
+        instance_id: ConnectorInstanceId,
+        files: Vec<IcebergDataFileInfo>,
+    ) -> ConnectorScanHandle {
+        ConnectorScanHandle::try_new(
+            instance_id,
+            encode_payload(
+                &ScanPayload {
+                    table: TablePayload {
+                        namespace: "db".to_string(),
+                        table: "orders".to_string(),
+                        table_info: None,
+                        metadata_columns: Vec::new(),
+                        metadata_table_type: None,
+                        prepared_files: Vec::new(),
+                        explicit_files: Some(files),
+                        logical_type_columns: BTreeMap::new(),
+                        hidden_columns: Vec::new(),
+                        frozen_rewrite: None,
+                    },
+                    snapshot_id: None,
+                    table_uuid: None,
+                    projection: Vec::new(),
+                    limit: None,
+                    physical_predicates: Vec::new(),
+                },
+                "test scan handle",
+                64 * 1024,
+            )
+            .expect("encode test scan handle"),
+        )
+        .expect("test scan handle")
+    }
+
+    fn local_planning_request() -> ConnectorSplitPlanningRequest {
+        ConnectorSplitPlanningRequest {
+            target_parallelism: NonZeroUsize::new(2).expect("parallelism"),
+            max_split_bytes: None,
+            context: context_with_payload_budgets(64 * 1024, 256 * 1024),
+        }
+    }
+
+    #[test]
+    fn composite_file_packing_is_deterministic_and_preserves_exact_costs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let files = [("a.parquet", 4), ("b.parquet", 4), ("c.parquet", 4096)]
+            .into_iter()
+            .map(|(name, row_count)| {
+                let path = directory.path().join(name);
+                let size = write_single_row_group_parquet(&path, row_count);
+                IcebergDataFileInfo::for_test(
+                    path.to_string_lossy().as_ref(),
+                    size,
+                    row_count as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            files[0].size == files[1].size && files[2].size >= files[0].size * 2,
+            "the large third leaf must exceed the derived soft target"
+        );
+        let expected_total = files.iter().map(|file| file.size as u64).sum::<u64>();
+        let provider = local_planning_provider(directory.path());
+        let scan = explicit_file_scan_handle(provider.instance_id.clone(), files.clone());
+
+        let first = ConnectorScanPlanning::plan_splits(&provider, &scan, local_planning_request())
+            .expect("first local composite plan");
+        let second = ConnectorScanPlanning::plan_splits(&provider, &scan, local_planning_request())
+            .expect("second local composite plan");
+        assert_eq!(
+            first.splits.len(),
+            2,
+            "two small leaves fit before the large leaf opens its own split"
+        );
+        assert_eq!(
+            first
+                .splits
+                .iter()
+                .map(|split| split.payload())
+                .collect::<Vec<_>>(),
+            second
+                .splits
+                .iter()
+                .map(|split| split.payload())
+                .collect::<Vec<_>>(),
+            "identical frozen leaves must produce byte-identical composite carriers"
+        );
+
+        let decoded = first
+            .splits
+            .iter()
+            .map(|split| {
+                let payload: SplitPayload =
+                    decode_payload(split.payload(), "planned composite split").expect("payload");
+                let unit_cost = payload
+                    .units
+                    .iter()
+                    .map(|unit| unit.estimated_bytes.expect("known leaf cost"))
+                    .sum::<u64>();
+                assert_eq!(split.estimated_bytes(), Some(unit_cost));
+                payload
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|payload| payload.units.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            decoded
+                .iter()
+                .flat_map(|payload| payload.units.iter())
+                .map(|unit| unit.data_file.path.as_str())
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            "packing must retain the stable leaf order inside and across splits"
+        );
+        assert_eq!(
+            first
+                .splits
+                .iter()
+                .map(|split| split.estimated_bytes().expect("known split cost"))
+                .sum::<u64>(),
+            expected_total
+        );
+    }
+
+    #[test]
+    fn parquet_row_group_materialization_selects_each_group_and_preserves_file_cost() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("multi.parquet");
+        let file_size = write_two_row_group_parquet(&path);
+        let request = ConnectorPrepareSplitRequest {
+            context: context_with_payload_budgets(64 * 1024, 256 * 1024),
+        };
+        let materialized = materialize_local_scan_units(
+            &IcebergReadBinding::default_binding(None).expect("local binding"),
+            vec![IcebergFrozenScanUnitPayload {
+                data_file: IcebergDataFileInfo::for_test(
+                    path.to_string_lossy().as_ref(),
+                    file_size,
+                    8,
+                ),
+                row_groups: None,
+                estimated_bytes: Some(file_size as u64),
+            }],
+            false,
+            &request,
+        )
+        .expect("materialize local row groups");
+
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|unit| unit.row_groups.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(&[0][..]), Some(&[1][..])]
+        );
+        assert_eq!(
+            materialized
+                .iter()
+                .map(|unit| unit.estimated_bytes.expect("known row-group cost"))
+                .sum::<u64>(),
+            file_size as u64,
+            "row-group costs must exactly reconstruct the frozen file cost"
+        );
+    }
+
+    #[test]
+    fn row_group_cost_distribution_is_deterministic_for_weighted_and_zero_weight_layouts() {
+        let weighted = vec![
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 0,
+                compressed_bytes: 1,
+                row_count: 1,
+            },
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 1,
+                compressed_bytes: 3,
+                row_count: 1,
+            },
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 2,
+                compressed_bytes: 6,
+                row_count: 1,
+            },
+        ];
+        assert_eq!(
+            distribute_unit_cost(101, &weighted).expect("weighted costs"),
+            [10, 30, 61]
+        );
+        assert_eq!(
+            distribute_unit_cost(101, &weighted).expect("repeated weighted costs"),
+            [10, 30, 61],
+            "weighted distribution must be repeatable"
+        );
+
+        let zero_weight = vec![
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 0,
+                compressed_bytes: 0,
+                row_count: 1,
+            },
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 1,
+                compressed_bytes: 0,
+                row_count: 1,
+            },
+            novarocks_fs::ParquetRowGroupLayout {
+                ordinal: 2,
+                compressed_bytes: 0,
+                row_count: 1,
+            },
+        ];
+        assert_eq!(
+            distribute_unit_cost(8, &zero_weight).expect("zero-weight costs"),
+            [3, 3, 2]
+        );
     }
 
     #[test]
@@ -6635,7 +7464,7 @@ mod tests {
             frozen_rewrite: None,
         };
         let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V1,
+            version: ICEBERG_SPLIT_V4,
             owner_instance_id: "ice".to_string(),
             incarnation: [0; 16],
             namespace: table.namespace,
@@ -6643,11 +7472,15 @@ mod tests {
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
             schema_id: Some(1),
-            data_file: IcebergDataFileInfo::for_test(
-                "s3://warehouse/db/orders/data-1.parquet",
-                1024,
-                10,
-            ),
+            units: vec![IcebergFrozenScanUnitPayload {
+                data_file: IcebergDataFileInfo::for_test(
+                    "s3://warehouse/db/orders/data-1.parquet",
+                    1024,
+                    10,
+                ),
+                row_groups: None,
+                estimated_bytes: Some(1024),
+            }],
             projection: vec![0],
             limit: None,
             physical_predicates: Vec::new(),
@@ -6670,9 +7503,9 @@ mod tests {
     }
 
     #[test]
-    fn split_v3_preserves_only_canonical_name_mapping() {
+    fn split_v4_requires_canonical_name_mapping() {
         let mut payload = SplitPayload {
-            version: ICEBERG_SPLIT_V3,
+            version: ICEBERG_SPLIT_V4,
             owner_instance_id: "ice".to_string(),
             incarnation: [0; 16],
             namespace: "db".to_string(),
@@ -6680,11 +7513,15 @@ mod tests {
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
             schema_id: Some(1),
-            data_file: IcebergDataFileInfo::for_test(
-                "s3://warehouse/db/orders/data-1.parquet",
-                1024,
-                10,
-            ),
+            units: vec![IcebergFrozenScanUnitPayload {
+                data_file: IcebergDataFileInfo::for_test(
+                    "s3://warehouse/db/orders/data-1.parquet",
+                    1024,
+                    10,
+                ),
+                row_groups: None,
+                estimated_bytes: Some(1024),
+            }],
             projection: vec![0],
             limit: None,
             physical_predicates: Vec::new(),
@@ -6692,59 +7529,20 @@ mod tests {
             delta: None,
             distributed_rewrite_position: None,
         };
-        validate_and_normalize_split_payload(&mut payload).expect("canonical V3 mapping");
+        validate_split_payload(&payload).expect("canonical V4 mapping");
         assert!(payload.name_mapping.is_some());
 
         payload.name_mapping = Some(r#"[{"names":["legacy_id"],"field-id":1}]"#.to_string());
-        let error = validate_and_normalize_split_payload(&mut payload)
-            .expect_err("non-canonical V3 mapping must fail");
+        let error =
+            validate_split_payload(&payload).expect_err("non-canonical V4 mapping must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn legacy_split_versions_cannot_carry_name_mapping() {
-        for version in [ICEBERG_SPLIT_V1, ICEBERG_SPLIT_V2] {
-            let mut payload = SplitPayload {
-                version,
-                owner_instance_id: "ice".to_string(),
-                incarnation: [0; 16],
-                namespace: "db".to_string(),
-                table: "orders".to_string(),
-                snapshot_id: Some(7),
-                table_uuid: Some("table-uuid".to_string()),
-                schema_id: Some(1),
-                data_file: IcebergDataFileInfo::for_test(
-                    "s3://warehouse/db/orders/data-1.parquet",
-                    1024,
-                    10,
-                ),
-                projection: vec![0],
-                limit: None,
-                physical_predicates: vec![IcebergPhysicalPredicate {
-                    field_id: 1,
-                    column: "id".to_string(),
-                    domain: IcebergPhysicalPredicateDomain::Range {
-                        op: IcebergPhysicalPredicateOp::Ge,
-                        value: IcebergPhysicalPredicateValue::Int32(0),
-                    },
-                }],
-                name_mapping: Some(r#"[{"field-id":1,"names":["legacy_id"]}]"#.to_string()),
-                delta: None,
-                distributed_rewrite_position: None,
-            };
-            validate_and_normalize_split_payload(&mut payload).expect("legacy split");
-            assert!(payload.name_mapping.is_none());
-            if version == ICEBERG_SPLIT_V1 {
-                assert!(payload.physical_predicates.is_empty());
-            }
-        }
     }
 
     #[test]
     fn aggregate_budget_rejects_candidate_before_split_is_pushed() {
         let owner = ConnectorInstanceId::parse("ice").expect("owner");
         let payload = |suffix: &str| SplitPayload {
-            version: ICEBERG_SPLIT_V1,
+            version: ICEBERG_SPLIT_V4,
             owner_instance_id: "ice".to_string(),
             incarnation: [0; 16],
             namespace: "db".to_string(),
@@ -6752,14 +7550,18 @@ mod tests {
             snapshot_id: Some(7),
             table_uuid: Some("table-uuid".to_string()),
             schema_id: Some(1),
-            data_file: IcebergDataFileInfo::for_test(
-                &format!(
-                    "s3://warehouse/db/orders/{}-{suffix}.parquet",
-                    "x".repeat(512)
+            units: vec![IcebergFrozenScanUnitPayload {
+                data_file: IcebergDataFileInfo::for_test(
+                    &format!(
+                        "s3://warehouse/db/orders/{}-{suffix}.parquet",
+                        "x".repeat(512)
+                    ),
+                    1024,
+                    10,
                 ),
-                1024,
-                10,
-            ),
+                row_groups: None,
+                estimated_bytes: Some(1024),
+            }],
             projection: vec![0],
             limit: None,
             physical_predicates: Vec::new(),
@@ -6823,7 +7625,7 @@ mod tests {
             .iter()
             .cloned()
             .map(|data_file| SplitPayload {
-                version: ICEBERG_SPLIT_V1,
+                version: ICEBERG_SPLIT_V4,
                 owner_instance_id: instance_id.as_str().to_string(),
                 incarnation: [0; 16],
                 namespace: "db".to_string(),
@@ -6831,7 +7633,11 @@ mod tests {
                 snapshot_id: None,
                 table_uuid: None,
                 schema_id: None,
-                data_file,
+                units: vec![IcebergFrozenScanUnitPayload {
+                    data_file,
+                    row_groups: None,
+                    estimated_bytes: Some(1024),
+                }],
                 projection: vec![0],
                 limit: None,
                 physical_predicates: Vec::new(),
@@ -7052,7 +7858,7 @@ fn planned_table_files_fixture_binding(
                         format!("fixture-{index}"),
                         encode_payload(
                             &SplitPayload {
-                                version: ICEBERG_SPLIT_V2,
+                                version: ICEBERG_SPLIT_V4,
                                 owner_instance_id: self.instance_id.as_str().to_string(),
                                 incarnation: [0; 16],
                                 namespace: scan.table.namespace.clone(),
@@ -7060,7 +7866,11 @@ fn planned_table_files_fixture_binding(
                                 snapshot_id: None,
                                 table_uuid: None,
                                 schema_id: None,
-                                data_file,
+                                units: vec![IcebergFrozenScanUnitPayload {
+                                    estimated_bytes,
+                                    data_file,
+                                    row_groups: None,
+                                }],
                                 projection: scan.projection.clone(),
                                 limit: scan.limit,
                                 physical_predicates: scan.physical_predicates.clone(),
@@ -7075,6 +7885,7 @@ fn planned_table_files_fixture_binding(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let composite_splits_planned = splits.len() as u64;
             ConnectorSplitPlanningResult::try_new(
                 splits,
                 ConnectorSplitPlanningMetrics {
@@ -7082,6 +7893,10 @@ fn planned_table_files_fixture_binding(
                     candidate_units_pruned: u64::try_from(pruning_counters.files_pruned)
                         .unwrap_or(u64::MAX)
                         .min(candidate_units_considered),
+                    composite_splits_planned,
+                    scan_units_planned: candidate_units_considered.saturating_sub(
+                        u64::try_from(pruning_counters.files_pruned).unwrap_or(u64::MAX),
+                    ),
                 },
             )
         }

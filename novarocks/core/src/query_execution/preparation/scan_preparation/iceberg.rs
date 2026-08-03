@@ -64,6 +64,8 @@ pub(super) fn plan_iceberg_connector_read(
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
     static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: std::num::NonZeroUsize,
+    max_split_bytes: Option<std::num::NonZeroU64>,
 ) -> Result<PlannedConnectorRead, String> {
     let ResolvedScanExecution::IcebergFiles(files) = execution else {
         return Err("Iceberg connector planning requires IcebergFiles execution".to_string());
@@ -88,6 +90,8 @@ pub(super) fn plan_iceberg_connector_read(
             &files.files,
             &projection,
             static_predicates.clone(),
+            target_parallelism,
+            max_split_bytes,
         )?,
         // Callers that construct plans outside SQL compilation (test-only
         // native encoding fixtures and legacy internal statistics plans) do
@@ -101,6 +105,8 @@ pub(super) fn plan_iceberg_connector_read(
             &files.files,
             &projection,
             static_predicates.clone(),
+            target_parallelism,
+            max_split_bytes,
         )?,
     };
     let predicate_dispositions =
@@ -130,6 +136,8 @@ pub(super) fn plan_iceberg_delta_connector_read(
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
+    target_parallelism: std::num::NonZeroUsize,
+    max_split_bytes: Option<std::num::NonZeroU64>,
 ) -> Result<PlannedConnectorRead, String> {
     let ResolvedScanExecution::IcebergDelta(delta) = execution else {
         return Err("Iceberg delta connector planning requires IcebergDelta execution".to_string());
@@ -147,6 +155,8 @@ pub(super) fn plan_iceberg_delta_connector_read(
                 table,
                 &delta.runtime_plan.change_files,
                 delta.runtime_plan.delete_side.as_ref(),
+                target_parallelism,
+                max_split_bytes,
             )?
         }
         None => crate::connector::iceberg::provider::plan_native_iceberg_delta_read(
@@ -155,6 +165,8 @@ pub(super) fn plan_iceberg_delta_connector_read(
             table,
             &delta.runtime_plan.change_files,
             delta.runtime_plan.delete_side.as_ref(),
+            target_parallelism,
+            max_split_bytes,
         )?,
     };
     Ok(PlannedConnectorRead {

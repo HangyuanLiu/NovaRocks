@@ -43,7 +43,7 @@ pub use cache::{
     validate_non_negative_i64,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
-pub use physical_reader::open_file_reader;
+pub use physical_reader::{ParquetRowGroupLayout, inspect_parquet_layout, open_file_reader};
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource,

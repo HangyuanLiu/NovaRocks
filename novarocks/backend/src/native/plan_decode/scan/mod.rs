@@ -143,7 +143,9 @@ mod tests {
         ConnectorBatchReader, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
         ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionResolver,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-        ConnectorProviderId, ConnectorReadExecution, ConnectorSplit,
+        ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+        ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+        ConnectorReadExecution, ConnectorSplit,
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
@@ -305,9 +307,26 @@ mod tests {
             &self.key
         }
 
-        fn open_reader(
+        fn prepare_split(
             &self,
-            _split: &ConnectorSplit,
+            split: &ConnectorSplit,
+            request: ConnectorPrepareSplitRequest,
+        ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+            ConnectorPreparedScanUnitSet::try_new(
+                self.key.clone(),
+                split,
+                bytes::Bytes::from_static(b"native-carrier-shared"),
+                vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                    bytes::Bytes::from_static(b"native-carrier-unit"),
+                    split.estimated_bytes(),
+                )?],
+                &request,
+            )
+        }
+
+        fn open_unit_reader(
+            &self,
+            _unit: &ConnectorPreparedScanUnit,
             _request: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
             Ok(Box::new(EmptyConnectorReader))
@@ -324,9 +343,26 @@ mod tests {
             &self.key
         }
 
-        fn open_reader(
+        fn prepare_split(
             &self,
-            _split: &ConnectorSplit,
+            split: &ConnectorSplit,
+            request: ConnectorPrepareSplitRequest,
+        ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+            ConnectorPreparedScanUnitSet::try_new(
+                self.key.clone(),
+                split,
+                bytes::Bytes::from_static(b"schema-recording-shared"),
+                vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                    bytes::Bytes::from_static(b"schema-recording-unit"),
+                    split.estimated_bytes(),
+                )?],
+                &request,
+            )
+        }
+
+        fn open_unit_reader(
+            &self,
+            _unit: &ConnectorPreparedScanUnit,
             request: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
             *self.expected_schema.lock().expect("expected schema lock") =
@@ -431,7 +467,7 @@ mod tests {
             .expect("bind generic connector source");
         let rows = op
             .execute_iter(
-                ScanMorsel::ConnectorSplit {
+                ScanMorsel::ConnectorScanUnit {
                     index: 0,
                     row_position: None,
                 },
@@ -493,7 +529,7 @@ mod tests {
             )
             .expect("bind generic connector source")
             .execute_iter(
-                ScanMorsel::ConnectorSplit {
+                ScanMorsel::ConnectorScanUnit {
                     index: 0,
                     row_position: None,
                 },
@@ -582,7 +618,7 @@ mod tests {
         let morsels = op.build_morsels().expect("build generic connector morsels");
         assert!(matches!(
             &morsels.morsels[..],
-            [ScanMorsel::ConnectorSplit { index: 0, .. }]
+            [ScanMorsel::ConnectorScanUnit { index: 0, .. }]
         ));
     }
 

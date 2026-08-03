@@ -272,6 +272,7 @@ pub(crate) struct PlannedCtasSourceQuery {
     output_columns: Vec<crate::sql::analysis::OutputColumn>,
     table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
     optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings,
+    connector_target_parallelism: std::num::NonZeroUsize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +340,7 @@ fn plan_query_for_ctas_source(
         optimized_tree: compiled.optimized_tree,
         table_bindings,
         optimizer_settings: execution.optimizer_settings().clone(),
+        connector_target_parallelism: backend_count,
     })
 }
 
@@ -367,7 +369,13 @@ fn prepare_planned_ctas_connector_write(
         connector_context,
         Some(planned.table_bindings.as_ref()),
         None,
-        super::scan_preparation_options(&planned.optimizer_settings),
+        crate::query_execution::preparation::ScanPreparationOptions::new(
+            planned
+                .optimizer_settings
+                .connector_static_predicate_pushdown_enabled(),
+            planned.connector_target_parallelism,
+            None,
+        ),
     )?;
     let native_bundle =
         crate::protocol::native::encode::encode_native_fragment_bundle(&distributed, &prepared)?;

@@ -345,7 +345,15 @@ pub(crate) fn build_statistics_collection_request(
         &context,
         None,
         Some(&resolver),
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::new(
+            true,
+            std::num::NonZeroUsize::new(execution.topology().targets().len()).ok_or_else(|| {
+                contract_violation(
+                    "statistics connector preparation requires a non-empty admitted backend topology",
+                )
+            })?,
+            None,
+        ),
     )
     .map_err(contract_violation)?;
     let native_bundle =

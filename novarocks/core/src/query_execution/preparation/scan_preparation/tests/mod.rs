@@ -54,7 +54,7 @@ fn prepare_scan_bindings(
         &crate::connector::test_request_context(),
         None,
         resolver,
-        super::ScanPreparationOptions::default(),
+        super::ScanPreparationOptions::single_backend_fixture(),
     )
 }
 

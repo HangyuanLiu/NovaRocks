@@ -33,10 +33,99 @@ use parquet::file::statistics::Statistics;
 
 use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
 use crate::{
-    FileBatch, FileBatchReader, FileError, FileErrorKind, FileMetricsSnapshot, FileProjection,
-    FileReadRange, FileReadRequest, FileResult, MinMaxPredicateOp, MinMaxPredicateValue,
-    ScanPredicate, ScanPredicateDomain,
+    BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind,
+    FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange, FileReadRequest,
+    FileResult, MinMaxPredicateOp, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
 };
+
+/// Connector-neutral physical layout of one Parquet row group.
+///
+/// The descriptor intentionally exposes only facts from the immutable file
+/// footer. Table formats decide whether and how those facts become scan work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParquetRowGroupLayout {
+    pub ordinal: u32,
+    pub compressed_bytes: u64,
+    pub row_count: u64,
+}
+
+/// Read the Parquet footer through the normal authorized file and metadata
+/// cache path. This is deliberately separate from `open_file_reader`: callers
+/// can plan bounded physical leaves without opening a decoder or reading data
+/// pages.
+pub fn inspect_parquet_layout(
+    file: BoundFile,
+    cache: Option<DataCacheContext>,
+    context: FileReadContext,
+) -> FileResult<Vec<ParquetRowGroupLayout>> {
+    const MAX_PARQUET_ROW_GROUPS: usize = 65_536;
+
+    context.check_active()?;
+    let cache_enabled = cache
+        .as_ref()
+        .is_some_and(crate::DataCacheContext::datacache_requested);
+    let identity = file.identity().clone();
+    let chunk_reader = BoundChunkReader::new(
+        file,
+        context.clone(),
+        cache,
+        crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
+        Arc::new(ReaderMetrics::default()),
+    );
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let metadata = if let Some(metadata) =
+        crate::cache::parquet_cache::metadata_get(cache_enabled, &identity)
+    {
+        metadata
+    } else {
+        let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
+            .map_err(|error| parquet_error("inspect Parquet metadata", error))?;
+        crate::cache::parquet_cache::metadata_put(cache_enabled, &identity, metadata.clone());
+        metadata
+    };
+    context.check_active()?;
+    let parquet = metadata.metadata();
+    if parquet.num_row_groups() > MAX_PARQUET_ROW_GROUPS {
+        return Err(FileError::new(
+            FileErrorKind::ResourceExhausted,
+            format!(
+                "Parquet row-group count {} exceeds inspection bound {MAX_PARQUET_ROW_GROUPS}",
+                parquet.num_row_groups()
+            ),
+        ));
+    }
+    parquet
+        .row_groups()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, row_group)| {
+            context.check_active()?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::ResourceExhausted,
+                    "Parquet row-group ordinal does not fit u32",
+                )
+            })?;
+            let compressed_bytes = u64::try_from(row_group.compressed_size()).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet row-group compressed size is negative",
+                )
+            })?;
+            let row_count = u64::try_from(row_group.num_rows()).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet row-group row count is negative",
+                )
+            })?;
+            Ok(ParquetRowGroupLayout {
+                ordinal,
+                compressed_bytes,
+                row_count,
+            })
+        })
+        .collect()
+}
 
 pub(crate) struct ParquetPhysicalReader {
     reader: Option<ParquetRangeReader>,

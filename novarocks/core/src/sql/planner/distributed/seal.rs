@@ -897,7 +897,7 @@ mod tests {
             &crate::connector::test_request_context(),
             None,
             None,
-            crate::query_execution::preparation::ScanPreparationOptions::default(),
+            crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
         )
         .expect("prepare actual sealed cycle plan");
         let bundle =

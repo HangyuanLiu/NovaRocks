@@ -72,6 +72,60 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
+/// Assign connector splits without inventing a byte estimate for an unknown
+/// split. Known-cost splits use deterministic largest-processing-time
+/// placement; unknown-cost splits retain their source order and balance only
+/// split counts. The returned vectors are restored to source split order so a
+/// provider sees a stable per-instance sequence after placement.
+fn place_connector_splits_by_cost(
+    splits: &[novarocks_spi::connector::ConnectorSplit],
+    instance_count: usize,
+) -> Result<Vec<Vec<novarocks_spi::connector::ConnectorSplit>>, DistributedQueryError> {
+    if instance_count == 0 {
+        return Err(contract_error(
+            "connector split placement requires at least one fragment instance",
+        ));
+    }
+
+    let mut placements =
+        vec![Vec::<(usize, novarocks_spi::connector::ConnectorSplit)>::new(); instance_count];
+    let mut known_loads = vec![0_u128; instance_count];
+    let mut split_counts = vec![0_usize; instance_count];
+    let mut known = splits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, split)| split.estimated_bytes().map(|bytes| (index, bytes, split)))
+        .collect::<Vec<_>>();
+    known.sort_by_key(|(index, bytes, _)| (std::cmp::Reverse(*bytes), *index));
+    for (index, bytes, split) in known {
+        let instance = (0..instance_count)
+            .min_by_key(|instance| (known_loads[*instance], split_counts[*instance], *instance))
+            .expect("non-empty placement range");
+        known_loads[instance] += u128::from(bytes);
+        split_counts[instance] += 1;
+        placements[instance].push((index, split.clone()));
+    }
+
+    for (index, split) in splits.iter().enumerate() {
+        if split.estimated_bytes().is_some() {
+            continue;
+        }
+        let instance = (0..instance_count)
+            .min_by_key(|instance| (split_counts[*instance], *instance))
+            .expect("non-empty placement range");
+        split_counts[instance] += 1;
+        placements[instance].push((index, split.clone()));
+    }
+
+    Ok(placements
+        .into_iter()
+        .map(|mut splits| {
+            splits.sort_by_key(|(index, _)| *index);
+            splits.into_iter().map(|(_, split)| split).collect()
+        })
+        .collect())
+}
+
 static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Opaque identity minted with a sealed prepared handoff. Role crates can
@@ -1115,12 +1169,14 @@ impl ValidatedFragmentSchedule {
                     for instance in &mut instances {
                         instance.connector_splits.entry(node_id).or_default();
                     }
-                    for (index, split) in connector_read.splits.iter().enumerate() {
-                        instances[index % instance_count]
+                    let assigned =
+                        place_connector_splits_by_cost(&connector_read.splits, instance_count)?;
+                    for (instance, splits) in instances.iter_mut().zip(assigned) {
+                        instance
                             .connector_splits
                             .entry(node_id)
                             .or_default()
-                            .push(split.clone());
+                            .extend(splits);
                     }
                 }
             }
@@ -2084,7 +2140,7 @@ mod tests {
         ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+        ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle, ConnectorWriteAbortOutcome,
         ConnectorWriteAbortRequest, ConnectorWriteCommitRequest, ConnectorWriteControl,
         ConnectorWriteExecutionId, ConnectorWriteLease, ConnectorWriteOperationId,
         ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
@@ -2093,7 +2149,7 @@ mod tests {
 
     use super::{
         attach_connector_write_plan, build_fragment_lifecycle_projection,
-        derive_fragment_instance_id,
+        derive_fragment_instance_id, place_connector_splits_by_cost,
     };
     use crate::common::types::UniqueId;
     use crate::query_execution::backend::LiveBackendTarget;
@@ -2123,6 +2179,117 @@ mod tests {
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
+    }
+
+    fn connector_split(split_id: &str, estimated_bytes: Option<u64>) -> ConnectorSplit {
+        ConnectorSplit::try_new(
+            ConnectorInstanceId::parse("placement-test").expect("valid instance"),
+            split_id,
+            Bytes::new(),
+            estimated_bytes,
+        )
+        .expect("valid split")
+    }
+
+    fn placed_split_ids(placements: Vec<Vec<ConnectorSplit>>) -> Vec<Vec<String>> {
+        placements
+            .into_iter()
+            .map(|splits| {
+                splits
+                    .into_iter()
+                    .map(|split| split.split_id().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn connector_split_placement_uses_lpt_for_known_costs() {
+        let splits = [
+            connector_split("split-0", Some(8)),
+            connector_split("split-1", Some(7)),
+            connector_split("split-2", Some(6)),
+            connector_split("split-3", Some(5)),
+        ];
+
+        let actual = placed_split_ids(
+            place_connector_splits_by_cost(&splits, 3).expect("known-cost placement succeeds"),
+        );
+
+        assert_eq!(
+            actual,
+            vec![
+                vec!["split-0".to_owned()],
+                vec!["split-1".to_owned()],
+                vec!["split-2".to_owned(), "split-3".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_split_placement_balances_unknown_costs_by_count() {
+        let splits = [
+            connector_split("unknown-0", None),
+            connector_split("unknown-1", None),
+            connector_split("unknown-2", None),
+            connector_split("unknown-3", None),
+            connector_split("unknown-4", None),
+        ];
+
+        let actual = placed_split_ids(
+            place_connector_splits_by_cost(&splits, 3).expect("unknown-cost placement succeeds"),
+        );
+
+        assert_eq!(
+            actual,
+            vec![
+                vec!["unknown-0".to_owned(), "unknown-3".to_owned()],
+                vec!["unknown-1".to_owned(), "unknown-4".to_owned()],
+                vec!["unknown-2".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_split_placement_has_stable_ties_and_restores_source_order() {
+        let splits = [
+            connector_split("split-0", Some(10)),
+            connector_split("split-1", Some(1)),
+            connector_split("split-2", Some(10)),
+            connector_split("split-3", Some(1)),
+            connector_split("split-4", None),
+        ];
+
+        let actual = placed_split_ids(
+            place_connector_splits_by_cost(&splits, 2).expect("mixed placement succeeds"),
+        );
+
+        // Equal-size known splits choose the lower instance index. The lower-cost
+        // known split is assigned after the larger source-later split, so each
+        // instance must be restored to original split sequence before exposure.
+        assert_eq!(
+            actual,
+            vec![
+                vec![
+                    "split-0".to_owned(),
+                    "split-1".to_owned(),
+                    "split-4".to_owned()
+                ],
+                vec!["split-2".to_owned(), "split-3".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn connector_split_placement_rejects_zero_instances() {
+        let error = place_connector_splits_by_cost(&[connector_split("split-0", Some(1))], 0)
+            .expect_err("zero instances violate the placement contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("connector split placement requires at least one fragment instance")
+        );
     }
 
     fn stream_edge(source_fragment_id: u32, target_fragment_id: u32, node_id: i32) -> FragmentEdge {

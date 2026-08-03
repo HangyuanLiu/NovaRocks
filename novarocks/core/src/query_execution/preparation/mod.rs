@@ -567,7 +567,7 @@ mod tests {
             &crate::connector::test_request_context(),
             None,
             None,
-            ScanPreparationOptions::default(),
+            ScanPreparationOptions::single_backend_fixture(),
         )
         .expect("sealed write output absence is legal");
         assert!(
@@ -594,7 +594,7 @@ mod tests {
             &crate::connector::test_request_context(),
             None,
             None,
-            ScanPreparationOptions::default(),
+            ScanPreparationOptions::single_backend_fixture(),
         ) {
             Ok(_) => {
                 panic!("non-write output absence must fail through production preparation")
@@ -625,7 +625,7 @@ mod tests {
             &crate::connector::test_request_context(),
             None,
             None,
-            ScanPreparationOptions::default(),
+            ScanPreparationOptions::single_backend_fixture(),
         )
         .expect("prepare sealed graph");
 

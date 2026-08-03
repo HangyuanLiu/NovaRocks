@@ -21,11 +21,78 @@ use arrow::array::{Array, Int32Array, StringArray};
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
     FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection,
-    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
+    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, inspect_parquet_layout,
+    open_file_reader,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use common::{Fixture, collect};
+
+#[test]
+fn parquet_layout_inspection_reports_stable_footer_facts() {
+    let fixture = Fixture::parquet();
+    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    let expected = {
+        let file = std::fs::File::open(fixture.file.location().path()).expect("open fixture");
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("read fixture footer");
+        builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, row_group)| {
+                (
+                    u32::try_from(ordinal).expect("fixture ordinal fits u32"),
+                    u64::try_from(row_group.compressed_size())
+                        .expect("fixture compressed size is non-negative"),
+                    u64::try_from(row_group.num_rows()).expect("fixture row count is non-negative"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let first = inspect_parquet_layout(fixture.file.clone(), None, request.context.clone())
+        .expect("inspect fixture footer");
+    let second = inspect_parquet_layout(fixture.file.clone(), None, request.context)
+        .expect("inspect fixture footer again");
+
+    assert_eq!(first, second, "footer inspection must be stable");
+    assert_eq!(first.len(), 2, "fixture has two real row groups");
+    assert_eq!(
+        first
+            .iter()
+            .map(|layout| (layout.ordinal, layout.compressed_bytes, layout.row_count))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(first.iter().all(|layout| layout.compressed_bytes > 0));
+    assert_eq!(
+        first.iter().map(|layout| layout.row_count).sum::<u64>(),
+        8,
+        "layout preserves total fixture row coverage"
+    );
+}
+
+#[test]
+fn parquet_layout_inspection_rejects_corrupt_footer() {
+    let fixture = Fixture::parquet();
+    let path = fixture.file.location().path();
+    let mut bytes = std::fs::read(path).expect("read fixture");
+    *bytes.last_mut().expect("Parquet fixture is non-empty") ^= 0xff;
+    std::fs::write(path, bytes).expect("corrupt footer marker");
+    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+
+    let error = inspect_parquet_layout(fixture.file.clone(), None, request.context)
+        .expect_err("corrupt footer must not produce a layout");
+
+    assert_eq!(error.kind(), FileErrorKind::Corrupt);
+    assert!(
+        error
+            .to_string()
+            .contains("inspect Parquet metadata failed"),
+        "inspection keeps a typed footer failure boundary: {error}"
+    );
+}
 
 #[test]
 fn parquet_projects_all_root_columns() {

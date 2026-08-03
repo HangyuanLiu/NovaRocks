@@ -1470,7 +1470,7 @@ mod tests {
                     &crate::connector::test_request_context(),
                     None,
                     None,
-                    crate::query_execution::preparation::ScanPreparationOptions::default(),
+                    crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
                 )?;
                 crate::protocol::native::encode::encode_native_fragment_bundle(
                     &distributed_plan,

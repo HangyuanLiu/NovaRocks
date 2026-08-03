@@ -66,6 +66,8 @@ pub struct ConnectorSplitPlanningRequest {
 pub struct ConnectorSplitPlanningMetrics {
     pub candidate_units_considered: u64,
     pub candidate_units_pruned: u64,
+    pub composite_splits_planned: u64,
+    pub scan_units_planned: u64,
 }
 
 #[derive(Clone, Debug)]

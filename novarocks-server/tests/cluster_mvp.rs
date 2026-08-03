@@ -827,11 +827,11 @@ deployment_owner = "fe-1"
                 .map(|lines| {
                     let opens = lines
                         .iter()
-                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_OPEN"))
                         .count();
                     let closes = lines
                         .iter()
-                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                        .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE"))
                         .count();
                     (opens, closes)
                 })
@@ -1593,7 +1593,7 @@ operator_buffer_chunks = 1
         .expect("target connection id");
 
     let reader_open_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
+        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg",
         Duration::from_secs(10),
     );
     let pre_kill_reader_counts = reader_open_output
@@ -1601,11 +1601,11 @@ operator_buffer_chunks = 1
         .map(|lines| {
             let opens = lines
                 .iter()
-                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_OPEN"))
                 .count();
             let closes = lines
                 .iter()
-                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE"))
                 .count();
             (opens, closes)
         })
@@ -1653,7 +1653,7 @@ operator_buffer_chunks = 1
         assert!(
             lines[cancel_index + 1..]
                 .iter()
-                .all(|line| !line.contains("NOVAROCKS_CONNECTOR_READER_OPEN")),
+                .all(|line| !line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_OPEN")),
             "terminal cancellation must reject new connector reader opens: {lines:?}"
         );
     }
@@ -1765,7 +1765,7 @@ emit_connector_reader_marker = true
         Some("catalog-mutation")
     );
     let reader_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
+        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg",
         Duration::from_secs(10),
     );
     for lines in &reader_output {
@@ -1841,16 +1841,17 @@ emit_connector_reader_marker = true
 
     let query = "SELECT count(*), min(id), max(id) \
                  FROM static_pruning_catalog.static_pruning.data WHERE id >= 175001";
-    let split_counts = |output: &[Vec<String>]| {
+    let prepared_unit_counts = |output: &[Vec<String>]| {
         output
             .iter()
             .map(|lines| {
                 lines
                     .iter()
-                    .find(|line| line.contains("NOVAROCKS_CONNECTOR_READ_SOURCE"))
-                    .and_then(|line| line.split("splits=").nth(1))
+                    .find(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED"))
+                    .and_then(|line| line.split("unit_count=").nth(1))
+                    .and_then(|value| value.split_whitespace().next())
                     .and_then(|value| value.parse::<usize>().ok())
-                    .expect("each BE connector-source marker must include a numeric split count")
+                    .expect("each BE prepared-unit marker must include a numeric unit count")
             })
             .collect::<Vec<_>>()
     };
@@ -1864,12 +1865,12 @@ emit_connector_reader_marker = true
         .query(query)
         .expect("disabled static pruning query must succeed");
     let disabled_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READ_SOURCE",
+        "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED",
         Duration::from_secs(15),
     );
-    let disabled_splits = split_counts(&disabled_output);
+    let disabled_units = prepared_unit_counts(&disabled_output);
     assert!(
-        disabled_splits.iter().all(|count| *count > 0),
+        disabled_units.iter().all(|count| *count > 0),
         "disabled path must still distribute real connector reads: {disabled_output:?}"
     );
 
@@ -1882,21 +1883,21 @@ emit_connector_reader_marker = true
         .query(query)
         .expect("enabled static pruning query must succeed");
     let enabled_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READ_SOURCE",
+        "NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED",
         Duration::from_secs(15),
     );
-    let enabled_splits = split_counts(&enabled_output);
+    let enabled_units = prepared_unit_counts(&enabled_output);
     assert_eq!(
         enabled_rows, disabled_rows,
         "the production rollback setting must preserve query results"
     );
     assert!(
-        enabled_splits.iter().all(|count| *count > 0),
-        "enabled path must retain a non-empty split and reader activity on every BE: {enabled_output:?}"
+        enabled_units.iter().all(|count| *count > 0),
+        "enabled path must retain a non-empty prepared-unit set on every BE: {enabled_output:?}"
     );
     assert!(
-        enabled_splits.iter().sum::<usize>() < disabled_splits.iter().sum::<usize>(),
-        "PruningOnly must reduce opaque connector splits without removing the core residual: disabled={disabled_splits:?}, enabled={enabled_splits:?}"
+        enabled_units.iter().sum::<usize>() < disabled_units.iter().sum::<usize>(),
+        "PruningOnly must reduce sealed connector scan units without removing the core residual: disabled={disabled_units:?}, enabled={enabled_units:?}"
     );
 
     let profile: Vec<String> = conn
@@ -1999,7 +2000,7 @@ emit_connector_reader_marker = true
     assert_eq!(row.get::<Option<i64>, usize>(3).flatten(), Some(300_000));
 
     let reader_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg",
+        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg",
         Duration::from_secs(10),
     );
     for lines in &reader_output {
@@ -2095,7 +2096,7 @@ operator_buffer_chunks = 1
         .recv_timeout(Duration::from_secs(5))
         .expect("old-generation target connection id");
     let old_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg instance=generation_catalog",
+        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg instance=generation_catalog",
         Duration::from_secs(10),
     );
     let old_incarnations = old_output
@@ -2113,11 +2114,11 @@ operator_buffer_chunks = 1
         .map(|lines| {
             let opens = lines
                 .iter()
-                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_OPEN"))
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_OPEN"))
                 .count();
             let closes = lines
                 .iter()
-                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_READER_CLOSE"))
+                .filter(|line| line.contains("NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE"))
                 .count();
             (opens, closes)
         })
@@ -2144,7 +2145,7 @@ operator_buffer_chunks = 1
         .expect("new generation must read existing Iceberg data");
     assert_eq!(rows, vec![300_000]);
     let new_output = cluster.wait_for_every_be_output_contains(
-        "NOVAROCKS_CONNECTOR_READER_OPEN provider=iceberg instance=generation_catalog",
+        "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN provider=iceberg instance=generation_catalog",
         Duration::from_secs(10),
     );
     for (old, lines) in old_incarnations.iter().zip(&new_output) {

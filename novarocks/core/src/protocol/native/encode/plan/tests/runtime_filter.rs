@@ -119,7 +119,7 @@ fn native_encoder_leaves_nonempty_runtime_filter_plan_unbound() {
         &crate::connector::test_request_context(),
         None,
         None,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare Graph-owned RF projection");
     let bundle = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(
@@ -167,7 +167,7 @@ fn native_encoder_leaves_empty_runtime_filter_plan_unbound() {
         &crate::connector::test_request_context(),
         None,
         None,
-        crate::query_execution::preparation::ScanPreparationOptions::default(),
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )
     .expect("prepare plan without runtime filters");
     let bundle = crate::protocol::native::encode::bundle::encode_native_fragment_bundle(

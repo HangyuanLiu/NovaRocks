@@ -33,7 +33,8 @@ use crate::runtime::descriptor_snapshot::{DescriptorSlot, DescriptorSnapshot};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorCancellation, ConnectorOpenReaderRequest,
-    ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorPrepareSplitRequest, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 struct LookupCancellation {
@@ -149,56 +150,70 @@ fn execute_connector_lookup_request(
                     scan_range_id
                 )
             })?;
-        let mut reader = binding
+        let read = binding
             .read()
-            .ok_or_else(|| "connector lookup binding has no read capability".to_string())?
-            .open_reader(&split, request.clone())
+            .ok_or_else(|| "connector lookup binding has no read capability".to_string())?;
+        let prepared = read
+            .prepare_split(
+                &split,
+                ConnectorPrepareSplitRequest {
+                    context: request.context.clone(),
+                },
+            )
             .map_err(|error| error.to_string())?;
-        let read_result = (|| -> Result<(), String> {
-            while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
-                let row_ids = batch
-                    .column(row_id_index)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "connector lookup _row_id must be Int64".to_string())?;
-                for row_idx in 0..batch.num_rows() {
-                    let row_id = row_ids.value(row_idx);
-                    let Some(queue) = positions_map.get_mut(&row_id) else {
-                        continue;
-                    };
-                    while let Some(position) = queue.pop_front() {
-                        for (column_index, slot) in lookup_slots.iter().enumerate() {
-                            let column = batch.column(column_index);
-                            let taken = take(
-                                column.as_ref(),
-                                &UInt32Array::from(vec![row_idx as u32]),
-                                None,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            column_chunks.entry(*slot).or_default().push(taken);
+        if prepared.binding_key() != binding.key() {
+            return Err("connector lookup prepared unit belongs to another binding".to_string());
+        }
+        for unit in prepared.units() {
+            let mut reader = read
+                .open_unit_reader(&unit, request.clone())
+                .map_err(|error| error.to_string())?;
+            let read_result = (|| -> Result<(), String> {
+                while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
+                    let row_ids = batch
+                        .column(row_id_index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| "connector lookup _row_id must be Int64".to_string())?;
+                    for row_idx in 0..batch.num_rows() {
+                        let row_id = row_ids.value(row_idx);
+                        let Some(queue) = positions_map.get_mut(&row_id) else {
+                            continue;
+                        };
+                        while let Some(position) = queue.pop_front() {
+                            for (column_index, slot) in lookup_slots.iter().enumerate() {
+                                let column = batch.column(column_index);
+                                let taken = take(
+                                    column.as_ref(),
+                                    &UInt32Array::from(vec![row_idx as u32]),
+                                    None,
+                                )
+                                .map_err(|error| error.to_string())?;
+                                column_chunks.entry(*slot).or_default().push(taken);
+                            }
+                            response_positions.push(position);
                         }
-                        response_positions.push(position);
                     }
                 }
-            }
-            for (row_id, queue) in positions_map {
-                if !queue.is_empty() {
-                    return Err(format!(
-                        "connector lookup failed to materialize row_id {} ({} pending)",
-                        row_id,
-                        queue.len()
-                    ));
+                Ok(())
+            })();
+            let close_result = reader.close().map_err(|error| error.to_string());
+            match (read_result, close_result) {
+                (Ok(()), Ok(())) => {}
+                (Ok(()), Err(cleanup)) => return Err(cleanup),
+                (Err(primary), Ok(())) => return Err(primary),
+                (Err(primary), Err(cleanup)) => {
+                    return Err(format!("{primary} (cleanup: {cleanup})"));
                 }
             }
-            Ok(())
-        })();
-        let close_result = reader.close().map_err(|error| error.to_string());
-        match (read_result, close_result) {
-            (Ok(()), Ok(())) => {}
-            (Ok(()), Err(cleanup)) => return Err(cleanup),
-            (Err(primary), Ok(())) => return Err(primary),
-            (Err(primary), Err(cleanup)) => {
-                return Err(format!("{primary} (cleanup: {cleanup})"));
+        }
+        for (row_id, queue) in positions_map {
+            if !queue.is_empty() {
+                return Err(format!(
+                    "connector lookup failed to materialize row_id {} ({} pending)",
+                    row_id,
+                    queue.len()
+                ));
             }
         }
     }

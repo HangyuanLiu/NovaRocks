@@ -28,8 +28,10 @@ use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorCancellation, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorRequestContext, ConnectorSplit, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use iceberg::spec::{SnapshotRetention, TableMetadata};
@@ -176,17 +178,21 @@ impl IcebergMetadataConnectorInstance {
         &self,
         split: &ConnectorSplit,
     ) -> Result<IcebergMetadataScanRange, ConnectorError> {
-        if split.owner() != &self.instance_id || split.payload().len() != 8 {
+        self.range_for_payload(split.owner(), split.payload())
+    }
+
+    fn range_for_payload(
+        &self,
+        owner: &ConnectorInstanceId,
+        payload: &[u8],
+    ) -> Result<IcebergMetadataScanRange, ConnectorError> {
+        if owner != &self.instance_id || payload.len() != 8 {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "invalid Iceberg metadata split payload",
             ));
         }
-        let bytes: [u8; 8] = split
-            .payload()
-            .as_ref()
-            .try_into()
-            .expect("payload length checked");
+        let bytes: [u8; 8] = payload.try_into().expect("payload length checked");
         let index = usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -234,12 +240,39 @@ impl ConnectorReadExecution for IcebergMetadataExecution {
         &self.key
     }
 
-    fn open_reader(
+    fn prepare_split(
         &self,
         split: &ConnectorSplit,
+        request: ConnectorPrepareSplitRequest,
+    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+        request.check_active()?;
+        let _ = self.reader.range_for_split(split)?;
+        ConnectorPreparedScanUnitSet::try_new(
+            self.key.clone(),
+            split,
+            bytes::Bytes::new(),
+            vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                split.payload().clone(),
+                None,
+            )?],
+            &request,
+        )
+    }
+
+    fn open_unit_reader(
+        &self,
+        unit: &ConnectorPreparedScanUnit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        let range = self.reader.range_for_split(split)?;
+        if unit.binding_key() != &self.key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata prepared unit belongs to another binding",
+            ));
+        }
+        let range = self
+            .reader
+            .range_for_payload(&self.key.instance_id, unit.payload())?;
         let mut config = self.reader.config.clone();
         config.ranges = vec![range];
         let reader = IcebergMetadataReader::new(config)
@@ -317,12 +350,8 @@ pub(crate) fn plan_iceberg_metadata_read_source(
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?
         .output_schema;
     let provider = Arc::new(IcebergMetadataConnectorInstance::new(instance_id, config));
-    let scheduled = (0..provider.range_count()?)
-        .map(|index| {
-            provider
-                .split_for_index(index)
-                .map(crate::connector::runtime::ConnectorScheduledSplit::plain)
-        })
+    let splits = (0..provider.range_count()?)
+        .map(|index| provider.split_for_index(index))
         .collect::<Result<Vec<_>, _>>()?;
     let chunk_schema = Arc::new(
         ChunkSchema::try_new(
@@ -344,16 +373,19 @@ pub(crate) fn plan_iceberg_metadata_read_source(
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
     );
     let binding = Arc::new(Arc::clone(&provider).execution_binding()?);
-    Ok(Arc::new(ConnectorReadScanSource::new_scheduled_execution(
-        binding,
-        scheduled,
-        ConnectorOpenReaderRequest {
-            expected_schema: output_schema,
-            batch,
-            context,
-        },
-        chunk_schema,
-    )))
+    Ok(Arc::new(
+        ConnectorReadScanSource::new_execution(
+            binding,
+            splits,
+            ConnectorOpenReaderRequest {
+                expected_schema: output_schema,
+                batch,
+                context,
+            },
+            chunk_schema,
+        )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?,
+    ))
 }
 
 fn metadata_budget_and_context(

@@ -450,7 +450,9 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-        ConnectorProviderId, ConnectorReadExecution,
+        ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+        ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+        ConnectorReadExecution,
     };
     use novarocks_types::QueryId;
 
@@ -473,9 +475,26 @@ mod tests {
             &self.key
         }
 
-        fn open_reader(
+        fn prepare_split(
             &self,
-            _split: &novarocks_spi::connector::ConnectorSplit,
+            split: &novarocks_spi::connector::ConnectorSplit,
+            request: ConnectorPrepareSplitRequest,
+        ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
+            ConnectorPreparedScanUnitSet::try_new(
+                self.key.clone(),
+                split,
+                Bytes::new(),
+                vec![ConnectorPreparedScanUnitDescriptor::try_new(
+                    Bytes::from_static(b"test-unit"),
+                    split.estimated_bytes(),
+                )?],
+                &request,
+            )
+        }
+
+        fn open_unit_reader(
+            &self,
+            _unit: &ConnectorPreparedScanUnit,
             _request: ConnectorOpenReaderRequest,
         ) -> Result<Box<dyn novarocks_spi::connector::ConnectorBatchReader>, ConnectorError>
         {

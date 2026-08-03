@@ -205,15 +205,16 @@ pub(crate) struct ConnectorStaticPlanningMetrics {
     connector_scan_count: u64,
     candidate_units_considered: u64,
     candidate_units_pruned: u64,
+    composite_splits_planned: u64,
+    scan_units_planned: u64,
 }
 
 impl ConnectorStaticPlanningMetrics {
     pub(crate) fn record(
         &mut self,
-        candidate_units_considered: u64,
-        candidate_units_pruned: u64,
+        metrics: novarocks_spi::connector::ConnectorSplitPlanningMetrics,
     ) -> Result<(), String> {
-        if candidate_units_pruned > candidate_units_considered {
+        if metrics.candidate_units_pruned > metrics.candidate_units_considered {
             return Err(
                 "connector static planning metrics report more pruned units than considered units"
                     .to_string(),
@@ -222,10 +223,16 @@ impl ConnectorStaticPlanningMetrics {
         self.connector_scan_count = self.connector_scan_count.saturating_add(1);
         self.candidate_units_considered = self
             .candidate_units_considered
-            .saturating_add(candidate_units_considered);
+            .saturating_add(metrics.candidate_units_considered);
         self.candidate_units_pruned = self
             .candidate_units_pruned
-            .saturating_add(candidate_units_pruned);
+            .saturating_add(metrics.candidate_units_pruned);
+        self.composite_splits_planned = self
+            .composite_splits_planned
+            .saturating_add(metrics.composite_splits_planned);
+        self.scan_units_planned = self
+            .scan_units_planned
+            .saturating_add(metrics.scan_units_planned);
         Ok(())
     }
 
@@ -238,8 +245,12 @@ impl std::fmt::Display for ConnectorStaticPlanningMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConnectorStaticPlanning: scans={} candidate_units_considered={} candidate_units_pruned={}",
-            self.connector_scan_count, self.candidate_units_considered, self.candidate_units_pruned,
+            "ConnectorStaticPlanning: scans={} candidate_units_considered={} candidate_units_pruned={} composite_splits_planned={} scan_units_planned={}",
+            self.connector_scan_count,
+            self.candidate_units_considered,
+            self.candidate_units_pruned,
+            self.composite_splits_planned,
+            self.scan_units_planned,
         )
     }
 }
@@ -726,13 +737,35 @@ mod tests {
     #[test]
     fn connector_static_planning_metrics_validate_and_format() {
         let mut metrics = super::ConnectorStaticPlanningMetrics::default();
-        metrics.record(7, 2).expect("valid first scan");
-        metrics.record(3, 1).expect("valid second scan");
+        metrics
+            .record(novarocks_spi::connector::ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 7,
+                candidate_units_pruned: 2,
+                composite_splits_planned: 3,
+                scan_units_planned: 5,
+            })
+            .expect("valid first scan");
+        metrics
+            .record(novarocks_spi::connector::ConnectorSplitPlanningMetrics {
+                candidate_units_considered: 3,
+                candidate_units_pruned: 1,
+                composite_splits_planned: 2,
+                scan_units_planned: 3,
+            })
+            .expect("valid second scan");
         assert_eq!(
             metrics.to_string(),
-            "ConnectorStaticPlanning: scans=2 candidate_units_considered=10 candidate_units_pruned=3"
+            "ConnectorStaticPlanning: scans=2 candidate_units_considered=10 candidate_units_pruned=3 composite_splits_planned=5 scan_units_planned=8"
         );
-        assert!(metrics.record(1, 2).is_err());
+        assert!(
+            metrics
+                .record(novarocks_spi::connector::ConnectorSplitPlanningMetrics {
+                    candidate_units_considered: 1,
+                    candidate_units_pruned: 2,
+                    ..Default::default()
+                })
+                .is_err()
+        );
     }
 
     fn add_operator_metrics(
