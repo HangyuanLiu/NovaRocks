@@ -478,8 +478,43 @@ struct PreparedSuite {
 }
 
 // ---------------------------------------------------------------------------
-// wait_alter helper – polls SHOW ALTER TABLE until the latest job is FINISHED
+// wait_alter helper – polls SHOW ALTER TABLE until the latest job is terminal
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Eq, PartialEq)]
+enum AlterJobPollState {
+    Pending,
+    Finished,
+    Failed(String),
+}
+
+fn classify_alter_job_poll(execution: &crate::types::QueryExecution) -> AlterJobPollState {
+    let Some(state_index) = execution
+        .header
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case("State"))
+    else {
+        return AlterJobPollState::Pending;
+    };
+    let message_index = execution
+        .header
+        .iter()
+        .position(|column| column.eq_ignore_ascii_case("Msg"));
+    let Some(row) = execution.rows.first() else {
+        return AlterJobPollState::Pending;
+    };
+    match row.get(state_index).map(String::as_str) {
+        Some("FINISHED") => AlterJobPollState::Finished,
+        Some("FAILED") => AlterJobPollState::Failed(
+            message_index
+                .and_then(|index| row.get(index))
+                .filter(|message| !message.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "ALTER job failed without an error message".to_string()),
+        ),
+        _ => AlterJobPollState::Pending,
+    }
+}
 
 fn execute_wait_alter(
     session: &mut MysqlSession,
@@ -512,16 +547,31 @@ fn execute_wait_alter(
         }
         if ok {
             if let Some(exec) = &execution {
-                if exec.text_output.contains("FINISHED") {
-                    let _ = writeln!(
-                        log,
-                        "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
-                        kind.to_lowercase(),
-                        table_name,
-                        attempt + 1,
-                        max_retries,
-                    );
-                    return (true, total_elapsed);
+                match classify_alter_job_poll(exec) {
+                    AlterJobPollState::Finished => {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
+                            kind.to_lowercase(),
+                            table_name,
+                            attempt + 1,
+                            max_retries,
+                        );
+                        return (true, total_elapsed);
+                    }
+                    AlterJobPollState::Failed(message) => {
+                        let _ = writeln!(
+                            log,
+                            "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
+                            kind.to_lowercase(),
+                            table_name,
+                            attempt + 1,
+                            max_retries,
+                            message,
+                        );
+                        return (false, total_elapsed);
+                    }
+                    AlterJobPollState::Pending => {}
                 }
             }
         }
@@ -3638,10 +3688,11 @@ mod tests {
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
-    use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
+    use crate::types::{QueryExecution, QueryMeta, ResultSet, SqlCase, SqlStep};
     use crate::{
-        Cli, annotate_failure_with_engine_error_code, bounded_fault_query_timeout,
-        evaluate_expected_error_branch, execute_target_session_sql_with,
+        AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
+        bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
+        execute_target_session_sql_with,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         validate_fault_injection_jobs, validate_selected_suite_cluster,
@@ -3700,6 +3751,29 @@ mod tests {
             case_dbs: vec![],
             sequential: false,
         }
+    }
+
+    #[test]
+    fn alter_job_poll_uses_structured_state_and_preserves_failure_message() {
+        let execution = |state: &str, message: &str| QueryExecution {
+            header: vec!["JobId".to_string(), "State".to_string(), "Msg".to_string()],
+            rows: vec![vec!["1".to_string(), state.to_string(), message.to_string()]],
+            text_output: format!("JobId\tState\tMsg\n1\t{state}\t{message}"),
+            elapsed: Duration::ZERO,
+        };
+
+        assert_eq!(
+            classify_alter_job_poll(&execution("RUNNING", "")),
+            AlterJobPollState::Pending
+        );
+        assert_eq!(
+            classify_alter_job_poll(&execution("FINISHED", "done")),
+            AlterJobPollState::Finished
+        );
+        assert_eq!(
+            classify_alter_job_poll(&execution("FAILED", "exact engine failure")),
+            AlterJobPollState::Failed("exact engine failure".to_string())
+        );
     }
 
     #[test]

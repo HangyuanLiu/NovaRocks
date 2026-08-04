@@ -57,8 +57,10 @@ pub(crate) fn discover_iceberg_mvs_from_entry(
     namespace: &str,
 ) -> Result<Vec<DiscoveredIcebergMv>, String> {
     let mut discovered = Vec::new();
-    for table in list_tables(entry, namespace)? {
-        let loaded = load_table(entry, namespace, &table)?;
+    let tables = list_tables(entry, namespace)?;
+    for (table, loaded) in load_discovery_candidates(catalog, namespace, tables, |table| {
+        load_table(entry, namespace, table)
+    }) {
         let Some(descriptor) = descriptor_from_loaded_table(&loaded)? else {
             continue;
         };
@@ -86,6 +88,30 @@ pub(crate) fn discover_iceberg_mvs_from_entry(
     Ok(discovered)
 }
 
+fn load_discovery_candidates<T>(
+    catalog: &str,
+    namespace: &str,
+    tables: Vec<String>,
+    mut load: impl FnMut(&str) -> Result<T, String>,
+) -> Vec<(String, T)> {
+    tables
+        .into_iter()
+        .filter_map(|table| match load(&table) {
+            Ok(loaded) => Some((table, loaded)),
+            Err(error) => {
+                tracing::warn!(
+                    catalog,
+                    namespace,
+                    table,
+                    error,
+                    "skip unreadable Iceberg table during lake MV discovery"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 fn descriptor_from_loaded_table(
     loaded: &IcebergLoadedTable,
 ) -> Result<Option<MvDescriptorV1>, String> {
@@ -94,4 +120,25 @@ fn descriptor_from_loaded_table(
         return Ok(None);
     }
     MvDescriptorV1::from_storage_properties(props).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_discovery_candidates;
+
+    #[test]
+    fn lake_mv_discovery_skips_unreadable_table_candidates() {
+        let loaded = load_discovery_candidates(
+            "ice",
+            "analytics",
+            vec!["healthy".to_string(), "stale".to_string()],
+            |table| match table {
+                "healthy" => Ok("loaded"),
+                "stale" => Err("metadata object is missing".to_string()),
+                other => panic!("unexpected table {other}"),
+            },
+        );
+
+        assert_eq!(loaded, vec![("healthy".to_string(), "loaded")]);
+    }
 }

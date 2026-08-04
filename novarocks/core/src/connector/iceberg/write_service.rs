@@ -1060,6 +1060,13 @@ impl IcebergWriteReportCommitter for IcebergDistributedRewriteReportCommitter {
         RecoveryEvidence::from_collector(&self.executor.collector)
     }
 
+    fn resulting_row_count(
+        &self,
+        outcome: &CommitOutcome,
+    ) -> Result<Option<u64>, CommitServiceError> {
+        committed_mv_row_count(&self.executor, outcome.new_snapshot_id).map(Some)
+    }
+
     fn reconcile_connector_operation(
         &self,
         evidence: &IcebergWriteReconcileEvidenceV1,
