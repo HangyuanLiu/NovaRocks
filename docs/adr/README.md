@@ -89,6 +89,7 @@ code-anchors:
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 - ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
+- ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
 
 ### distributed-query-lifecycle
 
@@ -146,9 +147,9 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：Frontend 拥有当前 MV refresh attempt 的 application state、durable ledger、query orchestration 与用户结果；SQL、provider 和 Backend 各自只承担其真实职责。commit truth使用typed provider evidence，不从错误文本猜测，不通过双journal或aggregate facade掩盖owner。
 
-- ADR-0028 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（active）
-- ADR-0029 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
-- ADR-0034 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
+- ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（active）
+- ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
+- ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
 
 #### 历史
 
