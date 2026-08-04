@@ -25,8 +25,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggStateArena, build_kernel_set};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
-
-const HLL_DATA_EMPTY: u8 = 0;
+use novarocks_types::value::hll::encode_hll_empty;
 
 pub fn eval_hll_empty(
     _arena: &ExprArena,
@@ -36,7 +35,7 @@ pub fn eval_hll_empty(
 ) -> Result<ArrayRef, String> {
     let mut builder = BinaryBuilder::new();
     for _ in 0..chunk.len() {
-        builder.append_value([HLL_DATA_EMPTY]);
+        builder.append_value(encode_hll_empty());
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

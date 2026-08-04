@@ -192,8 +192,6 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
 
-    use crate::runtime_filter::deployment::DeploymentError;
-    use crate::runtime_filter::deployment::wait_for::validate_wait_for;
     use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind,
@@ -210,9 +208,6 @@ mod tests {
     use crate::sql::planner::runtime_filter::graph::{
         ApplyPoint, PlanLocation, ProducerRequirement, RuntimeFilterBindingRole,
         RuntimeFilterBindingSpec, RuntimeFilterGraph,
-    };
-    use crate::sql::planner::runtime_filter::wait_graph::{
-        ConsumerWaitBehavior, ConsumerWaitInput, ProducerWaitInput,
     };
 
     fn stats() -> PhysicalPlanStats {
@@ -494,45 +489,6 @@ mod tests {
             split_join_inputs(&frag, &join),
             Err(FrontierSkip::MissingChild)
         );
-    }
-
-    #[test]
-    fn planner_skip_provenance_is_rendered_when_coarse_fallback_cycles() {
-        let mut join = hash_join(
-            10,
-            1,
-            JoinKind::LeftOuter,
-            vec![exchange(20, 1, 2), exchange(30, 1, 3)],
-        );
-        join.runtime_filter_binding_ids = vec![BindingId::new(100)];
-        let fragments = vec![fragment(1, join)];
-        let graph = producer_graph(1, 10);
-        let catalog = build_join_progress_proof_catalog(&fragments, &graph);
-        let edges = vec![fragment_edge(2, 1, 20), fragment_edge(3, 1, 30)];
-        let refined_edges = edges
-            .iter()
-            .map(FragmentEdge::as_refined_runtime_filter_edge)
-            .collect::<Vec<_>>();
-        let consumer = ConsumerWaitInput {
-            channel: ChannelId::new(7),
-            binding: BindingId::new(10),
-            consumer_fragment: 2,
-            behavior: ConsumerWaitBehavior::BlocksUntilComplete,
-            producers: vec![ProducerWaitInput {
-                channel: ChannelId::new(7),
-                binding: BindingId::new(100),
-                fragment: 1,
-                node_id: 10,
-                completion_requirement: CompletionRequirement::ProducerClosed,
-            }],
-        };
-
-        let err = validate_wait_for(&refined_edges, &[consumer], &catalog).unwrap_err();
-        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
-            panic!("expected coarse fallback cycle");
-        };
-        let rendered = cycle.join(", ");
-        assert!(rendered.contains("proof skipped: join-node=10 rule=NoRfSides"));
     }
 
     #[test]

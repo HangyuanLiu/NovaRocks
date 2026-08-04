@@ -16,7 +16,7 @@
 // under the License.
 
 use super::super::expr::encode_expr;
-use crate::sql::common::{ChangeStreamBranchKind, JoinKind};
+use crate::sql::common::{ChangeStreamBranchKind, JoinKind, SqlTopNType};
 use crate::sql::planner::distributed::{DataPartition, PartitionKind};
 use crate::sql::planner::physical::{
     AggMode, HashSource, JoinDistribution, JoinExecutionMode, PlanSetOpKind, RedistributeMode,
@@ -183,15 +183,12 @@ pub(super) fn encode_change_stream_branch_kind(src: ChangeStreamBranchKind) -> i
     }
 }
 
-pub(super) fn encode_sort_topn_type(src: crate::exec::node::sort::SortTopNType) -> i32 {
+/// Explicit SQL-to-native conversion for the SQL-owned TopN ranking fact.
+pub(super) fn encode_sort_topn_type(src: SqlTopNType) -> i32 {
     match src {
-        crate::exec::node::sort::SortTopNType::RowNumber => {
-            plan::SortTopNType::SortTopnTypeRowNumber as i32
-        }
-        crate::exec::node::sort::SortTopNType::Rank => plan::SortTopNType::SortTopnTypeRank as i32,
-        crate::exec::node::sort::SortTopNType::DenseRank => {
-            plan::SortTopNType::SortTopnTypeDenseRank as i32
-        }
+        SqlTopNType::RowNumber => plan::SortTopNType::SortTopnTypeRowNumber as i32,
+        SqlTopNType::Rank => plan::SortTopNType::SortTopnTypeRank as i32,
+        SqlTopNType::DenseRank => plan::SortTopNType::SortTopnTypeDenseRank as i32,
     }
 }
 
@@ -218,28 +215,28 @@ pub(super) fn encode_redistribute_mode(src: &RedistributeMode) -> plan::Redistri
 }
 
 pub(super) fn encode_iceberg_metadata_table_type(
-    src: &crate::connector::iceberg::IcebergMetadataTableType,
+    src: &crate::sql::planner::table::SqlMetadataTableKind,
 ) -> i32 {
     match src {
-        crate::connector::iceberg::IcebergMetadataTableType::Files => {
+        crate::sql::planner::table::SqlMetadataTableKind::Files => {
             plan::IcebergMetadataTableType::Files as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Manifests => {
+        crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
             plan::IcebergMetadataTableType::Manifests as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata => {
+        crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
             plan::IcebergMetadataTableType::LogicalIcebergMetadata as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Snapshots => {
+        crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
             plan::IcebergMetadataTableType::Snapshots as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::History => {
+        crate::sql::planner::table::SqlMetadataTableKind::History => {
             plan::IcebergMetadataTableType::History as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Refs => {
+        crate::sql::planner::table::SqlMetadataTableKind::Refs => {
             plan::IcebergMetadataTableType::Refs as i32
         }
-        crate::connector::iceberg::IcebergMetadataTableType::Partitions => {
+        crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
             plan::IcebergMetadataTableType::Partitions as i32
         }
     }

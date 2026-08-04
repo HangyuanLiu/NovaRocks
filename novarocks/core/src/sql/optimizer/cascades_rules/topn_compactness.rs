@@ -785,7 +785,9 @@ mod tests {
                     name: "t".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 stats_ref: None,
@@ -1068,7 +1070,7 @@ mod tests {
                 items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: Some(2),
-                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+                topn_type: Some(crate::sql::common::SqlTopNType::Rank),
             }),
             children: vec![child_group],
         }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod control_host;
+pub(crate) mod control_host;
 
 pub use control_host::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,

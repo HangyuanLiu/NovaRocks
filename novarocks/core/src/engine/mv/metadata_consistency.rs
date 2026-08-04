@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
 use crate::mv::persistence::schema::MvSchemaContract;
 
@@ -75,10 +78,11 @@ pub(crate) fn ensure_summary_watermark_matches_store(
 mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HIDDEN_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
-        OutputColumnLineage, OutputContract, TargetContract, TargetVisibleColumn,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, OutputColumnLineage, OutputContract, TargetContract,
+        TargetVisibleColumn,
     };
+    use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
         let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);

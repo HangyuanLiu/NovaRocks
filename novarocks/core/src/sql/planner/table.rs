@@ -17,25 +17,285 @@
 
 use std::collections::BTreeMap;
 
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
+use crate::sql::binding::SqlTableBindingId;
 #[cfg(test)]
-use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
+use crate::sql::binding::SqlTableBindingScopeId;
 use novarocks_catalog::schema::ColumnDef;
 
+/// Immutable version selector attached to a query-local table binding.
+///
+/// The selector is a SQL planning fact, not a provider request.  The
+/// application materializes the selected table once and assigns the binding
+/// token that preparation later uses to recover the exact connector lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqlTableVersionSelector {
+    Current,
+    Snapshot(i64),
+    TimestampMillis(i64),
+}
+
+/// SQL-level metadata table identity.  Provider-specific metadata APIs are
+/// deliberately not represented in the compiler vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SqlMetadataTableKind {
+    Snapshots,
+    History,
+    Refs,
+    Files,
+    Manifests,
+    Partitions,
+    LogicalIcebergMetadata,
+}
+
+impl SqlMetadataTableKind {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "snapshots" => Ok(Self::Snapshots),
+            "history" => Ok(Self::History),
+            "refs" => Ok(Self::Refs),
+            "files" => Ok(Self::Files),
+            "manifests" => Ok(Self::Manifests),
+            "partitions" => Ok(Self::Partitions),
+            "entries" | "logical_iceberg_metadata" => Ok(Self::LogicalIcebergMetadata),
+            _ => Err(format!("unsupported Iceberg metadata table type: {value}")),
+        }
+    }
+}
+
+/// Immutable SQL facts that characterize a scan without carrying provider
+/// metadata, files, credentials, or an executable connector handle.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SqlScanKind {
+    /// A connector-neutral external scan. Its exact execution authority is
+    /// recovered by `binding` at the application preparation boundary.
+    ConnectorRead,
+    Data {
+        version: SqlTableVersionSelector,
+    },
+    FrozenInputSet {
+        version: SqlTableVersionSelector,
+    },
+    Metadata {
+        kind: SqlMetadataTableKind,
+        version: SqlTableVersionSelector,
+    },
+    Delta {
+        from_snapshot_id: i64,
+        to_snapshot_id: i64,
+    },
+    MvTargetState {
+        facts: SqlMvTargetStateScan,
+    },
+    MvTargetLocator {
+        facts: SqlMvTargetLocatorScan,
+    },
+}
+
+/// Canonical table identity attached to a compiler scan fact.  This is kept
+/// separate from an application catalog handle so the optimizer can reason
+/// about identity without being able to reach a provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SqlTableIdentity {
+    pub(crate) catalog: String,
+    pub(crate) namespace: String,
+    pub(crate) table: String,
+}
+
+/// Immutable SQL facts that make UK/FK rewrites sound for one admitted table
+/// binding.  The application projects the two supported constraint properties
+/// while it still owns provider metadata; the optimizer only observes this
+/// normalized value attached to a `SqlScanSource`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SqlUkFkTableFacts {
+    unique_constraints: Vec<Vec<String>>,
+    foreign_key_constraints: Vec<SqlUkFkForeignKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SqlUkFkForeignKey {
+    local_columns: Vec<String>,
+    referenced_table: String,
+    referenced_columns: Vec<String>,
+}
+
+impl SqlUkFkTableFacts {
+    /// Decode only the SQL constraint properties from an already-frozen value
+    /// map.  The input deliberately is not provider metadata or a catalog
+    /// handle: application materialization owns that conversion.
+    pub(crate) fn from_frozen_properties(properties: &BTreeMap<String, String>) -> Self {
+        let unique_constraints = properties
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("unique_constraints"))
+            .map(|(_, value)| {
+                value
+                    .split(';')
+                    .filter_map(parse_constraint_columns)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let foreign_key_constraints = properties
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("foreign_key_constraints"))
+            .map(|(_, value)| {
+                value
+                    .split(';')
+                    .filter_map(parse_foreign_key_constraint)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            unique_constraints,
+            foreign_key_constraints,
+        }
+    }
+
+    pub(crate) fn has_unique_key(&self, columns: &[String]) -> bool {
+        self.unique_constraints
+            .iter()
+            .any(|constraint| same_constraint_columns(constraint, columns))
+    }
+
+    pub(crate) fn has_matching_foreign_key(
+        &self,
+        local_columns: &[String],
+        referenced_table: &str,
+        referenced_alias: Option<&str>,
+        referenced_columns: &[String],
+    ) -> bool {
+        self.foreign_key_constraints.iter().any(|foreign_key| {
+            same_constraint_columns(&foreign_key.local_columns, local_columns)
+                && table_name_matches_identity(
+                    &foreign_key.referenced_table,
+                    referenced_table,
+                    referenced_alias,
+                )
+                && same_constraint_columns(&foreign_key.referenced_columns, referenced_columns)
+        })
+    }
+}
+
+fn parse_constraint_columns(raw: &str) -> Option<Vec<String>> {
+    let segment = if let Some(open) = raw.find('(') {
+        let close = raw[open + 1..].find(')')? + open + 1;
+        &raw[open + 1..close]
+    } else {
+        raw
+    };
+    let columns = segment
+        .split(',')
+        .map(normalize_constraint_identifier)
+        .filter(|column| !column.is_empty())
+        .collect::<Vec<_>>();
+    (!columns.is_empty()).then_some(columns)
+}
+
+fn parse_foreign_key_constraint(raw: &str) -> Option<SqlUkFkForeignKey> {
+    let raw = raw.trim().trim_end_matches(';').trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let references_idx = raw.to_ascii_lowercase().find("references")?;
+    let local_columns = parse_constraint_columns(raw[..references_idx].trim())?;
+    let right = raw[references_idx + "references".len()..].trim();
+    let open = right.find('(')?;
+    let referenced_table = normalize_constraint_table_name(&right[..open]);
+    let referenced_columns = parse_constraint_columns(right)?;
+    (!referenced_table.is_empty() && !local_columns.is_empty() && !referenced_columns.is_empty())
+        .then_some(SqlUkFkForeignKey {
+            local_columns,
+            referenced_table,
+            referenced_columns,
+        })
+}
+
+fn normalize_constraint_identifier(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+fn normalize_constraint_table_name(value: &str) -> String {
+    value
+        .trim()
+        .split('.')
+        .map(normalize_constraint_identifier)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn same_constraint_columns(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .all(|column| right.iter().any(|other| other.eq_ignore_ascii_case(column)))
+}
+
+fn table_name_matches_identity(expected: &str, table: &str, alias: Option<&str>) -> bool {
+    let expected = normalize_constraint_table_name(expected);
+    let table = normalize_constraint_table_name(table);
+    if expected == table
+        || expected.rsplit('.').next().unwrap_or_default() == table
+        || expected == table.rsplit('.').next().unwrap_or_default()
+    {
+        return true;
+    }
+    alias
+        .map(normalize_constraint_table_name)
+        .is_some_and(|alias| expected == alias)
+}
+
+/// The only scan source a SQL compiler artifact may expose to application
+/// preparation.  A token is valid exclusively in the paired
+/// `QueryTableBindingStore`; attempts to use it with another request fail
+/// before connector submission.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SqlScanSource {
+    pub(crate) binding: SqlTableBindingId,
+    pub(crate) table: SqlTableIdentity,
+    pub(crate) kind: SqlScanKind,
+    ukfk_facts: SqlUkFkTableFacts,
+}
+
+impl SqlScanSource {
+    pub(crate) fn new(
+        binding: SqlTableBindingId,
+        table: SqlTableIdentity,
+        kind: SqlScanKind,
+    ) -> Self {
+        Self {
+            binding,
+            table,
+            kind,
+            ukfk_facts: SqlUkFkTableFacts::default(),
+        }
+    }
+
+    /// Attach normalized constraint facts captured from the exact admission
+    /// materialization.  No later planner or optimizer phase can replace
+    /// these facts by consulting a newer provider generation.
+    pub(crate) fn with_ukfk_facts(mut self, facts: SqlUkFkTableFacts) -> Self {
+        self.ukfk_facts = facts;
+        self
+    }
+
+    pub(crate) fn ukfk_facts(&self) -> &SqlUkFkTableFacts {
+        &self.ukfk_facts
+    }
+}
+
 /// Metadata for an IMV target-state scan source. This struct carries only
-/// planner-safe metadata for the MV's own target state — catalog identity,
-/// column definitions, and the aggregate/join logical contract. It has no
+/// planner-safe metadata for the MV's own target state — column definitions
+/// and the aggregate/join logical contract. The scan's canonical table
+/// identity and binding token live in the enclosing `SqlScanSource`. It has no
 /// execution or catalog handles and is designed to be inspectable during
 /// analyzer/optimizer phases without triggering runtime behavior. The
 /// standalone refresh codegen lowers this source into the local target-state
 /// scan used by aggregate-state merge execution.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct IcebergMvTargetStateScan {
-    pub(crate) catalog: String,
-    pub(crate) database: String,
-    pub(crate) table: String,
+pub(crate) struct SqlMvTargetStateScan {
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) aggregate_state_layout_version: u16,
@@ -44,18 +304,15 @@ pub(crate) struct IcebergMvTargetStateScan {
     pub(crate) aggregate_state_names: Vec<String>,
     pub(crate) physical_column_names: Vec<String>,
     pub(crate) row_id_column_name: String,
-    pub(crate) row_filter: IcebergMvTargetStateRowFilter,
-    pub(crate) partition_constraint: IcebergMvTargetStatePartitionConstraint,
+    pub(crate) row_filter: SqlMvTargetStateRowFilter,
+    pub(crate) partition_constraint: SqlMvTargetStatePartitionConstraint,
 }
 
 /// Metadata for an IMV target-locator scan source. It is a refresh-only
 /// placeholder that reads the MV target at the refresh-before snapshot and
 /// projects the physical apply-key columns plus Iceberg `_file` / `_pos`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IcebergMvTargetLocatorScan {
-    pub(crate) catalog: String,
-    pub(crate) database: String,
-    pub(crate) table: String,
+pub struct SqlMvTargetLocatorScan {
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) apply_key_column: String,
@@ -69,7 +326,7 @@ pub(crate) struct BranchScope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvTargetStateRowFilter {
+pub(crate) enum SqlMvTargetStateRowFilter {
     DeltaInputRowIds {
         row_id_column_name: String,
         branch_scope: Option<BranchScope>,
@@ -77,25 +334,28 @@ pub(crate) enum IcebergMvTargetStateRowFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IcebergMvTargetStatePartitionConstraint {
+pub(crate) enum SqlMvTargetStatePartitionConstraint {
     Unpartitioned,
     AffectedPartitionAllowListRequired,
 }
 
-impl IcebergMvTargetStateScan {
-    pub(crate) fn fqn(&self) -> String {
-        format!("{}.{}.{}", self.catalog, self.database, self.table)
+impl SqlMvTargetStateScan {
+    /// Legacy resolver diagnostics do not carry table identity. Canonical SQL
+    /// scans keep that identity on `SqlScanSource`; this label is deliberately
+    /// diagnostic-only and must never be used for lookup.
+    pub(crate) fn fqn(&self) -> &'static str {
+        "token-bound MV target"
     }
 
     pub(crate) fn constraint_summary(&self) -> String {
         let row_filter = match &self.row_filter {
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: None,
             } => {
                 format!("row_filter=delta_input_row_ids({row_id_column_name})")
             }
-            IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: Some(scope),
             } => format!(
@@ -104,8 +364,8 @@ impl IcebergMvTargetStateScan {
             ),
         };
         let partition = match self.partition_constraint {
-            IcebergMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
-            IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
+            SqlMvTargetStatePartitionConstraint::Unpartitioned => "partition=unpartitioned",
+            SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 "partition=affected_allow_list_required"
             }
         };
@@ -122,94 +382,63 @@ impl IcebergMvTargetStateScan {
     }
 }
 
-impl IcebergMvTargetLocatorScan {
-    pub(crate) fn fqn(&self) -> String {
-        format!("{}.{}.{}", self.catalog, self.database, self.table)
+impl SqlMvTargetLocatorScan {
+    /// See `SqlMvTargetStateScan::fqn`: identity belongs to the enclosing
+    /// tokenized source, not to locator facts.
+    pub(crate) fn fqn(&self) -> &'static str {
+        "token-bound MV target"
     }
 }
 
-/// Plan-time description of how the scan operator enumerates physical
-/// inputs for a table. Each variant covers a different lane:
-///
-/// - `IcebergDataFiles`: Iceberg `rest`/`hadoop`/IVM-delta-stamped
-///   parquet files — a concrete list of data files plus table identity,
-///   optional cloud-store credentials, and scan-binding provenance.
-/// - `IcebergMetadataTable`: synthetic source for iceberg metadata
-///   tables (`t$snapshots` etc.); the operator reads
-///   `iceberg::spec::TableMetadata` natively in Rust.
-/// - `IcebergDeltaTable`: plan-time identity for IVM-A1 delta
-///   scans; codegen expands it into an explicit change-file payload.
+pub(crate) fn sql_mv_target_state_scan(source: &ScanSource) -> Option<&SqlMvTargetStateScan> {
+    match source {
+        ScanSource::Sql(SqlScanSource {
+            kind: SqlScanKind::MvTargetState { facts },
+            ..
+        }) => Some(facts),
+        _ => None,
+    }
+}
+
+pub(crate) fn sql_mv_target_locator_scan(source: &ScanSource) -> Option<&SqlMvTargetLocatorScan> {
+    match source {
+        ScanSource::Sql(SqlScanSource {
+            kind: SqlScanKind::MvTargetLocator { facts },
+            ..
+        }) => Some(facts),
+        _ => None,
+    }
+}
+
+/// SQL scan carrier.  Every compiler artifact carries a tokenized SQL source;
+/// concrete provider materialization belongs exclusively to the paired
+/// application `QueryTableBindingStore`.
 #[derive(Clone, Debug)]
 pub enum ScanSource {
-    /// A provider-neutral, already pinned connector read. Preparation obtains
-    /// execution declarations and opaque scan/split handles only from its
-    /// injected resolver, never by resolving latest metadata again.
-    ConnectorPinned,
-    IcebergDataFiles {
-        table: IcebergTableInfo,
-        files: Vec<IcebergDataFileInfo>,
-        cloud_properties: BTreeMap<String, String>,
-        binding: IcebergDataFileBinding,
-    },
-    /// Synthetic scan source for an Iceberg metadata-table reference
-    /// (`t$snapshots` / `t$history` / `t$refs` / `t$partitions`). The
-    /// analyzer rewrites such references into a regular `Scan` over a
-    /// synthetic `TableDef` whose source is this variant; codegen then
-    /// emits an `HDFS_SCAN_NODE` whose lowering builds an Iceberg metadata
-    /// SPI reader that reads `iceberg::spec::TableMetadata`
-    /// natively in Rust (no JVM / JNI bridge — the embedded-JVM path
-    /// was removed in favor of iceberg-rust) — see
-    /// `src/connector/iceberg/metadata.rs`.
-    IcebergMetadataTable {
-        table: IcebergTableInfo,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-        /// JSON-serialized iceberg-rust `TableMetadata` (produced by
-        /// `serde_json::to_string` in
-        /// `connector/iceberg/catalog/backend.rs`). The metadata-scan
-        /// operator parses it back into a `TableMetadata` and reads
-        /// snapshots / history / refs directly off it.
-        serialized_table: String,
-        /// Cloud properties from the underlying iceberg table's storage.
-        /// Forwarded onto `THdfsScanNode.cloud_configuration` for parity
-        /// with regular HDFS scans; the native metadata-scan path itself
-        /// does not need them today.
-        cloud_properties: BTreeMap<String, String>,
-        /// Native-Rust metadata table payload used by flavors that need
-        /// manifest-derived file aggregates after planning.
-        metadata_payload: Option<String>,
-    },
-    /// IVM-A1 plan-time Iceberg delta-scan placeholder. Produced by the
-    /// analyzer/planner when it recognizes the
-    /// `__nr_ivm_delta('cat.ns.tbl', from, to)` table function. Codegen
-    /// emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE` with an explicit
-    /// typed payload produced from refresh-time Iceberg metadata planning.
-    /// Lowering consumes that payload and does not re-read connector catalog
-    /// state or reconstruct full Iceberg table metadata.
-    IcebergDeltaTable {
-        table: IcebergTableInfo,
-        from_snapshot_id: i64,
-        to_snapshot_id: i64,
-    },
-    /// Refresh-only pinned Iceberg version scan placeholder. Produced by the
-    /// IMV scan-binding rule for `Version(IcebergScan)`. Phase 1 keeps this
-    /// variant non-executable: it is inspectable in rewrite tests and guarded
-    /// at scan-range construction so it cannot silently read current snapshot.
-    IcebergVersionTable {
-        table: IcebergTableInfo,
-        snapshot_id: i64,
-    },
-    /// IMV target-state scan placeholder. Produced by the analyzer when
-    /// constructing an IMV refresh plan that reads the MV's own target state.
-    /// This variant carries only metadata-level information (catalog identity,
-    /// columns, and the aggregate/join logical contract) and has no codegen
-    /// or runtime behavior in this task. Future tasks will implement the
-    /// optimizer rewrite and execution path.
-    IcebergMvTargetState(IcebergMvTargetStateScan),
-    /// IMV target locator placeholder. Produced by the IMV rewrite pipeline
-    /// after the change stream carries its logical apply key. Codegen resolves
-    /// it through `IcebergMvRefreshContext` into an explicit target snapshot
-    /// scan that emits physical apply key, `_file`, and `_pos`.
-    IcebergMvTargetLocator(IcebergMvTargetLocatorScan),
+    Sql(SqlScanSource),
+}
+
+/// Build a tokenized scan carrier for owner-side unit tests.  The token is
+/// deliberately non-serializable and is only useful for tests that exercise
+/// SQL/native shape projection without scan preparation.  Tests that prepare
+/// a scan must instead allocate the token from a `QueryTableBindingStore` and
+/// retain the matching materialization there.
+#[cfg(test)]
+pub(crate) fn test_sql_scan_source(kind: SqlScanKind) -> ScanSource {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    ScanSource::Sql(SqlScanSource::new(
+        SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("test scope")),
+            NonZeroU32::new(1).expect("test ordinal"),
+        ),
+        SqlTableIdentity {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+        },
+        kind,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -228,76 +457,84 @@ pub struct TableDef {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use std::collections::BTreeMap;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use super::*;
 
-    fn test_iceberg_table_info(schema: IcebergSchemaDef) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "test_table".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: "file:///tmp/test_table".to_string(),
-            schema,
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    #[test]
+    fn sqlx2_scan_source_contains_only_binding_and_sql_facts() {
+        let binding = SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(NonZeroU64::new(3).expect("scope")),
+            NonZeroU32::new(7).expect("ordinal"),
+        );
+        let scan = SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+            },
+            SqlScanKind::Metadata {
+                kind: SqlMetadataTableKind::Snapshots,
+                version: SqlTableVersionSelector::Snapshot(42),
+            },
+        );
+
+        assert_eq!(scan.binding, binding);
+        assert_eq!(scan.table.catalog, "ice");
+        assert_eq!(scan.table.namespace, "sales");
+        assert_eq!(scan.table.table, "orders");
+        assert!(matches!(
+            scan.kind,
+            SqlScanKind::Metadata {
+                kind: SqlMetadataTableKind::Snapshots,
+                version: SqlTableVersionSelector::Snapshot(42),
+            }
+        ));
     }
 
     #[test]
-    fn table_def_can_carry_iceberg_schema_metadata() {
-        let iceberg = test_iceberg_table_info(IcebergSchemaDef {
-            fields: vec![IcebergSchemaFieldDef {
-                field_id: 10,
-                name: "order_id".to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: None,
-                write_default_json: None,
-                children: vec![IcebergSchemaFieldDef {
-                    field_id: 11,
-                    name: "nested".to_string(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: vec![],
-                }],
-            }],
-        });
-        let table = TableDef {
-            name: "orders".to_string(),
-            columns: vec![ColumnDef {
-                name: "order_id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                write_default: None,
-                logical_type: None,
-            }],
-            iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: iceberg,
-                files: vec![],
-                cloud_properties: BTreeMap::new(),
-                binding: IcebergDataFileBinding::CurrentSnapshot,
+    fn sqlx2_scan_source_keeps_frozen_ukfk_facts_on_its_binding() {
+        let mut properties = BTreeMap::new();
+        properties.insert("unique_constraints".to_string(), "(id)".to_string());
+        properties.insert(
+            "foreign_key_constraints".to_string(),
+            "(customer_id) REFERENCES dim_customer(id)".to_string(),
+        );
+        let binding = SqlTableBindingId::new(
+            crate::sql::binding::SqlTableBindingScopeId::new(NonZeroU64::new(5).expect("scope")),
+            NonZeroU32::new(2).expect("ordinal"),
+        );
+        let scan = SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
             },
-        };
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        )
+        .with_ukfk_facts(SqlUkFkTableFacts::from_frozen_properties(&properties));
 
-        let ScanSource::IcebergDataFiles { table: iceberg, .. } = table.source else {
-            panic!("expected iceberg data files");
-        };
-        assert_eq!(iceberg.location, "file:///tmp/test_table");
-        assert_eq!(iceberg.schema.fields[0].field_id, 10);
-        assert_eq!(iceberg.schema.fields[0].children[0].field_id, 11);
+        assert!(scan.ukfk_facts().has_unique_key(&["ID".to_string()]));
+        assert!(scan.ukfk_facts().has_matching_foreign_key(
+            &["customer_id".to_string()],
+            "sales.dim_customer",
+            Some("d"),
+            &["id".to_string()],
+        ));
     }
 }
 
 #[cfg(test)]
 mod imv_target_state_tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use super::*;
+    use crate::sql::binding::SqlTableBindingScopeId;
 
     fn sample_columns() -> Vec<ColumnDef> {
         vec![
@@ -319,30 +556,43 @@ mod imv_target_state_tests {
     }
 
     #[test]
-    fn iceberg_mv_target_state_scan_source_carries_logical_contract() {
-        let source = ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
-            catalog: "ice".to_string(),
-            database: "ns".to_string(),
-            table: "mv_sales".to_string(),
-            target_table_uuid: "target-uuid".to_string(),
-            target_snapshot_id: Some(42),
-            aggregate_state_layout_version: 1,
-            columns: sample_columns(),
-            group_key_names: vec!["region".to_string()],
-            aggregate_state_names: vec!["c".to_string()],
-            physical_column_names: vec!["region".to_string(), "c".to_string()],
-            row_id_column_name: "__row_id__".to_string(),
-            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
-                row_id_column_name: "__row_id__".to_string(),
-                branch_scope: None,
+    fn sqlx2_mv_target_state_scan_source_carries_logical_contract() {
+        let scope = SqlTableBindingScopeId::new(NonZeroU64::new(31).unwrap());
+        let source = ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(scope, NonZeroU32::new(1).unwrap()),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "ns".to_string(),
+                table: "mv_sales".to_string(),
             },
-            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
-        });
+            SqlScanKind::MvTargetState {
+                facts: SqlMvTargetStateScan {
+                    target_table_uuid: "target-uuid".to_string(),
+                    target_snapshot_id: Some(42),
+                    aggregate_state_layout_version: 1,
+                    columns: sample_columns(),
+                    group_key_names: vec!["region".to_string()],
+                    aggregate_state_names: vec!["c".to_string()],
+                    physical_column_names: vec!["region".to_string(), "c".to_string()],
+                    row_id_column_name: "__row_id__".to_string(),
+                    row_filter: SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                        row_id_column_name: "__row_id__".to_string(),
+                        branch_scope: None,
+                    },
+                    partition_constraint: SqlMvTargetStatePartitionConstraint::Unpartitioned,
+                },
+            },
+        ));
 
-        let ScanSource::IcebergMvTargetState(scan) = source else {
-            panic!("expected target-state scan source");
+        let ScanSource::Sql(sql_source) = &source else {
+            panic!("expected SQL source");
         };
-        assert_eq!(scan.fqn(), "ice.ns.mv_sales");
+        let Some(scan) = sql_mv_target_state_scan(&source) else {
+            panic!("expected SQL target-state scan source");
+        };
+        assert_eq!(sql_source.table.catalog, "ice");
+        assert_eq!(sql_source.table.namespace, "ns");
+        assert_eq!(sql_source.table.table, "mv_sales");
         assert_eq!(scan.group_key_names, vec!["region"]);
         assert_eq!(scan.aggregate_state_names, vec!["c"]);
         assert_eq!(scan.row_id_column_name, "__row_id__");
@@ -354,7 +604,7 @@ mod imv_target_state_tests {
 
     #[test]
     fn target_state_row_filter_carries_branch_scope() {
-        let filter = IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        let filter = SqlMvTargetStateRowFilter::DeltaInputRowIds {
             row_id_column_name: "__row_id__".to_string(),
             branch_scope: Some(BranchScope {
                 branch_id_column_name: "__branch_id__".to_string(),
@@ -362,7 +612,7 @@ mod imv_target_state_tests {
             }),
         };
 
-        let IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+        let SqlMvTargetStateRowFilter::DeltaInputRowIds {
             branch_scope: Some(scope),
             ..
         } = filter

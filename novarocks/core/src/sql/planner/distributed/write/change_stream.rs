@@ -21,7 +21,7 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::common::ChangeStreamBranchKind;
 
 use super::super::FragmentId;
-use super::sink::IcebergWriteSinkSpec;
+use super::contract::SqlWritePlanInput;
 
 /// Canonical internal output used by SQL change-stream plans to route rows to
 /// data writer branches. It is a planner contract and never reaches a user
@@ -33,7 +33,7 @@ pub(crate) const CHANGE_STREAM_DATA_ROUTE_COLUMN: &str = "__change_data_route";
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteLayoutBranch {
     pub(crate) branch_kind: ChangeStreamBranchKind,
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) sink: SqlWritePlanInput,
 }
 
 /// Planner-owned input for binding a logical change-stream branch set to one
@@ -51,7 +51,7 @@ pub(crate) struct ChangeStreamWriteBranchSpec {
     pub(crate) branch_kind: ChangeStreamBranchKind,
     pub(crate) stream_output_ordinals: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) sink: SqlWritePlanInput,
 }
 
 #[derive(Clone, Debug)]
@@ -80,16 +80,16 @@ pub(crate) struct ChangeStreamBranchRoute {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamWriteTopology {
-    pub(crate) writer_branches: Vec<IcebergChangeStreamWriterBranch>,
+pub(crate) struct SqlChangeStreamWriteTopology {
+    pub(crate) writer_branches: Vec<SqlChangeStreamWriterBranch>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IcebergChangeStreamWriterBranch {
+pub(crate) struct SqlChangeStreamWriterBranch {
     pub(crate) branch_id: i32,
     pub(crate) branch_kind: ChangeStreamBranchKind,
     pub(crate) writer_fragment_id: FragmentId,
-    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) sink: SqlWritePlanInput,
 }
 
 impl ChangeStreamWriteBranchSpec {
@@ -99,20 +99,14 @@ impl ChangeStreamWriteBranchSpec {
         branch_kind: ChangeStreamBranchKind,
         stream_output_ordinals: Vec<usize>,
     ) -> Self {
-        let mut sink_spec = super::sink::test_support::simple_sink_spec();
-        sink_spec.iceberg.serialized_metadata =
-            Some(super::sink::test_support::single_bucket_partition_metadata_json());
-        sink_spec.mode = match branch_kind {
-            ChangeStreamBranchKind::DeleteDv => super::sink::IcebergWriteSinkMode::DeletionVectors,
-            ChangeStreamBranchKind::ReuseData => super::sink::IcebergWriteSinkMode::RowLineageData,
-            ChangeStreamBranchKind::FreshData => super::sink::IcebergWriteSinkMode::Data,
-        };
         Self {
             branch_id,
             branch_kind,
             stream_output_ordinals,
             output_partition_ordinals: Vec::new(),
-            sink_spec,
+            sink: super::contract::test_support::simple_sql_write_plan_input(
+                super::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
         }
     }
 
@@ -194,7 +188,7 @@ pub(crate) fn bind_change_stream_write_layout(
     });
     let change_op_output_ordinal = output_ordinal_by_name(
         request.producer_output_columns,
-        crate::exec::change_op::CHANGE_OP_COLUMN,
+        crate::sql::common::CHANGE_OP_COLUMN,
         "change-op column",
         OutputBindingKind::Internal,
     )?;
@@ -222,7 +216,7 @@ pub(crate) fn bind_change_stream_write_layout(
         let output_partition_ordinals = match branch.branch_kind {
             ChangeStreamBranchKind::DeleteDv => vec![output_ordinal_by_name(
                 request.producer_output_columns,
-                crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+                crate::sql::common::ICEBERG_FILE_PATH_COL,
                 "delete file column",
                 OutputBindingKind::Internal,
             )?],
@@ -232,7 +226,7 @@ pub(crate) fn bind_change_stream_write_layout(
         };
         let stream_output_ordinals = output_ordinals_for_sink_columns(
             request.producer_output_columns,
-            &branch.sink_spec.target_columns,
+            &branch.sink.contract.input_columns,
         )?;
         branches.push(ChangeStreamWriteBranchSpec {
             branch_id: i32::try_from(idx).map_err(|_| {
@@ -241,7 +235,7 @@ pub(crate) fn bind_change_stream_write_layout(
             branch_kind: branch.branch_kind,
             stream_output_ordinals,
             output_partition_ordinals,
-            sink_spec: branch.sink_spec,
+            sink: branch.sink,
         });
     }
 
@@ -303,11 +297,11 @@ fn binding_kind_for_sink_column(name: &str) -> OutputBindingKind {
 }
 
 fn is_reserved_internal_output_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-        || name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
-        || name.eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+    name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
+        || name.eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
         || name.eq_ignore_ascii_case(CHANGE_STREAM_DATA_ROUTE_COLUMN)
 }
 
@@ -365,16 +359,18 @@ mod tests {
     fn dml_output_columns() -> Vec<OutputColumn> {
         vec![
             output_column(1, "id", false),
-            output_column(2, crate::exec::row_position::ICEBERG_FILE_PATH_COL, true),
-            output_column(3, crate::exec::row_position::ICEBERG_ROW_POS_COL, true),
-            output_column(4, crate::exec::change_op::CHANGE_OP_COLUMN, true),
+            output_column(2, crate::sql::common::ICEBERG_FILE_PATH_COL, true),
+            output_column(3, crate::sql::common::ICEBERG_ROW_POS_COL, true),
+            output_column(4, crate::sql::common::CHANGE_OP_COLUMN, true),
             output_column(5, CHANGE_STREAM_DATA_ROUTE_COLUMN, true),
         ]
     }
 
-    fn sink_spec(columns: &[&str]) -> IcebergWriteSinkSpec {
-        let mut sink_spec = super::super::sink::test_support::simple_sink_spec();
-        sink_spec.target_columns = columns
+    fn sql_sink(columns: &[&str]) -> SqlWritePlanInput {
+        let mut sink = super::super::contract::test_support::simple_sql_write_plan_input(
+            super::super::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        );
+        sink.contract.input_columns = columns
             .iter()
             .map(|name| ColumnDef {
                 name: (*name).to_string(),
@@ -384,13 +380,13 @@ mod tests {
                 logical_type: None,
             })
             .collect();
-        sink_spec
+        sink
     }
 
     fn branch(kind: ChangeStreamBranchKind, columns: &[&str]) -> ChangeStreamWriteLayoutBranch {
         ChangeStreamWriteLayoutBranch {
             branch_kind: kind,
-            sink_spec: sink_spec(columns),
+            sink: sql_sink(columns),
         }
     }
 
@@ -468,8 +464,8 @@ mod tests {
                 branch(
                     ChangeStreamBranchKind::DeleteDv,
                     &[
-                        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
-                        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+                        crate::sql::common::ICEBERG_FILE_PATH_COL,
+                        crate::sql::common::ICEBERG_ROW_POS_COL,
                     ],
                 ),
                 branch(ChangeStreamBranchKind::ReuseData, &["id"]),
@@ -506,7 +502,7 @@ mod tests {
             branches: vec![
                 branch(
                     ChangeStreamBranchKind::DeleteDv,
-                    &[crate::exec::row_position::ICEBERG_FILE_PATH_COL],
+                    &[crate::sql::common::ICEBERG_FILE_PATH_COL],
                 ),
                 branch(ChangeStreamBranchKind::ReuseData, &["id"]),
                 branch(ChangeStreamBranchKind::FreshData, &["id"]),

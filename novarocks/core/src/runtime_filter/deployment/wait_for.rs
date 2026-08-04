@@ -51,7 +51,9 @@ mod tests {
         BindingId, ChannelId, CompletionFenceKind, CompletionRequirement, ConsumerActivation,
         LateApplyGranularity,
     };
-    use crate::sql::planner::runtime_filter::progress::{FrontierEdge, JoinBuildProgressProof};
+    use crate::sql::planner::runtime_filter::progress::{
+        FrontierEdge, FrontierSkip, JoinBuildProgressProof, JoinBuildProgressSkip,
+    };
     use crate::sql::planner::runtime_filter::wait_graph::{
         ConsumerWaitBehavior, ExecutionDependencyGraph, ProducerWaitInput, ProofRejection,
         revalidate_proof,
@@ -449,6 +451,31 @@ mod tests {
             cycle
                 .iter()
                 .any(|step| step.contains("proof rejected: PartitionMismatch"))
+        );
+    }
+
+    #[test]
+    fn sqlx2_deployment_renders_planner_skip_provenance_for_coarse_cycle() {
+        let edges = vec![partitioned_edge(2, 1, 20), partitioned_edge(3, 1, 30)];
+        let consumer = wait(10, 2, ConsumerActivation::BlockingSnapshot, vec![1]);
+        let mut progress = JoinBuildProgressCatalog::new();
+        progress.insert_skip(
+            (ChannelId::new(7), BindingId::new(100), 1),
+            JoinBuildProgressSkip {
+                join_node_id: 10,
+                rule: FrontierSkip::NoRfSides,
+            },
+        );
+
+        let err = validate_wait_for(&edges, &[consumer], &progress)
+            .expect_err("a skipped planner proof must retain the coarse cycle guard");
+        let DeploymentError::BlockingFeedbackCycle { cycle, .. } = err else {
+            panic!("expected coarse fallback cycle");
+        };
+        assert!(
+            cycle
+                .join(", ")
+                .contains("proof skipped: join-node=10 rule=NoRfSides")
         );
     }
 

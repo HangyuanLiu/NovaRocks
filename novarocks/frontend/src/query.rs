@@ -312,8 +312,8 @@ impl FrontendQuerySession {
         &self,
         statement: &str,
     ) -> Result<StatementResult, QueryServiceError> {
-        let trimmed = statement.trim().trim_end_matches(';').trim();
-        if trimmed.is_empty() || trimmed.starts_with("--") {
+        let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
+        if trimmed.is_empty() {
             return Ok(StatementResult::Ok);
         }
         if let Some(schema) = parse_use_database(trimmed) {
@@ -885,25 +885,61 @@ fn resolve_database_context(
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        Backtick,
+        LineComment,
+        BlockComment,
+    }
+
     let mut statements = Vec::new();
     let mut start = 0;
-    let mut quote = None;
-    for (index, ch) in sql.char_indices() {
-        match quote {
-            Some(delimiter) if ch == delimiter => quote = None,
-            Some(_) => {}
-            None if matches!(ch, '\'' | '"' | '`') => quote = Some(ch),
-            None if ch == ';' => {
-                let statement = sql[start..index].trim();
-                if !statement.is_empty() {
-                    statements.push(statement.to_string());
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut state = State::Normal;
+    while index < bytes.len() {
+        match state {
+            State::Normal => match bytes[index] {
+                b'\'' => state = State::SingleQuote,
+                b'"' => state = State::DoubleQuote,
+                b'`' => state = State::Backtick,
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    state = State::LineComment;
+                    index += 1;
                 }
-                start = index + ch.len_utf8();
+                b'#' => state = State::LineComment,
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    state = State::BlockComment;
+                    index += 1;
+                }
+                b';' => {
+                    let statement = sql[start..index].trim();
+                    if !statement.is_empty() {
+                        statements.push(statement.to_string());
+                    }
+                    start = index + 1;
+                }
+                _ => {}
+            },
+            State::SingleQuote if bytes[index] == b'\'' => state = State::Normal,
+            State::DoubleQuote if bytes[index] == b'"' => state = State::Normal,
+            State::Backtick if bytes[index] == b'`' => state = State::Normal,
+            State::LineComment if bytes[index] == b'\n' => state = State::Normal,
+            State::BlockComment if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') => {
+                state = State::Normal;
+                index += 1;
             }
-            None => {}
+            _ => {}
         }
+        index += 1;
     }
-    if quote.is_some() {
+    if matches!(
+        state,
+        State::SingleQuote | State::DoubleQuote | State::Backtick
+    ) {
         return Err(QueryServiceError::new(
             QueryServiceErrorKind::Parse,
             "unterminated quoted string in SQL batch",
@@ -914,6 +950,28 @@ fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
         statements.push(statement.to_string());
     }
     Ok(statements)
+}
+
+/// Removes leading whole-line comments while retaining the first SQL token.
+/// Script fragments include the repository license header before the SQL
+/// statement, so treating the whole fragment as a comment loses the work.
+fn strip_leading_line_comments(sql: &str) -> &str {
+    let mut remaining = sql.trim();
+    loop {
+        let Some(newline) = remaining.find('\n') else {
+            return if remaining.starts_with("--") || remaining.starts_with('#') {
+                ""
+            } else {
+                remaining
+            };
+        };
+        let line = remaining[..newline].trim();
+        if line.is_empty() || line.starts_with("--") || line.starts_with('#') {
+            remaining = remaining[newline + 1..].trim_start();
+            continue;
+        }
+        return remaining;
+    }
 }
 
 fn parse_use_database(sql: &str) -> Option<&str> {
@@ -1408,6 +1466,12 @@ mod tests {
                     write_default: None,
                     logical_type: None,
                 }],
+                planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease::new(
+                    Arc::new(crate::connector::control_host::tests::test_control_binding(
+                        1,
+                    )),
+                    || {},
+                ),
             })
         }
 
@@ -1484,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_handles_insert_before_core_command() {
+    fn sqlx2_application_frontend_router_handles_insert_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1514,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_passes_one_request_context_to_dml() {
+    fn sqlx2_application_frontend_router_passes_one_request_context_to_dml() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1549,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_router_handles_delete_before_core_command() {
+    fn sqlx2_application_frontend_router_handles_delete_before_core_command() {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
@@ -1835,9 +1899,27 @@ mod tests {
     }
 
     #[test]
+    fn batch_split_ignores_semicolons_inside_leading_comments() {
+        let statements = split_sql_statements(
+            "SET query_timeout=120;\n-- license; users may obtain a copy\nCREATE CATALOG c;",
+        )
+        .expect("batch must parse");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0], "SET query_timeout=120");
+        assert!(statements[1].starts_with("-- license;"));
+    }
+
+    #[test]
     fn batch_split_rejects_unterminated_quote() {
         let error = split_sql_statements("SELECT 'unterminated").expect_err("must reject");
         assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+    }
+
+    #[test]
+    fn leading_line_comments_preserve_the_following_statement() {
+        let sql = "-- Licensed under the Apache License\n# suite header\nCREATE CATALOG c";
+        assert_eq!(strip_leading_line_comments(sql), "CREATE CATALOG c");
+        assert_eq!(strip_leading_line_comments("-- comment only"), "");
     }
 
     #[test]

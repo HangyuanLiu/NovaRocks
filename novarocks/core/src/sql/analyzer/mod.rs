@@ -4010,48 +4010,73 @@ fn sync_output_columns_from_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         ApplyClause, ApplyPredicateSpec, ApplyScalarSpec, BinOp, ExprKind, LiteralValue, Relation,
         SubqueryKind,
     };
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::catalog::IcebergMetadataTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+        SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
 
-    fn test_iceberg_table_info_for(
+    fn sql_test_scan_source(
         catalog: &str,
         namespace: &str,
         table: &str,
-    ) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: format!("file:///tmp/{catalog}/{namespace}/{table}"),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: Some(
-                serde_json::to_string(
-                    &crate::sql::analyzer::iceberg_ref::test_utils::metadata_empty(),
-                )
-                .expect("serialize test iceberg metadata"),
-            ),
-            serialized_metadata_rows: None,
+        kind: SqlScanKind,
+    ) -> ScanSource {
+        let mut ordinal = 2_166_136_261u32;
+        for byte in catalog
+            .bytes()
+            .chain(namespace.bytes())
+            .chain(table.bytes())
+            .chain([match &kind {
+                SqlScanKind::ConnectorRead => 1,
+                SqlScanKind::Data { .. } => 2,
+                SqlScanKind::FrozenInputSet { .. } => 3,
+                SqlScanKind::Metadata { .. } => 4,
+                SqlScanKind::Delta { .. } => 5,
+                SqlScanKind::MvTargetState { .. } => 6,
+                SqlScanKind::MvTargetLocator { .. } => 7,
+            }])
+        {
+            ordinal = ordinal.wrapping_mul(16_777_619) ^ u32::from(byte);
         }
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(41).expect("non-zero scope")),
+                NonZeroU32::new(ordinal.max(1)).expect("non-zero binding ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+            },
+            kind,
+        ))
     }
 
-    fn test_iceberg_table_info() -> IcebergTableInfo {
-        test_iceberg_table_info_for("test_catalog", "test_db", "test_table")
+    fn metadata_table_columns(metadata_table_type: &SqlMetadataTableKind) -> Vec<ColumnDef> {
+        crate::sql::analyzer::iceberg_metadata::metadata_table_schema(metadata_table_type.clone())
+            .into_iter()
+            .map(|column| ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect()
     }
 
     impl TestCatalog {
-        fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+        fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
             match table {
                 "t1" | "t2" | "t3" => {
                     let value_col = match table {
@@ -4085,7 +4110,14 @@ mod tests {
                             },
                         ],
                         iceberg_row_lineage_metadata_columns: vec![],
-                        source: ScanSource::ConnectorPinned,
+                        source: sql_test_scan_source(
+                            "test_catalog",
+                            database,
+                            table,
+                            SqlScanKind::Data {
+                                version: SqlTableVersionSelector::Current,
+                            },
+                        ),
                     })
                 }
                 "array_test" => Ok(TableDef {
@@ -4135,7 +4167,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "orders" => Ok(TableDef {
                     name: "orders".to_string(),
@@ -4184,7 +4223,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "lineitem" => Ok(TableDef {
                     name: "lineitem".to_string(),
@@ -4254,7 +4300,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "supplier" => Ok(TableDef {
                     name: "supplier".to_string(),
@@ -4282,7 +4335,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "part" => Ok(TableDef {
                     name: "part".to_string(),
@@ -4310,7 +4370,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "partsupp" => Ok(TableDef {
                     name: "partsupp".to_string(),
@@ -4345,7 +4412,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "customer" => Ok(TableDef {
                     name: "customer".to_string(),
@@ -4373,7 +4447,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 "nation" => Ok(TableDef {
                     name: "nation".to_string(),
@@ -4394,7 +4475,14 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 // IVM-A1 v3-row-lineage fixture: an iceberg-backed base
                 // table exposing the row-lineage metadata pseudo-columns
@@ -4434,13 +4522,14 @@ mod tests {
                             logical_type: None,
                         },
                     ],
-                    source: ScanSource::IcebergDataFiles {
-                        table: test_iceberg_table_info(),
-                        files: vec![],
-                        cloud_properties: Default::default(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: sql_test_scan_source(
+                        "test_catalog",
+                        database,
+                        table,
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    ),
                 }),
                 _ => Err(format!("table not found: {table}")),
             }
@@ -4471,20 +4560,19 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            _metadata_table_type: IcebergMetadataTableType,
+            metadata_table_type: SqlMetadataTableKind,
         ) -> Result<TableDef, String> {
             let mut table_def = self.get_table(database, table)?;
-            table_def.source = ScanSource::IcebergDataFiles {
-                table: test_iceberg_table_info_for(
-                    catalog.unwrap_or("default_catalog"),
-                    database,
-                    table,
-                ),
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-            };
+            table_def.columns = metadata_table_columns(&metadata_table_type);
+            table_def.source = sql_test_scan_source(
+                catalog.unwrap_or("default_catalog"),
+                database,
+                table,
+                SqlScanKind::Metadata {
+                    kind: metadata_table_type,
+                    version: SqlTableVersionSelector::Current,
+                },
+            );
             Ok(table_def)
         }
     }
@@ -6622,11 +6710,7 @@ mod tests {
     struct CatalogAwareTestCatalog;
 
     impl CatalogAwareTestCatalog {
-        fn connector_pinned_table_def(
-            catalog: Option<&str>,
-            database: &str,
-            table: &str,
-        ) -> TableDef {
+        fn table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
             let catalog_name = catalog.unwrap_or("default_catalog");
             TableDef {
                 name: format!("{catalog_name}_{database}_{table}"),
@@ -6638,23 +6722,34 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: sql_test_scan_source(
+                    catalog_name,
+                    database,
+                    table,
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                ),
             }
         }
 
-        fn iceberg_table_def(catalog: Option<&str>, database: &str, table: &str) -> TableDef {
-            let mut table_def = Self::connector_pinned_table_def(catalog, database, table);
-            table_def.source = ScanSource::IcebergDataFiles {
-                table: test_iceberg_table_info_for(
-                    catalog.unwrap_or("default_catalog"),
-                    database,
-                    table,
-                ),
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-            };
+        fn metadata_table_def(
+            catalog: Option<&str>,
+            database: &str,
+            table: &str,
+            metadata_table_type: SqlMetadataTableKind,
+        ) -> TableDef {
+            let mut table_def = Self::table_def(catalog, database, table);
+            table_def.columns = metadata_table_columns(&metadata_table_type);
+            table_def.source = sql_test_scan_source(
+                catalog.unwrap_or("default_catalog"),
+                database,
+                table,
+                SqlScanKind::Metadata {
+                    kind: metadata_table_type,
+                    version: SqlTableVersionSelector::Current,
+                },
+            );
             table_def
         }
     }
@@ -6669,7 +6764,7 @@ mod tests {
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog,
                 database,
-                Self::connector_pinned_table_def(catalog, database, table),
+                Self::table_def(catalog, database, table),
             ))
         }
 
@@ -6684,9 +6779,14 @@ mod tests {
             catalog: Option<&str>,
             database: &str,
             table: &str,
-            _metadata_table_type: IcebergMetadataTableType,
+            metadata_table_type: SqlMetadataTableKind,
         ) -> Result<TableDef, String> {
-            Ok(Self::iceberg_table_def(catalog, database, table))
+            Ok(Self::metadata_table_def(
+                catalog,
+                database,
+                table,
+                metadata_table_type,
+            ))
         }
     }
 
@@ -6756,10 +6856,10 @@ mod tests {
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                metadata_table_type: IcebergMetadataTableType,
+                metadata_table_type: SqlMetadataTableKind,
             ) -> Result<TableDef, String> {
                 self.0
-                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6808,13 +6908,13 @@ mod tests {
                 catalog: Option<&str>,
                 database: &str,
                 table: &str,
-                metadata_table_type: IcebergMetadataTableType,
+                metadata_table_type: SqlMetadataTableKind,
             ) -> Result<TableDef, String> {
                 assert_eq!(catalog, Some("ice"));
                 assert_eq!(database, "db");
                 assert_eq!(table, "orders");
                 self.0
-                    .set(metadata_table_type == IcebergMetadataTableType::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6841,7 +6941,7 @@ mod tests {
 
     #[test]
     fn analyzer_resolves_t_dollar_snapshots_to_metadata_scan() {
-        use crate::connector::iceberg::IcebergMetadataTableType;
+        use crate::sql::planner::table::SqlMetadataTableKind;
 
         // The parser rewrites `orders$snapshots` -> `orders.__nr_meta_snapshots__`
         // so we go through `parse_raw_and_analyze` to exercise the full pipeline.
@@ -6853,7 +6953,7 @@ mod tests {
         let from = sel.from.as_ref().expect("FROM clause should be present");
         match from {
             Relation::IcebergMetadataScan(rel) => {
-                assert_eq!(rel.metadata_table_type, IcebergMetadataTableType::Snapshots);
+                assert_eq!(rel.metadata_table_type, SqlMetadataTableKind::Snapshots);
                 assert_eq!(rel.table.name, "orders");
                 assert_eq!(rel.database, "default");
                 assert!(rel.alias.is_none());

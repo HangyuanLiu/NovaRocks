@@ -25,6 +25,9 @@
 -- 4. Incremental INSERT correctly updates AVG / MIN / MAX state.
 -- 5. DDL rejections: AVG(*), AVG(string), MIN(*).
 -- MV is Iceberg-target (PROPERTIES('storage_engine'='iceberg')).
+-- This is the native FE/BE owner case for first refresh plus incremental
+-- aggregate-state persistence; Core's in-process test harness intentionally
+-- does not emulate the runtime-filter deployment/session lifecycle.
 
 -- query 1
 -- @skip_result_check=true

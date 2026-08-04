@@ -10,7 +10,6 @@ use iceberg::TableIdent;
 
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::persistence::schema as mv_schema;
-use crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
 use crate::mv::refresh::change_stream_write::{
     ChangeStreamWriteError, ExecutedChangeStreamWrite, PopulatedChangeStreamWrite,
     execute_and_collect_change_stream_write,
@@ -20,6 +19,7 @@ use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 use crate::sql::planner::logical::LogicalPlanNode;
+use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 use novarocks_catalog::identifier::TableIdentity;
 
 pub(crate) struct JoinFirstRefreshLogicalInput {
@@ -370,14 +370,20 @@ fn collect_join_full_refresh_base_scans(
     scans: &mut Vec<JoinFullRefreshBaseScan>,
 ) {
     if let crate::sql::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
-        && let Some(table) = iceberg_scan_table_info(&scan.table.source)
-        && table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
-        && table.namespace.eq_ignore_ascii_case(&base_ref.namespace)
-        && table.table.eq_ignore_ascii_case(&base_ref.table)
+        && let Some(source) = sql_scan_source(&scan.table.source)
+        && source.table.catalog.eq_ignore_ascii_case(&base_ref.catalog)
+        && source
+            .table
+            .namespace
+            .eq_ignore_ascii_case(&base_ref.namespace)
+        && source.table.table.eq_ignore_ascii_case(&base_ref.table)
     {
         scans.push(JoinFullRefreshBaseScan {
             output_columns: scan.columns.clone(),
-            schema_fields: table.schema.fields.clone(),
+            // Field identifiers are intentionally not recovered from an
+            // Iceberg table here.  The immutable MV schema contract remains
+            // the fallback lineage authority when a SQL scan is tokenized.
+            schema_fields: Vec::new(),
         });
     }
     for child in &plan.children {
@@ -385,18 +391,11 @@ fn collect_join_full_refresh_base_scans(
     }
 }
 
-fn iceberg_scan_table_info(
+fn sql_scan_source(
     source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
+) -> Option<&crate::sql::planner::table::SqlScanSource> {
     match source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::IcebergMvTargetState(_)
-        | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator(_) => None,
+        crate::sql::planner::table::ScanSource::Sql(source) => Some(source),
     }
 }
 
@@ -711,7 +710,6 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use iceberg::spec::{
@@ -720,14 +718,13 @@ mod tests {
     };
     use iceberg::{NamespaceIdent, TableIdent};
 
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-    };
     use crate::mv::rewrite::context::tests_support::join_projection_rewrite_context;
     use crate::sql::analysis::JoinKind;
     use crate::sql::planner::logical::{LogicalJoinNode, LogicalPlanKind};
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
 
     fn output_column(
@@ -749,18 +746,6 @@ mod tests {
             data_type,
             nullable,
             is_internal,
-        }
-    }
-
-    fn schema_field(field_id: i32, name: &str) -> IcebergSchemaFieldDef {
-        IcebergSchemaFieldDef {
-            field_id,
-            name: name.to_string(),
-            initial_default: None,
-            write_default: None,
-            initial_default_json: None,
-            write_default_json: None,
-            children: Vec::new(),
         }
     }
 
@@ -795,25 +780,17 @@ mod tests {
             name: table_name.to_string(),
             columns: table_columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
-            source: ScanSource::IcebergDataFiles {
-                table: IcebergTableInfo {
+            source: ScanSource::Sql(SqlScanSource::new(
+                crate::sql::compiler::mv_rewrite::test_target_binding(),
+                SqlTableIdentity {
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: table_name.to_string(),
-                    table_uuid: Some(format!("uuid-{table_name}")),
-                    current_snapshot_id: Some(1),
-                    schema_id: 7,
-                    location: format!("file:///warehouse/db/{table_name}"),
-                    schema: IcebergSchemaDef {
-                        fields: vec![schema_field(1, "k"), schema_field(2, "v")],
-                    },
-                    serialized_metadata: None,
-                    serialized_metadata_rows: None,
                 },
-                files: Vec::new(),
-                cloud_properties: BTreeMap::new(),
-                binding: IcebergDataFileBinding::CurrentSnapshot,
-            },
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            )),
         };
         (
             LogicalPlanNode::new(

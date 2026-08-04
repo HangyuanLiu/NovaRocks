@@ -28,11 +28,11 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use crate::exec::variant::VariantValue;
 use novarocks_types::PrimitiveType;
 use novarocks_types::arrow_primitive::arrow_field_to_primitive;
 use novarocks_types::largeint;
 use novarocks_types::logical::{LogicalType, logical_type_of_field};
+use novarocks_types::value::variant::VariantValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FieldRenderSchema {

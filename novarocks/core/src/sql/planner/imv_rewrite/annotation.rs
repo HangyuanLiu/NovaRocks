@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use crate::mv::partition::derivation::PartitionDerivationSpec;
-use crate::mv::rewrite::context::IcebergMvRewriteContext;
+use crate::sql::compiler::mv_rewrite::SqlImvPartitionDerivationSpec;
+use crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::sql::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 
 /// IMV-pipeline-level plan annotations, populated by rewrite rules and
@@ -42,8 +42,8 @@ pub(crate) struct ImvPlanAnnotation {
 
 /// Plan-time partition derivation outcome (umbrella spec §4.2).
 ///
-/// This is the *plan-time* sibling of the runtime result
-/// [`crate::mv::model::AffectedTargetPartitions`]: `Derivable`
+/// This is the *plan-time* sibling of the application runtime result:
+/// `Derivable`
 /// records that a spec can be resolved (the rule attaches it), whereas the
 /// runtime type later evaluates that spec over delta chunks into concrete
 /// partition keys. The naming mirrors that split — `NotDerivable` is a
@@ -54,7 +54,9 @@ pub(crate) enum ImvPartitionAnnotation {
     /// The target contract has no partition spec — pruning is a no-op.
     Unpartitioned,
     /// One spec for non-union shapes; one per branch for union families (P2).
-    Derivable { specs: Vec<PartitionDerivationSpec> },
+    Derivable {
+        specs: Vec<SqlImvPartitionDerivationSpec>,
+    },
     /// The plan shape cannot yield a partition spec (e.g. non-pure lineage or
     /// an unsupported transform). Recorded, never fatal in v1 (policy is
     /// `BestEffort`, spec D5).
@@ -79,10 +81,10 @@ mod tests {
     }
 }
 
-/// Single value stored in `RewriteContext::set_extension`. Bundles the IMV
-/// rewrite context handle with the per-pipeline annotation.
+/// Single value stored in `RewriteContext::set_extension`. Bundles the
+/// immutable SQL IMV snapshot with the per-pipeline annotation.
 #[derive(Clone, Debug)]
 pub(crate) struct ImvExtension {
-    pub mv_ctx: Arc<IcebergMvRewriteContext>,
+    pub snapshot: Arc<SqlImvRewriteSnapshot>,
     pub annotation: ImvPlanAnnotation,
 }

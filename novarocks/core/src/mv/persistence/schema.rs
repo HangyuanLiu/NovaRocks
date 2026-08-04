@@ -23,6 +23,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::sql::planner::vocabulary::{
+    ApplyKeySource, BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+    HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MvSchemaContract {
     pub contract_version: u16,
@@ -216,24 +221,6 @@ pub enum MvPartitionTransformContract {
     Bucket { num_buckets: u32 },
     Truncate { width: u32 },
     Void,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ApplyKeySource {
-    BaseRowId,
-    JoinRowKey,
-    GroupRowId,
-}
-
-impl ApplyKeySource {
-    pub const fn table_property_value(self) -> &'static str {
-        match self {
-            Self::BaseRowId => "base._row_id",
-            Self::JoinRowKey => "JoinRowKey",
-            Self::GroupRowId => "GroupRowId",
-        }
-    }
 }
 
 /// Errors returned by `MvSchemaContract::ensure_self_consistent`.
@@ -450,10 +437,6 @@ impl std::fmt::Display for ContractSelfCheckError {
 
 impl std::error::Error for ContractSelfCheckError {}
 
-pub const HIDDEN_APPLY_KEY_COLUMN_NAME: &str = "__nova_base_row_id";
-pub const JOIN_APPLY_KEY_COLUMN_NAME: &str = "__nova_join_row_key";
-pub const GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME: &str = "__row_id__";
-pub const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
 pub const APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
 pub const APPLY_KEY_SOURCE_PROPERTY: &str = "novarocks.mv.apply-key.source";
 pub const APPLY_KEY_FIELD_ID_PROPERTY: &str = "novarocks.mv.apply-key.field-id";

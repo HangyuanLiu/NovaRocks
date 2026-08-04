@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
@@ -460,7 +461,42 @@ impl TableStatistics {
     }
 }
 
-/// Build table-level statistics from `IcebergDataFileInfo` entries.
+/// SQL-owned manifest facts used by optimizer test support. Provider adapters
+/// project concrete file metadata into this narrow value before it reaches the
+/// compiler; the optimizer never needs a connector data-file model.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SqlManifestColumnStatistics {
+    pub(crate) null_count: Option<i64>,
+    pub(crate) value_count: Option<i64>,
+    pub(crate) column_size: Option<i64>,
+    pub(crate) lower_bound: Option<Vec<u8>>,
+    pub(crate) upper_bound: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SqlManifestFileStatistics {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) row_count: Option<i64>,
+    pub(crate) column_stats: Option<HashMap<String, SqlManifestColumnStatistics>>,
+    pub(crate) partition_spec_id: Option<i32>,
+    pub(crate) partition_key: Option<String>,
+    pub(crate) first_row_id: Option<i64>,
+    pub(crate) data_sequence_number: Option<i64>,
+    pub(crate) ivm_change_op: Option<i8>,
+    pub(crate) included_positions: Option<Vec<i64>>,
+    pub(crate) delete_files: Vec<()>,
+    pub(crate) manifest_path: Option<String>,
+    pub(crate) partition_values: Vec<()>,
+}
+
+#[cfg(test)]
+#[cfg(test)]
+type IcebergColumnStats = SqlManifestColumnStatistics;
+
+/// Build table-level statistics from SQL manifest facts.
 ///
 /// Aggregates row counts and per-column Iceberg statistics across all files.
 /// Returns `None` if no file has a row count (e.g., non-Iceberg sources).
@@ -470,9 +506,8 @@ impl TableStatistics {
 /// / `max_value` ranges. Without it, bounds stay at +/-infinity (the legacy
 /// behavior).
 #[allow(dead_code)] // kept for tests and external callers that do not have column schema handy
-pub fn build_table_statistics(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
-) -> Option<TableStatistics> {
+#[cfg(test)]
+pub fn build_table_statistics(files: &[SqlManifestFileStatistics]) -> Option<TableStatistics> {
     build_table_statistics_with_columns(files, &[])
 }
 
@@ -480,8 +515,9 @@ pub fn build_table_statistics(
 /// using the supplied column schema. The `columns` slice should match
 /// `TableDef::columns` so that `column.name` maps to the correct Arrow
 /// `DataType` for decoding.
+#[cfg(test)]
 pub fn build_table_statistics_with_columns(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
 ) -> Option<TableStatistics> {
     build_table_statistics_with_ndv(files, columns, &HashMap::new(), &HashMap::new())
@@ -501,8 +537,9 @@ pub fn build_table_statistics_with_columns(
 /// Iceberg manifest `value_counts` is a non-null value count, not an NDV. Using
 /// it as distinct-count metadata makes equality predicates on low-cardinality
 /// string columns look almost unique, which causes severe join-order mistakes.
+#[cfg(test)]
 pub fn build_table_statistics_with_ndv(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     _name_to_field_id: &HashMap<String, i32>,
@@ -619,8 +656,9 @@ pub fn build_table_statistics_with_ndv(
 }
 
 #[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
+#[cfg(test)]
 pub(crate) fn build_base_table_statistics_with_ndv(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[SqlManifestFileStatistics],
     columns: &[novarocks_catalog::schema::ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     name_to_field_id: &HashMap<String, i32>,
@@ -790,6 +828,7 @@ pub(crate) fn build_base_table_statistics_with_ndv(
 /// - FLOAT: 4-byte little-endian f32
 /// - DOUBLE: 8-byte little-endian f64
 /// - DECIMAL: big-endian two's-complement unscaled, truncated to min bytes
+#[cfg(test)]
 fn decode_bound_to_f64(bytes: &[u8], dtype: &DataType) -> Option<f64> {
     match dtype {
         DataType::Boolean => match bytes {
@@ -852,6 +891,7 @@ fn decode_bound_to_f64(bytes: &[u8], dtype: &DataType) -> Option<f64> {
 /// Decode a big-endian two's-complement unscaled decimal byte payload into an
 /// approximate `f64` using the given scale. Lossy for large precision but
 /// sufficient as a cost-model bound.
+#[cfg(test)]
 fn decode_decimal_be_bytes(bytes: &[u8], scale: i32) -> Option<f64> {
     if bytes.is_empty() || bytes.len() > 16 {
         return None;
@@ -1348,10 +1388,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_decodes_int_min_max_without_using_value_count_as_ndv() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1395,10 +1434,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_skips_string_bounds() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(50),
@@ -1438,9 +1476,7 @@ mod tests {
 
     #[test]
     fn build_table_statistics_without_columns_leaves_ndv_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
-
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -1474,10 +1510,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_overrides_value_count_heuristic() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10_000),
@@ -1537,10 +1572,9 @@ mod tests {
 
     #[test]
     fn build_table_statistics_with_ndv_clamps_to_non_null_count() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(1_000),
@@ -1594,10 +1628,8 @@ mod tests {
     }
 
     #[test]
-    fn build_base_table_statistics_missing_row_count_stays_missing() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
-
-        let file = IcebergDataFileInfo {
+    fn sqlx2_scan_manifest_missing_row_count_stays_missing() {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: None,
@@ -1624,10 +1656,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1676,10 +1707,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_heuristic_ndv_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1749,10 +1779,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1816,10 +1845,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(10),
@@ -1906,10 +1934,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_puffin_ndv() {
-        use crate::connector::iceberg::scan_model::{IcebergColumnStats, IcebergDataFileInfo};
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),
@@ -1955,10 +1982,9 @@ mod tests {
 
     #[test]
     fn build_base_table_statistics_preserves_zero_puffin_ndv() {
-        use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
         use novarocks_catalog::schema::ColumnDef;
 
-        let file = IcebergDataFileInfo {
+        let file = SqlManifestFileStatistics {
             path: "f1.parquet".to_string(),
             size: 100,
             row_count: Some(100),

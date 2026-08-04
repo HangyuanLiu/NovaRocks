@@ -1110,9 +1110,11 @@ mod tests {
 
     /// Simplest `ScanSource` to construct in unit tests. The descriptor logic
     /// never inspects `ScanSource`, so the cheap `StarRocks` variant (two i64s)
-    /// is sufficient and avoids building a heavy `IcebergTableInfo`.
+    /// is sufficient and avoids building a heavy provider table-info object.
     fn test_scan_source() -> ScanSource {
-        ScanSource::ConnectorPinned
+        crate::sql::compiler::mv_rewrite::test_scan_source(
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        )
     }
 
     fn scan(cols: &[OutputColumn]) -> PlanScanNode {

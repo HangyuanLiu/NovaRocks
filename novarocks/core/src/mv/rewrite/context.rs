@@ -21,15 +21,30 @@
 //! pins, schemas, and derived aggregate layout. Concrete catalogs, tables,
 //! scan binding, and refresh execution state remain in the engine adapter.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, TimeUnit};
-use iceberg::spec::Schema;
+use arrow::datatypes::{DataType, Field, TimeUnit};
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
+use crate::sql::binding::SqlTableBindingId;
+use crate::sql::compiler::mv_rewrite::{
+    SqlImvAggregateContract, SqlImvAggregateExecutionLayout, SqlImvAggregateLayout,
+    SqlImvAggregateShape, SqlImvAggregateStateColumn, SqlImvAggregateStateColumnContract,
+    SqlImvAggregateStateRole, SqlImvAggregateStateRoleContract, SqlImvAggregateVisibleColumn,
+    SqlImvBaseContract, SqlImvBaseField, SqlImvBaseSnapshot, SqlImvBranchContract,
+    SqlImvExpressionKind, SqlImvExpressionLineage, SqlImvHiddenApplyKey, SqlImvJoinContract,
+    SqlImvJoinContractKind, SqlImvJoinPredicateLineage, SqlImvOutputColumnLineage,
+    SqlImvPartitionContract, SqlImvPartitionField, SqlImvPartitionTransform,
+    SqlImvQualifiedFieldLineage, SqlImvRewriteSnapshot, SqlImvSchemaContract, SqlImvTargetContract,
+    SqlImvTargetVisibleColumn,
+};
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
 
@@ -358,6 +373,382 @@ impl IcebergMvRewriteContext {
             )?;
         Ok((aggregate_calls, layout))
     }
+
+    /// Freeze the application MV contract into the SQL compiler's immutable
+    /// input vocabulary. This is intentionally an application-side adapter:
+    /// all connector schema access and persisted-contract interpretation end
+    /// before the SQL compiler receives the resulting snapshot.
+    pub(crate) fn to_sql_rewrite_snapshot(
+        &self,
+        target_binding: SqlTableBindingId,
+    ) -> Result<Arc<SqlImvRewriteSnapshot>, String> {
+        let schema_contract = Arc::new(sql_schema_contract(self.schema_contract.as_ref())?);
+        let base_snapshots = Arc::from(
+            self.base_refs
+                .iter()
+                .map(|table| {
+                    let snapshot_id = self.pin.get(table).ok_or_else(|| {
+                        format!(
+                            "IMV rewrite snapshot missing pinned snapshot for base {}",
+                            table.fqn()
+                        )
+                    })?;
+                    let table_uuid = self.pin.uuid(table).ok_or_else(|| {
+                        format!(
+                            "IMV rewrite snapshot missing pinned table UUID for base {}",
+                            table.fqn()
+                        )
+                    })?;
+                    Ok(SqlImvBaseSnapshot {
+                        table: table.clone(),
+                        snapshot_id,
+                        table_uuid: table_uuid.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
+        let target_columns = sql_target_columns(self.target_schema.as_ref())?;
+        let aggregate_execution =
+            if self.schema_contract.aggregate.is_some() {
+                let (calls, layout) = self.aggregate_shape_and_layout_for_execution().map_err(|e| {
+                format!(
+                    "IMV rewrite snapshot cannot derive aggregate execution layout for {}: {e}",
+                    self.target.fqn()
+                )
+            })?;
+                Some(SqlImvAggregateExecutionLayout {
+                    shape: SqlImvAggregateShape {
+                        group_key_count: calls.group_keys.len(),
+                        visible_outputs: calls.visible_outputs,
+                    },
+                    layout: SqlImvAggregateLayout {
+                        row_id_column_name: layout.row_id_column.column.name.clone(),
+                        visible_columns: layout
+                            .visible_columns
+                            .into_iter()
+                            .map(|column| SqlImvAggregateVisibleColumn {
+                                name: column.name,
+                                data_type: column.data_type,
+                                nullable: column.nullable,
+                            })
+                            .collect(),
+                        state_columns: layout
+                            .state_columns
+                            .into_iter()
+                            .map(|column| {
+                                Ok(SqlImvAggregateStateColumn {
+                                    name: column.name,
+                                    data_type: column.data_type,
+                                    nullable: column.nullable,
+                                    visible_source_index: column.visible_source_index,
+                                    aggregate_index: column.aggregate_index,
+                                    function: column.function,
+                                    state_role: match column.state_role {
+                                        crate::mv::model::AggregateStateRole::Single => {
+                                            SqlImvAggregateStateRole::Single
+                                        }
+                                        crate::mv::model::AggregateStateRole::RetractionCount => {
+                                            SqlImvAggregateStateRole::RetractionCount
+                                        }
+                                    },
+                                    count_star: column.count_star,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
+                        group_key_source_indexes: layout.group_key_source_indexes,
+                        physical_column_names: layout
+                            .physical_columns
+                            .into_iter()
+                            .map(|column| column.column.name)
+                            .collect(),
+                        aggregate_input_types: layout.aggregate_input_types,
+                    },
+                })
+            } else {
+                None
+            };
+
+        Ok(Arc::new(SqlImvRewriteSnapshot::from_frozen_parts(
+            self.target.clone(),
+            target_binding,
+            self.mv_id,
+            base_snapshots,
+            self.previous_snapshot_ids.clone(),
+            self.previous_table_uuids.clone(),
+            self.target_snapshot_id,
+            self.target_table_uuid.clone(),
+            target_columns,
+            schema_contract,
+            aggregate_execution,
+        )?))
+    }
+}
+
+fn sql_target_columns(
+    target_schema: &Schema,
+) -> Result<Arc<[novarocks_catalog::schema::ColumnDef]>, String> {
+    Ok(Arc::from(
+        target_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| sql_target_column_from_field(field.as_ref()))
+            .collect::<Result<Vec<_>, String>>()?,
+    ))
+}
+
+fn sql_target_column_from_field(
+    field: &NestedField,
+) -> Result<novarocks_catalog::schema::ColumnDef, String> {
+    Ok(novarocks_catalog::schema::ColumnDef {
+        name: field.name.clone(),
+        data_type: sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
+        nullable: !field.required,
+        write_default: None,
+        logical_type: None,
+    })
+}
+
+fn sql_iceberg_type_to_arrow(ty: &Type, column_name: &str) -> Result<DataType, String> {
+    Ok(match ty {
+        Type::Primitive(primitive) => sql_primitive_type_to_arrow(primitive, column_name)?,
+        Type::Struct(struct_ty) => {
+            let fields = struct_ty
+                .fields()
+                .iter()
+                .map(|field| {
+                    Ok(Arc::new(Field::new(
+                        field.name.clone(),
+                        sql_iceberg_type_to_arrow(field.field_type.as_ref(), &field.name)?,
+                        !field.required,
+                    )))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            DataType::Struct(fields.into())
+        }
+        Type::List(list_ty) => {
+            let element = list_ty.element_field.as_ref();
+            DataType::List(Arc::new(Field::new(
+                element.name.clone(),
+                sql_iceberg_type_to_arrow(element.field_type.as_ref(), &element.name)?,
+                !element.required,
+            )))
+        }
+        Type::Map(map_ty) => {
+            let key = map_ty.key_field.as_ref();
+            let value = map_ty.value_field.as_ref();
+            let entries = DataType::Struct(
+                vec![
+                    Arc::new(Field::new(
+                        key.name.clone(),
+                        sql_iceberg_type_to_arrow(key.field_type.as_ref(), &key.name)?,
+                        !key.required,
+                    )),
+                    Arc::new(Field::new(
+                        value.name.clone(),
+                        sql_iceberg_type_to_arrow(value.field_type.as_ref(), &value.name)?,
+                        !value.required,
+                    )),
+                ]
+                .into(),
+            );
+            DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+        }
+    })
+}
+
+fn sql_primitive_type_to_arrow(
+    primitive: &PrimitiveType,
+    column_name: &str,
+) -> Result<DataType, String> {
+    Ok(match primitive {
+        PrimitiveType::Boolean => DataType::Boolean,
+        PrimitiveType::Int => DataType::Int32,
+        PrimitiveType::Long => DataType::Int64,
+        PrimitiveType::Float => DataType::Float32,
+        PrimitiveType::Double => DataType::Float64,
+        PrimitiveType::Decimal { precision, scale } => {
+            let precision = u8::try_from(*precision).map_err(|_| {
+                format!(
+                    "IMV target column {column_name} has out-of-range decimal precision {precision}"
+                )
+            })?;
+            let scale = i8::try_from(*scale).map_err(|_| {
+                format!("IMV target column {column_name} has out-of-range decimal scale {scale}")
+            })?;
+            DataType::Decimal128(precision, scale)
+        }
+        PrimitiveType::Date => DataType::Date32,
+        PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+        PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        PrimitiveType::String => DataType::Utf8,
+        PrimitiveType::Binary => DataType::Binary,
+        other => {
+            return Err(format!(
+                "IMV target column {column_name} has unsupported Iceberg type {other:?}"
+            ));
+        }
+    })
+}
+
+fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContract, String> {
+    fn expression_kind(value: mv_schema::ExpressionKind) -> SqlImvExpressionKind {
+        match value {
+            mv_schema::ExpressionKind::Column => SqlImvExpressionKind::Column,
+            mv_schema::ExpressionKind::Cast => SqlImvExpressionKind::Cast,
+            mv_schema::ExpressionKind::Func => SqlImvExpressionKind::Func,
+            mv_schema::ExpressionKind::Literal => SqlImvExpressionKind::Literal,
+            mv_schema::ExpressionKind::Mixed => SqlImvExpressionKind::Mixed,
+        }
+    }
+
+    fn lineage(value: &mv_schema::QualifiedFieldLineage) -> SqlImvQualifiedFieldLineage {
+        SqlImvQualifiedFieldLineage {
+            table_fqn: value.table_fqn.clone(),
+            qualifier_at_create: value.qualifier_at_create.clone(),
+            field_id: value.field_id,
+        }
+    }
+
+    fn transform(value: &mv_schema::MvPartitionTransformContract) -> SqlImvPartitionTransform {
+        match value {
+            mv_schema::MvPartitionTransformContract::Identity => SqlImvPartitionTransform::Identity,
+            mv_schema::MvPartitionTransformContract::Year => SqlImvPartitionTransform::Year,
+            mv_schema::MvPartitionTransformContract::Month => SqlImvPartitionTransform::Month,
+            mv_schema::MvPartitionTransformContract::Day => SqlImvPartitionTransform::Day,
+            mv_schema::MvPartitionTransformContract::Hour => SqlImvPartitionTransform::Hour,
+            mv_schema::MvPartitionTransformContract::Bucket { num_buckets } => {
+                SqlImvPartitionTransform::Bucket {
+                    num_buckets: *num_buckets,
+                }
+            }
+            mv_schema::MvPartitionTransformContract::Truncate { width } => {
+                SqlImvPartitionTransform::Truncate { width: *width }
+            }
+            mv_schema::MvPartitionTransformContract::Void => SqlImvPartitionTransform::Void,
+        }
+    }
+
+    let aggregate = contract
+        .aggregate
+        .as_ref()
+        .map(|aggregate| {
+            let state_columns = aggregate
+                .state_columns
+                .iter()
+                .map(|column| {
+                    let role = match column.role {
+                        mv_schema::AggregateStateRoleContract::Single => {
+                            SqlImvAggregateStateRoleContract::Single
+                        }
+                        mv_schema::AggregateStateRoleContract::RetractionCount => {
+                            SqlImvAggregateStateRoleContract::RetractionCount
+                        }
+                        unsupported => {
+                            return Err(format!(
+                                "IMV schema contract has unsupported aggregate state role {unsupported:?}"
+                            ));
+                        }
+                    };
+                    Ok(SqlImvAggregateStateColumnContract {
+                        column_name: column.column_name.clone(),
+                        type_signature: column.type_signature.clone(),
+                        role,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok::<SqlImvAggregateContract, String>(SqlImvAggregateContract {
+                state_layout_version: aggregate.state_layout_version,
+                row_id_column_name: aggregate.row_id_column_name.clone(),
+                state_columns,
+            })
+        })
+        .transpose()?;
+
+    Ok(SqlImvSchemaContract {
+        bases: contract
+            .bases
+            .iter()
+            .map(|base| SqlImvBaseContract {
+                table_fqn: base.table_fqn.clone(),
+                alias_at_create: base.alias_at_create.clone(),
+                fields: base
+                    .schema_at_create
+                    .fields
+                    .iter()
+                    .map(|field| SqlImvBaseField {
+                        field_id: field.field_id,
+                        name_at_create: field.name_at_create.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        output_columns: contract
+            .output
+            .columns
+            .iter()
+            .map(|output| SqlImvOutputColumnLineage {
+                expression: SqlImvExpressionLineage {
+                    kind: expression_kind(output.expression.kind),
+                    referenced_base_field_ids: output.expression.referenced_base_field_ids.clone(),
+                    referenced_base_fields: output
+                        .expression
+                        .referenced_base_fields
+                        .iter()
+                        .map(lineage)
+                        .collect(),
+                },
+            })
+            .collect(),
+        join: contract.join.as_ref().map(|join| SqlImvJoinContract {
+            kind: match join.kind {
+                mv_schema::JoinContractKind::InnerEquiJoin => SqlImvJoinContractKind::InnerEquiJoin,
+            },
+            predicates: join
+                .predicates
+                .iter()
+                .map(|predicate| SqlImvJoinPredicateLineage {
+                    left: lineage(&predicate.left),
+                    right: lineage(&predicate.right),
+                })
+                .collect(),
+        }),
+        aggregate,
+        branch: contract.branch.as_ref().map(|branch| SqlImvBranchContract {
+            branch_id_column_name: branch.branch_id_column.column_name.clone(),
+        }),
+        target: SqlImvTargetContract {
+            visible_columns: contract
+                .target
+                .visible_columns
+                .iter()
+                .map(|column| SqlImvTargetVisibleColumn {
+                    output_name: column.output_name.clone(),
+                    target_field_id: column.target_field_id,
+                })
+                .collect(),
+            hidden_apply_key: SqlImvHiddenApplyKey {
+                column_name: contract.target.hidden_apply_key.column_name.clone(),
+                source: contract.target.hidden_apply_key.source,
+            },
+            partition: contract.target.partition.as_ref().map(|partition| {
+                SqlImvPartitionContract {
+                    target_spec_id: partition.target_spec_id,
+                    fields: partition
+                        .fields
+                        .iter()
+                        .map(|field| SqlImvPartitionField {
+                            partition_field_name: field.partition_field_name.clone(),
+                            source_target_field_id: field.source_target_field_id,
+                            transform: transform(&field.transform),
+                        })
+                        .collect(),
+                }
+            }),
+        },
+    })
 }
 
 /// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
@@ -398,7 +789,7 @@ fn aggregate_input_types_from_schema_contract(
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
     use crate::mv::aggregate_state::mv_shape::AggregateInput;
-    use crate::mv::model::VisibleAggregateOutput;
+    use crate::sql::mv_refresh::VisibleAggregateOutput;
 
     let mut input_types = vec![None; calls.aggregates.len()];
     for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
@@ -600,11 +991,12 @@ pub(crate) mod tests_support {
 
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
+    use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
     use mv_schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, JOIN_APPLY_KEY_COLUMN_NAME, JoinContract,
-        JoinContractKind, JoinPredicateLineage, MvSchemaContract, OutputColumnLineage,
-        OutputContract, QualifiedFieldLineage, TargetContract, TargetVisibleColumn,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
+        MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
+        TargetContract, TargetVisibleColumn,
     };
     use novarocks_catalog::identifier::TableIdentity;
 
@@ -933,9 +1325,10 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
+    use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
     use mv_schema::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BRANCH_ID_COLUMN_NAME, BranchIdColumnContract, BranchUnionContract,
+        BranchIdColumnContract, BranchUnionContract,
     };
     use novarocks_catalog::identifier::TableIdentity;
 
@@ -1561,5 +1954,24 @@ mod tests {
             Some(contract),
         )
         .expect("ctx must accept aggregate state columns in target schema");
+    }
+
+    #[test]
+    fn sqlx2_binary_target_column_remains_binary() {
+        let schema = Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![Arc::new(NestedField::required(
+                200,
+                "__agg_state_v",
+                Type::Primitive(PrimitiveType::Binary),
+            ))])
+            .build()
+            .expect("build schema");
+
+        let columns = sql_target_columns(&schema).expect("project SQL target columns");
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "__agg_state_v");
+        assert_eq!(columns[0].data_type, DataType::Binary);
     }
 }

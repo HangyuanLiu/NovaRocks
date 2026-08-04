@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -33,6 +35,7 @@ use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, o
 use crate::sql::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanKind, LogicalPlanNode, LogicalUnionNode,
 };
+use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;
 
 pub(crate) struct RewriteBranchUnionRule;
 
@@ -232,12 +235,12 @@ fn branch_union_aggregate_change_stream_output_columns(
     ext: &ImvExtension,
     ctx: &RewriteContext,
 ) -> Result<Vec<OutputColumn>, String> {
-    let (_shape, layout) = ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
+    let (_shape, layout) = ext.snapshot.aggregate_shape_and_layout_for_execution()?;
     let mut columns =
         Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len() + 6);
     columns.push(allocate_imv_output_column(
         ctx,
-        &layout.row_id_column.column.name,
+        &layout.row_id_column_name,
         DataType::Utf8,
         false,
         true,
@@ -253,8 +256,10 @@ fn branch_union_aggregate_change_stream_output_columns(
     }
     for column in &layout.state_columns {
         let data_type = match column.state_role {
-            crate::mv::model::AggregateStateRole::Single => DataType::Binary,
-            crate::mv::model::AggregateStateRole::RetractionCount => column.data_type.clone(),
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => DataType::Binary,
+            crate::sql::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
+                column.data_type.clone()
+            }
         };
         columns.push(allocate_imv_output_column(
             ctx,
@@ -273,28 +278,28 @@ fn branch_union_aggregate_change_stream_output_columns(
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_FILE_PATH_COL,
+        crate::sql::common::ICEBERG_FILE_PATH_COL,
         DataType::Utf8,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_POS_COL,
+        crate::sql::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        crate::sql::common::ICEBERG_ROW_ID_COL,
         DataType::Int64,
         true,
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
-        crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+        crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL,
         DataType::Int64,
         true,
         true,
@@ -328,21 +333,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use arrow::datatypes::DataType;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::persistence::schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, BranchIdColumnContract,
-        BranchUnionContract, JoinContract, JoinContractKind, JoinPredicateLineage,
-        QualifiedFieldLineage,
-    };
-    use crate::mv::rewrite::context::IcebergMvRewriteContext;
-    use crate::mv::rewrite::context::tests_support::{
-        make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
-    };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -359,7 +350,8 @@ mod tests {
     use crate::sql::planner::payload::{
         AggregateCall, PlanFilterNode, PlanProjectNode, PlanScanNode,
     };
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, SqlScanKind, SqlScanSource, TableDef};
+    use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
     #[test]
@@ -660,26 +652,20 @@ mod tests {
             .expect("branch-union aggregate output must include branch id");
         let file_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL))
             .expect("branch-union aggregate output must include file locator");
         let pos_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL))
             .expect("branch-union aggregate output must include row-position locator");
         let row_id_idx = output_names
             .iter()
-            .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
-            })
+            .position(|name| name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL))
             .expect("branch-union aggregate output must include row-lineage id");
         let last_updated_seq_idx = output_names
             .iter()
             .position(|name| {
-                name.eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+                name.eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
             })
             .expect("branch-union aggregate output must include last-updated sequence");
         let action_idx = output_names
@@ -817,7 +803,10 @@ mod tests {
             &plan.kind,
             LogicalPlanKind::Scan(PlanScanNode {
                 table: TableDef {
-                    source: ScanSource::IcebergMvTargetState(_),
+                    source: ScanSource::Sql(SqlScanSource {
+                        kind: SqlScanKind::MvTargetState { .. },
+                        ..
+                    }),
                     ..
                 },
                 ..
@@ -833,299 +822,30 @@ mod tests {
         ) || plan.children.iter().any(contains_signed_state_aggregate)
     }
 
-    fn single_state_column(type_signature: &str) -> AggregateStateColumnContract {
-        AggregateStateColumnContract {
-            column_name: "__agg_state_s".to_string(),
-            target_field_id: 200,
-            type_signature: type_signature.to_string(),
-            nullable: true,
-            role: AggregateStateRoleContract::Single,
-        }
-    }
-
-    fn retraction_count_state_column() -> AggregateStateColumnContract {
-        AggregateStateColumnContract {
-            column_name: "__agg_state___ivm_row_count".to_string(),
-            target_field_id: 201,
-            type_signature: "long".to_string(),
-            nullable: false,
-            role: AggregateStateRoleContract::RetractionCount,
-        }
-    }
-
-    fn build_ctx() -> RewriteContext {
-        let mut mv_def = make_mv_definition();
-        mv_def.select_sql =
-            "SELECT region, sum(amount) AS s FROM ice.db.b GROUP BY region".to_string();
-        mv_def.primary_key_columns = vec!["region".to_string()];
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[0].output_name = "region".to_string();
-        contract.target.visible_columns[1].output_name = "s".to_string();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
-                target_field_id: 998,
-            },
-            branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::GroupRowId,
-        });
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                single_state_column("binary"),
-                retraction_count_state_column(),
-            ],
-        });
-        mv_def.schema_contract = Some(contract.clone());
-
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "region",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::required(
-                        998,
-                        "__branch_id__",
-                        Type::Primitive(PrimitiveType::Int),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )),
-                    Arc::new(NestedField::required(
-                        201,
-                        "__agg_state___ivm_row_count",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
-        let mv_ctx = Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT region, sum(amount) AS s FROM ice.db.b GROUP BY region",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "b")]),
-                Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("aggregate rewrite context must build"),
-        );
-
+    fn rewrite_context(
+        snapshot: std::sync::Arc<crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
+    ) -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
         let factory = std::rc::Rc::new(std::cell::RefCell::new(ColumnRefFactory::new()));
         factory.borrow_mut().reserve_until(100);
-        ctx.set_column_ref_factory(std::rc::Rc::clone(&factory));
+        ctx.set_column_ref_factory(factory);
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx,
+            snapshot,
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
+    }
+
+    fn build_ctx() -> RewriteContext {
+        rewrite_context(crate::sql::compiler::mv_rewrite::test_branch_union_snapshot())
     }
 
     fn build_two_base_join_ctx() -> RewriteContext {
-        let mut ctx = build_ctx();
-        let mut mv_def = make_mv_definition();
-        mv_def.select_sql = concat!(
-            "SELECT l.region, sum(l.amount) AS s ",
-            "FROM ice.db.l l JOIN ice.db.r r ON l.region = r.region ",
-            "GROUP BY l.region"
-        )
-        .to_string();
-        mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
-        mv_def.primary_key_columns = vec!["region".to_string()];
-        mv_def.last_refresh_snapshots = [
-            ("ice.db.l".to_string(), 11i64),
-            ("ice.db.r".to_string(), 33i64),
-        ]
-        .into_iter()
-        .collect();
-        mv_def.last_refresh_table_uuids = [
-            ("ice.db.l".to_string(), "uuid-l".to_string()),
-            ("ice.db.r".to_string(), "uuid-r".to_string()),
-        ]
-        .into_iter()
-        .collect();
-
-        let mut contract = make_schema_contract();
-        contract.base = join_base_contract("ice.db.l", "uuid-l");
-        contract.bases = vec![
-            join_base_contract("ice.db.l", "uuid-l"),
-            join_base_contract("ice.db.r", "uuid-r"),
-        ];
-        contract.output.columns[0]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[0].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.l", "l", 1)];
-        contract.output.columns[1]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[1].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.l", "l", 2)];
-        contract.target.visible_columns[0].output_name = "region".to_string();
-        contract.target.visible_columns[1].output_name = "s".to_string();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = ApplyKeySource::GroupRowId;
-        contract.join = Some(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
-            predicates: vec![JoinPredicateLineage {
-                left: qualified_field("ice.db.l", "l", 1),
-                right: qualified_field("ice.db.r", "r", 1),
-            }],
-        });
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: crate::mv::persistence::schema::BRANCH_ID_COLUMN_NAME.to_string(),
-                target_field_id: 998,
-            },
-            branch_count: 2,
-            inner_apply_key_source: ApplyKeySource::GroupRowId,
-        });
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                single_state_column("binary"),
-                retraction_count_state_column(),
-            ],
-        });
-        mv_def.schema_contract = Some(contract.clone());
-
-        let target_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(7)
-                .with_fields(vec![
-                    Arc::new(NestedField::required(
-                        100,
-                        "region",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::optional(
-                        101,
-                        "s",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                    Arc::new(NestedField::required(
-                        999,
-                        "__row_id__",
-                        Type::Primitive(PrimitiveType::String),
-                    )),
-                    Arc::new(NestedField::required(
-                        998,
-                        "__branch_id__",
-                        Type::Primitive(PrimitiveType::Int),
-                    )),
-                    Arc::new(NestedField::optional(
-                        200,
-                        "__agg_state_s",
-                        Type::Primitive(PrimitiveType::Binary),
-                    )),
-                    Arc::new(NestedField::required(
-                        201,
-                        "__agg_state___ivm_row_count",
-                        Type::Primitive(PrimitiveType::Long),
-                    )),
-                ])
-                .build()
-                .expect("build schema"),
-        );
-        let mv_ctx = Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT l.region, sum(l.amount) AS s FROM ice.db.l l JOIN ice.db.r r ON l.region = r.region GROUP BY l.region",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "l"), make_ref("ice", "db", "r")]),
-                Arc::new(make_pin(&[
-                    ("ice.db.l", 22, "uuid-l"),
-                    ("ice.db.r", 22, "uuid-r"),
-                ])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Some(Arc::new(contract)),
-            )
-            .expect("join aggregate rewrite context must build"),
-        );
-        ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx,
-            annotation: ImvPlanAnnotation::default(),
-        });
-        ctx
+        rewrite_context(crate::sql::compiler::mv_rewrite::test_region_join_snapshot())
     }
-
-    fn join_base_contract(table_fqn: &str, table_uuid: &str) -> BaseContract {
-        BaseContract {
-            table_fqn: table_fqn.to_string(),
-            table_uuid: table_uuid.to_string(),
-            alias_at_create: None,
-            schema_id_at_create: 7,
-            schema_at_create: BaseSchemaSnapshot {
-                fields: vec![
-                    BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "region".to_string(),
-                        type_signature: "long".to_string(),
-                        required: true,
-                    },
-                    BaseFieldRecord {
-                        field_id: 2,
-                        name_at_create: "amount".to_string(),
-                        type_signature: "long".to_string(),
-                        required: true,
-                    },
-                ],
-            },
-        }
-    }
-
-    fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
-        QualifiedFieldLineage {
-            table_fqn: table_fqn.to_string(),
-            qualifier_at_create: qualifier.to_string(),
-            field_id,
-        }
-    }
-
     fn root_delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::ImvDelta(LogicalImvDeltaNode {
@@ -1189,24 +909,9 @@ mod tests {
                     name: name.to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
-                            catalog: "ice".to_string(),
-                            namespace: "db".to_string(),
-                            table: name.to_string(),
-                            table_uuid: Some(format!("uuid-{name}")),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: format!("file:///tmp/ice/db/{name}"),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
-                        },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source_for(
+                        "ice", "db", name,
+                    ),
                 },
                 alias: None,
                 columns: vec![

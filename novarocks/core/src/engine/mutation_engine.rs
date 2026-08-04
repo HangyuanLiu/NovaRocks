@@ -126,7 +126,7 @@ pub enum MutationStageOutcome {
 }
 
 /// One-to-one capability consumed only by the frontend DML application owner.
-// Design: ADR-0031 (docs/adr/ADR-0031-frontend-update-merge-application-owner.md)
+// Design: ADR-0033 (docs/adr/ADR-0033-frontend-update-merge-application-owner.md)
 pub trait MutationEngine: Send + Sync {
     fn prepare_mutation(
         &self,

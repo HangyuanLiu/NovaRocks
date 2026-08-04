@@ -18,32 +18,43 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use iceberg::spec::{PrimitiveType, TableMetadata, Type};
+
 use novarocks_spi::connector::{
     ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
     StatisticsMetricValue, StatisticsProvenance,
 };
 
-use crate::connector::unified_statistics::{ResolvedStatisticsTable, UnifiedStatisticsResolver};
-use crate::sql::catalog::ResolvedAnalyzerTable;
-use crate::sql::catalog::provider::{
-    QueryStatisticsPins, QueryTableBinding, QueryTableBindingLoader,
+use crate::connector::unified_statistics::{
+    ResolvedStatisticsTable, StatisticsResolutionFailure, UnifiedStatisticsResolver,
 };
+use crate::engine::query_planning::bindings::{
+    QueryScanMaterialization, QueryTableBinding, QueryTableBindingStore,
+    parse_time_travel_overlay_identity,
+};
+use crate::engine::query_planning::catalog_materializer::QueryTableBindingLoader;
+use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats_input::{
-    BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsMissingReason,
-    StatsRef, StatsSource,
+    BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, SqlStatisticsFatalError,
+    SqlStatisticsSnapshot, SqlTableStatisticsEvidence, StatValue, StatsMissingReason, StatsRef,
+    StatsSource,
 };
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{
+    ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
+    SqlTableVersionSelector,
+};
 
 #[derive(Clone, Default)]
 /// Query-scoped handles for the one unified statistics resolver.  This is not
 /// a provider registry: absent pins intentionally produce missing statistics
 /// rather than a second latest-resolution path.
 pub(crate) struct QueryStatisticsContext {
-    resolver: Option<Arc<UnifiedStatisticsResolver>>,
-    bindings: Option<QueryStatisticsPins>,
+    bindings: Option<Arc<QueryTableBindingStore>>,
+    snapshot: Arc<SqlStatisticsSnapshot>,
 }
 
 impl QueryStatisticsContext {
@@ -55,27 +66,133 @@ impl QueryStatisticsContext {
         Self::none()
     }
 
-    pub(crate) fn from_standalone_state_with_pins(
+    pub(crate) fn from_standalone_state_with_bindings(
         state: &Arc<super::StandaloneState>,
-        pins: QueryStatisticsPins,
+        bindings: Arc<QueryTableBindingStore>,
     ) -> Self {
         Self {
-            resolver: Some(Arc::clone(&state.unified_statistics)),
-            bindings: Some(pins),
+            snapshot: Arc::new(project_statistics_snapshot(
+                state.unified_statistics.as_ref(),
+                &bindings,
+            )),
+            bindings: Some(bindings),
         }
     }
 
-    pub(crate) fn from_optional_state_with_pins(
+    pub(crate) fn from_optional_state_with_bindings(
         state: Option<&Arc<super::StandaloneState>>,
-        pins: Option<QueryStatisticsPins>,
+        bindings: Option<Arc<QueryTableBindingStore>>,
     ) -> Self {
-        match (state, pins) {
-            (Some(state), Some(pins)) => Self::from_standalone_state_with_pins(state, pins),
+        match (state, bindings) {
+            (Some(state), Some(bindings)) => {
+                Self::from_standalone_state_with_bindings(state, bindings)
+            }
             // A caller without resolution pins must not resolve `latest` a
             // second time. Keep normal missing-statistics fallback instead.
             (Some(_), None) => Self::none(),
             (None, _) => Self::none(),
         }
+    }
+}
+
+/// Project every admission-frozen connector observation into SQL values before
+/// optimization begins.  This is the one application boundary that may touch
+/// a lease, a table handle, or a connector capability; `QueryStatisticsContext`
+/// subsequently serves only the immutable snapshot below.
+fn project_statistics_snapshot(
+    resolver: &UnifiedStatisticsResolver,
+    bindings: &QueryTableBindingStore,
+) -> SqlStatisticsSnapshot {
+    let mut snapshot = SqlStatisticsSnapshot::empty();
+    for (binding_id, binding) in bindings.captured_bindings() {
+        let label = binding.resolved.catalog.identity.fqn();
+        match project_binding_statistics(resolver, &binding) {
+            Ok(statistics) => {
+                snapshot.insert(binding_id, SqlTableStatisticsEvidence { label, statistics })
+            }
+            Err(error) => snapshot.insert_fatal(binding_id, error),
+        }
+    }
+    snapshot
+}
+
+fn project_binding_statistics(
+    resolver: &UnifiedStatisticsResolver,
+    binding: &QueryTableBinding,
+) -> Result<BaseTableStatistics, SqlStatisticsFatalError> {
+    let Some(pin) = binding.statistics_pin.as_ref() else {
+        return Ok(BaseTableStatistics::missing(
+            StatsMissingReason::ConnectorUnsupported(
+                "resolved table does not expose connector statistics".to_string(),
+            ),
+        ));
+    };
+    let Some(planning_lease) = binding.planning_lease.as_ref() else {
+        return Err(SqlStatisticsFatalError::BindingMissing);
+    };
+    let control_binding = planning_lease.binding();
+    if control_binding.descriptor().instance_id != *pin.table.owner() {
+        return Err(SqlStatisticsFatalError::OwnerMismatch);
+    }
+    let Some(statistics) = control_binding.statistics() else {
+        return Ok(BaseTableStatistics::missing(
+            StatsMissingReason::ConnectorUnsupported(
+                "resolved connector generation does not expose statistics".to_string(),
+            ),
+        ));
+    };
+    let metrics = metric_request(&binding.resolved.planner.columns).map_err(|error| {
+        SqlStatisticsFatalError::CorruptEvidence(format!("build metric request: {error}"))
+    })?;
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .map_err(|error| {
+        SqlStatisticsFatalError::CorruptEvidence(format!("build statistics context: {error}"))
+    })?;
+    let evidence = match resolver.resolve(
+        &ResolvedStatisticsTable {
+            table: pin.table.clone(),
+            data_version: pin.data_version.clone(),
+            incarnation: control_binding.incarnation(),
+        },
+        statistics.as_ref(),
+        metrics,
+        context,
+    ) {
+        Ok(evidence) => evidence,
+        // A provider that cannot supply evidence remains the normal
+        // conservative path.  Only a fact that contradicts the retained
+        // binding is fatal to compilation.
+        Err(StatisticsResolutionFailure::Connector(error)) => {
+            return Ok(BaseTableStatistics::missing(
+                StatsMissingReason::CatalogLoadError(error.to_string()),
+            ));
+        }
+        Err(error) => return Err(map_resolution_failure(error)),
+    };
+    Ok(evidence_to_base_statistics(
+        &evidence,
+        &binding.resolved.planner.columns,
+    ))
+}
+
+fn map_resolution_failure(error: StatisticsResolutionFailure) -> SqlStatisticsFatalError {
+    match error {
+        StatisticsResolutionFailure::OwnerMismatch => SqlStatisticsFatalError::OwnerMismatch,
+        StatisticsResolutionFailure::IncarnationMismatch => {
+            SqlStatisticsFatalError::IncarnationMismatch
+        }
+        StatisticsResolutionFailure::DataVersionMismatch => {
+            SqlStatisticsFatalError::DataVersionMismatch
+        }
+        StatisticsResolutionFailure::CorruptEvidence(message) => {
+            SqlStatisticsFatalError::CorruptEvidence(message)
+        }
+        StatisticsResolutionFailure::Connector(error) => SqlStatisticsFatalError::CorruptEvidence(
+            format!("unexpected connector error after conservative mapping: {error}"),
+        ),
     }
 }
 
@@ -116,10 +233,11 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         catalog: &str,
         namespace: &str,
         table: &str,
+        binding_id: crate::sql::binding::SqlTableBindingId,
     ) -> Result<QueryTableBinding, String> {
         if let Some((base_table, snapshot_id)) = parse_time_travel_overlay_identity(table) {
-            let (mut planner, statistics_pin, planning_lease) =
-                crate::connector::iceberg::provider::load_time_travel_table_def_with_lease(
+            let materialization =
+                crate::connector::iceberg::provider::load_time_travel_materialization_with_lease(
                     self.controls,
                     self.connector_context.clone(),
                     catalog,
@@ -127,26 +245,31 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                     base_table,
                     snapshot_id,
                 )?;
-            planner.name = table.to_string();
-            return Ok(QueryTableBinding {
-                resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-                statistics_pin,
-                planning_lease: Some(planning_lease),
-            });
+            return crate::engine::query_planning::catalog_materializer::
+                iceberg_query_binding_from_materialization(
+                    materialization,
+                    catalog,
+                    namespace,
+                    table,
+                    binding_id,
+                );
         }
-        let (planner, _schema_id, statistics_pin, planning_lease) =
-            crate::connector::iceberg::provider::load_schema_table_def_with_lease(
+        let materialization =
+            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
                 self.controls,
                 self.connector_context.clone(),
                 catalog,
                 namespace,
                 table,
             )?;
-        Ok(QueryTableBinding {
-            resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-            statistics_pin,
-            planning_lease: Some(planning_lease),
-        })
+        crate::engine::query_planning::catalog_materializer::
+            iceberg_query_binding_from_materialization(
+                materialization,
+                catalog,
+                namespace,
+                table,
+                binding_id,
+            )
     }
 
     fn load_metadata_table(
@@ -154,29 +277,311 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         catalog: &str,
         namespace: &str,
         table: &str,
-        metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
-    ) -> Result<crate::sql::planner::table::TableDef, String> {
-        crate::connector::iceberg::provider::load_metadata_table_def(
-            self.controls,
-            self.connector_context.clone(),
-            catalog,
-            namespace,
-            table,
-            metadata_table_type,
-        )
+        metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
+        binding_id: crate::sql::binding::SqlTableBindingId,
+    ) -> Result<QueryTableBinding, String> {
+        let iceberg_metadata_table_type = match metadata_table_type {
+            crate::sql::planner::table::SqlMetadataTableKind::Snapshots => {
+                crate::connector::iceberg::IcebergMetadataTableType::Snapshots
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::History => {
+                crate::connector::iceberg::IcebergMetadataTableType::History
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Refs => {
+                crate::connector::iceberg::IcebergMetadataTableType::Refs
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Files => {
+                crate::connector::iceberg::IcebergMetadataTableType::Files
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Manifests => {
+                crate::connector::iceberg::IcebergMetadataTableType::Manifests
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::Partitions => {
+                crate::connector::iceberg::IcebergMetadataTableType::Partitions
+            }
+            crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata => {
+                crate::connector::iceberg::IcebergMetadataTableType::LogicalIcebergMetadata
+            }
+        };
+        let materialization =
+            crate::connector::iceberg::provider::load_metadata_materialization_with_lease(
+                self.controls,
+                self.connector_context.clone(),
+                catalog,
+                namespace,
+                table,
+                iceberg_metadata_table_type,
+            )?;
+        let table_info = materialization.table;
+        let files = materialization.files;
+        let columns = metadata_columns_for_table(metadata_table_type, &table_info)?;
+        let columns = columns
+            .into_iter()
+            .map(|column| novarocks_catalog::schema::ColumnDef {
+                name: column.name,
+                data_type: column.data_type,
+                nullable: column.nullable,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect::<Vec<_>>();
+        let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
+            format!(
+                "iceberg metadata table {catalog}.{namespace}.{table} has no serialized metadata"
+            )
+        })?;
+        let metadata_payload = metadata_payload(metadata_table_type, &table_info, &files)?;
+        let planner = crate::sql::planner::table::TableDef {
+            name: materialization.table_name,
+            columns,
+            iceberg_row_lineage_metadata_columns: materialization
+                .iceberg_row_lineage_metadata_columns,
+            source: ScanSource::Sql(SqlScanSource::new(
+                binding_id,
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: namespace.to_string(),
+                    table: table.to_string(),
+                },
+                SqlScanKind::Metadata {
+                    kind: metadata_table_type,
+                    version: SqlTableVersionSelector::Current,
+                },
+            )),
+        };
+        Ok(QueryTableBinding {
+            resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
+            statistics_pin: materialization.statistics_pin,
+            planning_lease: Some(materialization.planning_lease),
+            scan_materialization: Some(QueryScanMaterialization::IcebergMetadata {
+                table: table_info,
+                metadata_table_type,
+                serialized_table,
+                metadata_payload,
+            }),
+            frozen_snapshot_files: std::collections::BTreeMap::new(),
+            delta_runtime_plans: std::collections::BTreeMap::new(),
+        })
     }
 }
 
-/// Query-prep encodes time-travel selectors as a synthetic analyzer identity.
-/// The identity is recognized only by this query-scoped binding loader, so it
-/// cannot leak into the global local catalog or another request's memo.
-fn parse_time_travel_overlay_identity(table: &str) -> Option<(&str, i64)> {
-    let encoded = table.strip_prefix("__sqlx1_tt_")?;
-    let (base_table, snapshot_id) = encoded.rsplit_once('_')?;
-    (!base_table.is_empty())
-        .then(|| snapshot_id.parse::<i64>().ok())
-        .flatten()
-        .map(|snapshot_id| (base_table, snapshot_id))
+fn metadata_payload(
+    kind: SqlMetadataTableKind,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+) -> Result<Option<String>, String> {
+    match kind {
+        SqlMetadataTableKind::Partitions => {
+            let mut groups = std::collections::BTreeMap::<
+                (i32, String),
+                (
+                    i64,
+                    i64,
+                    i64,
+                    std::collections::BTreeSet<String>,
+                    std::collections::BTreeSet<String>,
+                ),
+            >::new();
+            for file in files {
+                let spec_id = file.partition_spec_id.ok_or_else(|| {
+                    format!(
+                        "iceberg partitions metadata requires partition spec id for data file {}",
+                        file.path
+                    )
+                })?;
+                let rows = file.row_count.ok_or_else(|| {
+                    format!(
+                        "iceberg partitions metadata requires record_count for data file {}",
+                        file.path
+                    )
+                })?;
+                let entry = groups
+                    .entry((
+                        spec_id,
+                        file.partition_key
+                            .clone()
+                            .unwrap_or_else(|| "Struct([])".to_string()),
+                    ))
+                    .or_default();
+                entry.0 = entry.0.checked_add(rows).ok_or_else(|| {
+                    "iceberg partitions metadata record_count overflow".to_string()
+                })?;
+                entry.1 = entry
+                    .1
+                    .checked_add(1)
+                    .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
+                entry.2 = entry.2.checked_add(file.size).ok_or_else(|| {
+                    "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
+                })?;
+                for delete in &file.delete_files {
+                    match delete.file_content {
+                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                            entry.3.insert(delete.path.clone());
+                        }
+                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                            entry.4.insert(delete.path.clone());
+                        }
+                    }
+                }
+            }
+            let rows = groups.into_iter().map(|((spec_id, partition), (record_count, file_count, total_data_file_size_in_bytes, position_delete_files, equality_delete_files))| {
+                Ok(serde_json::json!({
+                    "spec_id": spec_id,
+                    "partition": partition,
+                    "record_count": record_count,
+                    "file_count": file_count,
+                    "total_data_file_size_in_bytes": total_data_file_size_in_bytes,
+                    "position_delete_file_count": i64::try_from(position_delete_files.len()).map_err(|_| "iceberg partitions metadata position_delete_file_count overflow".to_string())?,
+                    "equality_delete_file_count": i64::try_from(equality_delete_files.len()).map_err(|_| "iceberg partitions metadata equality_delete_file_count overflow".to_string())?,
+                }))
+            }).collect::<Result<Vec<_>, String>>()?;
+            serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
+                .map(Some)
+                .map_err(|error| {
+                    format!("serialize iceberg partitions metadata payload failed: {error}")
+                })
+        }
+        SqlMetadataTableKind::Files
+        | SqlMetadataTableKind::Manifests
+        | SqlMetadataTableKind::LogicalIcebergMetadata => table
+            .serialized_metadata_rows
+            .clone()
+            .map(Some)
+            .ok_or_else(|| {
+                "iceberg metadata rows were not resolved at catalog lookup time".to_string()
+            }),
+        SqlMetadataTableKind::Snapshots
+        | SqlMetadataTableKind::History
+        | SqlMetadataTableKind::Refs => Ok(None),
+    }
+}
+
+fn metadata_columns_for_table(
+    kind: SqlMetadataTableKind,
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+) -> Result<Vec<crate::sql::analyzer::iceberg_metadata::MetadataColumn>, String> {
+    let mut columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema(kind);
+    if matches!(
+        kind,
+        SqlMetadataTableKind::Files | SqlMetadataTableKind::LogicalIcebergMetadata
+    ) {
+        let partition = partition_struct_type(table)?;
+        let column = columns
+            .iter_mut()
+            .find(|column| column.name.eq_ignore_ascii_case("partition"))
+            .ok_or_else(|| "Iceberg metadata schema is missing partition column".to_string())?;
+        column.data_type = partition;
+    }
+    Ok(columns)
+}
+
+fn iceberg_type_to_arrow_type(ty: &Type) -> Result<DataType, String> {
+    match ty {
+        Type::Primitive(primitive) => Ok(match primitive {
+            PrimitiveType::Boolean => DataType::Boolean,
+            PrimitiveType::Int => DataType::Int32,
+            PrimitiveType::Long => DataType::Int64,
+            PrimitiveType::Float => DataType::Float32,
+            PrimitiveType::Double => DataType::Float64,
+            PrimitiveType::Decimal { precision, scale } => DataType::Decimal128(
+                u8::try_from(*precision)
+                    .map_err(|_| format!("iceberg decimal precision out of range: {precision}"))?,
+                i8::try_from(*scale)
+                    .map_err(|_| format!("iceberg decimal scale out of range: {scale}"))?,
+            ),
+            PrimitiveType::Date => DataType::Date32,
+            PrimitiveType::Time => DataType::Time64(TimeUnit::Microsecond),
+            PrimitiveType::Timestamp | PrimitiveType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => {
+                DataType::Timestamp(TimeUnit::Nanosecond, None)
+            }
+            PrimitiveType::String | PrimitiveType::Uuid => DataType::Utf8,
+            PrimitiveType::Fixed(width) => DataType::FixedSizeBinary(
+                i32::try_from(*width)
+                    .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
+            ),
+            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
+        }),
+        other => Err(format!(
+            "iceberg metadata partition field must be primitive, got {other:?}"
+        )),
+    }
+}
+
+fn partition_source_type<'a>(metadata: &'a TableMetadata, source_id: i32) -> Option<&'a Type> {
+    metadata
+        .current_schema()
+        .field_by_id(source_id)
+        .map(|field| field.field_type.as_ref())
+        .or_else(|| {
+            metadata.schemas_iter().find_map(|schema| {
+                schema
+                    .field_by_id(source_id)
+                    .map(|field| field.field_type.as_ref())
+            })
+        })
+}
+
+fn partition_struct_type(
+    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+) -> Result<DataType, String> {
+    let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
+        format!(
+            "iceberg metadata table {}.{} requires serialized metadata to type partition struct",
+            table.namespace, table.table
+        )
+    })?;
+    let metadata: TableMetadata = serde_json::from_str(serialized).map_err(|error| {
+        format!("parse iceberg table metadata for partition schema failed: {error}")
+    })?;
+    let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.spec_id());
+
+    let mut fields: Vec<Arc<Field>> = Vec::new();
+    for spec in specs {
+        for partition_field in spec.fields() {
+            let source_type = partition_source_type(&metadata, partition_field.source_id)
+                .ok_or_else(|| {
+                    format!(
+                        "iceberg partition field {} references missing source field id {}",
+                        partition_field.name, partition_field.source_id
+                    )
+                })?;
+            let result_type =
+                partition_field
+                    .transform
+                    .result_type(source_type)
+                    .map_err(|error| {
+                        format!(
+                            "infer iceberg partition field {} type: {error}",
+                            partition_field.name
+                        )
+                    })?;
+            let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
+            if let Some(existing) = fields
+                .iter()
+                .find(|field| field.name().eq_ignore_ascii_case(&partition_field.name))
+            {
+                if existing.data_type() != &arrow_type {
+                    return Err(format!(
+                        "iceberg partition field {} has incompatible types across specs: {:?} vs {:?}",
+                        partition_field.name,
+                        existing.data_type(),
+                        arrow_type
+                    ));
+                }
+                continue;
+            }
+            fields.push(Arc::new(Field::new(
+                partition_field.name.clone(),
+                arrow_type,
+                true,
+            )));
+        }
+    }
+    Ok(DataType::Struct(Fields::from(fields)))
 }
 
 pub(crate) type QueryStatsPlan = crate::sql::compiler::SqlStatisticsPlan;
@@ -233,89 +638,27 @@ pub(super) fn collect_table_stats(
     table_def: &crate::sql::planner::table::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
-    let ScanSource::IcebergDataFiles { table, binding, .. } = &table_def.source else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "scan source does not expose connector statistics".to_string(),
-            )),
-        );
-    };
-    let Some(resolver) = context.resolver.as_deref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "unified statistics cache is not available".to_string(),
-            )),
-        );
-    };
-    let Some(bindings) = context.bindings.as_ref() else {
+    let ScanSource::Sql(source) = &table_def.source;
+    let binding_id = source.binding;
+    if context.bindings.is_none() {
         return (
             label,
             BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
                 "query table bindings are not available".to_string(),
             )),
         );
-    };
-    let Some(query_binding) = bindings.iceberg_data_file_binding(table, *binding) else {
-        return (
+    }
+    match context.snapshot.get(binding_id) {
+        Ok(evidence) => (evidence.label.clone(), evidence.statistics.clone()),
+        // The legacy collector cannot return a compiler error.  The canonical
+        // kernel will consume this same immutable snapshot directly when its
+        // scan token migration lands; preserve conservative behavior here
+        // while retaining the typed failure in the snapshot for submission.
+        Err(error) => (
             label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain an exact query binding".to_string(),
-            )),
-        );
-    };
-    let Some(pin) = query_binding.statistics_pin.as_ref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain a statistics data-version pin".to_string(),
-            )),
-        );
-    };
-    let Some(planning_lease) = query_binding.planning_lease.as_ref() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
-                "table resolution did not retain its connector planning lease".to_string(),
-            )),
-        );
-    };
-    let Some(statistics) = planning_lease.binding().statistics() else {
-        return (
-            label,
-            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                "resolved connector generation does not expose statistics".to_string(),
-            )),
-        );
-    };
-    let metrics = metric_request(&table_def.columns).map_err(|error| error.to_string());
-    let context = crate::connector::connector_request_context(
-        None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
-    let stats = metrics
-        .and_then(|metrics| {
-            context.and_then(|context| {
-                resolver
-                    .resolve(
-                        &ResolvedStatisticsTable {
-                            table: pin.table.clone(),
-                            data_version: pin.data_version.clone(),
-                            incarnation: planning_lease.binding().incarnation(),
-                        },
-                        statistics.as_ref(),
-                        metrics,
-                        context,
-                    )
-                    .map_err(|error| error.to_string())
-            })
-        })
-        .map(|evidence| evidence_to_base_statistics(&evidence, &table_def.columns))
-        .unwrap_or_else(|error| {
-            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(error))
-        });
-    (label, stats)
+            BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(error.to_string())),
+        ),
+    }
 }
 
 fn metric_request(
@@ -446,14 +789,12 @@ fn metric_f64(state: Option<&StatisticsMetricState>) -> Option<f64> {
 }
 
 fn table_label(database: &str, table_def: &crate::sql::planner::table::TableDef) -> String {
-    match &table_def.source {
-        ScanSource::IcebergDataFiles { table, .. }
-        | ScanSource::IcebergVersionTable { table, .. }
-        | ScanSource::IcebergDeltaTable { table, .. } => {
-            format!("{}.{}.{}", table.catalog, table.namespace, table.table)
-        }
-        _ => format!("{}.{}", database, table_def.name),
-    }
+    let ScanSource::Sql(source) = &table_def.source;
+    let _ = database;
+    format!(
+        "{}.{}.{}",
+        source.table.catalog, source.table.namespace, source.table.table
+    )
 }
 
 #[cfg(test)]

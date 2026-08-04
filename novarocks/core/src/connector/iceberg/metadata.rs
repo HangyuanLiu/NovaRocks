@@ -1963,7 +1963,30 @@ mod tests {
     /// assigning sequential SlotIds. This exercises the REAL declared Arrow
     /// types so the builders' output must match exactly.
     fn output_columns_for(ty: IcebergMetadataTableType) -> Vec<IcebergMetadataOutputColumn> {
-        metadata_table_schema(ty)
+        let sql_kind = match ty {
+            IcebergMetadataTableType::Snapshots => {
+                crate::sql::planner::table::SqlMetadataTableKind::Snapshots
+            }
+            IcebergMetadataTableType::History => {
+                crate::sql::planner::table::SqlMetadataTableKind::History
+            }
+            IcebergMetadataTableType::Refs => {
+                crate::sql::planner::table::SqlMetadataTableKind::Refs
+            }
+            IcebergMetadataTableType::Files => {
+                crate::sql::planner::table::SqlMetadataTableKind::Files
+            }
+            IcebergMetadataTableType::Manifests => {
+                crate::sql::planner::table::SqlMetadataTableKind::Manifests
+            }
+            IcebergMetadataTableType::Partitions => {
+                crate::sql::planner::table::SqlMetadataTableKind::Partitions
+            }
+            IcebergMetadataTableType::LogicalIcebergMetadata => {
+                crate::sql::planner::table::SqlMetadataTableKind::LogicalIcebergMetadata
+            }
+        };
+        metadata_table_schema(sql_kind)
             .into_iter()
             .enumerate()
             .map(|(i, c)| {

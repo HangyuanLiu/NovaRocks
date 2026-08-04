@@ -788,11 +788,22 @@ fn decode_change_stream_router_program(
         let split_exprs = branch_kinds
             .into_iter()
             .map(|branch_kind| {
+                let execution_branch_kind = match branch_kind {
+                    crate::sql::common::ChangeStreamBranchKind::DeleteDv => {
+                        crate::exec::change_op::ChangeStreamBranchKind::DeleteDv
+                    }
+                    crate::sql::common::ChangeStreamBranchKind::ReuseData => {
+                        crate::exec::change_op::ChangeStreamBranchKind::ReuseData
+                    }
+                    crate::sql::common::ChangeStreamBranchKind::FreshData => {
+                        crate::exec::change_op::ChangeStreamBranchKind::FreshData
+                    }
+                };
                 build_change_stream_split_predicate(
                     &mut partition_arena,
                     change_op_slot_id,
                     data_route_slot_id,
-                    branch_kind,
+                    execution_branch_kind,
                 )
                 .map_err(|error| {
                     NativeFragmentLeafDecodeError::at_field(

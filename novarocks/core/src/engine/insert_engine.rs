@@ -62,7 +62,7 @@ pub fn parse_insert_statement(sql: &str) -> Result<Option<sqlparser::ast::Insert
 /// The binary format remains an execution-layer concern; frontend receives
 /// only opaque bytes and owns the decision to fold `parse_json(...)`.
 pub fn encode_insert_variant_json(json_text: &str) -> Result<Vec<u8>, String> {
-    crate::exec::variant_encode::encode_json_text_to_variant_bytes(json_text)
+    novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json_text)
 }
 
 /// One admitted INSERT statement at the frontend route boundary.
@@ -111,12 +111,25 @@ pub struct ResolveInsertTarget {
 }
 
 /// Iceberg target metadata used by frontend dispatch and shaping.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct ResolvedInsertTarget {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
     pub columns: Vec<ColumnDef>,
+    pub planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+}
+
+impl std::fmt::Debug for ResolvedInsertTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedInsertTarget")
+            .field("catalog", &self.catalog)
+            .field("namespace", &self.namespace)
+            .field("table", &self.table)
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One non-UNION source for an Iceberg INSERT transaction.
@@ -236,10 +249,13 @@ impl InsertEngine for Arc<StandaloneState> {
             request.current_catalog.as_deref(),
             &request.current_database,
         )?;
-        crate::connector::metadata_load_table(
+        let planning_lease = crate::connector::acquire_metadata_planning_lease(
             self.connector_control.as_ref(),
-            connector_context,
             &target.catalog,
+        )?;
+        crate::connector::metadata_load_table_with_planning_lease(
+            planning_lease.clone(),
+            connector_context,
             &target.namespace,
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
@@ -271,6 +287,7 @@ impl InsertEngine for Arc<StandaloneState> {
             namespace: target.namespace,
             table: target.table,
             columns,
+            planning_lease,
         })
     }
 
@@ -310,6 +327,7 @@ impl InsertEngine for Arc<StandaloneState> {
             &request.target_ref,
             Some(request.execution),
             &connector_context,
+            request.target.planning_lease.clone(),
         )?;
         let operation = IcebergInsertOperation {
             catalog: prepared.target().catalog.clone(),

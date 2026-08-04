@@ -344,10 +344,11 @@ impl ViewEngine for StandaloneState {
         query: &sqlparser::ast::Query,
         context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, String> {
-        let catalog_service_snapshot = crate::sql::catalog::StandaloneCatalogService::new(
-            Arc::new(RwLock::new(self.catalog_service.local_snapshot())),
-            self.catalog_service.registry_snapshot(),
-        );
+        let catalog_service_snapshot =
+            crate::engine::query_planning::catalog_runtime::QueryCatalogService::new(
+                Arc::new(RwLock::new(self.catalog_service.local_snapshot())),
+                self.catalog_service.registry_snapshot(),
+            );
         let connectors_snapshot = self
             .connectors
             .read()

@@ -27,8 +27,8 @@ use std::sync::Arc;
 use novarocks_spi::connector::ConnectorRequestContext;
 
 use crate::engine::table_maintenance::{MaintenanceTarget, TableMaintenanceEngine};
+use crate::mv::application::{MvRefreshAttemptIdentity, PreparedMvRefresh};
 use crate::mv::model::MvTarget;
-use crate::sql::mv_refresh::{MvRefreshAttemptIdentity, PreparedMvRefresh};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvBackgroundEngineErrorKind {

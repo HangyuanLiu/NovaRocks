@@ -151,7 +151,9 @@ mod tests {
                     name: "t".into(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 stats_ref: None,
@@ -290,7 +292,7 @@ mod tests {
                 // non-empty: partition-topn Sort always carries these
                 analytic_partition_exprs: vec![partition_expr],
                 partition_limit: Some(2),
-                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+                topn_type: Some(crate::sql::common::SqlTopNType::Rank),
             }),
             children: vec![scan_group],
         };

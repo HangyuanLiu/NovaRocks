@@ -30,10 +30,10 @@ use crate::sql::optimizer::scalar_expr;
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
 
-/// Map a window function name to its `SortTopNType` variant.
+/// Map a window function name to its SQL-owned `SqlTopNType` variant.
 /// Returns `None` for non-ranking functions (e.g. avg, sum, lead, lag).
-fn ranking_topn_type(name: &str) -> Option<crate::exec::node::sort::SortTopNType> {
-    use crate::exec::node::sort::SortTopNType::*;
+fn ranking_topn_type(name: &str) -> Option<crate::sql::common::SqlTopNType> {
+    use crate::sql::common::SqlTopNType::*;
     match name.to_ascii_lowercase().as_str() {
         "row_number" => Some(RowNumber),
         "rank" => Some(Rank),
@@ -519,7 +519,7 @@ mod tests {
     }
 
     fn make_sort_opt_with_limit(arena: &mut ScalarArena, p_id: ColumnId, limit: usize) -> OptExpr {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let partition_expr =
             crate::sql::planner::optimizer_bridge::scalar::intern_typed(arena, &col_typed(p_id));
         let sort_key = make_sort_key(arena, p_id);
@@ -528,7 +528,7 @@ mod tests {
                 items: vec![sort_key],
                 analytic_partition_exprs: vec![partition_expr],
                 partition_limit: Some(limit),
-                topn_type: Some(SortTopNType::Rank),
+                topn_type: Some(SqlTopNType::Rank),
             }),
             vec![empty_values_opt()],
         )
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn fires_on_rank_per_group_sets_partition_limit() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let rk_id = ColumnId::new_for_test(1);
         let p_id = ColumnId::new_for_test(2);
         let mut arena = ScalarArena::new();
@@ -766,12 +766,12 @@ mod tests {
         let result = rule.apply(plan, &mut ctx).unwrap();
         let sort = extract_sort_from_changed(result);
         assert_eq!(sort.partition_limit, Some(2));
-        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+        assert_eq!(sort.topn_type, Some(SqlTopNType::Rank));
     }
 
     #[test]
     fn maps_window_expr_to_trailing_output_column() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let rk_id = ColumnId::new_for_test(1);
         let p_id = ColumnId::new_for_test(2);
         let mut arena = ScalarArena::new();
@@ -794,12 +794,12 @@ mod tests {
             .unwrap();
         let sort = extract_sort_from_changed(result);
         assert_eq!(sort.partition_limit, Some(2));
-        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+        assert_eq!(sort.topn_type, Some(SqlTopNType::Rank));
     }
 
     #[test]
     fn fires_when_window_output_columns_include_passthrough_columns() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let region_id = ColumnId::new_for_test(10);
         let amount_id = ColumnId::new_for_test(11);
         let rank_id = ColumnId::new_for_test(12);
@@ -830,7 +830,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(sort.partition_limit, Some(2));
-        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+        assert_eq!(sort.topn_type, Some(SqlTopNType::Rank));
     }
 
     // -----------------------------------------------------------------------
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn fires_for_row_number_and_dense_rank() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let rk_id = ColumnId::new_for_test(10);
         let p_id = ColumnId::new_for_test(11);
 
@@ -853,7 +853,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(sort.partition_limit, Some(3));
-            assert_eq!(sort.topn_type, Some(SortTopNType::RowNumber));
+            assert_eq!(sort.topn_type, Some(SqlTopNType::RowNumber));
         }
         {
             let mut arena = ScalarArena::new();
@@ -865,7 +865,7 @@ mod tests {
                     .unwrap(),
             );
             assert_eq!(sort.partition_limit, Some(5));
-            assert_eq!(sort.topn_type, Some(SortTopNType::DenseRank));
+            assert_eq!(sort.topn_type, Some(SqlTopNType::DenseRank));
         }
     }
 
@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn sees_through_bare_passthrough_project() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let rk_id = ColumnId::new_for_test(60);
         let proj_rk_id = ColumnId::new_for_test(61);
         let p_id = ColumnId::new_for_test(62);
@@ -1027,7 +1027,7 @@ mod tests {
         let result = rule.apply(plan, &mut ctx).unwrap();
         let sort = extract_sort_from_changed(result);
         assert_eq!(sort.partition_limit, Some(3));
-        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+        assert_eq!(sort.topn_type, Some(SqlTopNType::Rank));
     }
 
     // -----------------------------------------------------------------------
@@ -1175,7 +1175,7 @@ mod tests {
 
     #[test]
     fn fires_for_same_signature_multi_fn() {
-        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::common::SqlTopNType;
         let rk_id = ColumnId::new_for_test(100);
         let drk_id = ColumnId::new_for_test(101);
         let p_id = ColumnId::new_for_test(102);
@@ -1219,6 +1219,6 @@ mod tests {
             .unwrap();
         let sort_node = extract_sort_from_changed(result);
         assert_eq!(sort_node.partition_limit, Some(3));
-        assert_eq!(sort_node.topn_type, Some(SortTopNType::Rank));
+        assert_eq!(sort_node.topn_type, Some(SqlTopNType::Rank));
     }
 }

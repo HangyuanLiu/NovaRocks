@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::connector::iceberg::changes::{ChangePartitionFieldValue, ChangePartitionValue};
 use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
 use crate::mv::persistence::schema::{
@@ -171,8 +174,8 @@ fn partition_transform_name(transform: &MvPartitionTransformContract) -> String 
 mod tests {
     use super::*;
     use crate::mv::persistence::schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };

@@ -427,8 +427,9 @@ fn json_object_literal(args: &[&sqlparser::ast::Expr]) -> Result<Literal, String
     }
     let json_text = serde_json::to_string(&JsonValue::Object(object))
         .map_err(|e| format!("json_object stringify failed: {e}"))?;
-    let bytes = crate::exec::variant_encode::encode_json_text_to_variant_bytes(&json_text)
-        .map_err(|e| format!("json_object failed: {e}"))?;
+    let bytes =
+        novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(&json_text)
+            .map_err(|e| format!("json_object failed: {e}"))?;
     Ok(Literal::String(bytes_to_latin1_string(&bytes)))
 }
 
@@ -534,7 +535,7 @@ pub(crate) fn sqlparser_function_to_literal(
             // SeriV2 empty bitmap encoding: a single BITMAP_TYPE_EMPTY (=0) byte,
             // matching `eval_bitmap_empty` runtime output.
             Ok(Literal::String(bytes_to_latin1_string(&[
-                crate::exec::expr::function::object::bitmap_common::BITMAP_TYPE_EMPTY,
+                novarocks_types::value::bitmap::BITMAP_TYPE_EMPTY,
             ])))
         }
         "hll_hash" => {
@@ -577,7 +578,7 @@ pub(crate) fn sqlparser_function_to_literal(
                     );
                 }
             }
-            use crate::exec::expr::function::object::hll_hash::{
+            use novarocks_types::value::hll::{
                 MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a,
             };
             let arg = sqlparser_expr_to_literal(args[0])?;
@@ -663,27 +664,23 @@ pub(crate) fn sqlparser_function_to_literal(
                 }
             };
             // Mirror runtime semantics: malformed string -> NULL (not error).
-            let values =
-                match crate::exec::expr::function::object::bitmap_common::parse_bitmap_string(&text)
-                {
-                    Ok(v) => v,
-                    Err(_) => return Ok(Literal::Null),
-                };
+            let values = match novarocks_types::value::bitmap::parse_bitmap_string(&text) {
+                Ok(v) => v,
+                Err(_) => return Ok(Literal::Null),
+            };
             // Use the EXTERNAL (storage / SeriV1-style) encoding here —
             // that's the format the StarRocks table bitmap column
             // reader expects, matching `bitmap_empty` / `to_bitmap`'s
             // const-fold output. The internal varint format only round-
             // trips through the runtime expression layer.
-            let bytes = crate::exec::expr::function::object::bitmap_common::encode_external_bitmap(
-                &values,
-            )?;
+            let bytes = novarocks_types::value::bitmap::encode_external_bitmap(&values)?;
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
         }
         "to_bitmap" => {
             if args.len() != 1 {
                 return Err("to_bitmap expects 1 argument".to_string());
             }
-            use crate::exec::expr::function::object::to_bitmap::encode_bitmap_single;
+            use novarocks_types::value::bitmap::encode_bitmap_single;
             let arg = sqlparser_expr_to_literal(args[0])?;
             // Mirror `eval_to_bitmap` runtime semantics for scalar literals:
             //   - NULL or negative integer → NULL
@@ -729,8 +726,10 @@ pub(crate) fn sqlparser_function_to_literal(
             let Literal::String(json_text) = sqlparser_expr_to_literal(args[0])? else {
                 return Err("parse_json expects VARCHAR argument".to_string());
             };
-            let bytes = crate::exec::variant_encode::encode_json_text_to_variant_bytes(&json_text)
-                .map_err(|e| format!("parse_json failed: {e}"))?;
+            let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(
+                &json_text,
+            )
+            .map_err(|e| format!("parse_json failed: {e}"))?;
             // Pack raw variant bytes into Literal::String via Latin-1 (matches
             // `to_binary` convention; INSERT VALUES decodes via
             // `latin1_string_to_bytes`).
@@ -2250,8 +2249,9 @@ mod tests {
         let unpacked = latin1_string_to_bytes(&packed).expect("latin1 decode");
 
         // Must equal the encoder's output for the same JSON.
-        let expected = crate::exec::variant_encode::encode_json_text_to_variant_bytes(r#"{"a":1}"#)
-            .expect("encode");
+        let expected =
+            novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(r#"{"a":1}"#)
+                .expect("encode");
         assert_eq!(unpacked, expected);
     }
 
@@ -2289,7 +2289,7 @@ mod tests {
             let bytes = latin1_string_to_bytes(&packed).expect("latin1 decode");
 
             assert_eq!(
-                crate::exec::expr::function::object::bitmap_common::decode_bitmap(&bytes)
+                novarocks_types::value::bitmap::decode_bitmap(&bytes)
                     .expect("runtime bitmap decode"),
                 expected,
                 "runtime codec disagrees with constant fold for `{sql}`"

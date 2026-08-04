@@ -60,11 +60,13 @@ fn build_for_test(
 > {
     let _ = request.catalog;
     let controls = crate::connector::FixtureControlResolver::new(request.connectors.clone());
+    let query_table_bindings =
+        tests::fixture_query_table_bindings(request.distributed_plan, &controls);
     let prepared = prepare_fragments(
         request.distributed_plan,
         &controls,
         &crate::connector::test_request_context(),
-        None,
+        query_table_bindings.as_ref(),
         request.scan_binding_resolver,
         crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
     )?;

@@ -27,35 +27,17 @@ use arrow::array::{
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::CastOptions;
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::datatypes::{DataType, Field};
 use parquet::variant::{
     GetOptions, VariantArray, json_to_variant, unshred_variant, variant_get as kernel_variant_get,
 };
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use crate::exec::variant::{
+use novarocks_types::value::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
+    variant_get_target_type,
 };
-
-/// Map a `variant_get` type-string literal to the engine arrow type.
-/// v1 whitelist per the IV3-6 design (decision E + §4).
-pub fn variant_get_target_type(type_str: &str) -> Result<DataType, String> {
-    match type_str.trim().to_ascii_lowercase().as_str() {
-        "boolean" | "bool" => Ok(DataType::Boolean),
-        "int" | "integer" | "int32" => Ok(DataType::Int32),
-        "bigint" | "long" | "int64" => Ok(DataType::Int64),
-        "float" | "float32" => Ok(DataType::Float32),
-        "double" | "float64" => Ok(DataType::Float64),
-        "string" | "varchar" => Ok(DataType::Utf8),
-        "date" => Ok(DataType::Date32),
-        "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        other => Err(format!(
-            "variant_get: unsupported type '{other}' \
-             (supported: boolean, int, bigint, float, double, string, date, datetime)"
-        )),
-    }
-}
 
 /// Read a required string-literal argument directly from the arena.
 /// Spark requires these arguments to be foldable; we require literals.
@@ -266,22 +248,4 @@ pub fn eval_try_variant_get(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     eval_variant_get_impl(arena, args, chunk, false, "try_variant_get")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn target_type_whitelist() {
-        assert_eq!(variant_get_target_type("bigint"), Ok(DataType::Int64));
-        assert_eq!(variant_get_target_type(" INT "), Ok(DataType::Int32));
-        assert_eq!(variant_get_target_type("string"), Ok(DataType::Utf8));
-        assert_eq!(
-            variant_get_target_type("datetime"),
-            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-        );
-        assert!(variant_get_target_type("decimal(10,2)").is_err());
-        assert!(variant_get_target_type("variant").is_err());
-    }
 }

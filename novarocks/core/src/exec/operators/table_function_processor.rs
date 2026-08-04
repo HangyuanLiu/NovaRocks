@@ -41,12 +41,12 @@ use arrow_data::transform::MutableArrayData;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::expr::function::object::bitmap_common;
 use crate::exec::node::table_function::TableFunctionOutputSlot;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::largeint;
+use novarocks_types::value::bitmap;
 
 const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize = u32::MAX as usize;
 
@@ -373,7 +373,7 @@ impl TableFunctionProcessorOperator {
                 row_values.push(None);
                 continue;
             }
-            let decoded = bitmap_common::decode_bitmap(bitmap_arr.value(row))
+            let decoded = bitmap::decode_bitmap(bitmap_arr.value(row))
                 .map_err(|e| format!("table function unnest_bitmap decode failed: {e}"))?;
             let mut values = Vec::with_capacity(decoded.len());
             for value in decoded {
@@ -479,7 +479,7 @@ impl TableFunctionProcessorOperator {
                 row_values.push(None);
                 continue;
             }
-            let bitmap_values = bitmap_common::decode_bitmap(bitmap_arr.value(row))
+            let bitmap_values = bitmap::decode_bitmap(bitmap_arr.value(row))
                 .map_err(|e| format!("table function subdivide_bitmap decode failed: {e}"))?
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1102,7 +1102,7 @@ fn build_row_indices(counts: &[usize]) -> Result<Vec<u32>, String> {
 
 fn encode_bitmap_chunk(values: &[u64]) -> Result<Vec<u8>, String> {
     let set: std::collections::BTreeSet<u64> = values.iter().copied().collect();
-    bitmap_common::encode_internal_bitmap(&set)
+    bitmap::encode_internal_bitmap(&set)
 }
 
 fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {

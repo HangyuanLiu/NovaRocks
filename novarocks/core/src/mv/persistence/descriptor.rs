@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -367,9 +370,9 @@ mod tests {
     #[test]
     fn schema_contract_typed_round_trips() {
         use crate::mv::persistence::schema::{
-            ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-            ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
-            OutputContract, TargetContract, TargetVisibleColumn,
+            BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+            HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage, OutputContract,
+            TargetContract, TargetVisibleColumn,
         };
         let contract = MvSchemaContract {
             contract_version: 1,

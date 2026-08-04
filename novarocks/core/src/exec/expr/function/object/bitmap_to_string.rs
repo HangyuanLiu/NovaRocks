@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use novarocks_types::value::bitmap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BinaryArray, StringBuilder};
@@ -59,7 +60,7 @@ pub fn eval_bitmap_to_string(
             builder.append_null();
             continue;
         }
-        let values = super::bitmap_common::decode_bitmap(arr.value(idx))?;
+        let values = bitmap::decode_bitmap(arr.value(idx))?;
         let out = values
             .into_iter()
             .map(|v| v.to_string())

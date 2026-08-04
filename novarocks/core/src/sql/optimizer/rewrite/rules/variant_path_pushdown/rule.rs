@@ -17,8 +17,6 @@
 
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::function::variant::variant_get_target_type;
-use crate::exec::variant::{VariantPathSegment, parse_variant_path};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::common::{LiteralValue, OutputColumn};
 use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp, ScanOp, ScanVariantColumn};
@@ -29,6 +27,9 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
 use crate::sql::planner::table::ScanSource;
+use novarocks_types::value::variant::{
+    VariantPathSegment, parse_variant_path, variant_get_target_type,
+};
 
 #[derive(Default)]
 pub(crate) struct VariantPathPushdownRule;
@@ -815,7 +816,14 @@ fn find_or_create_slot_on_scan(
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
 ) -> Option<ScalarId> {
-    if !matches!(scan.table.source, ScanSource::IcebergDataFiles { .. }) {
+    if !matches!(
+        scan.table.source,
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+            kind: crate::sql::planner::table::SqlScanKind::Data { .. }
+                | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. },
+            ..
+        })
+    ) {
         return None;
     }
 

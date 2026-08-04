@@ -976,7 +976,9 @@ mod column_id_helper_tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
@@ -1204,7 +1206,9 @@ mod column_id_helper_tests {
                     name: table.to_string(),
                     columns: column_defs,
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: Some(alias.to_string()),
                 columns: output,

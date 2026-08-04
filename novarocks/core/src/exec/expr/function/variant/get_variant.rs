@@ -25,7 +25,7 @@ use serde_json::Value as JsonValue;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::variant::{
+use novarocks_types::value::variant::{
     VariantValue, is_variant_null, parse_variant_path, variant_query, variant_to_bool,
     variant_to_date_days, variant_to_datetime_micros, variant_to_f64, variant_to_i64,
     variant_to_string, variant_to_time_micros,
@@ -81,13 +81,15 @@ fn resolve_variant_value(
 
 fn query_json_by_path<'a>(
     json: &'a JsonValue,
-    path: &[crate::exec::variant::VariantPathSegment],
+    path: &[novarocks_types::value::variant::VariantPathSegment],
 ) -> Option<&'a JsonValue> {
     let mut current = json;
     for segment in path {
         current = match segment {
-            crate::exec::variant::VariantPathSegment::ObjectKey(key) => current.get(key)?,
-            crate::exec::variant::VariantPathSegment::ArrayIndex(idx) => {
+            novarocks_types::value::variant::VariantPathSegment::ObjectKey(key) => {
+                current.get(key)?
+            }
+            novarocks_types::value::variant::VariantPathSegment::ArrayIndex(idx) => {
                 current.get(*idx as usize)?
             }
         };

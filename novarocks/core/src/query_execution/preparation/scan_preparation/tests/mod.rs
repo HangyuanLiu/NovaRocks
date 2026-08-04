@@ -19,7 +19,8 @@ mod dispatch;
 mod iceberg;
 mod projection;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
@@ -48,14 +49,165 @@ fn prepare_scan_bindings(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
-    super::prepare_scan_bindings(
+    prepare_scan_bindings_with_materialized_files(
         plan,
         &controls,
+        resolver,
+        vec![data_file("s3://bucket/explicit.parquet")],
+    )
+}
+
+/// Prepare a tokenized SQL scan with the exact provider facts that admission
+/// retained for this request.  This deliberately separates the connector
+/// fixture's available split set from the query-local materialization: tests
+/// that exercise frozen MV facts must provide their own materialized files.
+fn prepare_scan_bindings_with_materialized_files(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+    resolver: Option<&dyn ScanBindingResolver>,
+    materialized_files: Vec<IcebergDataFileInfo>,
+) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+    let query_bindings =
+        fixture_query_table_bindings_with_materialized_files(plan, controls, materialized_files);
+    super::prepare_scan_bindings(
+        plan,
+        controls,
         &crate::connector::test_request_context(),
-        None,
+        Some(&query_bindings),
         resolver,
         super::ScanPreparationOptions::single_backend_fixture(),
     )
+}
+
+/// The shared fixture deliberately allocates the same token that the SQL
+/// test scan carrier embeds.  Concrete Iceberg files remain in the
+/// application-owned store, never in `TableDef::source`.
+fn fixture_query_table_bindings(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
+    fixture_query_table_bindings_with_materialized_files(
+        plan,
+        controls,
+        vec![data_file("s3://bucket/explicit.parquet")],
+    )
+}
+
+fn fixture_query_table_bindings_with_materialized_files(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+    materialized_files: Vec<IcebergDataFileInfo>,
+) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
+    use crate::engine::query_planning::bindings::{
+        QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    };
+    use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
+    use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+
+    let scan = plan
+        .fragments()
+        .iter()
+        .find_map(|fragment| match &fragment.root.payload {
+            DistributedNodeKind::Scan(scan) => Some(scan),
+            _ => None,
+        })
+        .expect("shared fixture plan must have a root scan");
+    let ScanSource::Sql(source) = &scan.table.source;
+    let planning_lease = controls
+        .acquire_current(
+            &ConnectorInstanceId::parse(&source.table.catalog)
+                .expect("fixture catalog must be a valid connector instance"),
+        )
+        .ok();
+    let source = source.clone();
+    let planner = scan.table.clone();
+    let materialized_table = iceberg_table_for_planner(&planner);
+
+    let store = QueryTableBindingStore::try_new_with_scope_for_test(
+        NonZeroU64::new(1).expect("fixture scope"),
+    );
+    store
+        .resolve_or_insert_with_id(
+            QueryTableBindingKey::strict_base(
+                &source.table.catalog,
+                &source.table.namespace,
+                &source.table.table,
+            ),
+            |binding| {
+                let table = materialized_table.clone();
+                let mut resolved_planner = planner.clone();
+                resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
+                    binding,
+                    SqlTableIdentity {
+                        catalog: source.table.catalog.clone(),
+                        namespace: source.table.namespace.clone(),
+                        table: source.table.table.clone(),
+                    },
+                    source.kind.clone(),
+                ));
+                let scan_materialization = match &source.kind {
+                    SqlScanKind::MvTargetState { facts } => {
+                        QueryScanMaterialization::IcebergMvTarget {
+                            table,
+                            files: materialized_files.clone(),
+                            binding: IcebergDataFileBinding::CurrentSnapshot,
+                            target_table_uuid: facts.target_table_uuid.clone(),
+                            frozen_snapshot_id: facts.target_snapshot_id,
+                            target_state_partition_filter:
+                                crate::mv::model::TargetPartitionFilter::None,
+                            target_partition_contract: None,
+                        }
+                    }
+                    SqlScanKind::MvTargetLocator { facts } => {
+                        QueryScanMaterialization::IcebergMvTarget {
+                            table,
+                            files: materialized_files.clone(),
+                            binding: IcebergDataFileBinding::CurrentSnapshot,
+                            target_table_uuid: facts.target_table_uuid.clone(),
+                            frozen_snapshot_id: facts.target_snapshot_id,
+                            target_state_partition_filter:
+                                crate::mv::model::TargetPartitionFilter::None,
+                            target_partition_contract: None,
+                        }
+                    }
+                    _ => QueryScanMaterialization::IcebergDataFiles {
+                        table,
+                        files: materialized_files.clone(),
+                        binding: match &source.kind {
+                            SqlScanKind::FrozenInputSet { .. } => {
+                                IcebergDataFileBinding::ExplicitFiles
+                            }
+                            _ => IcebergDataFileBinding::CurrentSnapshot,
+                        },
+                    },
+                };
+                let frozen_snapshot_files = match &source.kind {
+                    SqlScanKind::FrozenInputSet {
+                        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
+                            snapshot_id,
+                        ),
+                    } => std::collections::BTreeMap::from([(
+                        *snapshot_id,
+                        materialized_files.clone(),
+                    )]),
+                    _ => std::collections::BTreeMap::new(),
+                };
+                Ok(QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some(&source.table.catalog),
+                        &source.table.namespace,
+                        resolved_planner,
+                    ),
+                    statistics_pin: None,
+                    planning_lease: planning_lease.clone(),
+                    scan_materialization: Some(scan_materialization),
+                    frozen_snapshot_files,
+                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                })
+            },
+        )
+        .expect("fixture query binding");
+    store
 }
 
 struct StaticResolver {
@@ -128,6 +280,32 @@ fn iceberg_table() -> IcebergTableInfo {
     }
 }
 
+/// Mirror the SQL table facts retained at admission in the application-owned
+/// Iceberg fixture.  Row-lineage columns stay provider metadata rather than
+/// physical table schema fields, matching the real connector contract.
+fn iceberg_table_for_planner(planner: &TableDef) -> IcebergTableInfo {
+    let mut table = iceberg_table();
+    table.schema.fields = planner
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| IcebergSchemaFieldDef {
+            field_id: match column.name.as_str() {
+                "id" => 1,
+                "category" => 3,
+                _ => i32::try_from(ordinal + 10).expect("fixture field id"),
+            },
+            name: column.name.clone(),
+            initial_default: None,
+            write_default: None,
+            initial_default_json: None,
+            write_default_json: None,
+            children: Vec::new(),
+        })
+        .collect();
+    table
+}
+
 fn data_file(path: &str) -> IcebergDataFileInfo {
     IcebergDataFileInfo {
         path: path.to_string(),
@@ -168,18 +346,17 @@ fn equality_delete_file(
     }
 }
 
-fn scan_node(node_id: i32, binding: IcebergDataFileBinding) -> DistributedNode {
+fn scan_node(node_id: i32, _binding: IcebergDataFileBinding) -> DistributedNode {
     let output = column(1, "id", DataType::Int32, false);
     let table = TableDef {
         name: "ice_t".to_string(),
         columns: vec![source_column("id", DataType::Int32, false)],
         iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: ScanSource::IcebergDataFiles {
-            table: iceberg_table(),
-            files: vec![data_file("s3://bucket/explicit.parquet")],
-            cloud_properties: BTreeMap::new(),
-            binding,
-        },
+        source: crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ),
     };
     DistributedNode {
         node_id,
@@ -278,6 +455,7 @@ fn resolved_data_delta() -> ResolvedScanExecution {
     let mut delta = match resolved_delta() {
         ResolvedScanExecution::IcebergDelta(delta) => delta,
         ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
+        ResolvedScanExecution::IcebergMetadata(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
     };
     delta.runtime_plan.change_files = vec![crate::connector::iceberg::delta::DeltaSourceFile {

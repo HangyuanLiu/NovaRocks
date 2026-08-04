@@ -270,7 +270,7 @@ pub(crate) struct CtasSourceExecutionGate {
 pub(crate) struct PlannedCtasSourceQuery {
     optimized_tree: crate::sql::optimizer::OptimizedOperatorNode,
     output_columns: Vec<crate::sql::analysis::OutputColumn>,
-    table_bindings: Arc<crate::sql::catalog::provider::QueryTableBindingStore>,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     optimizer_settings: crate::sql::optimizer::options::SessionOptimizerSettings,
     connector_target_parallelism: std::num::NonZeroUsize,
 }
@@ -303,10 +303,11 @@ fn plan_query_for_ctas_source(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let statistics = super::query_stats::QueryStatisticsContext::from_standalone_state_with_pins(
-        state,
-        Arc::clone(&table_bindings),
-    );
+    let statistics =
+        super::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+            state,
+            Arc::clone(&table_bindings),
+        );
     let catalog_snapshot = crate::sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
         .ok_or_else(|| "CTAS requires a frozen non-empty backend topology".to_string())?;
@@ -327,7 +328,9 @@ fn plan_query_for_ctas_source(
         None,
         crate::sql::compiler::SqlCompileControl::new(
             execution.deadline(),
-            execution.cancellation().clone(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
         ),
     );
     let crate::sql::compiler::SqlCompileOutput::Optimized(compiled) =
@@ -358,7 +361,7 @@ fn prepare_planned_ctas_connector_write(
         physical,
         crate::sql::planner::distributed::write::sink::ConnectorWritePlanInput {
             target_schema: input_schema,
-            input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            input: crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
             root_output_exprs: None,
         },
         &planned.optimizer_settings,

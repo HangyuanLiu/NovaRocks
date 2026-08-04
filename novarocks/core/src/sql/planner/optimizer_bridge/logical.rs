@@ -588,7 +588,7 @@ mod tests {
     use crate::sql::planner::payload::*;
     use crate::sql::planner::payload::{PlanFilterNode, PlanScanNode, PlanValuesNode};
     use crate::sql::planner::physical::PhysicalPlanKind;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{ScanSource, SqlScanKind, TableDef};
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
     use std::sync::Arc;
@@ -610,7 +610,7 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::planner::table::test_sql_scan_source(SqlScanKind::ConnectorRead),
         }
     }
 
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn scan_source_identity_survives_logical_optimizer_physical_roundtrip() {
         let mut table = dummy_table_def();
-        table.source = ScanSource::ConnectorPinned;
+        table.source = crate::sql::planner::table::test_sql_scan_source(SqlScanKind::ConnectorRead);
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
                 database: "db".to_string(),
@@ -929,9 +929,10 @@ mod tests {
         let PhysicalPlanKind::Scan(scan) = materialized.kind else {
             panic!("expected physical scan");
         };
-        let ScanSource::ConnectorPinned = scan.table.source else {
-            panic!("expected ConnectorPinned scan source");
+        let ScanSource::Sql(source) = scan.table.source else {
+            panic!("expected SQL-owned scan source");
         };
+        assert!(matches!(source.kind, SqlScanKind::ConnectorRead));
     }
 
     #[test]

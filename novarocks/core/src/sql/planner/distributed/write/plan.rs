@@ -17,12 +17,10 @@
 
 use super::change_stream::{
     ChangeStreamBranchRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec,
-    IcebergChangeStreamWriteTopology, IcebergChangeStreamWriterBranch,
+    SqlChangeStreamWriteTopology, SqlChangeStreamWriterBranch,
 };
-use super::sink::{
-    ConnectorWriteFragmentSink, ConnectorWriteInputBinding, ConnectorWritePlanInput,
-    IcebergWritePlanInput, IcebergWriteSinkMode, synthetic_iceberg_write_table_id,
-};
+use super::contract::{ConnectorWriteInputBinding, SqlWritePlanInput};
+use super::sink::{ConnectorWriteFragmentSink, ConnectorWritePlanInput};
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::planner::distributed::fragment::DistributedPlanDraft;
 use crate::sql::planner::distributed::{
@@ -32,24 +30,15 @@ use crate::sql::planner::distributed::{
 };
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlannedIcebergChangeStreamDistributedPlan {
+pub(crate) struct PlannedSqlChangeStreamDistributedPlan {
     pub(crate) distributed_plan: DistributedPlan,
-    pub(crate) topology: IcebergChangeStreamWriteTopology,
+    pub(crate) topology: SqlChangeStreamWriteTopology,
 }
 
 #[derive(Debug)]
-pub(in crate::sql::planner::distributed) struct PlannedIcebergChangeStreamDistributedPlanDraft {
+pub(in crate::sql::planner::distributed) struct PlannedSqlChangeStreamDistributedPlanDraft {
     distributed_plan: DistributedPlanDraft,
-    topology: IcebergChangeStreamWriteTopology,
-}
-
-pub(crate) fn build_iceberg_write_distributed_plan(
-    physical: &crate::sql::planner::physical::PhysicalPlanNode,
-    sink: IcebergWritePlanInput,
-) -> Result<DistributedPlan, String> {
-    let draft = crate::sql::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let draft = with_iceberg_write_sink(draft, sink)?;
-    crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
+    topology: SqlChangeStreamWriteTopology,
 }
 
 /// Build a distributed plan whose terminal is a provider-neutral connector
@@ -65,59 +54,46 @@ pub(crate) fn build_connector_write_distributed_plan(
     crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
-pub(crate) fn build_iceberg_change_stream_distributed_plan(
+/// Build a terminal writer from the compiler-owned write contract. This is
+/// the SQLX-2 path: table metadata and provider-specific options are resolved
+/// by the application from `contract.target.binding` only after the
+/// distributed plan is sealed.
+pub(crate) fn build_sql_write_distributed_plan(
     physical: &crate::sql::planner::physical::PhysicalPlanNode,
-    descriptor_database: &str,
-    dag: ChangeStreamWriteDagSpec,
-) -> Result<PlannedIcebergChangeStreamDistributedPlan, String> {
+    sink: SqlWritePlanInput,
+) -> Result<DistributedPlan, String> {
     let draft = crate::sql::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let planned = with_iceberg_change_stream_write(draft, descriptor_database, dag)?;
+    let draft = with_sql_write_sink(draft, sink)?;
+    crate::sql::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
+}
+
+/// Attach a compiler-owned write contract to an unsealed physical plan.  This
+/// is deliberately the same generic connector terminal used after native
+/// writer placement: SQL does not construct, inspect, or serialize a
+/// provider-specific sink here.
+pub(in crate::sql::planner::distributed) fn with_sql_write_sink(
+    plan: DistributedPlanDraft,
+    sink: SqlWritePlanInput,
+) -> Result<DistributedPlanDraft, String> {
+    with_connector_write_sink(
+        plan,
+        ConnectorWritePlanInput::from_sql_write_plan_input(sink),
+    )
+}
+
+pub(crate) fn build_sql_change_stream_distributed_plan(
+    physical: &crate::sql::planner::physical::PhysicalPlanNode,
+    dag: ChangeStreamWriteDagSpec,
+) -> Result<PlannedSqlChangeStreamDistributedPlan, String> {
+    let draft = crate::sql::planner::distributed::build::build_distributed_plan_draft(physical)?;
+    let planned = with_sql_change_stream_write(draft, dag)?;
     let distributed_plan =
         crate::sql::planner::distributed::seal::seal_draft(planned.distributed_plan)
             .map_err(|error| error.to_string())?;
-    Ok(PlannedIcebergChangeStreamDistributedPlan {
+    Ok(PlannedSqlChangeStreamDistributedPlan {
         distributed_plan,
         topology: planned.topology,
     })
-}
-
-pub(in crate::sql::planner::distributed) fn with_iceberg_write_sink(
-    mut plan: DistributedPlanDraft,
-    sink: IcebergWritePlanInput,
-) -> Result<DistributedPlanDraft, String> {
-    if let Some(generic) = sink.as_connector_write_input() {
-        return with_connector_write_sink(plan, generic);
-    }
-    let root_fragment_id = plan
-        .root_fragment_id
-        .ok_or_else(|| "Iceberg write sink requires a draft root fragment id".to_string())?;
-    let root = plan
-        .fragments
-        .iter_mut()
-        .find(|fragment| fragment.fragment_id == root_fragment_id)
-        .ok_or_else(|| {
-            format!("Iceberg write sink cannot find root fragment id={root_fragment_id}")
-        })?;
-    if !matches!(
-        root.sink,
-        crate::sql::planner::distributed::DataSink::Result
-    ) {
-        return Err(format!(
-            "Iceberg write sink expected root fragment id={} to use result sink",
-            root.fragment_id
-        ));
-    }
-    validate_iceberg_sink_arity(root, &sink)?;
-    let output_contract =
-        crate::sql::planner::distributed::output::finalize_iceberg_write_output(root, &sink)
-            .map_err(|error| error.to_string())?;
-    root.sink =
-        crate::sql::planner::distributed::DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
-            handle: None,
-            input: sink.input.into(),
-            output_contract: Some(output_contract),
-        });
-    Ok(plan)
 }
 
 pub(in crate::sql::planner::distributed) fn with_connector_write_sink(
@@ -151,59 +127,10 @@ pub(in crate::sql::planner::distributed) fn with_connector_write_sink(
     Ok(plan)
 }
 
-fn validate_iceberg_sink_arity(
-    fragment: &crate::sql::planner::distributed::PlanFragment,
-    sink: &IcebergWritePlanInput,
-) -> Result<(), String> {
-    let input_count = match &sink.input {
-        ConnectorWriteInputBinding::RootOutputByOrdinal => fragment.output_columns.len(),
-        ConnectorWriteInputBinding::OutputOrdinals(ordinals) => {
-            validate_iceberg_sink_output_ordinals(&fragment.output_columns, ordinals)?;
-            ordinals.len()
-        }
-    };
-    let expected_input_count =
-        if matches!(
-            sink.spec.mode,
-            IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors
-        ) && matches!(sink.input, ConnectorWriteInputBinding::OutputOrdinals(_))
-        {
-            // Position-delete staging materializes only Iceberg's physical row
-            // identity columns.  The provider handle carries the FE-frozen
-            // data-file partition facts, so trailing projection-only partition
-            // source columns are deliberately not sent to a generic BE writer.
-            2
-        } else {
-            sink.spec.target_columns.len()
-        };
-    if input_count != expected_input_count {
-        return Err(format!(
-            "Iceberg write sink input column count {} does not match expected writer input column count {}",
-            input_count, expected_input_count
-        ));
-    }
-    Ok(())
-}
-
-fn validate_iceberg_sink_output_ordinals(
-    output_columns: &[crate::sql::analysis::OutputColumn],
-    ordinals: &[usize],
-) -> Result<(), String> {
-    for ordinal in ordinals {
-        if output_columns.get(*ordinal).is_none() {
-            return Err(format!(
-                "Iceberg write sink output ordinal {ordinal} is out of range"
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
+pub(in crate::sql::planner::distributed) fn with_sql_change_stream_write(
     mut plan: DistributedPlanDraft,
-    descriptor_database: &str,
     dag: ChangeStreamWriteDagSpec,
-) -> Result<PlannedIcebergChangeStreamDistributedPlanDraft, String> {
+) -> Result<PlannedSqlChangeStreamDistributedPlanDraft, String> {
     dag.validate()?;
     if dag.branches.is_empty() {
         return Err("Iceberg change-stream write DAG requires at least one branch".to_string());
@@ -251,7 +178,7 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
     let mut writer_fragments = Vec::with_capacity(dag.branches.len());
     let mut writer_edges = Vec::with_capacity(dag.branches.len());
 
-    for (branch_index, branch) in dag.branches.into_iter().enumerate() {
+    for branch in dag.branches {
         validate_output_ordinals(
             &source_fragment.output_columns,
             &branch.stream_output_ordinals,
@@ -263,13 +190,7 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
             &format!("branch {:?} partition", branch.branch_kind),
         )?;
 
-        let mut sink_spec = branch.sink_spec;
-        let table_id_offset = i64::try_from(branch_index).map_err(|_| {
-            "Iceberg change-stream branch index overflow while assigning sink table ids".to_string()
-        })?;
-        sink_spec.target_table_id = synthetic_iceberg_write_table_id()
-            .checked_sub(table_id_offset)
-            .ok_or_else(|| "Iceberg change-stream synthetic sink table id underflow".to_string())?;
+        let sink = branch.sink;
 
         let writer_columns = output_columns_by_ordinals(
             &source_fragment.output_columns,
@@ -280,12 +201,15 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
             &branch.stream_output_ordinals,
             &format!("branch {:?} output", branch.branch_kind),
         )?;
-        if writer_columns.len() != sink_spec.target_columns.len() {
+        if !matches!(sink.input, ConnectorWriteInputBinding::RootOutputByOrdinal) {
+            return Err("SQL change-stream writer requires root output input binding".to_string());
+        }
+        if writer_columns.len() != sink.contract.input_columns.len() {
             return Err(format!(
-                "Iceberg change-stream branch {:?} output column count {} does not match target column count {}",
+                "SQL change-stream branch {:?} output column count {} does not match write input column count {}",
                 branch.branch_kind,
                 writer_columns.len(),
-                sink_spec.target_columns.len()
+                sink.contract.input_columns.len()
             ));
         }
 
@@ -302,11 +226,7 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
         )?;
         let stream_kind = stream_kind_for_data_partition(&output_partition);
 
-        let sink_template = IcebergWritePlanInput {
-            descriptor_database: descriptor_database.to_string(),
-            spec: sink_spec.clone(),
-            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
-        };
+        let sink_template = ConnectorWritePlanInput::from_sql_write_plan_input(sink.clone());
         let mut writer_fragment = PlanFragment {
             fragment_id: writer_fragment_id,
             root: DistributedNode {
@@ -335,14 +255,14 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
             cte_exchange_nodes: Vec::new(),
         };
         let output_contract =
-            crate::sql::planner::distributed::output::finalize_iceberg_write_output(
+            crate::sql::planner::distributed::output::finalize_connector_write_output(
                 &writer_fragment,
                 &sink_template,
             )
             .map_err(|error| error.to_string())?;
         writer_fragment.sink = DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
             handle: None,
-            input: sink_template.input.into(),
+            input: sink_template.input,
             output_contract: Some(output_contract),
         });
         writer_fragments.push(writer_fragment);
@@ -369,11 +289,11 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
             output_ordinals: branch.stream_output_ordinals,
             output_partition_ordinals: branch.output_partition_ordinals,
         });
-        writer_branches.push(IcebergChangeStreamWriterBranch {
+        writer_branches.push(SqlChangeStreamWriterBranch {
             branch_id: branch.branch_id,
             branch_kind: branch.branch_kind,
             writer_fragment_id,
-            sink_spec,
+            sink,
         });
     }
 
@@ -386,19 +306,18 @@ pub(in crate::sql::planner::distributed) fn with_iceberg_change_stream_write(
     plan.fragments.extend(writer_fragments);
     plan.edges.extend(writer_edges);
 
-    Ok(PlannedIcebergChangeStreamDistributedPlanDraft {
+    Ok(PlannedSqlChangeStreamDistributedPlanDraft {
         distributed_plan: plan,
-        topology: IcebergChangeStreamWriteTopology { writer_branches },
+        topology: SqlChangeStreamWriteTopology { writer_branches },
     })
 }
 
 #[cfg(test)]
-pub(crate) fn finalize_iceberg_change_stream_test_plan(
+pub(crate) fn finalize_sql_change_stream_test_plan(
     builder: crate::sql::planner::distributed::test_support::DistributedPlanDraftBuilder,
-    descriptor_database: &str,
     dag: ChangeStreamWriteDagSpec,
 ) -> Result<DistributedPlan, String> {
-    let planned = with_iceberg_change_stream_write(builder.into_draft(), descriptor_database, dag)?;
+    let planned = with_sql_change_stream_write(builder.into_draft(), dag)?;
     crate::sql::planner::distributed::seal::seal_draft(planned.distributed_plan)
         .map_err(|error| error.to_string())
 }
@@ -552,10 +471,8 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::change_stream::{ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec};
-    use super::super::sink::{
-        ConnectorWriteInputBinding, ConnectorWritePlanInput, IcebergWritePlanInput,
-        synthetic_iceberg_write_table_id,
-    };
+    use super::super::contract::{ConnectorWriteInputBinding, test_support};
+    use super::super::sink::ConnectorWritePlanInput;
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::ChangeStreamBranchKind;
@@ -565,20 +482,36 @@ mod tests {
     };
     use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    use super::{
-        with_connector_write_sink, with_iceberg_change_stream_write, with_iceberg_write_sink,
-    };
+    use super::{with_connector_write_sink, with_sql_change_stream_write, with_sql_write_sink};
 
     #[test]
-    fn with_iceberg_write_sink_replaces_root_result_sink() {
+    fn sqlx2_write_sink_uses_only_the_sql_contract() {
         let plan = single_fragment_plan_for_test();
-        let sink = IcebergWritePlanInput {
-            descriptor_database: "test_db".to_string(),
-            spec: super::super::sink::test_support::simple_sink_spec(),
-            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
-        };
+        let planned = with_sql_write_sink(
+            plan.into_draft(),
+            test_support::simple_sql_write_plan_input(
+                ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+        )
+        .expect("attach SQL write sink");
+        let planned = crate::sql::planner::distributed::seal::seal_draft(planned)
+            .expect("SQL write draft seals");
+        let root = planned
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.fragment_id == planned.root_fragment_id())
+            .expect("root fragment");
+        assert!(matches!(root.sink, DataSink::ConnectorWrite(_)));
+    }
 
-        let planned = with_iceberg_write_sink(plan.into_draft(), sink).expect("plan write sink");
+    #[test]
+    fn sqlx2_write_sink_replaces_root_result_sink() {
+        let plan = single_fragment_plan_for_test();
+        let sink = test_support::simple_sql_write_plan_input(
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+        );
+
+        let planned = with_sql_write_sink(plan.into_draft(), sink).expect("plan write sink");
         let planned = crate::sql::planner::distributed::seal::seal_draft(planned)
             .expect("decorated write draft seals");
 
@@ -591,43 +524,30 @@ mod tests {
     }
 
     #[test]
-    fn with_iceberg_write_sink_rejects_arity_mismatch() {
-        let plan = single_fragment_plan_for_test_with_columns(vec![
-            ("a", DataType::Int32),
-            ("b", DataType::Int32),
-        ]);
-        let sink = IcebergWritePlanInput {
-            descriptor_database: "test_db".to_string(),
-            spec: super::super::sink::test_support::simple_sink_spec(),
-            input: ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
-        };
-
-        let err = with_iceberg_write_sink(plan.into_draft(), sink).expect_err("arity mismatch");
-
-        assert!(err.contains("sink input column count 2 does not match target column count 1"));
-    }
-
-    #[test]
-    fn with_iceberg_write_sink_rejects_out_of_range_output_ordinal() {
+    fn sqlx2_write_sink_rejects_out_of_range_output_ordinal() {
         let plan = single_fragment_plan_for_test();
-        let sink = IcebergWritePlanInput {
-            descriptor_database: "test_db".to_string(),
-            spec: super::super::sink::test_support::simple_sink_spec(),
-            input: ConnectorWriteInputBinding::OutputOrdinals(vec![7]),
-        };
+        let sink = test_support::simple_sql_write_plan_input(
+            ConnectorWriteInputBinding::OutputOrdinals(vec![7]),
+        );
 
-        let err =
-            with_iceberg_write_sink(plan.into_draft(), sink).expect_err("out-of-range ordinal");
+        let err = with_sql_write_sink(plan.into_draft(), sink).expect_err("out-of-range ordinal");
 
-        assert!(err.contains("Iceberg write sink output ordinal 7 is out of range"));
+        assert!(
+            err.contains("sink input references output ordinal 7")
+                && err.contains("output columns exist"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn generic_connector_sink_replaces_result_without_provider_input() {
         let plan = single_fragment_plan_for_test();
-        let spec = super::super::sink::test_support::simple_sink_spec();
         let sink = ConnectorWritePlanInput::from_target_columns(
-            &spec.target_columns,
+            &test_support::simple_sql_write_plan_input(
+                ConnectorWriteInputBinding::RootOutputByOrdinal,
+            )
+            .contract
+            .input_columns,
             ConnectorWriteInputBinding::RootOutputByOrdinal,
             None,
         );
@@ -653,17 +573,19 @@ mod tests {
             ("reuse_id", DataType::Int32),
         ]);
         let mut delete_branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![3, 2]);
+        let repeated_column = delete_branch.sink.contract.input_columns[0].clone();
         delete_branch
-            .sink_spec
-            .target_columns
-            .push(delete_branch.sink_spec.target_columns[0].clone());
+            .sink
+            .contract
+            .input_columns
+            .push(repeated_column);
         delete_branch.output_partition_ordinals = vec![1];
         let reuse_branch = ChangeStreamWriteBranchSpec::reuse_data_for_test(vec![3]);
         let dag =
             ChangeStreamWriteDagSpec::for_test(Some(0), Some(1), vec![delete_branch, reuse_branch]);
 
-        let planned = with_iceberg_change_stream_write(plan.into_draft(), "test_db", dag)
-            .expect("plan change stream");
+        let planned =
+            with_sql_change_stream_write(plan.into_draft(), dag).expect("plan change stream");
         let topology = planned.topology;
         let distributed_plan =
             crate::sql::planner::distributed::seal::seal_draft(planned.distributed_plan)
@@ -729,12 +651,12 @@ mod tests {
         assert_eq!(writer.output_columns[1].name, "delete_id");
         assert_eq!(topology.writer_branches.len(), 2);
         assert_eq!(
-            topology.writer_branches[0].sink_spec.target_table_id,
-            synthetic_iceberg_write_table_id()
+            topology.writer_branches[0].sink.contract.target.binding,
+            topology.writer_branches[1].sink.contract.target.binding
         );
         assert_eq!(
-            topology.writer_branches[1].sink_spec.target_table_id,
-            synthetic_iceberg_write_table_id() - 1
+            topology.writer_branches[0].sink.contract.target.table.table,
+            "orders"
         );
     }
 
@@ -747,8 +669,8 @@ mod tests {
             vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
         );
 
-        let err = with_iceberg_change_stream_write(plan.into_draft(), "test_db", dag)
-            .expect_err("missing change_op");
+        let err =
+            with_sql_change_stream_write(plan.into_draft(), dag).expect_err("missing change_op");
 
         assert!(err.contains("requires change_op_output_ordinal"));
     }
@@ -762,7 +684,7 @@ mod tests {
             vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![7])],
         );
 
-        let err = with_iceberg_change_stream_write(plan.into_draft(), "test_db", dag)
+        let err = with_sql_change_stream_write(plan.into_draft(), dag)
             .expect_err("out-of-range branch output ordinal");
 
         assert!(
@@ -786,7 +708,7 @@ mod tests {
             vec![ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![0])],
         );
 
-        let err = with_iceberg_change_stream_write(plan.into_draft(), "test_db", dag)
+        let err = with_sql_change_stream_write(plan.into_draft(), dag)
             .expect_err("branch output slot id overflow");
 
         assert!(

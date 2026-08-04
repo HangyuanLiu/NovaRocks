@@ -47,8 +47,8 @@ pub(crate) struct MvRewriteCandidate {
     pub mv_scalars: ScalarArena,
     /// Database (namespace) of the MV target table, for ScanOp.
     pub target_database: String,
-    /// Executable TableDef of the MV target table
-    /// (ScanSource::IcebergDataFiles, binding = CurrentSnapshot).
+    /// SQL table definition of the MV target table, resolved through its
+    /// request-local current-snapshot binding.
     pub target_table: TableDef,
     /// Query-scoped statistics ref for the MV target scan injected by the rule.
     pub target_stats_ref: StatsRef,

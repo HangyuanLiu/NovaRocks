@@ -22,40 +22,7 @@ use arrow::array::{
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-
-pub const MURMUR_SEED: u32 = 0xadc8_3b19;
-const MURMUR_PRIME: u64 = 0xc6a4_a793_5bd1_e995;
-
-pub fn murmur_hash64a(data: &[u8], seed: u32) -> Result<u64, String> {
-    let r: u32 = 47;
-    let mut h = (seed as u64) ^ (data.len() as u64).wrapping_mul(MURMUR_PRIME);
-
-    let mut offset = 0usize;
-    while offset + 8 <= data.len() {
-        let mut block = [0u8; 8];
-        block.copy_from_slice(&data[offset..offset + 8]);
-        let mut k = u64::from_le_bytes(block);
-        k = k.wrapping_mul(MURMUR_PRIME);
-        k ^= k >> r;
-        k = k.wrapping_mul(MURMUR_PRIME);
-        h ^= k;
-        h = h.wrapping_mul(MURMUR_PRIME);
-        offset += 8;
-    }
-
-    let tail = &data[offset..];
-    if !tail.is_empty() {
-        for (idx, byte) in tail.iter().enumerate() {
-            h ^= (*byte as u64) << (idx * 8);
-        }
-        h = h.wrapping_mul(MURMUR_PRIME);
-    }
-
-    h ^= h >> r;
-    h = h.wrapping_mul(MURMUR_PRIME);
-    h ^= h >> r;
-    Ok(h)
-}
+use novarocks_types::value::hll::{MURMUR_SEED, murmur_hash64a};
 
 pub fn prehash_array_value(
     array: &ArrayRef,
@@ -67,7 +34,7 @@ pub fn prehash_array_value(
             if $arr.is_null(row) {
                 return Ok(None);
             }
-            return Ok(Some(murmur_hash64a($value.as_ref(), MURMUR_SEED)?));
+            return Ok(Some(murmur_hash64a($value.as_ref(), MURMUR_SEED)));
         }};
     }
 
@@ -83,7 +50,7 @@ pub fn prehash_array_value(
                 Ok(Some(murmur_hash64a(
                     &[if arr.value(row) { 1 } else { 0 }],
                     MURMUR_SEED,
-                )?))
+                )))
             }
         }
         DataType::Int8 => {
@@ -222,11 +189,11 @@ pub fn prehash_array_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{MURMUR_SEED, murmur_hash64a};
+    use novarocks_types::value::hll::{MURMUR_SEED, murmur_hash64a};
 
     #[test]
     fn murmur_hash64a_matches_known_value() {
-        let hash = murmur_hash64a(b"novarocks", MURMUR_SEED).expect("hash");
+        let hash = murmur_hash64a(b"novarocks", MURMUR_SEED);
         assert_eq!(hash, 7_139_930_336_803_328_733);
     }
 }

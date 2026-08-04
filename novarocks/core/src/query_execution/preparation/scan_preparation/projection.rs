@@ -55,7 +55,7 @@ pub(super) fn resolve_physical_columns(
             .collect();
     }
 
-    let keep_only_resolved = matches!(scan.table.source, ScanSource::IcebergVersionTable { .. });
+    let keep_only_resolved = false;
     scan.columns
         .iter()
         .filter(|planner| !is_variant_synthetic_column(scan, planner.column_id))
@@ -81,16 +81,20 @@ pub(super) fn resolve_physical_columns(
 
 fn refresh_scan_projected_names(source: &ScanSource) -> Option<Vec<String>> {
     match source {
-        ScanSource::IcebergMvTargetState(scan) => Some(projected_target_state_column_names(scan)),
-        ScanSource::IcebergMvTargetLocator(scan) => {
-            Some(projected_target_locator_column_names(scan))
-        }
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+            kind: crate::sql::planner::table::SqlScanKind::MvTargetState { facts },
+            ..
+        }) => Some(projected_target_state_column_names(facts)),
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource {
+            kind: crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts },
+            ..
+        }) => Some(projected_target_locator_column_names(facts)),
         _ => None,
     }
 }
 
 fn projected_target_state_column_names(
-    scan: &crate::sql::planner::table::IcebergMvTargetStateScan,
+    scan: &crate::sql::planner::table::SqlMvTargetStateScan,
 ) -> Vec<String> {
     let mut names = Vec::new();
     push_unique_projected_name(&mut names, &scan.row_id_column_name);
@@ -101,7 +105,7 @@ fn projected_target_state_column_names(
     {
         push_unique_projected_name(&mut names, name);
     }
-    if let crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+    if let crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
         branch_scope: Some(scope),
         ..
     } = &scan.row_filter
@@ -120,7 +124,7 @@ fn projected_target_state_column_names(
 }
 
 fn projected_target_locator_column_names(
-    scan: &crate::sql::planner::table::IcebergMvTargetLocatorScan,
+    scan: &crate::sql::planner::table::SqlMvTargetLocatorScan,
 ) -> Vec<String> {
     let mut names = vec![scan.apply_key_column.clone()];
     if let Some(branch_id_column) = &scan.branch_id_column {
@@ -158,10 +162,7 @@ pub(super) fn resolve_effective_required_reads(
         None => scan.required_columns.clone().unwrap_or_else(|| {
             scan.columns
                 .iter()
-                .filter(|column| {
-                    !matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
-                        || resolved_source_column(scan, &column.name).is_some()
-                })
+                .filter(|column| resolved_source_column(scan, &column.name).is_some())
                 .map(|column| column.name.clone())
                 .collect()
         }),

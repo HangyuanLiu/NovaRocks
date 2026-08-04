@@ -50,7 +50,7 @@ use super::write_descriptor::{
     IcebergPartitionDescriptor, IcebergPartitionValueDescriptor, decode_partition_descriptor,
     encode_partition_descriptor,
 };
-use crate::sql::planner::distributed::write::sink::{
+use crate::engine::query_planning::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
 
@@ -1740,6 +1740,76 @@ mod tests {
         }
     }
 
+    fn test_sink_spec() -> IcebergWriteSinkSpec {
+        IcebergWriteSinkSpec {
+            mode: IcebergWriteSinkMode::Data,
+            iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "target_orders".to_string(),
+                table_uuid: Some("00000000-0000-0000-0000-000000000002".to_string()),
+                current_snapshot_id: Some(1),
+                schema_id: 1,
+                location: "file:///warehouse/target_orders".to_string(),
+                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                    fields: vec![
+                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                            field_id: 1,
+                            name: "id".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            write_default_json: None,
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            },
+            target_columns: vec![novarocks_catalog::schema::ColumnDef {
+                name: "id".to_string(),
+                data_type: arrow::datatypes::DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            table_location: "file:///warehouse/target_orders".to_string(),
+            data_location: "file:///warehouse/target_orders/data".to_string(),
+            target_partition_spec_id: 0,
+            cloud_properties: BTreeMap::new(),
+            file_format: "parquet".to_string(),
+            compression: IcebergWriteFileCompression::Snappy,
+            position_delete_output_descriptor: None,
+        }
+    }
+
+    fn unpartitioned_metadata_json() -> String {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/target_orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        serde_json::to_string(&metadata.metadata).expect("serialize metadata")
+    }
+
     fn writer_identity() -> ConnectorWriterIdentity {
         let binding_key = ConnectorExecutionBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg.test").expect("instance"),
@@ -1934,11 +2004,8 @@ mod tests {
 
     #[test]
     fn data_sink_spec_handle_restores_iceberg_field_ids_on_generic_input() {
-        let mut spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
-        spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-        );
+        let mut spec = test_sink_spec();
+        spec.iceberg.serialized_metadata = Some(unpartitioned_metadata_json());
         let payload = encode_data_sink_spec_handle_payload(&spec).expect("encode data handle");
         let raw_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
             "id",
@@ -1958,10 +2025,8 @@ mod tests {
 
     #[test]
     fn frozen_data_rewrite_handle_restores_iceberg_field_ids_on_generic_input() {
-        let metadata: TableMetadata = serde_json::from_str(
-            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-        )
-        .expect("decode metadata");
+        let metadata: TableMetadata =
+            serde_json::from_str(&unpartitioned_metadata_json()).expect("decode metadata");
         let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, false)
             .expect("encode frozen data rewrite handle");
         let raw_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -1982,10 +2047,8 @@ mod tests {
 
     #[test]
     fn frozen_row_lineage_rewrite_handle_preserves_reserved_field_ids() {
-        let metadata: TableMetadata = serde_json::from_str(
-            &crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-        )
-        .expect("decode metadata");
+        let metadata: TableMetadata =
+            serde_json::from_str(&unpartitioned_metadata_json()).expect("decode metadata");
         let payload = encode_frozen_data_rewrite_handle_payload(&metadata, None, true)
             .expect("encode frozen row-lineage rewrite handle");
         let raw_schema = Arc::new(Schema::new(vec![
@@ -2021,12 +2084,9 @@ mod tests {
 
     #[test]
     fn row_lineage_data_handle_preserves_the_data_writer_contract() {
-        let mut spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        let mut spec = test_sink_spec();
         spec.mode = IcebergWriteSinkMode::RowLineageData;
-        spec.iceberg.serialized_metadata = Some(
-            crate::sql::planner::distributed::write::sink::test_support::unpartitioned_metadata_json(),
-        );
+        spec.iceberg.serialized_metadata = Some(unpartitioned_metadata_json());
         spec.iceberg.schema.fields.extend([
             IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
@@ -2134,8 +2194,7 @@ mod tests {
     #[test]
     fn position_delete_handle_round_trips_frozen_partition_index() {
         let metadata = metadata();
-        let mut spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        let mut spec = test_sink_spec();
         spec.mode = IcebergWriteSinkMode::PositionDeletes;
         spec.iceberg.current_snapshot_id = metadata.current_snapshot_id();
         let data_file = "file:///warehouse/db/t/data/00001.parquet".to_string();
@@ -2179,8 +2238,7 @@ mod tests {
     #[test]
     fn deletion_vector_handle_carries_only_frozen_canonical_vector_facts() {
         let metadata = metadata();
-        let mut spec =
-            crate::sql::planner::distributed::write::sink::test_support::simple_sink_spec();
+        let mut spec = test_sink_spec();
         spec.mode = IcebergWriteSinkMode::DeletionVectors;
         let data_file = "file:///warehouse/db/t/data/00001.parquet".to_string();
         let partitions = HashMap::from([(

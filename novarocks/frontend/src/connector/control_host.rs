@@ -1021,7 +1021,7 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1302,6 +1302,10 @@ mod tests {
             None,
         )
         .expect("control binding")
+    }
+
+    pub(crate) fn test_control_binding(incarnation: u8) -> ConnectorControlBinding {
+        binding(incarnation)
     }
 
     #[test]

@@ -12,30 +12,38 @@ use std::sync::{Arc, Weak};
 
 use iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorControlResolver, ConnectorExecutionBindingKey,
-    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorRefAction, ConnectorRefKind,
-    ConnectorTableIdentity, ConnectorWriteLease, ConnectorWriteOperationId, CreateOrReplacePolicy,
+    ConnectorCatalogMutationOperation, ConnectorControlPlanningLease, ConnectorControlResolver,
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
+    ConnectorRefAction, ConnectorRefKind, ConnectorTableIdentity, ConnectorWriteLease,
+    ConnectorWriteOperationId, CreateOrReplacePolicy,
 };
 
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::connector::iceberg::write_control::IcebergFirstRefreshWritePlanPayloadV2;
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::engine::query_planning::write_sink::{
+    IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
+    sql_write_plan_input_for_admitted_target,
+};
 use crate::engine::{
-    StandaloneState, execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context,
-    execute_query_as_iceberg_staging_in_operation_with_connector_context,
+    StandaloneState, execute_query_as_iceberg_staging_in_operation_with_connector_context,
     iceberg_write_shuffle_by_output_name,
+};
+use crate::mv::application::PreparedMvIncrementalWrite;
+use crate::mv::application::{
+    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, MvFirstRefreshWritePreparer,
+    MvFirstRefreshWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::query_execution::{ConnectorWriteCompletion, ConnectorWriteStagingSummary};
-use crate::sql::mv_refresh::PreparedDistributedWriteRequest;
 use crate::sql::mv_refresh::first_refresh::{
-    MvFirstRefreshExecutionArtifact, MvFirstRefreshPhysicalSql, MvFirstRefreshShape,
-    MvFirstRefreshTargetContract, MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest,
-    PreparedMvFirstRefreshWrite,
+    MvFirstRefreshPhysicalSql, MvFirstRefreshShape, MvFirstRefreshTargetContract,
+    SqlMvFirstRefreshArtifact, SqlMvFirstRefreshArtifactInput, SqlMvFirstRefreshPlanner,
+    SqlMvFirstRefreshPlannerInput,
 };
-use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
-use crate::sql::planner::distributed::write::sink::IcebergWriteSinkSpec;
 
 /// Core-side implementation installed into the frontend composition through
 /// the typed MV activation port. It retains only a weak engine reference, so
@@ -56,18 +64,26 @@ impl crate::mv::application::MvFirstRefreshWriteActivator
     fn bind_first_refresh_write(
         &self,
         prepared: PreparedMvFirstRefreshWrite,
+        planning_lease: &ConnectorControlPlanningLease,
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String> {
         let state = self.state.upgrade().ok_or_else(|| {
             "MV first-refresh write activator is unavailable during engine shutdown".to_string()
         })?;
-        bind_prepared_mv_first_refresh_staging(&state, prepared, exact_lease, execution)
+        bind_prepared_mv_first_refresh_staging(
+            &state,
+            prepared,
+            planning_lease,
+            exact_lease,
+            execution,
+        )
     }
 
     fn bind_incremental_refresh_write(
         &self,
         prepared: PreparedMvIncrementalWrite,
+        planning_lease: &ConnectorControlPlanningLease,
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String> {
@@ -77,6 +93,7 @@ impl crate::mv::application::MvFirstRefreshWriteActivator
         crate::engine::mv::iceberg_refresh::bind_prepared_mv_incremental_staging(
             &state,
             prepared,
+            planning_lease,
             exact_lease,
             execution,
         )
@@ -114,7 +131,7 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
         ctx,
         staging_branch.clone(),
         execution,
-        move |operation_id, observed_binding, connector_context| {
+        move |operation_id, observed_binding| {
             prepare_mv_first_refresh_sql_write(
                 ctx,
                 shape,
@@ -122,7 +139,6 @@ pub(crate) fn execute_mv_first_refresh_staging_for_test(
                 &staging_branch,
                 operation_id,
                 observed_binding,
-                connector_context,
             )
         },
     )
@@ -134,7 +150,7 @@ pub(crate) fn execute_mv_first_refresh_join_staging_for_test(
     state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
-    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
+    _append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
     staging_branch: String,
     execution: &QueryExecutionContext,
 ) -> Result<MvFirstRefreshStagingTestOutcome, String> {
@@ -143,15 +159,14 @@ pub(crate) fn execute_mv_first_refresh_join_staging_for_test(
         ctx,
         staging_branch.clone(),
         execution,
-        move |operation_id, observed_binding, connector_context| {
+        move |operation_id, observed_binding| {
             prepare_mv_first_refresh_join_write(
+                state,
                 ctx,
                 shape,
-                append,
                 &staging_branch,
                 operation_id,
                 observed_binding,
-                connector_context,
             )
         },
     )
@@ -169,7 +184,6 @@ where
     F: FnOnce(
         ConnectorWriteOperationId,
         ConnectorExecutionBindingKey,
-        novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<PreparedMvFirstRefreshWrite, String>,
 {
     let catalog_instance = ConnectorInstanceId::parse(&ctx.rewrite.target.catalog)
@@ -192,7 +206,7 @@ where
         .clone();
 
     // Preparation is intentionally complete before the staging-ref mutation.
-    let prepared = prepare(operation_id, observed_binding, connector_context.clone())?;
+    let prepared = prepare(operation_id, observed_binding)?;
     let mutation_lease = planning_lease
         .derive_mutation_lease()
         .map_err(|error| format!("derive MV first-refresh test mutation lease: {error}"))?;
@@ -262,6 +276,7 @@ where
                 operation_id.to_string(),
             ),
         ]),
+        connector_context.clone(),
         &write_lease,
     )?;
     let registration = ConnectorWriteOperationRegistration::single(template);
@@ -276,7 +291,9 @@ where
         state,
         prepared,
         sink_spec,
+        planning_lease,
         execution,
+        connector_context.clone(),
         write_registration,
         Some(ctx),
     )?;
@@ -364,7 +381,6 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvFirstRefreshWrite, String> {
     if matches!(
         shape,
@@ -372,29 +388,22 @@ pub(crate) fn prepare_mv_first_refresh_sql_write(
     ) {
         return Err("join first-refresh must use the typed append logical artifact".to_string());
     }
-    let request = mv_first_refresh_request(
-        ctx,
-        shape,
-        staging_branch,
-        operation_id,
-        observed_binding,
-        connector_context,
-    )?;
+    let request =
+        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
     MvFirstRefreshWritePreparer::prepare(request, physical_sql)
 }
 
-/// Freeze a canonical join append projection behind the same request facts as
-/// SQL-shaped first refreshes. The typed logical plan is still not prepared
-/// into native fragments until the exact write lease is active.
+/// Freeze a join first-refresh request behind immutable refresh facts. The
+/// canonical join SELECT is compiled only during activation, after the
+/// frontend has retained its exact planning lease.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_mv_first_refresh_join_write(
+    state: &Arc<StandaloneState>,
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
     shape: MvFirstRefreshShape,
-    append: crate::mv::refresh::join_first_refresh::JoinFirstRefreshAppendLogicalPlan,
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvFirstRefreshWrite, String> {
     if !matches!(
         shape,
@@ -402,30 +411,45 @@ pub(crate) fn prepare_mv_first_refresh_join_write(
     ) {
         return Err("typed first-refresh append artifact requires a join shape".to_string());
     }
-    let request = mv_first_refresh_request(
-        ctx,
-        shape,
-        staging_branch,
-        operation_id,
-        observed_binding,
-        connector_context,
-    )?;
-    MvFirstRefreshWritePreparer::prepare_join_logical(request, append, frozen_logical_context(ctx))
+    let request =
+        mv_first_refresh_request(ctx, shape, staging_branch, operation_id, observed_binding)?;
+    MvFirstRefreshWritePreparer::prepare_join_logical(
+        request,
+        frozen_logical_context_with_base_overlays(state, ctx)?,
+    )
 }
 
 pub(crate) fn frozen_logical_context(
     ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
-) -> crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
-    crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext {
+) -> Result<MvFirstRefreshLogicalContext, String> {
+    Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*ctx.rewrite.mv_definition).clone(),
         canonical_select_query: (*ctx.rewrite.canonical_select_query).clone(),
         base_refs: ctx.rewrite.base_refs.to_vec(),
-        pin: (*ctx.rewrite.pin).clone(),
+        pin: crate::sql::mv_refresh::first_refresh::SqlMvSnapshotPin::try_from_maps(
+            ctx.rewrite.pin.to_snapshot_map(),
+            ctx.rewrite.pin.to_table_uuid_map(),
+        )?,
         previous_snapshot_ids: ctx.rewrite.previous_snapshot_ids.clone(),
         previous_table_uuids: ctx.rewrite.previous_table_uuids.clone(),
         target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
         affected_partitions: ctx.affected_partitions.clone(),
-    }
+        frozen_base_overlays: None,
+    })
+}
+
+/// Retain the already-admitted base materializations in the application
+/// artifact.  Logical join activation must consume these overlays rather than
+/// resolving a newer connector generation after the write operation has been
+/// admitted.
+pub(crate) fn frozen_logical_context_with_base_overlays(
+    state: &Arc<StandaloneState>,
+    ctx: &crate::mv::refresh::execution_context::IcebergMvRefreshContext,
+) -> Result<MvFirstRefreshLogicalContext, String> {
+    let mut facts = frozen_logical_context(ctx)?;
+    facts.frozen_base_overlays =
+        Some(crate::engine::mv::iceberg_refresh::freeze_imv_base_query_local_overlays(state, ctx)?);
+    Ok(facts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,7 +459,6 @@ fn mv_first_refresh_request(
     staging_branch: &str,
     operation_id: ConnectorWriteOperationId,
     observed_binding: novarocks_spi::connector::ConnectorExecutionBindingKey,
-    connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvFirstRefreshWriteRequest, String> {
     if staging_branch.is_empty() {
         return Err("MV first-refresh staging branch is empty".to_string());
@@ -514,7 +537,6 @@ fn mv_first_refresh_request(
         target_contract,
         observed_binding,
         operation_id,
-        connector_context,
     )
 }
 
@@ -527,6 +549,7 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
     state: &Arc<StandaloneState>,
     prepared: &PreparedMvFirstRefreshWrite,
     mut provenance_properties: std::collections::BTreeMap<String, String>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<
     (
@@ -598,12 +621,8 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         &ident,
         prepared.staging_branch(),
         match prepared.write_mode() {
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
-                CommitOpKind::FastAppend
-            }
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
-                CommitOpKind::Overwrite
-            }
+            MvStagedRefreshWriteMode::Append => CommitOpKind::FastAppend,
+            MvStagedRefreshWriteMode::FullOverwrite => CommitOpKind::Overwrite,
         },
     );
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
@@ -642,23 +661,23 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
         payload,
         commit_executor,
         match prepared.write_mode() {
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+            MvStagedRefreshWriteMode::Append => {
                 novarocks_spi::connector::ConnectorWriteIntent::Append
             }
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+            MvStagedRefreshWriteMode::FullOverwrite => {
                 novarocks_spi::connector::ConnectorWriteIntent::Overwrite
             }
         },
         match prepared.write_mode() {
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::Append => {
+            MvStagedRefreshWriteMode::Append => {
                 crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::AbortWithoutSnapshot
             }
-            crate::sql::mv_refresh::first_refresh::MvStagedRefreshWriteMode::FullOverwrite => {
+            MvStagedRefreshWriteMode::FullOverwrite => {
                 crate::connector::iceberg::write_service::IcebergMvPrimaryEmptyInputPolicy::CommitEmptyOverwrite
             }
         },
         operation_id,
-        prepared.connector_context().clone(),
+        connector_context,
         exact_lease,
     )?;
     Ok((sink_spec, template))
@@ -692,6 +711,7 @@ fn validate_first_refresh_target_contract(
 pub(crate) fn bind_prepared_mv_first_refresh_staging(
     state: &Arc<StandaloneState>,
     prepared: PreparedMvFirstRefreshWrite,
+    planning_lease: &ConnectorControlPlanningLease,
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
 ) -> Result<PreparedDistributedWriteRequest, String> {
@@ -703,23 +723,59 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
-    let connector_context = prepared.connector_context().clone();
-    let root_distribution = iceberg_write_shuffle_by_output_name(prepared.root_hash_column());
+    let shape = prepared.shape();
+    let target_contract = prepared.target_contract().clone();
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
+    let root_hash_column = prepared.root_hash_column().to_string();
+    let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column.clone());
     let (sink_spec, template) = activate_mv_first_refresh_connector_write(
         state,
         &prepared,
         std::collections::BTreeMap::new(),
+        connector_context.clone(),
         exact_lease,
     )?;
     let distributed = match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
+            let bindings = Arc::new(QueryTableBindingStore::try_new()?);
+            let target_binding = admit_frozen_iceberg_write_target(
+                bindings.as_ref(),
+                &sink_spec,
+                planning_lease.clone(),
+            )?;
+            let sink = sql_write_plan_input_for_admitted_target(
+                bindings.as_ref(),
+                target_binding,
+                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                None,
+            )?;
+            let first_refresh = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
+                shape,
+                target_contract,
+                target_binding,
+                root_distribution,
+                artifact: SqlMvFirstRefreshArtifactInput::Sql(physical_sql),
+            })?;
+            if first_refresh.target_binding() != target_binding {
+                return Err(
+                    "MV first-refresh SQL plan target binding drifted during activation"
+                        .to_string(),
+                );
+            }
+            let root_distribution = first_refresh.root_distribution().clone();
+            let SqlMvFirstRefreshArtifact::Sql(physical_sql) = first_refresh.into_artifact() else {
+                return Err("MV first-refresh SQL activation expected a SQL artifact".to_string());
+            };
             let query = parse_query_from_sql(physical_sql.sql())?;
             crate::engine::prepare_query_as_iceberg_write_with_connector_binding(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
                 &query,
-                sink_spec,
+                sink,
+                bindings,
                 None,
                 Some(root_distribution),
                 execution,
@@ -728,8 +784,12 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             )?
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
-            let (logical_plan, factory, facts) = logical.into_parts();
-            let refresh_context = rebuild_frozen_mv_refresh_context(
+            let facts = logical.into_context();
+            let frozen_base_overlays = facts.frozen_base_overlays.clone().ok_or_else(|| {
+                "MV first-refresh logical artifact is missing its admitted base bindings"
+                    .to_string()
+            })?;
+            let mut refresh_context = rebuild_frozen_mv_refresh_context(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
@@ -739,15 +799,86 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 &target_name,
                 &facts,
             )?;
+            refresh_context.connector_context = Some(connector_context.clone());
+            let bindings = Arc::new(QueryTableBindingStore::try_new()?);
+            let _target_binding =
+                crate::engine::mv::iceberg_refresh::bind_imv_target_query_table_in_store(
+                    &refresh_context,
+                    &bindings,
+                    Some(planning_lease),
+                )?;
+            let write_target_binding = admit_frozen_iceberg_write_target(
+                bindings.as_ref(),
+                &sink_spec,
+                planning_lease.clone(),
+            )?;
+            let sink = sql_write_plan_input_for_admitted_target(
+                bindings.as_ref(),
+                write_target_binding,
+                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                None,
+            )?;
+            let (plan, factory) =
+                crate::engine::mv::iceberg_refresh::compile_canonical_select_for_imv_with_frozen_base_overlays(
+                    state,
+                    &refresh_context,
+                    Arc::clone(&bindings),
+                    execution,
+                    frozen_base_overlays,
+                )
+                .map_err(|error| error.message)?;
+            let schema_contract = refresh_context.rewrite.schema_contract.as_ref();
+            let (left_ref, right_ref) =
+                crate::engine::mv::iceberg_refresh::join_base_refs_for_schema_contract(
+                    schema_contract,
+                    &refresh_context.rewrite.base_refs,
+                )?;
+            let append = crate::mv::refresh::join_first_refresh::build_join_first_refresh_append_logical_plan(
+                &refresh_context.rewrite,
+                left_ref,
+                right_ref,
+                crate::mv::refresh::join_first_refresh::JoinFirstRefreshLogicalInput {
+                    plan,
+                    factory,
+                },
+            )?;
+            let first_refresh = SqlMvFirstRefreshPlanner::plan(SqlMvFirstRefreshPlannerInput {
+                shape,
+                target_contract,
+                target_binding: write_target_binding,
+                root_distribution,
+                artifact: SqlMvFirstRefreshArtifactInput::Logical {
+                    plan: append.plan,
+                    factory: append.factory,
+                    root_hash_column: root_hash_column.clone(),
+                },
+            })?;
+            if first_refresh.target_binding() != write_target_binding {
+                return Err(
+                    "MV first-refresh SQL plan target binding drifted during activation"
+                        .to_string(),
+                );
+            }
+            let root_distribution = first_refresh.root_distribution().clone();
+            let SqlMvFirstRefreshArtifact::Logical { plan, factory } =
+                first_refresh.into_artifact()
+            else {
+                return Err(
+                    "MV first-refresh join activation expected a logical SQL artifact".to_string(),
+                );
+            };
             crate::engine::prepare_logical_plan_as_iceberg_write_with_connector_binding(
                 state,
-                logical_plan,
+                current_catalog.as_deref(),
+                &current_database,
+                plan,
                 factory,
-                sink_spec,
+                sink,
                 root_distribution,
                 execution,
                 &connector_context,
-                &refresh_context,
+                bindings,
                 template,
             )?
         }
@@ -768,7 +899,7 @@ pub(crate) fn rebuild_frozen_mv_refresh_context(
     target_catalog: &str,
     target_namespace: &str,
     target_name: &str,
-    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+    facts: &MvFirstRefreshLogicalContext,
 ) -> Result<crate::mv::refresh::execution_context::IcebergMvRefreshContext, String> {
     let target_identity =
         novarocks_catalog::identifier::TableIdentity {
@@ -828,6 +959,27 @@ pub(crate) fn rebuild_frozen_mv_refresh_context(
         .iceberg_catalogs
         .read()
         .map_err(|error| format!("read Iceberg catalog registry for join context: {error}"))?;
+    let application_pin = crate::mv::refresh::pin::RefreshSnapshotPin::from_captured_entries(
+        facts
+            .base_refs
+            .iter()
+            .map(|base| {
+                let snapshot_id = facts.pin.get(base).ok_or_else(|| {
+                    format!(
+                        "MV first-refresh logical artifact has no snapshot pin for {}",
+                        base.fqn()
+                    )
+                })?;
+                let table_uuid = facts.pin.uuid(base).ok_or_else(|| {
+                    format!(
+                        "MV first-refresh logical artifact has no UUID pin for {}",
+                        base.fqn()
+                    )
+                })?;
+                Ok((base.clone(), snapshot_id, table_uuid.to_string()))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
     crate::mv::refresh::execution_context::IcebergMvRefreshContext::new_with_validated_inputs_and_pruning_limits(
         target_identity,
         facts.mv_definition.mv_id,
@@ -836,7 +988,7 @@ pub(crate) fn rebuild_frozen_mv_refresh_context(
         Arc::new(facts.mv_definition.clone()),
         Arc::new(facts.canonical_select_query.clone()),
         Arc::from(facts.base_refs.clone()),
-        Arc::new(facts.pin.clone()),
+        Arc::new(application_pin),
         facts.previous_snapshot_ids.clone(),
         facts.previous_table_uuids.clone(),
         expected_target_snapshot_id,
@@ -852,12 +1004,20 @@ pub(crate) fn rebuild_frozen_mv_refresh_context(
 
 fn validate_frozen_join_base_facts(
     state: &Arc<StandaloneState>,
-    facts: &crate::sql::mv_refresh::first_refresh::MvFirstRefreshLogicalContext,
+    facts: &MvFirstRefreshLogicalContext,
 ) -> Result<(), String> {
     if facts.base_refs.is_empty() || facts.pin.len() != facts.base_refs.len() {
         return Err(
             "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),
         );
+    }
+    // Production logical first-refresh artifacts retain the materializations
+    // admitted during preparation.  Those overlays carry the exact lease,
+    // table identity, and pinned input set that activation must use; asking
+    // the catalog for the current base here would silently reintroduce a
+    // latest-generation acquire.
+    if facts.frozen_base_overlays.is_some() {
+        return Ok(());
     }
     for base in &facts.base_refs {
         let pinned_uuid = facts.pin.uuid(base).ok_or_else(|| {
@@ -881,7 +1041,9 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
     state: &Arc<StandaloneState>,
     prepared: PreparedMvFirstRefreshWrite,
     sink_spec: IcebergWriteSinkSpec,
+    planning_lease: ConnectorControlPlanningLease,
     execution: &QueryExecutionContext,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
     registration: ConnectorWriteExecutionRegistration,
     mv_refresh_ctx: Option<&crate::mv::refresh::execution_context::IcebergMvRefreshContext>,
 ) -> Result<(ConnectorWriteCompletion, ConnectorWriteStagingSummary), String> {
@@ -895,7 +1057,6 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
             "MV first-refresh staging sink schema does not match target contract".to_string(),
         );
     }
-    let connector_context = prepared.connector_context().clone();
     let root_hash_column = prepared.root_hash_column().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
@@ -903,12 +1064,26 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let query = parse_query_from_sql(physical_sql.sql())?;
             let root_distribution = iceberg_write_shuffle_by_output_name(root_hash_column);
+            let bindings = Arc::new(QueryTableBindingStore::try_new()?);
+            let target_binding = admit_frozen_iceberg_write_target(
+                bindings.as_ref(),
+                &sink_spec,
+                planning_lease,
+            )?;
+            let sink = sql_write_plan_input_for_admitted_target(
+                bindings.as_ref(),
+                target_binding,
+                sink_spec.sql_mode(),
+                crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                None,
+            )?;
             execute_query_as_iceberg_staging_in_operation_with_connector_context(
                 state,
                 current_catalog.as_deref(),
                 &current_database,
                 &query,
-                sink_spec,
+                sink,
+                bindings,
                 None,
                 root_distribution,
                 Some(execution),
@@ -916,23 +1091,10 @@ pub(crate) fn execute_prepared_mv_first_refresh_staging(
                 registration,
             )
         }
-        MvFirstRefreshExecutionArtifact::Logical(logical) => {
-            let mv_refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
-                "MV first-refresh logical staging requires its frozen refresh context".to_string()
-            })?;
-            let (logical_plan, factory, _frozen_context) = logical.into_parts();
-            execute_logical_plan_as_iceberg_staging_in_operation_with_connector_context(
-                state,
-                logical_plan,
-                factory,
-                sink_spec,
-                iceberg_write_shuffle_by_output_name(root_hash_column),
-                execution,
-                &connector_context,
-                mv_refresh_ctx,
-                registration,
-            )
-        }
+        MvFirstRefreshExecutionArtifact::Logical(_) => Err(
+            "legacy direct join first-refresh execution is unavailable; use the frontend retained-lease activation path"
+                .to_string(),
+        ),
     }
 }
 

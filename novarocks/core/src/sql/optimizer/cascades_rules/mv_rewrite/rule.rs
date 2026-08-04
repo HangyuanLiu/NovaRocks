@@ -653,10 +653,11 @@ fn same_iceberg_table(
 ) -> bool {
     use crate::sql::planner::table::ScanSource;
     match (&a.source, &b.source) {
-        (
-            ScanSource::IcebergDataFiles { table: ta, .. },
-            ScanSource::IcebergDataFiles { table: tb, .. },
-        ) => ta.catalog == tb.catalog && ta.namespace == tb.namespace && ta.table == tb.table,
+        (ScanSource::Sql(ta), ScanSource::Sql(tb)) => {
+            ta.table.catalog == tb.table.catalog
+                && ta.table.namespace == tb.table.namespace
+                && ta.table.table == tb.table.table
+        }
         _ => false,
     }
 }
@@ -664,10 +665,8 @@ fn same_iceberg_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::cascades_rules::mv_rewrite::descriptor::{
         EquiEdge, JoinInput, JoinShape,
@@ -679,9 +678,12 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::scalar::materialize;
     use crate::sql::planner::payload::{AggregateCall, PlanFilterNode, PlanScanNode};
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     // --- fixture helpers --------------------------------------------------
 
@@ -793,23 +795,15 @@ mod tests {
         }
     }
 
-    fn iceberg_info(catalog: &str, ns: &str, tbl: &str) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: catalog.to_string(),
-            namespace: ns.to_string(),
-            table: tbl.to_string(),
-            table_uuid: None,
-            current_snapshot_id: None,
-            schema_id: 0,
-            location: String::new(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn test_binding() -> SqlTableBindingId {
+        SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero test scope")),
+            NonZeroU32::new(1).expect("non-zero test binding"),
+        )
     }
 
-    /// A `TableDef` over `ScanSource::IcebergDataFiles` with the given identity
-    /// and column names (all Int64). `same_iceberg_table` keys only on the
+    /// A `TableDef` over SQL-owned scan facts with the given identity and
+    /// column names (all Int64). `same_iceberg_table` keys only on the
     /// `(catalog, namespace, table)` triple, so the base table and the MV
     /// target table differ ONLY in the `table` component.
     fn iceberg_table(catalog: &str, ns: &str, tbl: &str, columns: &[&str]) -> TableDef {
@@ -826,12 +820,17 @@ mod tests {
                 })
                 .collect(),
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::IcebergDataFiles {
-                table: iceberg_info(catalog, ns, tbl),
-                files: vec![],
-                cloud_properties: Default::default(),
-                binding: IcebergDataFileBinding::CurrentSnapshot,
-            },
+            source: ScanSource::Sql(SqlScanSource::new(
+                test_binding(),
+                SqlTableIdentity {
+                    catalog: catalog.to_string(),
+                    namespace: ns.to_string(),
+                    table: tbl.to_string(),
+                },
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            )),
         }
     }
 

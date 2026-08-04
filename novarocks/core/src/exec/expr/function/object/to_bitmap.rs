@@ -21,10 +21,8 @@ use arrow::array::{
     Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array,
     UInt32Array, UInt64Array,
 };
+use novarocks_types::value::bitmap::encode_bitmap_single;
 use std::sync::Arc;
-
-const BITMAP_TYPE_SINGLE32: u8 = 1;
-const BITMAP_TYPE_SINGLE64: u8 = 3;
 
 pub fn eval_to_bitmap(
     arena: &ExprArena,
@@ -192,18 +190,4 @@ fn parse_unsigned_decimal(text: &str) -> Option<u64> {
         return None;
     }
     trimmed.parse::<u64>().ok()
-}
-
-pub(crate) fn encode_bitmap_single(value: u64) -> Vec<u8> {
-    if u32::try_from(value).is_ok() {
-        let mut out = Vec::with_capacity(1 + std::mem::size_of::<u32>());
-        out.push(BITMAP_TYPE_SINGLE32);
-        out.extend_from_slice(&(value as u32).to_le_bytes());
-        out
-    } else {
-        let mut out = Vec::with_capacity(1 + std::mem::size_of::<u64>());
-        out.push(BITMAP_TYPE_SINGLE64);
-        out.extend_from_slice(&value.to_le_bytes());
-        out
-    }
 }

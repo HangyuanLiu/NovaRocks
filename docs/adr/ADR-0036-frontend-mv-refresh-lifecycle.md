@@ -1,5 +1,9 @@
 ---
+<<<<<<<< HEAD:docs/adr/ADR-0036-frontend-mv-refresh-lifecycle.md
 id: ADR-0036
+========
+id: ADR-0029
+>>>>>>>> 98726ab8d (refactor(sql): complete dependency inversion caller cutover):docs/adr/ADR-0029-frontend-mv-refresh-lifecycle.md
 title: "Frontend-owned MV refresh lifecycle"
 domain: [frontend-mv, provider-spi]
 status: active

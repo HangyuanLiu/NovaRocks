@@ -2,7 +2,7 @@
 // contributor license agreements.  See the NOTICE file distributed with this
 // work for additional information regarding copyright ownership.
 //
-// Design: ADR-0029 (docs/adr/ADR-0029-connector-distributed-rewrite-contract.md)
+// Design: ADR-0030 (docs/adr/ADR-0030-connector-distributed-rewrite-contract.md)
 
 //! FE-only provider-neutral distributed rewrite planning contract.
 

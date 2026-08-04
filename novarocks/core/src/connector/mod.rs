@@ -259,6 +259,19 @@ pub(crate) fn metadata_load_table(
     resolution: ConnectorTableResolution,
 ) -> Result<(backend::ResolvedTable, Option<i32>), String> {
     let binding = metadata_binding(controls, catalog)?;
+    metadata_load_table_with_planning_lease(binding, context, namespace, table, resolution)
+}
+
+/// Resolve metadata through an admission-frozen planning lease.  Write
+/// callers use this instead of reopening `acquire_current` after target
+/// admission.
+pub(crate) fn metadata_load_table_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<(backend::ResolvedTable, Option<i32>), String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let metadata = binding
         .binding()
@@ -306,6 +319,13 @@ pub(crate) fn metadata_load_table(
         },
         schema_id,
     ))
+}
+
+pub(crate) fn acquire_metadata_planning_lease(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: &str,
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
+    metadata_binding(controls, catalog)
 }
 
 pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};

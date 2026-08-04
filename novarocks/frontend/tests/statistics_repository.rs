@@ -17,8 +17,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -561,6 +561,16 @@ struct StaticTableStatistics;
 
 struct StaticStatisticsTargetResolver;
 
+struct RecordingStatisticsTargetResolver {
+    calls: Mutex<Vec<StatisticsJobTarget>>,
+}
+
+impl RecordingStatisticsTargetResolver {
+    fn calls(&self) -> Vec<StatisticsJobTarget> {
+        self.calls.lock().expect("statistics target calls").clone()
+    }
+}
+
 impl StatisticsJobTargetResolver for StaticStatisticsTargetResolver {
     fn resolve_table_pin(
         &self,
@@ -571,6 +581,34 @@ impl StatisticsJobTargetResolver for StaticStatisticsTargetResolver {
             table_handle: format!("table:{}:{}", target.namespace, target.table).into_bytes(),
             data_version: b"snapshot:1".to_vec(),
             columns: vec!["v".to_string()],
+        })
+    }
+}
+
+impl StatisticsJobTargetResolver for RecordingStatisticsTargetResolver {
+    fn resolve_table_pin(
+        &self,
+        target: &StatisticsJobTarget,
+    ) -> Result<StatisticsJobTablePin, String> {
+        self.calls
+            .lock()
+            .expect("statistics target calls")
+            .push(target.clone());
+        if target.table == "missing_external_table" {
+            return Err(format!(
+                "unknown external table {}.{}.{}",
+                target.catalog, target.namespace, target.table
+            ));
+        }
+        Ok(StatisticsJobTablePin {
+            connector_instance_id: "statistics-test".to_string(),
+            table_handle: format!(
+                "table:{}:{}:{}",
+                target.catalog, target.namespace, target.table
+            )
+            .into_bytes(),
+            data_version: b"snapshot:1".to_vec(),
+            columns: vec!["value".to_string()],
         })
     }
 }
@@ -655,6 +693,111 @@ async fn typed_application_never_reparses_sql_and_keeps_reads_available_without_
         .await
         .expect("typed SHOW ANALYZE JOBS reads durable jobs");
     assert!(matches!(listed, StatisticsStatementResult::AnalyzeJobs(jobs) if jobs.len() == 1));
+}
+
+#[tokio::test]
+async fn sqlx2_application_analyze_target_resolution_preserves_admitted_external_identity() {
+    let (_temp, _store, repository) = fixture().await;
+    let resolver = Arc::new(RecordingStatisticsTargetResolver {
+        calls: Mutex::new(Vec::new()),
+    });
+    let service = StatisticsApplicationService::with_repository_and_target_resolver(
+        repository.clone(),
+        resolver.clone(),
+    );
+    let table_statistics = StaticTableStatistics;
+    let admitted_targets = [
+        // The Core command route has already applied the session's current
+        // catalog before the Frontend durable-job boundary is reached.
+        StatisticsJobTarget {
+            catalog: "current_catalog".to_string(),
+            namespace: "current_db".to_string(),
+            table: "current_table".to_string(),
+        },
+        // A two-part external name keeps the admitted catalog while changing
+        // only the namespace.
+        StatisticsJobTarget {
+            catalog: "current_catalog".to_string(),
+            namespace: "other_db".to_string(),
+            table: "two_part_table".to_string(),
+        },
+        StatisticsJobTarget {
+            catalog: "explicit_catalog".to_string(),
+            namespace: "explicit_db".to_string(),
+            table: "three_part_table".to_string(),
+        },
+    ];
+
+    for (index, target) in admitted_targets.iter().cloned().enumerate() {
+        let submitted = service
+            .execute(
+                StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
+                    target: target.clone(),
+                    metric_names: Vec::new(),
+                }),
+                100 + index as i64,
+                &table_statistics,
+            )
+            .await
+            .expect("resolved external ANALYZE target must create a durable job");
+        assert!(matches!(
+            submitted,
+            StatisticsStatementResult::JobSubmitted(job)
+                if job.target == target
+                    && job.table_pin.table_handle
+                        == format!("table:{}:{}:{}", target.catalog, target.namespace, target.table)
+                            .into_bytes()
+                    && job.metric_names == vec!["value".to_string()]
+        ));
+    }
+
+    assert_eq!(resolver.calls(), admitted_targets);
+    let jobs = repository.list().await.expect("list durable jobs");
+    assert_eq!(jobs.len(), 3);
+}
+
+#[tokio::test]
+async fn sqlx2_application_analyze_unknown_target_fails_before_durable_job_creation() {
+    let (_temp, _store, repository) = fixture().await;
+    let resolver = Arc::new(RecordingStatisticsTargetResolver {
+        calls: Mutex::new(Vec::new()),
+    });
+    let service = StatisticsApplicationService::with_repository_and_target_resolver(
+        repository.clone(),
+        resolver.clone(),
+    );
+    let table_statistics = StaticTableStatistics;
+    let target = StatisticsJobTarget {
+        catalog: "current_catalog".to_string(),
+        namespace: "other_db".to_string(),
+        table: "missing_external_table".to_string(),
+    };
+
+    let error = service
+        .execute(
+            StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
+                target: target.clone(),
+                metric_names: Vec::new(),
+            }),
+            200,
+            &table_statistics,
+        )
+        .await
+        .expect_err("unknown external target must fail before durable job creation");
+
+    assert_eq!(
+        error.kind(),
+        StatisticsApplicationErrorKind::TargetResolution
+    );
+    assert!(error.to_string().contains("unknown external table"));
+    assert_eq!(resolver.calls(), vec![target]);
+    assert!(
+        repository
+            .list()
+            .await
+            .expect("list durable jobs after failed resolution")
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

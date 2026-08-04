@@ -34,13 +34,13 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::logical::{LogicalPlanKind, LogicalPlanNode};
-use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::table::{ScanSource, SqlScanKind};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) struct ImvRowIdColumn;
 
 impl ImvRowIdColumn {
-    pub(crate) const NAME: &'static str = crate::exec::row_position::ICEBERG_ROW_ID_COL;
+    pub(crate) const NAME: &'static str = crate::sql::common::ICEBERG_ROW_ID_COL;
 
     pub(crate) fn output_column(column_id: ColumnId) -> OutputColumn {
         OutputColumn {
@@ -97,8 +97,12 @@ impl LogicalRewriteRule for InjectRowIdRule {
         match &plan.kind {
             LogicalPlanKind::Scan(scan) => {
                 matches!(
-                    scan.table.source,
-                    ScanSource::IcebergDeltaTable { .. } | ScanSource::IcebergVersionTable { .. }
+                    &scan.table.source,
+                    ScanSource::Sql(source)
+                        if matches!(
+                            source.kind,
+                            SqlScanKind::Delta { .. } | SqlScanKind::FrozenInputSet { .. }
+                        )
                 ) && !scan.columns.iter().any(ImvRowIdColumn::matches)
             }
             _ => false,
@@ -151,12 +155,14 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
     use std::cell::RefCell;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::rc::Rc;
 
     use crate::sql::column_id::ColumnId;
@@ -176,7 +182,7 @@ mod tests {
         ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         ctx
@@ -195,22 +201,10 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDeltaTable {
-                    table: IcebergTableInfo {
-                        catalog: "ice".to_string(),
-                        namespace: "db".to_string(),
-                        table: "b".to_string(),
-                        table_uuid: Some("uuid-b".to_string()),
-                        current_snapshot_id: Some(22),
-                        schema_id: 7,
-                        location: "file:///tmp/ice/db/b".to_string(),
-                        schema: IcebergSchemaDef { fields: Vec::new() },
-                        serialized_metadata: None,
-                        serialized_metadata_rows: None,
-                    },
+                source: sql_scan_source(SqlScanKind::Delta {
                     from_snapshot_id: 11,
                     to_snapshot_id: 22,
-                },
+                }),
             },
             alias: None,
             columns: vec![OutputColumn {
@@ -229,14 +223,25 @@ mod tests {
 
     fn version_scan() -> PlanScanNode {
         let mut scan = delta_scan();
-        let ScanSource::IcebergDeltaTable { table, .. } = scan.table.source else {
-            unreachable!("delta_scan must use IcebergDeltaTable")
-        };
-        scan.table.source = ScanSource::IcebergVersionTable {
-            table,
-            snapshot_id: 22,
-        };
+        scan.table.source = sql_scan_source(SqlScanKind::FrozenInputSet {
+            version: SqlTableVersionSelector::Snapshot(22),
+        });
         scan
+    }
+
+    fn sql_scan_source(kind: SqlScanKind) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            SqlTableBindingId::new(
+                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+                NonZeroU32::new(1).expect("ordinal"),
+            ),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "b".to_string(),
+            },
+            kind,
+        ))
     }
 
     fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {

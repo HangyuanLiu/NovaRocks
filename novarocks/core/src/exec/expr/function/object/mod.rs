@@ -18,7 +18,6 @@
 #![allow(unused_variables)]
 
 mod array_to_bitmap;
-pub(crate) mod bitmap_common;
 mod bitmap_functions;
 mod bitmap_to_array;
 mod bitmap_to_string;

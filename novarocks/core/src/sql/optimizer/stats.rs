@@ -2442,13 +2442,13 @@ fn repeat_output_columns(
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use super::*;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::AggregateOutputLayout;
@@ -2462,7 +2462,9 @@ mod tests {
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
     };
     use crate::sql::planner::payload::*;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, TableDef,
+    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -2506,19 +2508,21 @@ mod tests {
         estimate_selectivity(&arena, id, column_stats)
     }
 
-    fn test_iceberg_table_info() -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "test_catalog".to_string(),
-            namespace: "test_db".to_string(),
-            table: "test_table".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: "file:///tmp/test_table".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        }
+    fn sql_test_scan_source(table: &str) -> ScanSource {
+        let scope = SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("non-zero scope"));
+        let binding =
+            SqlTableBindingId::new(scope, NonZeroU32::new(1).expect("non-zero binding ordinal"));
+        ScanSource::Sql(SqlScanSource::new(
+            binding,
+            SqlTableIdentity {
+                catalog: "test_catalog".to_string(),
+                namespace: "db".to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        ))
     }
 
     fn make_table_stats(
@@ -2680,27 +2684,7 @@ mod tests {
                     name: name.to_string(),
                     columns: col_defs,
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::IcebergDataFiles {
-                        table: test_iceberg_table_info(),
-                        files: vec![IcebergDataFileInfo {
-                            path: format!("s3://bucket/{}.parquet", name),
-                            size: 1000,
-                            row_count: Some(1000),
-                            column_stats: None,
-                            partition_spec_id: None,
-                            partition_key: None,
-                            first_row_id: None,
-                            data_sequence_number: None,
-                            ivm_change_op: None,
-                            included_positions: None,
-                            delete_files: vec![],
-                            manifest_path: None,
-                            partition_values: vec![],
-                        }],
-                        cloud_properties: Default::default(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: sql_test_scan_source(name),
                 },
                 alias: None,
                 columns: columns,
@@ -2754,7 +2738,9 @@ mod tests {
                 name: name.to_string(),
                 columns: col_defs,
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             },
             alias: None,
             stats_ref: Some(stats_ref),

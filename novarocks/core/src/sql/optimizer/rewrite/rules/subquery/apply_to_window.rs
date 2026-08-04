@@ -714,7 +714,12 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "lineitem",
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 columns: vec![
@@ -759,7 +764,12 @@ mod tests {
                     name: "part".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "part",
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 columns: vec![
@@ -797,7 +807,12 @@ mod tests {
                     name: "lineitem".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "lineitem",
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 columns: vec![
@@ -1565,7 +1580,12 @@ mod tests {
                     name: "other".to_string(),
                     columns: vec![],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source_for(
+                        "test_catalog",
+                        "default",
+                        "other",
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 columns: vec![

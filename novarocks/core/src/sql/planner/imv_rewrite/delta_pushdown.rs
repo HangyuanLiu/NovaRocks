@@ -169,12 +169,10 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
 mod tests {
     use crate::sql::planner::logical::*;
     use crate::sql::planner::payload::*;
-    use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
     use crate::sql::analysis::{
         ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -199,8 +197,8 @@ mod tests {
         (ctx, arena)
     }
 
-    /// A leaf scan. Pushdown does not care about the scan source; an Iceberg
-    /// data-files source mirrors the realistic pre-binding shape.
+    /// A leaf scan. Pushdown does not care about provider metadata, so the
+    /// fixture uses the tokenized SQL scan source emitted by the compiler.
     fn leaf_scan() -> LogicalPlanNode {
         let column = ColumnDef {
             name: "k".to_string(),
@@ -216,24 +214,7 @@ mod tests {
                     name: "b".to_string(),
                     columns: vec![column],
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
-                            catalog: "ice".to_string(),
-                            namespace: "db".to_string(),
-                            table: "b".to_string(),
-                            table_uuid: Some("uuid-b".to_string()),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: "file:///tmp/ice/db/b".to_string(),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
-                        },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                    source: crate::sql::compiler::mv_rewrite::test_data_scan_source(),
                 },
                 alias: None,
                 columns: vec![OutputColumn {

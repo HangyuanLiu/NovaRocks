@@ -1,0 +1,58 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- @order_sensitive=true
+-- SQLX-2 owner coverage: UPDATE ... FROM resolves the target and one source
+-- through one request-local compiler input before the COW write lifecycle.
+
+-- query 1
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_target FORCE;
+DROP TABLE IF EXISTS ${case_db}.sqlx2_update_from_source FORCE;
+CREATE TABLE ${case_db}.sqlx2_update_from_target (
+  id BIGINT,
+  v STRING
+) TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true"
+);
+CREATE TABLE ${case_db}.sqlx2_update_from_source (
+  id BIGINT,
+  new_v STRING
+) TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true"
+);
+INSERT INTO ${case_db}.sqlx2_update_from_target VALUES (1, 'a'), (2, 'b');
+INSERT INTO ${case_db}.sqlx2_update_from_source VALUES (2, 'bb');
+
+-- query 2
+-- @skip_result_check=true
+UPDATE ${case_db}.sqlx2_update_from_target AS t
+SET v = s.new_v
+FROM ${case_db}.sqlx2_update_from_source AS s
+WHERE t.id = s.id;
+
+-- query 3
+SELECT id, v
+FROM ${case_db}.sqlx2_update_from_target
+ORDER BY id;
+
+-- query 4
+-- @skip_result_check=true
+DROP TABLE ${case_db}.sqlx2_update_from_target FORCE;
+DROP TABLE ${case_db}.sqlx2_update_from_source FORCE;

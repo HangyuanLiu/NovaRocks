@@ -27,6 +27,9 @@
 //! M3 calls this at startup for MVs discovered on the lake but missing from
 //! SQLite. No catalog I/O happens here — every input is already in memory.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -309,8 +312,8 @@ mod tests {
     use crate::connector::iceberg::commit::mv_provenance::{ProvenanceBase, RefreshTechnique};
     use crate::mv::persistence::descriptor::{DescriptorDependency, MvDescriptorV1};
     use crate::mv::persistence::schema::{
-        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
-        ExpressionLineage, HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
+        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
+        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };

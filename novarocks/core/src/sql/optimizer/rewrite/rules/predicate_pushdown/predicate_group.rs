@@ -344,10 +344,14 @@ mod tests {
         }
     }
 
-    fn func(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
+    fn func(
+        name: &str,
+        args: Vec<TypedExpr>,
+        volatility: crate::sql::functions::FunctionVolatility,
+    ) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::FunctionCall {
-                volatility: crate::sql::functions::FunctionVolatility::Immutable,
+                volatility,
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -507,13 +511,32 @@ mod tests {
     #[test]
     fn curdate_is_detected_as_non_deterministic() {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, &func("curdate", vec![]));
+        let id = intern_typed(
+            &mut arena,
+            &func(
+                "curdate",
+                vec![],
+                crate::sql::functions::FunctionVolatility::Volatile,
+            ),
+        );
         assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 
     #[test]
     fn nested_scalar_function_argument_is_checked_for_non_determinism() {
-        let expr = func("if", vec![col("a", 1), func("curdate", vec![]), int_lit(1)]);
+        let expr = func(
+            "if",
+            vec![
+                col("a", 1),
+                func(
+                    "curdate",
+                    vec![],
+                    crate::sql::functions::FunctionVolatility::Volatile,
+                ),
+                int_lit(1),
+            ],
+            crate::sql::functions::FunctionVolatility::Immutable,
+        );
 
         let mut arena = ScalarArena::new();
         let id = intern_typed(&mut arena, &expr);

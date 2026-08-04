@@ -161,7 +161,13 @@ impl RequestContext {
     }
 
     pub fn admit(admission: RequestAdmission) -> Self {
-        let settings = admission.optimizer_settings;
+        let mut settings = admission.optimizer_settings;
+        // Runtime configuration is an application concern. Capture its cost
+        // budget once at admission so SQL only receives an immutable value.
+        if settings.optimizer_query_mem_limit_bytes.is_none() {
+            settings.optimizer_query_mem_limit_bytes =
+                Some(crate::common::config::optimizer_query_mem_limit_bytes() as f64);
+        }
         Self::new(
             RequestSessionContext::new(
                 admission.current_catalog,
@@ -286,5 +292,38 @@ mod tests {
         );
         assert_eq!(context.execution().deadline(), Some(deadline));
         assert!(context.execution().topology().targets().is_empty());
+    }
+
+    #[test]
+    fn sqlx2_application_admission_freezes_optimizer_query_memory_once() {
+        struct ConfigReset;
+        impl Drop for ConfigReset {
+            fn drop(&mut self) {
+                crate::common::app_config::install_default_for_test();
+            }
+        }
+
+        let mut config = crate::common::app_config::NovaRocksConfig::default();
+        config.runtime.optimizer_query_mem_limit_bytes = 512 * 1024 * 1024;
+        crate::common::app_config::install_preloaded_config(config);
+        let _reset = ConfigReset;
+
+        let context = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            BackendTopologySnapshot::empty(7),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+        ));
+
+        assert_eq!(
+            context
+                .execution()
+                .optimizer_settings()
+                .optimizer_query_mem_limit_bytes,
+            Some(512.0 * 1024.0 * 1024.0)
+        );
     }
 }

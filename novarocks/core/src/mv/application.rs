@@ -17,23 +17,162 @@
 
 //! Materialized-view application and engine ports.
 
+mod refresh_artifact;
+
 use std::fmt;
 
+use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
 use uuid::Uuid;
 
 use crate::mv::repository::{
     CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
 };
+use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::runtime::query_result::QueryResult;
-use crate::sql::mv_refresh::first_refresh::PreparedMvFirstRefreshWrite;
-use crate::sql::mv_refresh::incremental::PreparedMvIncrementalWrite;
-use crate::sql::mv_refresh::{
-    MvRefreshPreparationService, MvRefreshStatement, PreparedDistributedWriteRequest,
-    PreparedMvRefresh,
-};
+use crate::sql::mv_refresh::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, IcebergPartitionFieldExpr, MaterializedViewRefreshPolicy, Statement,
 };
+
+pub(crate) use refresh_artifact::{
+    MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, MvFirstRefreshWritePreparer,
+    MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact, MvIncrementalJoinMode,
+    MvIncrementalRewriteEvidence, MvIncrementalWriteMode, MvIncrementalWritePreparer,
+    MvIncrementalWriteRequest, MvStagedRefreshWriteMode,
+};
+
+/// Frontend-preallocated identities for a single MV refresh lifecycle. These
+/// are application lifecycle values: SQL may validate them but cannot create
+/// a connector operation or persist their durable intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshAttemptIdentity {
+    pub refresh_id: i64,
+    pub request_id: [u8; 16],
+    pub staging_branch: String,
+    pub marker_token: String,
+    pub staging_create_operation_id: [u8; 16],
+    pub write_operation_id: ConnectorWriteOperationId,
+    pub publication_operation_id: [u8; 16],
+    pub staging_drop_operation_id: [u8; 16],
+}
+
+impl MvRefreshAttemptIdentity {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.refresh_id <= 0 || self.staging_branch.is_empty() || self.marker_token.is_empty() {
+            return Err(
+                "MV refresh preparation requires a positive identity and non-empty staging marker"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Application request supplied to the side-effect-free SQL preparation port.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvRefreshPreparationRequest {
+    pub statement: MvRefreshStatement,
+    pub target: SqlMvTarget,
+    pub attempt: MvRefreshAttemptIdentity,
+}
+
+impl MvRefreshPreparationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        self.statement.validate_supported()?;
+        self.attempt.validate()
+    }
+}
+
+/// Application-owned work handoff after SQL planning. SQL plans determine the
+/// semantic shape; this lifecycle envelope owns operation/cohort-bearing
+/// artifacts and is the only value admitted by frontend staging.
+pub enum PreparedMvRefreshWork {
+    NoOp,
+    MetadataOnly,
+    DataProducing {
+        first_refresh_writes: Vec<PreparedMvFirstRefreshWrite>,
+        incremental_writes: Vec<PreparedMvIncrementalWrite>,
+    },
+}
+
+/// Frontend lifecycle artifact assembled from SQL facts and a reserved attempt.
+pub struct PreparedMvRefresh {
+    pub statement: MvRefreshStatement,
+    pub attempt: MvRefreshAttemptIdentity,
+    pub observed_binding: ConnectorExecutionBindingKey,
+    pub finalize: MvRefreshFinalizeFacts,
+    pub work: PreparedMvRefreshWork,
+}
+
+/// SQL preparation port consumed by the frontend lifecycle owner. Its request
+/// and output are application envelopes around immutable SQL values, never a
+/// way for SQL to acquire lifecycle or connector authority itself.
+pub trait MvRefreshPreparationService: Send + Sync {
+    fn prepare_step(
+        &self,
+        request: MvRefreshPreparationRequest,
+    ) -> Result<PreparedMvRefresh, String>;
+}
+
+#[cfg(test)]
+mod refresh_preparation_tests {
+    use super::*;
+
+    fn attempt() -> MvRefreshAttemptIdentity {
+        MvRefreshAttemptIdentity {
+            refresh_id: 7,
+            request_id: [1; 16],
+            staging_branch: "__nova_mv_7".to_string(),
+            marker_token: "marker".to_string(),
+            staging_create_operation_id: [2; 16],
+            write_operation_id: ConnectorWriteOperationId::from_bytes([3; 16]),
+            publication_operation_id: [4; 16],
+            staging_drop_operation_id: [5; 16],
+        }
+    }
+
+    #[test]
+    fn sqlx2_application_refresh_attempt_is_lifecycle_owned() {
+        attempt().validate().expect("complete attempt identity");
+        assert!(
+            MvRefreshAttemptIdentity {
+                marker_token: String::new(),
+                ..attempt()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sqlx2_application_refresh_request_keeps_sql_rejection_and_attempt_together() {
+        let request = MvRefreshPreparationRequest {
+            statement: MvRefreshStatement {
+                name_parts: vec!["mv".to_string()],
+                full: false,
+            },
+            target: SqlMvTarget {
+                catalog: Some("iceberg".to_string()),
+                database: "db".to_string(),
+                name: "mv".to_string(),
+            },
+            attempt: attempt(),
+        };
+        request.validate().expect("complete request");
+        assert!(
+            MvRefreshPreparationRequest {
+                statement: MvRefreshStatement {
+                    full: true,
+                    ..request.statement
+                },
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+pub use refresh_artifact::{PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MvCreatePartitionField {
@@ -358,6 +497,7 @@ pub trait MvFirstRefreshWriteActivator: Send + Sync {
     fn bind_first_refresh_write(
         &self,
         prepared: PreparedMvFirstRefreshWrite,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String>;
@@ -367,6 +507,7 @@ pub trait MvFirstRefreshWriteActivator: Send + Sync {
     fn bind_incremental_refresh_write(
         &self,
         prepared: PreparedMvIncrementalWrite,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
         exact_lease: &novarocks_spi::connector::ConnectorWriteLease,
         execution: &crate::query_execution::request_context::QueryExecutionContext,
     ) -> Result<PreparedDistributedWriteRequest, String>;

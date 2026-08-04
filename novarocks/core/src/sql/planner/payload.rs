@@ -21,7 +21,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::ScanVariantColumn;
+use crate::sql::common::{ScanVariantColumn, SqlTopNType};
 use crate::sql::planner::table::TableDef;
 
 #[allow(dead_code)]
@@ -58,7 +58,7 @@ pub(crate) struct PlanSortNode {
     pub output_columns: Vec<OutputColumn>,
     pub offset: Option<i64>,
     pub partition_limit: Option<usize>,
-    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
+    pub topn_type: Option<SqlTopNType>,
 }
 
 #[allow(dead_code)]

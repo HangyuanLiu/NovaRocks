@@ -25,20 +25,22 @@
 //! direct-scan helpers.
 
 #[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::mv::model::TargetPartitionFilter;
 
 #[cfg(test)]
 use crate::mv::persistence::schema::{
     APPLY_KEY_COLUMN_PROPERTY, APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
-    ApplyKeySource, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-};
-use crate::mv::persistence::schema::{
-    BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use crate::mv::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column,
     expose_physical_apply_key_for_locator_registration, iceberg_mv_physical_select_sql,
     join_apply_key_table_column,
+};
+use crate::sql::planner::vocabulary::{
+    BRANCH_ID_COLUMN_NAME, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+    JOIN_APPLY_KEY_COLUMN_NAME,
 };
 
 #[cfg(test)]
@@ -714,28 +716,20 @@ pub(crate) fn resolve_target_positions_via_framework(
     }
     let requested = requested_apply_key_values(requested_keys);
     let request_is_i64 = matches!(requested_keys, ApplyKeyRequest::Int64(_));
-    let (locator_registration, sql) = register_scoped_framework_locator_table_for_query(
-        state,
-        target_table,
-        target_catalog_name,
-        target_namespace,
-        target_table_name,
-        apply_key_column,
-        requested_keys,
-        partition_filter,
-    )?;
-    let session = crate::engine::StandaloneSession {
-        inner: std::sync::Arc::clone(state),
-    };
-    let result = session.execute_in_context(&sql, None, target_namespace, None);
+    let (locator_registration, locator_overlay, sql) =
+        register_scoped_framework_locator_table_for_query(
+            state,
+            target_table,
+            target_catalog_name,
+            target_namespace,
+            target_table_name,
+            apply_key_column,
+            requested_keys,
+            partition_filter,
+        )?;
+    let result = execute_framework_locator_query(state, target_namespace, &sql, locator_overlay);
     let result = result?;
     locator_registration.cleanup()?;
-    let result = match result {
-        crate::engine::StatementResult::Query(result) => result,
-        crate::engine::StatementResult::Ok => {
-            return Err("framework target locator SELECT returned no rows schema".to_string());
-        }
-    };
 
     let empty_deletes_by_file = std::collections::HashMap::new();
     let mut matches = std::collections::HashMap::<ApplyKeyValue, (String, i64)>::new();
@@ -784,7 +778,14 @@ fn register_scoped_framework_locator_table_for_query(
     apply_key_column: &str,
     requested_keys: ApplyKeyRequest<'_>,
     partition_filter: &TargetPartitionFilter,
-) -> Result<(ScopedFrameworkLocatorTable, String), String> {
+) -> Result<
+    (
+        ScopedFrameworkLocatorTable,
+        crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay,
+        String,
+    ),
+    String,
+> {
     for _ in 0..1024 {
         let locator_table_name =
             next_framework_locator_synthetic_table_name(target_table_name, target_table);
@@ -804,15 +805,251 @@ fn register_scoped_framework_locator_table_for_query(
             requested_keys,
         )?;
         if let Some(registration) =
-            try_register_scoped_framework_locator_table(state, target_namespace, table_def)?
+            try_register_scoped_framework_locator_table(state, target_namespace, table_def.clone())?
         {
-            return Ok((registration, sql));
+            let overlay = framework_locator_query_local_overlay(
+                state,
+                target_table,
+                target_catalog_name,
+                target_namespace,
+                target_table_name,
+                table_def,
+                partition_filter,
+            )?;
+            return Ok((registration, overlay, sql));
         }
     }
     Err(
         "framework target locator could not allocate a collision-free synthetic table name"
             .to_string(),
     )
+}
+
+/// Build the query-local binding consumed by the framework locator SELECT.
+///
+/// The locator relation remains registered in the local catalog only so the
+/// collision/cleanup tests can exercise their ownership guard.  Its actual
+/// SQL compilation input is this overlay: it carries the exact fixture
+/// control lease and frozen files under one request-local token, rather than
+/// allowing the local catalog fallback to manufacture an unbound
+/// `SqlConnectorRead` scan.
+#[cfg(test)]
+fn framework_locator_query_local_overlay(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    target_table: &iceberg::table::Table,
+    target_catalog_name: &str,
+    target_namespace: &str,
+    target_table_name: &str,
+    locator_table_def: crate::sql::planner::table::TableDef,
+    partition_filter: &TargetPartitionFilter,
+) -> Result<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay, String> {
+    use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+    use crate::engine::query_planning::bindings::{
+        QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    };
+    use crate::sql::catalog::ResolvedAnalyzerTable;
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
+    };
+
+    let snapshot_id = target_table
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| snapshot.snapshot_id())
+        .ok_or_else(|| "framework target locator requires a frozen target snapshot".to_string())?;
+    let files = crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+        target_table,
+        snapshot_id,
+    )?;
+    let files = filter_locator_data_files_by_partition(target_table, files, partition_filter)?
+        .into_iter()
+        .map(
+            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+        )
+        .collect::<Vec<_>>();
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(target_catalog_name)
+        .map_err(|error| error.to_string())?;
+    let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+        state.connector_control.as_ref(),
+        &instance_id,
+    )
+    .map_err(|error| error.to_string())?;
+    let table = crate::connector::iceberg::scan_model::IcebergTableInfo {
+        catalog: target_catalog_name.to_string(),
+        namespace: target_namespace.to_string(),
+        table: target_table_name.to_string(),
+        table_uuid: Some(target_table.metadata().uuid().to_string()),
+        current_snapshot_id: Some(snapshot_id),
+        schema_id: target_table.metadata().current_schema_id(),
+        location: target_table.metadata().location().to_string(),
+        schema: crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen(
+            target_table.metadata().current_schema(),
+        ),
+        serialized_metadata: Some(
+            serde_json::to_string(target_table.metadata())
+                .map_err(|error| format!("serialize framework locator target metadata: {error}"))?,
+        ),
+        serialized_metadata_rows: None,
+    };
+    let locator_table_name = locator_table_def.name.clone();
+    let catalog = target_catalog_name.to_string();
+    let namespace = target_namespace.to_string();
+    let physical_table = target_table_name.to_string();
+    let key = QueryTableBindingKey::snapshot(&catalog, &namespace, &physical_table, snapshot_id);
+
+    Ok(
+        crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay::new(
+            namespace.clone(),
+            locator_table_name,
+            key,
+            move |binding| {
+                let mut planner = locator_table_def.clone();
+                planner.source = ScanSource::Sql(SqlScanSource::new(
+                    binding,
+                    SqlTableIdentity {
+                        catalog: catalog.clone(),
+                        namespace: namespace.clone(),
+                        table: physical_table.clone(),
+                    },
+                    SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(snapshot_id),
+                    },
+                ));
+                Ok(QueryTableBinding {
+                    resolved: ResolvedAnalyzerTable::from_planner(None, &namespace, planner),
+                    statistics_pin: None,
+                    planning_lease: Some(planning_lease.clone()),
+                    scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
+                        table: table.clone(),
+                        files: files.clone(),
+                        binding: IcebergDataFileBinding::ExplicitFiles,
+                    }),
+                    frozen_snapshot_files: std::collections::BTreeMap::new(),
+                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                })
+            },
+        ),
+    )
+}
+
+/// Execute the test-only locator query through the canonical compiler using
+/// the supplied query-local overlay.  This deliberately mirrors the
+/// application admission/prepare boundary instead of using the legacy
+/// `StandaloneSession` local-catalog seam, which cannot carry external scan
+/// materializations under SQLX-2.
+#[cfg(test)]
+fn execute_framework_locator_query(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    current_database: &str,
+    sql: &str,
+    overlay: crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay,
+) -> Result<crate::runtime::query_result::QueryResult, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|error| error.to_string())?;
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return Err("framework target locator expected a SELECT query".to_string());
+    };
+    let cancellation = crate::query_execution::cancellation::QueryCancellationSource::new();
+    let execution = crate::query_execution::request_context::QueryExecutionContext::new(
+        crate::common::app_config::ClusterRole::AllInOne,
+        crate::query_execution::backend::BackendTopologySnapshot::try_new(
+            0,
+            vec![crate::query_execution::backend::LiveBackendTarget::new(
+                0,
+                format!("127.0.0.1:{}", state.exchange_port)
+                    .parse()
+                    .map_err(|error| {
+                        format!("parse framework target locator loopback endpoint: {error}")
+                    })?,
+                1,
+            )],
+        )
+        .map_err(|error| error.to_string())?,
+        None,
+        cancellation.view(),
+        crate::sql::optimizer::options::SessionOptimizerSettings::default(),
+    );
+    let connector_context = crate::connector::connector_request_context_for_query(
+        None,
+        execution.cancellation().clone(),
+    )?;
+    let bindings = std::sync::Arc::new(
+        crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()?,
+    );
+    let catalog_service = crate::engine::catalog_service_snapshot(state);
+    let materializer =
+        crate::engine::build_catalog_service_provider_with_bindings_and_query_local_overlays(
+            None,
+            &catalog_service,
+            state.connector_control.as_ref(),
+            connector_context.clone(),
+            std::sync::Arc::clone(&bindings),
+            vec![overlay],
+        );
+    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
+        .ok_or_else(|| {
+            "framework target locator requires a non-empty backend topology".to_string()
+        })?;
+    let statistics =
+        crate::engine::query_stats::QueryStatisticsContext::from_standalone_state_with_bindings(
+            state,
+            std::sync::Arc::clone(&bindings),
+        );
+    let catalog = crate::sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+    let request = crate::sql::compiler::SqlCompileRequest::new(
+        crate::sql::compiler::SqlStatementInput::ParsedQuery(query),
+        crate::sql::compiler::SqlCompileIntent::Query,
+        crate::sql::compiler::SqlSessionContext {
+            current_catalog: None,
+            current_database: current_database.to_string(),
+            optimizer_settings: execution.optimizer_settings().clone(),
+        },
+        crate::sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        &catalog,
+        &statistics,
+        crate::sql::functions::builtin_sql_function_catalog(),
+        None,
+        crate::sql::compiler::SqlCompileControl::new(
+            execution.deadline(),
+            crate::engine::query_planning::sql_cancellation_observation(
+                execution.cancellation().clone(),
+            ),
+        ),
+    );
+    let crate::sql::compiler::SqlCompileOutput::Distributed(compiled) =
+        crate::sql::compiler::SqlCompiler::compile(request).map_err(|error| error.to_string())?
+    else {
+        return Err(
+            "framework target locator query did not produce a distributed plan".to_string(),
+        );
+    };
+    let prepared = crate::query_execution::preparation::prepare_fragments(
+        &compiled.distributed_plan,
+        state.connector_control.as_ref(),
+        &connector_context,
+        Some(bindings.as_ref()),
+        None,
+        crate::query_execution::preparation::ScanPreparationOptions::single_backend_fixture(),
+    )?;
+    let native_bundle = crate::protocol::native::encode::encode_native_fragment_bundle(
+        &compiled.distributed_plan,
+        &prepared,
+    )?;
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        crate::query_execution::contract::DistributedQueryIntent::Result,
+        &execution,
+    )
+    .map_err(|error| error.to_string())?;
+    state
+        .query_execution
+        .execute(request)
+        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -2787,26 +3024,28 @@ mod tests {
                 .expect("standalone catalog");
             catalog_guard.create_database("db").expect("create db");
             catalog_guard
-                .register("db", table_def)
+                .register("db", table_def.clone())
                 .expect("register target table def");
         }
 
-        let session = crate::engine::StandaloneSession {
-            inner: std::sync::Arc::clone(&state),
-        };
         let sql = format!(
             "SELECT _file, _pos, {apply_key} \
              FROM db.mv_target \
              WHERE {apply_key} IN ('key-a')",
             apply_key = JOIN_APPLY_KEY_COLUMN_NAME
         );
-        let result = match session
-            .execute_in_context(&sql, None, "db", None)
-            .expect("framework SELECT")
-        {
-            crate::engine::StatementResult::Query(result) => result,
-            crate::engine::StatementResult::Ok => panic!("SELECT returned Ok"),
-        };
+        let overlay = framework_locator_query_local_overlay(
+            &state,
+            target_table,
+            "ice",
+            "db",
+            "mv_target",
+            table_def,
+            &TargetPartitionFilter::None,
+        )
+        .expect("framework locator query-local binding");
+        let result =
+            execute_framework_locator_query(&state, "db", &sql, overlay).expect("framework SELECT");
 
         assert_eq!(result.row_count(), 1, "result={result:?}");
         let chunk = result
@@ -3414,7 +3653,9 @@ mod tests {
                 logical_type: None,
             }],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+            source: crate::sql::planner::table::test_sql_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         }
     }
 

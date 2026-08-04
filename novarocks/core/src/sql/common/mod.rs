@@ -15,24 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod change_stream;
+pub mod change_stream;
 #[cfg(feature = "runtime-filter-test-support")]
 pub mod expr;
 #[cfg(not(feature = "runtime-filter-test-support"))]
 pub(crate) mod expr;
 pub(crate) mod imv;
 pub(crate) mod plan_hints;
+pub(crate) mod row_lineage;
 pub(crate) mod schema;
 
 #[allow(unused_imports)]
 pub(crate) use change_stream::{
-    CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind, ChangeStreamRouteKey,
-    DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
+    CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT, ChangeStreamBranchKind,
+    ChangeStreamRouteKey, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
 };
 pub use expr::LiteralValue;
 pub(crate) use expr::{
     BinOp, JoinKind, LambdaParam, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
 pub(crate) use imv::{ImvVersionRef, ImvVersionRole};
-pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn};
+pub(crate) use plan_hints::{ApplyKind, ScanVariantColumn, SqlTopNType};
+pub(crate) use row_lineage::{
+    ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
+};
 pub(crate) use schema::{CteId, OutputColumn};

@@ -49,7 +49,7 @@ use crate::connector::iceberg::position_delete_descriptor::{
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
 use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
@@ -63,6 +63,11 @@ use crate::connector::iceberg::write_service::{
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::mv::refresh_io::query_result_to_chunks;
+use crate::engine::query_planning::write_sink::{
+    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
+    admit_frozen_iceberg_write_target, sql_write_plan_input_for_admitted_target,
+    transform_to_sink_string,
+};
 use crate::engine::write_transaction::{
     IcebergWriteCommitPolicy, IcebergWriteSource, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy,
@@ -72,11 +77,6 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
-use crate::sql::planner::distributed::write::sink::{
-    IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
-    synthetic_iceberg_write_table_id, transform_to_sink_string,
-};
-use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
 use novarocks_spi::connector::{
@@ -140,6 +140,7 @@ pub(crate) fn prepare_iceberg_write(
     target_ref: &str,
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
     prepare_iceberg_write_with_options(
         state,
@@ -152,6 +153,7 @@ pub(crate) fn prepare_iceberg_write(
         execution,
         connector_context,
         IcebergWritePreparationOptions::new(ConnectorWriteOperationId::new()),
+        planning_lease,
     )
 }
 
@@ -169,6 +171,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -241,6 +244,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
         execution,
         connector_context,
         options,
+        planning_lease,
     )
 }
 
@@ -260,10 +264,22 @@ fn prepare_iceberg_distributed_write(
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedIcebergWrite, String> {
     let metadata = table.metadata();
     let (query, sink_spec) =
         build_iceberg_write_plan(target, resolved, insert_columns, source, &table, entry)?;
+    let table_bindings =
+        Arc::new(crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()?);
+    let target_binding =
+        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let sql_write_input = sql_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        None,
+    )?;
 
     let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
     let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
@@ -316,6 +332,8 @@ fn prepare_iceberg_distributed_write(
         target: target.clone(),
         query,
         sink_spec,
+        sql_write_input,
+        table_bindings,
         commit_executor,
         execution,
         connector_context: connector_context.clone(),
@@ -513,7 +531,8 @@ pub(crate) fn activate_iceberg_change_stream_provider_binding_after_session(
 pub(crate) fn activate_iceberg_change_stream_connector_write(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
-    topology: &crate::sql::planner::distributed::write::change_stream::IcebergChangeStreamWriteTopology,
+    topology: &crate::sql::planner::distributed::write::change_stream::SqlChangeStreamWriteTopology,
+    table_bindings: &crate::engine::query_planning::bindings::QueryTableBindingStore,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     entry: &IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
@@ -532,6 +551,7 @@ pub(crate) fn activate_iceberg_change_stream_connector_write(
                 base_snapshot_id,
                 operation_id,
                 topology,
+                table_bindings,
                 commit_executor: Arc::clone(&commit_executor),
             },
         )?;
@@ -849,7 +869,8 @@ impl PreparedIcebergWrite {
             Some(&self.executor.target.catalog),
             &self.executor.target.namespace,
             &self.executor.query,
-            self.executor.sink_spec.clone(),
+            self.executor.sql_write_input.clone(),
+            Arc::clone(&self.executor.table_bindings),
             None,
             crate::sql::compiler::RootDistributionRequirement::Any,
             self.executor.execution.as_ref(),
@@ -879,7 +900,8 @@ impl PreparedIcebergWrite {
             Some(&executor.target.catalog),
             &executor.target.namespace,
             &executor.query,
-            executor.sink_spec,
+            executor.sql_write_input,
+            executor.table_bindings,
             None,
             None,
             execution,
@@ -1020,6 +1042,8 @@ struct PreparedIcebergWriteExecutor {
     target: TargetBackend,
     query: sqlparser::ast::Query,
     sink_spec: IcebergWriteSinkSpec,
+    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<crate::engine::query_planning::bindings::QueryTableBindingStore>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1143,8 +1167,6 @@ pub(crate) fn build_iceberg_write_sink_spec(
     target_columns: Vec<ColumnDef>,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
-    let target_descriptor_columns =
-        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns)?;
     let iceberg_schema = match mode {
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
@@ -1172,17 +1194,6 @@ pub(crate) fn build_iceberg_write_sink_spec(
         serialized_metadata_rows: None,
     };
     let cloud_properties = entry.cloud_properties_map();
-    let target_table = TableDef {
-        name: resolved.table.clone(),
-        columns: target_descriptor_columns,
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: ScanSource::IcebergDataFiles {
-            table: iceberg.clone(),
-            files: Vec::new(),
-            cloud_properties: cloud_properties.clone(),
-            binding: IcebergDataFileBinding::CurrentSnapshot,
-        },
-    };
     let table_location = metadata.location().to_string();
     let data_location = metadata
         .properties()
@@ -1200,8 +1211,6 @@ pub(crate) fn build_iceberg_write_sink_spec(
 
     Ok(IcebergWriteSinkSpec {
         mode,
-        target_table_id: synthetic_iceberg_write_table_id(),
-        target_table,
         iceberg,
         target_columns,
         table_location,
@@ -2096,7 +2105,7 @@ mod tests {
 
     #[test]
     fn branch_write_uses_the_branch_head_as_its_base_snapshot() {
-        let metadata = crate::sql::analyzer::iceberg_ref::test_utils::metadata_with_two_snapshots()
+        let metadata = crate::connector::iceberg::test_metadata::metadata_with_two_snapshots()
             .into_builder(None)
             .set_ref(
                 "dev",

@@ -131,12 +131,20 @@ impl StatisticsEngine for Arc<StandaloneState> {
         target: &StatisticsTableTarget,
     ) -> Result<Vec<StatisticsColumn>, String> {
         let name = object_name_from_parts(&target.name_parts)?;
-        super::query_prep::materialize_external_schema_table_for_statement(
+        if let Some(columns) = super::query_prep::external_schema_columns_for_statement(
             self,
             target.current_catalog.as_deref(),
             &target.current_database,
             &name,
-        )?;
+        )? {
+            return Ok(columns
+                .into_iter()
+                .map(|column| StatisticsColumn {
+                    name: column.name,
+                    data_type: column.data_type,
+                })
+                .collect());
+        }
         table_columns_for_materialized_target(self, &target.current_database, &name)
     }
 
@@ -553,7 +561,9 @@ mod tests {
                             logical_type: None,
                         }],
                         iceberg_row_lineage_metadata_columns: Vec::new(),
-                        source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                        source: crate::sql::planner::table::test_sql_scan_source(
+                            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                        ),
                     },
                 )
                 .expect("register table");

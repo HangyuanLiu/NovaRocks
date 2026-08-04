@@ -224,14 +224,15 @@ fn validate_native_variant_path_column_path(
     idx: usize,
     canonical_path: &str,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
-    let parsed = novarocks::exec::variant::parse_variant_path(canonical_path).map_err(|err| {
-        variant_error(
-            idx,
-            "canonical_path",
-            ProtocolErrorKind::InvalidValue,
-            format!("invalid canonical_path={canonical_path:?}: {err}"),
-        )
-    })?;
+    let parsed =
+        novarocks_types::value::variant::parse_variant_path(canonical_path).map_err(|err| {
+            variant_error(
+                idx,
+                "canonical_path",
+                ProtocolErrorKind::InvalidValue,
+                format!("invalid canonical_path={canonical_path:?}: {err}"),
+            )
+        })?;
     if parsed.segments.is_empty() {
         return Err(variant_error(
             idx,
@@ -243,7 +244,7 @@ fn validate_native_variant_path_column_path(
     if parsed.segments.iter().any(|segment| {
         !matches!(
             segment,
-            novarocks::exec::variant::VariantPathSegment::ObjectKey(_)
+            novarocks_types::value::variant::VariantPathSegment::ObjectKey(_)
         )
     }) {
         return Err(variant_error(

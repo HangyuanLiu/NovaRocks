@@ -19,15 +19,15 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME;
-use crate::mv::persistence::schema::{
-    BaseContract, ExpressionKind, JoinContractKind, MvSchemaContract, QualifiedFieldLineage,
-};
 use crate::sql::analysis::{
     ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
 };
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::ImvVersionRef;
+use crate::sql::compiler::mv_rewrite::{
+    SqlImvBaseContract, SqlImvExpressionKind, SqlImvJoinContract, SqlImvJoinContractKind,
+    SqlImvJoinPredicateLineage, SqlImvQualifiedFieldLineage, SqlImvSchemaContract,
+};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -55,6 +55,7 @@ use crate::sql::planner::logical::{
 };
 use crate::sql::planner::payload::PlanProjectNode;
 use crate::sql::planner::table::ScanSource;
+use crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME;
 
 pub(crate) struct RewriteJoinDeltaRule;
 
@@ -304,7 +305,7 @@ fn inject_join_apply_key(
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
-    let branch_evidence = collect_join_delta_branch_evidence(&plan)?;
+    let branch_evidence = collect_join_delta_branch_evidence(&plan, ext.snapshot.as_ref())?;
     validate_join_descriptor_contract(ext, &branch_evidence)?;
     let join_apply_key_column =
         allocate_imv_output_column(ctx, JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false, true)?;
@@ -342,7 +343,7 @@ fn is_join_refresh_descriptor_candidate_context(ctx: &RewriteContext) -> bool {
         return false;
     };
     ext.annotation.change_stream.join_refresh.is_none()
-        && ext.mv_ctx.schema_contract.aggregate.is_none()
+        && ext.snapshot.schema_contract.aggregate.is_none()
 }
 
 fn propagate_join_refresh_internal_outputs_through_project(
@@ -480,7 +481,7 @@ fn record_join_refresh_descriptor(
         return Ok(());
     }
 
-    let evidence = collect_join_delta_union_evidence(union_plan)?;
+    let evidence = collect_join_delta_union_evidence(union_plan, ext.snapshot.as_ref())?;
     let descriptor = build_join_refresh_descriptor(&ext, evidence)?;
     descriptor.validate()?;
 
@@ -492,11 +493,12 @@ fn record_join_refresh_descriptor(
 
 fn collect_join_delta_union_evidence(
     union_plan: &LogicalPlanNode,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<JoinDeltaUnionEvidence, String> {
     let LogicalPlanKind::Union(union) = &union_plan.kind else {
         return Err("join refresh descriptor expected join delta UnionAll".to_string());
     };
-    let branch_evidence = collect_join_delta_branch_evidence(union_plan)?;
+    let branch_evidence = collect_join_delta_branch_evidence(union_plan, snapshot)?;
     let left_delta_branch = branch_evidence
         .iter()
         .find(|branch| branch.side == JoinRefreshBranchSide::LeftDeltaRightSnapshot)
@@ -533,6 +535,7 @@ fn collect_join_delta_union_evidence(
 
 fn collect_join_delta_branch_evidence(
     union_plan: &LogicalPlanNode,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<Vec<JoinDeltaBranchEvidence>, String> {
     let LogicalPlanKind::Union(union) = &union_plan.kind else {
         return Err("join refresh descriptor expected join delta UnionAll".to_string());
@@ -545,13 +548,16 @@ fn collect_join_delta_branch_evidence(
     let branches = union_plan
         .children
         .iter()
-        .map(join_delta_branch_evidence)
+        .map(|branch| join_delta_branch_evidence(branch, snapshot))
         .collect::<Result<Vec<_>, String>>()?;
     validate_branch_pair(&branches)?;
     Ok(branches)
 }
 
-fn join_delta_branch_evidence(branch: &LogicalPlanNode) -> Result<JoinDeltaBranchEvidence, String> {
+fn join_delta_branch_evidence(
+    branch: &LogicalPlanNode,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+) -> Result<JoinDeltaBranchEvidence, String> {
     let LogicalPlanKind::Project(_) = &branch.kind else {
         return Err("join refresh descriptor expected normalized Project branch".to_string());
     };
@@ -566,8 +572,8 @@ fn join_delta_branch_evidence(branch: &LogicalPlanNode) -> Result<JoinDeltaBranc
         ));
     }
 
-    let left_base = unique_branch_base_identity(join_plan.left(), "left")?;
-    let right_base = unique_branch_base_identity(join_plan.right(), "right")?;
+    let left_base = unique_branch_base_identity(join_plan.left(), "left", snapshot)?;
+    let right_base = unique_branch_base_identity(join_plan.right(), "right", snapshot)?;
     let side = match (left_base.source_kind, right_base.source_kind) {
         (BranchSourceKind::Delta, BranchSourceKind::Version) => {
             JoinRefreshBranchSide::LeftDeltaRightSnapshot
@@ -630,9 +636,10 @@ fn validate_branch_pair(branches: &[JoinDeltaBranchEvidence]) -> Result<(), Stri
 fn unique_branch_base_identity(
     plan: &LogicalPlanNode,
     role: &str,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<PlanBaseIdentity, String> {
     let mut bases = Vec::new();
-    collect_branch_base_identities(plan, &mut bases)?;
+    collect_branch_base_identities(plan, &mut bases, snapshot)?;
     match bases.as_slice() {
         [base] => Ok(base.clone()),
         [] => Err(format!(
@@ -648,20 +655,32 @@ fn unique_branch_base_identity(
 fn collect_branch_base_identities(
     plan: &LogicalPlanNode,
     bases: &mut Vec<PlanBaseIdentity>,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<(), String> {
     match &plan.kind {
         LogicalPlanKind::Scan(scan) => match &scan.table.source {
-            ScanSource::IcebergDeltaTable { table, .. } => {
-                bases.push(plan_base_identity(table, BranchSourceKind::Delta)?);
-            }
-            ScanSource::IcebergVersionTable { table, .. } => {
-                bases.push(plan_base_identity(table, BranchSourceKind::Version)?);
-            }
+            ScanSource::Sql(source) => match source.kind {
+                crate::sql::planner::table::SqlScanKind::Delta { .. } => {
+                    bases.push(plan_base_identity(
+                        source,
+                        BranchSourceKind::Delta,
+                        snapshot,
+                    )?);
+                }
+                crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                    bases.push(plan_base_identity(
+                        source,
+                        BranchSourceKind::Version,
+                        snapshot,
+                    )?);
+                }
+                _ => {}
+            },
             _ => {}
         },
         _ => {
             for child in &plan.children {
-                collect_branch_base_identities(child, bases)?;
+                collect_branch_base_identities(child, bases, snapshot)?;
             }
         }
     }
@@ -669,17 +688,28 @@ fn collect_branch_base_identities(
 }
 
 fn plan_base_identity(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    source: &crate::sql::planner::table::SqlScanSource,
     source_kind: BranchSourceKind,
+    snapshot: &crate::sql::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<PlanBaseIdentity, String> {
-    let table_uuid = table.table_uuid.clone().ok_or_else(|| {
-        format!(
-            "join refresh descriptor requires table uuid for {}.{}.{}",
-            table.catalog, table.namespace, table.table
+    let table_uuid = snapshot
+        .base_snapshot_for_parts(
+            &source.table.catalog,
+            &source.table.namespace,
+            &source.table.table,
         )
-    })?;
+        .map(|base| base.table_uuid.clone())
+        .ok_or_else(|| {
+            format!(
+                "join refresh descriptor requires table uuid for {}.{}.{}",
+                source.table.catalog, source.table.namespace, source.table.table
+            )
+        })?;
     Ok(PlanBaseIdentity {
-        fqn: format!("{}.{}.{}", table.catalog, table.namespace, table.table),
+        fqn: format!(
+            "{}.{}.{}",
+            source.table.catalog, source.table.namespace, source.table.table
+        ),
         table_uuid,
         source_kind,
     })
@@ -689,14 +719,14 @@ fn validate_join_descriptor_contract(
     ext: &ImvExtension,
     branch_evidence: &[JoinDeltaBranchEvidence],
 ) -> Result<(), String> {
-    let mv_ctx = ext.mv_ctx.as_ref();
+    let snapshot = ext.snapshot.as_ref();
     let Some(first) = branch_evidence.first() else {
         return Err("join refresh descriptor requires join delta branch evidence".to_string());
     };
-    let join_contract = mv_ctx.schema_contract.join.as_ref().ok_or_else(|| {
+    let join_contract = snapshot.schema_contract.join.as_ref().ok_or_else(|| {
         "join refresh descriptor requires schema_contract.join lineage".to_string()
     })?;
-    if join_contract.kind != JoinContractKind::InnerEquiJoin {
+    if join_contract.kind != SqlImvJoinContractKind::InnerEquiJoin {
         return Err(format!(
             "join refresh descriptor supports inner equi-join contract only, got {:?}",
             join_contract.kind
@@ -709,9 +739,9 @@ fn validate_join_descriptor_contract(
     }
     validate_actual_bases_in_context(ext, &first.left_base.fqn, &first.right_base.fqn)?;
     let left_base_contract =
-        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &first.left_base.fqn)?;
+        base_contract_for_fqn(&snapshot.schema_contract.bases, &first.left_base.fqn)?;
     let right_base_contract =
-        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &first.right_base.fqn)?;
+        base_contract_for_fqn(&snapshot.schema_contract.bases, &first.right_base.fqn)?;
     build_join_key_pairs(
         join_contract,
         left_base_contract,
@@ -729,17 +759,17 @@ fn validate_actual_bases_in_context(
     left_base_fqn: &str,
     right_base_fqn: &str,
 ) -> Result<(), String> {
-    let base_refs = &ext.mv_ctx.base_refs;
-    if base_refs.len() != 2 {
+    let base_snapshots = &ext.snapshot.base_snapshots;
+    if base_snapshots.len() != 2 {
         return Err(format!(
-            "join refresh descriptor requires exactly two base refs, got {}",
-            base_refs.len()
+            "join refresh descriptor requires exactly two base snapshots, got {}",
+            base_snapshots.len()
         ));
     }
     for fqn in [left_base_fqn, right_base_fqn] {
-        if !base_refs
+        if !base_snapshots
             .iter()
-            .any(|base| base.fqn().eq_ignore_ascii_case(fqn))
+            .any(|base| base.table.fqn().eq_ignore_ascii_case(fqn))
         {
             return Err(format!(
                 "join refresh descriptor actual plan base {fqn} is not in refresh context"
@@ -753,11 +783,11 @@ fn build_join_refresh_descriptor(
     ext: &ImvExtension,
     evidence: JoinDeltaUnionEvidence,
 ) -> Result<JoinRefreshDescriptor, String> {
-    let mv_ctx = ext.mv_ctx.as_ref();
-    let join_contract = mv_ctx.schema_contract.join.as_ref().ok_or_else(|| {
+    let snapshot = ext.snapshot.as_ref();
+    let join_contract = snapshot.schema_contract.join.as_ref().ok_or_else(|| {
         "join refresh descriptor requires schema_contract.join lineage".to_string()
     })?;
-    if join_contract.kind != JoinContractKind::InnerEquiJoin {
+    if join_contract.kind != SqlImvJoinContractKind::InnerEquiJoin {
         return Err(format!(
             "join refresh descriptor supports inner equi-join contract only, got {:?}",
             join_contract.kind
@@ -770,9 +800,9 @@ fn build_join_refresh_descriptor(
     }
     validate_actual_bases_in_context(ext, &evidence.left_base_fqn, &evidence.right_base_fqn)?;
     let left_base_contract =
-        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &evidence.left_base_fqn)?;
+        base_contract_for_fqn(&snapshot.schema_contract.bases, &evidence.left_base_fqn)?;
     let right_base_contract =
-        base_contract_for_fqn(&mv_ctx.schema_contract.bases, &evidence.right_base_fqn)?;
+        base_contract_for_fqn(&snapshot.schema_contract.bases, &evidence.right_base_fqn)?;
     let join_key_pairs = build_join_key_pairs(
         join_contract,
         left_base_contract,
@@ -783,7 +813,7 @@ fn build_join_refresh_descriptor(
         &evidence.right_output_columns,
     )?;
     let payload_columns = build_join_payload_columns(
-        &mv_ctx.schema_contract,
+        &snapshot.schema_contract,
         left_base_contract,
         right_base_contract,
         &evidence.left_base_fqn,
@@ -800,9 +830,9 @@ fn build_join_refresh_descriptor(
     Ok(JoinRefreshDescriptor {
         mode: JoinRefreshMode::Coalesce,
         mv_identity: JoinRefreshMvIdentity {
-            catalog: mv_ctx.target.catalog.clone(),
-            database: mv_ctx.target.namespace.clone(),
-            name: mv_ctx.target.table.clone(),
+            catalog: snapshot.target.catalog.clone(),
+            database: snapshot.target.namespace.clone(),
+            name: snapshot.target.table.clone(),
         },
         left_base_fqn: evidence.left_base_fqn,
         right_base_fqn: evidence.right_base_fqn,
@@ -819,18 +849,18 @@ fn build_join_refresh_descriptor(
 }
 
 fn build_join_payload_columns(
-    schema_contract: &MvSchemaContract,
-    left_base_contract: &BaseContract,
-    right_base_contract: &BaseContract,
+    schema_contract: &SqlImvSchemaContract,
+    left_base_contract: &SqlImvBaseContract,
+    right_base_contract: &SqlImvBaseContract,
     left_base_fqn: &str,
     right_base_fqn: &str,
     left_output_columns: &[OutputColumn],
     right_output_columns: &[OutputColumn],
 ) -> Result<Vec<OutputColumn>, String> {
-    if schema_contract.output.columns.len() != schema_contract.target.visible_columns.len() {
+    if schema_contract.output_columns.len() != schema_contract.target.visible_columns.len() {
         return Err(format!(
             "join refresh descriptor output/target column count mismatch: output has {}, target has {}",
-            schema_contract.output.columns.len(),
+            schema_contract.output_columns.len(),
             schema_contract.target.visible_columns.len()
         ));
     }
@@ -838,13 +868,12 @@ fn build_join_payload_columns(
     let aggregate_contract = schema_contract.aggregate.is_some();
     let mut payload_columns = Vec::new();
     for (idx, (lineage, target)) in schema_contract
-        .output
-        .columns
+        .output_columns
         .iter()
         .zip(schema_contract.target.visible_columns.iter())
         .enumerate()
     {
-        if lineage.expression.kind != ExpressionKind::Column {
+        if lineage.expression.kind != SqlImvExpressionKind::Column {
             if aggregate_contract {
                 continue;
             }
@@ -880,9 +909,9 @@ fn build_join_payload_columns(
 }
 
 fn build_join_key_pairs(
-    join_contract: &crate::mv::persistence::schema::JoinContract,
-    left_base_contract: &BaseContract,
-    right_base_contract: &BaseContract,
+    join_contract: &SqlImvJoinContract,
+    left_base_contract: &SqlImvBaseContract,
+    right_base_contract: &SqlImvBaseContract,
     left_base_fqn: &str,
     right_base_fqn: &str,
     left_output_columns: &[OutputColumn],
@@ -913,10 +942,16 @@ fn build_join_key_pairs(
 }
 
 fn predicate_lineage_for_actual_sides<'a>(
-    predicate: &'a crate::mv::persistence::schema::JoinPredicateLineage,
+    predicate: &'a SqlImvJoinPredicateLineage,
     left_base_fqn: &str,
     right_base_fqn: &str,
-) -> Result<(&'a QualifiedFieldLineage, &'a QualifiedFieldLineage), String> {
+) -> Result<
+    (
+        &'a SqlImvQualifiedFieldLineage,
+        &'a SqlImvQualifiedFieldLineage,
+    ),
+    String,
+> {
     if predicate.left.table_fqn.eq_ignore_ascii_case(left_base_fqn)
         && predicate
             .right
@@ -943,9 +978,9 @@ fn predicate_lineage_for_actual_sides<'a>(
 }
 
 fn base_contract_for_fqn<'a>(
-    bases: &'a [BaseContract],
+    bases: &'a [SqlImvBaseContract],
     table_fqn: &str,
-) -> Result<&'a BaseContract, String> {
+) -> Result<&'a SqlImvBaseContract, String> {
     let matches = bases
         .iter()
         .filter(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
@@ -962,8 +997,8 @@ fn base_contract_for_fqn<'a>(
 }
 
 fn field_name_for_lineage<'a>(
-    base: &'a BaseContract,
-    field: &QualifiedFieldLineage,
+    base: &'a SqlImvBaseContract,
+    field: &SqlImvQualifiedFieldLineage,
 ) -> Result<&'a str, String> {
     if !field.table_fqn.eq_ignore_ascii_case(&base.table_fqn) {
         return Err(format!(
@@ -979,8 +1014,7 @@ fn field_name_for_lineage<'a>(
             ));
         }
     }
-    base.schema_at_create
-        .fields
+    base.fields
         .iter()
         .find(|base_field| base_field.field_id == field.field_id)
         .map(|base_field| base_field.name_at_create.as_str())
@@ -1131,16 +1165,16 @@ fn join_delta_payload_output_columns(
 fn is_iceberg_row_identity_metadata_output(column: &OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_FILE_PATH_COL)
+        .eq_ignore_ascii_case(crate::sql::common::ICEBERG_FILE_PATH_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_POS_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_POS_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
         || column
             .name
-            .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+            .eq_ignore_ascii_case(crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
 pub(crate) fn mark_delta_scan(
@@ -1514,14 +1548,13 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
 mod tests {
     use crate::sql::planner::logical::*;
     use crate::sql::planner::payload::*;
-    use std::collections::BTreeMap;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{IcebergSchemaDef, IcebergTableInfo};
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::common::ImvVersionRef;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -1537,7 +1570,9 @@ mod tests {
     };
     use crate::sql::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::sql::planner::payload::{PlanProjectNode, PlanScanNode};
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use novarocks_catalog::schema::ColumnDef;
 
     #[test]
@@ -1813,7 +1848,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation::default(),
         });
         let plan = LogicalPlanNode::new(
@@ -2213,28 +2248,28 @@ mod tests {
         scan.columns.extend([
             OutputColumn {
                 column_id: ColumnId(first_id + 2),
-                name: crate::exec::row_position::ICEBERG_FILE_PATH_COL.to_string(),
+                name: crate::sql::common::ICEBERG_FILE_PATH_COL.to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 3),
-                name: crate::exec::row_position::ICEBERG_ROW_POS_COL.to_string(),
+                name: crate::sql::common::ICEBERG_ROW_POS_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 4),
-                name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+                name: crate::sql::common::ICEBERG_ROW_ID_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 5),
-                name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+                name: crate::sql::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
                 is_internal: false,
@@ -2255,24 +2290,20 @@ mod tests {
                     name: name.to_string(),
                     columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: ScanSource::IcebergDataFiles {
-                        table: IcebergTableInfo {
+                    source: ScanSource::Sql(SqlScanSource::new(
+                        SqlTableBindingId::new(
+                            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+                            NonZeroU32::new(first_id.max(1)).expect("ordinal"),
+                        ),
+                        SqlTableIdentity {
                             catalog: "ice".to_string(),
                             namespace: "db".to_string(),
                             table: name.to_string(),
-                            table_uuid: Some(format!("uuid-{name}")),
-                            current_snapshot_id: Some(22),
-                            schema_id: 7,
-                            location: format!("file:///tmp/ice/db/{name}"),
-                            schema: IcebergSchemaDef { fields: Vec::new() },
-                            serialized_metadata: None,
-                            serialized_metadata_rows: None,
                         },
-                        files: Vec::new(),
-                        cloud_properties: BTreeMap::new(),
-                        binding:
-                            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-                    },
+                        SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                    )),
                 },
                 alias: None,
                 columns: vec![
@@ -2503,7 +2534,7 @@ mod tests {
 
         let mut ctx = build_ctx();
         let mut ext = ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_aggregate_snapshot(vec![], None, None),
             annotation: ImvPlanAnnotation::default(),
         };
         ext.annotation.change_stream = ImvChangeStreamDescriptor {

@@ -3214,7 +3214,11 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         PartitionKind::Unpartitioned
     ));
     assert!(receiver.partition.exprs.is_empty());
-    assert!(receiver.output_columns.is_empty());
+    assert_eq!(receiver.output_columns.len(), 1);
+    assert_eq!(
+        receiver.output_columns[0].column_id,
+        ColumnId::new_for_test(1)
+    );
     assert_eq!(receiver.output_qualifier, None);
     match &receiver.flavor {
         ExchangeFlavor::TopNSplit {
@@ -3242,6 +3246,7 @@ fn build_distributed_plan_topn_final_split_creates_topn_exchange() {
         edge.output_partition.kind,
         PartitionKind::Unpartitioned
     ));
+    assert_eq!(edge.output_slot_ids, vec![1]);
     let child_fragment = dp
         .fragments()
         .iter()
@@ -3655,7 +3660,9 @@ fn table_def() -> TableDef {
         name: "t".to_string(),
         columns: vec![column_def("k", DataType::Int64, false)],
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::ConnectorPinned,
+        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        ),
     }
 }
 
@@ -3667,7 +3674,9 @@ fn table_def_with_columns(columns: &[OutputColumn]) -> TableDef {
             .map(|column| column_def(&column.name, column.data_type.clone(), column.nullable))
             .collect(),
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::ConnectorPinned,
+        source: crate::sql::compiler::mv_rewrite::test_scan_source(
+            crate::sql::planner::table::SqlScanKind::ConnectorRead,
+        ),
     }
 }
 

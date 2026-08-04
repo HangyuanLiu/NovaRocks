@@ -36,7 +36,7 @@ use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use crate::exec::variant::{
+use novarocks_types::value::variant::{
     VariantValue, is_variant_null, variant_to_bool, variant_to_date_days,
     variant_to_datetime_micros, variant_to_f64, variant_to_i64, variant_to_string,
     variant_to_time_micros,

@@ -73,10 +73,31 @@ pub(crate) fn prepare_mv_select(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<PreparedMvSelect, String> {
+    prepare_mv_select_with_catalog_paths(query, current_catalog, current_database, false)
+}
+
+/// Prepare a materialized-view query for an analyzer that resolves external
+/// tables through the application catalog facade.  Unlike the legacy
+/// local-catalog adapter, this retains three-part identities so each relation
+/// is materialized under its own request-local connector binding.
+pub(crate) fn prepare_mv_select_for_catalog_provider(
+    query: &sqlparser::ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<PreparedMvSelect, String> {
+    prepare_mv_select_with_catalog_paths(query, current_catalog, current_database, true)
+}
+
+fn prepare_mv_select_with_catalog_paths(
+    query: &sqlparser::ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    retain_catalog_paths: bool,
+) -> Result<PreparedMvSelect, String> {
     validate_mv_select_raw_query_clauses(query)?;
     let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
     let mut query_for_analysis = query.clone();
-    if has_three_part_refs(&resolved_refs) {
+    if !retain_catalog_paths && has_three_part_refs(&resolved_refs) {
         crate::sql::parser::query_refs::strip_catalog_from_three_part_names(
             &mut query_for_analysis,
         );
@@ -802,6 +823,26 @@ mod tests {
         assert!(analysis_sql.contains("sales.first"), "{analysis_sql}");
         assert!(analysis_sql.contains("sales.second"), "{analysis_sql}");
         assert!(!analysis_sql.contains("ice.sales"), "{analysis_sql}");
+    }
+
+    #[test]
+    fn sqlx2_mv_catalog_provider_prep_keeps_three_part_identities() {
+        let query = parse_query(
+            "SELECT a.id, b.id FROM Ice.Sales.First a JOIN Other.Sales.Second b ON a.id = b.id",
+        );
+
+        let prepared = prepare_mv_select_for_catalog_provider(&query, Some("ice"), "sales")
+            .expect("prepare query");
+        let analysis_sql = prepared
+            .query_for_analysis()
+            .to_string()
+            .to_ascii_lowercase();
+
+        assert!(analysis_sql.contains("ice.sales.first"), "{analysis_sql}");
+        assert!(
+            analysis_sql.contains("other.sales.second"),
+            "{analysis_sql}"
+        );
     }
 
     #[test]

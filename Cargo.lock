@@ -3396,6 +3396,10 @@ name = "novarocks-types"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
+ "chrono",
+ "roaring 0.10.12",
+ "serde_json",
 ]
 
 [[package]]

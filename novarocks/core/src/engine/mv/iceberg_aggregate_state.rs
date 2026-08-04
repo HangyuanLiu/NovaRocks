@@ -432,7 +432,8 @@ mod tests {
     };
     use crate::mv::aggregate_state::physical_column::starrocks_physical_column;
     use crate::mv::aggregate_state::state_codec::encode_count_state;
-    use crate::mv::model::{AggregateFunctionKind, AggregateStateRole};
+    use crate::mv::model::AggregateStateRole;
+    use crate::sql::mv_refresh::AggregateFunctionKind;
     use novarocks_catalog::schema::SqlType;
 
     fn chunk(batch: RecordBatch) -> crate::exec::chunk::Chunk {

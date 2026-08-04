@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
+use bytes::Bytes;
 use novarocks::common::app_config::ClusterRole;
 use novarocks::engine::insert_engine::{
     IcebergInsertCommit, IcebergInsertOperation, IcebergInsertSource, IcebergPreparedInsert,
@@ -43,6 +44,15 @@ use novarocks_frontend::dml::{
     CommitOpKind, CommitOutcome, CommitServiceError, CreatePreparingRequest, DmlError,
     DmlErrorKind, DmlOperationId, DmlService, OperationFact, OperationJournal, OperationState,
     RecoveryEvidence, StoredOperation,
+};
+use novarocks_spi::connector::{
+    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlPlanningLease,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest,
 };
 use uuid::Uuid;
 
@@ -449,12 +459,114 @@ fn column(name: &str, nullable: bool) -> ColumnDef {
     }
 }
 
+struct InsertTestControl {
+    instance_id: ConnectorInstanceId,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorMetadata for InsertTestControl {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn namespace_exists(
+        &self,
+        _request: ConnectorNamespaceRequest,
+    ) -> Result<bool, ConnectorError> {
+        Err(unused_test_capability())
+    }
+
+    fn table_exists(&self, _request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
+        Err(unused_test_capability())
+    }
+
+    fn list_tables(
+        &self,
+        _request: ConnectorListTablesRequest,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorTableIdentity>, ConnectorError> {
+        Err(unused_test_capability())
+    }
+
+    fn load_table(
+        &self,
+        _request: ConnectorTableRequest,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        Err(unused_test_capability())
+    }
+}
+
+impl ConnectorScanPlanning for InsertTestControl {
+    fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    fn begin_scan(
+        &self,
+        _table: &ConnectorTableHandle,
+        _request: ConnectorBeginScanRequest,
+    ) -> Result<ConnectorScan, ConnectorError> {
+        Err(unused_test_capability())
+    }
+
+    fn plan_splits(
+        &self,
+        _scan: &ConnectorScanHandle,
+        _request: ConnectorSplitPlanningRequest,
+    ) -> Result<novarocks_spi::connector::ConnectorSplitPlanningResult, ConnectorError> {
+        Err(unused_test_capability())
+    }
+}
+
+impl ConnectorExecutionDistribution for InsertTestControl {
+    fn declaration(
+        &self,
+        _context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ConnectorExecutionDeclaration::try_new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                instance_id: self.instance_id.clone(),
+            },
+            self.incarnation,
+            Bytes::from_static(b"insert-service-test"),
+        )
+    }
+}
+
+fn unused_test_capability() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "insert-service test connector capability is unused",
+    )
+}
+
+fn target_planning_lease() -> ConnectorControlPlanningLease {
+    let control = Arc::new(InsertTestControl {
+        instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+    });
+    let binding = ConnectorControlBinding::try_new(
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: control.instance_id.clone(),
+        },
+        control.incarnation,
+        control.clone(),
+        control.clone(),
+        control,
+        None,
+    )
+    .expect("test control binding");
+    ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+}
+
 fn target() -> ResolvedInsertTarget {
     ResolvedInsertTarget {
         catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "t".to_string(),
         columns: vec![column("a", false), column("b", true)],
+        planning_lease: target_planning_lease(),
     }
 }
 

@@ -28,7 +28,7 @@ fn projected_required_column_merge_preserves_unicode_case_deduplication() {
 }
 
 #[test]
-fn version_scan_without_required_columns_reads_only_mappable_outputs_immutably() {
+fn version_scan_without_required_columns_rejects_unmaterializable_planner_output() {
     let mut root = scan_node(37, IcebergDataFileBinding::ExplicitFiles);
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         panic!("test root must be a scan");
@@ -36,36 +36,28 @@ fn version_scan_without_required_columns_reads_only_mappable_outputs_immutably()
     scan.required_columns = None;
     scan.columns
         .push(column(99, "stale_planner_only", DataType::Utf8, true));
-    scan.table.source = ScanSource::IcebergVersionTable {
-        table: iceberg_table(),
-        snapshot_id: 6,
-    };
+    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+        crate::sql::planner::table::SqlScanKind::Data {
+            version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(6),
+        },
+    );
     let plan = plan(root);
     let before = format!("{plan:#?}");
     let resolver = StaticResolver {
         execution: resolved_files(vec![data_file("s3://bucket/version-6.parquet")]),
     };
 
-    let bindings = prepare_scan_bindings(
+    let error = match prepare_scan_bindings(
         &plan,
         &registry(vec![data_file("s3://bucket/version-6.parquet")]),
         Some(&resolver),
-    )
-    .expect("prepare version scan");
-    let binding = bindings.binding(37).expect("version binding");
+    ) {
+        Ok(_) => panic!("unmaterializable planner column must fail before submission"),
+        Err(error) => error,
+    };
 
-    assert_eq!(binding.physical_columns.len(), 1);
-    assert_eq!(
-        binding.physical_columns[0].planner.column_id,
-        ColumnId::new_for_test(1)
-    );
-    assert_eq!(binding.physical_columns[0].source.name, "id");
-    assert_eq!(binding.required_reads.len(), 1);
-    assert_eq!(binding.required_reads[0].source.name, "id");
-    assert_eq!(
-        binding.required_reads[0].planner_column_id,
-        Some(ColumnId::new_for_test(1))
-    );
+    assert!(error.contains("node_id=37"), "{error}");
+    assert!(error.contains("stale_planner_only"), "{error}");
     assert_eq!(format!("{plan:#?}"), before);
 }
 
@@ -97,15 +89,14 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
         column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
-    scan.table.source = ScanSource::IcebergMvTargetLocator(
-        crate::sql::planner::table::IcebergMvTargetLocatorScan {
-            catalog: "test_catalog".to_string(),
-            database: "test_db".to_string(),
-            table: "test_table".to_string(),
-            target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-            target_snapshot_id: Some(6),
-            apply_key_column: "id".to_string(),
-            branch_id_column: None,
+    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+        crate::sql::planner::table::SqlScanKind::MvTargetLocator {
+            facts: crate::sql::planner::table::SqlMvTargetLocatorScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(6),
+                apply_key_column: "id".to_string(),
+                branch_id_column: None,
+            },
         },
     );
     let resolver = StaticResolver {
@@ -186,27 +177,27 @@ fn target_state_projection_keeps_declared_columns_and_row_lineage_ids() {
         column(13, ICEBERG_ROW_ID_COL, DataType::Int64, false),
         column(14, ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
     ];
-    scan.table.source =
-        ScanSource::IcebergMvTargetState(crate::sql::planner::table::IcebergMvTargetStateScan {
-            catalog: "test_catalog".to_string(),
-            database: "test_db".to_string(),
-            table: "test_table".to_string(),
-            target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
-            target_snapshot_id: Some(6),
-            aggregate_state_layout_version: 1,
-            columns: scan.table.columns.clone(),
-            group_key_names: vec!["id".to_string()],
-            aggregate_state_names: vec!["agg".to_string()],
-            physical_column_names: vec!["id".to_string(), "agg".to_string()],
-            row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
-            row_filter:
-                crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
-                    row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
-                    branch_scope: None,
-                },
-            partition_constraint:
-                crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
-        });
+    scan.table.source = crate::sql::planner::table::test_sql_scan_source(
+        crate::sql::planner::table::SqlScanKind::MvTargetState {
+            facts: crate::sql::planner::table::SqlMvTargetStateScan {
+                target_table_uuid: "00000000-0000-0000-0000-000000000001".to_string(),
+                target_snapshot_id: Some(6),
+                aggregate_state_layout_version: 1,
+                columns: scan.table.columns.clone(),
+                group_key_names: vec!["id".to_string()],
+                aggregate_state_names: vec!["agg".to_string()],
+                physical_column_names: vec!["id".to_string(), "agg".to_string()],
+                row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
+                row_filter:
+                    crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                        row_id_column_name: ICEBERG_ROW_ID_COL.to_string(),
+                        branch_scope: None,
+                    },
+                partition_constraint:
+                    crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
+            },
+        },
+    );
     let resolver = StaticResolver {
         execution: resolved_files(vec![data_file("s3://bucket/target-state-6.parquet")]),
     };
@@ -293,18 +284,6 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
         panic!("test root must be a scan");
     };
     scan.table.columns = vec![source_column("v", DataType::LargeBinary, false)];
-    let ScanSource::IcebergDataFiles { table, .. } = &mut scan.table.source else {
-        panic!("expected Iceberg data-file source");
-    };
-    table.schema.fields = vec![IcebergSchemaFieldDef {
-        field_id: 101,
-        name: "v".to_string(),
-        initial_default: None,
-        write_default: None,
-        initial_default_json: None,
-        write_default_json: None,
-        children: Vec::new(),
-    }];
     scan.columns = vec![
         column(1, "v", DataType::LargeBinary, false),
         OutputColumn {

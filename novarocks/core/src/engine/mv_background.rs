@@ -23,16 +23,17 @@ use std::sync::Arc;
 use crate::engine::StandaloneState;
 use crate::engine::mv::refresh_io::{load_current_iceberg_base_table, parse_iceberg_table_refs};
 use crate::engine::table_maintenance::MaintenanceTarget;
+use crate::mv::application::{
+    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
+    PreparedMvRefresh,
+};
 use crate::mv::background::{
     MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
     MvRefreshStep,
 };
 use crate::mv::dependency::model::iceberg_mv_dependency_ref;
 use crate::mv::model::{MvStorageEngine, MvTarget};
-use crate::sql::mv_refresh::{
-    MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
-    MvRefreshStatement, PreparedMvRefresh,
-};
+use crate::sql::mv_refresh::MvRefreshStatement;
 use novarocks_spi::connector::ConnectorRequestContext;
 
 #[derive(Clone)]

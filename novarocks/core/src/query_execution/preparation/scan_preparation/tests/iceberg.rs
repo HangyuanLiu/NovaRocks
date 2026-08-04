@@ -130,30 +130,98 @@ fn metadata_scan_uses_native_sentinel_range() {
     };
     assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
     assert!(file.use_iceberg_jni_metadata_reader);
+}
 
+#[test]
+fn sqlx2_scan_metadata_recovers_exact_request_local_materialization() {
     let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let mut table = iceberg_table();
+    table.serialized_metadata = Some("{}".to_string());
+    let store = crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
+        .expect("query binding store");
+    let token = store
+        .resolve_or_insert_with_id(
+            crate::engine::query_planning::bindings::QueryTableBindingKey::metadata(
+                "test_catalog",
+                "test_db",
+                "test_table",
+                crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+            ),
+            |binding| {
+                let source = ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+                    binding,
+                    crate::sql::planner::table::SqlTableIdentity {
+                        catalog: "test_catalog".to_string(),
+                        namespace: "test_db".to_string(),
+                        table: "test_table".to_string(),
+                    },
+                    crate::sql::planner::table::SqlScanKind::Metadata {
+                        kind: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                        version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+                    },
+                ));
+                let planner = TableDef {
+                    name: "test_table".to_string(),
+                    columns: vec![source_column("snapshot_id", DataType::Int64, false)],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source,
+                };
+                Ok(crate::engine::query_planning::bindings::QueryTableBinding {
+                    resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
+                        Some("test_catalog"),
+                        "test_db",
+                        planner,
+                    ),
+                    statistics_pin: None,
+                    planning_lease: None,
+                    scan_materialization: Some(
+                        crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergMetadata {
+                            table: table.clone(),
+                            metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                            serialized_table: "{}".to_string(),
+                            metadata_payload: None,
+                        },
+                    ),
+                    frozen_snapshot_files: std::collections::BTreeMap::new(),
+                    delta_runtime_plans: std::collections::BTreeMap::new(),
+                })
+            },
+        )
+        .expect("metadata token");
     replace_scan_source(
         &mut root,
-        ScanSource::IcebergMetadataTable {
-            table: iceberg_table(),
-            metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType::Snapshots,
-            serialized_table: "{}".to_string(),
-            cloud_properties: BTreeMap::new(),
-            metadata_payload: None,
-        },
+        ScanSource::Sql(crate::sql::planner::table::SqlScanSource::new(
+            token,
+            crate::sql::planner::table::SqlTableIdentity {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "test_table".to_string(),
+            },
+            crate::sql::planner::table::SqlScanKind::Metadata {
+                kind: crate::sql::planner::table::SqlMetadataTableKind::Snapshots,
+                version: crate::sql::planner::table::SqlTableVersionSelector::Current,
+            },
+        )),
     );
 
-    let bindings = prepare_scan_bindings(&plan(root), &ConnectorRegistry::new(), None)
-        .expect("prepare metadata scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("metadata ranges");
+    let controls = crate::connector::FixtureControlResolver::new(ConnectorRegistry::new());
+    let bindings = super::super::prepare_scan_bindings(
+        &plan(root),
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    )
+    .expect("prepare token-bound metadata scan");
 
-    assert_eq!(ranges.len(), 1);
-    let crate::runtime::scan_range::ScanRange::File(file) = &ranges[0].range else {
-        panic!("expected metadata file range");
-    };
-    assert_eq!(file.full_path.as_deref(), Some("iceberg-metadata"));
-    assert!(file.use_iceberg_jni_metadata_reader);
-    assert!(bindings.binding(10).is_none());
+    assert!(matches!(
+        &bindings.binding(10).expect("prepared binding").execution,
+        ResolvedScanExecution::IcebergMetadata(metadata)
+            if metadata.table.current_snapshot_id == Some(7)
+                && metadata.serialized_table == "{}"
+    ));
+    assert!(bindings.scan_ranges(0, 10).is_some());
 }
 
 #[test]
@@ -200,11 +268,12 @@ fn delta_scan_uses_opaque_connector_read() {
     let mut root = scan_node(40, IcebergDataFileBinding::ExplicitFiles);
     replace_scan_source(
         &mut root,
-        ScanSource::IcebergDeltaTable {
-            table: iceberg_table(),
-            from_snapshot_id: 6,
-            to_snapshot_id: 7,
-        },
+        crate::sql::planner::table::test_sql_scan_source(
+            crate::sql::planner::table::SqlScanKind::Delta {
+                from_snapshot_id: 6,
+                to_snapshot_id: 7,
+            },
+        ),
     );
     let resolver = StaticResolver {
         execution: resolved_data_delta(),
@@ -257,6 +326,99 @@ fn explicit_files_plan_opaque_connector_splits() {
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].split_id(), "fixture-0");
     assert_eq!(planned.splits[0].owner().as_str(), "test_catalog");
+}
+
+#[test]
+fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
+    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    };
+    let plan = plan(root);
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
+        "s3://bucket/current.parquet",
+    )]));
+    let store = fixture_query_table_bindings_with_materialized_files(
+        &plan,
+        &controls,
+        vec![data_file("s3://bucket/snapshot-11.parquet")],
+    );
+    let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
+        panic!("fixture root must remain a scan");
+    };
+    let ScanSource::Sql(source) = &scan.table.source;
+    let selected = store
+        .frozen_snapshot_materialization(source.binding, 11)
+        .expect("select admitted snapshot files");
+    let crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
+        files,
+        ..
+    } = selected
+    else {
+        panic!("frozen snapshot must retain data-file materialization");
+    };
+
+    assert_eq!(
+        files[0].path, "s3://bucket/snapshot-11.parquet",
+        "FrozenInputSet must not fall back to the binding's current materialization"
+    );
+    super::super::prepare_scan_bindings(
+        &plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    )
+    .expect("prepare selected frozen snapshot scan");
+}
+
+#[test]
+fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
+    let mut root = scan_node(10, IcebergDataFileBinding::ExplicitFiles);
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must be a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(11),
+    };
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
+        "s3://bucket/current.parquet",
+    )]));
+    let store = fixture_query_table_bindings_with_materialized_files(
+        &plan(root.clone()),
+        &controls,
+        vec![data_file("s3://bucket/snapshot-11.parquet")],
+    );
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        panic!("fixture root must remain a scan");
+    };
+    let ScanSource::Sql(source) = &mut scan.table.source;
+    source.kind = crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+        version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(12),
+    };
+    let plan = plan(root);
+
+    let error = match super::super::prepare_scan_bindings(
+        &plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&store),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    ) {
+        Ok(_) => panic!("unadmitted frozen snapshot must fail before split planning"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("snapshot 12 has no admitted file set"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -353,4 +515,62 @@ fn unsupported_predicate_does_not_guess_pruning() {
         format!("{:?}", vec![unsupported_id_predicate()])
     );
     assert_eq!(read.splits.len(), 2);
+}
+
+#[test]
+fn sqlx2_mv_target_state_uses_only_frozen_allow_list_files() {
+    use std::collections::BTreeSet;
+
+    use crate::mv::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
+    use crate::mv::persistence::schema::{
+        MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+    };
+
+    let mut selected = identity_partition_file("s3://bucket/selected.parquet", 7);
+    selected.partition_spec_id = Some(3);
+    let mut skipped = identity_partition_file("s3://bucket/skipped.parquet", 9);
+    skipped.partition_spec_id = Some(3);
+    let allow_key = MvPartitionKey::new(
+        3,
+        vec![MvPartitionKeyField::new(
+            "id".to_string(),
+            MvPartitionValue::String("7".to_string()),
+        )],
+    );
+    let contract = MvPartitionContract {
+        target_spec_id: 3,
+        fields: vec![MvPartitionFieldContract {
+            partition_field_id: 100,
+            partition_field_name: "id".to_string(),
+            source_target_field_id: 1,
+            source_column_name: "id".to_string(),
+            transform: MvPartitionTransformContract::Identity,
+        }],
+    };
+
+    let files = super::super::filter_frozen_mv_target_state_files(
+        vec![selected, skipped],
+        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::from([allow_key])),
+        Some(&contract),
+        42,
+    )
+    .expect("frozen target-state files should be deterministically pruned");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "s3://bucket/selected.parquet");
+}
+
+#[test]
+fn sqlx2_mv_target_state_empty_allow_list_reads_no_frozen_files() {
+    use std::collections::BTreeSet;
+
+    let files = super::super::filter_frozen_mv_target_state_files(
+        vec![data_file("s3://bucket/target.parquet")],
+        &crate::mv::model::TargetPartitionFilter::AllowList(BTreeSet::new()),
+        None,
+        43,
+    )
+    .expect("an empty admitted allow-list is a zero-file scan");
+
+    assert!(files.is_empty());
 }

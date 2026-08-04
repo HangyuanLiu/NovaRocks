@@ -740,19 +740,19 @@ fn is_join_refresh_action_column(column: &crate::sql::analysis::OutputColumn) ->
     column.is_internal
         && column
             .name
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .eq_ignore_ascii_case(crate::sql::common::CHANGE_OP_COLUMN)
 }
 
 fn is_join_refresh_apply_key_column(column: &crate::sql::analysis::OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME)
+        .eq_ignore_ascii_case(crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME)
 }
 
 fn is_join_refresh_row_id_column(column: &crate::sql::analysis::OutputColumn) -> bool {
     column
         .name
-        .eq_ignore_ascii_case(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+        .eq_ignore_ascii_case(crate::sql::common::ICEBERG_ROW_ID_COL)
 }
 
 fn tag_intersect(
@@ -1109,7 +1109,9 @@ mod tests {
                 },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::ConnectorPinned,
+            source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                crate::sql::planner::table::SqlScanKind::ConnectorRead,
+            ),
         };
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "d".to_string(),
@@ -1636,19 +1638,19 @@ mod tests {
         let arena_rc = make_arena();
         let mut action = make_output_column(
             ColumnId::new_for_test(14),
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
         );
         action.data_type = DataType::Int8;
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(15),
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = true;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         row_id.data_type = DataType::Int64;
         row_id.is_internal = true;
@@ -1697,25 +1699,25 @@ mod tests {
         let arena_rc = make_arena();
         let mut action = make_output_column(
             ColumnId::new_for_test(14),
-            crate::exec::change_op::CHANGE_OP_COLUMN,
+            crate::sql::common::CHANGE_OP_COLUMN,
         );
         action.data_type = DataType::Int8;
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(20),
-            crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+            crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
         join_apply_key.data_type = DataType::Utf8;
         join_apply_key.is_internal = false;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         row_id.data_type = DataType::Int64;
         row_id.is_internal = true;
         let mut branch_row_id = make_output_column(
             ColumnId::new_for_test(91),
-            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+            crate::sql::common::ICEBERG_ROW_ID_COL,
         );
         branch_row_id.data_type = DataType::Int64;
         branch_row_id.is_internal = true;
@@ -2588,7 +2590,9 @@ mod tests {
                         logical_type: None,
                     }],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::planner::table::ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 },
                 alias: None,
                 stats_ref: None,

@@ -49,7 +49,7 @@ pub const TRUNCATE_KIND: &str = "truncate";
 const RECEIPT_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"novarocks.connector-data-mutation.receipt-payload.v1\0";
 
-// Design: ADR-0033 (docs/adr/ADR-0033-frontend-add-files-source-ownership.md)
+// Design: ADR-0035 (docs/adr/ADR-0035-frontend-add-files-source-ownership.md)
 /// Provider-calculated, secret-free physical ownership scope for a bounded
 /// existing-files plan.  It deliberately contains no operation, target, or
 /// connector-instance identity, so the frontend can protect one physical

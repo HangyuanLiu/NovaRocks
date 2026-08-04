@@ -26,9 +26,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::engine::StandaloneState;
 use crate::engine::mv::lifecycle::MvListRow;
-use crate::engine::query_prep::drop_local_table_registration_if_exists;
 use crate::meta::MetaReadTxn;
-use crate::mv::analysis::{MvAnalysis, ResolvedTableRef, analyze_mv_select_with};
+use crate::mv::analysis::{MvAnalysis, finish_mv_analysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
 use crate::mv::persistence::refresh::MvRefreshState;
@@ -308,68 +307,19 @@ pub(crate) fn analyze_mv_select_with_connector_context(
     query: &sqlparser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<MvAnalysis, String> {
-    analyze_mv_select_with(
-        query,
+    let prepared =
+        prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
+    let catalog_service = crate::engine::catalog_service_snapshot(state);
+    let provider = crate::engine::build_catalog_service_provider(
         current_catalog,
-        current_database,
-        |resolved_refs| {
-            register_iceberg_tables_for_mv_analysis(state, resolved_refs, connector_context)
-        },
-        |query_for_analysis| {
-            let catalog = state
-                .catalog_service
-                .local()
-                .read()
-                .expect("standalone catalog read lock");
-            let (resolved, _, _factory) =
-                crate::sql::analyzer::analyze(query_for_analysis, &*catalog, current_database)?;
-            drop(catalog);
-            Ok(resolved)
-        },
-    )
-}
-
-fn register_iceberg_tables_for_mv_analysis(
-    state: &Arc<StandaloneState>,
-    resolved_refs: &[ResolvedTableRef],
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
-    let connectors = state
-        .connectors
-        .read()
-        .expect("standalone connector registry read lock")
-        .clone();
-
-    for table_ref in resolved_refs {
-        let ResolvedTableRef::Iceberg {
-            catalog,
-            namespace,
-            table,
-        } = table_ref
-        else {
-            continue;
-        };
-        drop_local_table_registration_if_exists(state, namespace, table)?;
-        let (mut table_def, _, _) = crate::connector::iceberg::provider::load_table_def_at(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            catalog,
-            namespace,
-            table,
-            None,
-            false,
-        )
-        .map_err(|err| format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}"))?;
-        table_def.name = table.clone();
-        let mut local_catalog = state
-            .catalog_service
-            .local()
-            .write()
-            .map_err(|e| format!("standalone catalog write lock: {e}"))?;
-        local_catalog.create_database(namespace)?;
-        local_catalog.register(namespace, table_def)?;
-    }
-    Ok(())
+        &catalog_service,
+        state.connector_control.as_ref(),
+        connector_context.clone(),
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+    let (resolved, _, _) =
+        crate::sql::analyzer::analyze(prepared.query_for_analysis(), &provider, current_database)?;
+    Ok(finish_mv_analysis(prepared, resolved))
 }
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {

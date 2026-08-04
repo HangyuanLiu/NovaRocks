@@ -23,7 +23,10 @@
 //! flows from plan-time manifest derivation, so this rule never changes the
 //! plan and never fails the rewrite.
 
-use crate::mv::partition::derivation::resolve_partition_derivation_spec;
+use crate::sql::compiler::mv_rewrite::{
+    SqlImvExpressionKind, SqlImvPartitionDerivationField, SqlImvPartitionDerivationSpec,
+    SqlImvPartitionTransform, SqlImvSchemaContract,
+};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -58,25 +61,13 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
             .ok_or("DerivePartitionSpec requires ImvExtension")?
             .clone();
 
-        let outcome = match resolve_partition_derivation_spec(&ext.mv_ctx.schema_contract) {
+        let outcome = match resolve_partition_derivation_spec(&ext.snapshot.schema_contract) {
             Ok(None) => ImvPartitionAnnotation::Unpartitioned,
             Ok(Some(spec)) => ImvPartitionAnnotation::Derivable { specs: vec![spec] },
             Err(err) => ImvPartitionAnnotation::NotDerivable {
                 reason: err.to_string(),
             },
         };
-
-        tracing::info!(
-            event = "iceberg_mv.partition_derivation",
-            mv_id = ext.mv_ctx.mv_id,
-            outcome = match &outcome {
-                ImvPartitionAnnotation::Unpartitioned => "unpartitioned",
-                ImvPartitionAnnotation::Derivable { .. } => "derivable",
-                ImvPartitionAnnotation::NotDerivable { .. } => "not_derivable",
-            },
-            reason = outcome_reason(&outcome),
-            "IMV partition derivation spec resolved"
-        );
 
         let mut annotation = ext.annotation.clone();
         annotation.partition = Some(outcome);
@@ -85,11 +76,65 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
     }
 }
 
-fn outcome_reason(outcome: &ImvPartitionAnnotation) -> &str {
-    match outcome {
-        ImvPartitionAnnotation::NotDerivable { reason } => reason.as_str(),
-        _ => "",
+/// Resolve an admitted SQL MV contract into plan-time partition facts.  This
+/// deliberately preserves the historical warn-and-skip behaviour: malformed
+/// contracts become `NotDerivable` annotations rather than rewrite failures.
+fn resolve_partition_derivation_spec(
+    contract: &SqlImvSchemaContract,
+) -> Result<Option<SqlImvPartitionDerivationSpec>, String> {
+    let Some(partition) = contract.target.partition.as_ref() else {
+        return Ok(None);
+    };
+    if partition.fields.is_empty() {
+        return Ok(None);
     }
+    let mut fields = Vec::with_capacity(partition.fields.len());
+    for partition_field in &partition.fields {
+        let output_index = contract
+            .target
+            .visible_columns
+            .iter()
+            .position(|column| column.target_field_id == partition_field.source_target_field_id)
+            .ok_or_else(|| {
+                format!(
+                    "aggregate target partition field {} has no visible column for target field id {}",
+                    partition_field.partition_field_name, partition_field.source_target_field_id
+                )
+            })?;
+        let lineage = contract.output_columns.get(output_index).ok_or_else(|| {
+            format!(
+                "aggregate target partition field {} has no output lineage",
+                partition_field.partition_field_name
+            )
+        })?;
+        let is_single_base_column = lineage.expression.kind == SqlImvExpressionKind::Column
+            && lineage.expression.referenced_base_field_ids.len() == 1;
+        let is_join_column = lineage.expression.kind == SqlImvExpressionKind::Column
+            && lineage.expression.referenced_base_field_ids.is_empty()
+            && lineage.expression.referenced_base_fields.len() == 1;
+        if !is_single_base_column && !is_join_column {
+            return Err(format!(
+                "aggregate target partition field {} requires pure column lineage",
+                partition_field.partition_field_name
+            ));
+        }
+        if partition_field.transform == SqlImvPartitionTransform::Void {
+            return Err(format!(
+                "aggregate target partition field {} uses unsupported void transform",
+                partition_field.partition_field_name
+            ));
+        }
+        fields.push(SqlImvPartitionDerivationField {
+            partition_field_name: partition_field.partition_field_name.clone(),
+            source_target_field_id: partition_field.source_target_field_id,
+            output_index,
+            transform: partition_field.transform.clone(),
+        });
+    }
+    Ok(Some(SqlImvPartitionDerivationSpec {
+        target_spec_id: partition.target_spec_id,
+        fields,
+    }))
 }
 
 #[cfg(test)]
@@ -97,7 +142,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::mv::rewrite::context::tests_support::dummy_rewrite_context;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, ValuesOp};
@@ -114,7 +158,7 @@ mod tests {
         let descriptor = valid_join_refresh_descriptor();
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_extension::<ImvExtension>(ImvExtension {
-            mv_ctx: dummy_rewrite_context(),
+            snapshot: crate::sql::compiler::mv_rewrite::test_incremental_snapshot(),
             annotation: ImvPlanAnnotation {
                 partition: None,
                 change_stream: ImvChangeStreamDescriptor {
@@ -160,14 +204,14 @@ mod tests {
             right_row_id_column: out(2, "_row_id", DataType::Int64, false, true),
             action_column: out(
                 3,
-                crate::exec::change_op::CHANGE_OP_COLUMN,
+                crate::sql::common::CHANGE_OP_COLUMN,
                 DataType::Int8,
                 false,
                 true,
             ),
             join_apply_key_column: out(
                 4,
-                crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                 DataType::Utf8,
                 false,
                 true,
@@ -185,7 +229,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         9,
-                        crate::exec::change_op::CHANGE_OP_COLUMN,
+                        crate::sql::common::CHANGE_OP_COLUMN,
                         DataType::Int8,
                         false,
                         true,
@@ -195,7 +239,7 @@ mod tests {
                 JoinRefreshOutputMapping {
                     mv_output_column: out(
                         10,
-                        crate::mv::persistence::schema::JOIN_APPLY_KEY_COLUMN_NAME,
+                        crate::sql::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                         DataType::Utf8,
                         false,
                         true,

@@ -139,8 +139,9 @@ pub(crate) enum Relation {
     /// IVM-A1 plan-time delta scan: `__nr_ivm_delta('cat.ns.tbl', from, to)`.
     /// Produced by the analyzer when it recognizes the `__nr_ivm_delta`
     /// table function. Lowered by the planner into a regular `Scan` over a
-    /// synthetic `TableDef` whose storage is `ScanSource::IcebergDeltaTable`,
-    /// and emitted by codegen as `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
+    /// synthetic `TableDef` whose source is a token-bound
+    /// `SqlScanSource::Delta` fact, and emitted by codegen as
+    /// `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`.
     IcebergDeltaScan(IcebergDeltaScanRelation),
     /// A subquery in FROM: `(SELECT ...) AS alias`.
     Subquery {
@@ -200,7 +201,7 @@ pub(crate) struct IcebergMetadataScanRelation {
     /// The underlying iceberg table being inspected.
     pub database: String,
     pub table: TableDef,
-    pub metadata_table_type: crate::connector::iceberg::IcebergMetadataTableType,
+    pub metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
     /// FROM-clause alias (e.g., `t$snapshots AS s` → `Some("s")`).
     pub alias: Option<String>,
     /// Analyzer-allocated ColumnIds for each metadata column, in schema order.
@@ -213,8 +214,8 @@ pub(crate) struct IcebergMetadataScanRelation {
 /// `__nr_ivm_delta('cat.ns.tbl', from_snap, to_snap)` table function call.
 /// Carries the base table's `TableDef` (with v3 row-lineage metadata
 /// columns already populated by the catalog) so the planner can emit a
-/// synthetic `LogicalPlanKind::Scan` whose storage tag dispatches codegen to
-/// `ICEBERG_DELTA_SCAN_NODE`.
+/// synthetic `LogicalPlanKind::Scan` whose token-bound source dispatches
+/// codegen to `ICEBERG_DELTA_SCAN_NODE`.
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaScanRelation {
     /// Three-part identifier of the base Iceberg table.

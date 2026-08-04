@@ -1,5 +1,5 @@
 ---
-id: ADR-0032
+id: ADR-0034
 title: "Change-stream layout and provider ownership"
 domain: [frontend-dml]
 status: active
@@ -20,7 +20,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-ADR-0031 已将 UPDATE/MERGE 的 statement admission、durable intent 与 terminal lifecycle 固定在 frontend。change-stream 本身不是新的 statement application use case：它由 SQL 产出 immutable writer topology，由 Iceberg Connector 解读 sink、writer handle 与 staged reports。ADR-0023 的 operation/cohort/execution/writer identity 仍是 exact session 的唯一提交依据。
+ADR-0033 已将 UPDATE/MERGE 的 statement admission、durable intent 与 terminal lifecycle 固定在 frontend。change-stream 本身不是新的 statement application use case：它由 SQL 产出 immutable writer topology，由 Iceberg Connector 解读 sink、writer handle 与 staged reports。ADR-0023 的 operation/cohort/execution/writer identity 仍是 exact session 的唯一提交依据。
 
 过去的 engine helper 同时绑定 output ordinal、DV frozen facts、commit routing 和 lazy control service，导致 mutation 与 MV 都依赖同一 application-private helper，并可能让 planner topology 与 provider terminal handles 分别派生。
 

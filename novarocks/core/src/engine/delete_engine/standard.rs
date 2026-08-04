@@ -68,11 +68,15 @@ use crate::engine::delete_engine::{
     DeleteOperation, PreparedDelete, PreparedDeleteExecution, has_iceberg_staged_output,
     prepared_delete,
 };
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
+use crate::engine::query_planning::write_sink::{
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
+    sql_write_plan_input_for_admitted_target,
+};
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
-use crate::sql::planner::distributed::write::sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_spi::connector::{ConnectorWriteIntent, ConnectorWriteOperationId};
 
@@ -115,6 +119,10 @@ pub(crate) fn prepare_delete_statement(
             target.backend_name
         ));
     }
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        state.connector_control.as_ref(),
+        &target.catalog,
+    )?;
 
     // 2. Build iceberg-rust catalog handle + load table.
     let entry = {
@@ -175,20 +183,18 @@ pub(crate) fn prepare_delete_statement(
             &stmt.where_clause,
             execution.clone(),
             connector_context,
+            planning_lease,
         );
     }
 
-    let resolved = {
-        crate::connector::metadata_load_table(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?
-        .0
-    };
+    let resolved = crate::connector::metadata_load_table_with_planning_lease(
+        planning_lease.clone(),
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
     let sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         &target, &resolved, &table, &entry,
     )?;
@@ -230,6 +236,7 @@ pub(crate) fn prepare_delete_statement(
         sink_spec,
         execution.clone(),
         connector_context,
+        planning_lease,
     )
 }
 
@@ -237,7 +244,8 @@ struct DistributedDeleteWriteExecutor {
     state: Arc<StandaloneState>,
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
-    sink_spec: IcebergWriteSinkSpec,
+    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<QueryTableBindingStore>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -251,7 +259,8 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             Some(&self.target.catalog),
             &self.target.namespace,
             &self.delete_query,
-            self.sink_spec.clone(),
+            self.sql_write_input.clone(),
+            Arc::clone(&self.table_bindings),
             None,
             crate::sql::compiler::RootDistributionRequirement::Any,
             Some(&self.execution),
@@ -287,7 +296,8 @@ struct DistributedDvDeleteWriteExecutor {
     state: Arc<StandaloneState>,
     target: TargetBackend,
     delete_query: sqlparser::ast::Query,
-    sink_spec: IcebergWriteSinkSpec,
+    sql_write_input: crate::sql::planner::distributed::write::contract::SqlWritePlanInput,
+    table_bindings: Arc<QueryTableBindingStore>,
     commit_executor: Arc<IcebergWriteCommitExecutor>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -301,7 +311,8 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
             Some(&self.target.catalog),
             &self.target.namespace,
             &self.delete_query,
-            self.sink_spec.clone(),
+            self.sql_write_input.clone(),
+            Arc::clone(&self.table_bindings),
             None,
             crate::engine::iceberg_write_shuffle_by_output_index(0),
             Some(&self.execution),
@@ -345,23 +356,31 @@ fn prepare_delete_dv_write(
     where_clause: &sqlast::Expr,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedDelete, String> {
-    let resolved = {
-        crate::connector::metadata_load_table(
-            state.connector_control.as_ref(),
-            connector_context.clone(),
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )?
-        .0
-    };
+    let resolved = crate::connector::metadata_load_table_with_planning_lease(
+        planning_lease.clone(),
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?
+    .0;
     let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
         target, &resolved, &table, &entry,
     )?;
     sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
     sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
+    let target_binding =
+        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let sql_write_input = sql_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
+        None,
+    )?;
     let delete_query = build_delete_position_sink_query(
         target,
         where_clause,
@@ -435,7 +454,8 @@ fn prepare_delete_dv_write(
         state: Arc::clone(state),
         target: target.clone(),
         delete_query,
-        sink_spec,
+        sql_write_input,
+        table_bindings,
         commit_executor,
         execution,
         connector_context: connector_context.clone(),
@@ -469,10 +489,21 @@ fn prepare_delete_write(
     sink_spec: IcebergWriteSinkSpec,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<PreparedDelete, String> {
     let metadata = table.metadata();
     let mut sink_spec = sink_spec;
     sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
+    let target_binding =
+        admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
+    let sql_write_input = sql_write_plan_input_for_admitted_target(
+        table_bindings.as_ref(),
+        target_binding,
+        sink_spec.sql_mode(),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
+        None,
+    )?;
     let position_index_storage =
         crate::connector::iceberg::change_stream_write::position_delete_index_storage_config(
             &entry,
@@ -526,7 +557,8 @@ fn prepare_delete_write(
         state: Arc::clone(state),
         target: target.clone(),
         delete_query,
-        sink_spec,
+        sql_write_input,
+        table_bindings,
         commit_executor,
         execution,
         connector_context: connector_context.clone(),

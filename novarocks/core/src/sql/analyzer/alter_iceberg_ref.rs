@@ -20,7 +20,7 @@
 
 #![allow(dead_code)]
 
-use crate::sql::analyzer::iceberg_ref::IcebergRefKind;
+use crate::sql::analyzer::iceberg_ref::{IcebergRefKind, SqlIcebergRefMetadata};
 use crate::sql::parser::ast::{AlterIcebergRefAction, AlterIcebergRefStmt, SnapshotAnchor};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,7 +63,7 @@ pub fn analyze_alter_iceberg_ref(
     catalog: &str,
     namespace: &str,
     table: &str,
-    table_metadata: &iceberg::spec::TableMetadata,
+    table_metadata: &SqlIcebergRefMetadata,
 ) -> Result<RefActionPlan, String> {
     let name = action_name(&stmt.action);
     if name == "main" {
@@ -78,7 +78,7 @@ pub fn analyze_alter_iceberg_ref(
             replace,
             ignored_options,
         } => {
-            warn_ignored_options(ignored_options);
+            let _ = ignored_options;
             check_kind(table_metadata, name, IcebergRefKind::Branch)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateBranch {
@@ -95,7 +95,7 @@ pub fn analyze_alter_iceberg_ref(
             replace,
             ignored_options,
         } => {
-            warn_ignored_options(ignored_options);
+            let _ = ignored_options;
             check_kind(table_metadata, name, IcebergRefKind::Tag)?;
             let snapshot_id = resolve_anchor(anchor, table_metadata, name)?;
             RefAction::CreateTag {
@@ -138,31 +138,22 @@ fn action_name(a: &AlterIcebergRefAction) -> &str {
     }
 }
 
-fn warn_ignored_options(opts: &[String]) {
-    if !opts.is_empty() {
-        tracing::warn!(
-            "iceberg ref: retention options ignored in phase 1: {}",
-            opts.join(" ")
-        );
-    }
-}
-
 fn resolve_anchor(
     anchor: &SnapshotAnchor,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &SqlIcebergRefMetadata,
     ref_name: &str,
 ) -> Result<i64, String> {
     match anchor {
         SnapshotAnchor::SnapshotId(n) => {
-            if metadata.snapshot_by_id(*n).is_none() {
+            if !metadata.has_snapshot(*n) {
                 return Err(format!(
                     "iceberg ref: snapshot {n} not found; cannot anchor '{ref_name}'"
                 ));
             }
             Ok(*n)
         }
-        SnapshotAnchor::CurrentMain => match metadata.current_snapshot() {
-            Some(s) => Ok(s.snapshot_id()),
+        SnapshotAnchor::CurrentMain => match metadata.current_snapshot_id() {
+            Some(snapshot_id) => Ok(snapshot_id),
             None => Err(
                 "iceberg ref: cannot create branch on table without a current snapshot".to_string(),
             ),
@@ -173,15 +164,12 @@ fn resolve_anchor(
 /// If a ref of the given name exists, ensure its kind matches the expected
 /// kind (branch vs tag). Mismatches are rejected.
 fn check_kind(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &SqlIcebergRefMetadata,
     name: &str,
     expected: IcebergRefKind,
 ) -> Result<(), String> {
-    if let Some(existing) = metadata.refs().get(name) {
-        let existing_kind = match &existing.retention {
-            iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
-            iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
-        };
+    if let Some(existing) = metadata.named_ref(name) {
+        let existing_kind = existing.kind.clone();
         if existing_kind != expected {
             let actual = match existing_kind {
                 IcebergRefKind::Branch => "branch",
@@ -199,15 +187,28 @@ fn check_kind(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::sql::analyzer::iceberg_ref::test_utils;
+    use std::collections::BTreeMap;
 
-    fn metadata_empty() -> iceberg::spec::TableMetadata {
-        test_utils::metadata_empty()
+    use super::*;
+    use crate::sql::analyzer::iceberg_ref::SqlIcebergNamedRef;
+
+    fn metadata_empty() -> SqlIcebergRefMetadata {
+        SqlIcebergRefMetadata::default()
     }
 
-    fn metadata_with_branch(branch_name: &str) -> iceberg::spec::TableMetadata {
-        test_utils::metadata_with_branch(branch_name)
+    fn metadata_with_branch(branch_name: &str) -> SqlIcebergRefMetadata {
+        SqlIcebergRefMetadata::new(
+            [1],
+            vec![],
+            BTreeMap::from([(
+                branch_name.to_string(),
+                SqlIcebergNamedRef {
+                    snapshot_id: 1,
+                    kind: IcebergRefKind::Branch,
+                },
+            )]),
+            Some(1),
+        )
     }
 
     fn make_stmt(action: AlterIcebergRefAction) -> AlterIcebergRefStmt {

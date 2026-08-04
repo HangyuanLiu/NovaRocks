@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sql::planner::table::{IcebergMvTargetStateScan, ScanSource};
+use crate::sql::binding::SqlTableBindingId;
+use crate::sql::planner::table::{
+    ScanSource, SqlMvTargetStateScan, SqlScanKind, SqlScanSource, SqlTableIdentity,
+};
 use novarocks_catalog::schema::ColumnDef;
 
 pub(crate) fn build_target_state_scan_source(
-    catalog: String,
-    database: String,
-    table: String,
+    binding: SqlTableBindingId,
+    table: SqlTableIdentity,
     target_table_uuid: String,
     target_snapshot_id: Option<i64>,
     aggregate_state_layout_version: u16,
@@ -30,33 +32,37 @@ pub(crate) fn build_target_state_scan_source(
     aggregate_state_names: Vec<String>,
     physical_column_names: Vec<String>,
     row_id_column_name: String,
-    row_filter: crate::sql::planner::table::IcebergMvTargetStateRowFilter,
-    partition_constraint: crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint,
+    row_filter: crate::sql::planner::table::SqlMvTargetStateRowFilter,
+    partition_constraint: crate::sql::planner::table::SqlMvTargetStatePartitionConstraint,
 ) -> ScanSource {
-    ScanSource::IcebergMvTargetState(IcebergMvTargetStateScan {
-        catalog,
-        database,
+    ScanSource::Sql(SqlScanSource::new(
+        binding,
         table,
-        target_table_uuid,
-        target_snapshot_id,
-        aggregate_state_layout_version,
-        columns,
-        group_key_names,
-        aggregate_state_names,
-        physical_column_names,
-        row_id_column_name,
-        row_filter,
-        partition_constraint,
-    })
+        SqlScanKind::MvTargetState {
+            facts: SqlMvTargetStateScan {
+                target_table_uuid,
+                target_snapshot_id,
+                aggregate_state_layout_version,
+                columns,
+                group_key_names,
+                aggregate_state_names,
+                physical_column_names,
+                row_id_column_name,
+                row_filter,
+                partition_constraint,
+            },
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::compiler::mv_rewrite::test_target_binding;
     use arrow::datatypes::DataType;
 
     #[test]
-    fn build_target_state_scan_source_carries_target_state_metadata() {
+    fn sqlx2_mv_target_state_scan_source_carries_target_state_metadata() {
         let columns = vec![ColumnDef {
             name: "k".to_string(),
             data_type: DataType::Int64,
@@ -66,9 +72,12 @@ mod tests {
         }];
 
         let source = build_target_state_scan_source(
-            "ice".to_string(),
-            "db".to_string(),
-            "mv_target".to_string(),
+            test_target_binding(),
+            SqlTableIdentity {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "mv_target".to_string(),
+            },
             "target-uuid".to_string(),
             Some(123),
             1,
@@ -81,18 +90,24 @@ mod tests {
                 "sum_v_state".to_string(),
             ],
             "__row_id__".to_string(),
-            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name: "__row_id__".to_string(),
                 branch_scope: None,
             },
-            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+            crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned,
         );
 
-        let ScanSource::IcebergMvTargetState(scan) = source else {
-            panic!("expected IcebergMvTargetState scan source");
+        let ScanSource::Sql(source) = source else {
+            panic!("expected SQL target-state scan source");
         };
 
-        assert_eq!(scan.fqn(), "ice.db.mv_target");
+        assert_eq!(source.binding, test_target_binding());
+        assert_eq!(source.table.catalog, "ice");
+        assert_eq!(source.table.namespace, "db");
+        assert_eq!(source.table.table, "mv_target");
+        let SqlScanKind::MvTargetState { facts: scan } = source.kind else {
+            panic!("expected target-state facts");
+        };
         assert_eq!(scan.target_table_uuid, "target-uuid");
         assert_eq!(scan.target_snapshot_id, Some(123));
         assert_eq!(scan.aggregate_state_layout_version, 1);
@@ -106,14 +121,14 @@ mod tests {
         assert_eq!(scan.row_id_column_name, "__row_id__");
         assert!(matches!(
             scan.row_filter,
-            crate::sql::planner::table::IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+            crate::sql::planner::table::SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 branch_scope: None,
                 ..
             }
         ));
         assert!(matches!(
             scan.partition_constraint,
-            crate::sql::planner::table::IcebergMvTargetStatePartitionConstraint::Unpartitioned
+            crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned
         ));
     }
 }

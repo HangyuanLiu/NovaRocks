@@ -20,13 +20,34 @@ use super::output::*;
 use super::query::*;
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
+use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::PlannerTableProvider;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::planner::logical::*;
 use crate::sql::planner::payload::*;
-use crate::sql::planner::table::{ScanSource, TableDef};
+use crate::sql::planner::table::{
+    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+};
 use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
+use std::num::{NonZeroU32, NonZeroU64};
+
+fn sqlx2_data_source(catalog: &str, namespace: &str, table: &str) -> ScanSource {
+    ScanSource::Sql(SqlScanSource::new(
+        SqlTableBindingId::new(
+            SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+            NonZeroU32::new(1).expect("ordinal"),
+        ),
+        SqlTableIdentity {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+        },
+        SqlScanKind::Data {
+            version: SqlTableVersionSelector::Current,
+        },
+    ))
+}
 
 struct TestCatalog;
 
@@ -52,7 +73,9 @@ impl TestCatalog {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             }),
             "maps" => Ok(TableDef {
                 name: "maps".to_string(),
@@ -85,7 +108,9 @@ impl TestCatalog {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             }),
             "t" => Ok(TableDef {
                 name: "t".to_string(),
@@ -106,7 +131,9 @@ impl TestCatalog {
                     },
                 ],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::ConnectorPinned,
+                source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                    crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                ),
             }),
             "iv_orders" => Ok(TableDef {
                 name: "iv_orders".to_string(),
@@ -142,7 +169,7 @@ impl TestCatalog {
                         logical_type: None,
                     },
                 ],
-                source: ScanSource::ConnectorPinned,
+                source: sqlx2_data_source("cat", "ns", "iv_orders"),
             }),
             "t1" | "t2" => {
                 let value_col = if table == "t1" { "v1" } else { "v2" };
@@ -172,7 +199,9 @@ impl TestCatalog {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::ConnectorPinned,
+                    source: crate::sql::compiler::mv_rewrite::test_scan_source(
+                        crate::sql::planner::table::SqlScanKind::ConnectorRead,
+                    ),
                 })
             }
             other => Err(format!("unknown test table: {other}")),
@@ -2193,6 +2222,33 @@ fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
         project.items[0].output_column_id, row_id_output.column_id,
         "visible _row_id output should preserve the PlanScanNode metadata ColumnId"
     );
+}
+
+#[test]
+fn sqlx2_delta_relation_projects_token_bound_sql_scan_source() {
+    let plan = parse_analyze_and_plan(
+        "SELECT _row_id FROM __nr_ivm_delta('cat.ns.iv_orders', 100, 200) AS t",
+    )
+    .expect("planner should accept the token-bound delta source");
+    let LogicalPlanKind::Project(_) = &plan.kind else {
+        panic!("expected Project root, got {plan:?}");
+    };
+    let LogicalPlanKind::Scan(scan) = &plan.unary_input().kind else {
+        panic!("expected Scan under Project, got {:?}", plan.unary_input());
+    };
+    let ScanSource::Sql(source) = &scan.table.source else {
+        panic!("delta scan must not retain an Iceberg provider source");
+    };
+    assert_eq!(source.table.catalog, "cat");
+    assert_eq!(source.table.namespace, "ns");
+    assert_eq!(source.table.table, "iv_orders");
+    assert!(matches!(
+        &source.kind,
+        SqlScanKind::Delta {
+            from_snapshot_id: 100,
+            to_snapshot_id: 200,
+        }
+    ));
 }
 
 #[test]

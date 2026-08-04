@@ -27,8 +27,7 @@ mod topology;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sql::catalog::provider::QueryTableBindingStore;
-use crate::sql::planner::table::ScanSource;
+use crate::engine::query_planning::bindings::QueryTableBindingStore;
 
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
@@ -90,15 +89,10 @@ pub(crate) fn prepare_fragments(
         &producer_fragment_ids,
         execution_anchor_fragment_id,
     )?;
-    let write_contract_fragment_ids = sealed_ids
-        .iter()
-        .copied()
-        .filter(|&fragment_id| {
-            plan.write_contracts()
-                .connector_write_output(fragment_id)
-                .is_some()
-        })
-        .collect::<BTreeSet<_>>();
+    // A terminal writer has an Iceberg-write boundary even when it has no
+    // query output contract. The latter is an application result-shape fact,
+    // while the former is part of the sealed execution topology.
+    let write_contract_fragment_ids = terminal_write_fragment_ids.clone();
     let boundary_contracts = validate_and_group_boundary_contracts(
         result_fragment_id,
         &write_contract_fragment_ids,
@@ -139,23 +133,18 @@ pub(crate) fn prepare_fragments(
                     fragment.fragment_id
                 ));
             }
-            match source {
-                ScanSource::IcebergMetadataTable { .. } => {}
-                _ => {
-                    expected_binding_node_ids.insert(*node_id);
-                    if scan_bindings.binding(*node_id).is_none() {
-                        return Err(format!(
-                            "prepared fragment missing scan binding fragment_id={} node_id={node_id}",
-                            fragment.fragment_id
-                        ));
-                    }
-                    if scan_bindings
-                        .connector_read(fragment.fragment_id, *node_id)
-                        .is_some()
-                    {
-                        expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
-                    }
-                }
+            expected_binding_node_ids.insert(*node_id);
+            if scan_bindings.binding(*node_id).is_none() {
+                return Err(format!(
+                    "prepared fragment missing scan binding fragment_id={} node_id={node_id}",
+                    fragment.fragment_id
+                ));
+            }
+            if scan_bindings
+                .connector_read(fragment.fragment_id, *node_id)
+                .is_some()
+            {
+                expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
@@ -182,13 +171,11 @@ pub(crate) fn prepare_fragments(
             write_contract_fragment_ids.contains(&fragment.fragment_id),
             sealed_output_columns,
         ) {
-            (true, None) => Vec::new(),
-            (true, Some(_)) => {
-                return Err(format!(
-                    "prepared sealed output mismatch fragment_id={}: Iceberg write fragment unexpectedly has FragmentEdgeOutputCatalog output",
-                    fragment.fragment_id
-                ));
-            }
+            // A connector writer's carrier output is not a query result. The
+            // write contract owns its target schema; preparation therefore
+            // deliberately projects no query-output columns whether or not
+            // sealing retained the writer's carrier columns.
+            (true, _) => Vec::new(),
             (false, Some(columns)) => columns
                 .iter()
                 .map(|column| PreparedOutputColumn {
@@ -534,7 +521,7 @@ mod tests {
             sink: DataSink::ConnectorWrite(
                 crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink {
                     handle: None,
-                    input: crate::sql::planner::distributed::write::sink::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    input: crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
                     output_contract: None,
                 },
             ),
@@ -557,7 +544,7 @@ mod tests {
         assert!(
             plan.fragment_edge_outputs()
                 .fragment_output_columns(9)
-                .is_none()
+                .is_some_and(|columns| !columns.is_empty())
         );
         let registry = crate::connector::ConnectorRegistry::new();
         let controls = crate::connector::FixtureControlResolver::new(registry.clone());

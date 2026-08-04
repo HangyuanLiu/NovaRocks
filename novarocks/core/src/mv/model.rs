@@ -54,21 +54,9 @@ impl MvStorageEngine {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvTarget {
-    pub catalog: Option<String>,
-    pub database: String,
-    pub name: String,
-}
-
-impl MvTarget {
-    pub fn display_name(&self) -> String {
-        match self.catalog.as_deref() {
-            Some(catalog) => format!("{catalog}.{}.{}", self.database, self.name),
-            None => format!("{}.{}", self.database, self.name),
-        }
-    }
-}
+/// Compatibility path for the SQL-owned target identity. Application model
+/// and repository users retain this import while lifecycle adapters migrate.
+pub use crate::sql::mv_refresh::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshMode {
@@ -237,33 +225,6 @@ impl AffectedTargetPartitions {
             Self::Unpartitioned | Self::NotDerived { .. } => TargetPartitionFilter::None,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AggregateFunctionKind {
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-    /// `BOOL_OR(col)` / `boolor_agg(col)`. Uses `Map<Boolean, Int64>` detail
-    /// state, same framework as `MIN/MAX`.
-    BoolOr,
-    /// `BOOL_AND(col)` / `booland_agg(col)`. Uses `Map<Boolean, Int64>` detail
-    /// state, same framework as `MIN/MAX`.
-    BoolAnd,
-    /// `count(DISTINCT col)` / `count_distinct(col)` / `multi_distinct_count(col)`.
-    /// Uses shared multiset state encoding; visible counts positive entries.
-    CountDistinct,
-    /// `approx_count_distinct(col)` / `ndv(col)` / `hll_ndv(col)`.
-    /// Shares multiset state with CountDistinct; visible computes an HLL estimate.
-    ApproxCountDistinct,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum VisibleAggregateOutput {
-    GroupKey(usize),
-    Aggregate(usize),
 }
 
 /// Identifies a state column's role within its logical aggregate.

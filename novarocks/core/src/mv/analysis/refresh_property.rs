@@ -51,6 +51,9 @@
 //! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
+#[cfg(test)]
+use crate::sql::planner::vocabulary::ApplyKeySource;
+
 use crate::mv::refresh::apply_key::ApplyKeyContract;
 use crate::mv::refresh::contract::{
     AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
@@ -998,11 +1001,23 @@ fn iceberg_ref_from_scan(
     scan: &crate::sql::analysis::ScanRelation,
 ) -> Result<TableIdentity, String> {
     match &scan.table.source {
-        ScanSource::IcebergDataFiles { table, .. } => Ok(TableIdentity {
-            catalog: table.catalog.clone(),
-            namespace: table.namespace.clone(),
-            table: table.table.clone(),
-        }),
+        // The IMV contract only needs the admitted SQL identity.  It must not
+        // retain an Iceberg scan descriptor merely to rediscover the base
+        // table; execution later obtains provider facts from this source's
+        // request-local binding.
+        ScanSource::Sql(source)
+            if matches!(
+                source.kind,
+                crate::sql::planner::table::SqlScanKind::Data { .. }
+                    | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+            ) =>
+        {
+            Ok(TableIdentity {
+                catalog: source.table.catalog.clone(),
+                namespace: source.table.namespace.clone(),
+                table: source.table.table.clone(),
+            })
+        }
         _ => Err(format!(
             "Iceberg IMV refresh contract requires Iceberg base tables, got non-Iceberg scan of `{}`",
             scan.table.name
@@ -1679,11 +1694,10 @@ fn join_key_side(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::catalog::PlannerTableProvider;
-    use crate::sql::planner::table::{ScanSource, TableDef};
+    use crate::sql::planner::table::{
+        ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
+    };
     use arrow::datatypes::DataType;
     use novarocks_catalog::schema::ColumnDef;
 
@@ -1705,17 +1719,26 @@ mod tests {
                     column("flag", DataType::Boolean, true),
                 ],
                 iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDataFiles {
-                    table: iceberg_table_info(database, table),
-                    files: Vec::new(),
-                    cloud_properties: Default::default(),
-                    binding: IcebergDataFileBinding::CurrentSnapshot,
-                },
+                source: test_scan_source(catalog.unwrap_or("ice"), database, table),
             };
             Ok(crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                 catalog, database, planner,
             ))
         }
+    }
+
+    fn test_scan_source(catalog: &str, database: &str, table: &str) -> ScanSource {
+        ScanSource::Sql(SqlScanSource::new(
+            crate::sql::compiler::mv_rewrite::test_target_binding(),
+            SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: database.to_string(),
+                table: table.to_string(),
+            },
+            SqlScanKind::Data {
+                version: SqlTableVersionSelector::Current,
+            },
+        ))
     }
 
     fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
@@ -1725,21 +1748,6 @@ mod tests {
             nullable,
             write_default: None,
             logical_type: None,
-        }
-    }
-
-    fn iceberg_table_info(database: &str, table: &str) -> IcebergTableInfo {
-        IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: database.to_string(),
-            table: table.to_string(),
-            table_uuid: Some(format!("uuid-{table}")),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: format!("file:///tmp/{database}/{table}"),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
         }
     }
 
@@ -2390,10 +2398,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::mv::persistence::schema::{
-        AggregateStateContract, ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
+        AggregateStateContract, BaseContract, BaseFieldRecord, BaseSchemaSnapshot,
         BranchIdColumnContract, BranchUnionContract, ExpressionKind, ExpressionLineage,
-        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, HiddenApplyKeyContract,
-        JOIN_APPLY_KEY_COLUMN_NAME, JoinContract, JoinContractKind, JoinPredicateLineage,
+        HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
     };
@@ -2402,6 +2409,10 @@ mod tests {
         PartitionPruningPolicy, RefreshCapabilities, RefreshIdentity,
     };
     use crate::mv::refresh::snapshot::BaseSnapshotPolicy;
+    use crate::sql::planner::vocabulary::{
+        GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+        JOIN_APPLY_KEY_COLUMN_NAME,
+    };
 
     fn from_schema_contract(contract: &MvSchemaContract) -> Result<RefreshCapabilities, String> {
         RefreshCapabilities::from_schema_contract(contract)

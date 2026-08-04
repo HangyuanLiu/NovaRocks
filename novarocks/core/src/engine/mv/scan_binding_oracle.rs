@@ -17,27 +17,18 @@
 
 use std::collections::BTreeMap;
 
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo,
-};
-use crate::sql::planner::table::ScanSource;
+use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
 
 use super::iceberg_target_apply_oracle::TargetRowPositionSet;
 
 fn bind_target_state_file_positions(
-    mut source: ScanSource,
+    mut files: Vec<IcebergDataFileInfo>,
     matched_positions: &[TargetRowPositionSet],
     target: &str,
-) -> Result<ScanSource, String> {
-    let ScanSource::IcebergDataFiles { files, .. } = &mut source else {
-        return Err(format!(
-            "Iceberg target-state position binding for {target} requires IcebergDataFiles source"
-        ));
-    };
-
+) -> Result<Vec<IcebergDataFileInfo>, String> {
     if matched_positions.is_empty() {
         files.clear();
-        return Ok(source);
+        return Ok(files);
     }
 
     let mut by_file = BTreeMap::<String, Vec<i64>>::new();
@@ -56,11 +47,11 @@ fn bind_target_state_file_positions(
     }
     if by_file.is_empty() {
         files.clear();
-        return Ok(source);
+        return Ok(files);
     }
 
     let mut bound_files = Vec::new();
-    for mut file in std::mem::take(files) {
+    for mut file in std::mem::take(&mut files) {
         if let Some(positions) = by_file.remove(&file.path) {
             file.included_positions = Some(positions);
             bound_files.push(file);
@@ -72,11 +63,10 @@ fn bind_target_state_file_positions(
             "Iceberg target-state scan {target} locator returned positions for files not present in scan source: [{missing}]"
         ));
     }
-    *files = bound_files;
-    Ok(source)
+    Ok(bound_files)
 }
 
-fn target_state_source_for_binding_test() -> ScanSource {
+fn target_state_files_for_binding_test() -> Vec<IcebergDataFileInfo> {
     let file = |path: &str, size| IcebergDataFileInfo {
         path: path.to_string(),
         size,
@@ -92,26 +82,10 @@ fn target_state_source_for_binding_test() -> ScanSource {
         manifest_path: None,
         partition_values: Vec::new(),
     };
-    ScanSource::IcebergDataFiles {
-        table: IcebergTableInfo {
-            catalog: "tgt".to_string(),
-            namespace: "db".to_string(),
-            table: "mv".to_string(),
-            table_uuid: Some("uuid-tgt".to_string()),
-            current_snapshot_id: Some(99),
-            schema_id: 1,
-            location: "s3://bucket/mv".to_string(),
-            schema: IcebergSchemaDef { fields: Vec::new() },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        },
-        files: vec![
-            file("s3://bucket/mv/data-a.parquet", 10),
-            file("s3://bucket/mv/data-b.parquet", 20),
-        ],
-        cloud_properties: BTreeMap::new(),
-        binding: IcebergDataFileBinding::ExplicitFiles,
-    }
+    vec![
+        file("s3://bucket/mv/data-a.parquet", 10),
+        file("s3://bucket/mv/data-b.parquet", 20),
+    ]
 }
 
 #[test]
@@ -120,15 +94,12 @@ fn bind_target_state_file_positions_keeps_only_matched_files() {
         referenced_data_file: "s3://bucket/mv/data-b.parquet".to_string(),
         positions: vec![2, 8, 13],
     }];
-    let source = bind_target_state_file_positions(
-        target_state_source_for_binding_test(),
+    let files = bind_target_state_file_positions(
+        target_state_files_for_binding_test(),
         &positions,
         "tgt.db.mv",
     )
     .expect("bind positions");
-    let ScanSource::IcebergDataFiles { files, .. } = source else {
-        panic!("expected IcebergDataFiles");
-    };
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "s3://bucket/mv/data-b.parquet");
     assert_eq!(files[0].included_positions, Some(vec![2, 8, 13]));
@@ -136,12 +107,9 @@ fn bind_target_state_file_positions_keeps_only_matched_files() {
 
 #[test]
 fn bind_target_state_file_positions_empty_matches_returns_empty_source() {
-    let source =
-        bind_target_state_file_positions(target_state_source_for_binding_test(), &[], "tgt.db.mv")
+    let files =
+        bind_target_state_file_positions(target_state_files_for_binding_test(), &[], "tgt.db.mv")
             .expect("bind empty positions");
-    let ScanSource::IcebergDataFiles { files, .. } = source else {
-        panic!("expected IcebergDataFiles");
-    };
     assert!(files.is_empty());
 }
 
@@ -152,7 +120,7 @@ fn bind_target_state_file_positions_rejects_missing_files() {
         positions: vec![1],
     }];
     let err = bind_target_state_file_positions(
-        target_state_source_for_binding_test(),
+        target_state_files_for_binding_test(),
         &positions,
         "tgt.db.mv",
     )

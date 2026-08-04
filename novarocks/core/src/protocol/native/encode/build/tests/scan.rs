@@ -294,35 +294,31 @@ fn equality_delete_key_from_planned_splits_is_hidden_from_query_projection() {
 }
 
 #[test]
-fn equality_delete_with_non_key_projection_keeps_provider_hidden_layout_private() {
-    let plan = iceberg_scan_plan_with_outputs(None, &["id"]);
+fn equality_delete_with_non_key_projection_rejects_unbound_hidden_key() {
+    // A sealed SQL scan may not introduce a connector-only physical key
+    // without a planner ColumnId. The enclosing planner must model that key
+    // explicitly before the native encoder receives the artifact.
+    let plan = iceberg_scan_plan_with_outputs(Some(vec!["id", "category"]), &["id"]);
     let registry = iceberg_registry(vec![iceberg_data_file(vec![equality_delete_file(
         Vec::new(),
         vec![3],
     )])]);
 
-    let result = build_for_test(TestBuildRequest::result(
+    let error = match build_for_test(TestBuildRequest::result(
         &plan,
         &EmptyCatalog,
         &registry,
         None,
-    ))
-    .expect("build unrestricted native Iceberg scan");
-    let scan = native_root_scan(&result);
+    )) {
+        Ok(_) => panic!("unbound hidden equality key must fail before encoding"),
+        Err(error) => error,
+    };
 
-    assert_eq!(scan.required_columns, vec!["id"]);
-    assert_eq!(
-        scan.columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["id"]
-    );
-    let table = scan.table.as_ref().expect("native scan table");
     assert!(
-        table.columns.iter().any(|column| column.name == "category"),
-        "hidden equality key must be materializable from the table schema"
+        error.contains("required physical column 'category'"),
+        "{error}"
     );
+    assert!(error.contains("no planner ColumnId"), "{error}");
 }
 
 #[test]

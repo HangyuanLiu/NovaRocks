@@ -86,9 +86,9 @@ use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
 use super::scan_model::{
-    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-    IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
-    IcebergPhysicalPredicateValue,
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
 };
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
@@ -4041,7 +4041,6 @@ impl ConnectorMetadata for IcebergControlProvider {
             loaded.table.metadata().current_snapshot_id(),
         )?;
         let table = build_table_payload(
-            &entry,
             self.instance_id.as_str(),
             &request.table.namespace,
             &table_name,
@@ -5303,7 +5302,6 @@ fn resolve_table_request(
 }
 
 fn build_table_payload(
-    entry: &IcebergCatalogEntry,
     catalog: &str,
     namespace: &str,
     table: &str,
@@ -5322,7 +5320,7 @@ fn build_table_payload(
     let mut prepared_files = Vec::new();
     let metadata_table = loaded.table.clone();
     let metadata_file_io = metadata_table.file_io().clone();
-    let mut table_def = if matches!(
+    if matches!(
         metadata_table_type,
         Some(super::IcebergMetadataTableType::Partitions)
     ) {
@@ -5337,15 +5335,23 @@ fn build_table_payload(
             .cloned()
             .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
             .collect();
-        super::catalog::backend::build_iceberg_table_def_with_files(
-            entry, catalog, namespace, table, loaded, data_files,
-        )
-        .map_err(map_iceberg_error)?
-    } else {
-        super::catalog::backend::build_iceberg_schema_table_def_from_loaded(
-            entry, catalog, namespace, table, loaded,
-        )
-        .map_err(map_iceberg_error)?
+    }
+    let mut table_info = super::scan_model::IcebergTableInfo {
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: table.to_string(),
+        table_uuid: Some(metadata_table.metadata().uuid().to_string()),
+        current_snapshot_id: metadata_table.metadata().current_snapshot_id(),
+        schema_id: metadata_table.metadata().current_schema_id(),
+        location: metadata_table.metadata().location().to_string(),
+        schema: super::catalog::backend::iceberg_schema_def_for_codegen(
+            metadata_table.metadata().current_schema(),
+        ),
+        serialized_metadata: Some(
+            serde_json::to_string(metadata_table.metadata())
+                .map_err(|error| internal(format!("serialize Iceberg table metadata: {error}")))?,
+        ),
+        serialized_metadata_rows: None,
     };
     if matches!(
         metadata_table_type,
@@ -5367,33 +5373,12 @@ fn build_table_payload(
         })
         .map_err(map_iceberg_error)?
         .map_err(map_iceberg_error)?;
-        if let crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. } =
-            &mut table_def.source
-        {
-            table.serialized_metadata_rows = Some(rows);
-        }
+        table_info.serialized_metadata_rows = Some(rows);
     }
     let hidden_columns = super::catalog::backend::hidden_internal_column_names_from_metadata(
         metadata_table.metadata(),
     );
-    let metadata_columns = table_def
-        .iceberg_row_lineage_metadata_columns
-        .iter()
-        .map(|column| column.name.clone())
-        .collect();
-    let (table_info, source_files) = match table_def.source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, files, .. } => {
-            (table, files)
-        }
-        _ => {
-            return Err(internal(
-                "Iceberg metadata capability produced a non-Iceberg table source".to_string(),
-            ));
-        }
-    };
-    if prepared_files.is_empty() {
-        prepared_files = source_files;
-    }
+    let metadata_columns = iceberg_metadata_column_names(metadata_table.metadata());
     Ok(TablePayload {
         namespace: namespace.to_string(),
         table: table.to_string(),
@@ -5406,6 +5391,24 @@ fn build_table_payload(
         hidden_columns,
         frozen_rewrite: None,
     })
+}
+
+/// Project only the SQL-visible Iceberg pseudo-column names into the provider
+/// payload.  This is intentionally independent of a planner `TableDef`: the
+/// connector owns its metadata envelope and application query planning later
+/// assigns the request-local scan token.
+fn iceberg_metadata_column_names(metadata: &iceberg::spec::TableMetadata) -> Vec<String> {
+    let mut names = vec!["_file".to_string(), "_pos".to_string()];
+    if matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3)
+        && !metadata
+            .properties()
+            .get("write.row-lineage")
+            .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+    {
+        names.push("_row_id".to_string());
+        names.push("_last_updated_sequence_number".to_string());
+    }
+    names
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -5423,6 +5426,26 @@ struct TablePayload {
     hidden_columns: Vec<String>,
     #[serde(default)]
     frozen_rewrite: Option<FrozenRewriteSourcePayloadV1>,
+}
+
+/// Provider facts admitted for one query table.  This is deliberately an
+/// application/provider envelope rather than a SQL table: it preserves the
+/// exact Iceberg descriptor, prepared files, statistics identity, and control
+/// lease until `engine::query_planning` assigns a request-local binding token.
+///
+/// No `TableDef` or SQL scan source is carried here.  The application catalog
+/// materializer is the only code that may project this envelope into SQL facts.
+#[derive(Clone)]
+pub(crate) struct IcebergQueryTableMaterialization {
+    pub(crate) table_name: String,
+    pub(crate) schema_id: Option<i32>,
+    pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    pub(crate) table: super::scan_model::IcebergTableInfo,
+    pub(crate) files: Vec<IcebergDataFileInfo>,
+    pub(crate) binding: IcebergDataFileBinding,
+    pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
 /// A bounded reference to an Iceberg-owned rewrite artifact.  It is the only
@@ -6271,52 +6294,43 @@ fn rewrite_position_output_schema() -> SchemaRef {
     ]))
 }
 
-pub(crate) fn load_schema_table_def(
+/// Resolve a base table into the application-owned admission envelope.  New
+/// query planning callers must use this instead of receiving a legacy
+/// `TableDef`: the concrete descriptor remains outside SQL until a
+/// `SqlTableBindingId` has been allocated.
+pub(crate) fn load_schema_materialization_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
-) -> Result<
-    (
-        crate::sql::planner::table::TableDef,
-        Option<i32>,
-        Option<ResolvedTableStatisticsPin>,
-    ),
-    String,
-> {
-    let (table_def, schema_id, statistics_pin, _planning_lease) =
-        load_schema_table_def_with_lease(controls, context, catalog, namespace, table)?;
-    Ok((table_def, schema_id, statistics_pin))
+) -> Result<IcebergQueryTableMaterialization, String> {
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    load_schema_materialization_from_exact_lease(planning_lease, context, namespace, table)
 }
 
-/// Resolves an Iceberg schema while retaining the exact control generation
-/// that served metadata. Query-scoped callers carry this lease through
-/// statistics and split planning instead of resolving `latest` again.
-pub(crate) fn load_schema_table_def_with_lease(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+/// Materialize a base table from the caller's exact control generation.
+///
+/// This is an application-facing admission helper for flows which have already
+/// frozen a `ConnectorControlPlanningLease`. It deliberately does not accept a
+/// resolver or catalog identity, so it cannot reacquire a newer generation
+/// while resolving schema facts. The returned envelope retains the supplied
+/// lease through query-local binding and preparation.
+pub(crate) fn load_schema_materialization_from_exact_lease(
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    catalog: &str,
     namespace: &str,
     table: &str,
-) -> Result<
-    (
-        crate::sql::planner::table::TableDef,
-        Option<i32>,
-        Option<ResolvedTableStatisticsPin>,
-        novarocks_spi::connector::ConnectorControlPlanningLease,
-    ),
-    String,
-> {
+) -> Result<IcebergQueryTableMaterialization, String> {
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
 
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let lease = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
-    let metadata = lease
+    let instance_id = planning_lease.binding().descriptor().instance_id.clone();
+    let metadata = planning_lease
         .binding()
         .metadata()
         .load_table(ConnectorTableRequest {
@@ -6329,193 +6343,53 @@ pub(crate) fn load_schema_table_def_with_lease(
             context,
         })
         .map_err(|error| error.to_string())?;
-    let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
-        .map_err(|error| error.to_string())?;
-    let schema_id = metadata.version.as_ref().and_then(|version| {
-        <[u8; 4]>::try_from(version.as_ref())
-            .ok()
-            .map(i32::from_le_bytes)
-    });
-    let table_info = payload
-        .table_info
-        .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
-    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
-        .into_iter()
-        .filter(|column| {
-            !payload
-                .hidden_columns
-                .iter()
-                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
-        })
-        .collect();
-    let table_def = crate::sql::planner::table::TableDef {
-        name: payload.table,
-        columns,
-        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: table_info,
-            files: Vec::new(),
-            cloud_properties: BTreeMap::new(),
-            binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        },
-    };
-    let statistics_pin = metadata
-        .statistics_data_version
-        .clone()
-        .map(|data_version| ResolvedTableStatisticsPin {
-            table: metadata.table.clone(),
-            data_version,
-        });
-    Ok((table_def, schema_id, statistics_pin, lease))
+    materialization_from_metadata(
+        metadata,
+        planning_lease,
+        IcebergDataFileBinding::CurrentSnapshot,
+    )
 }
 
-pub(crate) fn load_table_def_at(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-    snapshot_id: Option<i64>,
-    schema_only: bool,
-) -> Result<
-    (
-        crate::sql::planner::table::TableDef,
-        Option<i32>,
-        Option<ResolvedTableStatisticsPin>,
-    ),
-    String,
-> {
-    use novarocks_spi::connector::{
-        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    };
-
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let lease = controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
-    let metadata = lease
-        .binding()
-        .metadata()
-        .load_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(namespace),
-                table: Arc::from(table),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context: context.clone(),
-        })
-        .map_err(|error| error.to_string())?;
-    let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
-        .map_err(|error| error.to_string())?;
-    let schema_id = metadata.version.as_ref().and_then(|version| {
-        <[u8; 4]>::try_from(version.as_ref())
-            .ok()
-            .map(i32::from_le_bytes)
-    });
-    let mut table_info = payload
-        .table_info
-        .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
-    let binding = if snapshot_id.is_some() {
-        table_info.current_snapshot_id = snapshot_id;
-        super::scan_model::IcebergDataFileBinding::ExplicitFiles
-    } else {
-        super::scan_model::IcebergDataFileBinding::CurrentSnapshot
-    };
-    let files = if schema_only {
-        Vec::new()
-    } else {
-        plan_scan_files(
-            controls,
-            context,
-            &table_info,
-            binding,
-            &payload.prepared_files,
-            &(0..metadata.schema.fields().len()).collect::<Vec<_>>(),
-        )?
-    };
-    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
-        .into_iter()
-        .filter(|column| {
-            !payload
-                .hidden_columns
-                .iter()
-                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
-        })
-        .collect();
-    let table_def = crate::sql::planner::table::TableDef {
-        name: payload.table,
-        columns,
-        iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: table_info,
-            files,
-            cloud_properties: BTreeMap::new(),
-            binding,
-        },
-    };
-    let statistics_pin = metadata
-        .statistics_data_version
-        .clone()
-        .map(|data_version| ResolvedTableStatisticsPin {
-            table: metadata.table.clone(),
-            data_version,
-        });
-    Ok((table_def, schema_id, statistics_pin))
-}
-
-/// Resolve a fixed Iceberg snapshot without publishing a synthetic table to
-/// the process-wide local catalog. The returned planning lease is retained by
-/// the query binding and later reused by statistics and split preparation.
-pub(crate) fn load_time_travel_table_def_with_lease(
+/// Resolve one fixed snapshot without manufacturing a synthetic catalog table.
+/// The selector is carried as an application fact here and later projected to
+/// `SqlTableVersionSelector::Snapshot` with the same request binding token.
+pub(crate) fn load_time_travel_materialization_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
     snapshot_id: i64,
-) -> Result<
-    (
-        crate::sql::planner::table::TableDef,
-        Option<ResolvedTableStatisticsPin>,
-        novarocks_spi::connector::ConnectorControlPlanningLease,
-    ),
-    String,
-> {
-    let (mut table_def, _schema_id, statistics_pin, planning_lease) =
-        load_schema_table_def_with_lease(controls, context, catalog, namespace, table)?;
-    let crate::sql::planner::table::ScanSource::IcebergDataFiles {
-        table,
-        files,
-        binding,
-        ..
-    } = &mut table_def.source
-    else {
-        return Err("Iceberg time travel metadata did not produce a file scan".to_string());
-    };
-    table.current_snapshot_id = Some(snapshot_id);
-    files.clear();
-    *binding = super::scan_model::IcebergDataFileBinding::ExplicitFiles;
-    Ok((table_def, statistics_pin, planning_lease))
+) -> Result<IcebergQueryTableMaterialization, String> {
+    let mut materialization =
+        load_schema_materialization_with_lease(controls, context, catalog, namespace, table)?;
+    materialization.table.current_snapshot_id = Some(snapshot_id);
+    materialization.binding = IcebergDataFileBinding::ExplicitFiles;
+    materialization.files.clear();
+    Ok(materialization)
 }
 
-pub(crate) fn load_metadata_table_def(
+/// Resolve an Iceberg metadata alias into an admission envelope.  Metadata
+/// rows and provider descriptors stay application-owned until the catalog
+/// materializer creates the tokenized SQL metadata scan.
+pub(crate) fn load_metadata_materialization_with_lease(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
     metadata_table_type: super::IcebergMetadataTableType,
-) -> Result<crate::sql::planner::table::TableDef, String> {
+) -> Result<IcebergQueryTableMaterialization, String> {
     use novarocks_spi::connector::{
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     };
+
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    let lease = controls
+    let planning_lease = controls
         .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
     let alias = format!("{table}${}", metadata_table_name(&metadata_table_type));
-    let metadata = lease
+    let metadata = planning_lease
         .binding()
         .metadata()
         .load_table(ConnectorTableRequest {
@@ -6528,27 +6402,45 @@ pub(crate) fn load_metadata_table_def(
             context,
         })
         .map_err(|error| error.to_string())?;
-    table_def_from_metadata(metadata)
+    materialization_from_metadata(
+        metadata,
+        planning_lease,
+        IcebergDataFileBinding::CurrentSnapshot,
+    )
 }
 
-fn table_def_from_metadata(
+fn materialization_from_metadata(
     metadata: ConnectorTableMetadata,
-) -> Result<crate::sql::planner::table::TableDef, String> {
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    binding: IcebergDataFileBinding,
+) -> Result<IcebergQueryTableMaterialization, String> {
+    let schema_id = metadata.version.as_ref().and_then(|version| {
+        <[u8; 4]>::try_from(version.as_ref())
+            .ok()
+            .map(i32::from_le_bytes)
+    });
+    let statistics_pin = metadata
+        .statistics_data_version
+        .clone()
+        .map(|data_version| ResolvedTableStatisticsPin {
+            table: metadata.table.clone(),
+            data_version,
+        });
     let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
         .map_err(|error| error.to_string())?;
-    let table_info = payload
+    let table = payload
         .table_info
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
-    Ok(crate::sql::planner::table::TableDef {
-        name: payload.table,
+    Ok(IcebergQueryTableMaterialization {
+        table_name: payload.table,
+        schema_id,
         columns: columns_from_metadata(&metadata.schema, &payload.logical_type_columns),
         iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
-        source: crate::sql::planner::table::ScanSource::IcebergDataFiles {
-            table: table_info,
-            files: payload.prepared_files,
-            cloud_properties: BTreeMap::new(),
-            binding: super::scan_model::IcebergDataFileBinding::CurrentSnapshot,
-        },
+        table,
+        files: payload.prepared_files,
+        binding,
+        statistics_pin,
+        planning_lease,
     })
 }
 

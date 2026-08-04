@@ -388,13 +388,9 @@ mod tests {
     use crate::sql::planner::distributed::write::change_stream::{
         ChangeStreamWriteBranchSpec, ChangeStreamWriteDagSpec,
     };
-    use crate::sql::planner::distributed::write::plan::finalize_iceberg_change_stream_test_plan;
-    use crate::sql::planner::distributed::write::sink::test_support::{
-        simple_sink_spec, unpartitioned_metadata_json,
-    };
-    use crate::sql::planner::distributed::write::sink::{
-        ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
-    };
+    use crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding;
+    use crate::sql::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
+    use crate::sql::planner::distributed::write::sink::ConnectorWriteFragmentSink;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId,
@@ -682,10 +678,8 @@ mod tests {
         );
         let mut branch = ChangeStreamWriteBranchSpec::delete_dv_for_test(vec![2]);
         branch.output_partition_ordinals = vec![2];
-        branch.sink_spec.iceberg.serialized_metadata = Some(unpartitioned_metadata_json());
         let dag = ChangeStreamWriteDagSpec::for_test(Some(0), None, vec![branch]);
-        finalize_iceberg_change_stream_test_plan(builder, "test_db", dag)
-            .expect("change-stream router plan seals")
+        finalize_sql_change_stream_test_plan(builder, dag).expect("change-stream router plan seals")
     }
 
     // ----- Positive seal-path contracts -------------------------------------

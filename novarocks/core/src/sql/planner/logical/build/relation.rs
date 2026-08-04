@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::iceberg::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent};
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::column_id::ColumnRefFactory;
@@ -202,8 +201,8 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 }
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
-/// `LogicalPlanKind::Scan` whose `TableDef` carries the synthetic
-/// `ScanSource::IcebergMetadataTable` source. The optimizer treats it
+/// `LogicalPlanKind::Scan` whose `TableDef` carries a token-bound
+/// `SqlScanSource::Metadata` source. The optimizer treats it
 /// like any other Scan; codegen branches on the source variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
 /// Iceberg metadata SPI reader (no JVM / JNI bridge — the embedded-Java
@@ -212,34 +211,22 @@ fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    use crate::sql::analyzer::iceberg_metadata::metadata_table_schema_for_source;
     use crate::sql::planner::table::{ScanSource, TableDef};
-    use novarocks_catalog::schema::ColumnDef;
 
-    let cols =
-        metadata_table_schema_for_source(rel.metadata_table_type.clone(), &rel.table.source)?;
-    if cols.is_empty() {
+    if rel.table.columns.is_empty() {
         return Err(format!(
             "iceberg metadata table type {:?} is not supported",
             rel.metadata_table_type
         ));
     }
-    let column_defs: Vec<ColumnDef> = cols
-        .iter()
-        .map(|c| ColumnDef {
-            name: c.name.clone(),
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
-            write_default: None,
-            logical_type: None,
-        })
-        .collect();
     // Reuse the ColumnIds that the analyzer already minted for this metadata
     // table's columns (carried on `rel.column_ids`). Creating fresh ids here
     // would desync the `ColumnRef` ids in the rest of the plan (SELECT list,
     // WHERE, etc.) from the scan's output_columns, causing Phase-2 column
     // pruning to incorrectly prune needed columns (same pattern as Relation::Scan).
-    let output_columns: Vec<OutputColumn> = cols
+    let output_columns: Vec<OutputColumn> = rel
+        .table
+        .columns
         .iter()
         .enumerate()
         .map(|(idx, c)| OutputColumn {
@@ -252,42 +239,27 @@ fn plan_iceberg_metadata_scan(
             is_internal: false,
         })
         .collect();
-    let table_info = iceberg_table_info(&rel.table.source)
-        .ok_or_else(|| {
-            format!(
-                "iceberg metadata table {} requires iceberg table identity; \
-                 table was not loaded through an iceberg catalog",
-                rel.table.name
-            )
-        })?
-        .clone();
-    let serialized_table = table_info.serialized_metadata.clone().ok_or_else(|| {
-        format!(
-            "iceberg metadata table {} requires serialized metadata; \
-                 table was not loaded through an iceberg catalog",
+    let ScanSource::Sql(source) = rel.table.source else {
+        return Err(format!(
+            "iceberg metadata table {} was not projected into a SQL binding source",
             rel.table.name
-        )
-    })?;
-    let cloud_properties = match &rel.table.source {
-        ScanSource::IcebergDataFiles {
-            cloud_properties, ..
-        } => cloud_properties.clone(),
-        _ => Default::default(),
+        ));
     };
-    let metadata_payload =
-        build_iceberg_metadata_payload(&rel.metadata_table_type, &rel.table.source)?;
+    if !matches!(
+        source.kind,
+        crate::sql::planner::table::SqlScanKind::Metadata { .. }
+    ) {
+        return Err(format!(
+            "iceberg metadata table {} has a non-metadata SQL scan source",
+            rel.table.name
+        ));
+    }
     let synthetic_name = format!("{}__nr_meta__", rel.table.name);
     let synthetic_table = TableDef {
         name: synthetic_name,
-        columns: column_defs,
+        columns: rel.table.columns,
         iceberg_row_lineage_metadata_columns: vec![],
-        source: ScanSource::IcebergMetadataTable {
-            table: table_info,
-            metadata_table_type: rel.metadata_table_type,
-            serialized_table,
-            cloud_properties,
-            metadata_payload,
-        },
+        source: ScanSource::Sql(source),
     };
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
@@ -305,136 +277,11 @@ fn plan_iceberg_metadata_scan(
     ))
 }
 
-#[derive(Default)]
-struct PartitionMetadataAgg {
-    record_count: i64,
-    file_count: i64,
-    total_data_file_size_in_bytes: i64,
-    position_delete_files: std::collections::BTreeSet<String>,
-    equality_delete_files: std::collections::BTreeSet<String>,
-}
-
-fn build_iceberg_metadata_payload(
-    metadata_table_type: &crate::connector::iceberg::IcebergMetadataTableType,
-    storage: &crate::sql::planner::table::ScanSource,
-) -> Result<Option<String>, String> {
-    use crate::connector::iceberg::IcebergMetadataTableType;
-    use crate::sql::planner::table::ScanSource;
-    match metadata_table_type {
-        IcebergMetadataTableType::Partitions => {
-            let ScanSource::IcebergDataFiles { files, .. } = storage else {
-                return Err(
-                    "iceberg partitions metadata table requires catalog-resolved data files"
-                        .to_string(),
-                );
-            };
-            build_iceberg_partitions_payload(files).map(Some)
-        }
-        IcebergMetadataTableType::Files
-        | IcebergMetadataTableType::Manifests
-        | IcebergMetadataTableType::LogicalIcebergMetadata => {
-            let table_info = iceberg_table_info(storage).ok_or_else(|| {
-                "iceberg files/manifests/entries metadata table requires iceberg table identity"
-                    .to_string()
-            })?;
-            table_info
-                .serialized_metadata_rows
-                .clone()
-                .map(Some)
-                .ok_or_else(|| {
-                    "iceberg metadata rows were not resolved at catalog lookup time".to_string()
-                })
-        }
-        IcebergMetadataTableType::Snapshots
-        | IcebergMetadataTableType::History
-        | IcebergMetadataTableType::Refs => Ok(None),
-    }
-}
-
-fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<String, String> {
-    let mut groups = std::collections::BTreeMap::<(i32, String), PartitionMetadataAgg>::new();
-    for file in files {
-        let spec_id = file.partition_spec_id.ok_or_else(|| {
-            format!(
-                "iceberg partitions metadata requires partition spec id for data file {}",
-                file.path
-            )
-        })?;
-        let record_count = file.row_count.ok_or_else(|| {
-            format!(
-                "iceberg partitions metadata requires record_count for data file {}",
-                file.path
-            )
-        })?;
-        let partition_key = file
-            .partition_key
-            .clone()
-            .unwrap_or_else(|| "Struct([])".to_string());
-        let agg = groups.entry((spec_id, partition_key)).or_default();
-        agg.record_count = agg
-            .record_count
-            .checked_add(record_count)
-            .ok_or_else(|| "iceberg partitions metadata record_count overflow".to_string())?;
-        agg.file_count = agg
-            .file_count
-            .checked_add(1)
-            .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
-        agg.total_data_file_size_in_bytes = agg
-            .total_data_file_size_in_bytes
-            .checked_add(file.size)
-            .ok_or_else(|| {
-                "iceberg partitions metadata total_data_file_size_in_bytes overflow".to_string()
-            })?;
-        for delete_file in &file.delete_files {
-            match delete_file.file_content {
-                IcebergDeleteFileContent::Position => {
-                    agg.position_delete_files.insert(delete_file.path.clone());
-                }
-                IcebergDeleteFileContent::Equality => {
-                    agg.equality_delete_files.insert(delete_file.path.clone());
-                }
-            }
-        }
-    }
-    let rows = groups
-        .into_iter()
-        .map(
-            |((spec_id, partition), agg)| -> Result<serde_json::Value, String> {
-                let position_delete_file_count = i64::try_from(agg.position_delete_files.len())
-                    .map_err(|_| {
-                        "iceberg partitions metadata position_delete_file_count overflow"
-                            .to_string()
-                    })?;
-                let equality_delete_file_count = i64::try_from(agg.equality_delete_files.len())
-                    .map_err(|_| {
-                        "iceberg partitions metadata equality_delete_file_count overflow"
-                            .to_string()
-                    })?;
-                Ok(serde_json::json!({
-                    "spec_id": spec_id,
-                    "partition": partition,
-                    "record_count": agg.record_count,
-                    "file_count": agg.file_count,
-                    "total_data_file_size_in_bytes": agg.total_data_file_size_in_bytes,
-                    "position_delete_file_count": position_delete_file_count,
-                    "equality_delete_file_count": equality_delete_file_count,
-                }))
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    serde_json::to_string(&serde_json::json!({
-        "version": 1,
-        "rows": rows,
-    }))
-    .map_err(|e| format!("serialize iceberg partitions metadata payload failed: {e}"))
-}
-
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
-/// `LogicalPlanKind::Scan` whose `TableDef` carries the synthetic
-/// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
-/// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
-/// (rather than `HDFS_SCAN_NODE`). Refresh/codegen expands the storage
-/// variant into a typed explicit payload; lower only consumes that payload.
+/// `LogicalPlanKind::Scan` whose `TableDef` carries a token-bound
+/// `SqlScanSource::Delta` fact. Preparation resolves the exact provider
+/// materialization through that same request-local token; the logical plan
+/// neither receives nor reconstructs Iceberg metadata.
 fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
@@ -483,14 +330,39 @@ fn plan_iceberg_delta_scan(
             is_internal: false,
         });
     }
-    let table_info = iceberg_table_info(&rel.table.source)
-        .ok_or_else(|| {
-            format!(
-                "iceberg delta scan {}.{}.{} requires iceberg table identity",
-                rel.catalog, rel.namespace, rel.table_name
-            )
-        })?
-        .clone();
+    let ScanSource::Sql(source) = rel.table.source else {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} requires a token-bound SQL scan source",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    };
+    if !matches!(
+        &source.kind,
+        crate::sql::planner::table::SqlScanKind::Data { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
+    ) {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} requires a data or frozen-input SQL scan source",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    }
+    if source.table.catalog != rel.catalog
+        || source.table.namespace != rel.namespace
+        || source.table.table != rel.table_name
+    {
+        return Err(format!(
+            "iceberg delta scan {}.{}.{} binding identity does not match the resolved table",
+            rel.catalog, rel.namespace, rel.table_name
+        ));
+    }
+    let delta_source = crate::sql::planner::table::SqlScanSource::new(
+        source.binding,
+        source.table,
+        crate::sql::planner::table::SqlScanKind::Delta {
+            from_snapshot_id: rel.from_snapshot_id,
+            to_snapshot_id: rel.to_snapshot_id,
+        },
+    );
     let synthetic_table = TableDef {
         name: rel.table.name.clone(),
         columns: rel.table.columns.clone(),
@@ -498,11 +370,7 @@ fn plan_iceberg_delta_scan(
             .table
             .iceberg_row_lineage_metadata_columns
             .clone(),
-        source: ScanSource::IcebergDeltaTable {
-            table: table_info,
-            from_snapshot_id: rel.from_snapshot_id,
-            to_snapshot_id: rel.to_snapshot_id,
-        },
+        source: ScanSource::Sql(delta_source),
     };
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
@@ -518,21 +386,6 @@ fn plan_iceberg_delta_scan(
         vec![],
         None,
     ))
-}
-
-fn iceberg_table_info(
-    source: &crate::sql::planner::table::ScanSource,
-) -> Option<&crate::connector::iceberg::scan_model::IcebergTableInfo> {
-    match source {
-        crate::sql::planner::table::ScanSource::IcebergDataFiles { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergMetadataTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergDeltaTable { table, .. }
-        | crate::sql::planner::table::ScanSource::IcebergVersionTable { table, .. } => Some(table),
-        crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::ConnectorPinned
-        | crate::sql::planner::table::ScanSource::IcebergMvTargetState { .. }
-        | crate::sql::planner::table::ScanSource::IcebergMvTargetLocator { .. } => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

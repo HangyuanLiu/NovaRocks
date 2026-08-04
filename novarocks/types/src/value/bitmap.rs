@@ -20,19 +20,19 @@ use std::io::Cursor;
 
 use roaring::RoaringBitmap;
 
-pub(crate) const BITMAP_TYPE_EMPTY: u8 = 0;
-pub(crate) const BITMAP_TYPE_SINGLE32: u8 = 1;
-pub(crate) const BITMAP_TYPE_BITMAP32: u8 = 2;
-pub(crate) const BITMAP_TYPE_SINGLE64: u8 = 3;
-pub(crate) const BITMAP_TYPE_BITMAP64: u8 = 4;
-pub(crate) const BITMAP_TYPE_SET: u8 = 10;
-pub(crate) const BITMAP_TYPE_BITMAP32_SERIV2: u8 = 12;
-pub(crate) const BITMAP_TYPE_BITMAP64_SERIV2: u8 = 13;
+pub const BITMAP_TYPE_EMPTY: u8 = 0;
+pub const BITMAP_TYPE_SINGLE32: u8 = 1;
+pub const BITMAP_TYPE_BITMAP32: u8 = 2;
+pub const BITMAP_TYPE_SINGLE64: u8 = 3;
+pub const BITMAP_TYPE_BITMAP64: u8 = 4;
+pub const BITMAP_TYPE_SET: u8 = 10;
+pub const BITMAP_TYPE_BITMAP32_SERIV2: u8 = 12;
+pub const BITMAP_TYPE_BITMAP64_SERIV2: u8 = 13;
 
 const ROARING_COOKIE_NO_RUNCONTAINER: u32 = 12_346; // 0x303A
 const ROARING_COOKIE_RUNCONTAINER: u16 = 12_347; // 0x303B
 
-pub(crate) fn encode_varint_u64(mut value: u64, out: &mut Vec<u8>) {
+pub fn encode_varint_u64(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8 & 0x7f) | 0x80);
         value >>= 7;
@@ -40,7 +40,7 @@ pub(crate) fn encode_varint_u64(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-pub(crate) fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), String> {
+pub fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), String> {
     let mut out = 0u64;
     let mut shift = 0u32;
     for (idx, byte) in bytes.iter().enumerate() {
@@ -56,7 +56,7 @@ pub(crate) fn decode_varint_u64(bytes: &[u8]) -> Result<(u64, usize), String> {
     Err("bitmap decode varint reached end of payload".to_string())
 }
 
-pub(crate) fn parse_bitmap_string(text: &str) -> Result<BTreeSet<u64>, String> {
+pub fn parse_bitmap_string(text: &str) -> Result<BTreeSet<u64>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(BTreeSet::new());
@@ -81,7 +81,7 @@ fn parse_bitmap_text(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     parse_bitmap_string(text)
 }
 
-pub(crate) fn decode_internal_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
+pub fn decode_internal_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     if bytes.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -247,7 +247,7 @@ fn decode_external_bitmap64(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     Ok(out)
 }
 
-pub(crate) fn decode_external_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
+pub fn decode_external_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     if bytes.is_empty() {
         return Err("bitmap external payload is empty".to_string());
     }
@@ -323,7 +323,7 @@ pub(crate) fn decode_external_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, Stri
     }
 }
 
-pub(crate) fn decode_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
+pub fn decode_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     if bytes.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -336,7 +336,7 @@ pub(crate) fn decode_bitmap(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     parse_bitmap_text(bytes)
 }
 
-pub(crate) fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+pub fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
     if values.is_empty() {
         return Ok(vec![BITMAP_TYPE_EMPTY]);
     }
@@ -364,6 +364,35 @@ pub(crate) fn encode_internal_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, 
     out.extend_from_slice(&count.to_le_bytes());
     for value in values {
         encode_varint_u64(*value, &mut out);
+    }
+    Ok(out)
+}
+
+/// Encode one unsigned value using the canonical internal bitmap representation.
+pub fn encode_bitmap_single(value: u64) -> Vec<u8> {
+    encode_internal_bitmap(&BTreeSet::from([value]))
+        .expect("a single bitmap value is always representable")
+}
+
+/// Encode a bitmap aggregate intermediate in its historical fixed-width SET
+/// layout. The general decoder accepts this alongside the compact SQL form.
+pub fn encode_bitmap_aggregate(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+    if values.is_empty() {
+        return Ok(vec![BITMAP_TYPE_EMPTY]);
+    }
+    if values.len() == 1 {
+        return Ok(encode_bitmap_single(values.first().copied().ok_or_else(
+            || "bitmap aggregate missing singleton value".to_string(),
+        )?));
+    }
+
+    let count = u32::try_from(values.len())
+        .map_err(|_| format!("bitmap aggregate value count overflow: {}", values.len()))?;
+    let mut out = Vec::with_capacity(1 + 4 + values.len() * 8);
+    out.push(BITMAP_TYPE_SET);
+    out.extend_from_slice(&count.to_le_bytes());
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
     }
     Ok(out)
 }
@@ -446,7 +475,7 @@ fn encode_roaring32_payload(values: &[u32]) -> Result<Vec<u8>, String> {
     encode_roaring32_no_run(values)
 }
 
-pub(crate) fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
+pub fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, String> {
     if values.is_empty() {
         return Ok(vec![BITMAP_TYPE_EMPTY]);
     }
@@ -511,6 +540,37 @@ pub(crate) fn encode_external_bitmap(values: &BTreeSet<u64>) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-pub(crate) fn roaring_cookie_no_run() -> u32 {
+pub fn roaring_cookie_no_run() -> u32 {
     ROARING_COOKIE_NO_RUNCONTAINER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlx2_value_codec_bitmap_empty_single_and_set_are_stable() {
+        assert_eq!(
+            encode_internal_bitmap(&BTreeSet::new()).unwrap(),
+            vec![BITMAP_TYPE_EMPTY]
+        );
+        assert_eq!(
+            encode_bitmap_single(7),
+            vec![BITMAP_TYPE_SINGLE32, 7, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_bitmap(&[BITMAP_TYPE_SET, 2, 0, 0, 0, 1, 172, 2]).unwrap(),
+            BTreeSet::from([1, 300])
+        );
+    }
+
+    #[test]
+    fn sqlx2_value_codec_bitmap_string_and_malformed_payloads_are_checked() {
+        assert_eq!(
+            parse_bitmap_string(" 1, 2, 1 ").unwrap(),
+            BTreeSet::from([1, 2])
+        );
+        assert!(parse_bitmap_string("one").is_err());
+        assert!(decode_internal_bitmap(&[BITMAP_TYPE_SINGLE32]).is_err());
+    }
 }
