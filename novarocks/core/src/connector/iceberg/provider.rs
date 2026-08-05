@@ -76,6 +76,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::catalog::IcebergCatalogEntry;
+use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
     extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
@@ -1840,7 +1841,19 @@ impl IcebergControlProvider {
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Arc::new(Schema::new(fields)))
+        let columns = fields
+            .iter()
+            .map(|field| super::schema::IcebergArrowColumn {
+                name: field.name().to_string(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+            })
+            .collect::<Vec<_>>();
+        super::schema::build_projected_output_schema_from_scan_model(
+            &iceberg_schema_def_for_codegen(loaded.table.metadata().current_schema()),
+            &columns,
+        )
+        .map_err(|error| internal(format!("build Iceberg projected schema: {error}")))
     }
 
     fn frozen_data_rewrite_schema(

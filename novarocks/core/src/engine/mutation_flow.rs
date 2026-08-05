@@ -305,9 +305,17 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) table_write_mode: IcebergUpdateMode,
+    pub(crate) mor_write_target: Option<PreparedMorMergeWriteTarget>,
     pub(crate) insert_columns_resolved: Option<MergeInsertColumns>,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) connector_context: novarocks_spi::connector::ConnectorRequestContext,
+}
+
+/// Frozen MOR writer facts for MERGE.  The producer query and its terminal
+/// sink must use the same admission lease and physical target envelope.
+pub(crate) struct PreparedMorMergeWriteTarget {
+    pub(crate) sink_spec: IcebergWriteSinkSpec,
+    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 }
 
 pub(crate) fn prepare_update_mutation(
@@ -502,6 +510,32 @@ pub(crate) fn prepare_merge_mutation(
         .as_ref()
         .map(|clause| resolve_merge_insert_columns(&clause.action, &target_columns))
         .transpose()?;
+    let mor_write_target = if table_write_mode == IcebergUpdateMode::MergeOnRead
+        || matches!(
+            stmt.matched.as_ref().map(|clause| &clause.action),
+            Some(MergeMatchedAction::Delete)
+        ) {
+        let planning_lease = crate::connector::acquire_metadata_planning_lease(
+            state.connector_control.as_ref(),
+            &target.catalog,
+        )?;
+        let materialization =
+            crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+                planning_lease,
+                connector_context.clone(),
+                &target.namespace,
+                &target.table,
+            )?;
+        let planning_lease = materialization.planning_lease.clone();
+        let sink_spec =
+            row_lineage_sink_spec_from_frozen_materialization(&materialization, &entry)?;
+        Some(PreparedMorMergeWriteTarget {
+            sink_spec,
+            planning_lease,
+        })
+    } else {
+        None
+    };
     Ok(PreparedMergeMutation {
         stmt: stmt.clone(),
         current_catalog: current_catalog.map(str::to_string),
@@ -512,6 +546,7 @@ pub(crate) fn prepare_merge_mutation(
         target_columns,
         entry,
         table_write_mode,
+        mor_write_target,
         insert_columns_resolved,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
@@ -2854,6 +2889,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         target_columns,
         entry,
         table_write_mode,
+        mor_write_target,
         insert_columns_resolved,
         execution,
         connector_context,
@@ -2876,6 +2912,12 @@ pub(crate) fn stage_prepared_merge_mutation(
             .current_snapshot()
             .map(|snapshot| snapshot.snapshot_id());
         let metadata = table.metadata();
+        let PreparedMorMergeWriteTarget {
+            sink_spec: write_sink_spec,
+            planning_lease: write_planning_lease,
+        } = mor_write_target.ok_or_else(|| {
+            "MOR MERGE reached stage without an admitted frozen write target".to_string()
+        })?;
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 CommitOpKind::RowDeltaDvFromFiles,
@@ -2904,6 +2946,8 @@ pub(crate) fn stage_prepared_merge_mutation(
             metadata.last_sequence_number() + 1,
             &execution,
             &connector_context,
+            &write_sink_spec,
+            write_planning_lease,
         )?;
         let abort_cleanup =
             crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
@@ -3718,6 +3762,8 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_sink_spec: &IcebergWriteSinkSpec,
+    write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<DmlChangeStreamWritePlan, String> {
     let target_alias = stmt
         .target_alias
@@ -3846,6 +3892,11 @@ fn build_merge_mor_change_stream_write_plan(
         crate::sql::catalog::TableLookupMode::SchemaOnly,
     );
     let table_bindings = analyzer_provider.query_table_bindings();
+    admit_frozen_iceberg_write_target(
+        table_bindings.as_ref(),
+        write_sink_spec,
+        write_planning_lease,
+    )?;
     let planned = crate::engine::plan_query_for_iceberg_change_stream_refresh(
         state,
         &query,

@@ -42,8 +42,8 @@ use crate::engine::delete_engine::{
 };
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::engine::query_planning::write_sink::{
-    IcebergWriteSinkMode, IcebergWriteSinkSpec, admit_frozen_iceberg_write_target,
-    sql_write_plan_input_for_admitted_target,
+    IcebergWriteSinkMode, admit_frozen_iceberg_write_target,
+    sql_write_plan_input_from_admitted_binding,
 };
 use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::query_execution::outcome::QueryExecutionResult;
@@ -224,10 +224,21 @@ fn prepare_equality_delete_distributed_write(
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding =
         admit_frozen_iceberg_write_target(table_bindings.as_ref(), &sink_spec, planning_lease)?;
-    let sql_write_input = sql_write_plan_input_for_admitted_target(
+    let input_columns = delete_columns
+        .iter()
+        .map(|column| ColumnDef {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            write_default: None,
+            logical_type: None,
+        })
+        .collect();
+    let sql_write_input = sql_write_plan_input_from_admitted_binding(
         table_bindings.as_ref(),
         target_binding,
         sink_spec.sql_mode(),
+        input_columns,
         crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
