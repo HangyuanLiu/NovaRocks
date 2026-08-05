@@ -378,7 +378,7 @@ fn prepare_delete_dv_write(
         table_bindings.as_ref(),
         target_binding,
         sink_spec.sql_mode(),
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
     let delete_query = build_delete_position_sink_query(
@@ -501,7 +501,7 @@ fn prepare_delete_write(
         table_bindings.as_ref(),
         target_binding,
         sink_spec.sql_mode(),
-        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
+        crate::sql::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         None,
     )?;
     let position_index_storage =

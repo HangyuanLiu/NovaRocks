@@ -6021,12 +6021,29 @@ fn map_iceberg_fact_columns<'a>(
     columns: &'a [IcebergScanFactColumnV1],
 ) -> Result<Vec<(&'a IcebergScanFactColumnV1, Option<u32>)>, ConnectorError> {
     let physical = inspection.physical_columns();
-    let physical_columns_len = physical.len();
-    let with_ids = physical
+    // Iceberg VARIANT is one logical table field but is encoded as an opaque
+    // Parquet group whose `metadata`/`value` leaves intentionally do not carry
+    // table field IDs. Exclude those leaves from the ordinary field-ID
+    // coverage check; they cannot provide scalar fact-column statistics and
+    // must not make a valid file look like a mixed-identity footer.
+    let identity_physical = physical
+        .iter()
+        .filter(|column| {
+            let Some(root) = column.path().first() else {
+                return true;
+            };
+            !inspection.schema().fields().iter().any(|field| {
+                field.name().eq_ignore_ascii_case(root)
+                    && crate::formats::parquet::is_variant_struct_data_type(field.data_type())
+            })
+        })
+        .collect::<Vec<_>>();
+    let physical_columns_len = identity_physical.len();
+    let with_ids = identity_physical
         .iter()
         .filter(|column| column.field_id().is_some())
         .count();
-    if with_ids != 0 && with_ids != physical.len() {
+    if with_ids != 0 && with_ids != physical_columns_len {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             "Iceberg Parquet footer has mixed field-ID coverage",
@@ -6444,10 +6461,19 @@ fn materialization_from_metadata(
     let table = payload
         .table_info
         .ok_or_else(|| "Iceberg SPI table metadata is missing its read descriptor".to_string())?;
+    let columns = columns_from_metadata(&metadata.schema, &payload.logical_type_columns)
+        .into_iter()
+        .filter(|column| {
+            !payload
+                .hidden_columns
+                .iter()
+                .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
+        })
+        .collect();
     Ok(IcebergQueryTableMaterialization {
         table_name: payload.table,
         schema_id,
-        columns: columns_from_metadata(&metadata.schema, &payload.logical_type_columns),
+        columns,
         iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
         table,
         files: payload.prepared_files,

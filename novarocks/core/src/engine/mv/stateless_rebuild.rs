@@ -54,7 +54,6 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::engine::mv::iceberg_discovery::discover_iceberg_mvs;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::sql::parser::procedure::CallProcedureStmt;
@@ -171,16 +170,25 @@ pub(crate) fn execute_request(
     // Discovering the MV package and reading its descriptor IS the lake
     // rebuild: it walks the Iceberg MV table descriptor and never consults
     // SQLite. If it fails, fail loud.
-    let discovered = discover_iceberg_mvs(state, &req.catalog, &req.namespace)?;
-    let mv = discovered
-        .into_iter()
-        .find(|entry| entry.public_name.eq_ignore_ascii_case(&req.mv))
-        .ok_or_else(|| {
-            format!(
-                "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
-                req.namespace, req.mv, req.catalog
-            )
-        })?;
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&req.catalog)?
+    };
+    let mv = crate::engine::mv::iceberg_discovery::discover_iceberg_mv_from_entry(
+        &entry,
+        &req.catalog,
+        &req.namespace,
+        &req.mv,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
+            req.namespace, req.mv, req.catalog
+        )
+    })?;
 
     let descriptor_hash = mv.descriptor.content_hash()?;
 
@@ -189,13 +197,6 @@ pub(crate) fn execute_request(
     // the server can reconstruct the provenance level purely from the lake;
     // otherwise (no current snapshot, or an MV that was created but never
     // refreshed) it falls back to the W1 package level.
-    let entry = {
-        let catalogs = state
-            .iceberg_catalogs
-            .read()
-            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        catalogs.get(&req.catalog)?
-    };
     let loaded =
         crate::connector::iceberg::catalog::registry::load_table(&entry, &mv.namespace, &mv.table)?;
     let provenance = loaded

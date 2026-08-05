@@ -88,6 +88,48 @@ pub(crate) fn discover_iceberg_mvs_from_entry(
     Ok(discovered)
 }
 
+/// Discover one named lake-native MV without depending on the catalog's table
+/// enumeration implementation. Targeted stateless rebuild already has the
+/// exact table identity from the procedure request, so direct loading is the
+/// authoritative lookup for that path.
+pub(crate) fn discover_iceberg_mv_from_entry(
+    entry: &IcebergCatalogEntry,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Option<DiscoveredIcebergMv>, String> {
+    let loaded = match load_table(entry, namespace, table) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            tracing::warn!(
+                catalog,
+                namespace,
+                table,
+                error,
+                "skip unreadable named Iceberg table during targeted lake MV discovery"
+            );
+            return Ok(None);
+        }
+    };
+    let Some(descriptor) = descriptor_from_loaded_table(&loaded)? else {
+        return Ok(None);
+    };
+    let expected_package_id = format!("{namespace}.{table}");
+    if descriptor.package_id != expected_package_id {
+        return Err(format!(
+            "Iceberg MV descriptor package id mismatch for discovered table {catalog}.{namespace}.{table}: expected {expected_package_id}, got {}",
+            descriptor.package_id
+        ));
+    }
+    Ok(Some(DiscoveredIcebergMv {
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        public_name: table.to_string(),
+        table: table.to_string(),
+        descriptor,
+    }))
+}
+
 fn load_discovery_candidates<T>(
     catalog: &str,
     namespace: &str,

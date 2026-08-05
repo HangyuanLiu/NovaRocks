@@ -626,6 +626,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 &target_columns,
                 &entry,
                 base_snapshot_id,
+                &target_ref,
                 None,
                 &connector_context,
             )?;
@@ -1904,6 +1905,7 @@ fn build_cow_update_distributed_write(
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
+    target_ref: &str,
     planning_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowUpdateDistributedWrite, String> {
@@ -1968,6 +1970,7 @@ fn build_cow_update_distributed_write(
             &synthetic_table_name,
             data_file,
             base_snapshot_id,
+            target_ref,
             planning_lease.clone(),
             connector_context,
         )?;
@@ -2007,6 +2010,7 @@ fn build_cow_rewrite_query_local_overlay(
     synthetic_table_name: &str,
     data_file: crate::connector::iceberg::catalog::registry::DataFileWithStats,
     base_snapshot_id: i64,
+    target_ref: &str,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay, String> {
@@ -2023,7 +2027,7 @@ fn build_cow_rewrite_query_local_overlay(
             &target.namespace,
             &target.table,
         )?;
-    if materialization.table.current_snapshot_id != Some(base_snapshot_id) {
+    if target_ref == "main" && materialization.table.current_snapshot_id != Some(base_snapshot_id) {
         return Err(format!(
             "COW UPDATE source {}.{}.{} changed after admission: expected snapshot {}, got {:?}",
             target.catalog,
@@ -2033,6 +2037,11 @@ fn build_cow_rewrite_query_local_overlay(
             materialization.table.current_snapshot_id,
         ));
     }
+    // The provider's strict-base materialization is rooted at the table's
+    // main snapshot. A branch COW rewrite uses explicit files selected from
+    // the admitted branch head, so carry that branch snapshot into the
+    // request-local overlay instead of rejecting the schema-only materialization
+    // because its default snapshot is main.
     materialization.table.current_snapshot_id = Some(base_snapshot_id);
     materialization.files = vec![
         crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info(
@@ -3124,6 +3133,7 @@ pub(crate) fn stage_prepared_merge_mutation(
                             .metadata()
                             .current_snapshot()
                             .map(|snapshot| snapshot.snapshot_id()),
+                        "main",
                         insert_branch.as_ref().map(|(_, _, lease)| lease.clone()),
                         &connector_context,
                     )?)

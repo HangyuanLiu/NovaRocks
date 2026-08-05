@@ -97,6 +97,7 @@ pub(super) struct ActiveSession {
 #[derive(Default)]
 struct TerminalState {
     heartbeat_acks: BTreeMap<usize, u64>,
+    backend_stream_closed: BTreeSet<usize>,
     locally_drained: BTreeSet<usize>,
     termination_accepted: BTreeMap<usize, QueryTerminationReason>,
     snapshots: BTreeMap<usize, QueryTerminalSnapshot>,
@@ -861,6 +862,11 @@ impl AttemptControl {
                 // drained.
                 return Some(Ok(()));
             }
+            if terminal.backend_stream_closed.contains(&backend_idx) {
+                return Some(Err(format!(
+                    "query lifecycle backend {backend_idx} control stream closed"
+                )));
+            }
             if let Some(error) = &terminal.reader_failure {
                 return Some(Err(error.clone()));
             }
@@ -1172,11 +1178,15 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 return;
             }
             Err(error) => {
-                control.record_reader_failure(format!(
-                    "query lifecycle control stream lost on backend {} digest {}: {error}",
-                    session.target.backend_idx(),
-                    hex::encode(session.digest.as_bytes())
-                ));
+                if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed) {
+                    control.record_backend_stream_closed(session.target.backend_idx());
+                } else {
+                    control.record_reader_failure(format!(
+                        "query lifecycle control stream lost on backend {} digest {}: {error}",
+                        session.target.backend_idx(),
+                        hex::encode(session.digest.as_bytes())
+                    ));
+                }
                 return;
             }
         };
@@ -1308,6 +1318,12 @@ impl AttemptControl {
         if terminal.reader_failure.is_none() {
             terminal.reader_failure = Some(reason);
         }
+        self.terminal.1.notify_all();
+    }
+
+    fn record_backend_stream_closed(&self, backend_idx: usize) {
+        let mut terminal = self.terminal.0.lock().expect("query terminal state");
+        terminal.backend_stream_closed.insert(backend_idx);
         self.terminal.1.notify_all();
     }
 
@@ -1516,6 +1532,16 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
                 sequence,
                 sent_mono_ns: started.elapsed().as_nanos() as u64,
             }) {
+                if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed) {
+                    control.supervisor_failed(
+                        format!(
+                            "backend {} lost after heartbeat timeout",
+                            session.target.backend_idx()
+                        ),
+                        SupervisorFailureKind::HeartbeatTimeout,
+                    );
+                    return;
+                }
                 let terminal = control.terminal.0.lock().expect("query terminal state");
                 if control.terminal_delivery_started(&terminal) {
                     return;
@@ -1539,12 +1565,12 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
             ) {
                 Ok(()) => {}
                 Err(error) => {
-                    let timeout = error.contains("heartbeat timeout");
+                    let timeout = error.contains("heartbeat timeout")
+                        || error.contains("control stream closed");
                     let failure = if timeout {
                         format!(
-                            "query lifecycle heartbeat timeout on backend {} digest {}",
-                            session.target.backend_idx(),
-                            hex::encode(session.digest.as_bytes())
+                            "backend {} lost after heartbeat timeout",
+                            session.target.backend_idx()
                         )
                     } else {
                         format!(

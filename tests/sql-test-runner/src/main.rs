@@ -531,14 +531,21 @@ fn execute_wait_alter(
     // engine to receive each identifier part quoted independently — wrapping
     // `catalog.db` in a single backtick group flattens it into one db name and
     // makes the lookup miss.
-    let qualified_from = match db_name.split_once('.') {
-        Some((catalog, db)) => format!("`{}`.`{}`", catalog, db),
-        None => format!("`{}`", db_name),
+    let show_sql = if db_name.is_empty() {
+        format!(
+            "SHOW ALTER TABLE {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
+            kind, table_name,
+        )
+    } else {
+        let qualified_from = match db_name.split_once('.') {
+            Some((catalog, db)) => format!("`{}`.`{}`", catalog, db),
+            None => format!("`{}`", db_name),
+        };
+        format!(
+            "SHOW ALTER TABLE {} FROM {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
+            kind, qualified_from, table_name,
+        )
     };
-    let show_sql = format!(
-        "SHOW ALTER TABLE {} FROM {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
-        kind, qualified_from, table_name,
-    );
     let mut total_elapsed = Duration::ZERO;
     for attempt in 0..max_retries {
         let (ok, execution, _err) = session.execute_query(query_timeout, &show_sql, None);
@@ -603,11 +610,10 @@ fn run_step_wait_alters(
     step: &SqlStep,
     session: &mut MysqlSession,
     query_timeout: u64,
-    primary_case_db: Option<&str>,
     log: &mut String,
 ) -> (bool, Duration) {
     let mut total = Duration::ZERO;
-    let db = step.meta.db.as_deref().or(primary_case_db).unwrap_or("");
+    let db = step.meta.db.as_deref().unwrap_or("");
     for (table, kind, default_retries) in [
         (&step.meta.wait_alter_column, "COLUMN", 60usize),
         (&step.meta.wait_alter_rollup, "ROLLUP", 120usize),
@@ -1838,7 +1844,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         step,
                         &mut target_session,
                         ctx.query_timeout,
-                        primary_case_db,
                         &mut log,
                     );
                     case_elapsed += wait_elapsed;
@@ -2151,7 +2156,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         step,
                         &mut target_session,
                         ctx.query_timeout,
-                        primary_case_db,
                         &mut log,
                     );
                     case_elapsed += wait_elapsed;

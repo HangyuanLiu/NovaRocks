@@ -646,6 +646,16 @@ fn apply_name_mapping_to_batch(
         return Ok(batch);
     }
     if identified != 0 {
+        // Some parquet readers do not retain the parent field ID on the
+        // logical VARIANT group even though the physical file is valid. The
+        // variant payload is opaque to Iceberg field identity (its metadata
+        // and value children are not table fields), so a missing ID there is
+        // safe to align by name when no rename mapping is required. Keep the
+        // mixed-ID rejection for ordinary fields and nested structs.
+        if name_mapping.is_none() && unidentified_fields_are_only_opaque_variants(&batch.schema())?
+        {
+            return Ok(batch);
+        }
         return Err("Iceberg data file mixes fields with and without field IDs".to_string());
     }
     let Some(name_mapping) = name_mapping else {
@@ -800,6 +810,23 @@ fn field_id_coverage(field: &Field) -> Result<(usize, usize), String> {
         _ => (0, 0),
     };
     Ok((identified + children_identified, 1 + children_total))
+}
+
+fn unidentified_fields_are_only_opaque_variants(schema: &SchemaRef) -> Result<bool, String> {
+    let mut found_unidentified_variant = false;
+    for field in schema.fields() {
+        if crate::formats::parquet::is_variant_struct_data_type(field.data_type()) {
+            if parse_field_id(field)?.is_none() {
+                found_unidentified_variant = true;
+            }
+            continue;
+        }
+        let (identified, total) = field_id_coverage(field.as_ref())?;
+        if identified != total {
+            return Ok(false);
+        }
+    }
+    Ok(found_unidentified_variant)
 }
 
 fn parse_field_id(field: &Field) -> Result<Option<i32>, String> {
@@ -1276,6 +1303,16 @@ mod tests {
             schema_field_id_coverage(&ordinary_struct).expect("ordinary struct coverage"),
             (1, 2)
         );
+    }
+
+    #[test]
+    fn missing_variant_parent_id_does_not_make_a_valid_file_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_id("id", 1, false),
+            physical_variant_field("payload", None),
+        ]));
+
+        assert!(unidentified_fields_are_only_opaque_variants(&schema).expect("variant coverage"));
     }
 
     #[test]

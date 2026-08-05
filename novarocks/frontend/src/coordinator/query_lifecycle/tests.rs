@@ -1638,7 +1638,7 @@ fn frontend_query_lifecycle_heartbeat_timeout_fails_closed() {
 }
 
 #[test]
-fn frontend_query_lifecycle_stream_loss_is_classified_as_coordinator_lost() {
+fn frontend_query_lifecycle_backend_stream_loss_is_classified_as_heartbeat_timeout() {
     let plan = query_init_plan(None);
     let query_id = plan.execution_id().query_id();
     let (transport, sessions) = RecordingTransport::ready(&plan);
@@ -1682,12 +1682,12 @@ fn frontend_query_lifecycle_stream_loss_is_classified_as_coordinator_lost() {
     wait_until(Duration::from_secs(1), || {
         registry
             .first_failure(query_id)
-            .is_some_and(|failure| failure.contains("stream lost"))
+            .is_some_and(|failure| failure.contains("backend 0 lost after heartbeat timeout"))
     });
     let snapshot = barrier.metrics_snapshot();
-    assert_eq!(snapshot.coordinator_lost, 1);
+    assert_eq!(snapshot.coordinator_lost, 0);
     assert_eq!(snapshot.local_failures, 0);
-    assert_eq!(snapshot.heartbeat_timeouts, 0);
+    assert_eq!(snapshot.heartbeat_timeouts, 1);
     drop(lease);
 }
 
