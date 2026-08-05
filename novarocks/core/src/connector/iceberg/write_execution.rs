@@ -1078,14 +1078,14 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
 /// an internal construction detail never becomes persisted table data.
 fn position_delete_storage_batch(batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
     let input_schema = batch.schema();
-    if input_schema.fields().len() != 2 {
+    if input_schema.fields().len() < 2 {
         return Err(error(
             ConnectorErrorKind::InvalidRequest,
-            "Iceberg position-delete storage batch requires exactly two columns",
+            "Iceberg position-delete storage batch requires _file and _pos as its first two columns",
         ));
     }
     let schema = canonical_output_schema();
-    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|arrow_error| {
+    RecordBatch::try_new(schema, batch.columns()[..2].to_vec()).map_err(|arrow_error| {
         error(
             ConnectorErrorKind::Internal,
             format!("build Iceberg position-delete storage batch failed: {arrow_error}"),
@@ -1144,6 +1144,29 @@ mod tests {
                 .get(PARQUET_FIELD_ID_META_KEY),
             Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string())
         );
+        assert_eq!(stored.column(0).as_ref(), input.column(0).as_ref());
+        assert_eq!(stored.column(1).as_ref(), input.column(1).as_ref());
+    }
+
+    #[test]
+    fn position_delete_storage_batch_drops_partition_routing_columns() {
+        let input = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("region", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["s3://warehouse/t/data.parquet"])),
+                Arc::new(Int64Array::from(vec![4])),
+                Arc::new(StringArray::from(vec!["east"])),
+            ],
+        )
+        .expect("internal position-delete batch with partition routing column");
+
+        let stored = position_delete_storage_batch(&input).expect("storage batch");
+
+        assert_eq!(stored.num_columns(), 2);
         assert_eq!(stored.column(0).as_ref(), input.column(0).as_ref());
         assert_eq!(stored.column(1).as_ref(), input.column(1).as_ref());
     }

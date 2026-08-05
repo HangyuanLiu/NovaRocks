@@ -58,7 +58,9 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::{carry_forward_puffin_stats, register_puffin_stats};
+use super::fast_append::{
+    carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot, register_puffin_stats,
+};
 use super::helpers::{
     effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
@@ -90,11 +92,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             }
         }
         if groups.iter().all(|g| g.positions.is_empty()) && written.is_empty() {
-            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
-            return Ok(CommitOutcome {
-                new_snapshot_id: id,
-                written_manifest_paths: vec![],
-            });
+            return commit_empty_iceberg_mv_snapshot(ctx).await;
         }
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

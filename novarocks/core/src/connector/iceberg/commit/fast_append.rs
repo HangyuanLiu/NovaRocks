@@ -47,19 +47,66 @@ use crate::connector::iceberg::stats_assembler::{CommitType, FileSketchSet, Stat
 
 pub struct FastAppendCommit;
 
+/// Commit an MV staging marker even when the change-stream produced no data
+/// files. A frontend-owned MV refresh still publishes the staged snapshot, so
+/// returning the parent snapshot would make the publication guard reject the
+/// refresh marker.
+pub(crate) async fn commit_empty_iceberg_mv_snapshot(
+    ctx: CommitCtx<'_>,
+) -> Result<CommitOutcome, String> {
+    if ctx.snapshot_properties.is_empty() {
+        let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
+        return Ok(CommitOutcome {
+            new_snapshot_id: id,
+            written_manifest_paths: vec![],
+        });
+    }
+
+    if matches!(
+        crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table),
+        IcebergWriteMode::RowLineageV3
+    ) {
+        return commit_v3_row_lineage_append(ctx, Vec::new()).await;
+    }
+    if ctx.target_ref != "main" {
+        return Err(format!(
+            "MV empty snapshot branch target_ref={} requires the v3 row-lineage path",
+            ctx.target_ref
+        ));
+    }
+
+    let tx = Transaction::new(ctx.table);
+    let action = tx
+        .fast_append()
+        .set_commit_uuid(ctx.commit_uuid)
+        .set_snapshot_properties(ctx.snapshot_properties.clone().into_iter().collect());
+    let tx = action
+        .apply(tx)
+        .map_err(|e| format!("empty MV fast_append apply failed: {e}"))?;
+    let table_after = tx
+        .commit(ctx.catalog)
+        .await
+        .map_err(|e| format!("empty MV fast_append commit failed: {e}"))?;
+    let new_snapshot_id = table_after
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id())
+        .ok_or_else(|| "empty MV fast_append produced no current snapshot".to_string())?;
+    Ok(CommitOutcome {
+        new_snapshot_id,
+        written_manifest_paths: vec![],
+    })
+}
+
 #[async_trait]
 impl IcebergCommitAction for FastAppendCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let written = ctx.collector.take_written_files()?;
 
-        // Spec §4.1: empty input is a no-op — return the existing snapshot id
-        // (or 0 for an empty table) and skip the catalog round-trip.
+        // Ordinary empty input is a no-op. MV staging carries publication
+        // marker properties and therefore needs a data-free snapshot instead.
         if written.is_empty() {
-            let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
-            return Ok(CommitOutcome {
-                new_snapshot_id: id,
-                written_manifest_paths: vec![],
-            });
+            return commit_empty_iceberg_mv_snapshot(ctx).await;
         }
 
         // FastAppendAction::validate_added_data_files rejects any non-Data
