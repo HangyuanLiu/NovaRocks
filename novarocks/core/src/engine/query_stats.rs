@@ -55,6 +55,7 @@ use crate::sql::planner::table::{
 pub(crate) struct QueryStatisticsContext {
     bindings: Option<Arc<QueryTableBindingStore>>,
     snapshot: Arc<SqlStatisticsSnapshot>,
+    resolver: Option<Arc<UnifiedStatisticsResolver>>,
 }
 
 impl QueryStatisticsContext {
@@ -76,6 +77,7 @@ impl QueryStatisticsContext {
                 &bindings,
             )),
             bindings: Some(bindings),
+            resolver: Some(Arc::clone(&state.unified_statistics)),
         }
     }
 
@@ -650,6 +652,42 @@ pub(super) fn collect_table_stats(
     }
     match context.snapshot.get(binding_id) {
         Ok(evidence) => (evidence.label.clone(), evidence.statistics.clone()),
+        Err(SqlStatisticsFatalError::BindingMissing) => {
+            let Some(bindings) = context.bindings.as_ref() else {
+                return (
+                    label,
+                    BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                        SqlStatisticsFatalError::BindingMissing.to_string(),
+                    )),
+                );
+            };
+            let Some(resolver) = context.resolver.as_ref() else {
+                return (
+                    label,
+                    BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                        SqlStatisticsFatalError::BindingMissing.to_string(),
+                    )),
+                );
+            };
+            let binding = match bindings.binding(binding_id) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    return (
+                        label,
+                        BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(error)),
+                    );
+                }
+            };
+            match project_binding_statistics(resolver, &binding) {
+                Ok(statistics) => (binding.resolved.catalog.identity.fqn(), statistics),
+                Err(error) => (
+                    binding.resolved.catalog.identity.fqn(),
+                    BaseTableStatistics::missing(StatsMissingReason::CatalogLoadError(
+                        error.to_string(),
+                    )),
+                ),
+            }
+        }
         // The legacy collector cannot return a compiler error.  The canonical
         // kernel will consume this same immutable snapshot directly when its
         // scan token migration lands; preserve conservative behavior here

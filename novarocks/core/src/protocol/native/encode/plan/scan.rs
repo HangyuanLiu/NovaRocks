@@ -672,7 +672,7 @@ fn encode_scan_source(
                     scan_output_columns.unwrap_or_default(),
                     scan_analysis_columns.unwrap_or_default(),
                     scan_required_columns.unwrap_or_default(),
-                    iceberg_schema_for_connector_source(src),
+                    iceberg_schema_for_connector_source(binding),
                     scan_variant_columns,
                     binding,
                 )?,
@@ -770,10 +770,11 @@ fn encode_scan_source(
 }
 
 fn iceberg_schema_for_connector_source(
-    source: &table_model::ScanSource,
+    binding: Option<&ResolvedScanBinding>,
 ) -> Option<&iceberg_scan_model::IcebergSchemaDef> {
-    match source {
-        table_model::ScanSource::Sql(_) => None,
+    match binding.map(|binding| &binding.execution) {
+        Some(ResolvedScanExecution::IcebergFiles(files)) => Some(&files.table.schema),
+        _ => None,
     }
 }
 
