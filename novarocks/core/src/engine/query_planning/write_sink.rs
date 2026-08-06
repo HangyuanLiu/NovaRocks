@@ -46,7 +46,7 @@ use crate::sql::planner::table::SqlTableIdentity;
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
     pub(crate) mode: IcebergWriteSinkMode,
-    pub(crate) iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    pub(crate) iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) target_columns: Vec<ColumnDef>,
     pub(crate) table_location: String,
     pub(crate) data_location: String,
@@ -288,7 +288,7 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
 /// cannot be confused with the locator scan's schema.
 pub(crate) fn admit_frozen_iceberg_write_target_materialization(
     bindings: &QueryTableBindingStore,
-    table: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     let descriptor = planning_lease.binding().descriptor();
@@ -340,7 +340,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
                 table,
                 files: Vec::new(),
                 binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             }),
             frozen_snapshot_files: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
@@ -354,7 +354,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
 /// needs every field the exact writer contract consumes, including SQL-owned
 /// hidden row-lineage and MV state columns.
 fn admitted_write_target_columns(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<ColumnDef>, String> {
     let metadata = admitted_iceberg_metadata(table)?;
     write_target_columns_from_iceberg_schema(metadata.current_schema())
@@ -397,7 +397,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
     let mut iceberg = table;
     if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
         iceberg.schema.fields.extend([
-            crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
                 name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
@@ -406,7 +406,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
                 write_default_json: None,
                 children: Vec::new(),
             },
-            crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
                 name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
@@ -489,7 +489,7 @@ fn position_delete_descriptor_from_sql(
 }
 
 fn admitted_iceberg_metadata(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<novarocks_connector_iceberg::iceberg::spec::TableMetadata, String> {
     let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
         "SQL write target binding is missing frozen Iceberg table metadata".to_string()
@@ -500,7 +500,7 @@ fn admitted_iceberg_metadata(
 
 fn admitted_iceberg_table(
     materialization: &QueryScanMaterialization,
-) -> Result<&crate::connector::iceberg::scan_model::IcebergTableInfo, String> {
+) -> Result<&novarocks_connector_iceberg::scan_model::IcebergTableInfo, String> {
     match materialization {
         QueryScanMaterialization::IcebergDataFiles { table, .. }
         | QueryScanMaterialization::IcebergMvTarget { table, .. } => Ok(table),
@@ -576,7 +576,7 @@ fn admitted_write_input_columns(
 
 fn sql_write_target_fields(
     columns: &[ColumnDef],
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<SqlWriteTargetField>, String> {
     let mut fields = Vec::with_capacity(columns.len());
     for column in columns {

@@ -11,14 +11,14 @@
 //! Default value helpers shared by DDL, schema transport, parquet read path,
 //! and INSERT write path.
 
-use novarocks_connector_iceberg::iceberg::spec::{
+use crate::iceberg::spec::{
     FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral, PrimitiveType,
     Type,
 };
 
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
 
-pub(crate) fn iceberg_literal_to_column_default(
+pub fn iceberg_literal_to_column_default(
     literal: &IcebergLiteral,
     iceberg_type: &Type,
 ) -> Result<ColumnDefault, String> {
@@ -197,7 +197,7 @@ fn iceberg_literal_to_nested_column_default(
     }
 }
 
-pub(crate) fn column_default_to_iceberg_literal(
+pub fn column_default_to_iceberg_literal(
     value: &ColumnDefault,
     iceberg_type: &Type,
 ) -> Result<IcebergLiteral, String> {
@@ -361,7 +361,7 @@ fn column_default_to_nested_iceberg_literal(
     Ok(Some(IcebergLiteral::Primitive(primitive)))
 }
 
-pub(crate) fn require_v3_for_column_default(
+pub fn require_v3_for_column_default(
     format_version: FormatVersion,
     default: Option<&ColumnDefault>,
 ) -> Result<(), String> {
@@ -386,7 +386,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 /// Build an Arrow constant array of length `row_count` whose every element is
 /// the value encoded by `literal`. The literal's runtime type must agree with
 /// `target_type`; mismatches fail fast.
-pub(crate) fn literal_to_constant_array(
+pub fn literal_to_constant_array(
     literal: &IcebergLiteral,
     target_type: &DataType,
     row_count: usize,
@@ -506,10 +506,10 @@ pub(crate) fn literal_to_constant_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_catalog::schema::ColumnDefault;
-    use novarocks_connector_iceberg::iceberg::spec::{
+    use crate::iceberg::spec::{
         ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type,
     };
+    use novarocks_catalog::schema::ColumnDefault;
 
     fn assert_iceberg_default_round_trip(
         literal: IcebergLiteral,

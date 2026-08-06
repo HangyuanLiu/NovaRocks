@@ -31,7 +31,6 @@ use super::type_mapping::{
     encode_edge_partition_type, encode_iceberg_metadata_table_type, encode_sql_type,
 };
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
-use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
@@ -40,6 +39,7 @@ use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
+use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
@@ -411,7 +411,7 @@ fn encode_column_write_default_json(
         }
         _ => value,
     };
-    crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+    novarocks_connector_iceberg::default_value::column_default_to_iceberg_literal(
         value,
         &iceberg_type,
     )

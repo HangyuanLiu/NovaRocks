@@ -23,14 +23,14 @@ use crate::sql::planner::vocabulary::ApplyKeySource;
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::IcebergCatalogEntry;
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
 use crate::mv::rewrite::context::IcebergMvRewriteContext;
 use crate::sql::planner::vocabulary::{
     BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME, JOIN_APPLY_KEY_COLUMN_NAME,
 };
 use novarocks_catalog::identifier::TableIdentity;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
 
 pub(crate) fn apply_key_table_column() -> crate::sql::parser::ast::TableColumnDef {
     crate::sql::parser::ast::TableColumnDef {
@@ -232,7 +232,7 @@ fn iceberg_column_def_for_locator(
             .write_default
             .as_ref()
             .map(|literal| {
-                crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
                     literal,
                     nested.field_type.as_ref(),
                 )

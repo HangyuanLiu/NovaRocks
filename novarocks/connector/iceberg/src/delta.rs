@@ -94,12 +94,42 @@ pub struct DeletedFileVisibility {
     pub already_deleted_positions: Vec<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum DeleteVisibilityDeleteFileFormat {
+    Parquet,
+    Puffin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum DeleteVisibilityDeleteFileContent {
+    Position,
+    Equality,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DeleteVisibilityDeleteFileDescriptor {
+    pub path: String,
+    pub file_format: DeleteVisibilityDeleteFileFormat,
+    pub file_content: DeleteVisibilityDeleteFileContent,
+    pub length: Option<i64>,
+    pub content_offset: Option<i64>,
+    pub content_size_in_bytes: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DeleteVisibilityDataFileDescriptor {
+    pub path: String,
+    pub size: i64,
+    pub first_row_id: Option<i64>,
+    pub data_sequence_number: Option<i64>,
+    pub delete_files: Vec<DeleteVisibilityDeleteFileDescriptor>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeltaScanDeleteSide {
     pub base_data_file_lineage: HashMap<String, BaseDataFileLineage>,
     pub previous_data_file_lineage: HashMap<String, BaseDataFileLineage>,
-    pub previous_delete_visibility_data_files:
-        Vec<super::changes::DeleteVisibilityDataFileDescriptor>,
+    pub previous_delete_visibility_data_files: Vec<DeleteVisibilityDataFileDescriptor>,
     pub previously_deleted_positions_per_file: HashMap<String, Vec<u64>>,
     pub deleted_data_file_paths: HashSet<String>,
 }

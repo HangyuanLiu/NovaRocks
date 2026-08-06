@@ -22,7 +22,7 @@ use novarocks_connector_iceberg::iceberg::spec::{
     Literal, PartitionSpecRef, PrimitiveLiteral, Struct,
 };
 
-use crate::connector::iceberg::delete_file::IcebergFileContent;
+use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IcebergColumnStats {

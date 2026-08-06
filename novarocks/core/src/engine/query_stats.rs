@@ -369,8 +369,8 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
 
 fn metadata_payload(
     kind: SqlMetadataTableKind,
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    files: &[novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
 ) -> Result<Option<String>, String> {
     match kind {
         SqlMetadataTableKind::Partitions => {
@@ -417,10 +417,10 @@ fn metadata_payload(
                 })?;
                 for delete in &file.delete_files {
                     match delete.file_content {
-                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
                             entry.3.insert(delete.path.clone());
                         }
-                        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
                             entry.4.insert(delete.path.clone());
                         }
                     }
@@ -460,7 +460,7 @@ fn metadata_payload(
 
 fn metadata_columns_for_table(
     kind: SqlMetadataTableKind,
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<crate::sql::analyzer::iceberg_metadata::MetadataColumn>, String> {
     let mut columns = crate::sql::analyzer::iceberg_metadata::metadata_table_schema(kind);
     if matches!(
@@ -527,7 +527,7 @@ fn partition_source_type<'a>(metadata: &'a TableMetadata, source_id: i32) -> Opt
 }
 
 fn partition_struct_type(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<DataType, String> {
     let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
         format!(

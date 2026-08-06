@@ -3247,7 +3247,7 @@ pub(crate) fn apply_add_at(
     let iceberg_default = column_default
         .as_ref()
         .map(|value| {
-            crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+            novarocks_connector_iceberg::default_value::column_default_to_iceberg_literal(
                 value, &new_ty,
             )
         })
@@ -3836,7 +3836,7 @@ pub(crate) fn alter_table_schema(
     {
         let column_default =
             crate::sql::literal::default_literal_to_column_default(literal, data_type)?;
-        crate::connector::iceberg::default_value::require_v3_for_column_default(
+        novarocks_connector_iceberg::default_value::require_v3_for_column_default(
             format_version,
             column_default.as_ref(),
         )?;
@@ -3937,7 +3937,7 @@ pub(crate) fn alter_table_schema_on_entry(
     {
         let column_default =
             crate::sql::literal::default_literal_to_column_default(literal, data_type)?;
-        crate::connector::iceberg::default_value::require_v3_for_column_default(
+        novarocks_connector_iceberg::default_value::require_v3_for_column_default(
             metadata.format_version(),
             column_default.as_ref(),
         )?;

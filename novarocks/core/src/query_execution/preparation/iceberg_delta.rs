@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide, DeltaSourceFile};
+use novarocks_connector_iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide, DeltaSourceFile};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaScanRuntimePlan {

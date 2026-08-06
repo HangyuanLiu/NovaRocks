@@ -341,7 +341,7 @@ fn validate_join_full_refresh_payload_columns(
 #[derive(Clone, Debug)]
 struct JoinFullRefreshBaseScan {
     output_columns: Vec<OutputColumn>,
-    schema_fields: Vec<crate::connector::iceberg::scan_model::IcebergSchemaFieldDef>,
+    schema_fields: Vec<novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef>,
 }
 
 fn find_join_full_refresh_base_scan(

@@ -95,8 +95,8 @@ fn physical_values_node(
 fn iceberg_schema_field(
     field_id: i32,
     name: &str,
-) -> crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
-    crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+) -> novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
+    novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
         field_id,
         name: name.to_string(),
         initial_default: None,
@@ -107,8 +107,8 @@ fn iceberg_schema_field(
     }
 }
 
-fn iceberg_table_info() -> crate::connector::iceberg::scan_model::IcebergTableInfo {
-    crate::connector::iceberg::scan_model::IcebergTableInfo {
+fn iceberg_table_info() -> novarocks_connector_iceberg::scan_model::IcebergTableInfo {
+    novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: "test_catalog".to_string(),
         namespace: "test_db".to_string(),
         table: "test_table".to_string(),
@@ -116,7 +116,7 @@ fn iceberg_table_info() -> crate::connector::iceberg::scan_model::IcebergTableIn
         current_snapshot_id: Some(7),
         schema_id: 1,
         location: "s3://bucket/test_table".to_string(),
-        schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+        schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
             fields: vec![
                 iceberg_schema_field(1, "id"),
                 iceberg_schema_field(3, "category"),
@@ -182,7 +182,7 @@ pub(super) fn fixture_query_table_bindings(
                     scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
                         table: iceberg_table_info(),
                         files: Vec::new(),
-                        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                        binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
                     }),
                     frozen_snapshot_files: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),

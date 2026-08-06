@@ -28,6 +28,14 @@ iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-catalog-hms = "0.9.0"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
+arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+datasketches = "0.2.0"
+ordered-float = "4"
+serde = { version = "1", features = ["derive"] }
+novarocks-catalog = { path = "../../catalog" }
 novarocks-fs = { path = "../../fs" }
 novarocks-spi = { path = "../../spi" }
 
+[dev-dependencies]
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::connector::iceberg::scan_model::IcebergColumnStats;
+use novarocks_connector_iceberg::scan_model::IcebergColumnStats;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergReadDeleteFormat {

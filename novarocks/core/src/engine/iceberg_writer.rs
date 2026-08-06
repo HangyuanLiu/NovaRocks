@@ -48,9 +48,6 @@ use crate::connector::iceberg::position_delete_descriptor::{
     ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
     PositionDeleteDescriptorInput, PositionDeleteOutputField, PositionDeletePartitionSourceField,
 };
-use crate::connector::iceberg::scan_model::{
-    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
 use crate::connector::iceberg::write_control::{
@@ -79,6 +76,9 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::parser::ast::Literal;
 use novarocks_catalog::schema::ColumnDef;
 use novarocks_catalog::schema::SqlType;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorTableHandle, ConnectorWriteIntent, ConnectorWriteLease,
     ConnectorWriteOperationId,
@@ -1608,7 +1608,7 @@ pub(crate) fn iceberg_insert_columns_from_schema(
                     .write_default
                     .as_ref()
                     .map(|literal| {
-                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                        novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
                             literal,
                             nested.field_type.as_ref(),
                         )

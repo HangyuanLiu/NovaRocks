@@ -38,7 +38,6 @@ use super::catalog::registry::{
     build_iceberg_catalog, extract_data_files_with_stats, load_table,
 };
 use super::commit::{CommitOpKind, IcebergCommitCollector, SelectedRewriteKind};
-use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 use super::sink::build_position_delete_data_file_partition_index;
 use super::sink_plan::IcebergSinkObjectStoreConfig;
 use super::write_commit::IcebergWriteCommitExecutor;
@@ -53,6 +52,9 @@ use super::write_service::{
 use crate::common::types::UniqueId;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+};
 
 pub(crate) const ARTIFACT_VERSION: u16 = 1;
 pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
@@ -2010,7 +2012,7 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{
+    use novarocks_connector_iceberg::scan_model::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
 

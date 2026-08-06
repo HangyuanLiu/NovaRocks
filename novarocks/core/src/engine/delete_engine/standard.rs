@@ -59,7 +59,6 @@ use crate::connector::iceberg::delete_visibility::{
 use crate::connector::iceberg::delete_visibility::{
     ExistingDeleteVisibilityByDataFile, data_file_row_is_visible,
 };
-use crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_position_delete_sink_handle_payload;
 use crate::engine::StandaloneState;
@@ -78,6 +77,7 @@ use crate::query_execution::request_context::QueryExecutionContext;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id;
 use novarocks_spi::connector::{ConnectorWriteIntent, ConnectorWriteOperationId};
 
 pub(crate) fn prepare_delete_statement(
@@ -1386,7 +1386,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use sqlparser::ast as sqlast;
 
-    use crate::connector::iceberg::delete_file::{
+    use novarocks_connector_iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
 

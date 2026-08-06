@@ -48,10 +48,11 @@ impl crate::query_execution::preparation::scan::ScanBindingResolver for Sentinel
                         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan {
                             table_location: "s3://bucket/test_table".to_string(),
                             data_columns: Vec::new(),
-                            change_files: vec![crate::connector::iceberg::delta::DeltaSourceFile {
+                            change_files:
+                                vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
                                 path: "s3://bucket/delta-added.parquet".to_string(),
                                 size: 128,
-                                role: crate::connector::iceberg::delta::DeltaSourceRole::DataFile,
+                                role: novarocks_connector_iceberg::delta::DeltaSourceRole::DataFile,
                                 partition_spec_id: Some(0),
                                 partition_key: Some("Struct([])".to_string()),
                                 first_row_id: Some(100),

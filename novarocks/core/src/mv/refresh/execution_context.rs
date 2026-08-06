@@ -30,11 +30,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::registry::{IcebergCatalogEntry, IcebergCatalogRegistry};
-#[cfg(test)]
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
-    IcebergTableInfo,
-};
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
 use crate::mv::refresh::pin::RefreshSnapshotPin;
@@ -45,6 +40,11 @@ use crate::sql::planner::table::SqlMvTargetLocatorScan;
 use crate::sql::planner::table::SqlMvTargetStateScan;
 use mv_schema::MvSchemaContract;
 use novarocks_catalog::identifier::TableIdentity;
+#[cfg(test)]
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef,
+    IcebergTableInfo,
+};
 
 /// Refresh-time context. Wraps `IcebergMvRewriteContext` and adds execution
 /// handles only the refresh path needs.

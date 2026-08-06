@@ -23,7 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergTableInfo};
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergTableInfo,
+};
 
 pub(crate) fn validate_planned_files(
     table: Option<&IcebergTableInfo>,

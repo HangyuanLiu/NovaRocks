@@ -843,7 +843,6 @@ fn framework_locator_query_local_overlay(
     locator_table_def: crate::sql::planner::table::TableDef,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay, String> {
-    use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
     use crate::engine::query_planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
     };
@@ -851,6 +850,7 @@ fn framework_locator_query_local_overlay(
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
     };
+    use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
     let snapshot_id = target_table
         .metadata()
@@ -874,7 +874,7 @@ fn framework_locator_query_local_overlay(
         &instance_id,
     )
     .map_err(|error| error.to_string())?;
-    let table = crate::connector::iceberg::scan_model::IcebergTableInfo {
+    let table = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: target_catalog_name.to_string(),
         namespace: target_namespace.to_string(),
         table: target_table_name.to_string(),
@@ -1430,7 +1430,7 @@ fn framework_locator_loaded_table(
                     .write_default
                     .as_ref()
                     .map(|literal| {
-                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                        novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
                             literal,
                             nested.field_type.as_ref(),
                         )

@@ -242,10 +242,10 @@ mod tests {
 
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;
-    use crate::connector::iceberg::delete_file::IcebergFileContent;
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
+    use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()

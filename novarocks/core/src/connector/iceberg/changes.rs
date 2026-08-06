@@ -21,9 +21,10 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
-use crate::connector::iceberg::delta::{
-    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
-    PositionDeleteSourceData,
+use novarocks_connector_iceberg::delta::{
+    DeleteVisibilityDataFileDescriptor, DeleteVisibilityDeleteFileContent,
+    DeleteVisibilityDeleteFileDescriptor, DeleteVisibilityDeleteFileFormat, DeltaSourceFile,
+    DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
 };
 
 /// All failure modes the iceberg change-planning and IVM CREATE/REFRESH
@@ -260,37 +261,6 @@ pub(crate) struct PositionDeleteRef {
     /// `file_format == Parquet`.
     pub content_size_in_bytes: Option<i64>,
     pub partition_values: Vec<ChangePartitionFieldValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum DeleteVisibilityDeleteFileFormat {
-    Parquet,
-    Puffin,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum DeleteVisibilityDeleteFileContent {
-    Position,
-    Equality,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct DeleteVisibilityDeleteFileDescriptor {
-    pub path: String,
-    pub file_format: DeleteVisibilityDeleteFileFormat,
-    pub file_content: DeleteVisibilityDeleteFileContent,
-    pub length: Option<i64>,
-    pub content_offset: Option<i64>,
-    pub content_size_in_bytes: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct DeleteVisibilityDataFileDescriptor {
-    pub path: String,
-    pub size: i64,
-    pub first_row_id: Option<i64>,
-    pub data_sequence_number: Option<i64>,
-    pub delete_files: Vec<DeleteVisibilityDeleteFileDescriptor>,
 }
 
 /// Reference to a single equality-delete file added to the table. Unlike
@@ -634,18 +604,18 @@ fn delete_visibility_data_file_from_stats(
         .into_iter()
         .map(|delete| {
             let file_format = match delete.file_format {
-                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
                     DeleteVisibilityDeleteFileFormat::Parquet
                 }
-                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
                     DeleteVisibilityDeleteFileFormat::Puffin
                 }
             };
             let file_content = match delete.file_content {
-                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
                     DeleteVisibilityDeleteFileContent::Position
                 }
-                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
                     DeleteVisibilityDeleteFileContent::Equality
                 }
             };
@@ -980,7 +950,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
     deletes: &[PositionDeleteRef],
     base_data_file_lineage: &std::collections::HashMap<
         String,
-        crate::connector::iceberg::delta::BaseDataFileLineage,
+        novarocks_connector_iceberg::delta::BaseDataFileLineage,
     >,
     suppressed_data_files: &std::collections::HashSet<String>,
     previously_deleted_positions_per_file: &std::collections::HashMap<
@@ -1549,7 +1519,7 @@ pub(crate) fn base_data_file_lineage_index_at(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let read_snapshot =
@@ -1570,7 +1540,7 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     base_data_file_lineage_index_at(table, snapshot_id)
@@ -1579,7 +1549,7 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
 fn build_data_file_lineage_index_from_snapshot(
     read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let mut out = std::collections::HashMap::new();
@@ -1598,7 +1568,7 @@ fn build_data_file_lineage_index_from_snapshot(
         })?;
         out.insert(
             file.path.clone(),
-            crate::connector::iceberg::delta::BaseDataFileLineage {
+            novarocks_connector_iceberg::delta::BaseDataFileLineage {
                 first_row_id,
                 data_sequence_number,
             },
@@ -1630,18 +1600,18 @@ fn equality_change_to_delete_spec(
     delete: &EqualityDeleteRef,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
-) -> Result<crate::connector::iceberg::delete_file::IcebergDeleteFileSpec, String> {
+) -> Result<novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec, String> {
     Ok(
-        crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
+        novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec {
             path: normalize_delete_projection_path(
                 &delete.delete_file_path,
                 object_store_config,
                 expected_object_store_bucket,
             )
             .map_err(|e| e.to_string())?,
-            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet,
             file_content:
-                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
+                novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: if delete.delete_file_size > 0 {
                 Some(delete.delete_file_size as u64)
             } else {
@@ -2517,19 +2487,21 @@ mod tests {
         let mut equality_targets = HashMap::new();
         equality_targets.insert(
             "eq-delete.parquet".to_string(),
-            vec![crate::connector::iceberg::delta::EqualityDeleteTargetData {
-                data_file_path: "data.parquet".to_string(),
-                data_file_size: 456,
-                data_file_first_row_id: Some(1000),
-                data_file_sequence_number: Some(6),
-            }],
+            vec![
+                novarocks_connector_iceberg::delta::EqualityDeleteTargetData {
+                    data_file_path: "data.parquet".to_string(),
+                    data_file_size: 456,
+                    data_file_first_row_id: Some(1000),
+                    data_file_sequence_number: Some(6),
+                },
+            ],
         );
 
         let files =
             delta_source_files_from_change_batch_with_equality_targets(&batch, &equality_targets)
                 .expect("delta source files");
         assert_eq!(files.len(), 1);
-        let crate::connector::iceberg::delta::DeltaSourceRole::EqualityDelete {
+        let novarocks_connector_iceberg::delta::DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets,
         } = &files[0].role
@@ -2651,11 +2623,11 @@ mod tests {
         let factory = novarocks_fs::FsAccessResolver::new()
             .resolve_location(dir.path().join("__binding__").to_string_lossy(), None)
             .expect("access");
-        let spec = crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
+        let spec = novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec {
             path: "eq.parquet".to_string(),
-            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet,
             file_content:
-                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
+                novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: Some(std::fs::metadata(&equality_path).expect("metadata").len()),
             content_offset: None,
             content_size_in_bytes: None,

@@ -37,12 +37,10 @@ use novarocks_spi::connector::{
 };
 
 use super::commit::DeletionVector;
-use super::delete_file::{IcebergFileContent, IcebergFileFormat};
 use super::report::{
     IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     partition_path_from_struct,
 };
-use super::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use super::sink_plan::{
     IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
@@ -53,6 +51,8 @@ use super::write_descriptor::{
 use crate::engine::query_planning::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
+use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 pub(crate) const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;
 
@@ -1749,7 +1749,7 @@ mod tests {
     fn test_sink_spec() -> IcebergWriteSinkSpec {
         IcebergWriteSinkSpec {
             mode: IcebergWriteSinkMode::Data,
-            iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo {
+            iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo {
                 catalog: "test_catalog".to_string(),
                 namespace: "test_db".to_string(),
                 table: "target_orders".to_string(),
@@ -1757,9 +1757,9 @@ mod tests {
                 current_snapshot_id: Some(1),
                 schema_id: 1,
                 location: "file:///warehouse/target_orders".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
                     fields: vec![
-                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                        novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                             field_id: 1,
                             name: "id".to_string(),
                             initial_default: None,

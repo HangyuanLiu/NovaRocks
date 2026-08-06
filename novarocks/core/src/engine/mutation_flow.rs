@@ -399,7 +399,7 @@ pub(crate) fn prepare_update_mutation(
     let mode = select_iceberg_update_mode(&table)?;
     let mor_write_target = if mode == IcebergUpdateMode::MergeOnRead {
         let read_snapshot_id = if target_ref != "main" {
-            crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                 table.metadata(),
                 &target_ref,
             )?
@@ -592,7 +592,7 @@ pub(crate) fn stage_prepared_update_mutation(
             validate_unique_target_row_ids(&matched.row_ids)?;
             let metadata = table.metadata();
             let base_snapshot_id = if target_ref != "main" {
-                crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+                novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                     metadata,
                     &target_ref,
                 )?
@@ -2049,7 +2049,7 @@ fn build_cow_rewrite_query_local_overlay(
         ),
     ];
     materialization.binding =
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
     // The single-file scan must expose `_row_id` / `_last_updated_sequence_number`
     // for the rewrite projection; the table is v3 row-lineage (COW mode was
     // selected) and the file carries `first_row_id`, so the builder advertises

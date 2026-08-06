@@ -41,7 +41,6 @@ use super::data_writer::{
     StagedDataFile, StagedWriteContext, StagedWriteOptions, cleanup_staged_files,
     staged_data_file_to_writer_report, write_record_batches,
 };
-use super::delete_file::IcebergFileContent;
 use super::position_delete_descriptor::canonical_output_schema;
 use super::provider::IcebergReadBinding;
 use super::report::{
@@ -58,6 +57,7 @@ use super::write_contract::{
     staged_report_from_unpartitioned_equality_delete_reports, write_handle_mode,
 };
 use crate::runtime::global_async_runtime::data_block_on;
+use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]

@@ -400,7 +400,7 @@ impl IcebergCommitCollector {
         &self,
         report: IcebergWriterReport,
     ) -> Result<WrittenFile, String> {
-        use crate::connector::iceberg::delete_file::IcebergFileContent;
+        use novarocks_connector_iceberg::delete_file::IcebergFileContent;
         use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat};
 
         let IcebergWriterReport { file, .. } = report;
@@ -1064,7 +1064,7 @@ mod parity_tests {
             file: crate::connector::iceberg::report::IcebergWrittenFileReport {
                 path: "file:///warehouse/t/data/a.parquet".to_string(),
                 format: "PARQUET".to_string(),
-                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
                 partition: crate::connector::iceberg::report::IcebergPartitionReport {
@@ -1291,7 +1291,7 @@ mod parity_tests {
             file: crate::connector::iceberg::report::IcebergWrittenFileReport {
                 path: "file:///t/data-variant.parquet".to_string(),
                 format: "PARQUET".to_string(),
-                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 10,
                 partition: crate::connector::iceberg::report::IcebergPartitionReport {
@@ -1398,7 +1398,7 @@ mod tests {
             file: crate::connector::iceberg::report::IcebergWrittenFileReport {
                 path: path.to_string(),
                 format: "parquet".to_string(),
-                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 3,
                 file_size_in_bytes: 40,
                 partition: crate::connector::iceberg::report::IcebergPartitionReport {
@@ -1536,7 +1536,7 @@ mod tests {
         let mut report = unpartitioned_writer_report("s3://b/data/dv-00000000.puffin", 0);
         report.file.format = "puffin".to_string();
         report.file.content =
-            crate::connector::iceberg::delete_file::IcebergFileContent::PositionDeletes;
+            novarocks_connector_iceberg::delete_file::IcebergFileContent::PositionDeletes;
         report.file.referenced_data_file = Some("s3://b/data/f.parquet".to_string());
         report.file.content_offset = Some(4);
         report.file.content_size_in_bytes = Some(12);
@@ -1707,7 +1707,7 @@ mod tests {
             file: crate::connector::iceberg::report::IcebergWrittenFileReport {
                 path: path.to_string(),
                 format: "parquet".to_string(),
-                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
                 partition: crate::connector::iceberg::report::IcebergPartitionReport {
@@ -1742,7 +1742,7 @@ mod tests {
             file: crate::connector::iceberg::report::IcebergWrittenFileReport {
                 path: "file:///warehouse/t/data/a.parquet".to_string(),
                 format: "parquet".to_string(),
-                content: crate::connector::iceberg::delete_file::IcebergFileContent::Data,
+                content: novarocks_connector_iceberg::delete_file::IcebergFileContent::Data,
                 record_count: 1,
                 file_size_in_bytes: 12,
                 partition: crate::connector::iceberg::report::IcebergPartitionReport {

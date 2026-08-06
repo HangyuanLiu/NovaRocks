@@ -22,14 +22,14 @@ use std::collections::HashMap;
 /// manifest statistics and identity partition metadata, which are keyed by
 /// their current logical names.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) struct IcebergPhysicalPredicate {
-    pub(crate) field_id: i32,
-    pub(crate) column: String,
-    pub(crate) domain: IcebergPhysicalPredicateDomain,
+pub struct IcebergPhysicalPredicate {
+    pub field_id: i32,
+    pub column: String,
+    pub domain: IcebergPhysicalPredicateDomain,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum IcebergPhysicalPredicateDomain {
+pub enum IcebergPhysicalPredicateDomain {
     Range {
         op: IcebergPhysicalPredicateOp,
         value: IcebergPhysicalPredicateValue,
@@ -40,7 +40,7 @@ pub(crate) enum IcebergPhysicalPredicateDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum IcebergPhysicalPredicateOp {
+pub enum IcebergPhysicalPredicateOp {
     Eq,
     Lt,
     Le,
@@ -49,7 +49,7 @@ pub(crate) enum IcebergPhysicalPredicateOp {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub(crate) enum IcebergPhysicalPredicateValue {
+pub enum IcebergPhysicalPredicateValue {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
@@ -88,9 +88,9 @@ pub struct IcebergPartitionFieldValue {
     pub value: Option<IcebergPartitionValue>,
 }
 
-#[cfg(test)]
 impl IcebergPartitionFieldValue {
-    pub(crate) fn identity_int64_for_test(source_column: &str, value: i64) -> Self {
+    #[doc(hidden)]
+    pub fn identity_int64_for_test(source_column: &str, value: i64) -> Self {
         Self {
             source_column: source_column.to_string(),
             field_name: source_column.to_string(),
@@ -132,9 +132,9 @@ pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
     #[serde(skip)]
-    pub initial_default: Option<novarocks_connector_iceberg::iceberg::spec::Literal>,
+    pub initial_default: Option<crate::iceberg::spec::Literal>,
     #[serde(skip)]
-    pub write_default: Option<novarocks_connector_iceberg::iceberg::spec::Literal>,
+    pub write_default: Option<crate::iceberg::spec::Literal>,
     /// Spec-compliant JSON encoding of `initial_default` precomputed at the
     /// point of construction where the iceberg `Type` is still available.
     /// Necessary because `novarocks_connector_iceberg::iceberg::spec::Literal::Int128` carries no scale,
@@ -216,9 +216,9 @@ pub struct IcebergDataFileInfo {
     pub partition_values: Vec<IcebergPartitionFieldValue>,
 }
 
-#[cfg(test)]
 impl IcebergDataFileInfo {
-    pub(crate) fn for_test(path: &str, size: i64, row_count: i64) -> Self {
+    #[doc(hidden)]
+    pub fn for_test(path: &str, size: i64, row_count: i64) -> Self {
         Self {
             path: path.to_string(),
             size,

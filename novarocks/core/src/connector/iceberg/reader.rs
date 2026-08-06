@@ -44,12 +44,14 @@ use novarocks_spi::connector::{
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use super::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
 use super::equality_delete::{
     EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_with_context,
 };
 use super::position_delete::load_position_deletes_with_context;
-use super::scan_model::{
+use novarocks_connector_iceberg::delete_file::{
+    IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
+};
+use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,

@@ -3237,12 +3237,19 @@ dependencies = [
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "datasketches",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
+ "novarocks-catalog",
  "novarocks-fs",
  "novarocks-spi",
  "opendal",
+ "ordered-float 4.6.0",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

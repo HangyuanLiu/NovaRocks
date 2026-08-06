@@ -1139,7 +1139,7 @@ fn convert_loaded_write_default(
     table: &str,
     column: &str,
 ) -> Result<ColumnDefault, String> {
-    crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+    novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
         literal,
         field_type,
     )
@@ -1349,27 +1349,27 @@ pub(crate) struct DataFileWithStats {
     pub size: i64,
     pub record_count: Option<i64>,
     pub column_stats:
-        Option<HashMap<String, crate::connector::iceberg::scan_model::IcebergColumnStats>>,
+        Option<HashMap<String, novarocks_connector_iceberg::scan_model::IcebergColumnStats>>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
     pub partition_values: Option<novarocks_connector_iceberg::iceberg::spec::Struct>,
     pub manifest_path: Option<String>,
     pub partition_field_values:
-        Vec<crate::connector::iceberg::scan_model::IcebergPartitionFieldValue>,
+        Vec<novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue>,
     /// Iceberg v3 row-lineage: first row id assigned to this data file.
     pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
     /// file belongs to.  Falls back to the manifest file's sequence number when
     /// the entry itself does not carry one (e.g. V1/V2 manifests).
     pub data_sequence_number: Option<i64>,
-    pub delete_files: Vec<crate::connector::iceberg::scan_model::IcebergDeleteFileInfo>,
+    pub delete_files: Vec<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo>,
 }
 
 fn iceberg_partition_field_values(
     metadata: &TableMetadata,
     spec_id: i32,
     partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
-) -> Result<Vec<crate::connector::iceberg::scan_model::IcebergPartitionFieldValue>, String> {
+) -> Result<Vec<novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue>, String> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(format!(
             "iceberg table metadata missing partition spec id {spec_id}"
@@ -1388,7 +1388,7 @@ fn iceberg_partition_field_values(
             .and_then(|literal| literal.as_ref())
             .and_then(iceberg_partition_value_from_literal);
         values.push(
-            crate::connector::iceberg::scan_model::IcebergPartitionFieldValue {
+            novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue {
                 source_column,
                 field_name: field.name.clone(),
                 transform: iceberg_partition_transform_name(&field.transform),
@@ -1408,31 +1408,31 @@ fn iceberg_partition_transform_name(transform: &Transform) -> String {
 
 fn iceberg_partition_value_from_literal(
     literal: &IcebergLiteral,
-) -> Option<crate::connector::iceberg::scan_model::IcebergPartitionValue> {
+) -> Option<novarocks_connector_iceberg::scan_model::IcebergPartitionValue> {
     let IcebergLiteral::Primitive(value) = literal else {
         return None;
     };
     match value {
         PrimitiveLiteral::Boolean(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Boolean(*v))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Boolean(*v))
         }
         PrimitiveLiteral::Int(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Int32(*v))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int32(*v))
         }
         PrimitiveLiteral::Long(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Int64(*v))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int64(*v))
         }
         PrimitiveLiteral::Float(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Float(v.0))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Float(v.0))
         }
         PrimitiveLiteral::Double(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Double(v.0))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Double(v.0))
         }
         PrimitiveLiteral::String(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::String(v.clone()))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::String(v.clone()))
         }
         PrimitiveLiteral::Binary(v) => {
-            Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Binary(v.clone()))
+            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Binary(v.clone()))
         }
         PrimitiveLiteral::Int128(_)
         | PrimitiveLiteral::UInt128(_)
@@ -1591,8 +1591,8 @@ pub(crate) fn extract_data_files_with_stats(
 
 fn read_delete_to_catalog_delete(
     delete_file: crate::connector::iceberg::read::IcebergReadDeleteFile,
-) -> Result<crate::connector::iceberg::scan_model::IcebergDeleteFileInfo, String> {
-    use crate::connector::iceberg::scan_model::{
+) -> Result<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo, String> {
+    use novarocks_connector_iceberg::scan_model::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
 
@@ -2471,14 +2471,14 @@ fn build_iceberg_schema(
                 })
                 .transpose()?
                 .flatten();
-            crate::connector::iceberg::default_value::require_v3_for_column_default(
+            novarocks_connector_iceberg::default_value::require_v3_for_column_default(
                 format_version,
                 column_default.as_ref(),
             )?;
             let iceberg_default = column_default
                 .as_ref()
                 .map(|value| {
-                    crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+                    novarocks_connector_iceberg::default_value::column_default_to_iceberg_literal(
                         value,
                         &iceberg_type,
                     )
@@ -3405,7 +3405,7 @@ mod read_delete_conversion_tests {
     use crate::connector::iceberg::read::{
         IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
     };
-    use crate::connector::iceberg::scan_model::{
+    use novarocks_connector_iceberg::scan_model::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat,
     };
 

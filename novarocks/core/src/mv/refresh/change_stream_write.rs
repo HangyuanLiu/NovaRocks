@@ -149,12 +149,12 @@ mod tests {
     use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::delete_file::IcebergFileContent;
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use crate::query_execution::write::{WriterCommitInput, WriterKey};
     use crate::sql::common::ChangeStreamBranchKind;
+    use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
     fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
         let schema = Schema::builder()

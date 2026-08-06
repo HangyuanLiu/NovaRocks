@@ -2022,10 +2022,10 @@ mod tests {
     use parquet::basic::Compression;
 
     use super::*;
-    use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::report::{IcebergPartitionReport, IcebergWrittenFileReport};
     use crate::connector::iceberg::sink_plan::IcebergSinkPlan;
     use crate::connector::iceberg::write_contract::staged_report_from_iceberg_reports;
+    use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {

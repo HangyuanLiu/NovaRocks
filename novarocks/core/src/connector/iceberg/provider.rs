@@ -86,22 +86,22 @@ use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
 use super::data_mutation::IcebergDataMutationAdapter;
 use super::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use super::reader::IcebergBatchReader;
-use super::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
-    IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
-    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
-};
 use super::write_control::IcebergWriteControlAdapter;
 use super::write_execution::IcebergDataWriteExecution;
 use super::write_service::RegisteredIcebergWriteControlBackend;
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use crate::sql::optimizer::stats_input::{StatValue, StatsMissingReason};
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+    IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
+    IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 struct IcebergDeltaSplitPayload {
-    source: super::delta::DeltaSourceFile,
+    source: novarocks_connector_iceberg::delta::DeltaSourceFile,
     #[serde(default)]
-    delete_side: Option<super::delta::DeltaScanDeleteSide>,
+    delete_side: Option<novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
 }
 
 const PROVIDER_ID: &str = "iceberg";
@@ -4514,8 +4514,10 @@ impl StatisticsCollection for IcebergControlProvider {
             })?;
             let (lg_k, theta, hashes) = partial.compact_parts();
             let sketch =
-                super::theta_sketch::ThetaSketchHandle::from_compact_parts(lg_k, theta, hashes)
-                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+                novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle::from_compact_parts(
+                    lg_k, theta, hashes,
+                )
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
             sketches.insert(*field_id, sketch);
         }
         let statistics_path = super::stats_assembler::puffin_path_for_statistics_operation(
@@ -5366,7 +5368,7 @@ fn build_table_payload(
             .map(super::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
             .collect();
     }
-    let mut table_info = super::scan_model::IcebergTableInfo {
+    let mut table_info = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: catalog.to_string(),
         namespace: namespace.to_string(),
         table: table.to_string(),
@@ -5449,7 +5451,7 @@ fn iceberg_metadata_column_names(
 struct TablePayload {
     namespace: String,
     table: String,
-    table_info: Option<super::scan_model::IcebergTableInfo>,
+    table_info: Option<novarocks_connector_iceberg::scan_model::IcebergTableInfo>,
     metadata_columns: Vec<String>,
     metadata_table_type: Option<super::IcebergMetadataTableType>,
     prepared_files: Vec<IcebergDataFileInfo>,
@@ -5475,7 +5477,7 @@ pub(crate) struct IcebergQueryTableMaterialization {
     pub(crate) schema_id: Option<i32>,
     pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
-    pub(crate) table: super::scan_model::IcebergTableInfo,
+    pub(crate) table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) files: Vec<IcebergDataFileInfo>,
     pub(crate) binding: IcebergDataFileBinding,
     pub(crate) statistics_pin: Option<ResolvedTableStatisticsPin>,
@@ -6570,8 +6572,8 @@ fn metadata_table_name(metadata_type: &super::IcebergMetadataTableType) -> &'sta
 pub(crate) fn plan_scan_files(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    binding: super::scan_model::IcebergDataFileBinding,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
@@ -6582,7 +6584,7 @@ pub(crate) fn plan_scan_files(
     // as an explicitly empty scan.
     let file_override = (!matches!(
         binding,
-        super::scan_model::IcebergDataFileBinding::ExplicitFiles
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
     ) || !explicit_files.is_empty())
     .then_some(explicit_files);
     let planned = plan_native_iceberg_read_with_file_override(
@@ -6643,8 +6645,8 @@ pub(crate) fn planned_split_data_file_for_test(
 pub(crate) fn plan_native_iceberg_read(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    binding: super::scan_model::IcebergDataFileBinding,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
@@ -6671,8 +6673,8 @@ pub(crate) fn plan_native_iceberg_read(
 pub(crate) fn plan_native_iceberg_read_with_lease(
     lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    binding: super::scan_model::IcebergDataFileBinding,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     explicit_files: &[IcebergDataFileInfo],
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
@@ -6695,8 +6697,8 @@ pub(crate) fn plan_native_iceberg_read_with_lease(
 fn plan_native_iceberg_read_with_file_override(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    binding: super::scan_model::IcebergDataFileBinding,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     explicit_files: Option<&[IcebergDataFileInfo]>,
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
@@ -6724,8 +6726,8 @@ fn plan_native_iceberg_read_with_file_override(
 fn plan_native_iceberg_read_with_bound_lease(
     lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    binding: super::scan_model::IcebergDataFileBinding,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     explicit_files: Option<&[IcebergDataFileInfo]>,
     projection: &[usize],
     static_predicates: Vec<ConnectorStaticPredicate>,
@@ -6753,7 +6755,7 @@ fn plan_native_iceberg_read_with_bound_lease(
     // table.
     let use_explicit_files = matches!(
         binding,
-        super::scan_model::IcebergDataFileBinding::ExplicitFiles
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
     ) && explicit_files.is_some_and(|files| !files.is_empty());
     let table_handle = ConnectorTableHandle::try_new(
         instance_id.clone(),
@@ -6789,7 +6791,7 @@ fn plan_native_iceberg_read_with_bound_lease(
                     .filter(|_| {
                         matches!(
                             binding,
-                            super::scan_model::IcebergDataFileBinding::ExplicitFiles
+                            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles
                         )
                     })
                     .map(ConnectorReadSelector::SnapshotId)
@@ -6848,9 +6850,9 @@ fn plan_native_iceberg_read_with_bound_lease(
 pub(crate) fn plan_native_iceberg_delta_read(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    sources: &[super::delta::DeltaSourceFile],
-    delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
+    delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
     target_parallelism: NonZeroUsize,
     max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
@@ -6875,9 +6877,9 @@ pub(crate) fn plan_native_iceberg_delta_read(
 pub(crate) fn plan_native_iceberg_delta_read_with_lease(
     lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &super::scan_model::IcebergTableInfo,
-    sources: &[super::delta::DeltaSourceFile],
-    delete_side: Option<&super::delta::DeltaScanDeleteSide>,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+    sources: &[novarocks_connector_iceberg::delta::DeltaSourceFile],
+    delete_side: Option<&novarocks_connector_iceberg::delta::DeltaScanDeleteSide>,
     target_parallelism: NonZeroUsize,
     max_split_bytes: Option<NonZeroU64>,
 ) -> Result<PlannedIcebergConnectorRead, String> {
@@ -6885,7 +6887,7 @@ pub(crate) fn plan_native_iceberg_delta_read_with_lease(
         lease,
         context.clone(),
         table,
-        super::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
         &[],
         &[],
         Vec::new(),
@@ -7096,7 +7098,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{
+    use novarocks_connector_iceberg::scan_model::{
         IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
 
@@ -7577,7 +7579,7 @@ mod tests {
             record_count: Some(4),
             column_stats: Some(HashMap::from([(
                 column.to_string(),
-                crate::connector::iceberg::scan_model::IcebergColumnStats {
+                novarocks_connector_iceberg::scan_model::IcebergColumnStats {
                     null_count,
                     value_count: Some(4),
                     column_size: Some(32),
@@ -7638,12 +7640,12 @@ mod tests {
 
         let mut files_with_delete = files;
         files_with_delete[0].delete_files.push(
-            crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+            novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
                 path: "file:///tmp/table/delete.parquet".to_string(),
                 file_format:
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
                 file_content:
-                    crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position,
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position,
                 length: Some(4),
                 content_offset: None,
                 content_size_in_bytes: None,

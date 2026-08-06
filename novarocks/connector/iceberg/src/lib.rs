@@ -17,13 +17,22 @@
 
 //! Iceberg provider dependency boundary.
 //!
-//! Concrete provider implementation is being cut over from the aggregate
-//! engine in SPI-5.  The external Iceberg, catalog, and object-store crates
-//! are owned here so the aggregate Core crate consumes a bounded provider
-//! surface instead of selecting those dependencies itself.
+//! Provider-owned Iceberg facts and table-format value conversions.
+//!
+//! The external Iceberg, catalog, object-store, and provider-specific value
+//! modules live here. Consumer crates depend on these typed facts at their
+//! boundaries; the provider crate does not depend on aggregate Core, SQL, or
+//! execution modules.
 
 /// Stable provider identity used by server composition and SPI declarations.
 pub const PROVIDER_ID: &str = "iceberg";
+
+pub mod default_value;
+pub mod delete_file;
+pub mod delta;
+pub mod ref_snapshot;
+pub mod scan_model;
+pub mod theta_sketch;
 
 pub mod iceberg {
     pub use ::iceberg::*;

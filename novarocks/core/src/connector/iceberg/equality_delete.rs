@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::connector::file_execution::read_foundation_parquet_batches;
-use crate::connector::iceberg::delete_file::{
+use novarocks_connector_iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use novarocks_fs::FileReadContext;
@@ -467,7 +467,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
-    use crate::connector::iceberg::delete_file::{
+    use novarocks_connector_iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
 

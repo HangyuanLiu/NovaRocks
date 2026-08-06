@@ -47,7 +47,6 @@ use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
 };
-use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
 use crate::engine::mv::analysis_adapter::{
     analyze_mv_select_with_connector_context, descriptor_from_loaded, now_ms,
     validate_ivm_primary_key,
@@ -180,6 +179,7 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
 };

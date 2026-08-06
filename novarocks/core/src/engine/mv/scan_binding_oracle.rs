@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::connector::iceberg::scan_model::IcebergDataFileInfo;
+use novarocks_connector_iceberg::scan_model::IcebergDataFileInfo;
 
 use super::iceberg_target_apply_oracle::TargetRowPositionSet;
 

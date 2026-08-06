@@ -425,7 +425,8 @@ pub(crate) struct ParquetWriteResult {
     /// action plumbing (Phase 2.3). The `dead_code` lint is suppressed
     /// because the field is intentionally written ahead of its reader.
     #[allow(dead_code)]
-    theta_sketches: Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>>,
+    theta_sketches:
+        Option<HashMap<i32, novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle>>,
 }
 
 #[derive(Default)]
@@ -992,7 +993,7 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergCol
 /// helper.
 pub(crate) fn compute_theta_sketches_for_batch(
     batch: &RecordBatch,
-) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
+) -> Option<HashMap<i32, novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle>> {
     collect_theta_sketches(batch)
 }
 
@@ -1003,7 +1004,7 @@ pub(crate) fn compute_theta_sketches_for_batch(
 /// metadata) and `collect_theta_sketches_by_name` (ANALYZE path, field-id from
 /// an explicit name map). Unsupported/complex types feed nothing -> false.
 fn feed_array_into_sketch(
-    sketch: &mut super::theta_sketch::ThetaSketchHandle,
+    sketch: &mut novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle,
     data_type: &DataType,
     array: &arrow::array::ArrayRef,
 ) -> bool {
@@ -1120,8 +1121,8 @@ fn feed_array_into_sketch(
 
 fn collect_theta_sketches(
     batch: &RecordBatch,
-) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
-    use super::theta_sketch::ThetaSketchHandle;
+) -> Option<HashMap<i32, novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle>> {
+    use novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle;
 
     // Apache DataSketches Java/Spark default lg_k = 12 (k = 4096, ~1.5% error)
     // matches the spec. Kept hard-coded here; the table property override is
@@ -1161,7 +1162,7 @@ fn collect_theta_sketches(
 pub(crate) fn collect_theta_sketches_by_name(
     batch: &RecordBatch,
     name_to_field_id: &HashMap<String, i32>,
-) -> HashMap<i32, super::theta_sketch::ThetaSketchHandle> {
+) -> HashMap<i32, novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle> {
     const LG_K: u8 = 12;
     let schema = batch.schema();
     let mut sketches = HashMap::new();
@@ -1169,7 +1170,7 @@ pub(crate) fn collect_theta_sketches_by_name(
         let Some(&field_id) = name_to_field_id.get(&field.name().to_lowercase()) else {
             continue;
         };
-        let mut sketch = super::theta_sketch::ThetaSketchHandle::new(LG_K);
+        let mut sketch = novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle::new(LG_K);
         if feed_array_into_sketch(&mut sketch, field.data_type(), batch.column(col_idx)) {
             sketches.insert(field_id, sketch);
         }

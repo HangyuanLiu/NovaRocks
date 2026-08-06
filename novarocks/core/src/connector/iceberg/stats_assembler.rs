@@ -49,7 +49,7 @@ use novarocks_connector_iceberg::iceberg::puffin::{
 use novarocks_connector_iceberg::iceberg::spec::{BlobMetadata, StatisticsFile, TableMetadata};
 use novarocks_connector_iceberg::iceberg::table::Table;
 
-use super::theta_sketch::ThetaSketchHandle;
+use novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle;
 
 /// Provider-owned, versioned evidence blob.  It lives in a standard Iceberg
 /// Puffin file, so other Iceberg readers can retain the StatisticsFile even

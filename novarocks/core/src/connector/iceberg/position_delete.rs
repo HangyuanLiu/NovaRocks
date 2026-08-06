@@ -31,7 +31,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use roaring::RoaringTreemap;
 
 use crate::connector::file_execution::{read_foundation_bytes, read_foundation_parquet_batches};
-use crate::connector::iceberg::delete_file::{
+use novarocks_connector_iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use novarocks_fs::FileReadContext;

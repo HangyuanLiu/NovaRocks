@@ -32,7 +32,7 @@ use novarocks_connector_iceberg::iceberg::io::FileIO;
 use novarocks_connector_iceberg::iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, PuffinReader};
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
-use super::theta_sketch::ThetaSketchHandle;
+use novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle;
 
 /// Loader for Iceberg Puffin statistics. Produces a `field_id → NDV` map.
 pub(crate) struct StatsLoader;

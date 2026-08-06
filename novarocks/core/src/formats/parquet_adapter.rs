@@ -684,8 +684,8 @@ pub(crate) fn build_iceberg_default_array(
     target_field: &Field,
     row_count: usize,
 ) -> Result<ArrayRef, String> {
-    use crate::connector::iceberg::default_value::literal_to_constant_array;
     use crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY;
+    use novarocks_connector_iceberg::default_value::literal_to_constant_array;
     use novarocks_connector_iceberg::iceberg::spec::Literal;
 
     let Some(json) = target_field

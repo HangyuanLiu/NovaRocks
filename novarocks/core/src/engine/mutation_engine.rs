@@ -254,7 +254,7 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
                         .current_snapshot()
                         .map(|snapshot| snapshot.snapshot_id())
                 } else {
-                    crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+                    novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                         prepared.table.metadata(),
                         &prepared.target_ref,
                     )?

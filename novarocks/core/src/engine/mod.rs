@@ -9046,7 +9046,7 @@ path = "meta/operations.sqlite"
     -> crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
         crate::engine::query_planning::write_sink::IcebergWriteSinkSpec {
             mode: crate::engine::query_planning::write_sink::IcebergWriteSinkMode::Data,
-            iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo {
+            iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo {
                 catalog: "test_catalog".to_string(),
                 namespace: "test_db".to_string(),
                 table: "target_orders".to_string(),
@@ -9054,9 +9054,9 @@ path = "meta/operations.sqlite"
                 current_snapshot_id: Some(1),
                 schema_id: 1,
                 location: "file:///warehouse/target_orders".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
                     fields: vec![
-                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                        novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                             field_id: 1,
                             name: "id".to_string(),
                             initial_default: None,

@@ -26,20 +26,20 @@ use crate::connector::iceberg::catalog::backend::{
     data_file_with_stats_to_iceberg_data_file_info, iceberg_schema_def_for_codegen,
 };
 use crate::connector::iceberg::catalog::registry::{extract_data_files_with_stats_at, load_table};
-use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::connector::stats::StatsProviderError;
 use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats_input::{
     BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
 };
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
 
 /// Provider-owned conversion of Iceberg manifest/Puffin artifacts into the
 /// neutral, immutable SQL statistics value.  SQL consumes only the returned
 /// `BaseTableStatistics`; it neither receives an Iceberg file nor decodes
 /// provider bounds itself.
 fn build_base_table_statistics_with_ndv(
-    files: &[crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &[novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
     columns: &[ColumnDef],
     ndv_by_name: &HashMap<String, f64>,
     name_to_field_id: &HashMap<String, i32>,
@@ -367,7 +367,7 @@ fn columns_for_stats_schema(
                     .write_default
                     .as_ref()
                     .map(|literal| {
-                        crate::connector::iceberg::default_value::iceberg_literal_to_column_default(
+                        novarocks_connector_iceberg::default_value::iceberg_literal_to_column_default(
                             literal,
                             iceberg_field.field_type.as_ref(),
                         )

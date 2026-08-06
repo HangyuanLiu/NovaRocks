@@ -40,12 +40,12 @@ use novarocks_connector_iceberg::iceberg::writer::file_writer::rolling_writer::R
 use novarocks_connector_iceberg::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
-use super::delete_file::IcebergFileContent;
-use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{
     VariantShreddingConfig, apply_variant_shredding_to_arrow_schema,
     parse_variant_shredding_properties, transform_variant_columns_for_write, variant_field_indices,
 };
+use novarocks_connector_iceberg::delete_file::IcebergFileContent;
+use novarocks_connector_iceberg::theta_sketch::ThetaSketchHandle;
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;

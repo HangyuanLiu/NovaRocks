@@ -86,7 +86,7 @@ fn planned_connector_read_for_test(
 
 fn encode_scan_node_with_file_binding(
     scan: &DistributedNode,
-    table: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     column_name: &str,
     data_type: DataType,
     nullable: bool,
@@ -108,7 +108,8 @@ fn encode_scan_node_with_file_binding(
         execution: ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
             table,
             files: Vec::new(),
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            binding:
+                novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         }),
         physical_columns: vec![ResolvedScanColumn {
             planner: OutputColumn {
@@ -146,8 +147,8 @@ fn encode_scan_node_with_file_binding(
 
 fn iceberg_table_for_write_default_test(
     column_name: &str,
-) -> crate::connector::iceberg::scan_model::IcebergTableInfo {
-    crate::connector::iceberg::scan_model::IcebergTableInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergTableInfo {
+    novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "orders".to_string(),
@@ -155,9 +156,9 @@ fn iceberg_table_for_write_default_test(
         current_snapshot_id: Some(10),
         schema_id: 1,
         location: "s3://warehouse/db/orders".to_string(),
-        schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+        schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
             fields: vec![
-                crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                     field_id: 1,
                     name: column_name.to_string(),
                     initial_default: None,
@@ -553,9 +554,9 @@ fn values_distributed_node(
 
 #[test]
 fn native_scan_encoder_preserves_iceberg_write_defaults() {
-    let schema = crate::connector::iceberg::scan_model::IcebergSchemaDef {
+    let schema = novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
         fields: vec![
-            crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: 1,
                 name: "amount".to_string(),
                 initial_default: Some(
@@ -574,7 +575,7 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
             },
         ],
     };
-    let iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
+    let iceberg_table = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "orders".to_string(),

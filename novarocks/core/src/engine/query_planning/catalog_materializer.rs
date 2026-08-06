@@ -75,13 +75,13 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
     >,
     mut frozen_snapshot_files: BTreeMap<
         i64,
-        Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
+        Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
     >,
 ) -> Result<QueryTableBinding, String> {
-    use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
     };
+    use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
     let version = match materialization.binding {
         IcebergDataFileBinding::CurrentSnapshot => SqlTableVersionSelector::Current,
@@ -437,11 +437,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::connector::iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::ScanSource;
+    use novarocks_connector_iceberg::scan_model::{
+        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
+    };
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         SqlTableBindingId::new(

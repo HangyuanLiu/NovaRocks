@@ -21,7 +21,7 @@ use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateOp, MinMa
 use crate::common::scan_predicate::{
     MembershipPredicate, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
 };
-use crate::connector::iceberg::scan_model::{
+use novarocks_connector_iceberg::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergPartitionValue, IcebergPhysicalPredicate,
     IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
 };

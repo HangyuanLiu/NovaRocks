@@ -20,14 +20,14 @@
 use std::sync::{Arc, RwLock};
 
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
 use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
 #[cfg(test)]
 use crate::sql::planner::table::{ScanSource, TableDef};
 #[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
 
 #[cfg(test)]
 use super::registry::load_table as reg_load_table;
@@ -52,7 +52,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
         table_name,
         loaded,
         data_files,
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
     )
 }
 
@@ -161,7 +161,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = empty_iceberg_scan_source(
         iceberg_table_info.clone(),
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
     );
     let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
     iceberg_row_lineage_metadata_columns.push(ColumnDef {
@@ -196,7 +196,8 @@ pub(crate) fn build_iceberg_schema_table_def_from_loaded(
         Vec::new(),
         IcebergTableDefOptions {
             mode: IcebergTableDefMode::SchemaOnly,
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            binding:
+                novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         },
     )
 }
@@ -212,7 +213,7 @@ enum IcebergTableDefMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IcebergTableDefOptions {
     mode: IcebergTableDefMode,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 }
 
 #[cfg(test)]
@@ -223,7 +224,7 @@ fn build_iceberg_table_def_with_data_files(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
         entry,
@@ -263,14 +264,14 @@ fn build_iceberg_table_def_with_data_files_impl(
     let iceberg_table_info =
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = match options.binding {
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::Data {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                 },
             )
         }
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
@@ -594,17 +595,17 @@ pub(crate) fn row_lineage_enabled(
 #[cfg(test)]
 fn empty_iceberg_scan_source(
     _table: IcebergTableInfo,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> ScanSource {
     match binding {
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::Data {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                 },
             )
         }
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(0),
@@ -1091,7 +1092,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1107,7 +1108,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file()],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1124,7 +1125,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file_without_first_row_id()],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 

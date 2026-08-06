@@ -539,7 +539,7 @@ fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<
 #[cfg(test)]
 fn stamp_delta_table_def_change_ops(
     table_def: &mut TableDef,
-    files: &mut [crate::connector::iceberg::scan_model::IcebergDataFileInfo],
+    files: &mut [novarocks_connector_iceberg::scan_model::IcebergDataFileInfo],
     change_ops: &[i8],
 ) -> Result<(), String> {
     if table_def.columns.iter().any(|col| {
@@ -602,8 +602,8 @@ mod tests {
         )
     }
 
-    fn test_data_file() -> crate::connector::iceberg::scan_model::IcebergDataFileInfo {
-        crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+    fn test_data_file() -> novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
             path: "file:///tmp/data.parquet".to_string(),
             size: 10,
             row_count: Some(1),
