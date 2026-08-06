@@ -38,6 +38,7 @@ pub mod scan_model;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod theta_sketch;
+pub mod write_descriptor;
 
 pub mod iceberg {
     pub use ::iceberg::*;
