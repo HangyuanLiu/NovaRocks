@@ -37,6 +37,7 @@ pub mod fs_io;
 pub mod hadoop_catalog;
 pub mod metadata_read;
 pub mod position_delete_descriptor;
+pub mod read_snapshot;
 pub mod ref_snapshot;
 pub mod scan_model;
 pub mod stats_assembler;

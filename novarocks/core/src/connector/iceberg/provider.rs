@@ -417,9 +417,6 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
     }
 }
 
-/// Process-startup binding for a read-only Iceberg execution instance.
-///
-/// This type intentionally owns only a locally-composed access binding.  It
 /// Core application adapter around the provider-owned process-local binding.
 /// Core adds only the writer-specific object-store projection below; access
 /// resolution and file-runtime ownership remain in the provider crate.
