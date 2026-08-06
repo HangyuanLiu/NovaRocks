@@ -33,6 +33,7 @@ async-trait = "0.1"
 bytes = "1"
 datasketches = "0.2.0"
 ordered-float = "4"
+parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 typetag = "0.2"

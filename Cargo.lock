@@ -3249,6 +3249,7 @@ dependencies = [
  "novarocks-spi",
  "opendal",
  "ordered-float 4.6.0",
+ "parquet",
  "serde",
  "serde_json",
  "tempfile",
