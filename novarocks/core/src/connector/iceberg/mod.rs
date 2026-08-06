@@ -45,7 +45,10 @@ pub(crate) mod partition_spec;
 pub(crate) mod planning;
 pub mod position_delete;
 pub mod position_delete_descriptor;
-pub(crate) mod provider;
+/// Provider execution/control adapters consumed by the process composition
+/// root. The provider crate owns the external Iceberg dependency boundary;
+/// these adapters only bind frozen SPI payloads to Core's runtime.
+pub mod provider;
 pub(crate) mod read;
 pub(crate) mod reader;
 pub(crate) mod ref_snapshot;

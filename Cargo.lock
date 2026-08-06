@@ -3353,6 +3353,7 @@ dependencies = [
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
  "novarocks-frontend",
+ "novarocks-fs",
  "novarocks-spi",
  "novarocks-state-store",
  "reqwest",

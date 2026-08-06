@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionResolver,
+    ConnectorExecutionInstaller, ConnectorExecutionResolver,
 };
 
 use crate::cache::CacheOptions;
@@ -109,8 +109,11 @@ impl ConnectorExecutionResolver for TestExecutionResolver {
 fn install_connector_bindings(
     declarations: &[ConnectorExecutionDeclaration],
 ) -> Result<Arc<dyn ConnectorExecutionResolver>, DistributedQueryError> {
-    let installers =
-        crate::connector::compose_backend_connector_execution_installers(None).map_err(failed)?;
+    let binding = crate::connector::iceberg::provider::IcebergReadBinding::default_binding(None)
+        .map_err(|error| failed(error.to_string()))?;
+    let installers: Vec<Arc<dyn ConnectorExecutionInstaller>> = vec![Arc::new(
+        crate::connector::iceberg::provider::IcebergConnectorInstaller::new(binding),
+    )];
     let context = crate::connector::test_request_context();
     let mut resolver = TestExecutionResolver::default();
     for declaration in declarations {

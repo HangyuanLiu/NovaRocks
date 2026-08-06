@@ -426,7 +426,7 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
 /// consume the fully planned provider split rather than reconnecting a
 /// catalog.
 #[derive(Clone)]
-pub(crate) struct IcebergReadBinding {
+pub struct IcebergReadBinding {
     access_binding: String,
     object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
     access_resolver: FsAccessResolver,
@@ -448,7 +448,7 @@ impl std::fmt::Debug for IcebergReadBinding {
 }
 
 impl IcebergReadBinding {
-    pub(crate) fn default_binding(
+    pub fn default_binding(
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
     ) -> Result<Self, ConnectorError> {
         let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
@@ -470,7 +470,7 @@ impl IcebergReadBinding {
         ))
     }
 
-    pub(crate) fn new(
+    pub fn new(
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
@@ -576,13 +576,13 @@ impl IcebergReadBinding {
 
 /// Startup-composed installer for Iceberg read-only instances.  The payload
 /// identifies the binding but cannot override it with cloud properties.
-pub(crate) struct IcebergConnectorInstaller {
+pub struct IcebergConnectorInstaller {
     provider_id: ConnectorProviderId,
     binding: IcebergReadBinding,
 }
 
 impl IcebergConnectorInstaller {
-    pub(crate) fn new(binding: IcebergReadBinding) -> Self {
+    pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
                 .expect("static Iceberg provider ID is valid"),

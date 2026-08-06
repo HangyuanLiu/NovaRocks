@@ -21,10 +21,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks::connector::iceberg::provider::{IcebergConnectorInstaller, IcebergReadBinding};
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
+use novarocks_fs::{TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -32,12 +34,18 @@ const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub fn compose_backend_execution_installers(
     config: &NovaRocksConfig,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
-    let iceberg_installers = novarocks::connector::compose_backend_connector_execution_installers(
-        config.connector.object_store_config().map_err(|error| {
-            anyhow::anyhow!("resolve connector startup object-store binding: {error}")
-        })?,
-    )
-    .map_err(|error| anyhow::anyhow!("compose Iceberg execution installers: {error}"))?;
+    let object_store = config.connector.object_store_config().map_err(|error| {
+        anyhow::anyhow!("resolve connector startup object-store binding: {error}")
+    })?;
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|error| anyhow::anyhow!("resolve Tokio runtime for Iceberg installer: {error}"))?;
+    let binding = IcebergReadBinding::new(
+        object_store,
+        std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
+    );
+    let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
+        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(binding))];
     let expected = novarocks_spi::connector::ConnectorProviderId::parse(
         novarocks_connector_iceberg::PROVIDER_ID,
     )
