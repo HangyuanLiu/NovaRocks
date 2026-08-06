@@ -2249,7 +2249,6 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
     logical_type_property_key, logical_type_property_value,
 };
-use crate::connector::iceberg::commit::retry::commit_with_retry;
 use crate::connector::iceberg::variant_write::{
     VARIANT_SHREDDING_PROPERTY_PREFIX, parse_variant_shredding_properties,
 };
@@ -2261,6 +2260,7 @@ use crate::engine::statement::{
 };
 use novarocks_catalog::identifier::normalize_identifier;
 use novarocks_catalog::schema::SqlType;
+use novarocks_connector_iceberg::commit::commit_with_retry;
 
 #[cfg(test)]
 pub(crate) fn apply_change_to_schema_for_test(

@@ -40,11 +40,11 @@ use uuid::Uuid;
 use super::helpers::{
     current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
-use super::retry::{commit_with_retry, is_retryable_commit_conflict};
 use novarocks_connector_iceberg::commit::{
     DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
     write_multi_deletion_vector_puffin,
 };
+use novarocks_connector_iceberg::commit::{commit_with_retry, is_retryable_commit_conflict};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewritePositionDeleteOptions {

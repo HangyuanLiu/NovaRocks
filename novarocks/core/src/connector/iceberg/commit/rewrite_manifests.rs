@@ -47,7 +47,7 @@ use super::data_file::clone_data_file_with_first_row_id;
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
-use super::retry::commit_with_retry;
+use novarocks_connector_iceberg::commit::commit_with_retry;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RewriteManifestsOutcome {

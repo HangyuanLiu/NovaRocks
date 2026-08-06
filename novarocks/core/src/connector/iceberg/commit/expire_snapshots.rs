@@ -48,7 +48,7 @@ use novarocks_connector_iceberg::iceberg::{
     Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
 };
 
-use super::retry::commit_with_retry;
+use novarocks_connector_iceberg::commit::commit_with_retry;
 use novarocks_connector_iceberg::commit::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
