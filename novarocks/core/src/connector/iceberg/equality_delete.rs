@@ -139,7 +139,7 @@ pub(crate) fn load_equality_delete_sets_with_context(
                 spec.path
             ));
         }
-        let batches = crate::connector::iceberg::file_reader::read_parquet_batches(
+        let batches = novarocks_connector_iceberg::file_reader::read_parquet_batches(
             access,
             &spec.path,
             spec.length,

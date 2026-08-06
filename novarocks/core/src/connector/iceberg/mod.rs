@@ -32,7 +32,6 @@ pub(crate) mod distributed_rewrite_execution;
 pub(crate) mod distributed_rewrite_reader;
 pub mod equality_delete;
 pub(crate) mod file_pruning;
-pub(crate) mod file_reader;
 pub(crate) mod fs_io;
 pub mod metadata;
 pub(crate) mod metadata_maintenance;
