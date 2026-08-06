@@ -130,7 +130,7 @@ def verify_roles(metadata):
     frontend = package(metadata, FRONTEND)
     backend = package(metadata, BACKEND)
     for role_name, role in ((FRONTEND, frontend), (BACKEND, backend)):
-        direct = dependency_names(role, {None, "build"})
+        direct = dependency_names(role, {None, "build", "dev"})
         if direct & provider_direct:
             fail(f"{role_name} must not directly depend on {PROVIDER}")
 
