@@ -34,7 +34,7 @@
 //! hash, so the server can reconstruct the `package` level today. W3a adds the
 //! `provenance` level: when the MV table's current snapshot carries a
 //! `provenance.v1` record (stamped by every MV refresh, see
-//! `crate::connector::iceberg::commit::mv_provenance`), the server also
+//! `novarocks_connector_iceberg::commit::mv_provenance`), the server also
 //! reports `ProvenanceHash`/`WaterlineHash` derived from it. An MV that was
 //! created but never refreshed (no current snapshot, or a snapshot without
 //! provenance) still reports `package` with those hashes NULL.
@@ -204,9 +204,7 @@ pub(crate) fn execute_request(
         .metadata()
         .current_snapshot()
         .map(|current| {
-            crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1::from_snapshot_summary(
-                current,
-            )
+            novarocks_connector_iceberg::commit::MvProvenanceV1::from_snapshot_summary(current)
         })
         .transpose()?
         .flatten();
@@ -325,7 +323,7 @@ fn clear_sqlite_and_rebuild_from_lake(
 /// as a pure function so the level-selection contract is unit-testable
 /// without loading a live Iceberg table.
 fn provenance_level(
-    provenance: Option<&crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1>,
+    provenance: Option<&novarocks_connector_iceberg::commit::MvProvenanceV1>,
 ) -> Result<(Option<String>, Option<String>, StatelessLevel), String> {
     match provenance {
         Some(prov) => Ok((
@@ -408,8 +406,8 @@ mod tests {
         assert!(ensure_stateless_rebuild_enabled(Some("1")).is_ok());
     }
 
-    fn sample_provenance() -> crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1 {
-        use crate::connector::iceberg::commit::mv_provenance::{
+    fn sample_provenance() -> novarocks_connector_iceberg::commit::MvProvenanceV1 {
+        use novarocks_connector_iceberg::commit::{
             MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
         };
         MvProvenanceV1 {

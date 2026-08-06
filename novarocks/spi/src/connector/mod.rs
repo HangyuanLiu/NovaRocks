@@ -53,8 +53,10 @@ pub use cleanup_maintenance::{
 };
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
-    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlRegistry,
-    ConnectorControlResolver, ConnectorExecutionDistribution, ConnectorScanPlanning,
+    ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
+    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
+    ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
+    ConnectorScanPlanning,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

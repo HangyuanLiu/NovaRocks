@@ -7,12 +7,13 @@
 
 use std::sync::Arc;
 
-use iceberg::TableIdent;
+use novarocks_connector_iceberg::iceberg::TableIdent;
 
 use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
 };
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergCommitCollector};
+use crate::connector::iceberg::commit::IcebergCommitCollector;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::write::WriteCommitInput;
 
 pub(crate) struct ExecutedChangeStreamWrite {
@@ -56,7 +57,7 @@ impl ChangeStreamWriteError {
 }
 
 pub(crate) fn execute_and_collect_change_stream_write<F>(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
     op_kind: CommitOpKind,
@@ -95,7 +96,7 @@ where
 }
 
 pub(crate) fn new_iceberg_mv_commit_collector(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
     op_kind: CommitOpKind,
@@ -142,21 +143,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Struct,
         TableMetadataBuilder, Type,
     };
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
-    use crate::connector::iceberg::delete_file::IcebergFileContent;
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
     use crate::query_execution::write::{WriterCommitInput, WriterKey};
     use crate::sql::common::ChangeStreamBranchKind;
+    use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
-    fn test_table() -> iceberg::table::Table {
+    fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![Arc::new(NestedField::required(
@@ -178,9 +179,9 @@ mod tests {
         .build()
         .expect("table metadata")
         .metadata;
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .identifier(test_ident())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("table")
@@ -202,7 +203,7 @@ mod tests {
     }
 
     fn executed_write(
-        _table: &iceberg::table::Table,
+        _table: &novarocks_connector_iceberg::iceberg::table::Table,
         _writers: Vec<(i32, &str, IcebergFileContent, i64)>,
         branches: BTreeMap<i32, ChangeStreamBranchKind>,
     ) -> ExecutedChangeStreamWrite {

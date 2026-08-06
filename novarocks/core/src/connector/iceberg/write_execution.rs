@@ -41,7 +41,6 @@ use super::data_writer::{
     StagedDataFile, StagedWriteContext, StagedWriteOptions, cleanup_staged_files,
     staged_data_file_to_writer_report, write_record_batches,
 };
-use super::delete_file::IcebergFileContent;
 use super::position_delete_descriptor::canonical_output_schema;
 use super::provider::IcebergReadBinding;
 use super::report::{
@@ -58,6 +57,7 @@ use super::write_contract::{
     staged_report_from_unpartitioned_equality_delete_reports, write_handle_mode,
 };
 use crate::runtime::global_async_runtime::data_block_on;
+use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]
@@ -128,10 +128,9 @@ impl IcebergDataWriteExecution {
             None,
         )
         .map_err(|message| error(ConnectorErrorKind::Unsupported, message))?;
-        plan.object_store_s3 = self
-            .binding
-            .write_object_store_config(&plan.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        plan.object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &plan.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let report_file_format = plan.report_file_format.clone();
         let context = plan
             .build_staged_write_context()
@@ -158,10 +157,9 @@ impl IcebergDataWriteExecution {
             request.expected_schema.clone(),
         )
         .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergEqualityDeleteBatchWriter {
@@ -185,10 +183,9 @@ impl IcebergDataWriteExecution {
         let handle =
             position_delete_handle_from_payload(request.handle.payload(), &request.expected_schema)
                 .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&handle.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &handle.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergPositionDeleteBatchWriter {
@@ -218,10 +215,9 @@ impl IcebergDataWriteExecution {
                 "deletion-vector adapter received a non-DV handle",
             ));
         }
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&handle.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &handle.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergDeletionVectorBatchWriter {
@@ -462,7 +458,7 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
 
 struct IcebergEqualityDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     staging_dir: String,
     partition_spec_id: i32,
     columns: Vec<super::commit::EqualityDeleteColumn>,
@@ -489,7 +485,7 @@ struct IcebergPositionDeleteStagedFileOwned {
 
 struct IcebergPositionDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     object_store_s3: Option<IcebergSinkObjectStoreConfig>,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
@@ -731,7 +727,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
 /// delete file is opened on the BE.
 struct IcebergDeletionVectorBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
     pending: BTreeMap<String, DeletionVector>,

@@ -31,7 +31,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use roaring::RoaringTreemap;
 
 use crate::connector::file_execution::{read_foundation_bytes, read_foundation_parquet_batches};
-use crate::connector::iceberg::delete_file::{
+use novarocks_connector_iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use novarocks_fs::FileReadContext;
@@ -110,7 +110,7 @@ fn accumulate_deletes_from_file_with_context(
             .map_err(|_| format!("Puffin deletion vector {} has negative offset", spec.path))?;
         let length = u64::try_from(size)
             .map_err(|_| format!("Puffin deletion vector {} size is too large", spec.path))?;
-        let payload = crate::connector::iceberg::file_reader::read_bytes(
+        let payload = novarocks_connector_iceberg::file_reader::read_bytes(
             access,
             &spec.path,
             spec.length,
@@ -136,7 +136,7 @@ fn accumulate_deletes_from_file_with_context(
             spec.path, spec.file_format
         ));
     }
-    for batch in crate::connector::iceberg::file_reader::read_parquet_batches(
+    for batch in novarocks_connector_iceberg::file_reader::read_parquet_batches(
         access,
         &spec.path,
         spec.length,

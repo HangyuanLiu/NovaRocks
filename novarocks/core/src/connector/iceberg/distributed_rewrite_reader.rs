@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use iceberg::spec::DataFileFormat;
+use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot,
@@ -23,7 +23,9 @@ use novarocks_spi::connector::{
 
 use super::changes::PositionDeleteRef;
 use super::provider::{IcebergReadBinding, IcebergRewritePositionSplitPayloadV1};
-use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+};
 
 const POSITION_BATCH_ROWS: usize = 64 * 1024;
 
@@ -226,7 +228,7 @@ fn deadline() -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::IcebergDeleteFileInfo;
+    use novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo;
 
     fn puffin(path: &str) -> IcebergDeleteFileInfo {
         IcebergDeleteFileInfo {

@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::connector::file_execution::read_foundation_parquet_batches;
-use crate::connector::iceberg::delete_file::{
+use novarocks_connector_iceberg::delete_file::{
     IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
 };
 use novarocks_fs::FileReadContext;
@@ -139,7 +139,7 @@ pub(crate) fn load_equality_delete_sets_with_context(
                 spec.path
             ));
         }
-        let batches = crate::connector::iceberg::file_reader::read_parquet_batches(
+        let batches = novarocks_connector_iceberg::file_reader::read_parquet_batches(
             access,
             &spec.path,
             spec.length,
@@ -467,7 +467,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
-    use crate::connector::iceberg::delete_file::{
+    use novarocks_connector_iceberg::delete_file::{
         IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat,
     };
 

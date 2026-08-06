@@ -27,6 +27,7 @@ doctest = false
 novarocks-catalog = { path = "../catalog" }
 novarocks-execution = { path = "../execution" }
 novarocks-fs = { path = "../fs" }
+novarocks-connector-iceberg = { path = "../connector/iceberg" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
@@ -50,11 +51,7 @@ arrow-data = { version = "58.2.0" }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 orc-rust = { version = "0.8.0", default-features = false }
 apache-avro = "0.21.0"
-iceberg = "0.9.0"
-iceberg-catalog-rest = "0.9.0"
-iceberg-catalog-hms = "0.9.0"
 typetag = "0.2"
-opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = "25"

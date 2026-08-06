@@ -43,8 +43,9 @@ use novarocks_spi::connector::{
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use super::commit::{CommitOutcome, CommitServiceError, RecoveryEvidence};
+use super::commit::{CommitServiceError, RecoveryEvidence};
 use super::write_contract::connector_write_receipt;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
 const ICEBERG_WRITE_OPERATION_KIND: &str = "iceberg.connector_write.v2";
@@ -197,7 +198,7 @@ pub(crate) trait IcebergWriteControlBackend: Send + Sync {
     fn build_staged_create_action(
         &self,
         _completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<novarocks_connector_iceberg::commit::AbortLog>,
     ) -> Result<
         super::commit::StagedFastAppendAction,
         super::write_service::StagedCreateActionBuildFailure,
@@ -214,7 +215,7 @@ pub(crate) trait IcebergWriteControlBackend: Send + Sync {
     fn abort_staged_create_action(
         &self,
         _completion: &novarocks_spi::connector::ConnectorWriteOperationCompletion,
-        _abort_handle: &Arc<super::commit::AbortLog>,
+        _abort_handle: &Arc<novarocks_connector_iceberg::commit::AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -1057,7 +1058,7 @@ mod tests {
                     "commit response lost".to_string(),
                     RecoveryEvidence {
                         table_ident: "db.t".to_string(),
-                        op_kind: super::super::commit::CommitOpKind::FastAppend,
+                        op_kind: CommitOpKind::FastAppend,
                         base_snapshot_id: None,
                         base_sequence_number: 0,
                         staging_dir: "file:///warehouse/db/t/data".to_string(),

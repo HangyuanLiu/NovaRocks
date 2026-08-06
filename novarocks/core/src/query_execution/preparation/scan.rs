@@ -23,9 +23,6 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate,
 };
 
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::TypedExpr;
@@ -33,6 +30,9 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::FragmentId;
 use crate::sql::planner::payload::PlanScanNode;
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
+};
 
 pub(crate) use super::iceberg_delta::IcebergDeltaScanRuntimePlan;
 

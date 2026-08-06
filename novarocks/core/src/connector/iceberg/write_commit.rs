@@ -8,22 +8,24 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_connector_iceberg::opendal::Operator;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorWriteAbortOutcome, ExternalMutationFinalization, ExternalMutationOutcome,
 };
-use opendal::Operator;
 
 use super::catalog::registry::block_on_iceberg;
 use super::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterReports, route_change_stream_staged_reports,
 };
 use super::commit::{
-    AbortLog, CleanupAttempt, CleanupPathMapper, CommitOutcome, CommitServiceError,
-    CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
+    CleanupAttempt, CleanupPathMapper, CommitServiceError, CowUpdateRewriteSet,
+    IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use super::report::IcebergWriterReport;
 use super::write_contract::decode_write_receipt;
+use crate::connector::iceberg::commit::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::AbortLog;
 
 /// Convert a sealed provider commit decision into the application-neutral
 /// durable outcome consumed by the frontend lifecycle runner.
@@ -149,8 +151,8 @@ pub(crate) fn abort_iceberg_connector_write(
 /// remains outside this type. Callers supply only reports accepted by the
 /// sealed generic write operation.
 pub(crate) struct IcebergWriteCommitExecutor {
-    pub(crate) catalog: Arc<dyn iceberg::Catalog>,
-    pub(crate) table: iceberg::table::Table,
+    pub(crate) catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) collector: Arc<IcebergCommitCollector>,
     pub(crate) fs: Operator,
     pub(crate) cleanup_path_mapper: Option<CleanupPathMapper>,

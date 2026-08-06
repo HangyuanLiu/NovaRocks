@@ -28,14 +28,14 @@ use novarocks_spi::connector::{
     ConnectorReaderMetricsSnapshot,
 };
 
-use super::delete_file::IcebergDeleteFileSpec;
-use super::delta::{
+use super::provider::IcebergReadBinding;
+use super::reader::IcebergBatchReader;
+use novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec;
+use novarocks_connector_iceberg::delta::{
     BaseDataFileLineage, DeltaScanDeleteSide, DeltaSourceFile, DeltaSourceRole,
     PositionDeleteFileFormat,
 };
-use super::provider::IcebergReadBinding;
-use super::reader::IcebergBatchReader;
-use super::scan_model::{
+use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 
@@ -359,7 +359,7 @@ fn source_as_data_file(
 }
 
 fn position_delete_spec(
-    delete: &super::delta::PositionDeleteSourceData,
+    delete: &novarocks_connector_iceberg::delta::PositionDeleteSourceData,
 ) -> Result<IcebergDeleteFileSpec, ConnectorError> {
     let length = u64::try_from(delete.delete_file_size).ok();
     match delete.file_format {
@@ -381,7 +381,7 @@ fn position_delete_spec(
 }
 
 fn position_delete_applies_to_data_file(
-    delete: &super::delta::PositionDeleteSourceData,
+    delete: &novarocks_connector_iceberg::delta::PositionDeleteSourceData,
     data_file_path: &str,
 ) -> bool {
     match delete.file_format {
@@ -400,7 +400,7 @@ fn position_delete_applies_to_data_file(
 }
 
 fn delete_visibility_specs(
-    file: &super::changes::DeleteVisibilityDataFileDescriptor,
+    file: &novarocks_connector_iceberg::delta::DeleteVisibilityDataFileDescriptor,
 ) -> Result<Vec<IcebergDeleteFileInfo>, ConnectorError> {
     file.delete_files
         .iter()
@@ -408,18 +408,18 @@ fn delete_visibility_specs(
             Ok(IcebergDeleteFileInfo {
                 path: delete.path.clone(),
                 file_format: match delete.file_format {
-                    super::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Parquet => {
                         IcebergDeleteFileFormat::Parquet
                     }
-                    super::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Puffin => {
                         IcebergDeleteFileFormat::Puffin
                     }
                 },
                 file_content: match delete.file_content {
-                    super::changes::DeleteVisibilityDeleteFileContent::Position => {
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Position => {
                         IcebergDeleteFileContent::Position
                     }
-                    super::changes::DeleteVisibilityDeleteFileContent::Equality => {
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Equality => {
                         IcebergDeleteFileContent::Equality
                     }
                 },
@@ -487,8 +487,8 @@ mod tests {
 
     fn puffin_delete(
         referenced_data_file: Option<&str>,
-    ) -> super::super::delta::PositionDeleteSourceData {
-        super::super::delta::PositionDeleteSourceData {
+    ) -> novarocks_connector_iceberg::delta::PositionDeleteSourceData {
+        novarocks_connector_iceberg::delta::PositionDeleteSourceData {
             delete_file_path: "s3://bucket/table/delete.puffin".to_string(),
             delete_file_size: 1,
             referenced_data_file: referenced_data_file.map(str::to_string),

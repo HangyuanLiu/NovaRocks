@@ -133,7 +133,7 @@ pub(super) fn plan_iceberg_connector_read(
 pub(super) fn plan_iceberg_delta_connector_read(
     exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     predicates: &[TypedExpr],
     execution: &ResolvedScanExecution,
     target_parallelism: std::num::NonZeroUsize,

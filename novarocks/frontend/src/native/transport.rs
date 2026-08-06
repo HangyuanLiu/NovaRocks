@@ -28,6 +28,7 @@ use novarocks::query_execution::lifecycle::{
     QueryControlSession, QueryInitAck, QueryInitRequest, QueryLifecycleTarget,
     QueryLifecycleTransport, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
     QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
+    QueryTerminationReason,
 };
 use novarocks::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 use novarocks::service::observe_backend_heartbeat_rtt;
@@ -612,6 +613,12 @@ impl QueryControlSession for ControlSession {
             .commands
             .lock()
             .map_err(|_| unavailable("query control command lock poisoned"))?;
+        if state.sender.is_none() {
+            return Err(state
+                .terminal
+                .clone()
+                .unwrap_or_else(|| closed("query control stream is closed")));
+        }
         if state.pending.len() >= QUERY_CONTROL_CHANNEL_CAPACITY {
             return Err(backpressure(
                 "query control pending command capacity is exhausted",
@@ -686,6 +693,10 @@ async fn bridge(
         let terminal = next.is_err();
         if let Ok(event) = &next {
             if let Err(error) = validate_control_event(event, &commands) {
+                if let Ok(mut commands) = commands.lock() {
+                    commands.sender.take();
+                    commands.terminal = Some(error.clone());
+                }
                 let _ = events.send(Err(error)).await;
                 break;
             }
@@ -710,8 +721,11 @@ fn validate_control_event(
         .lock()
         .map_err(|_| unavailable("query control command lock poisoned"))?;
     match event {
-        QueryControlEvent::HeartbeatAck { sequence } => match commands.pending.pop_front() {
-            Some(Pending::Heartbeat(expected)) if expected == *sequence => Ok(()),
+        QueryControlEvent::HeartbeatAck { sequence } => match commands.pending.front().copied() {
+            Some(Pending::Heartbeat(expected)) if expected == *sequence => {
+                commands.pending.pop_front();
+                Ok(())
+            }
             Some(other) => Err(invalid(format!(
                 "unexpected heartbeat acknowledgement {sequence} for {other:?}"
             ))),
@@ -719,17 +733,33 @@ fn validate_control_event(
                 "received unsolicited heartbeat sequence {sequence}"
             ))),
         },
-        QueryControlEvent::TerminationAccepted { .. } => {
+        QueryControlEvent::TerminationAccepted { reason } => {
+            let expected = commands
+                .pending
+                .iter()
+                .copied()
+                .find(|command| !matches!(command, Pending::Heartbeat(_)));
+            let matches_reason = match (expected, reason) {
+                (Some(Pending::Abort), QueryTerminationReason::CoordinatorAbort)
+                | (Some(Pending::Finalize), QueryTerminationReason::CoordinatorFinalize) => true,
+                (None, _) => {
+                    commands
+                        .pending
+                        .retain(|command| !matches!(command, Pending::Heartbeat(_)));
+                    return Ok(());
+                }
+                _ => false,
+            };
+            if !matches_reason {
+                return Err(invalid(format!(
+                    "unexpected termination acknowledgement {reason:?} for {expected:?}"
+                )));
+            }
             commands
                 .pending
                 .retain(|command| !matches!(command, Pending::Heartbeat(_)));
-            match commands.pending.pop_front() {
-                Some(Pending::Abort | Pending::Finalize) => Ok(()),
-                Some(other) => Err(invalid(format!(
-                    "unexpected termination acknowledgement for {other:?}"
-                ))),
-                None => Ok(()),
-            }
+            commands.pending.pop_front();
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -799,6 +829,13 @@ fn status_error(status: tonic::Status) -> QueryLifecycleTransportError {
             status.code(),
             status.message()
         )),
+        tonic::Code::Cancelled if status.message().to_ascii_lowercase().contains("timeout") => {
+            deadline_error(format!(
+                "rpc status {:?}: {}",
+                status.code(),
+                status.message()
+            ))
+        }
         tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown => unavailable(
             format!("rpc status {:?}: {}", status.code(), status.message()),
         ),

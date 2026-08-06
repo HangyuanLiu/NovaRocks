@@ -12,9 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
-use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
+use crate::connector::iceberg::commit::IcebergCommitCollector;
+use crate::connector::iceberg::commit::WrittenFile;
 use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;
@@ -233,19 +234,19 @@ mod tests {
 
     use std::sync::Arc;
 
-    use iceberg::TableCreation;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::TableCreation;
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         TableMetadataBuilder, Type,
     };
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;
-    use crate::connector::iceberg::delete_file::IcebergFileContent;
     use crate::connector::iceberg::report::{
         IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     };
+    use novarocks_connector_iceberg::delete_file::IcebergFileContent;
 
     fn test_unpartitioned_metadata() -> TableMetadata {
         let schema = Schema::builder()

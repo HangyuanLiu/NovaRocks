@@ -22,7 +22,6 @@
 //! Parquet file produced by the pipeline), and [`CommitOutcome`] (result of a
 //! successful commit).
 
-mod abort;
 mod action;
 mod collector;
 mod data_file;
@@ -30,15 +29,12 @@ mod equality_delete_writer;
 pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
-pub(crate) mod mv_provenance;
-mod mv_refresh_ref;
+#[cfg(test)]
+mod mv_provenance_tests;
 mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
-mod puffin_dv;
-mod ref_action;
 pub mod remove_orphan_files;
-pub mod retry;
 mod rewrite_data_files;
 pub mod rewrite_manifests;
 pub mod rewrite_position_delete_files;
@@ -49,8 +45,8 @@ mod row_delta_dv_metadata;
 mod run;
 mod selected_rewrite;
 mod service;
-pub mod snapshot_lifecycle_helpers;
-pub(crate) mod statistics;
+#[cfg(test)]
+pub(crate) mod snapshot_lifecycle_helpers_tests;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;
@@ -58,28 +54,30 @@ mod types;
 mod update_cow;
 mod validation;
 
-pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use data_file::written_file_to_iceberg_data_file;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub(crate) use fast_append::{StagedFastAppendAction, build_staged_fast_append_action};
-pub use mv_refresh_ref::{
-    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
-    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
-    snapshot_matches_refresh_marker,
+pub use novarocks_connector_iceberg::commit::{
+    COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, commit_with_retry,
+    is_retryable_commit_conflict,
 };
-pub use overwrite::OverwriteCommit;
-pub use overwrite_partitions::OverwritePartitionsCommit;
-pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
-pub use puffin_dv::{
+pub use novarocks_connector_iceberg::commit::{
     DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
     read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
-pub use retry::{commit_with_retry, is_retryable_commit_conflict};
+pub use novarocks_connector_iceberg::commit::{
+    MV_ID_PROP, MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ID_PROP,
+    MV_REFRESH_ROW_COUNT_PROP, MV_REFRESH_TOKEN_PROP, MvProvenanceV1, MvRefreshPublishOutcome,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, ProvenanceBase, RefreshTechnique,
+    publish_staging_branch_to_main, snapshot_matches_refresh_marker,
+};
+pub use overwrite::OverwriteCommit;
+pub use overwrite_partitions::OverwritePartitionsCommit;
+pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 #[allow(unused_imports)]
 pub(crate) use rewrite_data_files::count_current_live_files;

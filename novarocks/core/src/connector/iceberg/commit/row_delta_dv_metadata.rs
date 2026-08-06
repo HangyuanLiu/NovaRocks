@@ -19,15 +19,17 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, ManifestContentType, ManifestFile,
     ManifestWriterBuilder, PartitionSpecRef, SchemaRef, TableMetadata,
 };
-use iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::table::Table;
 
-use super::puffin_dv::{DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin};
-use super::types::WrittenFile;
+use crate::connector::iceberg::commit::types::WrittenFile;
+use novarocks_connector_iceberg::commit::{
+    DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WrittenDvFile {
@@ -292,7 +294,7 @@ pub(super) fn validate_delete_file_for_row_lineage(file: &DataFile) -> Result<()
 pub(super) fn partition_spec_by_id(
     metadata: &TableMetadata,
     spec_id: i32,
-) -> iceberg::Result<PartitionSpecRef> {
+) -> novarocks_connector_iceberg::iceberg::Result<PartitionSpecRef> {
     metadata
         .partition_spec_by_id(spec_id)
         .cloned()
@@ -524,6 +526,9 @@ pub(super) fn dv_summary(
     Ok(p)
 }
 
-pub(super) fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+pub(super) fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }

@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
-use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
+use novarocks_connector_iceberg::iceberg::spec::{
+    ListType, MapType, NestedField, PrimitiveType, StructType, Type,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::expr::encode_sort_items;
@@ -29,7 +31,6 @@ use super::type_mapping::{
     encode_edge_partition_type, encode_iceberg_metadata_table_type, encode_sql_type,
 };
 use super::{NativePlanEncodeContext, encode_exprs, optional_context_ref};
-use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::protocol::native::type_mapping::encode_type;
 use crate::query_execution::preparation::scan::{
     ResolvedScanBinding, ResolvedScanColumnKind, ResolvedScanExecution,
@@ -38,6 +39,7 @@ use crate::sql::analysis::OutputColumn as AnalysisOutputColumn;
 use crate::sql::planner::distributed::{ExchangeFlavor, ExchangeReceiver};
 use crate::sql::planner::table as table_model;
 use novarocks_catalog::schema::{ColumnDefault, validate_column_default};
+use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 use novarocks_protocol::{common, plan};
 
 pub(super) fn encode_scan_node(
@@ -409,7 +411,7 @@ fn encode_column_write_default_json(
         }
         _ => value,
     };
-    crate::connector::iceberg::default_value::column_default_to_iceberg_literal(
+    novarocks_connector_iceberg::default_value::column_default_to_iceberg_literal(
         value,
         &iceberg_type,
     )
@@ -511,7 +513,7 @@ fn iceberg_primitive_type_for_arrow_data_type(
 
 fn iceberg_nested_field_for_arrow_field(
     field: &Field,
-) -> Result<iceberg::spec::NestedFieldRef, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef, String> {
     let field_id = arrow_field_id(field)?;
     let field_type = iceberg_type_for_arrow_data_type(field.data_type())?;
     Ok(Arc::new(NestedField::new(
@@ -953,7 +955,7 @@ fn encode_iceberg_schema_field(
 fn encode_iceberg_schema_default_json(
     label: &str,
     precomputed_json: Option<&String>,
-    literal: Option<&iceberg::spec::Literal>,
+    literal: Option<&novarocks_connector_iceberg::iceberg::spec::Literal>,
 ) -> Result<Option<String>, String> {
     if let Some(json) = precomputed_json {
         return Ok(Some(json.clone()));

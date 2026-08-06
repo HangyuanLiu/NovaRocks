@@ -21,9 +21,10 @@
 //! error enum so that CREATE-time PRIMARY KEY validation has a stable type
 //! to return.
 
-use crate::connector::iceberg::delta::{
-    DeltaSourceFile, DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat,
-    PositionDeleteSourceData,
+use novarocks_connector_iceberg::delta::{
+    DeleteVisibilityDataFileDescriptor, DeleteVisibilityDeleteFileContent,
+    DeleteVisibilityDeleteFileDescriptor, DeleteVisibilityDeleteFileFormat, DeltaSourceFile,
+    DeltaSourceRole, EqualityDeleteTargetData, PositionDeleteFileFormat, PositionDeleteSourceData,
 };
 
 /// All failure modes the iceberg change-planning and IVM CREATE/REFRESH
@@ -250,7 +251,7 @@ pub(crate) struct PositionDeleteRef {
     pub referenced_data_file: Option<String>,
     /// `Parquet` for v2 position-delete files, `Puffin` for v3 deletion-vector
     /// files. Other variants are rejected at construction.
-    pub file_format: iceberg::spec::DataFileFormat,
+    pub file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat,
     /// Required when `file_format == Puffin`: byte offset of the
     /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
     /// `file_format == Parquet`.
@@ -260,37 +261,6 @@ pub(crate) struct PositionDeleteRef {
     /// `file_format == Parquet`.
     pub content_size_in_bytes: Option<i64>,
     pub partition_values: Vec<ChangePartitionFieldValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum DeleteVisibilityDeleteFileFormat {
-    Parquet,
-    Puffin,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum DeleteVisibilityDeleteFileContent {
-    Position,
-    Equality,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct DeleteVisibilityDeleteFileDescriptor {
-    pub path: String,
-    pub file_format: DeleteVisibilityDeleteFileFormat,
-    pub file_content: DeleteVisibilityDeleteFileContent,
-    pub length: Option<i64>,
-    pub content_offset: Option<i64>,
-    pub content_size_in_bytes: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct DeleteVisibilityDataFileDescriptor {
-    pub path: String,
-    pub size: i64,
-    pub first_row_id: Option<i64>,
-    pub data_sequence_number: Option<i64>,
-    pub delete_files: Vec<DeleteVisibilityDeleteFileDescriptor>,
 }
 
 /// Reference to a single equality-delete file added to the table. Unlike
@@ -309,7 +279,9 @@ pub(crate) struct EqualityDeleteRef {
     pub partition_values: Vec<ChangePartitionFieldValue>,
 }
 
-fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
+fn iceberg_partition_key(
+    partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
+) -> Option<String> {
     if partition.fields().is_empty() {
         None
     } else {
@@ -318,9 +290,9 @@ fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
 }
 
 pub(crate) fn change_partition_field_values(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     spec_id: i32,
-    partition: &iceberg::spec::Struct,
+    partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
 ) -> Result<Vec<ChangePartitionFieldValue>, ChangeError> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(ChangeError::InternalInconsistency(format!(
@@ -351,46 +323,56 @@ pub(crate) fn change_partition_field_values(
     Ok(values)
 }
 
-pub(crate) fn change_partition_transform_name(transform: &iceberg::spec::Transform) -> String {
+pub(crate) fn change_partition_transform_name(
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
+) -> String {
     match transform {
-        iceberg::spec::Transform::Identity => "identity".to_string(),
+        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => "identity".to_string(),
         other => format!("{other:?}").to_ascii_lowercase(),
     }
 }
 
-fn change_partition_value(literal: Option<&iceberg::spec::Literal>) -> ChangePartitionValue {
+fn change_partition_value(
+    literal: Option<&novarocks_connector_iceberg::iceberg::spec::Literal>,
+) -> ChangePartitionValue {
     let Some(literal) = literal else {
         return ChangePartitionValue::Null;
     };
-    let iceberg::spec::Literal::Primitive(value) = literal else {
+    let novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(value) = literal else {
         return ChangePartitionValue::Unsupported("non-primitive partition value".to_string());
     };
     match value {
-        iceberg::spec::PrimitiveLiteral::Boolean(v) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Boolean(v) => {
             ChangePartitionValue::Primitive(v.to_string())
         }
-        iceberg::spec::PrimitiveLiteral::Int(v) => ChangePartitionValue::Primitive(v.to_string()),
-        iceberg::spec::PrimitiveLiteral::Long(v) => ChangePartitionValue::Primitive(v.to_string()),
-        iceberg::spec::PrimitiveLiteral::Float(v) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(v) => {
+            ChangePartitionValue::Primitive(v.to_string())
+        }
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Long(v) => {
+            ChangePartitionValue::Primitive(v.to_string())
+        }
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Float(v) => {
             ChangePartitionValue::Primitive(v.0.to_string())
         }
-        iceberg::spec::PrimitiveLiteral::Double(v) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Double(v) => {
             ChangePartitionValue::Primitive(v.0.to_string())
         }
-        iceberg::spec::PrimitiveLiteral::String(v) => ChangePartitionValue::Primitive(v.clone()),
-        iceberg::spec::PrimitiveLiteral::Binary(_) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::String(v) => {
+            ChangePartitionValue::Primitive(v.clone())
+        }
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Binary(_) => {
             ChangePartitionValue::Unsupported("binary partition value".to_string())
         }
-        iceberg::spec::PrimitiveLiteral::Int128(_) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int128(_) => {
             ChangePartitionValue::Unsupported("int128 partition value".to_string())
         }
-        iceberg::spec::PrimitiveLiteral::UInt128(_) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::UInt128(_) => {
             ChangePartitionValue::Unsupported("uint128 partition value".to_string())
         }
-        iceberg::spec::PrimitiveLiteral::AboveMax => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::AboveMax => {
             ChangePartitionValue::Unsupported("above-max partition value".to_string())
         }
-        iceberg::spec::PrimitiveLiteral::BelowMin => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::BelowMin => {
             ChangePartitionValue::Unsupported("below-min partition value".to_string())
         }
     }
@@ -401,7 +383,7 @@ impl PositionDeleteRef {
     /// referenced_data_file fields are mutually consistent. Returns
     /// `ChangeError::InternalInconsistency` on any mismatch.
     pub(crate) fn validate_invariants(&self) -> Result<(), ChangeError> {
-        use iceberg::spec::DataFileFormat;
+        use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
         match self.file_format {
             DataFileFormat::Parquet => {
                 if self.content_offset.is_some() || self.content_size_in_bytes.is_some() {
@@ -504,8 +486,12 @@ pub(crate) fn delta_source_files_from_change_batch_with_equality_targets(
             delete_file_size: del.delete_file_size,
             referenced_data_file: del.referenced_data_file.clone(),
             file_format: match del.file_format {
-                iceberg::spec::DataFileFormat::Parquet => PositionDeleteFileFormat::Parquet,
-                iceberg::spec::DataFileFormat::Puffin => PositionDeleteFileFormat::Puffin,
+                novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet => {
+                    PositionDeleteFileFormat::Parquet
+                }
+                novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin => {
+                    PositionDeleteFileFormat::Puffin
+                }
                 other => {
                     return Err(format!(
                         "ivm-a1 delta-scan payload: position-delete file {} has unsupported \
@@ -568,7 +554,7 @@ pub(crate) fn delta_source_files_from_change_batch_with_equality_targets(
 }
 
 pub(crate) fn equality_delete_targets_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
     equality_deletes: &[EqualityDeleteRef],
 ) -> Result<std::collections::HashMap<String, Vec<EqualityDeleteTargetData>>, String> {
@@ -580,7 +566,7 @@ pub(crate) fn equality_delete_targets_at(
     let mut out = std::collections::HashMap::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
-        let targets = crate::connector::iceberg::read::data_files_matching_delete(
+        let targets = novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         )
@@ -598,7 +584,7 @@ pub(crate) fn equality_delete_targets_at(
 }
 
 pub(crate) fn delete_visibility_data_files_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<Vec<DeleteVisibilityDataFileDescriptor>, String> {
     crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
@@ -618,18 +604,18 @@ fn delete_visibility_data_file_from_stats(
         .into_iter()
         .map(|delete| {
             let file_format = match delete.file_format {
-                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
                     DeleteVisibilityDeleteFileFormat::Parquet
                 }
-                crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
                     DeleteVisibilityDeleteFileFormat::Puffin
                 }
             };
             let file_content = match delete.file_content {
-                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
                     DeleteVisibilityDeleteFileContent::Position
                 }
-                crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
                     DeleteVisibilityDeleteFileContent::Equality
                 }
             };
@@ -704,10 +690,10 @@ pub(crate) struct LineagePlan {
 /// `None` for any other operation; passing `None` for REPLACE
 /// produces a `ReplaceValidationFailed` error.
 fn classify_snapshot(
-    snapshot: &iceberg::spec::Snapshot,
-    parent: Option<&iceberg::spec::Snapshot>,
+    snapshot: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
+    parent: Option<&novarocks_connector_iceberg::iceberg::spec::Snapshot>,
 ) -> Result<Option<LineageAction>, ChangeError> {
-    use iceberg::spec::Operation;
+    use novarocks_connector_iceberg::iceberg::spec::Operation;
     let snapshot_id = snapshot.snapshot_id();
     match &snapshot.summary().operation {
         Operation::Append => Ok(Some(LineageAction::CollectInserts { snapshot_id })),
@@ -732,8 +718,8 @@ fn classify_snapshot(
 /// explicit `0/0` data-file counters. Both forms must leave `total-records`
 /// unchanged and keep the same schema id. Anything else is rejected.
 fn validate_replace_snapshot(
-    snapshot: &iceberg::spec::Snapshot,
-    parent: &iceberg::spec::Snapshot,
+    snapshot: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
+    parent: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
 ) -> Result<(), ChangeError> {
     let snap_props = &snapshot.summary().additional_properties;
     let parent_props = &parent.summary().additional_properties;
@@ -795,7 +781,7 @@ fn validate_replace_snapshot(
 }
 
 fn required_replace_summary_i64(
-    snapshot: &iceberg::spec::Snapshot,
+    snapshot: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
     key: &'static str,
 ) -> Result<i64, ChangeError> {
     let value = snapshot
@@ -827,7 +813,7 @@ fn required_replace_summary_i64(
 /// - `UnsupportedOperation` / `ReplaceValidationFailed` propagated from
 ///   `classify_snapshot`.
 pub(crate) fn classify_lineage(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
 ) -> Result<LineagePlan, ChangeError> {
@@ -904,7 +890,7 @@ pub(crate) fn classify_lineage(
 /// The `_pk_columns` parameter is reserved for future delete-side row-id
 /// computation; snapshot lineage planning itself does not need it yet.
 pub(crate) fn plan_changes(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     previous_snapshot_id: i64,
     to_snapshot_id: Option<i64>,
     _pk_columns: &[String],
@@ -964,7 +950,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
     deletes: &[PositionDeleteRef],
     base_data_file_lineage: &std::collections::HashMap<
         String,
-        crate::connector::iceberg::delta::BaseDataFileLineage,
+        novarocks_connector_iceberg::delta::BaseDataFileLineage,
     >,
     suppressed_data_files: &std::collections::HashSet<String>,
     previously_deleted_positions_per_file: &std::collections::HashMap<
@@ -1001,7 +987,7 @@ pub(crate) fn scan_position_delete_rows_for_targets(
 /// downstream codegen tuple descriptor's slot count matches.
 #[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     delete: &EqualityDeleteRef,
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1018,7 +1004,7 @@ pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage(
 /// `scan_equality_delete_rows_for_one_with_v3_lineage`.
 #[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_one_with_v3_lineage_at(
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     delete: &EqualityDeleteRef,
     snapshot_id: i64,
     factory: &novarocks_fs::FsAccessHandle,
@@ -1093,7 +1079,7 @@ pub(crate) fn scan_equality_delete_rows_for_targets_with_v3_lineage(
 pub(crate) fn scan_one_added_data_file(
     path: &str,
     size: i64,
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     let factory = build_factory_for_table(base_table, object_store_config)?;
@@ -1132,7 +1118,7 @@ pub(crate) fn scan_one_added_data_file_with_factory(
 /// descriptor's slot count matches.
 #[allow(dead_code)]
 pub(crate) fn scan_one_deleted_data_file(
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     deleted_file: &DeletedDataFileRef,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     previous_delete_visibility: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -1166,7 +1152,7 @@ pub(crate) fn scan_one_deleted_data_file_with_factory(
 
 #[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_table(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1186,7 +1172,7 @@ pub(crate) fn scan_equality_delete_rows_for_table(
 }
 
 pub(crate) fn scan_equality_delete_rows_for_table_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     snapshot_id: i64,
     factory: &novarocks_fs::FsAccessHandle,
@@ -1208,7 +1194,7 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
 }
 
 fn scan_equality_delete_rows_for_snapshot(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1226,7 +1212,7 @@ fn scan_equality_delete_rows_for_snapshot(
             &delete_specs,
             factory,
         )?;
-        for data_file in crate::connector::iceberg::read::data_files_matching_delete(
+        for data_file in novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         ) {
@@ -1257,7 +1243,7 @@ fn scan_equality_delete_rows_for_snapshot(
 /// IVM-A1 variant of `scan_equality_delete_rows_for_table` that emits the
 /// full Iceberg v3 row-lineage virtual column set on each batch.
 pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1280,7 +1266,7 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage(
 /// `scan_equality_delete_rows_for_table_with_v3_lineage`.
 #[allow(dead_code)]
 pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     snapshot_id: i64,
     factory: &novarocks_fs::FsAccessHandle,
@@ -1302,7 +1288,7 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
 }
 
 fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1320,7 +1306,7 @@ fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
             &delete_specs,
             factory,
         )?;
-        for data_file in crate::connector::iceberg::read::data_files_matching_delete(
+        for data_file in novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         ) {
@@ -1530,10 +1516,10 @@ where
 /// so the operator can synthesize the four v3 row-lineage virtual columns
 /// (`_file`, `_pos`, `_row_id`, `_last_updated_sequence_number`).
 pub(crate) fn base_data_file_lineage_index_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let read_snapshot =
@@ -1551,19 +1537,19 @@ pub(crate) fn base_data_file_lineage_index_at(
 /// first_row_id is faithfully readable via iceberg-rust per-manifest
 /// inheritance.
 pub(crate) fn previous_snapshot_data_file_lineage_index(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     base_data_file_lineage_index_at(table, snapshot_id)
 }
 
 fn build_data_file_lineage_index_from_snapshot(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
 ) -> Result<
-    std::collections::HashMap<String, crate::connector::iceberg::delta::BaseDataFileLineage>,
+    std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
 > {
     let mut out = std::collections::HashMap::new();
@@ -1582,7 +1568,7 @@ fn build_data_file_lineage_index_from_snapshot(
         })?;
         out.insert(
             file.path.clone(),
-            crate::connector::iceberg::delta::BaseDataFileLineage {
+            novarocks_connector_iceberg::delta::BaseDataFileLineage {
                 first_row_id,
                 data_sequence_number,
             },
@@ -1593,11 +1579,11 @@ fn build_data_file_lineage_index_from_snapshot(
 
 fn equality_change_to_read_delete(
     delete: &EqualityDeleteRef,
-) -> crate::connector::iceberg::read::IcebergReadDeleteFile {
-    crate::connector::iceberg::read::IcebergReadDeleteFile {
+) -> novarocks_connector_iceberg::read_model::IcebergReadDeleteFile {
+    novarocks_connector_iceberg::read_model::IcebergReadDeleteFile {
         path: delete.delete_file_path.clone(),
-        file_format: crate::connector::iceberg::read::IcebergReadDeleteFormat::Parquet,
-        kind: crate::connector::iceberg::read::IcebergReadDeleteKind::Equality {
+        file_format: novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Parquet,
+        kind: novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Equality {
             equality_field_ids: delete.equality_ids.clone(),
         },
         length: Some(delete.delete_file_size),
@@ -1614,18 +1600,18 @@ fn equality_change_to_delete_spec(
     delete: &EqualityDeleteRef,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
     expected_object_store_bucket: Option<&str>,
-) -> Result<crate::connector::iceberg::delete_file::IcebergDeleteFileSpec, String> {
+) -> Result<novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec, String> {
     Ok(
-        crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
+        novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec {
             path: normalize_delete_projection_path(
                 &delete.delete_file_path,
                 object_store_config,
                 expected_object_store_bucket,
             )
             .map_err(|e| e.to_string())?,
-            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet,
             file_content:
-                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
+                novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: if delete.delete_file_size > 0 {
                 Some(delete.delete_file_size as u64)
             } else {
@@ -1644,7 +1630,7 @@ fn equality_change_to_delete_spec(
 /// `scan_deleted_data_file_rows_with_visibility_and_v3_lineage` variant
 /// instead.
 pub(crate) fn scan_deleted_data_file_rows(
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     deleted_data_files: &[DeletedDataFileRef],
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
@@ -1973,7 +1959,7 @@ pub(crate) fn expected_object_store_bucket_from_location(
 }
 
 pub(crate) fn expected_object_store_bucket_for_table(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Option<String>, String> {
     expected_object_store_bucket_from_location(table.metadata().location())
 }
@@ -1983,7 +1969,7 @@ pub(crate) fn expected_object_store_bucket_for_table(
 /// outside delta scan still pass a loaded table; delta scan uses
 /// `build_factory_for_table_location` to avoid runtime TableMetadata handles.
 pub(crate) fn build_factory_for_table(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<novarocks_fs::FsAccessHandle, String> {
     build_factory_for_table_location(table.metadata().location(), object_store_config)
@@ -2050,8 +2036,8 @@ pub(crate) fn normalize_delete_projection_path(
 /// deleted data files. Order of the returned vectors matches the lineage
 /// order in `actions`.
 async fn collect_files(
-    metadata: &iceberg::spec::TableMetadata,
-    file_io: &iceberg::io::FileIO,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     actions: &[LineageAction],
 ) -> Result<
     (
@@ -2142,13 +2128,15 @@ async fn collect_files(
 }
 
 async fn collect_added_data_files_for_manifest_list(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
-    file_io: &iceberg::io::FileIO,
-    manifest_list: &iceberg::spec::ManifestList,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
+    manifest_list: &novarocks_connector_iceberg::iceberg::spec::ManifestList,
     inserts: &mut Vec<DataFileRef>,
 ) -> Result<(), ChangeError> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, ManifestContentType, ManifestStatus,
+    };
 
     for manifest_file in manifest_list.entries() {
         if manifest_file.content != ManifestContentType::Data {
@@ -2227,13 +2215,15 @@ async fn collect_added_data_files_for_manifest_list(
 }
 
 async fn collect_deleted_data_files_for_manifest_list(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
-    file_io: &iceberg::io::FileIO,
-    manifest_list: &iceberg::spec::ManifestList,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
+    manifest_list: &novarocks_connector_iceberg::iceberg::spec::ManifestList,
     deleted_data_files: &mut Vec<DeletedDataFileRef>,
 ) -> Result<(), ChangeError> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, ManifestContentType, ManifestStatus,
+    };
 
     for manifest_file in manifest_list.entries() {
         if manifest_file.content != ManifestContentType::Data {
@@ -2290,14 +2280,16 @@ async fn collect_deleted_data_files_for_manifest_list(
 }
 
 async fn collect_added_delete_files_for_manifest_list(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
-    file_io: &iceberg::io::FileIO,
-    manifest_list: &iceberg::spec::ManifestList,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
+    manifest_list: &novarocks_connector_iceberg::iceberg::spec::ManifestList,
     deletes: &mut Vec<PositionDeleteRef>,
     equality_deletes: &mut Vec<EqualityDeleteRef>,
 ) -> Result<(), ChangeError> {
-    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFileFormat, ManifestContentType, ManifestStatus,
+    };
 
     for manifest_file in manifest_list.entries() {
         if manifest_file.content != ManifestContentType::Deletes {
@@ -2447,7 +2439,7 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::spec::{Operation, Snapshot, Summary};
+    use novarocks_connector_iceberg::iceberg::spec::{Operation, Snapshot, Summary};
     use parquet::arrow::ArrowWriter;
 
     use super::{
@@ -2463,8 +2455,9 @@ mod tests {
         IcebergCatalogEntry, block_on_iceberg, build_catalog_entry, build_hadoop_catalog,
         create_namespace, create_table, insert_rows, load_table,
     };
+    use crate::connector::iceberg::commit::CommitOpKind;
     use crate::connector::iceberg::commit::{
-        CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
+        CommitCtx, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
     };
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
     use crate::sql::{Literal, TableColumnDef};
@@ -2495,19 +2488,21 @@ mod tests {
         let mut equality_targets = HashMap::new();
         equality_targets.insert(
             "eq-delete.parquet".to_string(),
-            vec![crate::connector::iceberg::delta::EqualityDeleteTargetData {
-                data_file_path: "data.parquet".to_string(),
-                data_file_size: 456,
-                data_file_first_row_id: Some(1000),
-                data_file_sequence_number: Some(6),
-            }],
+            vec![
+                novarocks_connector_iceberg::delta::EqualityDeleteTargetData {
+                    data_file_path: "data.parquet".to_string(),
+                    data_file_size: 456,
+                    data_file_first_row_id: Some(1000),
+                    data_file_sequence_number: Some(6),
+                },
+            ],
         );
 
         let files =
             delta_source_files_from_change_batch_with_equality_targets(&batch, &equality_targets)
                 .expect("delta source files");
         assert_eq!(files.len(), 1);
-        let crate::connector::iceberg::delta::DeltaSourceRole::EqualityDelete {
+        let novarocks_connector_iceberg::delta::DeltaSourceRole::EqualityDelete {
             equality_field_ids,
             targets,
         } = &files[0].role
@@ -2629,11 +2624,11 @@ mod tests {
         let factory = novarocks_fs::FsAccessResolver::new()
             .resolve_location(dir.path().join("__binding__").to_string_lossy(), None)
             .expect("access");
-        let spec = crate::connector::iceberg::delete_file::IcebergDeleteFileSpec {
+        let spec = novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec {
             path: "eq.parquet".to_string(),
-            file_format: crate::connector::iceberg::delete_file::IcebergFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet,
             file_content:
-                crate::connector::iceberg::delete_file::IcebergFileContent::EqualityDeletes,
+                novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes,
             length: Some(std::fs::metadata(&equality_path).expect("metadata").len()),
             content_offset: None,
             content_size_in_bytes: None,
@@ -2699,7 +2694,9 @@ mod tests {
 
     #[test]
     fn change_partition_value_distinguishes_null_from_unsupported() {
-        use iceberg::spec::{Literal as IcebergLiteral, PrimitiveLiteral, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            Literal as IcebergLiteral, PrimitiveLiteral, Struct,
+        };
 
         assert_eq!(
             super::change_partition_value(None),
@@ -2724,7 +2721,7 @@ mod tests {
             delete_file_size: 20,
             record_count: Some(1),
             referenced_data_file: Some("s3://bucket/t/data.parquet".to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: vec![super::ChangePartitionFieldValue {
@@ -3490,7 +3487,9 @@ mod tests {
         .expect("write data file");
 
         let metadata = loaded.table.metadata();
-        let table_ident = iceberg::TableIdent::from_strs(["ns", "orders"]).expect("ident");
+        let table_ident =
+            novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["ns", "orders"])
+                .expect("ident");
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 CommitOpKind::Overwrite,
@@ -3786,7 +3785,7 @@ mod tests {
             .build()
             .expect("pruned metadata")
             .metadata;
-        let pruned_table = iceberg::table::Table::builder()
+        let pruned_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(loaded.table.file_io().clone())
             .metadata(std::sync::Arc::new(pruned_metadata))
             .identifier(loaded.table.identifier().clone())
@@ -3808,7 +3807,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -3823,7 +3822,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: Some(0),
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -3839,7 +3838,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: Some(120),
             partition_values: Vec::new(),
@@ -3855,7 +3854,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: Some("/tmp/data.parquet".to_string()),
-            file_format: iceberg::spec::DataFileFormat::Puffin,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin,
             content_offset: Some(4),
             content_size_in_bytes: Some(120),
             partition_values: Vec::new(),
@@ -3870,7 +3869,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: Some("/tmp/data.parquet".to_string()),
-            file_format: iceberg::spec::DataFileFormat::Puffin,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin,
             content_offset: None,
             content_size_in_bytes: Some(120),
             partition_values: Vec::new(),
@@ -3886,7 +3885,7 @@ mod tests {
             delete_file_size: 0,
             record_count: None,
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Puffin,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin,
             content_offset: Some(4),
             content_size_in_bytes: Some(120),
             partition_values: Vec::new(),
@@ -3938,7 +3937,7 @@ mod tests {
             .build()
             .expect("pruned metadata")
             .metadata;
-        let pruned_table = iceberg::table::Table::builder()
+        let pruned_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(loaded.table.file_io().clone())
             .metadata(std::sync::Arc::new(pruned_metadata))
             .identifier(loaded.table.identifier().clone())

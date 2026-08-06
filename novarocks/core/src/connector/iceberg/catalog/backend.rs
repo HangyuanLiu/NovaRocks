@@ -20,14 +20,14 @@
 use std::sync::{Arc, RwLock};
 
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
-};
 use crate::mv::persistence::schema::{APPLY_KEY_COLUMN_PROPERTY, HIDDEN_COLUMNS_PROPERTY};
 #[cfg(test)]
 use crate::sql::planner::table::{ScanSource, TableDef};
 #[cfg(test)]
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+};
 
 #[cfg(test)]
 use super::registry::load_table as reg_load_table;
@@ -52,7 +52,7 @@ pub(crate) fn build_iceberg_table_def_with_files(
         table_name,
         loaded,
         data_files,
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
     )
 }
 
@@ -161,7 +161,7 @@ pub(crate) fn build_iceberg_table_def_for_delta_scan(
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = empty_iceberg_scan_source(
         iceberg_table_info.clone(),
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles,
     );
     let mut iceberg_row_lineage_metadata_columns = iceberg_row_lineage_metadata_columns();
     iceberg_row_lineage_metadata_columns.push(ColumnDef {
@@ -196,7 +196,8 @@ pub(crate) fn build_iceberg_schema_table_def_from_loaded(
         Vec::new(),
         IcebergTableDefOptions {
             mode: IcebergTableDefMode::SchemaOnly,
-            binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            binding:
+                novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         },
     )
 }
@@ -212,7 +213,7 @@ enum IcebergTableDefMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IcebergTableDefOptions {
     mode: IcebergTableDefMode,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 }
 
 #[cfg(test)]
@@ -223,7 +224,7 @@ fn build_iceberg_table_def_with_data_files(
     table_name: &str,
     loaded: IcebergLoadedTable,
     data_files: Vec<super::registry::DataFileWithStats>,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> Result<TableDef, String> {
     build_iceberg_table_def_with_data_files_impl(
         entry,
@@ -263,14 +264,14 @@ fn build_iceberg_table_def_with_data_files_impl(
     let iceberg_table_info =
         build_iceberg_table_info(catalog_name, namespace, table_name, &loaded, schema)?;
     let source = match options.binding {
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::Data {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                 },
             )
         }
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
@@ -324,7 +325,7 @@ fn build_iceberg_table_def_with_data_files_impl(
 
 #[cfg(test)]
 fn hide_novarocks_mv_internal_columns(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     columns: Vec<ColumnDef>,
 ) -> Result<Vec<ColumnDef>, String> {
     hide_novarocks_mv_internal_columns_by_property(
@@ -386,7 +387,7 @@ fn hide_novarocks_mv_internal_columns_by_property(
 /// `SELECT *` would omit, and react accordingly. An empty result means the
 /// table has no hidden internal columns (plain Iceberg table or non-MV table).
 pub(crate) fn hidden_internal_column_names_from_metadata(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
 ) -> Vec<String> {
     hidden_internal_column_names(
         metadata
@@ -472,11 +473,15 @@ fn build_iceberg_table_info(
     })
 }
 
-pub(crate) fn iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+pub(crate) fn iceberg_schema_def_for_codegen(
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> IcebergSchemaDef {
     iceberg_schema_def(schema)
 }
 
-fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+fn iceberg_schema_def(
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> IcebergSchemaDef {
     IcebergSchemaDef {
         fields: schema
             .as_struct()
@@ -487,7 +492,9 @@ fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
     }
 }
 
-fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
+fn iceberg_field_def(
+    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
+) -> IcebergSchemaFieldDef {
     let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
         literal
             .clone()
@@ -513,21 +520,23 @@ fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDe
     }
 }
 
-fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef> {
+fn iceberg_type_children(
+    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
+) -> Vec<IcebergSchemaFieldDef> {
     match ty {
-        iceberg::spec::Type::Struct(struct_ty) => struct_ty
+        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
             .fields()
             .iter()
             .map(|field| iceberg_field_def(field.as_ref()))
             .collect(),
-        iceberg::spec::Type::List(list_ty) => {
+        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
             vec![iceberg_field_def(list_ty.element_field.as_ref())]
         }
-        iceberg::spec::Type::Map(map_ty) => vec![
+        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
             iceberg_field_def(map_ty.key_field.as_ref()),
             iceberg_field_def(map_ty.value_field.as_ref()),
         ],
-        iceberg::spec::Type::Primitive(_) => vec![],
+        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
     }
 }
 
@@ -535,8 +544,11 @@ fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef>
 /// `write.row-lineage=true`, meaning per-row `_row_id` and
 /// `_last_updated_sequence_number` metadata columns are available.
 #[cfg(test)]
-fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
-    let v3 = matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3);
+fn is_v3_row_lineage(metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata) -> bool {
+    let v3 = matches!(
+        metadata.format_version(),
+        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
+    );
     let lineage = metadata
         .properties()
         .get("write.row-lineage")
@@ -559,8 +571,13 @@ fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
 /// only synthesize row-lineage metadata when every bound file carries row IDs.
 /// OPTIMIZE preserves row-lineage whenever the writer would emit it on a fresh
 /// INSERT, which follows the V3-default semantics modelled here.
-pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bool {
-    if !matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3) {
+pub(crate) fn row_lineage_enabled(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> bool {
+    if !matches!(
+        metadata.format_version(),
+        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
+    ) {
         return false;
     }
     match metadata.properties().get("write.row-lineage") {
@@ -578,17 +595,17 @@ pub(crate) fn row_lineage_enabled(metadata: &iceberg::spec::TableMetadata) -> bo
 #[cfg(test)]
 fn empty_iceberg_scan_source(
     _table: IcebergTableInfo,
-    binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+    binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
 ) -> ScanSource {
     match binding {
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::Data {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                 },
             )
         }
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles => {
             crate::sql::planner::table::test_sql_scan_source(
                 crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                     version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(0),
@@ -604,12 +621,12 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, ListType, MapType, NestedField, PartitionSpec, PrimitiveType, Schema,
         SortOrder, TableMetadataBuilder, Type,
     };
-    use iceberg::table::Table;
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::table::Table;
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::connector::iceberg::catalog::registry::DataFileWithStats;
     use crate::sql::parser::ast::TableColumnDef;
@@ -1075,7 +1092,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1091,7 +1108,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file()],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1108,7 +1125,7 @@ mod tests {
             "t",
             v3_row_lineage_loaded_table(),
             vec![test_data_file_without_first_row_id()],
-            crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+            novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
         )
         .expect("table def");
 
@@ -1151,9 +1168,13 @@ mod tests {
         let struct_field = Arc::new(NestedField::required(
             2,
             "payload",
-            Type::Struct(iceberg::spec::StructType::new(vec![Arc::new(
-                NestedField::optional(3, "inner", Type::Primitive(PrimitiveType::String)),
-            )])),
+            Type::Struct(novarocks_connector_iceberg::iceberg::spec::StructType::new(
+                vec![Arc::new(NestedField::optional(
+                    3,
+                    "inner",
+                    Type::Primitive(PrimitiveType::String),
+                ))],
+            )),
         ));
         let list_field = Arc::new(NestedField::optional(
             4,

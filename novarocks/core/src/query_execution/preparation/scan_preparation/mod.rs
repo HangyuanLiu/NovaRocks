@@ -508,11 +508,11 @@ fn resolve_frozen_mv_target_scan(
 /// binding facts.  This must not consult a catalog, a provider, or a current
 /// connector generation.
 fn filter_frozen_mv_target_state_files(
-    files: Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
+    files: Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
     filter: &crate::mv::model::TargetPartitionFilter,
     contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,
     node_id: i32,
-) -> Result<Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>, String> {
+) -> Result<Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>, String> {
     let crate::mv::model::TargetPartitionFilter::AllowList(allow_list) = filter else {
         return Ok(files);
     };
@@ -539,7 +539,7 @@ fn filter_frozen_mv_target_state_files(
 
 fn frozen_mv_target_partition_key(
     contract: &crate::mv::persistence::schema::MvPartitionContract,
-    file: &crate::connector::iceberg::scan_model::IcebergDataFileInfo,
+    file: &novarocks_connector_iceberg::scan_model::IcebergDataFileInfo,
 ) -> Result<crate::mv::model::MvPartitionKey, String> {
     let spec_id = file
         .partition_spec_id
@@ -585,9 +585,9 @@ fn frozen_mv_target_partition_key(
 }
 
 fn frozen_mv_target_partition_value(
-    value: &crate::connector::iceberg::scan_model::IcebergPartitionFieldValue,
+    value: &novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue,
 ) -> Result<crate::mv::model::MvPartitionValue, String> {
-    use crate::connector::iceberg::scan_model::IcebergPartitionValue;
+    use novarocks_connector_iceberg::scan_model::IcebergPartitionValue;
 
     match &value.value {
         None => Ok(crate::mv::model::MvPartitionValue::Null),
@@ -735,7 +735,7 @@ fn reject_target_equality_deletes(
     if files.files.iter().any(|file| {
         file.delete_files.iter().any(|delete| {
             delete.file_content
-                == crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
+                == novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality
         })
     }) {
         return Err(format!(

@@ -89,12 +89,12 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
             logical_type: None,
         })
         .collect::<Vec<_>>();
-    let schema = crate::connector::iceberg::scan_model::IcebergSchemaDef {
+    let schema = novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
         fields: names
             .iter()
             .enumerate()
             .map(
-                |(idx, name)| crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                |(idx, name)| novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                     field_id: i32::try_from(idx + 1).expect("field id"),
                     name: (*name).to_string(),
                     initial_default: None,
@@ -106,7 +106,7 @@ fn iceberg_scan_table_for_columns(names: &[&str]) -> crate::sql::planner::table:
             )
             .collect(),
     };
-    let _iceberg_table = crate::connector::iceberg::scan_model::IcebergTableInfo {
+    let _iceberg_table = novarocks_connector_iceberg::scan_model::IcebergTableInfo {
         catalog: "ice".to_string(),
         namespace: "db".to_string(),
         table: "sc2".to_string(),

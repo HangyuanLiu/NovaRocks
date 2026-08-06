@@ -18,8 +18,8 @@
 #[cfg(test)]
 use crate::sql::planner::vocabulary::ApplyKeySource;
 
-use crate::connector::iceberg::commit::mv_provenance::ProvenanceBase;
 use crate::mv::persistence::schema::MvSchemaContract;
+use novarocks_connector_iceberg::commit::ProvenanceBase;
 
 /// Assert the lake descriptor's schema contract matches the store's contract.
 /// Fail-loud: the descriptor is the authoritative home (W2); a missing or
@@ -85,7 +85,9 @@ mod tests {
     use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {

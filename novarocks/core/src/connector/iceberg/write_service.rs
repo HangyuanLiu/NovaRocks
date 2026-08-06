@@ -24,9 +24,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use iceberg::Catalog;
-use iceberg::spec::TableMetadata;
-use iceberg::{NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorStagedReport, ConnectorWriteAbortRequest, ConnectorWriteCohortId,
@@ -81,9 +81,8 @@ use sha2::{Digest, Sha256};
 
 use super::change_stream_routing::ChangeStreamWriterCommitPlan;
 use super::commit::{
-    CleanupAttempt, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    RecoveryEvidence, RunInput, SelectedRewriteFiles, SelectedRewriteKind, WrittenFile,
-    run_iceberg_commit,
+    CleanupAttempt, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
+    RecoveryEvidence, RunInput, SelectedRewriteFiles, SelectedRewriteKind, run_iceberg_commit,
 };
 use super::report::IcebergWriterReport;
 use super::sink_plan::IcebergSinkPlan;
@@ -95,13 +94,15 @@ use super::write_control::{
     IcebergFirstRefreshWritePlanPayloadV2, IcebergWriteControlBackend, IcebergWriteControlPlan,
     IcebergWritePlanPayloadV1, IcebergWriteReconcileEvidenceV1,
 };
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::AbortLog;
 
 /// A staged-action build can create manifest artifacts before it discovers a
 /// definite failure.  Keep the exact abort register with the typed error so
 /// the staged-create owner never loses the cleanup handle.
 pub(crate) struct StagedCreateActionBuildFailure {
     pub(crate) error: CommitServiceError,
-    pub(crate) abort_handle: Arc<super::commit::AbortLog>,
+    pub(crate) abort_handle: Arc<AbortLog>,
 }
 
 /// FE-local operation table for write services created by a DML owner before
@@ -225,7 +226,7 @@ impl IcebergWriteServiceRegistry {
     pub(crate) fn build_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
         self.resolve(completion.sealed().operation_id())
             .map_err(|error| StagedCreateActionBuildFailure {
@@ -238,7 +239,7 @@ impl IcebergWriteServiceRegistry {
     pub(crate) fn abort_staged_create_completion(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         self.resolve(completion.sealed().operation_id())
             .map_err(ConnectorError::with_retryable_before_progress)?
@@ -314,7 +315,7 @@ impl IcebergWriteControlBackend for RegisteredIcebergWriteControlBackend {
     fn build_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
         self.services
             .build_staged_create_action(completion, abort_handle)
@@ -323,7 +324,7 @@ impl IcebergWriteControlBackend for RegisteredIcebergWriteControlBackend {
     fn abort_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         self.services
             .abort_staged_create_completion(completion, abort_handle)
@@ -423,7 +424,7 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     fn build_staged_create_action(
         &self,
         _completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
         Err(StagedCreateActionBuildFailure {
             error: CommitServiceError::invalid_input(
@@ -437,7 +438,7 @@ pub(crate) trait IcebergWriteReportCommitter: Send + Sync {
     fn abort_staged_create_action(
         &self,
         _completion: &ConnectorWriteOperationCompletion,
-        _abort_handle: &Arc<super::commit::AbortLog>,
+        _abort_handle: &Arc<AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
@@ -618,7 +619,7 @@ impl IcebergWriteReportCommitter for IcebergWriteCommitExecutor {
     fn build_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
         self.build_staged_create_action(completion, abort_handle)
     }
@@ -626,7 +627,7 @@ impl IcebergWriteReportCommitter for IcebergWriteCommitExecutor {
     fn abort_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         self.abort_staged_create_action(completion, abort_handle)
     }
@@ -925,7 +926,8 @@ impl IcebergDistributedRewriteReportCommitter {
             match cohort_kind {
                 SelectedRewriteKind::Data => {
                     if files.iter().any(|file| {
-                        file.content != iceberg::spec::DataContentType::Data
+                        file.content
+                            != novarocks_connector_iceberg::iceberg::spec::DataContentType::Data
                             || !output_paths.insert(file.path.clone())
                     }) {
                         return Err(CommitServiceError::invalid_input(
@@ -938,8 +940,8 @@ impl IcebergDistributedRewriteReportCommitter {
                     let references = files
                         .iter()
                         .map(|file| {
-                            if file.content != iceberg::spec::DataContentType::PositionDeletes
-                                || file.format != iceberg::spec::DataFileFormat::Puffin
+                            if file.content != novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes
+                                || file.format != novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin
                                 || !output_paths.insert(file.path.clone())
                             {
                                 return Err(CommitServiceError::invalid_input(
@@ -1195,7 +1197,7 @@ impl IcebergCowWriteReportCommitter {
                         .unwrap_or_else(|error| CleanupAttempt::completed(vec![error]));
                     CommitServiceError::known_uncommitted(message, cleanup)
                 })?;
-            if file.content != iceberg::spec::DataContentType::Data {
+            if file.content != novarocks_connector_iceberg::iceberg::spec::DataContentType::Data {
                 return Err(CommitServiceError::invalid_input(format!(
                     "Iceberg COW cohort wrote non-data artifact {}",
                     file.path
@@ -1965,7 +1967,7 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
     fn build_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<super::commit::StagedFastAppendAction, StagedCreateActionBuildFailure> {
         self.context
             .validate_sealed(completion.sealed())
@@ -1981,7 +1983,7 @@ impl IcebergWriteControlBackend for IcebergWriteControlService {
     fn abort_staged_create_action(
         &self,
         completion: &ConnectorWriteOperationCompletion,
-        abort_handle: &Arc<super::commit::AbortLog>,
+        abort_handle: &Arc<AbortLog>,
     ) -> Result<ExternalMutationFinalization, ConnectorError> {
         self.context
             .commit_executor
@@ -2006,7 +2008,7 @@ mod tests {
 
     use arrow::datatypes::Schema;
     use bytes::Bytes;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
         Schema as IcebergSchema, TableMetadataBuilder, Type,
     };
@@ -2021,10 +2023,10 @@ mod tests {
     use parquet::basic::Compression;
 
     use super::*;
-    use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
     use crate::connector::iceberg::report::{IcebergPartitionReport, IcebergWrittenFileReport};
     use crate::connector::iceberg::sink_plan::IcebergSinkPlan;
     use crate::connector::iceberg::write_contract::staged_report_from_iceberg_reports;
+    use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {
@@ -2134,7 +2136,7 @@ mod tests {
         fn recovery_evidence(&self) -> RecoveryEvidence {
             RecoveryEvidence {
                 table_ident: "db.t".to_string(),
-                op_kind: super::super::commit::CommitOpKind::FastAppend,
+                op_kind: CommitOpKind::FastAppend,
                 base_snapshot_id: None,
                 base_sequence_number: 0,
                 staging_dir: "file:///warehouse/db/t/data".to_string(),
@@ -2151,7 +2153,7 @@ mod tests {
                 .build()
                 .expect("schema"),
             PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             "file:///warehouse/db/t".to_string(),
             FormatVersion::V2,
             HashMap::new(),
@@ -2305,7 +2307,7 @@ mod tests {
                     partition_path: String::new(),
                     null_fingerprint: String::new(),
                     partition_spec_id: 0,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
                 split_offsets: None,
                 column_stats: None,
@@ -2327,7 +2329,7 @@ mod tests {
             path: path.to_string(),
             format: DataFileFormat::Parquet,
             content: DataContentType::Data,
-            partition_values: iceberg::spec::Struct::empty(),
+            partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             partition_spec_id: 0,
             record_count: 1,
             file_size_in_bytes: 2,

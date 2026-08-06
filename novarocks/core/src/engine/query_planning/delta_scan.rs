@@ -24,8 +24,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::connector::iceberg::catalog::IcebergCatalogEntry;
-use crate::connector::iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide};
-use crate::connector::iceberg::scan_model::IcebergTableInfo;
 use crate::engine::query_planning::bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{
     IcebergDeltaScanRuntimePlan, ResolvedIcebergDeltaScan, ResolvedScanExecution,
@@ -33,6 +31,8 @@ use crate::query_execution::preparation::scan::{
 };
 use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::table::{ScanSource, SqlScanKind};
+use novarocks_connector_iceberg::delta::{DeltaDataColumn, DeltaScanDeleteSide};
+use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
 
 /// Freeze every physical input for one delta snapshot window while admission
 /// still holds the exact table object.  The returned value contains no catalog
@@ -41,7 +41,7 @@ use crate::sql::planner::table::{ScanSource, SqlScanKind};
 pub(crate) fn freeze_iceberg_delta_runtime_plan(
     table: &IcebergTableInfo,
     entry: &IcebergCatalogEntry,
-    loaded: &iceberg::table::Table,
+    loaded: &novarocks_connector_iceberg::iceberg::table::Table,
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> Result<IcebergDeltaScanRuntimePlan, String> {

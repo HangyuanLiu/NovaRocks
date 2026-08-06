@@ -154,8 +154,6 @@ mod tests {
     use super::super::runtime_filter::NativeRuntimeFilterDecodeLedger;
     use crate::common::ids::SlotId;
     use crate::connector::ConnectorRegistry;
-    use crate::connector::iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
-    use crate::connector::iceberg::delta::DeltaSourceRole;
     use crate::connector::iceberg::file_pruning::IcebergFileNullState;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNodeKind;
@@ -165,6 +163,8 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime_filter::model::contract::NullSemantics;
     use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
+    use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+    use novarocks_connector_iceberg::delta::DeltaSourceRole;
     use novarocks_protocol::{common, expr, novarocks, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

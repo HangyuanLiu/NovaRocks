@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connector::iceberg::commit::{
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError,
-};
+use crate::connector::iceberg::commit::{CleanupAttempt, CommitServiceError};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::meta::repository::iceberg_operation::{
     IcebergCleanupOutcomeRecord, IcebergCommitOutcomeRecord, IcebergOperationFailureKind,
     IcebergOperationFailureRecord, IcebergOperationNextAction, IcebergOperationState,
@@ -161,9 +160,8 @@ fn recovery_evidence_record_from_evidence(
 
 #[cfg(test)]
 mod tests {
-    use crate::connector::iceberg::commit::{
-        CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, RecoveryEvidence,
-    };
+    use crate::connector::iceberg::commit::{CleanupAttempt, CommitServiceError, RecoveryEvidence};
+    use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
     use crate::meta::repository::iceberg_operation::{
         IcebergOperationFailureKind, IcebergOperationNextAction, IcebergOperationState,
     };

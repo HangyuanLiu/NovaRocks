@@ -25,14 +25,14 @@ use novarocks_catalog::identifier::TableIdentity;
 const ICEBERG_ROW_LINEAGE_PROP: &str = "write.row-lineage";
 
 pub(crate) fn current_iceberg_table_view(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> CurrentIcebergTableView<'_> {
     current_iceberg_table_view_with_schema(table, table.metadata().current_schema())
 }
 
 pub(crate) fn current_iceberg_table_view_with_schema<'a>(
-    table: &'a iceberg::table::Table,
-    schema: &'a iceberg::spec::Schema,
+    table: &'a novarocks_connector_iceberg::iceberg::table::Table,
+    schema: &'a novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> CurrentIcebergTableView<'a> {
     let metadata = table.metadata();
     CurrentIcebergTableView {
@@ -46,8 +46,8 @@ pub(crate) fn current_iceberg_table_view_with_schema<'a>(
 
 pub(crate) fn validate_current_schema_contract(
     contract: &MvSchemaContract,
-    current_base_table: &iceberg::table::Table,
-    current_target_table: &iceberg::table::Table,
+    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> ContractDecision {
     validate_current_schema_contract_with_base_schema(
         contract,
@@ -59,9 +59,9 @@ pub(crate) fn validate_current_schema_contract(
 
 pub(crate) fn validate_current_schema_contract_with_base_schema(
     contract: &MvSchemaContract,
-    current_base_table: &iceberg::table::Table,
-    base_schema: &iceberg::spec::Schema,
-    current_target_table: &iceberg::table::Table,
+    current_base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> ContractDecision {
     let base_view = current_iceberg_table_view_with_schema(current_base_table, base_schema);
     let target_view = current_iceberg_table_view(current_target_table);
@@ -70,8 +70,11 @@ pub(crate) fn validate_current_schema_contract_with_base_schema(
 
 pub(crate) fn validate_current_join_schema_contract(
     contract: &MvSchemaContract,
-    bases: &[(&TableIdentity, &iceberg::table::Table); 2],
-    current_target_table: &iceberg::table::Table,
+    bases: &[(
+        &TableIdentity,
+        &novarocks_connector_iceberg::iceberg::table::Table,
+    ); 2],
+    current_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<JoinContractDecision, JoinSchemaValidationError> {
     let base_fqns = [bases[0].0.fqn(), bases[1].0.fqn()];
     let base_views = [

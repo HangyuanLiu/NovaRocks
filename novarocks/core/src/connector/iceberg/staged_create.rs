@@ -18,8 +18,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::connector::iceberg::commit::CommitOpKind;
 use bytes::Bytes;
-use iceberg::{Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::commit::AbortLog;
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate,
+};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
     ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
@@ -76,7 +80,7 @@ struct StagedWrite {
     completion: ConnectorWriteOperationCompletion,
     updates: Vec<TableUpdate>,
     expected_snapshot_id: Option<i64>,
-    abort_handle: Arc<super::commit::AbortLog>,
+    abort_handle: Arc<AbortLog>,
     action_built: bool,
 }
 
@@ -490,7 +494,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             completion,
             updates: Vec::new(),
             expected_snapshot_id: None,
-            abort_handle: Arc::new(super::commit::AbortLog::new()),
+            abort_handle: Arc::new(AbortLog::new()),
             action_built: false,
         });
         self.operations
@@ -580,7 +584,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let table_ident = staged_table.identifier().clone();
             let collector = Arc::new(
                 super::commit::IcebergCommitCollector::new(
-                    super::commit::CommitOpKind::FastAppend,
+                    CommitOpKind::FastAppend,
                     table_ident,
                     None,
                     metadata.last_sequence_number(),
@@ -598,7 +602,8 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let cleanup =
                 crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)
                     .map_err(internal)?;
-            let catalog: Arc<dyn iceberg::Catalog> = prepared.staged.catalog.clone();
+            let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> =
+                prepared.staged.catalog.clone();
             let commit_executor = Arc::new(super::write_commit::IcebergWriteCommitExecutor {
                 catalog,
                 table: staged_table.clone(),
@@ -838,7 +843,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence,
                 })
             }
-            Ok(Err(iceberg_catalog_rest::StagedCommitError::Conflict(error))) => {
+            Ok(Err(novarocks_connector_iceberg::iceberg_catalog_rest::StagedCommitError::Conflict(error))) => {
                 if prepared.policy == CreatePolicy::NoOpIfExists {
                     self.operations
                         .lock()
@@ -871,7 +876,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     })
                 }
             }
-            Ok(Err(iceberg_catalog_rest::StagedCommitError::PossiblyDispatched(error))) => {
+            Ok(Err(novarocks_connector_iceberg::iceberg_catalog_rest::StagedCommitError::PossiblyDispatched(error))) => {
                 let evidence = self.publish_evidence(
                     request.operation_id,
                     operation_id,
@@ -892,7 +897,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence,
                 })
             }
-            Ok(Err(iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(error))) => {
+            Ok(Err(novarocks_connector_iceberg::iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(error))) => {
                 let receipt = self.bounded_receipt(
                     request.operation_id,
                     ConnectorStagedCreateReceiptPhase::Published,
@@ -926,7 +931,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     ),
                 })
             }
-            Ok(Err(iceberg_catalog_rest::StagedCommitError::KnownNotDispatched(error))) => {
+            Ok(Err(novarocks_connector_iceberg::iceberg_catalog_rest::StagedCommitError::KnownNotDispatched(error))) => {
                 self.operations
                     .lock()
                     .map_err(|lock| internal(format!("staged-create operation lock: {lock}")))?
@@ -1196,7 +1201,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
 }
 
 fn publication_matches(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_operation_id: novarocks_spi::connector::ConnectorStagedCreateOperationId,
     prepared: &PreparedOperation,
     expected_snapshot_id: Option<i64>,

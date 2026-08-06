@@ -21,7 +21,7 @@ fn data_file_with_i32_stats(path: &str, min: i32, max: i32) -> IcebergDataFileIn
     let mut file = data_file(path);
     file.column_stats = Some(HashMap::from([(
         "id".to_string(),
-        crate::connector::iceberg::scan_model::IcebergColumnStats {
+        novarocks_connector_iceberg::scan_model::IcebergColumnStats {
             null_count: Some(0),
             value_count: Some(10),
             column_size: None,
@@ -36,11 +36,11 @@ fn identity_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
     let mut file = data_file(path);
     file.partition_key = Some(format!("Struct([{id}])"));
     file.partition_values = vec![
-        crate::connector::iceberg::scan_model::IcebergPartitionFieldValue {
+        novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue {
             source_column: "id".to_string(),
             field_name: "id".to_string(),
             transform: "identity".to_string(),
-            value: Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Int32(id)),
+            value: Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int32(id)),
         },
     ];
     file
@@ -48,11 +48,11 @@ fn identity_partition_file(path: &str, id: i32) -> IcebergDataFileInfo {
 
 fn position_delete_file(
     path: &str,
-) -> crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
-    crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
+    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
         path: path.to_string(),
-        file_format: crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position,
+        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position,
         length: Some(1),
         content_offset: None,
         content_size_in_bytes: None,

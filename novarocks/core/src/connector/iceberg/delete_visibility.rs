@@ -23,7 +23,7 @@ use super::catalog::registry;
 
 pub(crate) struct ReferencedDataFilePartition {
     pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: iceberg::spec::Struct,
+    pub(crate) partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
 }
 
 pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
@@ -32,7 +32,7 @@ pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFil
 ///
 /// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
 pub(crate) fn load_referenced_data_file_partitions_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: Option<i64>,
 ) -> Result<ReferencedDataFilePartitions, String> {
     let data_files = match snapshot_id {
@@ -63,7 +63,7 @@ pub(crate) fn load_referenced_data_file_partitions_at(
 }
 
 pub(crate) fn load_referenced_data_file_partitions(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<ReferencedDataFilePartitions, String> {
     load_referenced_data_file_partitions_at(table, None)
 }
@@ -107,7 +107,7 @@ pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDel
 ///
 /// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
 pub(crate) fn load_existing_delete_visibility_by_data_file_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: Option<i64>,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
@@ -119,14 +119,14 @@ pub(crate) fn load_existing_delete_visibility_by_data_file_at(
 }
 
 pub(crate) fn load_existing_delete_visibility_by_data_file(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)
 }
 
 pub(crate) fn load_existing_delete_visibility_from_descriptors(
-    data_files: &[super::changes::DeleteVisibilityDataFileDescriptor],
+    data_files: &[novarocks_connector_iceberg::delta::DeleteVisibilityDataFileDescriptor],
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     let mut out = ExistingDeleteVisibilityByDataFile::new();
@@ -140,19 +140,19 @@ pub(crate) fn load_existing_delete_visibility_from_descriptors(
                 content_offset: file.content_offset,
                 content_size_in_bytes: file.content_size_in_bytes,
                 file_format: match file.file_format {
-                    super::changes::DeleteVisibilityDeleteFileFormat::Parquet => {
-                        super::delete_file::IcebergFileFormat::Parquet
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Parquet => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet
                     }
-                    super::changes::DeleteVisibilityDeleteFileFormat::Puffin => {
-                        super::delete_file::IcebergFileFormat::Puffin
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileFormat::Puffin => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileFormat::Puffin
                     }
                 },
                 file_content: match file.file_content {
-                    super::changes::DeleteVisibilityDeleteFileContent::Position => {
-                        super::delete_file::IcebergFileContent::PositionDeletes
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Position => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileContent::PositionDeletes
                     }
-                    super::changes::DeleteVisibilityDeleteFileContent::Equality => {
-                        super::delete_file::IcebergFileContent::EqualityDeletes
+                    novarocks_connector_iceberg::delta::DeleteVisibilityDeleteFileContent::Equality => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes
                     }
                 },
             })
@@ -183,19 +183,19 @@ fn load_delete_visibility_from_data_files(
                 content_offset: file.content_offset,
                 content_size_in_bytes: file.content_size_in_bytes,
                 file_format: match file.file_format {
-                    super::scan_model::IcebergDeleteFileFormat::Parquet => {
-                        super::delete_file::IcebergFileFormat::Parquet
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileFormat::Parquet
                     }
-                    super::scan_model::IcebergDeleteFileFormat::Puffin => {
-                        super::delete_file::IcebergFileFormat::Puffin
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Puffin => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileFormat::Puffin
                     }
                 },
                 file_content: match file.file_content {
-                    super::scan_model::IcebergDeleteFileContent::Position => {
-                        super::delete_file::IcebergFileContent::PositionDeletes
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileContent::PositionDeletes
                     }
-                    super::scan_model::IcebergDeleteFileContent::Equality => {
-                        super::delete_file::IcebergFileContent::EqualityDeletes
+                    novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality => {
+                        novarocks_connector_iceberg::delete_file::IcebergFileContent::EqualityDeletes
                     }
                 },
             })
@@ -216,8 +216,8 @@ struct DeleteFileInput<'a> {
     length: Option<i64>,
     content_offset: Option<i64>,
     content_size_in_bytes: Option<i64>,
-    file_format: super::delete_file::IcebergFileFormat,
-    file_content: super::delete_file::IcebergFileContent,
+    file_format: novarocks_connector_iceberg::delete_file::IcebergFileFormat,
+    file_content: novarocks_connector_iceberg::delete_file::IcebergFileContent,
 }
 
 fn load_visibility_for_data_file(
@@ -265,20 +265,22 @@ fn load_visibility_for_data_file(
         .skip(1)
         .zip(delete_files)
         .map(|(resolved, original)| {
-            Ok(super::delete_file::IcebergDeleteFileSpec {
-                path: resolved.path.clone(),
-                file_format: original.file_format,
-                file_content: original.file_content,
-                length: original
-                    .length
-                    .map(u64::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        format!("iceberg delete file size is negative: {}", original.path)
-                    })?,
-                content_offset: original.content_offset,
-                content_size_in_bytes: original.content_size_in_bytes,
-            })
+            Ok(
+                novarocks_connector_iceberg::delete_file::IcebergDeleteFileSpec {
+                    path: resolved.path.clone(),
+                    file_format: original.file_format,
+                    file_content: original.file_content,
+                    length: original
+                        .length
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            format!("iceberg delete file size is negative: {}", original.path)
+                        })?,
+                    content_offset: original.content_offset,
+                    content_size_in_bytes: original.content_size_in_bytes,
+                },
+            )
         })
         .collect::<Result<Vec<_>, String>>()?;
     let deleted_positions = super::position_delete::load_position_deletes(

@@ -46,17 +46,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, FormatVersion, ManifestFile, Operation, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{
     carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot, register_puffin_stats,
@@ -67,14 +68,15 @@ use super::helpers::{
     target_ref_snapshot_id, write_manifest_list,
 };
 use super::position_delete_writer::PositionDeleteGroup;
-use super::puffin_dv::{DeletionVector, write_single_deletion_vector_puffin};
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_with_dv_merge, dv_summary, dv_total_records,
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
 
 pub struct RowDeltaDvCommit;
 
@@ -177,12 +179,15 @@ struct RowDeltaDvTxnAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaDvTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version != FormatVersion::V3 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "RowDeltaDvCommit requires an Iceberg v3 table",
             ));
         }
@@ -473,7 +478,7 @@ fn mark_replacement_manifest_row_id_assigned(
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataFileBuilder, DataFileFormat};
+    use novarocks_connector_iceberg::iceberg::spec::{DataFileBuilder, DataFileFormat};
 
     use super::super::row_delta_dv_metadata::{LiveFile, validate_delete_file_for_row_lineage};
     use super::*;
@@ -484,7 +489,7 @@ mod tests {
             .content(DataContentType::PositionDeletes)
             .file_path("file:///tmp/delete.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
-            .partition(iceberg::spec::Struct::empty())
+            .partition(novarocks_connector_iceberg::iceberg::spec::Struct::empty())
             .partition_spec_id(0)
             .record_count(1)
             .file_size_in_bytes(10)
@@ -503,7 +508,7 @@ mod tests {
             .content(DataContentType::EqualityDeletes)
             .file_path("file:///tmp/eq.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
-            .partition(iceberg::spec::Struct::empty())
+            .partition(novarocks_connector_iceberg::iceberg::spec::Struct::empty())
             .partition_spec_id(0)
             .record_count(1)
             .file_size_in_bytes(10);
@@ -519,19 +524,19 @@ mod tests {
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/data.parquet".to_string(),
                 partition_spec_id: 0,
-                partition_values: iceberg::spec::Struct::empty(),
+                partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 positions: vec![1, 2],
             },
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/data.parquet".to_string(),
                 partition_spec_id: 0,
-                partition_values: iceberg::spec::Struct::empty(),
+                partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 positions: vec![3],
             },
             PositionDeleteGroup {
                 referenced_data_file: "file:///x/empty.parquet".to_string(),
                 partition_spec_id: 0,
-                partition_values: iceberg::spec::Struct::empty(),
+                partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 positions: vec![],
             },
         ];
@@ -549,7 +554,7 @@ mod tests {
         let groups = vec![PositionDeleteGroup {
             referenced_data_file: "file:///x/data.parquet".to_string(),
             partition_spec_id: 0,
-            partition_values: iceberg::spec::Struct::empty(),
+            partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             positions: vec![1, -1],
         }];
         let err = groups_to_vectors(&groups).unwrap_err();
@@ -691,7 +696,7 @@ mod tests {
             .content(DataContentType::Data)
             .file_path(format!("file:///x/data-{partition_spec_id}.parquet"))
             .file_format(DataFileFormat::Parquet)
-            .partition(iceberg::spec::Struct::empty())
+            .partition(novarocks_connector_iceberg::iceberg::spec::Struct::empty())
             .partition_spec_id(partition_spec_id)
             .record_count(1)
             .file_size_in_bytes(10)
@@ -730,7 +735,7 @@ mod tests {
             path: path.to_string(),
             format: DataFileFormat::Parquet,
             content: DataContentType::Data,
-            partition_values: iceberg::spec::Struct::empty(),
+            partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             partition_spec_id: 0,
             record_count,
             file_size_in_bytes: 20,

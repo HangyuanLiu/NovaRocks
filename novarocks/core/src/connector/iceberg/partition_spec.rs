@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     PartitionSpecRef, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionField,
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
@@ -143,13 +143,13 @@ pub(crate) enum PartitionSpecChange<'a> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn spec_count(table: &iceberg::table::Table) -> usize {
+pub(crate) fn spec_count(table: &novarocks_connector_iceberg::iceberg::table::Table) -> usize {
     table.metadata().partition_specs_iter().count()
 }
 
 #[allow(dead_code)]
 pub(crate) fn partition_spec_by_id(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     spec_id: i32,
 ) -> Result<PartitionSpecRef, String> {
     table
@@ -331,7 +331,9 @@ pub(crate) fn partition_match_in_touched(
 mod tests {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        NestedField, PartitionSpec, PrimitiveType, Transform, Type,
+    };
 
     use super::*;
 
@@ -553,7 +555,7 @@ mod tests {
 
 #[cfg(test)]
 mod overwrite_partitions_match_tests {
-    use iceberg::spec::{Literal, PrimitiveLiteral, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{Literal, PrimitiveLiteral, Struct};
 
     use super::*;
 

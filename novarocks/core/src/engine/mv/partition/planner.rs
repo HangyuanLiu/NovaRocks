@@ -274,7 +274,7 @@ mod tests {
             delete_file_size: 128,
             record_count: Some(1),
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),

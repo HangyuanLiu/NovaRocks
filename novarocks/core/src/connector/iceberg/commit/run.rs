@@ -27,10 +27,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use iceberg::Catalog;
-use iceberg::io::FileIO;
-use iceberg::table::Table;
-use opendal::Operator;
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::opendal::Operator;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction};
@@ -46,9 +46,9 @@ use super::service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
 };
 use super::truncate::TruncateCommit;
-use super::types::{CommitOpKind, CommitOutcome};
 use super::update_cow::CowUpdateCommit;
 use super::update_cow::CowUpdateRewriteSet;
+use crate::connector::iceberg::commit::types::{CommitOpKind, CommitOutcome};
 
 pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
@@ -193,8 +193,8 @@ async fn handle_commit_error(
 mod tests {
     use std::sync::Arc;
 
-    use opendal::Operator;
-    use opendal::services::Fs;
+    use novarocks_connector_iceberg::opendal::Operator;
+    use novarocks_connector_iceberg::opendal::services::Fs;
 
     use super::super::service::{CleanupAttempt, CommitServiceError, RecoveryEvidence};
     use super::super::test_helpers::IcebergTestFixture;

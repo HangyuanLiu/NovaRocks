@@ -26,7 +26,7 @@ pub(crate) struct NonJoinBaseChange<'a> {
     pub base_ref: &'a TableIdentity,
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
-    pub base_table: &'a iceberg::table::Table,
+    pub base_table: &'a novarocks_connector_iceberg::iceberg::table::Table,
     pub current_table_uuid: &'a str,
 }
 

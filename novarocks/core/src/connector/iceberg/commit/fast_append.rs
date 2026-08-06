@@ -24,14 +24,16 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, ManifestFile, Operation, PartitionSpecRef, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
@@ -42,7 +44,7 @@ use super::helpers::{
     snapshot_total_records, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
-use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
 
 pub struct FastAppendCommit;
@@ -134,7 +136,7 @@ impl IcebergCommitAction for FastAppendCommit {
             ));
         }
 
-        let data_files: Vec<iceberg::spec::DataFile> = written
+        let data_files: Vec<novarocks_connector_iceberg::iceberg::spec::DataFile> = written
             .iter()
             .map(|f| written_file_to_iceberg_data_file(f, ctx.collector))
             .collect::<Result<Vec<_>, _>>()?;
@@ -189,7 +191,7 @@ impl IcebergCommitAction for FastAppendCommit {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn register_puffin_stats(
     table_after: &Table,
-    catalog: &dyn iceberg::Catalog,
+    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
     file_io: &FileIO,
     commit_type: CommitType,
     sketch_sets: Vec<FileSketchSet>,
@@ -210,7 +212,12 @@ pub(crate) async fn register_puffin_stats(
     {
         Ok(Some(stats_file)) => {
             if let Err(err) =
-                super::statistics::commit_statistics_file(table_after, catalog, stats_file).await
+                novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
+                    table_after,
+                    catalog,
+                    stats_file,
+                )
+                .await
             {
                 tracing::warn!(
                     new_snapshot_id,
@@ -243,7 +250,7 @@ pub(crate) async fn register_puffin_stats(
 /// Errors are logged and swallowed; missing previous stats is normal.
 pub(crate) async fn carry_forward_puffin_stats(
     table_after: &Table,
-    catalog: &dyn iceberg::Catalog,
+    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
     new_snapshot_id: i64,
     prev_snapshot_id: i64,
 ) {
@@ -259,7 +266,13 @@ pub(crate) async fn carry_forward_puffin_stats(
     for blob in entry.blob_metadata.iter_mut() {
         blob.snapshot_id = new_snapshot_id;
     }
-    if let Err(err) = super::statistics::commit_statistics_file(table_after, catalog, entry).await {
+    if let Err(err) = novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
+        table_after,
+        catalog,
+        entry,
+    )
+    .await
+    {
         tracing::warn!(
             new_snapshot_id,
             error = %err,
@@ -339,7 +352,7 @@ async fn commit_v3_row_lineage_append(
 pub(crate) struct StagedFastAppendAction {
     pub action: ActionCommit,
     pub outcome: Option<CommitOutcome>,
-    pub abort_handle: Arc<super::abort::AbortLog>,
+    pub abort_handle: Arc<novarocks_connector_iceberg::commit::abort::AbortLog>,
 }
 
 /// Build, but do not submit, v2 or v3 fast-append changes for atomic CTAS
@@ -473,7 +486,7 @@ struct FastAppendV3TxnAction {
     partition_spec: PartitionSpecRef,
     schema: SchemaRef,
     schema_id: i32,
-    abort_handle: Arc<super::abort::AbortLog>,
+    abort_handle: Arc<novarocks_connector_iceberg::commit::abort::AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     row_lineage: Option<(u64, u64)>,
     target_ref: String,
@@ -484,7 +497,10 @@ struct FastAppendV3TxnAction {
 
 #[async_trait]
 impl TransactionAction for FastAppendV3TxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
@@ -666,8 +682,11 @@ fn append_summary(
     p
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
@@ -675,14 +694,17 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
         Type,
     };
-    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{
+        Catalog, NamespaceIdent, TableCreation, TableIdent,
+    };
 
     use super::*;
-    use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
+    use crate::connector::iceberg::commit::CommitOpKind;
+    use crate::connector::iceberg::commit::IcebergCommitCollector;
 
     #[test]
     fn type_compiles() {
@@ -874,7 +896,7 @@ mod tests {
         );
         collector.inject_written_file(test_written_data_file(1));
         let file_io = table.file_io().clone();
-        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let abort_handle = Arc::new(novarocks_connector_iceberg::commit::abort::AbortLog::new());
         let snapshot_properties = BTreeMap::new();
         let action = build_staged_fast_append_action(CommitCtx {
             collector: &collector,
@@ -897,9 +919,11 @@ mod tests {
             "manifest file and list must both be tracked"
         );
 
-        let builder =
-            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
-        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let builder = novarocks_connector_iceberg::opendal::services::Fs::default()
+            .root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = novarocks_connector_iceberg::opendal::Operator::new(builder)
+            .unwrap()
+            .finish();
         let root_prefix = format!("file://{}/", warehouse_dir.path().display());
         let errors = abort_handle
             .cleanup_with_path_mapper(&fs, |path| {
@@ -971,7 +995,7 @@ mod tests {
             )
             .with_table_metadata(metadata.clone()),
         );
-        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let abort_handle = Arc::new(novarocks_connector_iceberg::commit::abort::AbortLog::new());
         let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
         let action = FastAppendV3TxnAction {
             written: vec![test_written_data_file(1)],
@@ -999,9 +1023,11 @@ mod tests {
             "both attempted artifacts must be registered"
         );
 
-        let builder =
-            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
-        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let builder = novarocks_connector_iceberg::opendal::services::Fs::default()
+            .root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = novarocks_connector_iceberg::opendal::Operator::new(builder)
+            .unwrap()
+            .finish();
         let root_prefix = format!("file://{}/", warehouse_dir.path().display());
         let first_relative = paths[0]
             .strip_prefix(&root_prefix)

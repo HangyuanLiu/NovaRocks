@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use iceberg::{NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteCohortPlan,
@@ -37,8 +37,7 @@ use super::catalog::registry::{
     DataFileWithStats, IcebergCatalogEntry, IcebergCatalogRegistry, block_on_iceberg,
     build_iceberg_catalog, extract_data_files_with_stats, load_table,
 };
-use super::commit::{CommitOpKind, IcebergCommitCollector, SelectedRewriteKind};
-use super::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
+use super::commit::{IcebergCommitCollector, SelectedRewriteKind};
 use super::sink::build_position_delete_data_file_partition_index;
 use super::sink_plan::IcebergSinkObjectStoreConfig;
 use super::write_commit::IcebergWriteCommitExecutor;
@@ -51,8 +50,12 @@ use super::write_service::{
     IcebergWriteReportCommitter, IcebergWriteServiceRegistry,
 };
 use crate::common::types::UniqueId;
+use crate::connector::iceberg::commit::CommitOpKind;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
+};
 
 pub(crate) const ARTIFACT_VERSION: u16 = 1;
 pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
@@ -238,7 +241,8 @@ impl IcebergDistributedRewritePlanner {
                     min_input_files.unwrap_or(2) as usize,
                 )?;
                 if !groups.is_empty()
-                    && metadata.format_version() != iceberg::spec::FormatVersion::V3
+                    && metadata.format_version()
+                        != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
                 {
                     return Err(invalid(
                         "Iceberg rewrite position delete files requires a format v3 table",
@@ -275,7 +279,10 @@ impl IcebergDistributedRewritePlanner {
         )?;
 
         let physical_schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).map_err(|error| {
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+                metadata.current_schema(),
+            )
+            .map_err(|error| {
                 internal(format!("convert Iceberg rewrite schema to Arrow: {error}"))
             })?,
         );
@@ -538,7 +545,7 @@ impl IcebergDistributedRewriteAdapter {
     fn attempt_file_io(
         &self,
         plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<iceberg::io::FileIO, ConnectorError> {
+    ) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO, ConnectorError> {
         let (namespace, table) = super::provider::decode_data_mutation_table_target(plan.target())?;
         let entry = self.planner.entry()?;
         let table = load_table(&entry, &namespace, &table)
@@ -705,7 +712,7 @@ struct IcebergRewriteReceiptPayloadV1 {
 
 fn validate_frozen_rewrite_table(
     artifact: &IcebergFrozenRewriteArtifactV1,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
 ) -> Result<(), ConnectorError> {
     if metadata.uuid().to_string() != artifact.table_uuid
         || metadata
@@ -725,7 +732,7 @@ fn validate_frozen_rewrite_table(
 
 fn rewrite_position_partitions(
     entry: &IcebergCatalogEntry,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     base_snapshot_id: Option<i64>,
     selected_data_paths: &BTreeSet<String>,
 ) -> Result<HashMap<String, super::sink_plan::PositionDeleteDataFilePartition>, ConnectorError> {
@@ -1322,7 +1329,7 @@ pub(crate) fn decode_group_payload(
 /// group to the Iceberg scan planner. Generic core only carries the opaque
 /// group payload; this function is the single Iceberg-only decoder.
 pub(crate) fn load_frozen_rewrite_group(
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     payload: &IcebergRewriteGroupPayloadV1,
 ) -> Result<IcebergFrozenRewriteGroupV1, ConnectorError> {
     let root_location = format!("{}/manifest.json", payload.artifact_location);
@@ -1409,7 +1416,7 @@ pub(crate) fn load_frozen_rewrite_group(
 }
 
 fn read_artifact_file(
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     location: &str,
     max_bytes: usize,
 ) -> Result<Bytes, ConnectorError> {
@@ -1432,7 +1439,7 @@ fn read_artifact_file(
 /// storage paths or process-local catalog state.  A single oversized group is
 /// rejected rather than silently widening the carrier or flattening groups.
 fn write_frozen_artifact(
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     artifact: &IcebergFrozenRewriteArtifactV1,
     logical_digest: [u8; 32],
     root_location: &str,
@@ -1546,7 +1553,7 @@ pub(crate) fn plan_data_file_groups(
 }
 
 fn live_delete_file_paths(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<BTreeSet<String>, ConnectorError> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
@@ -1560,7 +1567,9 @@ fn live_delete_file_paths(
             .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
         let mut paths = BTreeSet::new();
         for manifest_file in manifest_list.entries() {
-            if manifest_file.content != iceberg::spec::ManifestContentType::Deletes {
+            if manifest_file.content
+                != novarocks_connector_iceberg::iceberg::spec::ManifestContentType::Deletes
+            {
                 continue;
             }
             let manifest = manifest_file
@@ -2004,7 +2013,7 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::scan_model::{
+    use novarocks_connector_iceberg::scan_model::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
 

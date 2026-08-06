@@ -27,17 +27,18 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFileFormat, FormatVersion, ManifestFile, Operation, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot};
 use super::helpers::{
@@ -46,15 +47,16 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
     target_ref_snapshot_id, write_manifest_list,
 };
-use super::puffin_dv::{
-    DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
-};
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{
+    DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
+};
 
 pub struct RowDeltaDvFromFilesCommit;
 
@@ -177,12 +179,15 @@ struct RowDeltaDvFromFilesTxnAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaDvFromFilesTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version != FormatVersion::V3 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "RowDeltaDvFromFilesCommit requires an Iceberg v3 table",
             ));
         }
@@ -728,7 +733,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
 
-    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Struct,
+    };
     use uuid::Uuid;
 
     use super::super::action::CommitCtx;
@@ -736,9 +743,9 @@ mod tests {
     use super::super::position_delete_writer::PositionDeleteGroup;
     use super::super::row_delta_dv_metadata::{LiveFile, dv_data_file};
     use super::super::test_helpers::empty_v3_iceberg_table;
-    use super::super::types::CommitOpKind;
     use super::*;
     use crate::common::types::UniqueId;
+    use crate::connector::iceberg::commit::types::CommitOpKind;
 
     /// M3a Part B: a RowDeltaDvFromFiles commit may carry, in one snapshot,
     /// REUSE data (MOR-UPDATE replacement rows that preserve their `_row_id`s,
@@ -1034,7 +1041,10 @@ mod tests {
         let delete_manifests = manifest_list
             .entries()
             .iter()
-            .filter(|manifest| manifest.content == iceberg::spec::ManifestContentType::Deletes)
+            .filter(|manifest| {
+                manifest.content
+                    == novarocks_connector_iceberg::iceberg::spec::ManifestContentType::Deletes
+            })
             .collect::<Vec<_>>();
         assert_eq!(delete_manifests.len(), 1);
         let manifest = delete_manifests[0]
@@ -1050,7 +1060,7 @@ mod tests {
         );
         assert_eq!(data_file.record_count(), 3);
 
-        let merged = super::super::puffin_dv::read_deletion_vector_puffin(
+        let merged = novarocks_connector_iceberg::commit::read_deletion_vector_puffin(
             &file_io,
             data_file.file_path(),
             data_file.content_offset().expect("content offset"),
@@ -1211,11 +1221,11 @@ mod tests {
         referenced: &str,
         positions: &[u64],
     ) -> WrittenFile {
-        let mut dv = super::super::DeletionVector::new();
+        let mut dv = novarocks_connector_iceberg::commit::DeletionVector::new();
         for pos in positions {
             dv.insert(*pos).expect("insert position");
         }
-        let written = super::super::puffin_dv::write_single_deletion_vector_puffin(
+        let written = novarocks_connector_iceberg::commit::write_single_deletion_vector_puffin(
             file_io, path, referenced, &dv,
         )
         .await

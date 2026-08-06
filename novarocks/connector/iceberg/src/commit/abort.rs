@@ -29,7 +29,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use opendal::Operator;
+use crate::opendal::Operator;
 
 /// Tracks staged Iceberg files for best-effort cleanup on abort.
 #[derive(Default)]
@@ -43,7 +43,7 @@ pub struct AbortLog {
 #[derive(Debug)]
 pub struct CleanupError {
     pub path: String,
-    pub source: opendal::Error,
+    pub source: crate::opendal::Error,
 }
 
 impl AbortLog {
@@ -115,7 +115,7 @@ impl AbortLog {
 mod tests {
     use std::sync::Arc;
 
-    use opendal::services::Fs;
+    use crate::opendal::services::Fs;
 
     use super::*;
 

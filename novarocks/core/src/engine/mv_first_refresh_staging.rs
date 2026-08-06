@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Weak};
 
-use iceberg::{NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorControlPlanningLease, ConnectorControlResolver,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
@@ -502,8 +502,9 @@ fn mv_first_refresh_request(
         .column_name
         .clone();
     let target_schema = ctx.rewrite.target_schema.as_ref();
-    let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
-        .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
+    let target_arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(target_schema)
+            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
     let target_field_ids = target_schema
         .as_struct()
         .fields()
@@ -684,12 +685,15 @@ pub(crate) fn activate_mv_first_refresh_connector_write(
 }
 
 fn validate_first_refresh_target_contract(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     contract: &MvFirstRefreshTargetContract,
 ) -> Result<(), String> {
     let actual_schema = target_table.metadata().current_schema();
-    let actual_arrow_schema = iceberg::arrow::schema_to_arrow_schema(actual_schema)
-        .map_err(|error| format!("convert MV first-refresh activation schema to Arrow: {error}"))?;
+    let actual_arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(actual_schema)
+            .map_err(|error| {
+                format!("convert MV first-refresh activation schema to Arrow: {error}")
+            })?;
     let actual_field_ids = actual_schema
         .as_struct()
         .fields()

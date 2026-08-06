@@ -27,7 +27,6 @@ use novarocks_spi::connector::{
 };
 
 use super::*;
-use crate::connector::iceberg::scan_model as iceberg_scan_model;
 use crate::protocol::native::encode::plan as native_plan;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan;
@@ -40,6 +39,7 @@ use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::distributed::DataPartition;
 use crate::sql::planner::table as table_model;
+use novarocks_connector_iceberg::scan_model as iceberg_scan_model;
 
 fn prepared_runtime_filter_bindings(plan: &DistributedPlan) -> &'static PreparedFragmentSet {
     Box::leak(Box::new(

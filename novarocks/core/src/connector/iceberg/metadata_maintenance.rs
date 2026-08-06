@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use iceberg::NamespaceIdent;
+use novarocks_connector_iceberg::iceberg::NamespaceIdent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -399,7 +399,7 @@ impl IcebergMetadataMaintenanceAdapter {
             novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND => {
                 block_on_iceberg(run_rewrite_manifests_once_with_marker(
                     catalog,
-                    iceberg::TableIdent::new(
+                    novarocks_connector_iceberg::iceberg::TableIdent::new(
                         NamespaceIdent::new(payload.namespace.clone()),
                         payload.table.clone(),
                     ),
@@ -419,7 +419,7 @@ impl IcebergMetadataMaintenanceAdapter {
             novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND => {
                 block_on_iceberg(run_expire_snapshots_once_with_marker(
                     catalog,
-                    iceberg::TableIdent::new(
+                    novarocks_connector_iceberg::iceberg::TableIdent::new(
                         NamespaceIdent::new(payload.namespace.clone()),
                         payload.table.clone(),
                     ),
@@ -685,7 +685,7 @@ fn validate_payload_for_plan(
 }
 
 fn validate_frozen_state(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     plan: &ConnectorMetadataMaintenancePlan,
     payload: &IcebergMetadataMaintenancePlanPayloadV1,
 ) -> Result<(), ConnectorError> {
@@ -779,15 +779,17 @@ fn maintenance_artifact_location(
     Ok(path)
 }
 
-fn classify_iceberg_error(error: iceberg::Error) -> ExecFailure {
+fn classify_iceberg_error(error: novarocks_connector_iceberg::iceberg::Error) -> ExecFailure {
     match error.kind() {
-        iceberg::ErrorKind::CatalogCommitConflicts
-        | iceberg::ErrorKind::PreconditionFailed
-        | iceberg::ErrorKind::DataInvalid
-        | iceberg::ErrorKind::TableNotFound => {
+        novarocks_connector_iceberg::iceberg::ErrorKind::CatalogCommitConflicts
+        | novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed
+        | novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid
+        | novarocks_connector_iceberg::iceberg::ErrorKind::TableNotFound => {
             ExecFailure::KnownUncommitted(invalid(error.to_string()))
         }
-        iceberg::ErrorKind::Unexpected => ExecFailure::Unknown(unavailable(error.to_string())),
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected => {
+            ExecFailure::Unknown(unavailable(error.to_string()))
+        }
         _ => ExecFailure::KnownUncommitted(invalid(error.to_string())),
     }
 }

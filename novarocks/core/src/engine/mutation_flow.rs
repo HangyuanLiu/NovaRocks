@@ -23,14 +23,15 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::compute::{cast, concat_batches, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use iceberg::Catalog;
-use iceberg::arrow::schema_to_arrow_schema;
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
 use sha2::{Digest, Sha256};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector, IcebergUpdateMode,
-    ensure_iceberg_write_supported, select_iceberg_update_mode,
+    CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
+    select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;
@@ -267,8 +268,8 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::engine::backend_resolver::TargetBackend,
     pub(crate) catalog: Arc<dyn Catalog>,
-    pub(crate) table_ident: iceberg::TableIdent,
-    pub(crate) table: iceberg::table::Table,
+    pub(crate) table_ident: novarocks_connector_iceberg::iceberg::TableIdent,
+    pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) target_ref: String,
@@ -300,8 +301,8 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) current_catalog: Option<String>,
     pub(crate) target: crate::engine::backend_resolver::TargetBackend,
     pub(crate) catalog: Arc<dyn Catalog>,
-    pub(crate) table_ident: iceberg::TableIdent,
-    pub(crate) table: iceberg::table::Table,
+    pub(crate) table_ident: novarocks_connector_iceberg::iceberg::TableIdent,
+    pub(crate) table: novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) target_columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     pub(crate) table_write_mode: IcebergUpdateMode,
@@ -369,8 +370,8 @@ pub(crate) fn prepare_update_mutation(
         registry.get(&target.catalog)?
     };
     let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
@@ -384,7 +385,7 @@ pub(crate) fn prepare_update_mutation(
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
         let fmt = table.metadata().format_version();
-        if fmt != iceberg::spec::FormatVersion::V3 {
+        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
             return Err(format!(
                 "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
                 table_ident, fmt as u8,
@@ -399,7 +400,7 @@ pub(crate) fn prepare_update_mutation(
     let mode = select_iceberg_update_mode(&table)?;
     let mor_write_target = if mode == IcebergUpdateMode::MergeOnRead {
         let read_snapshot_id = if target_ref != "main" {
-            crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+            novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                 table.metadata(),
                 &target_ref,
             )?
@@ -485,8 +486,8 @@ pub(crate) fn prepare_merge_mutation(
         registry.get(&target.catalog)?
     };
     let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
@@ -592,7 +593,7 @@ pub(crate) fn stage_prepared_update_mutation(
             validate_unique_target_row_ids(&matched.row_ids)?;
             let metadata = table.metadata();
             let base_snapshot_id = if target_ref != "main" {
-                crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+                novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                     metadata,
                     &target_ref,
                 )?
@@ -1900,7 +1901,7 @@ struct CowUpdateDistributedWrite {
 fn build_cow_update_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     matched: &MatchedUpdateBatch,
     target_columns: &[novarocks_catalog::schema::ColumnDef],
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
@@ -2049,7 +2050,7 @@ fn build_cow_rewrite_query_local_overlay(
         ),
     ];
     materialization.binding =
-        crate::connector::iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
+        novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::ExplicitFiles;
     // The single-file scan must expose `_row_id` / `_last_updated_sequence_number`
     // for the rewrite projection; the table is v3 row-lineage (COW mode was
     // selected) and the file carries `first_row_id`, so the builder advertises
@@ -2433,7 +2434,7 @@ fn build_cow_update_distributed_execution(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn Catalog>,
-    table: iceberg::table::Table,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     collector: Arc<IcebergCommitCollector>,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
@@ -2720,7 +2721,7 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 }
 
 fn iceberg_table_columns(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<novarocks_catalog::schema::ColumnDef>, String> {
     let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
@@ -2733,12 +2734,12 @@ fn iceberg_table_columns(
                 .field_by_name(field.name())
                 .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
             let data_type = match nested.field_type.as_ref() {
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
-                    DataType::LargeBinary
-                }
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
-                    DataType::Binary
-                }
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant,
+                ) => DataType::LargeBinary,
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary,
+                ) => DataType::Binary,
                 _ => field.data_type().clone(),
             };
             Ok(novarocks_catalog::schema::ColumnDef {
@@ -2752,7 +2753,9 @@ fn iceberg_table_columns(
         .collect()
 }
 
-fn iceberg_partition_source_columns(table: &iceberg::table::Table) -> Result<Vec<String>, String> {
+fn iceberg_partition_source_columns(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Result<Vec<String>, String> {
     let schema = table.metadata().current_schema();
     let mut out = Vec::new();
     for field in table.metadata().default_partition_spec().fields() {
@@ -4635,10 +4638,10 @@ mod tests {
 
     #[test]
     fn iceberg_table_columns_maps_variant_to_largebinary() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
 
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -4648,21 +4651,24 @@ mod tests {
                 .build()
                 .expect("schema"),
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             iceberg_schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             "file:///tmp/iv3_variant_columns".to_string(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("builder")
         .build()
         .expect("metadata")
         .metadata;
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).expect("ident"))
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"])
+                    .expect("ident"),
+            )
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("table");

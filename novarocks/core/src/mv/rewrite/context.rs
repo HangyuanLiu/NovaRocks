@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use crate::mv::persistence::definition::StoredMvDefinition;
 use crate::mv::persistence::schema as mv_schema;
@@ -338,8 +338,10 @@ impl IcebergMvRewriteContext {
             )
             .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
 
-        let arrow_schema = iceberg::arrow::schema_to_arrow_schema(self.target_schema.as_ref())
-            .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
+        let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+            self.target_schema.as_ref(),
+        )
+        .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
         let iceberg_fields = self.target_schema.as_ref().as_struct().fields();
         let mut output_columns =
             Vec::with_capacity(self.schema_contract.target.visible_columns.len());
@@ -987,7 +989,7 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::persistence::definition::StoredMvDefinition;
     use crate::mv::refresh::pin::RefreshSnapshotPin;
@@ -1322,7 +1324,7 @@ pub(crate) mod tests_support {
 mod tests {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::refresh::pin::RefreshSnapshotPin;
     use crate::sql::planner::vocabulary::BRANCH_ID_COLUMN_NAME;

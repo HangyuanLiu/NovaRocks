@@ -495,24 +495,6 @@ impl novarocks_spi::connector::ConnectorControlResolver for FixtureControlResolv
     }
 }
 
-/// Compose the BE-only installers used by the execution host. The resulting
-/// installers are bound entirely from process startup configuration; an
-/// execution declaration can select a named binding but cannot carry a client
-/// or credential into the BE.
-pub fn compose_backend_connector_execution_installers(
-    default_object_store: Option<novarocks_fs::ObjectStoreConfig>,
-) -> Result<Vec<Arc<dyn novarocks_spi::connector::ConnectorExecutionInstaller>>, String> {
-    let file_runtime = crate::runtime::global_async_runtime::data_runtime_handle()?;
-    let binding = iceberg::provider::IcebergReadBinding::new(
-        default_object_store,
-        Arc::new(novarocks_fs::TokioFileIoRuntime::new(file_runtime.clone())),
-        Arc::new(novarocks_fs::TokioFileTaskSpawner::new(file_runtime)),
-    );
-    Ok(vec![Arc::new(
-        iceberg::provider::IcebergConnectorInstaller::new(binding),
-    )])
-}
-
 pub(crate) fn register_standalone_backends(state: &Arc<crate::engine::StandaloneState>) {
     {
         let mut connectors = state

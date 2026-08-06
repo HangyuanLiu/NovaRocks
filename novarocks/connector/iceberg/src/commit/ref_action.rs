@@ -23,8 +23,8 @@
 
 #![allow(dead_code)]
 
-use iceberg::spec::{SnapshotReference, SnapshotRetention};
-use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefActionPlan {
@@ -63,6 +63,119 @@ pub enum RefAction {
         source_snapshot_id: i64,
         expected_target_snapshot_id: Option<i64>,
     },
+}
+
+/// Lower a provider-independent reference action into the Iceberg commit
+/// primitive after validating the pinned table metadata.
+pub fn lower_ref_action(
+    action: novarocks_spi::connector::ConnectorRefAction,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    namespace: &str,
+    table: &str,
+    catalog: &str,
+) -> Result<RefActionPlan, novarocks_spi::connector::ConnectorError> {
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorRefAction, ConnectorRefKind,
+        CreateOrReplacePolicy, DropPolicy,
+    };
+
+    fn assert_kind(
+        metadata: &crate::iceberg::spec::TableMetadata,
+        name: &str,
+        expected: ConnectorRefKind,
+    ) -> Result<(), ConnectorError> {
+        let Some(existing) = metadata.refs().get(name) else {
+            return Ok(());
+        };
+        let actual = match existing.retention {
+            crate::iceberg::spec::SnapshotRetention::Branch { .. } => ConnectorRefKind::Branch,
+            crate::iceberg::spec::SnapshotRetention::Tag { .. } => ConnectorRefKind::Tag,
+        };
+        if actual == expected {
+            return Ok(());
+        }
+        Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!("Iceberg ref `{name}` has a different kind"),
+        ))
+    }
+
+    let action = match action {
+        ConnectorRefAction::Create {
+            kind,
+            name,
+            snapshot_id,
+            policy,
+        } => {
+            if name.eq_ignore_ascii_case("main") {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg ref `main` is reserved",
+                ));
+            }
+            assert_kind(metadata, &name, kind)?;
+            let snapshot_id = match snapshot_id.or_else(|| metadata.current_snapshot_id()) {
+                Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_some() => snapshot_id,
+                _ => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "Iceberg ref create requires an existing snapshot",
+                    ));
+                }
+            };
+            let (replace, if_not_exists) = match policy {
+                CreateOrReplacePolicy::FailIfExists => (false, false),
+                CreateOrReplacePolicy::NoOpIfExists => (false, true),
+                CreateOrReplacePolicy::ReplaceIfExists => (true, false),
+            };
+            match kind {
+                ConnectorRefKind::Branch => RefAction::CreateBranch {
+                    name: name.to_string(),
+                    snapshot_id,
+                    replace,
+                    if_not_exists,
+                },
+                ConnectorRefKind::Tag => RefAction::CreateTag {
+                    name: name.to_string(),
+                    snapshot_id,
+                    replace,
+                    if_not_exists,
+                },
+            }
+        }
+        ConnectorRefAction::Drop { kind, name, policy } => {
+            if name.eq_ignore_ascii_case("main") {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg ref `main` is reserved",
+                ));
+            }
+            assert_kind(metadata, &name, kind)?;
+            let if_exists = policy == DropPolicy::NoOpIfMissing;
+            match kind {
+                ConnectorRefKind::Branch => RefAction::DropBranch {
+                    name: name.to_string(),
+                    if_exists,
+                },
+                ConnectorRefKind::Tag => RefAction::DropTag {
+                    name: name.to_string(),
+                    if_exists,
+                },
+            }
+        }
+        ConnectorRefAction::FastForwardBranch { .. } => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "guarded MV publication bypassed its provider commit path",
+            ));
+        }
+    };
+    Ok(RefActionPlan {
+        catalog: catalog.to_string(),
+        namespace: namespace.to_string(),
+        table: table.to_string(),
+        action,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]

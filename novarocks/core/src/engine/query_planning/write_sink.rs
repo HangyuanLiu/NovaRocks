@@ -46,7 +46,7 @@ use crate::sql::planner::table::SqlTableIdentity;
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
     pub(crate) mode: IcebergWriteSinkMode,
-    pub(crate) iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    pub(crate) iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) target_columns: Vec<ColumnDef>,
     pub(crate) table_location: String,
     pub(crate) data_location: String,
@@ -96,7 +96,9 @@ impl IcebergWriteSinkSpec {
     }
 }
 
-pub(crate) fn transform_to_sink_string(transform: &iceberg::spec::Transform) -> String {
+pub(crate) fn transform_to_sink_string(
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
+) -> String {
     transform.to_string()
 }
 
@@ -146,8 +148,9 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
         "SQL write target binding is missing frozen Iceberg table metadata".to_string()
     })?;
-    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized)
-        .map_err(|error| format!("decode admitted Iceberg write target metadata: {error}"))?;
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized)
+            .map_err(|error| format!("decode admitted Iceberg write target metadata: {error}"))?;
     let fields = sql_write_target_fields(&captured.resolved.planner.columns, table)?;
     let partition = sql_write_partition_contract(&metadata)?;
     let target = SqlWriteSinkTargetContract::try_new(
@@ -285,7 +288,7 @@ pub(crate) fn row_lineage_sink_spec_from_frozen_materialization(
 /// cannot be confused with the locator scan's schema.
 pub(crate) fn admit_frozen_iceberg_write_target_materialization(
     bindings: &QueryTableBindingStore,
-    table: crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<SqlTableBindingId, String> {
     let descriptor = planning_lease.binding().descriptor();
@@ -337,7 +340,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
                 table,
                 files: Vec::new(),
                 binding:
-                    crate::connector::iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
+                    novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             }),
             frozen_snapshot_files: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
@@ -351,14 +354,14 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
 /// needs every field the exact writer contract consumes, including SQL-owned
 /// hidden row-lineage and MV state columns.
 fn admitted_write_target_columns(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<ColumnDef>, String> {
     let metadata = admitted_iceberg_metadata(table)?;
     write_target_columns_from_iceberg_schema(metadata.current_schema())
 }
 
 fn write_target_columns_from_iceberg_schema(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Vec<ColumnDef>, String> {
     crate::engine::iceberg_writer::iceberg_insert_columns_from_schema(schema)
 }
@@ -394,7 +397,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
     let mut iceberg = table;
     if matches!(mode, IcebergWriteSinkMode::RowLineageData) {
         iceberg.schema.fields.extend([
-            crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
                 name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
                 initial_default: None,
@@ -403,7 +406,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
                 write_default_json: None,
                 children: Vec::new(),
             },
-            crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+            novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
                 name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
                 initial_default: None,
@@ -486,8 +489,8 @@ fn position_delete_descriptor_from_sql(
 }
 
 fn admitted_iceberg_metadata(
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-) -> Result<iceberg::spec::TableMetadata, String> {
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::TableMetadata, String> {
     let serialized = table.serialized_metadata.as_deref().ok_or_else(|| {
         "SQL write target binding is missing frozen Iceberg table metadata".to_string()
     })?;
@@ -497,7 +500,7 @@ fn admitted_iceberg_metadata(
 
 fn admitted_iceberg_table(
     materialization: &QueryScanMaterialization,
-) -> Result<&crate::connector::iceberg::scan_model::IcebergTableInfo, String> {
+) -> Result<&novarocks_connector_iceberg::scan_model::IcebergTableInfo, String> {
     match materialization {
         QueryScanMaterialization::IcebergDataFiles { table, .. }
         | QueryScanMaterialization::IcebergMvTarget { table, .. } => Ok(table),
@@ -508,7 +511,7 @@ fn admitted_iceberg_table(
 fn admitted_write_input_columns(
     mode: SqlWriteSinkMode,
     target_columns: &[ColumnDef],
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
 ) -> Result<Vec<ColumnDef>, String> {
     match mode {
         SqlWriteSinkMode::Data | SqlWriteSinkMode::EqualityDeletes => Ok(target_columns.to_vec()),
@@ -573,7 +576,7 @@ fn admitted_write_input_columns(
 
 fn sql_write_target_fields(
     columns: &[ColumnDef],
-    table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+    table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
 ) -> Result<Vec<SqlWriteTargetField>, String> {
     let mut fields = Vec::with_capacity(columns.len());
     for column in columns {
@@ -598,7 +601,7 @@ fn sql_write_target_fields(
 }
 
 fn sql_write_partition_contract(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
 ) -> Result<SqlWritePartitionContract, String> {
     let partition_spec = metadata.default_partition_spec();
     let fields = partition_spec
@@ -619,7 +622,7 @@ fn sql_write_partition_contract(
 }
 
 fn sql_position_delete_descriptor(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     columns: &[ColumnDef],
     partition: &SqlWritePartitionContract,
 ) -> Result<SqlPositionDeleteOutputDescriptor, String> {
@@ -673,23 +676,39 @@ fn sql_position_delete_descriptor(
 }
 
 fn sql_write_partition_transform(
-    transform: &iceberg::spec::Transform,
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
 ) -> Result<SqlWritePartitionTransform, String> {
     Ok(match transform {
-        iceberg::spec::Transform::Identity => SqlWritePartitionTransform::Identity,
-        iceberg::spec::Transform::Year => SqlWritePartitionTransform::Year,
-        iceberg::spec::Transform::Month => SqlWritePartitionTransform::Month,
-        iceberg::spec::Transform::Day => SqlWritePartitionTransform::Day,
-        iceberg::spec::Transform::Hour => SqlWritePartitionTransform::Hour,
-        iceberg::spec::Transform::Bucket(buckets) => SqlWritePartitionTransform::Bucket {
-            buckets: u32::try_from(*buckets)
-                .map_err(|_| format!("Iceberg partition bucket count {buckets} is invalid"))?,
-        },
-        iceberg::spec::Transform::Truncate(width) => SqlWritePartitionTransform::Truncate {
-            width: u32::try_from(*width)
-                .map_err(|_| format!("Iceberg partition truncate width {width} is invalid"))?,
-        },
-        iceberg::spec::Transform::Void => SqlWritePartitionTransform::Void,
+        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+            SqlWritePartitionTransform::Identity
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+            SqlWritePartitionTransform::Year
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+            SqlWritePartitionTransform::Month
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+            SqlWritePartitionTransform::Day
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+            SqlWritePartitionTransform::Hour
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(buckets) => {
+            SqlWritePartitionTransform::Bucket {
+                buckets: u32::try_from(*buckets)
+                    .map_err(|_| format!("Iceberg partition bucket count {buckets} is invalid"))?,
+            }
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
+            SqlWritePartitionTransform::Truncate {
+                width: u32::try_from(*width)
+                    .map_err(|_| format!("Iceberg partition truncate width {width} is invalid"))?,
+            }
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+            SqlWritePartitionTransform::Void
+        }
         unsupported => {
             return Err(format!(
                 "Iceberg write target uses unsupported partition transform {unsupported}"
@@ -762,18 +781,26 @@ mod tests {
 
     #[test]
     fn sqlx2_write_binding_preserves_hidden_mv_target_fields() {
-        let schema = iceberg::spec::Schema::builder()
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "region",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    "__nova_base_row_id",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "region",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        "__nova_base_row_id",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("target schema");

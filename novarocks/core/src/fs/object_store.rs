@@ -22,8 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use opendal::Operator;
-use opendal::layers::{
+use novarocks_connector_iceberg::opendal::Operator;
+use novarocks_connector_iceberg::opendal::layers::{
     ConcurrentLimitLayer, HttpClientLayer, RetryInterceptor, RetryLayer, TimeoutLayer,
 };
 
@@ -267,7 +267,7 @@ impl ObjectStoreRetryInterceptor {
 }
 
 impl RetryInterceptor for ObjectStoreRetryInterceptor {
-    fn intercept(&self, err: &opendal::Error, dur: Duration) {
+    fn intercept(&self, err: &novarocks_connector_iceberg::opendal::Error, dur: Duration) {
         let control = retry_log_control();
         let err_text = err.to_string();
         let err_lower = err_text.to_ascii_lowercase();
@@ -506,7 +506,7 @@ fn build_raw_object_store_operator(bucket: &str, cfg: &ObjectStoreConfig) -> Res
     let local_endpoint = is_local_endpoint(&endpoint);
     let use_path_style = should_use_path_style(cfg);
 
-    let mut builder = opendal::services::S3::default()
+    let mut builder = novarocks_connector_iceberg::opendal::services::S3::default()
         .endpoint(&endpoint)
         .bucket(bucket)
         .region(effective_s3_region(cfg.region.as_deref()))
@@ -529,7 +529,9 @@ fn build_raw_object_store_operator(bucket: &str, cfg: &ObjectStoreConfig) -> Res
             .no_proxy()
             .build()
             .context("build reqwest client without proxy for local object endpoint")?;
-        op = op.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(client)));
+        op = op.layer(HttpClientLayer::new(
+            novarocks_connector_iceberg::opendal::raw::HttpClient::with(client),
+        ));
     }
 
     if let Some(timeout_layer) = build_timeout_layer(cfg) {

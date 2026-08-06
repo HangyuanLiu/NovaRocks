@@ -12,7 +12,7 @@ use novarocks_fs::{
     FileReadRange, FileReadRequest, FsAccessHandle, PhysicalPruning, open_file_reader,
 };
 
-pub(crate) fn read_parquet_batches(
+pub fn read_parquet_batches(
     access: &FsAccessHandle,
     path: &str,
     file_size: Option<u64>,
@@ -64,7 +64,7 @@ pub(crate) fn read_parquet_batches(
     Ok(batches)
 }
 
-pub(crate) fn read_bytes(
+pub fn read_bytes(
     access: &FsAccessHandle,
     path: &str,
     file_size: Option<u64>,

@@ -247,11 +247,7 @@ impl ThetaSketchHandle {
     /// state.  This is intentionally crate-visible: it lets the native
     /// Iceberg statistics provider emit standard Puffin blobs without making
     /// an Iceberg representation part of the provider-neutral SPI.
-    pub(crate) fn from_compact_parts(
-        lg_k: u8,
-        theta: u64,
-        hashes: Vec<u64>,
-    ) -> Result<Self, String> {
+    pub fn from_compact_parts(lg_k: u8, theta: u64, hashes: Vec<u64>) -> Result<Self, String> {
         if !(5..=16).contains(&lg_k) {
             return Err("Theta compact lg_k must be between 5 and 16".to_string());
         }

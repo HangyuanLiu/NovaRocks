@@ -265,7 +265,7 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     assert_eq!(file.delete_files.len(), 1);
     assert_eq!(
         file.delete_files[0].file_content,
-        crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality
+        novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality
     );
     assert_eq!(
         seen_column_names

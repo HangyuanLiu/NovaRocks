@@ -147,7 +147,7 @@ pub(crate) fn change_partition_value_to_mv_value(
 
 /// Maps a contract transform to the manifest text produced by
 /// `crate::connector::iceberg::changes::change_partition_transform_name`,
-/// which uses `{:?}` (Rust Debug) on `iceberg::spec::Transform` and lowercases
+/// which uses `{:?}` (Rust Debug) on `novarocks_connector_iceberg::iceberg::spec::Transform` and lowercases
 /// the result. This gives `bucket(8)` / `truncate(16)` with round parens,
 /// NOT the `bucket[8]` form from Iceberg's `Display` impl. Returns `None` for
 /// `Void` — void partitions carry no useful pruning information.
@@ -465,9 +465,9 @@ mod tests {
         // sure the symbol is visible at the call site. If this fn ever becomes
         // private again, this test will fail to compile.
         let _fn_ptr: fn(
-            &iceberg::spec::TableMetadata,
+            &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
             i32,
-            &iceberg::spec::Struct,
+            &novarocks_connector_iceberg::iceberg::spec::Struct,
         ) -> Result<
             Vec<crate::connector::iceberg::changes::ChangePartitionFieldValue>,
             crate::connector::iceberg::changes::ChangeError,

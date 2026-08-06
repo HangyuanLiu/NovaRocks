@@ -26,10 +26,6 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::DataType;
 
 use crate::connector::ConnectorRegistry;
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
-    IcebergTableInfo,
-};
 use crate::query_execution::preparation::scan::{
     ResolvedIcebergFileScan, ResolvedReadReason, ResolvedScanExecution, ScanBindingResolver,
 };
@@ -42,6 +38,10 @@ use crate::sql::planner::payload::PlanScanNode;
 use crate::sql::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 use crate::sql::planner::table::{ScanSource, TableDef};
 use novarocks_catalog::schema::ColumnDef;
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef,
+    IcebergTableInfo,
+};
 
 fn prepare_scan_bindings(
     plan: &DistributedPlan,
@@ -327,11 +327,11 @@ fn data_file(path: &str) -> IcebergDataFileInfo {
 fn equality_delete_file(
     equality_column_names: Vec<&str>,
     equality_field_ids: Vec<i32>,
-) -> crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
-    crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
+    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
         path: "s3://bucket/eq-delete.parquet".to_string(),
-        file_format: crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality,
+        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality,
         length: Some(1),
         content_offset: None,
         content_size_in_bytes: None,
@@ -458,10 +458,10 @@ fn resolved_data_delta() -> ResolvedScanExecution {
         ResolvedScanExecution::IcebergMetadata(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
     };
-    delta.runtime_plan.change_files = vec![crate::connector::iceberg::delta::DeltaSourceFile {
+    delta.runtime_plan.change_files = vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
         path: "s3://bucket/delta-added.parquet".to_string(),
         size: 128,
-        role: crate::connector::iceberg::delta::DeltaSourceRole::DataFile,
+        role: novarocks_connector_iceberg::delta::DeltaSourceRole::DataFile,
         partition_spec_id: Some(0),
         partition_key: Some("Struct([])".to_string()),
         first_row_id: Some(100),

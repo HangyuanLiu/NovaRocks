@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::datatypes::SchemaRef;
 use base64::Engine;
 use bytes::Bytes;
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use serde::{Deserialize, Serialize};
 
@@ -37,12 +37,10 @@ use novarocks_spi::connector::{
 };
 
 use super::commit::DeletionVector;
-use super::delete_file::{IcebergFileContent, IcebergFileFormat};
 use super::report::{
     IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
     partition_path_from_struct,
 };
-use super::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 use super::sink_plan::{
     IcebergSinkMode, IcebergSinkObjectStoreConfig, IcebergSinkPlan, PositionDeleteDataFilePartition,
 };
@@ -53,6 +51,8 @@ use super::write_descriptor::{
 use crate::engine::query_planning::write_sink::{
     IcebergWriteFileCompression, IcebergWriteSinkMode, IcebergWriteSinkSpec,
 };
+use novarocks_connector_iceberg::delete_file::{IcebergFileContent, IcebergFileFormat};
+use novarocks_connector_iceberg::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 pub(crate) const ICEBERG_WRITE_PAYLOAD_VERSION: u32 = 1;
 
@@ -1632,23 +1632,29 @@ mod tests {
     use crate::connector::iceberg::sink_plan::IcebergSinkObjectStoreConfig;
 
     fn metadata() -> TableMetadata {
-        iceberg::spec::TableMetadataBuilder::from_table_creation(
-            iceberg::TableCreation::builder()
+        novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
+            novarocks_connector_iceberg::iceberg::TableCreation::builder()
                 .name("t".to_string())
                 .location("file:///warehouse/db/t".to_string())
                 .schema(
-                    iceberg::spec::Schema::builder()
+                    novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                         .with_schema_id(1)
-                        .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                            1,
-                            "id",
-                            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                        ))])
+                        .with_fields(vec![Arc::new(
+                            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                                1,
+                                "id",
+                                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                                ),
+                            ),
+                        )])
                         .build()
                         .expect("schema"),
                 )
-                .partition_spec(iceberg::spec::PartitionSpec::unpartition_spec())
-                .format_version(iceberg::spec::FormatVersion::V2)
+                .partition_spec(
+                    novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+                )
+                .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2)
                 .build(),
         )
         .expect("metadata builder")
@@ -1673,7 +1679,7 @@ mod tests {
                     partition_path: String::new(),
                     null_fingerprint: String::new(),
                     partition_spec_id: 0,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
                 split_offsets: Some(vec![4, 12]),
                 column_stats: Some(IcebergColumnStats {
@@ -1743,7 +1749,7 @@ mod tests {
     fn test_sink_spec() -> IcebergWriteSinkSpec {
         IcebergWriteSinkSpec {
             mode: IcebergWriteSinkMode::Data,
-            iceberg: crate::connector::iceberg::scan_model::IcebergTableInfo {
+            iceberg: novarocks_connector_iceberg::scan_model::IcebergTableInfo {
                 catalog: "test_catalog".to_string(),
                 namespace: "test_db".to_string(),
                 table: "target_orders".to_string(),
@@ -1751,9 +1757,9 @@ mod tests {
                 current_snapshot_id: Some(1),
                 schema_id: 1,
                 location: "file:///warehouse/target_orders".to_string(),
-                schema: crate::connector::iceberg::scan_model::IcebergSchemaDef {
+                schema: novarocks_connector_iceberg::scan_model::IcebergSchemaDef {
                     fields: vec![
-                        crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
+                        novarocks_connector_iceberg::scan_model::IcebergSchemaFieldDef {
                             field_id: 1,
                             name: "id".to_string(),
                             initial_default: None,
@@ -1785,23 +1791,28 @@ mod tests {
     }
 
     fn unpartitioned_metadata_json() -> String {
-        let schema = iceberg::spec::Schema::builder()
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                1,
-                "id",
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-            ))])
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                    ),
+                ),
+            )])
             .build()
             .expect("schema");
-        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
-            .build()
-            .expect("partition spec");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let partition_spec =
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
+                .build()
+                .expect("partition spec");
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema,
             partition_spec,
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             "file:///warehouse/target_orders".to_string(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("metadata builder")
@@ -2202,7 +2213,7 @@ mod tests {
             data_file.clone(),
             PositionDeleteDataFilePartition {
                 partition_spec_id: metadata.default_partition_spec_id(),
-                partition_values: iceberg::spec::Struct::empty(),
+                partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             },
         )]);
         let payload =
@@ -2245,7 +2256,7 @@ mod tests {
             data_file.clone(),
             PositionDeleteDataFilePartition {
                 partition_spec_id: metadata.default_partition_spec_id(),
-                partition_values: iceberg::spec::Struct::empty(),
+                partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             },
         )]);
         let mut vector = DeletionVector::new();

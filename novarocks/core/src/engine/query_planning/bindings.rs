@@ -29,14 +29,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
-use crate::connector::iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
 use crate::sql::binding::{SqlTableBindingId, SqlTableBindingScopeId};
 use crate::sql::catalog::ResolvedAnalyzerTable;
 use crate::sql::planner::table::{
     ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
     SqlUkFkTableFacts,
+};
+use novarocks_connector_iceberg::scan_model::{
+    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -307,7 +307,9 @@ pub(crate) fn sql_ukfk_facts_from_admitted_table(table: &IcebergTableInfo) -> Sq
     let Some(serialized) = table.serialized_metadata.as_deref() else {
         return SqlUkFkTableFacts::default();
     };
-    let Ok(metadata) = serde_json::from_str::<iceberg::spec::TableMetadata>(serialized) else {
+    let Ok(metadata) = serde_json::from_str::<
+        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    >(serialized) else {
         return SqlUkFkTableFacts::default();
     };
     let properties = metadata
@@ -584,10 +586,10 @@ impl QueryTableBindingStore {
     /// or latest-generation acquire is possible here.
     pub(crate) fn iceberg_data_file_binding_id(
         &self,
-        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
-        binding: crate::connector::iceberg::scan_model::IcebergDataFileBinding,
+        table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
+        binding: novarocks_connector_iceberg::scan_model::IcebergDataFileBinding,
     ) -> Option<SqlTableBindingId> {
-        use crate::connector::iceberg::scan_model::IcebergDataFileBinding;
+        use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 
         let key = match binding {
             IcebergDataFileBinding::ExplicitFiles => table.current_snapshot_id.map(|snapshot_id| {
@@ -616,7 +618,7 @@ impl QueryTableBindingStore {
     /// alias through a distinct table handle and schema version.
     pub(crate) fn metadata_binding_id(
         &self,
-        table: &crate::connector::iceberg::scan_model::IcebergTableInfo,
+        table: &novarocks_connector_iceberg::scan_model::IcebergTableInfo,
         kind: SqlMetadataTableKind,
     ) -> Option<SqlTableBindingId> {
         let key =

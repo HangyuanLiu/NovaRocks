@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use iceberg::spec::{DataContentType, DataFileFormat, Datum, Struct};
+use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat, Datum, Struct};
 
 /// Selects which Iceberg commit action to run for a given write transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

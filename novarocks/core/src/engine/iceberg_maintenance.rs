@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use iceberg::Catalog;
-use iceberg::{NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::engine::StandaloneState;

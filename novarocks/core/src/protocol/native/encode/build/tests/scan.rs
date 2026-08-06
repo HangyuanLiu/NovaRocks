@@ -20,11 +20,11 @@ use super::*;
 fn equality_delete_file(
     equality_column_names: Vec<&str>,
     equality_field_ids: Vec<i32>,
-) -> crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
-    crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
+    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
         path: "s3://bucket/eq-delete.parquet".to_string(),
-        file_format: crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Equality,
+        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Equality,
         length: Some(1),
         content_offset: None,
         content_size_in_bytes: None,
@@ -40,9 +40,9 @@ fn equality_delete_file(
 }
 
 fn iceberg_data_file(
-    delete_files: Vec<crate::connector::iceberg::scan_model::IcebergDeleteFileInfo>,
-) -> crate::connector::iceberg::scan_model::IcebergDataFileInfo {
-    crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+    delete_files: Vec<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo>,
+) -> novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
+    novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
         path: "s3://bucket/data.parquet".to_string(),
         size: 128,
         row_count: Some(10),
@@ -63,12 +63,12 @@ fn iceberg_i32_stats_file(
     path: &str,
     min: i32,
     max: i32,
-) -> crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
     let mut file = iceberg_data_file(Vec::new());
     file.path = path.to_string();
     file.column_stats = Some(HashMap::from([(
         "id".to_string(),
-        crate::connector::iceberg::scan_model::IcebergColumnStats {
+        novarocks_connector_iceberg::scan_model::IcebergColumnStats {
             null_count: Some(0),
             value_count: Some(10),
             column_size: None,
@@ -82,16 +82,16 @@ fn iceberg_i32_stats_file(
 fn iceberg_identity_partition_file(
     path: &str,
     id: i32,
-) -> crate::connector::iceberg::scan_model::IcebergDataFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDataFileInfo {
     let mut file = iceberg_data_file(Vec::new());
     file.path = path.to_string();
     file.partition_key = Some(format!("Struct([{id}])"));
     file.partition_values = vec![
-        crate::connector::iceberg::scan_model::IcebergPartitionFieldValue {
+        novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue {
             source_column: "id".to_string(),
             field_name: "id".to_string(),
             transform: "identity".to_string(),
-            value: Some(crate::connector::iceberg::scan_model::IcebergPartitionValue::Int32(id)),
+            value: Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int32(id)),
         },
     ];
     file
@@ -99,11 +99,11 @@ fn iceberg_identity_partition_file(
 
 fn position_delete_file(
     path: &str,
-) -> crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
-    crate::connector::iceberg::scan_model::IcebergDeleteFileInfo {
+) -> novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
+    novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo {
         path: path.to_string(),
-        file_format: crate::connector::iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
-        file_content: crate::connector::iceberg::scan_model::IcebergDeleteFileContent::Position,
+        file_format: novarocks_connector_iceberg::scan_model::IcebergDeleteFileFormat::Parquet,
+        file_content: novarocks_connector_iceberg::scan_model::IcebergDeleteFileContent::Position,
         length: Some(1),
         content_offset: None,
         content_size_in_bytes: None,
@@ -156,7 +156,7 @@ fn id_eq_literal(value: i64) -> TypedExpr {
 }
 
 fn iceberg_registry(
-    files: Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo>,
+    files: Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
 ) -> ConnectorRegistry {
     let registry = ConnectorRegistry::new();
     crate::connector::iceberg::provider::register_planned_files_fixture(
@@ -218,7 +218,7 @@ fn native_planned_data_files(
         NativeFragmentBundle,
         Vec<BoundarySchemaReport>,
     ),
-) -> Vec<crate::connector::iceberg::scan_model::IcebergDataFileInfo> {
+) -> Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo> {
     native_connector_splits(result)
         .iter()
         .map(|split| {

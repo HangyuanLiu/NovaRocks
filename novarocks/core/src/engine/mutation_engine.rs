@@ -25,7 +25,8 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use crate::connector::iceberg::commit::CommitServiceError;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;
 
@@ -254,7 +255,7 @@ impl MutationEngine for Arc<crate::engine::StandaloneState> {
                         .current_snapshot()
                         .map(|snapshot| snapshot.snapshot_id())
                 } else {
-                    crate::connector::iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
+                    novarocks_connector_iceberg::ref_snapshot::resolve_branch_head_snapshot_id(
                         prepared.table.metadata(),
                         &prepared.target_ref,
                     )?
@@ -493,7 +494,8 @@ mod tests {
         CoreMutationAbort, CoreMutationPrepared, MutationAbort, MutationEngine, MutationOperation,
         MutationStatementKind, STAGED, parse_merge_statement, parse_update_statement,
     };
-    use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+    use crate::connector::iceberg::commit::CommitServiceError;
+    use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
     use crate::engine::mutation_flow::MutationExecution;
     use crate::query_execution::ConnectorWriteCompletion;
     use crate::query_execution::outcome::QueryExecutionResult;
