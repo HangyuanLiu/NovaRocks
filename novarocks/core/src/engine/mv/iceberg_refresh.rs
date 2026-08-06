@@ -35,9 +35,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::engine_error::EngineError;
 use crate::connector::iceberg::changes::plan_changes;
-use crate::connector::iceberg::commit::mv_provenance::{
-    MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
-};
 use crate::connector::iceberg::commit::{
     CleanupAttempt, CommitServiceError, IcebergCommitCollector, MvRefreshSnapshotMarker,
     PositionDeleteGroup, RecoveryEvidence, RunInput, run_iceberg_commit,
@@ -180,6 +177,9 @@ use crate::sql::planner::vocabulary::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
+use novarocks_connector_iceberg::commit::{
+    MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
+};
 use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,

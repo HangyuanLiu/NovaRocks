@@ -2483,19 +2483,22 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
                     "published MV recovery snapshot is missing",
                 )
             })?;
-            let provenance = crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1::from_snapshot_summary(snapshot)
-                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
-                    .filter(|provenance| {
-                        provenance.refresh_id == descriptor.refresh_id
-                            && provenance.mv_id == descriptor.mv_id
-                            && provenance.token == descriptor.marker_token.as_ref()
-                    })
-                    .ok_or_else(|| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::CorruptData,
-                            "published MV recovery snapshot lacks matching provenance",
-                        )
-                    })?;
+            let provenance =
+                novarocks_connector_iceberg::commit::MvProvenanceV1::from_snapshot_summary(
+                    snapshot,
+                )
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?
+                .filter(|provenance| {
+                    provenance.refresh_id == descriptor.refresh_id
+                        && provenance.mv_id == descriptor.mv_id
+                        && provenance.token == descriptor.marker_token.as_ref()
+                })
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        "published MV recovery snapshot lacks matching provenance",
+                    )
+                })?;
             let total_records = snapshot
                 .summary()
                 .additional_properties

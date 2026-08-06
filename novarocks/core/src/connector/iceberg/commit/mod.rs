@@ -29,7 +29,8 @@ mod equality_delete_writer;
 pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
-pub(crate) mod mv_provenance;
+#[cfg(test)]
+mod mv_provenance_tests;
 mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
@@ -61,9 +62,10 @@ pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_fil
 pub use fast_append::FastAppendCommit;
 pub(crate) use fast_append::{StagedFastAppendAction, build_staged_fast_append_action};
 pub use novarocks_connector_iceberg::commit::{
-    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
-    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
-    snapshot_matches_refresh_marker,
+    MV_ID_PROP, MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ID_PROP,
+    MV_REFRESH_ROW_COUNT_PROP, MV_REFRESH_TOKEN_PROP, MvProvenanceV1, MvRefreshPublishOutcome,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, ProvenanceBase, RefreshTechnique,
+    publish_staging_branch_to_main, snapshot_matches_refresh_marker,
 };
 pub use overwrite::OverwriteCommit;
 pub use overwrite_partitions::OverwritePartitionsCommit;

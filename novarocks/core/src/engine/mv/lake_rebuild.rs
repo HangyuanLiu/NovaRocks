@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use novarocks_catalog::identifier::normalize_identifier;
 
-use crate::connector::iceberg::commit::mv_provenance::MvProvenanceV1;
 use crate::engine::StandaloneState;
 use crate::engine::mv::iceberg_discovery::{DiscoveredIcebergMv, discover_iceberg_mvs_from_entry};
 use crate::mv::dependency::model::{
@@ -45,6 +44,7 @@ use crate::mv::model::MvStorageEngine;
 use crate::mv::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::persistence::descriptor::DescriptorDependency;
+use novarocks_connector_iceberg::commit::MvProvenanceV1;
 
 fn namespace_is_addressable(namespace: &str) -> bool {
     normalize_identifier(namespace).is_ok()
@@ -309,7 +309,6 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 mod tests {
     use super::namespace_is_addressable;
     use super::*;
-    use crate::connector::iceberg::commit::mv_provenance::{ProvenanceBase, RefreshTechnique};
     use crate::mv::persistence::descriptor::{DescriptorDependency, MvDescriptorV1};
     use crate::mv::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
@@ -317,6 +316,7 @@ mod tests {
         MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
         TargetContract, TargetVisibleColumn,
     };
+    use novarocks_connector_iceberg::commit::{ProvenanceBase, RefreshTechnique};
 
     fn sample_contract() -> MvSchemaContract {
         MvSchemaContract {

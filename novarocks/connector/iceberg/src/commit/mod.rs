@@ -21,11 +21,16 @@
 //! depend on Core SQL, execution, or application state.
 
 pub mod abort;
+pub mod mv_provenance;
 pub mod mv_refresh_ref;
 pub mod ref_action;
 pub mod statistics;
 
 pub use abort::{AbortLog, CleanupError};
+pub use mv_provenance::{
+    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1,
+    ProvenanceBase, RefreshTechnique,
+};
 pub use mv_refresh_ref::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
