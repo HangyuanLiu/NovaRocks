@@ -37,8 +37,8 @@ pub fn compose_backend_execution_installers(
     let object_store = config.connector.object_store_config().map_err(|error| {
         anyhow::anyhow!("resolve connector startup object-store binding: {error}")
     })?;
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|error| anyhow::anyhow!("resolve Tokio runtime for Iceberg installer: {error}"))?;
+    let runtime = novarocks::runtime::global_async_runtime::data_runtime_handle()
+        .map_err(|error| anyhow::anyhow!("resolve data runtime for Iceberg installer: {error}"))?;
     let binding = IcebergReadBinding::new(
         object_store,
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
