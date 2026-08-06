@@ -47,9 +47,6 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
     target_ref_snapshot_id, write_manifest_list,
 };
-use super::puffin_dv::{
-    DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
-};
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
@@ -57,6 +54,9 @@ use super::row_delta_dv_metadata::{
 };
 use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use novarocks_connector_iceberg::commit::abort::AbortLog;
+use novarocks_connector_iceberg::commit::{
+    DeletionVector, read_deletion_vector_puffin, write_single_deletion_vector_puffin,
+};
 
 pub struct RowDeltaDvFromFilesCommit;
 
@@ -1060,7 +1060,7 @@ mod tests {
         );
         assert_eq!(data_file.record_count(), 3);
 
-        let merged = super::super::puffin_dv::read_deletion_vector_puffin(
+        let merged = novarocks_connector_iceberg::commit::read_deletion_vector_puffin(
             &file_io,
             data_file.file_path(),
             data_file.content_offset().expect("content offset"),
@@ -1221,11 +1221,11 @@ mod tests {
         referenced: &str,
         positions: &[u64],
     ) -> WrittenFile {
-        let mut dv = super::super::DeletionVector::new();
+        let mut dv = novarocks_connector_iceberg::commit::DeletionVector::new();
         for pos in positions {
             dv.insert(*pos).expect("insert position");
         }
-        let written = super::super::puffin_dv::write_single_deletion_vector_puffin(
+        let written = novarocks_connector_iceberg::commit::write_single_deletion_vector_puffin(
             file_io, path, referenced, &dv,
         )
         .await

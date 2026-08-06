@@ -23,6 +23,7 @@
 pub mod abort;
 pub mod mv_provenance;
 pub mod mv_refresh_ref;
+pub mod puffin_dv;
 pub mod ref_action;
 pub mod statistics;
 
@@ -35,6 +36,11 @@ pub use mv_refresh_ref::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
     snapshot_matches_refresh_marker,
+};
+pub use puffin_dv::{
+    DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
+    read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
+    write_single_deletion_vector_puffin,
 };
 pub use ref_action::{
     RefAction, RefActionOutcome, RefActionPlan, execute_ref_action, lower_ref_action,

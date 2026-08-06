@@ -3237,9 +3237,11 @@ dependencies = [
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow",
  "async-trait",
  "bytes",
+ "crc32fast",
  "datasketches",
  "iceberg",
  "iceberg-catalog-hms",
@@ -3250,6 +3252,7 @@ dependencies = [
  "opendal",
  "ordered-float 4.6.0",
  "parquet",
+ "roaring 0.10.12",
  "serde",
  "serde_json",
  "sha2",

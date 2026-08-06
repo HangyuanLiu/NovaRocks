@@ -40,11 +40,11 @@ use uuid::Uuid;
 use super::helpers::{
     current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
-use super::puffin_dv::{
+use super::retry::{commit_with_retry, is_retryable_commit_conflict};
+use novarocks_connector_iceberg::commit::{
     DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
     write_multi_deletion_vector_puffin,
 };
-use super::retry::{commit_with_retry, is_retryable_commit_conflict};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewritePositionDeleteOptions {
@@ -1114,7 +1114,7 @@ fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::commit::puffin_dv::write_single_deletion_vector_puffin;
+    use novarocks_connector_iceberg::commit::write_single_deletion_vector_puffin;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::path::Path;

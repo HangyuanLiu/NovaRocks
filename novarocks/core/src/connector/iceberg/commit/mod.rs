@@ -34,7 +34,6 @@ mod mv_provenance_tests;
 mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
-mod puffin_dv;
 pub mod remove_orphan_files;
 pub mod retry;
 mod rewrite_data_files;
@@ -62,6 +61,11 @@ pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_fil
 pub use fast_append::FastAppendCommit;
 pub(crate) use fast_append::{StagedFastAppendAction, build_staged_fast_append_action};
 pub use novarocks_connector_iceberg::commit::{
+    DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
+    read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
+    write_single_deletion_vector_puffin,
+};
+pub use novarocks_connector_iceberg::commit::{
     MV_ID_PROP, MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ID_PROP,
     MV_REFRESH_ROW_COUNT_PROP, MV_REFRESH_TOKEN_PROP, MvProvenanceV1, MvRefreshPublishOutcome,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, ProvenanceBase, RefreshTechnique,
@@ -70,11 +74,6 @@ pub use novarocks_connector_iceberg::commit::{
 pub use overwrite::OverwriteCommit;
 pub use overwrite_partitions::OverwritePartitionsCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
-pub use puffin_dv::{
-    DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
-    read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
-    write_single_deletion_vector_puffin,
-};
 pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 #[allow(unused_imports)]
