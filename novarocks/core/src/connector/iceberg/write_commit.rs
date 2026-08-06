@@ -19,11 +19,13 @@ use super::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterReports, route_change_stream_staged_reports,
 };
 use super::commit::{
-    AbortLog, CleanupAttempt, CleanupPathMapper, CommitOutcome, CommitServiceError,
-    CowUpdateRewriteSet, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
+    CleanupAttempt, CleanupPathMapper, CommitServiceError, CowUpdateRewriteSet,
+    IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use super::report::IcebergWriterReport;
 use super::write_contract::decode_write_receipt;
+use crate::connector::iceberg::commit::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::AbortLog;
 
 /// Convert a sealed provider commit decision into the application-neutral
 /// durable outcome consumed by the frontend lifecycle runner.

@@ -45,11 +45,12 @@ use super::catalog::registry::{
     data_file_to_written_file, load_table,
 };
 use super::commit::{
-    CleanupAttempt, CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError,
-    IcebergCommitCollector, RecoveryEvidence, RunInput, run_iceberg_commit,
+    CleanupAttempt, CleanupPathMapper, CommitServiceError, IcebergCommitCollector,
+    RecoveryEvidence, RunInput, run_iceberg_commit,
 };
 use super::fs_io;
 use super::provider::decode_data_mutation_table_target;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;

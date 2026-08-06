@@ -2364,7 +2364,11 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     let catalog = super::catalog::registry::build_iceberg_catalog(&entry)
                         .map_err(map_iceberg_error)?;
                     super::catalog::registry::block_on_iceberg(async {
-                        super::commit::execute_ref_action(catalog.as_ref(), &action).await
+                        novarocks_connector_iceberg::commit::execute_ref_action(
+                            catalog.as_ref(),
+                            &action,
+                        )
+                        .await
                     })
                     .map_err(|error| {
                         ConnectorError::new(
@@ -2373,10 +2377,12 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                         )
                     })?
                     .map(|outcome| match outcome {
-                        super::commit::RefActionOutcome::Committed => {
+                        novarocks_connector_iceberg::commit::RefActionOutcome::Committed => {
                             ExternalMutationEffect::Applied
                         }
-                        super::commit::RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
+                        novarocks_connector_iceberg::commit::RefActionOutcome::NoOp => {
+                            ExternalMutationEffect::NoOp
+                        }
                     })
                     .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
                 }
@@ -3656,7 +3662,7 @@ fn lower_ref_action(
     namespace: &str,
     table: &str,
     catalog: &str,
-) -> Result<super::commit::RefActionPlan, ConnectorError> {
+) -> Result<novarocks_connector_iceberg::commit::RefActionPlan, ConnectorError> {
     use novarocks_spi::connector::{ConnectorRefAction, ConnectorRefKind};
 
     fn assert_kind(
@@ -3713,18 +3719,22 @@ fn lower_ref_action(
                 CreateOrReplacePolicy::ReplaceIfExists => (true, false),
             };
             match kind {
-                ConnectorRefKind::Branch => super::commit::RefAction::CreateBranch {
-                    name: name.to_string(),
-                    snapshot_id,
-                    replace,
-                    if_not_exists,
-                },
-                ConnectorRefKind::Tag => super::commit::RefAction::CreateTag {
-                    name: name.to_string(),
-                    snapshot_id,
-                    replace,
-                    if_not_exists,
-                },
+                ConnectorRefKind::Branch => {
+                    novarocks_connector_iceberg::commit::RefAction::CreateBranch {
+                        name: name.to_string(),
+                        snapshot_id,
+                        replace,
+                        if_not_exists,
+                    }
+                }
+                ConnectorRefKind::Tag => {
+                    novarocks_connector_iceberg::commit::RefAction::CreateTag {
+                        name: name.to_string(),
+                        snapshot_id,
+                        replace,
+                        if_not_exists,
+                    }
+                }
             }
         }
         ConnectorRefAction::Drop { kind, name, policy } => {
@@ -3737,11 +3747,13 @@ fn lower_ref_action(
             assert_kind(metadata, &name, kind)?;
             let if_exists = policy == DropPolicy::NoOpIfMissing;
             match kind {
-                ConnectorRefKind::Branch => super::commit::RefAction::DropBranch {
-                    name: name.to_string(),
-                    if_exists,
-                },
-                ConnectorRefKind::Tag => super::commit::RefAction::DropTag {
+                ConnectorRefKind::Branch => {
+                    novarocks_connector_iceberg::commit::RefAction::DropBranch {
+                        name: name.to_string(),
+                        if_exists,
+                    }
+                }
+                ConnectorRefKind::Tag => novarocks_connector_iceberg::commit::RefAction::DropTag {
                     name: name.to_string(),
                     if_exists,
                 },
@@ -3754,7 +3766,7 @@ fn lower_ref_action(
             ));
         }
     };
-    Ok(super::commit::RefActionPlan {
+    Ok(novarocks_connector_iceberg::commit::RefActionPlan {
         catalog: catalog.to_string(),
         namespace: namespace.to_string(),
         table: table.to_string(),
@@ -4566,7 +4578,7 @@ impl StatisticsCollection for IcebergControlProvider {
         let catalog =
             super::catalog::registry::build_iceberg_catalog(&entry).map_err(map_iceberg_error)?;
         match super::catalog::registry::block_on_iceberg(
-            super::commit::statistics::commit_statistics_file(
+            novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
                 &loaded.table,
                 catalog.as_ref(),
                 statistics_file,

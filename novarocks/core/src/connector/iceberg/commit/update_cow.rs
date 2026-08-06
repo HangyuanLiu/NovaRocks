@@ -38,7 +38,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
@@ -47,8 +46,9 @@ use super::helpers::{
     required_target_ref_snapshot_id, snapshot_summary, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 // `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
 // `WrittenFile` is `PartialEq`-only (it carries stats fields not suited to `Eq`).
@@ -1182,7 +1182,7 @@ mod tests {
         written: Vec<WrittenFile>,
     ) -> Result<CommitOutcome, String> {
         use super::super::collector::IcebergCommitCollector;
-        use super::super::types::CommitOpKind;
+        use crate::connector::iceberg::commit::types::CommitOpKind;
 
         let metadata = fixture.table.metadata();
         let staging_dir = format!("{}/staging", metadata.location());

@@ -39,11 +39,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;
 
-use super::abort::AbortLog;
 use super::position_delete_writer::PositionDeleteGroup;
-use super::types::{CommitOpKind, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
 use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::connector::iceberg::stats_assembler::FileSketchSet;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 #[derive(Default)]
 struct StagedEffectCounters {

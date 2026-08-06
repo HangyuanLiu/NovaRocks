@@ -27,7 +27,7 @@ use novarocks_connector_iceberg::iceberg::spec::{
 use novarocks_connector_iceberg::iceberg::table::Table;
 
 use super::puffin_dv::{DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin};
-use super::types::WrittenFile;
+use crate::connector::iceberg::commit::types::WrittenFile;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WrittenDvFile {

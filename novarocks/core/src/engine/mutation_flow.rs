@@ -28,9 +28,10 @@ use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
 use sha2::{Digest, Sha256};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergUpdateMode};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector, IcebergUpdateMode,
-    ensure_iceberg_write_supported, select_iceberg_update_mode,
+    CommitServiceError, IcebergCommitCollector, ensure_iceberg_write_supported,
+    select_iceberg_update_mode,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;
 use crate::connector::iceberg::write_contract::encode_data_sink_spec_handle_payload;

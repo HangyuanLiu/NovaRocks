@@ -28,7 +28,8 @@ use std::sync::Arc;
 use novarocks_catalog::schema::ColumnDef;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use crate::connector::iceberg::commit::CommitServiceError;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::statistics::StatisticsEngine;
 use crate::engine::{StandaloneState, iceberg_writer};

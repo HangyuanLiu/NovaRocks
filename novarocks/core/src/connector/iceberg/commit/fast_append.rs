@@ -44,7 +44,7 @@ use super::helpers::{
     snapshot_total_records, target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
-use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::stats_assembler::{CommitType, FileSketchSet, StatsAssembler};
 
 pub struct FastAppendCommit;
@@ -212,7 +212,12 @@ pub(crate) async fn register_puffin_stats(
     {
         Ok(Some(stats_file)) => {
             if let Err(err) =
-                super::statistics::commit_statistics_file(table_after, catalog, stats_file).await
+                novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
+                    table_after,
+                    catalog,
+                    stats_file,
+                )
+                .await
             {
                 tracing::warn!(
                     new_snapshot_id,
@@ -261,7 +266,13 @@ pub(crate) async fn carry_forward_puffin_stats(
     for blob in entry.blob_metadata.iter_mut() {
         blob.snapshot_id = new_snapshot_id;
     }
-    if let Err(err) = super::statistics::commit_statistics_file(table_after, catalog, entry).await {
+    if let Err(err) = novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
+        table_after,
+        catalog,
+        entry,
+    )
+    .await
+    {
         tracing::warn!(
             new_snapshot_id,
             error = %err,
@@ -341,7 +352,7 @@ async fn commit_v3_row_lineage_append(
 pub(crate) struct StagedFastAppendAction {
     pub action: ActionCommit,
     pub outcome: Option<CommitOutcome>,
-    pub abort_handle: Arc<super::abort::AbortLog>,
+    pub abort_handle: Arc<novarocks_connector_iceberg::commit::abort::AbortLog>,
 }
 
 /// Build, but do not submit, v2 or v3 fast-append changes for atomic CTAS
@@ -475,7 +486,7 @@ struct FastAppendV3TxnAction {
     partition_spec: PartitionSpecRef,
     schema: SchemaRef,
     schema_id: i32,
-    abort_handle: Arc<super::abort::AbortLog>,
+    abort_handle: Arc<novarocks_connector_iceberg::commit::abort::AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     row_lineage: Option<(u64, u64)>,
     target_ref: String,
@@ -692,7 +703,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
+    use crate::connector::iceberg::commit::CommitOpKind;
+    use crate::connector::iceberg::commit::IcebergCommitCollector;
 
     #[test]
     fn type_compiles() {
@@ -884,7 +896,7 @@ mod tests {
         );
         collector.inject_written_file(test_written_data_file(1));
         let file_io = table.file_io().clone();
-        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let abort_handle = Arc::new(novarocks_connector_iceberg::commit::abort::AbortLog::new());
         let snapshot_properties = BTreeMap::new();
         let action = build_staged_fast_append_action(CommitCtx {
             collector: &collector,
@@ -983,7 +995,7 @@ mod tests {
             )
             .with_table_metadata(metadata.clone()),
         );
-        let abort_handle = Arc::new(super::super::abort::AbortLog::new());
+        let abort_handle = Arc::new(novarocks_connector_iceberg::commit::abort::AbortLog::new());
         let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
         let action = FastAppendV3TxnAction {
             written: vec![test_written_data_file(1)],

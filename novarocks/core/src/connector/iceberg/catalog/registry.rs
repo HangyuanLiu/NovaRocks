@@ -42,9 +42,10 @@ use crate::runtime::global_async_runtime::data_block_on;
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::commit::{
-    CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
-    IcebergWriteMode, WrittenFile, classify_iceberg_write_mode,
+    CommitCtx, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
+    classify_iceberg_write_mode,
 };
+use crate::connector::iceberg::commit::{CommitOpKind, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::fs_io;
 use crate::connector::iceberg::variant_write::parse_variant_shredding_properties;

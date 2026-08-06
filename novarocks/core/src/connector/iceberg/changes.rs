@@ -2455,8 +2455,9 @@ mod tests {
         IcebergCatalogEntry, block_on_iceberg, build_catalog_entry, build_hadoop_catalog,
         create_namespace, create_table, insert_rows, load_table,
     };
+    use crate::connector::iceberg::commit::CommitOpKind;
     use crate::connector::iceberg::commit::{
-        CommitCtx, CommitOpKind, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
+        CommitCtx, IcebergCommitAction, IcebergCommitCollector, OverwriteCommit,
     };
     use crate::sql::parser::ast::IcebergPartitionFieldExpr;
     use crate::sql::{Literal, TableColumnDef};

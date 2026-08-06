@@ -23,7 +23,8 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, CommitServiceError};
+use crate::connector::iceberg::commit::CommitServiceError;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::engine::StandaloneState;
 use crate::query_execution::request_context::QueryExecutionContext;
 use crate::runtime::query_options::QueryOptions;

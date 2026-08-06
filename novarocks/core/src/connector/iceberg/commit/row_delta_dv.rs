@@ -58,7 +58,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{
     carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot, register_puffin_stats,
@@ -75,8 +74,9 @@ use super::row_delta_dv_metadata::{
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
 use crate::connector::iceberg::stats_assembler::CommitType;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct RowDeltaDvCommit;
 

@@ -12,7 +12,8 @@ use novarocks_connector_iceberg::iceberg::TableIdent;
 use crate::connector::iceberg::change_stream_routing::{
     ChangeStreamWriterCommitPlan, ChangeStreamWriterRoutingError,
 };
-use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergCommitCollector};
+use crate::connector::iceberg::commit::IcebergCommitCollector;
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::query_execution::write::WriteCommitInput;
 
 pub(crate) struct ExecutedChangeStreamWrite {

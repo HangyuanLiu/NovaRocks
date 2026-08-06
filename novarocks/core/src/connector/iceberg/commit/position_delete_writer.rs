@@ -24,7 +24,7 @@
 //! given a list of `(data_file_path, pos)` tuples already grouped by data
 //! file, write one Parquet file per group with the v2 position-delete schema
 //! (`[file_path STRING, pos BIGINT]` plus reserved field-ids 2147483546 /
-//! 2147483545) and return a [`super::types::WrittenFile`] with
+//! 2147483545) and return a [`crate::connector::iceberg::commit::types::WrittenFile`] with
 //! `content = PositionDeletes` and `referenced_data_file = <data file path>`.
 
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use super::types::WrittenFile;
+use crate::connector::iceberg::commit::types::WrittenFile;
 
 /// Reserved Iceberg v2 field-id for the `file_path` column of a position
 /// delete file.

@@ -27,6 +27,7 @@
 /// Stable provider identity used by server composition and SPI declarations.
 pub const PROVIDER_ID: &str = "iceberg";
 
+pub mod commit;
 pub mod default_value;
 pub mod delete_file;
 pub mod delta;

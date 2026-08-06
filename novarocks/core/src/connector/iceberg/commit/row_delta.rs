@@ -50,7 +50,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
@@ -58,7 +57,8 @@ use super::helpers::{
     read_snapshot_manifest_list, required_target_ref_snapshot_id, snapshot_summary,
     target_ref_snapshot_id, write_manifest_list,
 };
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct RowDeltaCommit;
 

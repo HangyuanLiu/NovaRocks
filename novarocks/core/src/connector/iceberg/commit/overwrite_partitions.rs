@@ -48,7 +48,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
@@ -59,9 +58,10 @@ use super::helpers::{
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
-use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 use crate::connector::iceberg::partition_spec::{PartitionMatch, partition_match_in_touched};
 use crate::connector::iceberg::stats_assembler::CommitType;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct OverwritePartitionsCommit;
 

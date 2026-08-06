@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
-use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
+use crate::connector::iceberg::commit::IcebergCommitCollector;
+use crate::connector::iceberg::commit::WrittenFile;
 use crate::connector::iceberg::report::IcebergWriterReport;
 use crate::sql::common::ChangeStreamBranchKind;
 use crate::sql::planner::distributed::FragmentId;

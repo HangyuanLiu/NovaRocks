@@ -864,7 +864,7 @@ mod tests {
         let disk_path = stats_path.strip_prefix("file://").unwrap_or(&stats_path);
         std::fs::write(disk_path, b"registered statistics").expect("write stats file");
 
-        crate::connector::iceberg::commit::statistics::commit_statistics_file(
+        novarocks_connector_iceberg::commit::statistics::commit_statistics_file(
             &table,
             catalog.as_ref(),
             novarocks_connector_iceberg::iceberg::spec::StatisticsFile {

@@ -46,9 +46,9 @@ use super::service::{
     CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
 };
 use super::truncate::TruncateCommit;
-use super::types::{CommitOpKind, CommitOutcome};
 use super::update_cow::CowUpdateCommit;
 use super::update_cow::CowUpdateRewriteSet;
+use crate::connector::iceberg::commit::types::{CommitOpKind, CommitOutcome};
 
 pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
 

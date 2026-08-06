@@ -38,4 +38,6 @@ novarocks-spi = { path = "../../spi" }
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }

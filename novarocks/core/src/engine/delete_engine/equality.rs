@@ -28,8 +28,9 @@ use novarocks_connector_iceberg::iceberg::Catalog;
 use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
+    CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
     ensure_equality_delete_single_partition_spec,
 };
 use crate::connector::iceberg::write_commit::IcebergWriteCommitExecutor;

@@ -37,7 +37,7 @@ use super::action::{CommitCtx, IcebergCommitAction};
 use super::collector::IcebergCommitCollector;
 use super::fast_append::FastAppendCommit;
 use super::overwrite_partitions::OverwritePartitionsCommit;
-use super::types::{CommitOpKind, CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOpKind, CommitOutcome, WrittenFile};
 
 /// A minimal local iceberg fixture: a Hadoop catalog, the freshly
 /// `create_table`-ed `Table`, and the matching `TableIdent`. The catalog is

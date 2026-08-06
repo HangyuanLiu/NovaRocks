@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::connector::iceberg::commit::CommitOpKind;
 use bytes::Bytes;
+use novarocks_connector_iceberg::commit::AbortLog;
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, TableCommit, TableRequirement, TableUpdate,
 };
@@ -78,7 +80,7 @@ struct StagedWrite {
     completion: ConnectorWriteOperationCompletion,
     updates: Vec<TableUpdate>,
     expected_snapshot_id: Option<i64>,
-    abort_handle: Arc<super::commit::AbortLog>,
+    abort_handle: Arc<AbortLog>,
     action_built: bool,
 }
 
@@ -492,7 +494,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             completion,
             updates: Vec::new(),
             expected_snapshot_id: None,
-            abort_handle: Arc::new(super::commit::AbortLog::new()),
+            abort_handle: Arc::new(AbortLog::new()),
             action_built: false,
         });
         self.operations
@@ -582,7 +584,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             let table_ident = staged_table.identifier().clone();
             let collector = Arc::new(
                 super::commit::IcebergCommitCollector::new(
-                    super::commit::CommitOpKind::FastAppend,
+                    CommitOpKind::FastAppend,
                     table_ident,
                     None,
                     metadata.last_sequence_number(),

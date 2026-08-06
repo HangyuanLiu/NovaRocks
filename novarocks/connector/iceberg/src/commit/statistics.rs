@@ -17,16 +17,16 @@
 
 //! Shared metadata-only commit for an iceberg Puffin StatisticsFile.
 
-use novarocks_connector_iceberg::iceberg::spec::StatisticsFile;
-use novarocks_connector_iceberg::iceberg::table::Table;
-use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
+use crate::iceberg::spec::StatisticsFile;
+use crate::iceberg::table::Table;
+use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 /// Apply `stats_file` to `table` via a metadata-only `update_statistics`
 /// transaction and commit it through `catalog`. Returns an error on apply or
 /// commit failure (callers decide whether to surface or log it).
-pub(crate) async fn commit_statistics_file(
+pub async fn commit_statistics_file(
     table: &Table,
-    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
+    catalog: &dyn crate::iceberg::Catalog,
     stats_file: StatisticsFile,
 ) -> Result<(), String> {
     let tx = Transaction::new(table);

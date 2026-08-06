@@ -23,10 +23,8 @@
 
 #![allow(dead_code)]
 
-use novarocks_connector_iceberg::iceberg::spec::{SnapshotReference, SnapshotRetention};
-use novarocks_connector_iceberg::iceberg::{
-    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
-};
+use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefActionPlan {

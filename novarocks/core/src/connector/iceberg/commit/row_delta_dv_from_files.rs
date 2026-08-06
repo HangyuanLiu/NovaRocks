@@ -39,7 +39,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{carry_forward_puffin_stats, commit_empty_iceberg_mv_snapshot};
 use super::helpers::{
@@ -56,7 +55,8 @@ use super::row_delta_dv_metadata::{
     group_live_files_by_partition_spec, group_written_dvs_by_partition_spec, partition_spec_by_id,
     to_iceberg_unexpected, write_added_dv_manifest, write_existing_delete_manifest,
 };
-use super::types::{CommitOutcome, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, WrittenFile};
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct RowDeltaDvFromFilesCommit;
 
@@ -743,9 +743,9 @@ mod tests {
     use super::super::position_delete_writer::PositionDeleteGroup;
     use super::super::row_delta_dv_metadata::{LiveFile, dv_data_file};
     use super::super::test_helpers::empty_v3_iceberg_table;
-    use super::super::types::CommitOpKind;
     use super::*;
     use crate::common::types::UniqueId;
+    use crate::connector::iceberg::commit::types::CommitOpKind;
 
     /// M3a Part B: a RowDeltaDvFromFiles commit may carry, in one snapshot,
     /// REUSE data (MOR-UPDATE replacement rows that preserve their `_row_id`s,

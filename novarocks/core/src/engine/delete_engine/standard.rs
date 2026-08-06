@@ -44,9 +44,9 @@ use novarocks_connector_iceberg::iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, IcebergSqlDeleteStrategy};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
-    IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
+    CommitServiceError, IcebergCommitCollector, classify_sql_delete_strategy,
 };
 #[cfg(test)]
 use crate::connector::iceberg::delete_visibility::{

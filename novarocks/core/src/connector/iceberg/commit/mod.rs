@@ -22,7 +22,6 @@
 //! Parquet file produced by the pipeline), and [`CommitOutcome`] (result of a
 //! successful commit).
 
-mod abort;
 mod action;
 mod collector;
 mod data_file;
@@ -36,7 +35,6 @@ mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
 mod puffin_dv;
-mod ref_action;
 pub mod remove_orphan_files;
 pub mod retry;
 mod rewrite_data_files;
@@ -50,7 +48,6 @@ mod run;
 mod selected_rewrite;
 mod service;
 pub mod snapshot_lifecycle_helpers;
-pub(crate) mod statistics;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;
@@ -58,7 +55,6 @@ mod types;
 mod update_cow;
 mod validation;
 
-pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use data_file::written_file_to_iceberg_data_file;
@@ -78,7 +74,6 @@ pub use puffin_dv::{
     read_deletion_vector_puffin_with_range_reader, write_multi_deletion_vector_puffin,
     write_single_deletion_vector_puffin,
 };
-pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
 pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use rewrite_data_files::RewriteDataFilesCommit;
 #[allow(unused_imports)]

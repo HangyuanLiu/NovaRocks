@@ -44,14 +44,14 @@ use crate::exec::row_position::{
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
 };
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::carry_forward_puffin_stats;
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
 };
 use super::overwrite::{build_minimal_data_file, write_added_data_manifest};
-use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use crate::connector::iceberg::commit::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct RewriteDataFilesCommit;
 

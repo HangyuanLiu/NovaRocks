@@ -39,10 +39,11 @@ use crate::connector::iceberg::commit::mv_provenance::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
 use crate::connector::iceberg::commit::{
-    CleanupAttempt, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
-    MvRefreshSnapshotMarker, PositionDeleteGroup, RecoveryEvidence, RunInput, run_iceberg_commit,
+    CleanupAttempt, CommitServiceError, IcebergCommitCollector, MvRefreshSnapshotMarker,
+    PositionDeleteGroup, RecoveryEvidence, RunInput, run_iceberg_commit,
     snapshot_matches_refresh_marker,
 };
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome};
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::iceberg::operation_lifecycle::{
     operation_fact_from_commit_result, operation_fact_from_finalize_failure,
@@ -28729,13 +28730,13 @@ mod tests {
                 token: "token-7".to_string(),
             };
             let staging_branch = "__nova_mv_refresh_3_7";
-            crate::connector::iceberg::commit::execute_ref_action(
+            novarocks_connector_iceberg::commit::execute_ref_action(
                 catalog.as_ref(),
-                &crate::connector::iceberg::commit::RefActionPlan {
+                &novarocks_connector_iceberg::commit::RefActionPlan {
                     catalog: "ice".to_string(),
                     namespace: "test_ns".to_string(),
                     table: "t".to_string(),
-                    action: crate::connector::iceberg::commit::RefAction::CreateBranch {
+                    action: novarocks_connector_iceberg::commit::RefAction::CreateBranch {
                         name: staging_branch.to_string(),
                         snapshot_id: current.expect("main snapshot"),
                         replace: false,
@@ -28938,13 +28939,13 @@ mod tests {
             .await
             .unwrap()
             .new_snapshot_id;
-            crate::connector::iceberg::commit::execute_ref_action(
+            novarocks_connector_iceberg::commit::execute_ref_action(
                 catalog.as_ref(),
-                &crate::connector::iceberg::commit::RefActionPlan {
+                &novarocks_connector_iceberg::commit::RefActionPlan {
                     catalog: "ice".to_string(),
                     namespace: "test_ns".to_string(),
                     table: "t".to_string(),
-                    action: crate::connector::iceberg::commit::RefAction::CreateBranch {
+                    action: novarocks_connector_iceberg::commit::RefAction::CreateBranch {
                         name: staging_branch.to_string(),
                         snapshot_id: initial_snapshot,
                         replace: false,

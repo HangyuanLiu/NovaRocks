@@ -54,7 +54,6 @@ use novarocks_connector_iceberg::iceberg::transaction::{
 use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
-use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
@@ -62,7 +61,8 @@ use super::helpers::{
 use super::overwrite::{
     enumerate_live_all_files, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
-use super::types::CommitOutcome;
+use crate::connector::iceberg::commit::types::CommitOutcome;
+use novarocks_connector_iceberg::commit::abort::AbortLog;
 
 pub struct TruncateCommit;
 

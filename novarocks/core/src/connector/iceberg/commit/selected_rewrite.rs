@@ -28,7 +28,7 @@ use super::row_delta_dv_metadata::{
     group_written_dvs_by_partition_spec, partition_spec_by_id, write_added_dv_manifest,
     write_existing_delete_manifest,
 };
-use super::types::CommitOutcome;
+use crate::connector::iceberg::commit::types::CommitOutcome;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SelectedRewriteFiles {

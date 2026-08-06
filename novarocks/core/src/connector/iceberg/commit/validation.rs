@@ -25,7 +25,7 @@ use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use novarocks_connector_iceberg::iceberg::spec::FormatVersion;
 use novarocks_connector_iceberg::iceberg::table::Table;
 
-use super::types::{
+use crate::connector::iceberg::commit::types::{
     IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
     NOVAROCKS_UPDATE_MODE_COW,
 };
@@ -357,8 +357,8 @@ fn arrow_iceberg_types_compatible(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::NOVAROCKS_UPDATE_MODE_MOR;
     use super::*;
+    use crate::connector::iceberg::commit::types::NOVAROCKS_UPDATE_MODE_MOR;
 
     #[test]
     fn default_sort_order_resolvable_ok_for_unsorted_table() {

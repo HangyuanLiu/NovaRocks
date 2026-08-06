@@ -39,10 +39,11 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn,
-    IcebergCommitCollector, WrittenFile, ensure_iceberg_write_supported,
-    ensure_no_equality_deletes, ensure_overwrite_single_partition_spec,
+    CleanupPathMapper, CommitServiceError, EqualityDeleteColumn, IcebergCommitCollector,
+    ensure_iceberg_write_supported, ensure_no_equality_deletes,
+    ensure_overwrite_single_partition_spec,
 };
+use crate::connector::iceberg::commit::{CommitOpKind, CommitOutcome, WrittenFile};
 use crate::connector::iceberg::position_delete_descriptor::{
     ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
     ICEBERG_POSITION_DELETE_POS_COLUMN, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
