@@ -35,6 +35,8 @@ pub mod file_reader;
 pub mod fs_io;
 pub mod ref_snapshot;
 pub mod scan_model;
+pub mod stats_assembler;
+pub mod stats_loader;
 pub mod theta_sketch;
 
 pub mod iceberg {

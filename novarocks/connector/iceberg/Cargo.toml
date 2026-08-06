@@ -34,7 +34,9 @@ bytes = "1"
 datasketches = "0.2.0"
 ordered-float = "4"
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
 typetag = "0.2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-catalog = { path = "../../catalog" }
 novarocks-fs = { path = "../../fs" }
 novarocks-spi = { path = "../../spi" }
@@ -43,4 +45,3 @@ novarocks-spi = { path = "../../spi" }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
