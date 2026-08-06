@@ -36,6 +36,7 @@ ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 typetag = "0.2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-catalog = { path = "../../catalog" }
@@ -45,4 +46,3 @@ novarocks-spi = { path = "../../spi" }
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
