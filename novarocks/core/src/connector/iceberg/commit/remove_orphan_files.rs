@@ -42,7 +42,7 @@ use novarocks_connector_iceberg::iceberg::io::FileIO;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 
-use super::snapshot_lifecycle_helpers::{
+use novarocks_connector_iceberg::commit::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
 

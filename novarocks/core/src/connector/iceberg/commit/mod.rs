@@ -46,7 +46,8 @@ mod row_delta_dv_metadata;
 mod run;
 mod selected_rewrite;
 mod service;
-pub mod snapshot_lifecycle_helpers;
+#[cfg(test)]
+pub(crate) mod snapshot_lifecycle_helpers_tests;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;

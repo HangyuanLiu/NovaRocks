@@ -49,7 +49,7 @@ use novarocks_connector_iceberg::iceberg::{
 };
 
 use super::retry::commit_with_retry;
-use super::snapshot_lifecycle_helpers::{
+use novarocks_connector_iceberg::commit::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
 
@@ -365,8 +365,8 @@ async fn best_effort_delete_files(file_io: &FileIO, files: &FileSet) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::compute_live_snapshot_set;
-    use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::test_support::build_test_metadata_with_snapshots;
+    use crate::connector::iceberg::commit::snapshot_lifecycle_helpers_tests::test_support::build_test_metadata_with_snapshots;
+    use novarocks_connector_iceberg::commit::compute_live_snapshot_set;
 
     // ---- compute_expire_candidates tests (graph-shape, no I/O) ----
 

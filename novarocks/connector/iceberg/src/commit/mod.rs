@@ -25,6 +25,7 @@ pub mod mv_provenance;
 pub mod mv_refresh_ref;
 pub mod puffin_dv;
 pub mod ref_action;
+pub mod snapshot_lifecycle_helpers;
 pub mod statistics;
 
 pub use abort::{AbortLog, CleanupError};
@@ -44,4 +45,8 @@ pub use puffin_dv::{
 };
 pub use ref_action::{
     RefAction, RefActionOutcome, RefActionPlan, execute_ref_action, lower_ref_action,
+};
+pub use snapshot_lifecycle_helpers::{
+    FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
+    is_puffin_path, puffin_half_reference_protection,
 };
