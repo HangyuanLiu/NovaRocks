@@ -1591,25 +1591,27 @@ pub(crate) fn extract_data_files_with_stats(
 }
 
 fn read_delete_to_catalog_delete(
-    delete_file: crate::connector::iceberg::read::IcebergReadDeleteFile,
+    delete_file: novarocks_connector_iceberg::read_model::IcebergReadDeleteFile,
 ) -> Result<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo, String> {
     use novarocks_connector_iceberg::scan_model::{
         IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
     };
 
     let file_format = match delete_file.file_format {
-        crate::connector::iceberg::read::IcebergReadDeleteFormat::Parquet => {
+        novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Parquet => {
             IcebergDeleteFileFormat::Parquet
         }
-        crate::connector::iceberg::read::IcebergReadDeleteFormat::Puffin => {
+        novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Puffin => {
             IcebergDeleteFileFormat::Puffin
         }
     };
     let (file_content, equality_column_names, equality_field_ids) = match delete_file.kind {
-        crate::connector::iceberg::read::IcebergReadDeleteKind::Position => {
+        novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Position => {
             (IcebergDeleteFileContent::Position, Vec::new(), Vec::new())
         }
-        crate::connector::iceberg::read::IcebergReadDeleteKind::Equality { equality_field_ids } => {
+        novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Equality {
+            equality_field_ids,
+        } => {
             if file_format != IcebergDeleteFileFormat::Parquet {
                 return Err(format!(
                     "iceberg equality-delete file {} must use Parquet format",
@@ -3403,7 +3405,7 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
 #[cfg(test)]
 mod read_delete_conversion_tests {
     use super::read_delete_to_catalog_delete;
-    use crate::connector::iceberg::read::{
+    use novarocks_connector_iceberg::read_model::{
         IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
     };
     use novarocks_connector_iceberg::scan_model::{

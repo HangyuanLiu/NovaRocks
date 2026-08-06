@@ -677,10 +677,9 @@ where
     N: Fn(&str) -> Result<String, ChangeError>,
     P: Fn(&str) -> bool,
 {
-    use crate::connector::iceberg::read::{
-        IcebergReadDeleteFormat, IcebergReadDeleteKind, build_read_snapshot_at,
-    };
+    use crate::connector::iceberg::read::build_read_snapshot_at;
     use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::read_model::{IcebergReadDeleteFormat, IcebergReadDeleteKind};
 
     let prior_snapshot = build_read_snapshot_at(table, snapshot_id).map_err(|e| {
         ChangeError::InternalInconsistency(format!(

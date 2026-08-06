@@ -51,6 +51,7 @@ pub mod iceberg_catalog_hms {
 pub mod opendal {
     pub use ::opendal::*;
 }
+pub mod read_model;
 
 pub use novarocks_fs;
 pub use novarocks_spi;

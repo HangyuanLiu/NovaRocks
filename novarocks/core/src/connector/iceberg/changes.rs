@@ -566,7 +566,7 @@ pub(crate) fn equality_delete_targets_at(
     let mut out = std::collections::HashMap::new();
     for delete in equality_deletes {
         let delete_file = equality_change_to_read_delete(delete);
-        let targets = crate::connector::iceberg::read::data_files_matching_delete(
+        let targets = novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         )
@@ -1194,7 +1194,7 @@ pub(crate) fn scan_equality_delete_rows_for_table_at(
 }
 
 fn scan_equality_delete_rows_for_snapshot(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1212,7 +1212,7 @@ fn scan_equality_delete_rows_for_snapshot(
             &delete_specs,
             factory,
         )?;
-        for data_file in crate::connector::iceberg::read::data_files_matching_delete(
+        for data_file in novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         ) {
@@ -1288,7 +1288,7 @@ pub(crate) fn scan_equality_delete_rows_for_table_with_v3_lineage_at(
 }
 
 fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
     equality_deletes: &[EqualityDeleteRef],
     factory: &novarocks_fs::FsAccessHandle,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -1306,7 +1306,7 @@ fn scan_equality_delete_rows_for_snapshot_with_v3_lineage(
             &delete_specs,
             factory,
         )?;
-        for data_file in crate::connector::iceberg::read::data_files_matching_delete(
+        for data_file in novarocks_connector_iceberg::read_model::data_files_matching_delete(
             &read_snapshot,
             &delete_file,
         ) {
@@ -1547,7 +1547,7 @@ pub(crate) fn previous_snapshot_data_file_lineage_index(
 }
 
 fn build_data_file_lineage_index_from_snapshot(
-    read_snapshot: &crate::connector::iceberg::read::IcebergReadSnapshot,
+    read_snapshot: &novarocks_connector_iceberg::read_model::IcebergReadSnapshot,
 ) -> Result<
     std::collections::HashMap<String, novarocks_connector_iceberg::delta::BaseDataFileLineage>,
     String,
@@ -1579,11 +1579,11 @@ fn build_data_file_lineage_index_from_snapshot(
 
 fn equality_change_to_read_delete(
     delete: &EqualityDeleteRef,
-) -> crate::connector::iceberg::read::IcebergReadDeleteFile {
-    crate::connector::iceberg::read::IcebergReadDeleteFile {
+) -> novarocks_connector_iceberg::read_model::IcebergReadDeleteFile {
+    novarocks_connector_iceberg::read_model::IcebergReadDeleteFile {
         path: delete.delete_file_path.clone(),
-        file_format: crate::connector::iceberg::read::IcebergReadDeleteFormat::Parquet,
-        kind: crate::connector::iceberg::read::IcebergReadDeleteKind::Equality {
+        file_format: novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Parquet,
+        kind: novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Equality {
             equality_field_ids: delete.equality_ids.clone(),
         },
         length: Some(delete.delete_file_size),
