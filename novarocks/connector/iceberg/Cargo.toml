@@ -35,6 +35,7 @@ datasketches = "0.2.0"
 ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 typetag = "0.2"
@@ -44,5 +45,4 @@ novarocks-fs = { path = "../../fs" }
 novarocks-spi = { path = "../../spi" }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"
