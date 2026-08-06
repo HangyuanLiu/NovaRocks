@@ -35,6 +35,7 @@ pub mod delta;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
+pub mod manifest;
 pub mod metadata_read;
 pub mod position_delete_descriptor;
 pub mod read_snapshot;

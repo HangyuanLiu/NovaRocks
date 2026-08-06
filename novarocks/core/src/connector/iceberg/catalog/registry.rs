@@ -1343,302 +1343,29 @@ fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Re
     Ok(())
 }
 
-/// Result of extracting data files with column-level statistics from Iceberg manifests.
-#[derive(Clone)]
-pub(crate) struct DataFileWithStats {
-    pub path: String,
-    pub size: i64,
-    pub record_count: Option<i64>,
-    pub column_stats:
-        Option<HashMap<String, novarocks_connector_iceberg::scan_model::IcebergColumnStats>>,
-    pub partition_spec_id: Option<i32>,
-    pub partition_key: Option<String>,
-    pub partition_values: Option<novarocks_connector_iceberg::iceberg::spec::Struct>,
-    pub manifest_path: Option<String>,
-    pub partition_field_values:
-        Vec<novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue>,
-    /// Iceberg v3 row-lineage: first row id assigned to this data file.
-    pub first_row_id: Option<i64>,
-    /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
-    /// file belongs to.  Falls back to the manifest file's sequence number when
-    /// the entry itself does not carry one (e.g. V1/V2 manifests).
-    pub data_sequence_number: Option<i64>,
-    pub delete_files: Vec<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo>,
-}
-
-fn iceberg_partition_field_values(
-    metadata: &TableMetadata,
-    spec_id: i32,
-    partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
-) -> Result<Vec<novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue>, String> {
-    let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
-        return Err(format!(
-            "iceberg table metadata missing partition spec id {spec_id}"
-        ));
-    };
-    let schema = metadata.current_schema();
-    let mut values = Vec::with_capacity(spec.fields().len());
-    for (idx, field) in spec.fields().iter().enumerate() {
-        let source_column = schema
-            .field_by_id(field.source_id)
-            .map(|source| source.name.clone())
-            .unwrap_or_else(|| format!("#{}", field.source_id));
-        let value = partition
-            .fields()
-            .get(idx)
-            .and_then(|literal| literal.as_ref())
-            .and_then(iceberg_partition_value_from_literal);
-        values.push(
-            novarocks_connector_iceberg::scan_model::IcebergPartitionFieldValue {
-                source_column,
-                field_name: field.name.clone(),
-                transform: iceberg_partition_transform_name(&field.transform),
-                value,
-            },
-        );
-    }
-    Ok(values)
-}
-
-fn iceberg_partition_transform_name(transform: &Transform) -> String {
-    match transform {
-        Transform::Identity => "identity".to_string(),
-        other => format!("{:?}", other).to_ascii_lowercase(),
-    }
-}
-
-fn iceberg_partition_value_from_literal(
-    literal: &IcebergLiteral,
-) -> Option<novarocks_connector_iceberg::scan_model::IcebergPartitionValue> {
-    let IcebergLiteral::Primitive(value) = literal else {
-        return None;
-    };
-    match value {
-        PrimitiveLiteral::Boolean(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Boolean(*v))
-        }
-        PrimitiveLiteral::Int(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int32(*v))
-        }
-        PrimitiveLiteral::Long(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Int64(*v))
-        }
-        PrimitiveLiteral::Float(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Float(v.0))
-        }
-        PrimitiveLiteral::Double(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Double(v.0))
-        }
-        PrimitiveLiteral::String(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::String(v.clone()))
-        }
-        PrimitiveLiteral::Binary(v) => {
-            Some(novarocks_connector_iceberg::scan_model::IcebergPartitionValue::Binary(v.clone()))
-        }
-        PrimitiveLiteral::Int128(_)
-        | PrimitiveLiteral::UInt128(_)
-        | PrimitiveLiteral::AboveMax
-        | PrimitiveLiteral::BelowMin => None,
-    }
-}
-
-fn equality_delete_column_names_for_field_ids(
-    file_path: &str,
-    equality_ids: Option<Vec<i32>>,
-    field_id_to_name: &HashMap<i32, String>,
-) -> Result<Vec<String>, String> {
-    let equality_ids = equality_ids
-        .ok_or_else(|| format!("iceberg equality-delete file {file_path} missing equality_ids"))?;
-    if equality_ids.is_empty() {
-        return Err(format!(
-            "iceberg equality-delete file {file_path} has empty equality_ids"
-        ));
-    }
-    equality_ids
-        .iter()
-        .map(|id| {
-            field_id_to_name.get(id).cloned().ok_or_else(|| {
-                format!("iceberg equality-delete file {file_path} references unknown field id {id}")
-            })
-        })
-        .collect()
-}
+pub(crate) use novarocks_connector_iceberg::manifest::DataFileWithStats;
 
 pub(crate) fn current_equality_delete_column_names(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<String>, String> {
-    use novarocks_connector_iceberg::iceberg::spec::{
-        DataContentType, DataFileFormat, ManifestContentType, ManifestStatus,
-    };
-
-    let metadata = table.metadata();
-    let snapshot = match metadata.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
-    };
-    let schema = metadata.current_schema();
-    let field_id_to_name: HashMap<i32, String> = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| (f.id, f.name.clone()))
-        .collect();
-    let file_io = table.file_io();
-
-    block_on_iceberg(async {
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, metadata)
-            .await
-            .map_err(|e| format!("load manifest list: {e}"))?;
-        let mut columns = Vec::new();
-        for manifest_file in manifest_list.entries() {
-            if manifest_file.content != ManifestContentType::Deletes {
-                continue;
-            }
-            let manifest = manifest_file
-                .load_manifest(file_io)
-                .await
-                .map_err(|e| format!("load manifest: {e}"))?;
-            for entry in manifest.entries() {
-                if entry.status == ManifestStatus::Deleted {
-                    continue;
-                }
-                let df = entry.data_file();
-                if df.content_type() != DataContentType::EqualityDeletes {
-                    continue;
-                }
-                if df.file_format() != DataFileFormat::Parquet {
-                    return Err(format!(
-                        "unsupported iceberg equality-delete file format {:?}: {}",
-                        df.file_format(),
-                        df.file_path()
-                    ));
-                }
-                columns.extend(equality_delete_column_names_for_field_ids(
-                    df.file_path(),
-                    df.equality_ids(),
-                    &field_id_to_name,
-                )?);
-            }
-        }
-        Ok(columns)
-    })
-    .map_err(|e| format!("extract equality delete columns runtime: {e}"))?
+    block_on_iceberg(
+        novarocks_connector_iceberg::manifest::current_equality_delete_column_names(table),
+    )?
 }
 
-/// Extract data file paths, sizes, row counts, and per-column statistics from
-/// Iceberg manifest entries for a specific snapshot.
-///
-/// This reads the manifest list from the given snapshot, loads each data
-/// manifest, and collects per-column stats (null counts, column sizes,
-/// lower/upper bounds) mapped to column names via the snapshot's own schema.
 pub(crate) fn extract_data_files_with_stats_at(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    let metadata = table.metadata();
-    let read_snapshot =
-        crate::connector::iceberg::read::build_read_snapshot_at(table, snapshot_id)?;
-    read_snapshot
-        .files
-        .into_iter()
-        .map(|file| {
-            let partition_field_values =
-                match (file.partition_spec_id, file.partition_values.as_ref()) {
-                    (Some(spec_id), Some(partition_values)) => {
-                        iceberg_partition_field_values(metadata, spec_id, partition_values)?
-                    }
-                    _ => Vec::new(),
-                };
-            let delete_files = file
-                .deletes
-                .into_iter()
-                .map(read_delete_to_catalog_delete)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataFileWithStats {
-                path: file.path,
-                size: file.size,
-                record_count: file.record_count,
-                column_stats: file.column_stats,
-                partition_spec_id: file.partition_spec_id,
-                partition_key: file.partition_key,
-                partition_values: file.partition_values,
-                manifest_path: file.manifest_path,
-                partition_field_values,
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files,
-            })
-        })
-        .collect()
+    block_on_iceberg(
+        novarocks_connector_iceberg::manifest::extract_data_files_with_stats_at(table, snapshot_id),
+    )?
 }
 
-/// Extract data file paths, sizes, row counts, and per-column statistics from
-/// Iceberg manifest entries for the current snapshot.
-///
-/// This reads the manifest list from the current snapshot, loads each data
-/// manifest, and collects per-column stats (null counts, column sizes,
-/// lower/upper bounds) mapped to column names via the table schema.
-///
-/// If no snapshot exists the result is an empty vec.
 pub(crate) fn extract_data_files_with_stats(
     table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    match table.metadata().current_snapshot() {
-        Some(s) => extract_data_files_with_stats_at(table, s.snapshot_id()),
-        None => Ok(Vec::new()),
-    }
-}
-
-fn read_delete_to_catalog_delete(
-    delete_file: novarocks_connector_iceberg::read_model::IcebergReadDeleteFile,
-) -> Result<novarocks_connector_iceberg::scan_model::IcebergDeleteFileInfo, String> {
-    use novarocks_connector_iceberg::scan_model::{
-        IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
-    };
-
-    let file_format = match delete_file.file_format {
-        novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Parquet => {
-            IcebergDeleteFileFormat::Parquet
-        }
-        novarocks_connector_iceberg::read_model::IcebergReadDeleteFormat::Puffin => {
-            IcebergDeleteFileFormat::Puffin
-        }
-    };
-    let (file_content, equality_column_names, equality_field_ids) = match delete_file.kind {
-        novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Position => {
-            (IcebergDeleteFileContent::Position, Vec::new(), Vec::new())
-        }
-        novarocks_connector_iceberg::read_model::IcebergReadDeleteKind::Equality {
-            equality_field_ids,
-        } => {
-            if file_format != IcebergDeleteFileFormat::Parquet {
-                return Err(format!(
-                    "iceberg equality-delete file {} must use Parquet format",
-                    delete_file.path
-                ));
-            }
-            (
-                IcebergDeleteFileContent::Equality,
-                Vec::new(),
-                equality_field_ids,
-            )
-        }
-    };
-
-    Ok(IcebergDeleteFileInfo {
-        path: delete_file.path,
-        file_format,
-        file_content,
-        length: delete_file.length,
-        content_offset: delete_file.content_offset,
-        content_size_in_bytes: delete_file.content_size_in_bytes,
-        sequence_number: delete_file.sequence_number,
-        partition_spec_id: delete_file.partition_spec_id,
-        partition_key: delete_file.partition_key,
-        equality_column_names,
-        equality_field_ids,
-    })
+    block_on_iceberg(novarocks_connector_iceberg::manifest::extract_data_files_with_stats(table))?
 }
 
 /// Register an existing Iceberg table in the catalog entry by loading it.
@@ -3403,90 +3130,6 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
 }
 
 #[cfg(test)]
-mod read_delete_conversion_tests {
-    use super::read_delete_to_catalog_delete;
-    use novarocks_connector_iceberg::read_model::{
-        IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
-    };
-    use novarocks_connector_iceberg::scan_model::{
-        IcebergDeleteFileContent, IcebergDeleteFileFormat,
-    };
-
-    fn read_delete(
-        file_format: IcebergReadDeleteFormat,
-        kind: IcebergReadDeleteKind,
-    ) -> IcebergReadDeleteFile {
-        IcebergReadDeleteFile {
-            path: "s3://bucket/table/delete-file".to_string(),
-            file_format,
-            kind,
-            length: Some(128),
-            content_offset: None,
-            content_size_in_bytes: None,
-            sequence_number: Some(7),
-            partition_spec_id: Some(1),
-            partition_key: Some("city=A".to_string()),
-            referenced_data_file: None,
-        }
-    }
-
-    #[test]
-    fn parquet_equality_delete_carries_explicit_field_ids() {
-        let delete_file = read_delete(
-            IcebergReadDeleteFormat::Parquet,
-            IcebergReadDeleteKind::Equality {
-                equality_field_ids: vec![3, 1],
-            },
-        );
-
-        let catalog_delete = read_delete_to_catalog_delete(delete_file).expect("convert");
-
-        assert_eq!(catalog_delete.file_format, IcebergDeleteFileFormat::Parquet);
-        assert_eq!(
-            catalog_delete.file_content,
-            IcebergDeleteFileContent::Equality
-        );
-        assert_eq!(catalog_delete.equality_field_ids, vec![3, 1]);
-        assert!(catalog_delete.equality_column_names.is_empty());
-    }
-
-    #[test]
-    fn puffin_position_delete_preserves_content_range() {
-        let mut delete_file = read_delete(
-            IcebergReadDeleteFormat::Puffin,
-            IcebergReadDeleteKind::Position,
-        );
-        delete_file.content_offset = Some(64);
-        delete_file.content_size_in_bytes = Some(512);
-
-        let catalog_delete = read_delete_to_catalog_delete(delete_file).expect("convert");
-
-        assert_eq!(catalog_delete.file_format, IcebergDeleteFileFormat::Puffin);
-        assert_eq!(
-            catalog_delete.file_content,
-            IcebergDeleteFileContent::Position
-        );
-        assert_eq!(catalog_delete.content_offset, Some(64));
-        assert_eq!(catalog_delete.content_size_in_bytes, Some(512));
-        assert!(catalog_delete.equality_field_ids.is_empty());
-    }
-
-    #[test]
-    fn puffin_equality_delete_is_rejected() {
-        let delete_file = read_delete(
-            IcebergReadDeleteFormat::Puffin,
-            IcebergReadDeleteKind::Equality {
-                equality_field_ids: vec![3],
-            },
-        );
-
-        let err = read_delete_to_catalog_delete(delete_file).expect_err("reject puffin equality");
-
-        assert!(err.contains("must use Parquet format"));
-    }
-}
-
-#[cfg(test)]
 mod data_file_with_stats_tests {
     use super::{DataFileWithStats, IcebergCatalogEntry, IcebergCatalogKind};
     use std::collections::HashMap;
@@ -3663,32 +3306,6 @@ mod s3_listing_tests {
             );
         })
         .expect("run object-store probe");
-    }
-}
-
-#[cfg(test)]
-mod equality_delete_dependency_tests {
-    use super::equality_delete_column_names_for_field_ids;
-    use std::collections::HashMap;
-
-    #[test]
-    fn equality_delete_column_names_follow_current_schema_field_ids() {
-        let fields = HashMap::from([(1, "id".to_string()), (2, "category".to_string())]);
-        let names =
-            equality_delete_column_names_for_field_ids("delete.parquet", Some(vec![2, 1]), &fields)
-                .expect("column names");
-
-        assert_eq!(names, vec!["category".to_string(), "id".to_string()]);
-    }
-
-    #[test]
-    fn equality_delete_column_names_reject_unknown_field_id() {
-        let fields = HashMap::from([(1, "id".to_string())]);
-        let err =
-            equality_delete_column_names_for_field_ids("delete.parquet", Some(vec![7]), &fields)
-                .expect_err("unknown field id");
-
-        assert!(err.contains("unknown field id 7"));
     }
 }
 
