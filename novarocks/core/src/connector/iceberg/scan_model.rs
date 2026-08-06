@@ -132,12 +132,12 @@ pub struct IcebergSchemaFieldDef {
     pub field_id: i32,
     pub name: String,
     #[serde(skip)]
-    pub initial_default: Option<iceberg::spec::Literal>,
+    pub initial_default: Option<novarocks_connector_iceberg::iceberg::spec::Literal>,
     #[serde(skip)]
-    pub write_default: Option<iceberg::spec::Literal>,
+    pub write_default: Option<novarocks_connector_iceberg::iceberg::spec::Literal>,
     /// Spec-compliant JSON encoding of `initial_default` precomputed at the
     /// point of construction where the iceberg `Type` is still available.
-    /// Necessary because `iceberg::spec::Literal::Int128` carries no scale,
+    /// Necessary because `novarocks_connector_iceberg::iceberg::spec::Literal::Int128` carries no scale,
     /// so decimal defaults cannot be serialized correctly from the literal
     /// alone after the logical Iceberg type is no longer available.
     /// `None` falls back to the type-blind serializer.

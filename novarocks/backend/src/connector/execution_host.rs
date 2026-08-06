@@ -511,6 +511,7 @@ mod tests {
     struct TestInstaller {
         provider_id: ConnectorProviderId,
         installs: Arc<AtomicUsize>,
+        fail: bool,
     }
 
     impl ConnectorExecutionInstaller for TestInstaller {
@@ -524,6 +525,12 @@ mod tests {
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionBinding, ConnectorError> {
             self.installs.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "test installer failed to install binding",
+                ));
+            }
             std::thread::sleep(Duration::from_millis(10));
             let key = declaration.binding_key();
             ConnectorExecutionBinding::try_new(
@@ -536,7 +543,7 @@ mod tests {
 
     fn descriptor() -> ConnectorInstanceDescriptor {
         ConnectorInstanceDescriptor {
-            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            provider_id: ConnectorProviderId::parse("fixture").expect("provider ID"),
             instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
         }
     }
@@ -570,6 +577,7 @@ mod tests {
         host.register_installer(Arc::new(TestInstaller {
             provider_id: descriptor().provider_id,
             installs,
+            fail: false,
         }))
         .expect("installer");
         host
@@ -637,6 +645,55 @@ mod tests {
                 .expect("released query cannot resolve")
                 .kind(),
             ConnectorErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn duplicate_startup_installers_are_rejected_before_execution() {
+        let host = ConnectorExecutionHost::new();
+        let provider_id = descriptor().provider_id;
+        host.register_installer(Arc::new(TestInstaller {
+            provider_id: provider_id.clone(),
+            installs: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+        }))
+        .expect("first startup installer");
+
+        let error = host
+            .register_installer(Arc::new(TestInstaller {
+                provider_id,
+                installs: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }))
+            .expect_err("duplicate startup installer must fail fast");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn unknown_provider_and_installer_failure_are_explicit() {
+        let query = query(11);
+        let declaration = declaration(9);
+        let context = context();
+        let host = ConnectorExecutionHost::new();
+        assert_eq!(
+            host.ensure(query, &declaration, &context)
+                .expect_err("unknown provider must be rejected")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        let host = ConnectorExecutionHost::new();
+        host.register_installer(Arc::new(TestInstaller {
+            provider_id: declaration.descriptor().provider_id.clone(),
+            installs: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+        }))
+        .expect("failing startup installer registration");
+        assert_eq!(
+            host.ensure(query, &declaration, &context)
+                .expect_err("installer failure must not be swallowed")
+                .kind(),
+            ConnectorErrorKind::Unavailable
         );
     }
 }

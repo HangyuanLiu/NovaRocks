@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use iceberg::TableIdent;
+use novarocks_connector_iceberg::iceberg::TableIdent;
 
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::mv::refresh::change_stream_write::{
@@ -131,7 +131,7 @@ pub(crate) fn build_join_incremental_refresh_logical_plan(
 }
 
 pub(crate) fn execute_join_incremental_refresh_write<F>(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
     mode: JoinIncrementalRefreshMode,
@@ -252,8 +252,8 @@ mod tests {
 
     use std::cell::Cell;
 
-    use iceberg::NamespaceIdent;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::NamespaceIdent;
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
         TableMetadataBuilder, Type,
     };
@@ -281,7 +281,7 @@ mod tests {
         TableIdent::new(NamespaceIdent::new("db".to_string()), "mv".to_string())
     }
 
-    fn test_table() -> iceberg::table::Table {
+    fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![Arc::new(NestedField::required(
@@ -303,9 +303,9 @@ mod tests {
         .build()
         .expect("table metadata")
         .metadata;
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .identifier(test_ident())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("table")

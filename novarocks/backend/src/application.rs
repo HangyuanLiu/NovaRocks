@@ -14,7 +14,7 @@ use novarocks::query_execution::lifecycle::{
 };
 use novarocks::runtime_filter_transition::port::transport::RuntimeFilterEnvelopeIngress;
 use novarocks::service::MetricsHttpServer;
-use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
+use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
@@ -31,6 +31,11 @@ const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct BackendServerConfig {
     pub config: NovaRocksConfig,
+    /// Provider-owned execution installers composed by the server role.
+    ///
+    /// Backend only owns registration and lifecycle of these contributions; it
+    /// never constructs a provider-specific installer or catalog binding.
+    pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +215,7 @@ impl Drop for QueryLifecycleSweepTask {
 
 fn compose_backend_application_services(
     config: &NovaRocksConfig,
+    execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let controls = Arc::new(FragmentControlRegistry::default());
     let execution_host = Arc::new(crate::ConnectorExecutionHost::new());
@@ -223,23 +229,9 @@ fn compose_backend_application_services(
         QueryLifecycleRegistryConfig::from_runtime_config(&config.runtime),
     );
     let connector_registry = Arc::new(ConnectorRegistry::new());
-    let default_object_store = config.connector.object_store_config().map_err(|error| {
-        BackendApplicationError::new(
-            BackendApplicationErrorKind::Configuration,
-            format!("resolve connector startup object-store binding: {error}"),
-        )
-    })?;
-    for installer in
-        novarocks::connector::compose_backend_connector_execution_installers(default_object_store)
-            .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Configuration,
-                format!("compose connector execution installers: {error}"),
-            )
-        })?
-    {
+    for installer in execution_installers {
         execution_host
-            .register_installer(installer)
+            .register_installer(Arc::clone(installer))
             .map_err(|error| {
                 BackendApplicationError::new(
                     BackendApplicationErrorKind::Configuration,
@@ -247,16 +239,6 @@ fn compose_backend_application_services(
                 )
             })?;
     }
-    execution_host
-        .register_installer(Arc::new(StarRocksExecutionInstaller::new(
-            StarRocksExecutionBindings::new(),
-        )))
-        .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Configuration,
-                format!("register StarRocks connector execution installer: {error}"),
-            )
-        })?;
     let native_fragment_service = Arc::new(NativeFragmentService::new_with_controls(
         grpc_exchange_transmitter(),
         grpc_fragment_lookup_client(),
@@ -365,7 +347,10 @@ impl BackendApplicationHost {
         readiness_timeout: Duration,
         terminal_ingress: Option<Arc<dyn QueryTerminalIngress>>,
     ) -> Result<Self, BackendApplicationError> {
-        let config = config.config;
+        let BackendServerConfig {
+            config,
+            execution_installers,
+        } = config;
         app_config::install_preloaded_config(config.clone());
 
         let advertise_endpoint = network::standalone_advertise_endpoint_for_config(&config)
@@ -380,7 +365,7 @@ impl BackendApplicationHost {
             )?;
         let bind_host = config.server.host.clone();
         let grpc_port = config.server.grpc_port;
-        let services = compose_backend_application_services(&config)?;
+        let services = compose_backend_application_services(&config, &execution_installers)?;
         let metrics_http_server = if config.server.http_port == grpc_port {
             MetricsHttpServer::shared_with_grpc()
         } else {
@@ -597,20 +582,13 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
-    use std::num::NonZeroUsize;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex};
-    use std::time::{Duration, Instant};
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendServerConfig, combine_primary_and_shutdown, compose_backend_application_services,
     };
     use crate::native::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use bytes::Bytes;
     use novarocks::common::app_config::NovaRocksConfig;
     use novarocks::query_execution::lifecycle::contract::{
         decode_query_control_event, encode_abort_query_request, encode_query_control_attach,
@@ -623,228 +601,14 @@ mod tests {
         QueryTerminationReason,
     };
     use novarocks::runtime::query_options::QueryOptions;
-    use novarocks_connector_starrocks::{
-        StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksControlGeneration,
-        StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
-        StarRocksDirectMetadataLayout, StarRocksDirectReaderFactory, StarRocksDirectSplitPlanner,
-        StarRocksDirectTabletDescriptor, StarRocksDirectTabletPlanningSource,
-        StarRocksExecutionBindings, StarRocksExecutionInstaller, StarRocksLocalBindingRef,
-        StarRocksLocalExecutionBinding, StarRocksMetadataSource, StarRocksReadPolicy,
-        StarRocksResolvedTable, StarRocksRpcSplitPlanner, StarRocksRpcTransport,
-        StarRocksSharedDataDirectPlanner, StarRocksSplitPlanningInput, StarRocksStorageBindingRef,
-        StarRocksStrategySplit, StarRocksTopology,
-    };
-    use novarocks_protocol::common::UniqueId;
     use novarocks_protocol::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest,
     };
-    use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-        ConnectorExecutionDistribution, ConnectorExecutionResolver, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-        ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorProviderId,
-        ConnectorReadExecution, ConnectorReadSelector, ConnectorRequestContext,
-        ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableIdentity,
-        ConnectorTableRequest, ConnectorTableResolution,
-    };
     use novarocks_types::QueryId;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::connector::ConnectorExecutionHost;
-
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct FixtureDirectFactory;
-
-    impl StarRocksDirectReaderFactory for FixtureDirectFactory {
-        fn open_direct_reader(
-            &self,
-            _: novarocks_connector_starrocks::StarRocksDirectSplit,
-            _: novarocks_spi::connector::ConnectorOpenReaderRequest,
-        ) -> Result<
-            Box<dyn novarocks_spi::connector::ConnectorBatchReader>,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Err(novarocks_spi::connector::ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                "fixture direct reader is not opened by this lifecycle test",
-            ))
-        }
-    }
-
-    struct OneBatchReader {
-        batch: Option<RecordBatch>,
-    }
-
-    impl ConnectorBatchReader for OneBatchReader {
-        fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-            Ok(self.batch.take())
-        }
-
-        fn close(&mut self) -> Result<(), ConnectorError> {
-            self.batch = None;
-            Ok(())
-        }
-    }
-
-    struct OpeningFixtureDirectFactory(Arc<AtomicUsize>);
-
-    impl StarRocksDirectReaderFactory for OpeningFixtureDirectFactory {
-        fn open_direct_reader(
-            &self,
-            split: novarocks_connector_starrocks::StarRocksDirectSplit,
-            request: ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            assert_eq!(split.tablet_id(), 1);
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(OneBatchReader {
-                batch: Some(
-                    RecordBatch::try_new(
-                        request.expected_schema,
-                        vec![Arc::new(Int64Array::from(vec![42_i64]))],
-                    )
-                    .expect("fixture Arrow batch"),
-                ),
-            }))
-        }
-    }
-
-    struct DirectFixtureMetadataSource;
-
-    impl StarRocksMetadataSource for DirectFixtureMetadataSource {
-        fn namespace_exists(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-
-        fn table_exists(
-            &self,
-            _: &str,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-
-        fn list_tables(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<Vec<String>, ConnectorError> {
-            Ok(vec![])
-        }
-
-        fn load_table(
-            &self,
-            _: &str,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<StarRocksResolvedTable, ConnectorError> {
-            StarRocksResolvedTable::try_new(
-                "db",
-                "table",
-                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-                StarRocksTopology::SharedData,
-                Bytes::from_static(b"schema-v1"),
-                Bytes::from_static(b"data-v1"),
-                StarRocksCapabilitySnapshot {
-                    api_contract_version: 1,
-                    rpc_transports: Default::default(),
-                    rpc_ready: false,
-                    direct_contract_version: Some(1),
-                    direct_ready: true,
-                },
-            )
-        }
-    }
-
-    struct UnsupportedRpcPlanner;
-
-    impl StarRocksRpcSplitPlanner for UnsupportedRpcPlanner {
-        fn plan_rpc_splits(
-            &self,
-            _: &StarRocksSplitPlanningInput,
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "fixture only plans direct splits",
-            ))
-        }
-    }
-
-    struct DirectFixtureTablets;
-
-    impl StarRocksDirectTabletPlanningSource for DirectFixtureTablets {
-        fn plan_tablets(
-            &self,
-            _: &StarRocksSplitPlanningInput,
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<
-            Vec<novarocks_connector_starrocks::StarRocksDirectTabletDescriptor>,
-            ConnectorError,
-        > {
-            Ok(vec![StarRocksDirectTabletDescriptor::try_new(
-                1,
-                2,
-                3,
-                StarRocksDirectMetadataLayout::Standalone,
-                "meta/1.meta",
-                vec![StarRocksDirectColumnBinding::try_new(
-                    0, 1, "id", "BIGINT", false, None,
-                )?],
-                None,
-            )?])
-        }
-    }
-
-    struct DirectFixtureLocations;
-
-    impl StarRocksDirectLocationSource for DirectFixtureLocations {
-        fn resolve_locations(
-            &self,
-            _: &[i64],
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksDirectLocation>, ConnectorError> {
-            Ok(vec![StarRocksDirectLocation::try_new(
-                1,
-                "s3://fixture/tablet/1",
-                StarRocksStorageBindingRef::parse("fixture")?,
-                "fixture-store",
-            )?])
-        }
-    }
-
-    fn direct_fixture_control_binding() -> novarocks_spi::connector::ConnectorControlBinding {
-        StarRocksControlGeneration::try_new(
-            StarRocksConnectorConfig::new(
-                ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
-                StarRocksReadPolicy::Direct,
-                StarRocksRpcTransport::BrpcChunk,
-                StarRocksLocalBindingRef::parse("fixture").expect("binding"),
-            ),
-            Arc::new(DirectFixtureMetadataSource),
-            Arc::new(UnsupportedRpcPlanner),
-            Arc::new(StarRocksSharedDataDirectPlanner::new(
-                Arc::new(DirectFixtureTablets),
-                Arc::new(DirectFixtureLocations),
-            )),
-        )
-        .expect("direct fixture control binding")
-    }
 
     fn unused_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -862,7 +626,10 @@ mod tests {
         config.server.grpc_port = grpc_port;
         config.cluster.advertise_host = "127.0.0.1".to_string();
         config.cluster.advertise_port = advertise_port;
-        BackendServerConfig { config }
+        BackendServerConfig {
+            config,
+            execution_installers: Vec::new(),
+        }
     }
 
     fn live_query_init_request(start_epoch: u64, query_low: i64) -> QueryInitRequest {
@@ -904,7 +671,7 @@ mod tests {
     #[test]
     fn application_composition_owns_one_query_lifecycle_registry() {
         let config = NovaRocksConfig::default();
-        let services = compose_backend_application_services(&config)
+        let services = compose_backend_application_services(&config, &[])
             .expect("compose backend application services");
 
         assert_eq!(
@@ -912,214 +679,6 @@ mod tests {
             3,
             "application, Stage ingress, and fragment service must share exactly one registry"
         );
-    }
-
-    #[test]
-    fn starrocks_execution_host_direct_read_production_binding_is_unavailable() {
-        let services = compose_backend_application_services(&NovaRocksConfig::default())
-            .expect("compose backend application services");
-        let query = QueryExecutionId::new(
-            QueryId::new(0x5352_4331, 1),
-            AttemptId::new(1).expect("attempt"),
-        )
-        .expect("query");
-        let declaration = ConnectorExecutionDeclaration::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("starrocks").expect("provider ID"),
-                instance_id: ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
-            },
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
-            Bytes::from_static(br#"{"version":1,"contract_version":1,"local_binding":"missing"}"#),
-        )
-        .expect("declaration");
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("context");
-
-        assert_eq!(
-            services
-                .execution_host
-                .ensure(query, &declaration, &context)
-                .expect_err("empty startup binding map must reject execution")
-                .kind(),
-            ConnectorErrorKind::Unavailable
-        );
-    }
-
-    #[test]
-    fn starrocks_execution_host_rpc_read_production_binding_is_unavailable() {
-        // The production installer is transport-neutral and deliberately owns
-        // an empty startup-local binding map until a catalog supplies one.
-        starrocks_execution_host_direct_read_production_binding_is_unavailable();
-    }
-
-    #[test]
-    fn starrocks_execution_host_direct_read_leases_and_retires_configured_binding() {
-        let host = ConnectorExecutionHost::new();
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("fixture").expect("binding"),
-            StarRocksLocalExecutionBinding {
-                rpc: None,
-                direct: Some(Arc::new(FixtureDirectFactory)),
-            },
-        );
-        host.register_installer(Arc::new(StarRocksExecutionInstaller::new(bindings)))
-            .expect("register StarRocks direct installer");
-        let query = QueryExecutionId::new(
-            QueryId::new(0x5352_4332, 1),
-            AttemptId::new(1).expect("attempt"),
-        )
-        .expect("query");
-        let declaration = ConnectorExecutionDeclaration::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("starrocks").expect("provider ID"),
-                instance_id: ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID"),
-            },
-            ConnectorInstanceIncarnation::from_bytes([8; 16]),
-            Bytes::from_static(br#"{"version":1,"contract_version":1,"local_binding":"fixture"}"#),
-        )
-        .expect("declaration");
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("context");
-
-        host.ensure(query, &declaration, &context).expect("ensure");
-        let key = declaration.binding_key();
-        assert!(host.resolver_for(query).resolve(&key).is_ok());
-        host.retire(&key).expect("retire");
-        assert!(host.resolver_for(query).resolve(&key).is_ok());
-        host.release_query(query).expect("release");
-        let error = match host.resolver_for(query).resolve(&key) {
-            Ok(_) => panic!("released query cannot resolve"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
-    }
-
-    #[test]
-    fn starrocks_execution_host_direct_read_opens_a_frozen_fixture_split() {
-        let control = direct_fixture_control_binding();
-        let instance = control.descriptor().instance_id.clone();
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
-            16 * 1024 * 1024,
-            64 * 1024 * 1024,
-        )
-        .expect("context");
-        let table = control
-            .metadata()
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: instance.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("table"),
-                },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: context.clone(),
-            })
-            .expect("load direct fixture table");
-        let batch = ConnectorBatchBudget {
-            max_rows: NonZeroUsize::new(16).expect("nonzero row budget"),
-            max_bytes: NonZeroUsize::new(4096).expect("nonzero byte budget"),
-        };
-        let scan = control
-            .planning()
-            .begin_scan(
-                &table.table,
-                ConnectorBeginScanRequest {
-                    projection: vec![],
-                    static_predicates: vec![],
-                    selector: ConnectorReadSelector::Current,
-                    limit: None,
-                    batch,
-                    context: context.clone(),
-                },
-            )
-            .expect("freeze direct scan");
-        let splits = control
-            .planning()
-            .plan_splits(
-                &scan.handle,
-                ConnectorSplitPlanningRequest {
-                    target_parallelism: NonZeroUsize::new(1).expect("parallelism"),
-                    max_split_bytes: None,
-                    context: context.clone(),
-                },
-            )
-            .expect("plan frozen direct split");
-        assert_eq!(splits.splits.len(), 1);
-
-        let opens = Arc::new(AtomicUsize::new(0));
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("fixture").expect("binding"),
-            StarRocksLocalExecutionBinding {
-                rpc: None,
-                direct: Some(Arc::new(OpeningFixtureDirectFactory(Arc::clone(&opens)))),
-            },
-        );
-        let host = ConnectorExecutionHost::new();
-        host.register_installer(Arc::new(StarRocksExecutionInstaller::new(bindings)))
-            .expect("register direct installer");
-        let query = QueryExecutionId::new(
-            QueryId::new(0x5352_4333, 1),
-            AttemptId::new(1).expect("attempt"),
-        )
-        .expect("query");
-        let declaration = control
-            .execution_declaration(&context)
-            .expect("direct declaration");
-        host.ensure(query, &declaration, &context)
-            .expect("ensure direct binding");
-
-        let binding = host
-            .resolver_for(query)
-            .resolve(&declaration.binding_key())
-            .expect("resolve leased direct binding");
-        let read = binding.read().expect("read capability");
-        let request = ConnectorOpenReaderRequest {
-            expected_schema: table.schema.clone(),
-            batch,
-            context: context.clone(),
-        };
-        let prepared = read
-            .prepare_split(
-                &splits.splits[0],
-                ConnectorPrepareSplitRequest {
-                    context: context.clone(),
-                },
-            )
-            .expect("prepare frozen direct split");
-        let unit = prepared
-            .units()
-            .next()
-            .expect("prepared direct split has one unit");
-        assert_eq!(prepared.len(), 1, "fixture split has one local unit");
-        let mut reader = read
-            .open_unit_reader(&unit, request)
-            .expect("open frozen direct unit");
-        let output = reader
-            .next_batch()
-            .expect("read fixture batch")
-            .expect("fixture batch");
-        assert_eq!(output.num_rows(), 1);
-        assert_eq!(opens.load(Ordering::SeqCst), 1);
-        assert!(reader.next_batch().expect("fixture EOS").is_none());
-        reader.close().expect("close fixture reader");
-
-        host.retire(&declaration.binding_key())
-            .expect("retire direct binding");
-        host.release_query(query).expect("release direct lease");
     }
 
     #[test]

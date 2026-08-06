@@ -11,7 +11,7 @@
 //! Default value helpers shared by DDL, schema transport, parquet read path,
 //! and INSERT write path.
 
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     FormatVersion, Literal as IcebergLiteral, Map as IcebergMap, PrimitiveLiteral, PrimitiveType,
     Type,
 };
@@ -506,8 +506,10 @@ pub(crate) fn literal_to_constant_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type};
     use novarocks_catalog::schema::ColumnDefault;
+    use novarocks_connector_iceberg::iceberg::spec::{
+        ListType, MapType, NestedField, PrimitiveType, Struct, StructType, Type,
+    };
 
     fn assert_iceberg_default_round_trip(
         literal: IcebergLiteral,

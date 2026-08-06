@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
-use iceberg::TableIdent;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::TableIdent;
+use novarocks_connector_iceberg::iceberg::spec::{
     Datum, Literal, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef, Struct,
     TableMetadata, Transform, Type,
 };
@@ -261,7 +261,7 @@ impl IcebergCommitCollector {
     /// validated. Each path is recorded in the [`AbortLog`] so abort cleanup
     /// still works.
     pub(crate) fn inject_written_files(&self, files: Vec<WrittenFile>) {
-        use iceberg::spec::DataContentType;
+        use novarocks_connector_iceberg::iceberg::spec::DataContentType;
 
         {
             let mut effect = self
@@ -299,7 +299,7 @@ impl IcebergCommitCollector {
     /// [`inject_written_files`] (the reuse channel). Each path is recorded in the
     /// [`AbortLog`] so abort cleanup still works.
     pub(crate) fn inject_appended_files(&self, files: Vec<WrittenFile>) {
-        use iceberg::spec::DataContentType;
+        use novarocks_connector_iceberg::iceberg::spec::DataContentType;
 
         {
             let mut effect = self
@@ -401,7 +401,7 @@ impl IcebergCommitCollector {
         report: IcebergWriterReport,
     ) -> Result<WrittenFile, String> {
         use crate::connector::iceberg::delete_file::IcebergFileContent;
-        use iceberg::spec::{DataContentType, DataFileFormat};
+        use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat};
 
         let IcebergWriterReport { file, .. } = report;
         let format_name = file.format.clone();
@@ -510,14 +510,14 @@ impl IcebergCommitCollector {
 }
 
 fn validate_puffin_dv_descriptor(
-    format: iceberg::spec::DataFileFormat,
-    content: iceberg::spec::DataContentType,
+    format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat,
+    content: novarocks_connector_iceberg::iceberg::spec::DataContentType,
     referenced_data_file: Option<&str>,
     content_offset: Option<i64>,
     content_size_in_bytes: Option<i64>,
     cardinality: Option<i64>,
 ) -> Result<(), String> {
-    use iceberg::spec::{DataContentType, DataFileFormat};
+    use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat};
 
     if format != DataFileFormat::Puffin || content != DataContentType::PositionDeletes {
         return Ok(());
@@ -933,7 +933,7 @@ fn datetime_to_units<Tz: chrono::TimeZone>(
 #[cfg(test)]
 mod parity_tests {
     use super::*;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, NestedField,
         PartitionSpec, PrimitiveType, Schema, Struct, TableMetadata, TableMetadataBuilder,
         Transform, Type,
@@ -980,7 +980,7 @@ mod parity_tests {
             None,
             0,
             schema,
-            Arc::new(iceberg::spec::PartitionSpec::unpartition_spec()),
+            Arc::new(novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()),
             "file:///tmp/staging".to_string(),
             UniqueId::new(0, 0),
         )
@@ -988,7 +988,7 @@ mod parity_tests {
     }
 
     fn table_metadata(schema: SchemaRef, partition_spec: PartitionSpecRef) -> TableMetadata {
-        let creation = iceberg::TableCreation::builder()
+        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .location("file:///warehouse/db/t".to_string())
             .schema(schema.as_ref().clone())
@@ -1045,7 +1045,7 @@ mod parity_tests {
     }
 
     fn writer_report_from_data_file(
-        df: &iceberg::spec::DataFile,
+        df: &novarocks_connector_iceberg::iceberg::spec::DataFile,
         partition_spec_id: i32,
         metadata: &TableMetadata,
     ) -> crate::connector::iceberg::report::IcebergWriterReport {
@@ -1155,7 +1155,7 @@ mod parity_tests {
 
     fn identity_partition_spec(schema: &SchemaRef) -> PartitionSpecRef {
         Arc::new(
-            iceberg::spec::PartitionSpec::builder(schema.clone())
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
                 .with_spec_id(0)
                 .add_partition_field("k1", "k1", Transform::Identity)
                 .expect("add partition field")
@@ -1166,7 +1166,7 @@ mod parity_tests {
 
     #[test]
     fn convert_reproduces_identity_partition_values() {
-        use iceberg::spec::Literal;
+        use novarocks_connector_iceberg::iceberg::spec::Literal;
 
         let schema = int_schema();
         let spec = identity_partition_spec(&schema);
@@ -1210,7 +1210,7 @@ mod parity_tests {
     fn convert_accepts_transform_partition_paths() {
         let schema = int_schema();
         let spec = Arc::new(
-            iceberg::spec::PartitionSpec::builder(schema.clone())
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
                 .with_spec_id(0)
                 .add_partition_field("k1", "k1_bucket", Transform::Bucket(4))
                 .expect("add partition field")
@@ -1223,7 +1223,9 @@ mod parity_tests {
         b.content(DataContentType::Data)
             .file_path("file:///t/k1_bucket=2/data-1.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
-            .partition(Struct::from_iter([Some(iceberg::spec::Literal::int(2))]))
+            .partition(Struct::from_iter([Some(
+                novarocks_connector_iceberg::iceberg::spec::Literal::int(2),
+            )]))
             .partition_spec_id(0)
             .record_count(1)
             .file_size_in_bytes(64);
@@ -1344,7 +1346,7 @@ mod parity_tests {
 mod tests {
     use super::*;
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
         Schema, Struct, TableMetadata, TableMetadataBuilder, Transform, Type,
     };
@@ -1363,7 +1365,7 @@ mod tests {
     }
 
     fn unpartitioned_collector(schema: SchemaRef) -> IcebergCommitCollector {
-        let creation = iceberg::TableCreation::builder()
+        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .location("file:///warehouse/db/t".to_string())
             .schema(schema.as_ref().clone())
@@ -1403,7 +1405,7 @@ mod tests {
                     partition_path: String::new(),
                     null_fingerprint: String::new(),
                     partition_spec_id: spec_id,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
                 split_offsets: None,
                 column_stats: None,
@@ -1517,7 +1519,10 @@ mod tests {
             .convert_writer_report(report)
             .expect("convert writer report");
 
-        assert_eq!(wf.format, iceberg::spec::DataFileFormat::Puffin);
+        assert_eq!(
+            wf.format,
+            novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Puffin
+        );
         assert_eq!(wf.content_offset, Some(4));
         assert_eq!(wf.content_size_in_bytes, Some(12));
         assert_eq!(wf.cardinality, Some(3));
@@ -1584,7 +1589,10 @@ mod tests {
             .convert_writer_report(report)
             .expect("convert writer report");
 
-        assert_eq!(wf.format, iceberg::spec::DataFileFormat::Orc);
+        assert_eq!(
+            wf.format,
+            novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Orc
+        );
     }
 
     #[test]
@@ -1659,7 +1667,7 @@ mod tests {
                 .build()
                 .expect("partition spec"),
         );
-        let creation = iceberg::TableCreation::builder()
+        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .location("file:///warehouse/db/t".to_string())
             .schema(schema.as_ref().clone())
@@ -1898,7 +1906,9 @@ mod tests {
         let literal = parse_partition_path("v=null", &spec, &schema, Some("0"))
             .expect("parse non-null literal");
         match &literal.fields()[0] {
-            Some(Literal::Primitive(iceberg::spec::PrimitiveLiteral::String(value))) => {
+            Some(Literal::Primitive(
+                novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::String(value),
+            )) => {
                 assert_eq!(value, "null");
             }
             other => panic!("expected string literal, got {other:?}"),
@@ -1995,8 +2005,8 @@ mod tests {
         let (schema, spec) = fixture_schema_and_spec();
         let collector = IcebergCommitCollector::new(
             CommitOpKind::RowDeltaDv,
-            iceberg::TableIdent::new(
-                iceberg::NamespaceIdent::new("db".to_string()),
+            novarocks_connector_iceberg::iceberg::TableIdent::new(
+                novarocks_connector_iceberg::iceberg::NamespaceIdent::new("db".to_string()),
                 "t".to_string(),
             ),
             None,
@@ -2009,7 +2019,7 @@ mod tests {
         collector.inject_delete_group(PositionDeleteGroup {
             referenced_data_file: "file:///tmp/data.parquet".to_string(),
             partition_spec_id: 0,
-            partition_values: iceberg::spec::Struct::empty(),
+            partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             positions: vec![1, 3, 5],
         });
         let groups = collector.take_delete_groups();

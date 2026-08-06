@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use iceberg::io::FileIO;
-use opendal::ErrorKind as OpenDalErrorKind;
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::opendal::ErrorKind as OpenDalErrorKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -428,8 +428,11 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         let metadata = table.metadata();
         let collected = block_on_iceberg(collect_orphan_candidates(
             build_catalog(&entry)?,
-            iceberg::TableIdent::from_strs([namespace.as_str(), table_name.as_str()])
-                .map_err(|e| invalid(e.to_string()))?,
+            novarocks_connector_iceberg::iceberg::TableIdent::from_strs([
+                namespace.as_str(),
+                table_name.as_str(),
+            ])
+            .map_err(|e| invalid(e.to_string()))?,
             request.operation().older_than_ms(),
             entry.object_store_config(),
         ))
@@ -646,7 +649,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
 
 fn records_from_candidates(
     files: &[ScannedFile],
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<ManifestRecordV1>, ConnectorError> {
     let supports_version = fs_io::resolve_access_for_location(table.metadata().location(), config)
@@ -777,10 +780,10 @@ fn reconcile_frozen_batch(
 }
 
 async fn stat_matches(
-    op: &opendal::Operator,
+    op: &novarocks_connector_iceberg::opendal::Operator,
     path: &str,
     identity: &ObjectIdentityV1,
-) -> Result<bool, opendal::Error> {
+) -> Result<bool, novarocks_connector_iceberg::opendal::Error> {
     let metadata = op.stat(path).await?;
     let size = metadata.content_length();
     let mtime = metadata
@@ -813,10 +816,10 @@ async fn stat_matches(
 }
 
 async fn delete_exact(
-    op: &opendal::Operator,
+    op: &novarocks_connector_iceberg::opendal::Operator,
     path: &str,
     identity: &ObjectIdentityV1,
-) -> Result<(), opendal::Error> {
+) -> Result<(), novarocks_connector_iceberg::opendal::Error> {
     match identity {
         ObjectIdentityV1::Version { version, .. } => op.delete_with(path).version(version).await,
         _ => op.delete(path).await,
@@ -1130,7 +1133,9 @@ fn table_file_io(
         .to_string();
     Ok((loaded.table.file_io().clone(), table_location))
 }
-fn build_catalog(entry: &IcebergCatalogEntry) -> Result<Arc<dyn iceberg::Catalog>, ConnectorError> {
+fn build_catalog(
+    entry: &IcebergCatalogEntry,
+) -> Result<Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>, ConnectorError> {
     super::catalog::registry::build_iceberg_catalog(entry).map_err(unavailable)
 }
 

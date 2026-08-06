@@ -20,8 +20,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use iceberg::spec::DataFile;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::spec::DataFile;
+use novarocks_connector_iceberg::iceberg::{Catalog, NamespaceIdent, TableIdent};
 use sqlparser::ast::Statement;
 
 use crate::common::types::UniqueId;
@@ -364,7 +364,7 @@ fn load_current_table(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
     target: &WholeTableRewriteTarget,
-) -> Result<iceberg::table::Table, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
     block_on_iceberg(async { catalog.load_table(table_ident).await })?.map_err(|e| {
         format!(
             "load iceberg table {}.{}.{} for {} failed: {e}",
@@ -377,7 +377,7 @@ fn load_current_table(
 }
 
 fn validate_base_snapshot(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     target: &WholeTableRewriteTarget,
 ) -> Result<(), String> {
     let current_snapshot_id = table
@@ -519,7 +519,7 @@ fn row_lineage_batches_row_count(batches: &[RowLineageWriteBatch]) -> Result<i64
 /// the row-lineage writer.
 ///
 /// This bypasses the SQL analyzer entirely (which would hide MV-internal
-/// columns) by scanning the `iceberg::table::Table` directly via the same
+/// columns) by scanning the `novarocks_connector_iceberg::iceberg::table::Table` directly via the same
 /// `scan().select(...)` + `ArrowReaderBuilder` mechanism that
 /// `locate_target_rows_by_apply_key` uses. Crucially, and unlike the locator,
 /// this path does NOT clear `task.deletes`: positional/equality deletes are
@@ -546,14 +546,14 @@ fn row_lineage_batches_row_count(batches: &[RowLineageWriteBatch]) -> Result<i64
 /// writer stamps them at their reserved field ids while the apply-key column
 /// rides through as an ordinary physical column at its real field id.
 async fn read_full_physical_row_lineage_batches(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<RowLineageWriteBatch>, String> {
     use std::collections::HashMap;
 
     use arrow::array::Int64Array;
     use arrow::datatypes::Schema;
     use futures::StreamExt;
-    use iceberg::arrow::ArrowReaderBuilder;
+    use novarocks_connector_iceberg::iceberg::arrow::ArrowReaderBuilder;
 
     // Physical column names in `current_schema()` field order. The apply-key
     // column (and any hidden aggregate-state columns) are physical fields, so

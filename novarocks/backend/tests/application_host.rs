@@ -19,7 +19,10 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
     config.server.grpc_port = grpc_port;
     config.cluster.advertise_host = "127.0.0.1".to_string();
     config.cluster.advertise_port = advertise_port;
-    BackendServerConfig { config }
+    BackendServerConfig {
+        config,
+        execution_installers: Vec::new(),
+    }
 }
 
 #[test]

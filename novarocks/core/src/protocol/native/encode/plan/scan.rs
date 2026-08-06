@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
-use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
+use novarocks_connector_iceberg::iceberg::spec::{
+    ListType, MapType, NestedField, PrimitiveType, StructType, Type,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::super::expr::encode_sort_items;
@@ -511,7 +513,7 @@ fn iceberg_primitive_type_for_arrow_data_type(
 
 fn iceberg_nested_field_for_arrow_field(
     field: &Field,
-) -> Result<iceberg::spec::NestedFieldRef, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef, String> {
     let field_id = arrow_field_id(field)?;
     let field_type = iceberg_type_for_arrow_data_type(field.data_type())?;
     Ok(Arc::new(NestedField::new(
@@ -953,7 +955,7 @@ fn encode_iceberg_schema_field(
 fn encode_iceberg_schema_default_json(
     label: &str,
     precomputed_json: Option<&String>,
-    literal: Option<&iceberg::spec::Literal>,
+    literal: Option<&novarocks_connector_iceberg::iceberg::spec::Literal>,
 ) -> Result<Option<String>, String> {
     if let Some(json) = precomputed_json {
         return Ok(Some(json.clone()));

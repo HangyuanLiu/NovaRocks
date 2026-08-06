@@ -27,8 +27,8 @@ use std::time::Instant;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_catalog::schema::SqlType;
+use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_fs::{
     FileCancellation, FileError, FileErrorKind, FileIdentity, FileIoRuntime, FileReadContext,
     FileTaskSpawner, FsAccessHandle, FsAccessResolver, ParquetMetadataInspection,
@@ -317,25 +317,28 @@ fn statistics_scan_layout(
             "Iceberg statistics collection payload is missing serialized pinned metadata",
         )
     })?;
-    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized).map_err(|e| {
-        ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            format!("decode pinned Iceberg statistics metadata: {e}"),
-        )
-    })?;
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized).map_err(|e| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode pinned Iceberg statistics metadata: {e}"),
+            )
+        })?;
     if metadata.current_schema_id() != table_info.schema_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             "Iceberg statistics collection metadata does not match its pinned schema ID",
         ));
     }
-    let schema =
-        iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).map_err(|e| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("convert pinned Iceberg statistics schema to Arrow: {e}"),
-            )
-        })?;
+    let schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+        metadata.current_schema(),
+    )
+    .map_err(|e| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("convert pinned Iceberg statistics schema to Arrow: {e}"),
+        )
+    })?;
     projection
         .iter()
         .map(|&ordinal| {
@@ -1462,19 +1465,21 @@ impl IcebergControlProvider {
             Ok(catalog) => catalog,
             Err(error) => return Ok(known_uncommitted(error)),
         };
-        let ident =
-            iceberg::TableIdent::from_strs([table.namespace.as_ref(), table.table.as_ref()])
-                .map_err(|error| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        format!("invalid bootstrap table identity: {error}"),
-                    )
-                })?;
+        let ident = novarocks_connector_iceberg::iceberg::TableIdent::from_strs([
+            table.namespace.as_ref(),
+            table.table.as_ref(),
+        ])
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("invalid bootstrap table identity: {error}"),
+            )
+        })?;
         let commit_result = super::catalog::registry::block_on_iceberg(async {
             let current = catalog.load_table(&ident).await?;
             if current.metadata().current_snapshot().is_some() {
-                return Err(iceberg::Error::new(
-                    iceberg::ErrorKind::PreconditionFailed,
+                return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                     "empty-table bootstrap target gained a snapshot before commit",
                 ));
             }
@@ -1803,9 +1808,10 @@ impl IcebergControlProvider {
         projection: &[usize],
     ) -> Result<SchemaRef, ConnectorError> {
         let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
-        let storage_schema =
-            iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
-                .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
+        let storage_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+            loaded.table.metadata().current_schema(),
+        )
+        .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
         let indexes = if projection.is_empty() {
             (0..storage_schema.fields().len()).collect::<Vec<_>>()
         } else {
@@ -1864,9 +1870,10 @@ impl IcebergControlProvider {
         projection: &[usize],
     ) -> Result<SchemaRef, ConnectorError> {
         let loaded = load_table(entry, namespace, table).map_err(map_iceberg_error)?;
-        let storage_schema =
-            iceberg::arrow::schema_to_arrow_schema(loaded.table.metadata().current_schema())
-                .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
+        let storage_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+            loaded.table.metadata().current_schema(),
+        )
+        .map_err(|error| internal(format!("convert Iceberg schema to Arrow: {error}")))?;
         let mut storage_fields = storage_schema.fields().to_vec();
         if super::catalog::backend::row_lineage_enabled(loaded.table.metadata()) {
             storage_fields.extend([
@@ -2940,7 +2947,9 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
     }
 }
 
-fn iceberg_main_ancestors(metadata: &iceberg::spec::TableMetadata) -> Vec<i64> {
+fn iceberg_main_ancestors(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> Vec<i64> {
     let mut ancestors = Vec::new();
     let mut cursor = metadata.current_snapshot_id();
     while let Some(snapshot_id) = cursor {
@@ -3014,7 +3023,7 @@ fn provider_version(metadata_location: Option<&str>) -> Bytes {
 }
 
 fn snapshot_matches_publication_guard(
-    snapshot: &iceberg::spec::Snapshot,
+    snapshot: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
     guard: &ConnectorRefreshPublicationGuard,
 ) -> bool {
     let properties = &snapshot.summary().additional_properties;
@@ -3064,13 +3073,13 @@ fn source_snapshot_id_from_committed_version(
 fn build_guarded_fast_forward_commit(
     namespace: &str,
     table: &str,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     source_branch: &str,
     target_branch: &str,
     source_snapshot_id: i64,
     expected_target_snapshot_id: Option<i64>,
     guard: &ConnectorRefreshPublicationGuard,
-) -> Result<iceberg::TableCommit, ConnectorError> {
+) -> Result<novarocks_connector_iceberg::iceberg::TableCommit, ConnectorError> {
     let source = metadata.refs().get(source_branch).ok_or_else(|| {
         ConnectorError::new(
             ConnectorErrorKind::NotFound,
@@ -3124,31 +3133,35 @@ fn build_guarded_fast_forward_commit(
             "MV publication target branch does not match its expected snapshot",
         ));
     }
-    let ident = iceberg::TableIdent::from_strs([namespace, table]).map_err(|error| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            format!("invalid Iceberg MV publication table identity: {error}"),
-        )
-    })?;
-    Ok(iceberg::TableCommit::builder()
+    let ident = novarocks_connector_iceberg::iceberg::TableIdent::from_strs([namespace, table])
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("invalid Iceberg MV publication table identity: {error}"),
+            )
+        })?;
+    Ok(novarocks_connector_iceberg::iceberg::TableCommit::builder()
         .ident(ident)
-        .updates(vec![iceberg::TableUpdate::SetSnapshotRef {
-            ref_name: target_branch.to_string(),
-            reference: iceberg::spec::SnapshotReference {
-                snapshot_id: source_snapshot_id,
-                retention: iceberg::spec::SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
+        .updates(vec![
+            novarocks_connector_iceberg::iceberg::TableUpdate::SetSnapshotRef {
+                ref_name: target_branch.to_string(),
+                reference: novarocks_connector_iceberg::iceberg::spec::SnapshotReference {
+                    snapshot_id: source_snapshot_id,
+                    retention:
+                        novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch {
+                            min_snapshots_to_keep: None,
+                            max_snapshot_age_ms: None,
+                            max_ref_age_ms: None,
+                        },
                 },
             },
-        }])
+        ])
         .requirements(vec![
-            iceberg::TableRequirement::RefSnapshotIdMatch {
+            novarocks_connector_iceberg::iceberg::TableRequirement::RefSnapshotIdMatch {
                 r#ref: target_branch.to_string(),
                 snapshot_id: expected_target_snapshot_id,
             },
-            iceberg::TableRequirement::RefSnapshotIdMatch {
+            novarocks_connector_iceberg::iceberg::TableRequirement::RefSnapshotIdMatch {
                 r#ref: source_branch.to_string(),
                 snapshot_id: Some(source_snapshot_id),
             },
@@ -3442,7 +3455,7 @@ fn reconcile_iceberg_mutation_evidence(
 }
 
 fn publication_guard_digest_from_snapshot(
-    snapshot: &iceberg::spec::Snapshot,
+    snapshot: &novarocks_connector_iceberg::iceberg::spec::Snapshot,
 ) -> Result<[u8; 32], ConnectorError> {
     let properties = &snapshot.summary().additional_properties;
     let refresh_id = properties
@@ -3639,7 +3652,7 @@ pub(crate) fn lower_partition(
 
 fn lower_ref_action(
     action: novarocks_spi::connector::ConnectorRefAction,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     namespace: &str,
     table: &str,
     catalog: &str,
@@ -3647,7 +3660,7 @@ fn lower_ref_action(
     use novarocks_spi::connector::{ConnectorRefAction, ConnectorRefKind};
 
     fn assert_kind(
-        metadata: &iceberg::spec::TableMetadata,
+        metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         name: &str,
         expected: ConnectorRefKind,
     ) -> Result<(), ConnectorError> {
@@ -3655,8 +3668,12 @@ fn lower_ref_action(
             return Ok(());
         };
         let actual = match existing.retention {
-            iceberg::spec::SnapshotRetention::Branch { .. } => ConnectorRefKind::Branch,
-            iceberg::spec::SnapshotRetention::Tag { .. } => ConnectorRefKind::Tag,
+            novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch { .. } => {
+                ConnectorRefKind::Branch
+            }
+            novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Tag { .. } => {
+                ConnectorRefKind::Tag
+            }
         };
         if actual == expected {
             return Ok(());
@@ -5410,13 +5427,17 @@ fn build_table_payload(
 /// payload.  This is intentionally independent of a planner `TableDef`: the
 /// connector owns its metadata envelope and application query planning later
 /// assigns the request-local scan token.
-fn iceberg_metadata_column_names(metadata: &iceberg::spec::TableMetadata) -> Vec<String> {
+fn iceberg_metadata_column_names(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> Vec<String> {
     let mut names = vec!["_file".to_string(), "_pos".to_string()];
-    if matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3)
-        && !metadata
-            .properties()
-            .get("write.row-lineage")
-            .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+    if matches!(
+        metadata.format_version(),
+        novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
+    ) && !metadata
+        .properties()
+        .get("write.row-lineage")
+        .is_some_and(|value| value.eq_ignore_ascii_case("false"))
     {
         names.push("_row_id".to_string());
         names.push("_last_updated_sequence_number".to_string());
@@ -5734,8 +5755,8 @@ fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorE
     else {
         return Ok(None);
     };
-    let metadata: iceberg::spec::TableMetadata = serde_json::from_str(serialized_metadata)
-        .map_err(|error| {
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized_metadata).map_err(|error| {
             ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 format!("decode pinned Iceberg metadata for name mapping: {error}"),
@@ -5743,7 +5764,7 @@ fn split_name_mapping(table: &TablePayload) -> Result<Option<String>, ConnectorE
         })?;
     let Some(mapping) = metadata
         .properties()
-        .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+        .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
     else {
         return Ok(None);
     };

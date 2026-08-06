@@ -3180,7 +3180,7 @@ fn build_iceberg_create_table_ddl(
     table: &str,
     loaded: &crate::connector::iceberg::catalog::registry::IcebergLoadedTable,
 ) -> Result<String, String> {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
 
     fn iceberg_type_to_sql(ty: &Type) -> String {
         match ty {
@@ -5971,7 +5971,7 @@ fn parse_explain_refresh_materialized_view(
 mod build_iceberg_create_table_ddl_tests {
     use super::build_iceberg_create_table_ddl;
     use crate::connector::iceberg::catalog::registry::IcebergLoadedTable;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
     };
     use std::collections::HashMap;
@@ -5986,7 +5986,7 @@ mod build_iceberg_create_table_ddl_tests {
             ))])
             .build()
             .expect("build schema");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema,
             PartitionSpec::unpartition_spec(),
             SortOrder::unsorted_order(),
@@ -5998,9 +5998,11 @@ mod build_iceberg_create_table_ddl_tests {
         .build()
         .expect("metadata")
         .metadata;
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            )
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("table");
@@ -8338,7 +8340,7 @@ path = "meta/operations.sqlite"
         warehouse: &TempDir,
         extra_props: &[(&str, &str)],
     ) -> (StandaloneNovaRocks, StandaloneSession) {
-        use iceberg::Catalog;
+        use novarocks_connector_iceberg::iceberg::Catalog;
 
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
@@ -8355,19 +8357,28 @@ path = "meta/operations.sqlite"
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
                 .expect("build hadoop catalog")
         };
-        let namespace = iceberg::NamespaceIdent::new("db1".to_string());
-        let schema = iceberg::spec::Schema::builder()
+        let namespace =
+            novarocks_connector_iceberg::iceberg::NamespaceIdent::new("db1".to_string());
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    "v",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        "v",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("build schema");
@@ -8376,10 +8387,10 @@ path = "meta/operations.sqlite"
         for (k, v) in extra_props {
             props.push(((*k).to_string(), (*v).to_string()));
         }
-        let table_creation = iceberg::TableCreation::builder()
+        let table_creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .schema(schema)
-            .format_version(iceberg::spec::FormatVersion::V3)
+            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
             .properties(props)
             .build();
         crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
@@ -8648,7 +8659,10 @@ path = "meta/operations.sqlite"
         catalog: &str,
         namespace: &str,
         table: &str,
-    ) -> Vec<(String, iceberg::spec::Transform)> {
+    ) -> Vec<(
+        String,
+        novarocks_connector_iceberg::iceberg::spec::Transform,
+    )> {
         let registry = engine.inner.iceberg_catalogs.read().expect("registry");
         let entry = registry.get(catalog).expect("entry");
         entry.invalidate_table_cache(namespace, table);
@@ -8679,7 +8693,10 @@ path = "meta/operations.sqlite"
             .expect("create partitioned table");
         assert_eq!(
             current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
-            vec![("ts_month".to_string(), iceberg::spec::Transform::Month)]
+            vec![(
+                "ts_month".to_string(),
+                novarocks_connector_iceberg::iceberg::spec::Transform::Month
+            )]
         );
 
         session
@@ -8690,7 +8707,10 @@ path = "meta/operations.sqlite"
             .expect("drop partition column");
         assert_eq!(
             current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
-            Vec::<(String, iceberg::spec::Transform)>::new()
+            Vec::<(
+                String,
+                novarocks_connector_iceberg::iceberg::spec::Transform
+            )>::new()
         );
 
         session
@@ -8703,7 +8723,7 @@ path = "meta/operations.sqlite"
             current_iceberg_default_spec_fields(&engine, "ice", "db1", "t_evolved"),
             vec![(
                 "id_bucket_8".to_string(),
-                iceberg::spec::Transform::Bucket(8)
+                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(8)
             )]
         );
     }
@@ -8766,7 +8786,7 @@ path = "meta/operations.sqlite"
                 .await
                 .expect("load manifest list");
             for manifest_file in manifest_list.entries() {
-                if manifest_file.content != iceberg::spec::ManifestContentType::Deletes {
+                if manifest_file.content != novarocks_connector_iceberg::iceberg::spec::ManifestContentType::Deletes {
                     continue;
                 }
                 let manifest = manifest_file
@@ -8777,8 +8797,8 @@ path = "meta/operations.sqlite"
                     let data_file = entry.data_file();
                     if entry.is_alive()
                         && data_file.content_type()
-                            == iceberg::spec::DataContentType::PositionDeletes
-                        && data_file.file_format() == iceberg::spec::DataFileFormat::Parquet
+                            == novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes
+                        && data_file.file_format() == novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet
                     {
                         return true;
                     }
@@ -8859,8 +8879,8 @@ path = "meta/operations.sqlite"
     fn open_v3_row_lineage_session_bigint(
         warehouse: &TempDir,
     ) -> (StandaloneNovaRocks, StandaloneSession) {
-        use iceberg::Catalog;
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::Catalog;
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
 
         let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
@@ -8877,8 +8897,8 @@ path = "meta/operations.sqlite"
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
                 .expect("build hadoop catalog")
         };
-        let namespace = iceberg::NamespaceIdent::new("ns".to_string());
-        let schema = iceberg::spec::Schema::builder()
+        let namespace = novarocks_connector_iceberg::iceberg::NamespaceIdent::new("ns".to_string());
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
                     1,
@@ -8893,10 +8913,10 @@ path = "meta/operations.sqlite"
             ])
             .build()
             .expect("build schema");
-        let table_creation = iceberg::TableCreation::builder()
+        let table_creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .schema(schema)
-            .format_version(iceberg::spec::FormatVersion::V3)
+            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
             .properties([("write.row-lineage".to_string(), "true".to_string())])
             .build();
         crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
@@ -9141,25 +9161,34 @@ path = "meta/operations.sqlite"
     }
 
     fn single_bucket_partition_metadata_json() -> String {
-        let schema = iceberg::spec::Schema::builder()
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                1,
-                "id",
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-            ))])
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                    ),
+                ),
+            )])
             .build()
             .expect("schema");
-        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
-            .add_partition_field("id", "id_bucket", iceberg::spec::Transform::Bucket(16))
-            .expect("partition field")
-            .build()
-            .expect("partition spec");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let partition_spec =
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
+                .add_partition_field(
+                    "id",
+                    "id_bucket",
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(16),
+                )
+                .expect("partition field")
+                .build()
+                .expect("partition spec");
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema,
             partition_spec,
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             "file:///warehouse/target_orders".to_string(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("metadata builder")

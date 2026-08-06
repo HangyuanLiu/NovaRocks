@@ -558,12 +558,16 @@ fn native_scan_encoder_preserves_iceberg_write_defaults() {
             crate::connector::iceberg::scan_model::IcebergSchemaFieldDef {
                 field_id: 1,
                 name: "amount".to_string(),
-                initial_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(5),
-                )),
-                write_default: Some(iceberg::spec::Literal::Primitive(
-                    iceberg::spec::PrimitiveLiteral::Int(7),
-                )),
+                initial_default: Some(
+                    novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(
+                        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(5),
+                    ),
+                ),
+                write_default: Some(
+                    novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(
+                        novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(7),
+                    ),
+                ),
                 initial_default_json: Some("5".to_string()),
                 write_default_json: Some("7".to_string()),
                 children: vec![],

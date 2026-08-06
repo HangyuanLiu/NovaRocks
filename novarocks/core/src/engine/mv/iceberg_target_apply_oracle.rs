@@ -46,7 +46,7 @@ use crate::sql::planner::vocabulary::{
 #[cfg(test)]
 pub(crate) fn load_target_apply_locator_inputs(
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<
     (
         crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -83,7 +83,7 @@ pub(crate) fn load_target_apply_locator_inputs(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     base_row_ids: &[i64],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
@@ -102,7 +102,7 @@ pub(crate) async fn locate_target_rows_by_apply_key(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     base_row_ids: &[i64],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
@@ -121,7 +121,7 @@ pub(crate) async fn locate_target_rows_by_apply_key_with_matches(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_string_apply_key(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[String],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -142,7 +142,7 @@ pub(crate) async fn locate_target_rows_by_string_apply_key(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_string_apply_key_with_matches(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[String],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -176,7 +176,7 @@ pub(crate) struct BranchStringApplyKey {
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_apply_key(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
@@ -195,7 +195,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     requested_keys: &[BranchApplyKey],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
@@ -214,7 +214,7 @@ pub(crate) async fn locate_target_rows_by_branch_apply_key_with_matches(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[BranchStringApplyKey],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -235,7 +235,7 @@ pub(crate) async fn locate_target_rows_by_branch_string_apply_key(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_branch_string_apply_key_with_matches(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: &[BranchStringApplyKey],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -699,7 +699,7 @@ fn build_target_apply_locator_result_from_apply_key_matches(
 #[cfg(test)]
 pub(crate) fn resolve_target_positions_via_framework(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_catalog_name: &str,
     target_namespace: &str,
     target_table_name: &str,
@@ -771,7 +771,7 @@ pub(crate) fn resolve_target_positions_via_framework(
 #[cfg(test)]
 fn register_scoped_framework_locator_table_for_query(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_catalog_name: &str,
     target_namespace: &str,
     target_table_name: &str,
@@ -836,7 +836,7 @@ fn register_scoped_framework_locator_table_for_query(
 #[cfg(test)]
 fn framework_locator_query_local_overlay(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_catalog_name: &str,
     target_namespace: &str,
     target_table_name: &str,
@@ -1189,7 +1189,7 @@ impl Drop for ScopedFrameworkLocatorTable {
 #[cfg(test)]
 fn next_framework_locator_synthetic_table_name(
     target_table_name: &str,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> String {
     static NEXT_LOCATOR_TABLE_ID: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
@@ -1224,7 +1224,7 @@ fn framework_locator_identifier_token(identifier: &str) -> String {
 #[cfg(test)]
 fn build_locator_visible_target_table_def(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_catalog_name: &str,
     target_namespace: &str,
     target_table_name: &str,
@@ -1283,7 +1283,7 @@ fn register_framework_locator_control_fixture(
 
 #[cfg(test)]
 fn filter_locator_data_files_by_partition(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     files: Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats>, String> {
@@ -1310,7 +1310,7 @@ fn filter_locator_data_files_by_partition(
 
 #[cfg(test)]
 fn locator_data_file_matches_partition_filter(
-    target_metadata: &iceberg::spec::TableMetadata,
+    target_metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     file: &crate::connector::iceberg::catalog::registry::DataFileWithStats,
     partition_filter: &TargetPartitionFilter,
 ) -> Result<bool, String> {
@@ -1359,7 +1359,7 @@ fn locator_data_file_matches_partition_filter(
 fn framework_locator_catalog_entry(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     target_catalog_name: &str,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<crate::connector::iceberg::catalog::IcebergCatalogEntry, String> {
     match state
         .iceberg_catalogs
@@ -1384,7 +1384,7 @@ fn framework_locator_catalog_entry(
 
 #[cfg(test)]
 fn framework_locator_local_warehouse_uri(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<String, String> {
     let location = target_table.metadata().location().trim_end_matches('/');
     if !location.starts_with("file://") {
@@ -1405,12 +1405,13 @@ fn framework_locator_local_warehouse_uri(
 
 #[cfg(test)]
 fn framework_locator_loaded_table(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 ) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let iceberg_schema = target_table.metadata().current_schema();
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
+    let arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
     let columns = arrow_schema
         .fields()
         .iter()
@@ -1562,7 +1563,7 @@ fn quote_sql_string_literal(value: &str) -> String {
 
 #[cfg(test)]
 async fn locate_target_rows_by_apply_key_impl(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
     requested_keys: ApplyKeyRequest<'_>,
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
@@ -1570,7 +1571,7 @@ async fn locate_target_rows_by_apply_key_impl(
     partition_filter: &TargetPartitionFilter,
 ) -> Result<TargetApplyLocatorResult, String> {
     use futures::StreamExt;
-    use iceberg::arrow::ArrowReaderBuilder;
+    use novarocks_connector_iceberg::iceberg::arrow::ArrowReaderBuilder;
 
     if requested_keys.is_empty() {
         return Ok(TargetApplyLocatorResult {
@@ -1606,8 +1607,8 @@ async fn locate_target_rows_by_apply_key_impl(
         task.predicate = None;
         if filter_owned.is_allow_list() {
             let Some(partition_struct) = task.partition.as_ref() else {
-                return Err(iceberg::Error::new(
-                    iceberg::ErrorKind::DataInvalid,
+                return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                     format!(
                         "iceberg MV target locator: file scan task for data file `{}` is missing partition metadata",
                         task.data_file_path
@@ -1628,8 +1629,8 @@ async fn locate_target_rows_by_apply_key_impl(
                 partition_struct,
             )
             .map_err(|e| {
-                iceberg::Error::new(
-                    iceberg::ErrorKind::DataInvalid,
+                novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                     format!(
                         "iceberg MV target locator: cannot derive partition values for `{}`: {e}",
                         task.data_file_path
@@ -1644,7 +1645,7 @@ async fn locate_target_rows_by_apply_key_impl(
                         &value.value,
                     )
                     .map_err(|e| {
-                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e)
+                        novarocks_connector_iceberg::iceberg::Error::new(novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid, e)
                     })?;
                 fields.push(crate::mv::model::MvPartitionKeyField::new(
                     value.field_name.clone(),
@@ -1728,7 +1729,7 @@ async fn locate_target_rows_by_apply_key_impl(
 
 #[cfg(test)]
 pub(crate) async fn locate_target_rows_by_apply_key_string(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     join_row_keys: &[String],
     existing_deletes_by_file: &crate::connector::iceberg::delete_visibility::ExistingDeleteVisibilityByDataFile,
     referenced_data_file_partitions: &crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions,
@@ -1753,7 +1754,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::spec::Struct;
+    use novarocks_connector_iceberg::iceberg::spec::Struct;
     use std::sync::Arc;
 
     /// Build a minimal local Hadoop-catalog iceberg table that can serve as
@@ -1762,12 +1763,14 @@ mod tests {
     /// files.  The `_row_ids` slice is accepted for future extension but
     /// currently unused (no data is written; tests that exercise the no-request
     /// path need an empty target table).
-    fn build_local_iceberg_apply_key_target(_row_ids: &[i64]) -> iceberg::table::Table {
-        use iceberg::Catalog;
-        use iceberg::spec::{
+    fn build_local_iceberg_apply_key_target(
+        _row_ids: &[i64],
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
+        use novarocks_connector_iceberg::iceberg::Catalog;
+        use novarocks_connector_iceberg::iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
         };
-        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableCreation, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
             .expect("target warehouse tempdir")
@@ -2325,21 +2328,23 @@ mod tests {
     /// Partition spec: identity(region), bound spec_id=0.
     ///
     struct PartitionedApplyKeyTargetFixture {
-        table: iceberg::table::Table,
+        table: novarocks_connector_iceberg::iceberg::table::Table,
         file_paths: Vec<String>,
-        _catalog: std::sync::Arc<dyn iceberg::Catalog>,
+        _catalog: std::sync::Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
         _warehouse_dir: tempfile::TempDir,
     }
 
     /// Returns a real MV-target-shaped Iceberg table fixture. The tempdir and
     /// catalog guards must stay alive while the table is scanned.
     fn build_partitioned_apply_key_target_with_rows() -> PartitionedApplyKeyTargetFixture {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
             UnboundPartitionSpec,
         };
-        use iceberg::transaction::{ApplyTransactionAction, Transaction};
-        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+        use novarocks_connector_iceberg::iceberg::transaction::{
+            ApplyTransactionAction, Transaction,
+        };
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableCreation, TableIdent};
         use uuid::Uuid;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2467,7 +2472,7 @@ mod tests {
                 .add_data_files(data_files)
                 .set_commit_uuid(Uuid::new_v4());
             let tx = action.apply(tx).expect("fast_append apply");
-            let _table_after: iceberg::table::Table = tx
+            let _table_after: novarocks_connector_iceberg::iceberg::table::Table = tx
                 .commit(catalog.as_ref())
                 .await
                 .expect("fast_append commit");
@@ -2487,18 +2492,20 @@ mod tests {
     }
 
     struct BranchApplyKeyTargetFixture {
-        table: iceberg::table::Table,
+        table: novarocks_connector_iceberg::iceberg::table::Table,
         file_paths: Vec<String>,
-        _catalog: std::sync::Arc<dyn iceberg::Catalog>,
+        _catalog: std::sync::Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
         _warehouse_dir: tempfile::TempDir,
     }
 
     fn build_branch_apply_key_target_with_rows() -> BranchApplyKeyTargetFixture {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, Type,
         };
-        use iceberg::transaction::{ApplyTransactionAction, Transaction};
-        use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+        use novarocks_connector_iceberg::iceberg::transaction::{
+            ApplyTransactionAction, Transaction,
+        };
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableCreation, TableIdent};
         use uuid::Uuid;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2624,7 +2631,7 @@ mod tests {
                 .add_data_files(data_files)
                 .set_commit_uuid(Uuid::new_v4());
             let tx = action.apply(tx).expect("fast_append apply");
-            let _table_after: iceberg::table::Table = tx
+            let _table_after: novarocks_connector_iceberg::iceberg::table::Table = tx
                 .commit(catalog.as_ref())
                 .await
                 .expect("fast_append commit");
@@ -2644,7 +2651,7 @@ mod tests {
     }
 
     fn hadoop_catalog_entry_for_target(
-        target_table: &iceberg::table::Table,
+        target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> crate::connector::iceberg::catalog::IcebergCatalogEntry {
         crate::connector::iceberg::catalog::registry::build_catalog_entry(
             "ice",
@@ -2669,7 +2676,7 @@ mod tests {
         fixture: &PartitionedApplyKeyTargetFixture,
         referenced_data_file: &str,
         position: i64,
-    ) -> Result<iceberg::table::Table, String> {
+    ) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
         let snapshot_id = fixture
             .table
             .metadata()
@@ -2704,8 +2711,8 @@ mod tests {
         )
         .await?;
 
-        let table_ident = iceberg::TableIdent::new(
-            iceberg::NamespaceIdent::new("db".to_string()),
+        let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+            novarocks_connector_iceberg::iceberg::NamespaceIdent::new("db".to_string()),
             "mv_apply_target".to_string(),
         );
         let collector = std::sync::Arc::new(
@@ -2751,7 +2758,7 @@ mod tests {
     }
 
     fn loaded_partitioned_apply_key_target(
-        target_table: &iceberg::table::Table,
+        target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> crate::connector::iceberg::catalog::IcebergLoadedTable {
         crate::connector::iceberg::catalog::IcebergLoadedTable {
             table: target_table.clone(),
@@ -2886,7 +2893,7 @@ mod tests {
     }
 
     fn referenced_partitions_for_table(
-        table: &iceberg::table::Table,
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> crate::connector::iceberg::delete_visibility::ReferencedDataFilePartitions {
         let snapshot_id = table
             .metadata()
@@ -2916,7 +2923,7 @@ mod tests {
         let file_paths = &fixture.file_paths;
         assert_eq!(
             target_table.metadata().format_version(),
-            iceberg::spec::FormatVersion::V3
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
         );
         assert_eq!(
             target_table
@@ -3156,7 +3163,7 @@ mod tests {
                 path.clone(),
                 crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
             );
         }
@@ -3553,7 +3560,7 @@ mod tests {
                 path.clone(),
                 crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
             );
         }
@@ -3705,7 +3712,7 @@ mod tests {
                 path.clone(),
                 crate::connector::iceberg::delete_visibility::ReferencedDataFilePartition {
                     partition_spec_id: 0,
-                    partition_values: iceberg::spec::Struct::empty(),
+                    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 },
             );
         }

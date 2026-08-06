@@ -24,6 +24,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use novarocks::common::app_config::NovaRocksConfig;
+use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_state_store::StateStoreHostConfig;
 
 use crate::mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMvSchedulerConfig};
@@ -40,6 +41,11 @@ pub struct FrontendServerConfig {
     pub config: NovaRocksConfig,
     pub config_path: Option<PathBuf>,
     pub port_override: Option<u16>,
+    /// Provider-owned FE control factories composed by the server root.
+    pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+    /// Typed StateStore host input. The FE remains the owner of opening and
+    /// shutting down this host; the server only supplies the composition data.
+    pub state_store_host_config: Option<StateStoreHostConfig>,
 }
 
 fn standalone_open_services(
@@ -78,7 +84,13 @@ pub async fn open_frontend_application_for_server(
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     let execution = resolve_frontend_execution_config(config)?;
     let backend = cluster_backend_open_config(&config.config)?;
-    FrontendApplicationHost::open(state_store_host_config(&config.config), execution, backend).await
+    FrontendApplicationHost::open_with_factories(
+        resolved_state_store_host_config(config),
+        execution,
+        backend,
+        config.connector_control_factories.clone(),
+    )
+    .await
 }
 
 /// Builds standalone services from a previously opened frontend host.
@@ -119,10 +131,22 @@ where
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
     let backend = cluster_backend_open_config(&config.config)?;
+    let connector_factories = config.connector_control_factories.clone();
     run_frontend_server_until_shutdown_with_ports(
         config,
         shutdown,
-        |state_store| async move { FrontendApplicationHost::open(state_store, execution, backend).await },
+        move |state_store| {
+            let connector_factories = connector_factories.clone();
+            async move {
+                FrontendApplicationHost::open_with_factories(
+                    state_store,
+                    execution,
+                    backend,
+                    connector_factories,
+                )
+                .await
+            }
+        },
         move |host| {
             (
                 standalone_open_services(system_catalog, host),
@@ -195,10 +219,22 @@ where
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let execution = resolve_frontend_execution_config(&config)?;
     let backend = cluster_backend_open_config(&config.config)?;
+    let connector_factories = config.connector_control_factories.clone();
     run_frontend_server_with_signal_and_ports(
         config,
         signal,
-        |state_store| async move { FrontendApplicationHost::open(state_store, execution, backend).await },
+        move |state_store| {
+            let connector_factories = connector_factories.clone();
+            async move {
+                FrontendApplicationHost::open_with_factories(
+                    state_store,
+                    execution,
+                    backend,
+                    connector_factories,
+                )
+                .await
+            }
+        },
         move |host| {
             (
                 standalone_open_services(system_catalog, host),
@@ -333,7 +369,7 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = state_store_host_config(&config.config);
+    let state_store_host_config = resolved_state_store_host_config(&config);
     let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = serve(config, service, shutdown).await;
@@ -373,7 +409,7 @@ where
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
-    let state_store_host_config = state_store_host_config(&config.config);
+    let state_store_host_config = resolved_state_store_host_config(&config);
     let host = open_host(state_store_host_config).await?;
     let service = extract_service(&host);
     let server_result = run_server_until_signal(config, service, signal, serve).await;
@@ -382,14 +418,17 @@ where
     combine_server_and_shutdown(server_result, shutdown_result)
 }
 
-fn state_store_host_config(config: &NovaRocksConfig) -> Option<StateStoreHostConfig> {
-    config
-        .state_store
-        .clone()
-        .map(|state_store| StateStoreHostConfig {
-            state_store,
-            foundationdb_client: config.foundationdb_client.clone(),
-        })
+fn resolved_state_store_host_config(config: &FrontendServerConfig) -> Option<StateStoreHostConfig> {
+    config.state_store_host_config.clone().or_else(|| {
+        config
+            .config
+            .state_store
+            .clone()
+            .map(|state_store| StateStoreHostConfig {
+                state_store,
+                foundationdb_client: config.config.foundationdb_client.clone(),
+            })
+    })
 }
 
 fn cluster_backend_open_config(
@@ -549,6 +588,8 @@ mod tests {
             config: novarocks::common::app_config::NovaRocksConfig::default(),
             config_path: None,
             port_override: None,
+            connector_control_factories: Vec::new(),
+            state_store_host_config: None,
         }
     }
 

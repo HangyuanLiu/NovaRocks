@@ -24,14 +24,16 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, ManifestFile, Operation, PartitionSpecRef, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
@@ -134,7 +136,7 @@ impl IcebergCommitAction for FastAppendCommit {
             ));
         }
 
-        let data_files: Vec<iceberg::spec::DataFile> = written
+        let data_files: Vec<novarocks_connector_iceberg::iceberg::spec::DataFile> = written
             .iter()
             .map(|f| written_file_to_iceberg_data_file(f, ctx.collector))
             .collect::<Result<Vec<_>, _>>()?;
@@ -189,7 +191,7 @@ impl IcebergCommitAction for FastAppendCommit {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn register_puffin_stats(
     table_after: &Table,
-    catalog: &dyn iceberg::Catalog,
+    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
     file_io: &FileIO,
     commit_type: CommitType,
     sketch_sets: Vec<FileSketchSet>,
@@ -243,7 +245,7 @@ pub(crate) async fn register_puffin_stats(
 /// Errors are logged and swallowed; missing previous stats is normal.
 pub(crate) async fn carry_forward_puffin_stats(
     table_after: &Table,
-    catalog: &dyn iceberg::Catalog,
+    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
     new_snapshot_id: i64,
     prev_snapshot_id: i64,
 ) {
@@ -484,7 +486,10 @@ struct FastAppendV3TxnAction {
 
 #[async_trait]
 impl TransactionAction for FastAppendV3TxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let new_seq = m.last_sequence_number() + 1;
         let new_snapshot_id = generate_snapshot_id();
@@ -666,8 +671,11 @@ fn append_summary(
     p
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
@@ -675,11 +683,13 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
         Type,
     };
-    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{
+        Catalog, NamespaceIdent, TableCreation, TableIdent,
+    };
 
     use super::*;
     use crate::connector::iceberg::commit::{CommitOpKind, IcebergCommitCollector};
@@ -897,9 +907,11 @@ mod tests {
             "manifest file and list must both be tracked"
         );
 
-        let builder =
-            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
-        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let builder = novarocks_connector_iceberg::opendal::services::Fs::default()
+            .root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = novarocks_connector_iceberg::opendal::Operator::new(builder)
+            .unwrap()
+            .finish();
         let root_prefix = format!("file://{}/", warehouse_dir.path().display());
         let errors = abort_handle
             .cleanup_with_path_mapper(&fs, |path| {
@@ -999,9 +1011,11 @@ mod tests {
             "both attempted artifacts must be registered"
         );
 
-        let builder =
-            opendal::services::Fs::default().root(warehouse_dir.path().to_string_lossy().as_ref());
-        let fs = opendal::Operator::new(builder).unwrap().finish();
+        let builder = novarocks_connector_iceberg::opendal::services::Fs::default()
+            .root(warehouse_dir.path().to_string_lossy().as_ref());
+        let fs = novarocks_connector_iceberg::opendal::Operator::new(builder)
+            .unwrap()
+            .finish();
         let root_prefix = format!("file://{}/", warehouse_dir.path().display());
         let first_relative = paths[0]
             .strip_prefix(&root_prefix)

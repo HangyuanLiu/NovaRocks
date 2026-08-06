@@ -26,15 +26,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
     ManifestWriterBuilder, Operation, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef,
     Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use crate::exec::row_position::{
@@ -182,12 +184,15 @@ struct RewriteDataFilesTxnAction {
 
 #[async_trait]
 impl TransactionAction for RewriteDataFilesTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version == FormatVersion::V1 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "RewriteDataFilesCommit does not support V1 tables",
             ));
         }
@@ -652,9 +657,9 @@ fn group_by_partition_spec(
 }
 
 fn partition_spec_by_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     spec_id: i32,
-) -> iceberg::Result<PartitionSpecRef> {
+) -> novarocks_connector_iceberg::iceberg::Result<PartitionSpecRef> {
     metadata
         .partition_spec_by_id(spec_id)
         .cloned()
@@ -743,8 +748,11 @@ fn rewrite_summary(added: &[WrittenFile], live: &LiveFiles) -> HashMap<String, S
     p
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 fn stamp_preserve_row_lineage_first_row_ids(written: &mut [WrittenFile]) -> Result<(), String> {
@@ -842,7 +850,7 @@ fn preserve_row_lineage_sequence_number(file: &WrittenFile) -> Result<i64, Strin
 
 fn lineage_long_bound(
     file: &WrittenFile,
-    bounds: &HashMap<i32, iceberg::spec::Datum>,
+    bounds: &HashMap<i32, novarocks_connector_iceberg::iceberg::spec::Datum>,
     field_id: i32,
     field_name: &str,
     label: &str,
@@ -867,7 +875,9 @@ fn lineage_long_bound(
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataFileBuilder, DataFileFormat, Datum, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataFileBuilder, DataFileFormat, Datum, Struct,
+    };
 
     use super::*;
 

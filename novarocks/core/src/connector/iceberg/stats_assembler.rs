@@ -42,10 +42,12 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use iceberg::io::FileIO;
-use iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, Blob, PuffinReader, PuffinWriter};
-use iceberg::spec::{BlobMetadata, StatisticsFile, TableMetadata};
-use iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::puffin::{
+    APACHE_DATASKETCHES_THETA_V1, Blob, PuffinReader, PuffinWriter,
+};
+use novarocks_connector_iceberg::iceberg::spec::{BlobMetadata, StatisticsFile, TableMetadata};
+use novarocks_connector_iceberg::iceberg::table::Table;
 
 use super::theta_sketch::ThetaSketchHandle;
 
@@ -370,7 +372,10 @@ pub(crate) async fn write_puffin_with_provider_statistics(
             .properties(HashMap::new())
             .build();
         writer
-            .add(blob, iceberg::puffin::CompressionCodec::None)
+            .add(
+                blob,
+                novarocks_connector_iceberg::iceberg::puffin::CompressionCodec::None,
+            )
             .await
             .map_err(|e| format!("write puffin blob field={field_id}: {e}"))?;
 
@@ -392,7 +397,10 @@ pub(crate) async fn write_puffin_with_provider_statistics(
             .properties(HashMap::new())
             .build();
         writer
-            .add(blob, iceberg::puffin::CompressionCodec::None)
+            .add(
+                blob,
+                novarocks_connector_iceberg::iceberg::puffin::CompressionCodec::None,
+            )
             .await
             .map_err(|e| format!("write Puffin provider statistics blob: {e}"))?;
         blob_metadata.push(BlobMetadata {
@@ -467,7 +475,7 @@ pub(crate) async fn read_provider_statistics_blob(
 /// where `payload_length` is the little-endian u32 stored at
 /// `file_size - FOOTER_STRUCT_LENGTH = file_size - 12`.
 async fn read_footer_size(
-    input_file: &iceberg::io::InputFile,
+    input_file: &novarocks_connector_iceberg::iceberg::io::InputFile,
     file_size: u64,
 ) -> Result<u64, String> {
     const FOOTER_STRUCT_LENGTH: u64 = 12; // payload_length(4) + flags(4) + magic(4)

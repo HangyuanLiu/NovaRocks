@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::TableIdent;
+use novarocks_connector_iceberg::iceberg::TableIdent;
 
 use crate::connector::iceberg::commit::CommitOpKind;
 use crate::exec::chunk::Chunk;
@@ -133,14 +133,14 @@ impl RepartitionChunkPayload {
 }
 
 pub(crate) struct PreparedRepartitionChunkWrite {
-    pub(crate) data_files: Vec<iceberg::spec::DataFile>,
+    pub(crate) data_files: Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>,
     pub(crate) total_rows: i64,
     pub(crate) base_snapshots: BTreeMap<String, i64>,
     pub(crate) base_table_uuids: BTreeMap<String, String>,
 }
 
 pub(crate) async fn write_repartition_chunk_payload(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     payload: RepartitionChunkPayload,
 ) -> Result<PreparedRepartitionChunkWrite, String> {
     let total_rows = payload.total_rows();
@@ -167,7 +167,7 @@ fn join_repartition_commit_kind() -> CommitOpKind {
 }
 
 fn execute_prepared_join_repartition_write<T, F>(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
     logical: T,
@@ -187,7 +187,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_join_repartition_write<F>(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     target_ref: &str,
     rewrite: &IcebergMvRewriteContext,
@@ -278,11 +278,11 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
         SortOrder, TableMetadataBuilder, Type,
     };
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::mv::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::refresh::capabilities::{
@@ -315,7 +315,7 @@ mod tests {
         record_batch_to_chunk(batch).expect("chunk")
     }
 
-    fn test_table() -> iceberg::table::Table {
+    fn test_table() -> novarocks_connector_iceberg::iceberg::table::Table {
         let schema = IcebergSchema::builder()
             .with_schema_id(1)
             .with_fields(vec![Arc::new(NestedField::required(
@@ -337,12 +337,12 @@ mod tests {
         .build()
         .expect("table metadata")
         .metadata;
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),
                 "mv".to_string(),
             ))
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("table")

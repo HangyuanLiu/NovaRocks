@@ -20,8 +20,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use iceberg::io::FileIO;
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
 /// Set of object-store paths (data / delete / manifest / manifest-list / DV puffin).
 pub type FileSet = HashSet<String>;
@@ -62,12 +62,12 @@ pub async fn enumerate_files_for_snapshots(
     file_io: &FileIO,
     metadata: &TableMetadata,
     snapshot_ids: &HashSet<i64>,
-) -> Result<FileSet, iceberg::Error> {
+) -> Result<FileSet, novarocks_connector_iceberg::iceberg::Error> {
     let mut out = FileSet::new();
     for sid in snapshot_ids {
         let snapshot = metadata.snapshot_by_id(*sid).ok_or_else(|| {
-            iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 format!("snapshot id {sid} not found in metadata"),
             )
         })?;
@@ -137,7 +137,7 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadata,
         TableMetadataBuilder, Type,
@@ -187,7 +187,7 @@ pub(crate) mod test_support {
             let ts = 1_700_000_000_000i64 + seq * 1000;
             let manifest_list = format!("/tmp/test_table/metadata/snap-{sid}-ml.avro");
             let summary = Summary {
-                operation: iceberg::spec::Operation::Append,
+                operation: novarocks_connector_iceberg::iceberg::spec::Operation::Append,
                 additional_properties: HashMap::new(),
             };
             let snapshot = Snapshot::builder()

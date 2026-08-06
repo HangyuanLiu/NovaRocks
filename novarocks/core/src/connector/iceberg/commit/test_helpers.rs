@@ -24,12 +24,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveLiteral,
     PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionSpec,
 };
-use iceberg::table::Table;
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 use uuid::Uuid;
 

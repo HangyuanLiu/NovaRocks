@@ -58,7 +58,7 @@ use super::scan_model::{
 pub(crate) struct IcebergBatchReader {
     reader: Box<dyn FileBatchReader>,
     expected_schema: SchemaRef,
-    name_mapping: Option<Arc<iceberg::spec::NameMapping>>,
+    name_mapping: Option<Arc<novarocks_connector_iceberg::iceberg::spec::NameMapping>>,
     data_file_path: String,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
@@ -198,7 +198,7 @@ impl IcebergBatchReader {
     fn try_new_with_equality_mode(
         file: &IcebergDataFileInfo,
         physical_predicates: &[IcebergPhysicalPredicate],
-        name_mapping: Option<Arc<iceberg::spec::NameMapping>>,
+        name_mapping: Option<Arc<novarocks_connector_iceberg::iceberg::spec::NameMapping>>,
         row_groups: Option<&[usize]>,
         access: FsAccessHandle,
         request: ConnectorOpenReaderRequest,
@@ -639,7 +639,7 @@ fn connector_metrics(metrics: FileMetricsSnapshot) -> ConnectorReaderMetricsSnap
 
 fn apply_name_mapping_to_batch(
     batch: RecordBatch,
-    name_mapping: Option<&iceberg::spec::NameMapping>,
+    name_mapping: Option<&novarocks_connector_iceberg::iceberg::spec::NameMapping>,
 ) -> Result<RecordBatch, String> {
     let (identified, total) = schema_field_id_coverage(&batch.schema())?;
     if identified == total {
@@ -678,7 +678,7 @@ pub(super) fn schema_field_id_coverage(schema: &SchemaRef) -> Result<(usize, usi
 
 pub(super) fn apply_name_mapping_to_schema(
     schema: &SchemaRef,
-    name_mapping: &iceberg::spec::NameMapping,
+    name_mapping: &novarocks_connector_iceberg::iceberg::spec::NameMapping,
 ) -> Result<SchemaRef, String> {
     let mappings = name_mapping
         .fields()
@@ -699,7 +699,7 @@ pub(super) fn apply_name_mapping_to_schema(
 
 fn map_field_id_recursive(
     field: &Field,
-    mappings: &[Arc<iceberg::spec::MappedField>],
+    mappings: &[Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
 ) -> Result<Field, String> {
     let mapped = mapped_field_for_name(mappings, field.name())?;
     let field_id = mapped.field_id().ok_or_else(|| {
@@ -762,9 +762,9 @@ fn map_field_id_recursive(
 }
 
 fn mapped_field_for_name<'a>(
-    mappings: &'a [Arc<iceberg::spec::MappedField>],
+    mappings: &'a [Arc<novarocks_connector_iceberg::iceberg::spec::MappedField>],
     name: &str,
-) -> Result<&'a iceberg::spec::MappedField, String> {
+) -> Result<&'a novarocks_connector_iceberg::iceberg::spec::MappedField, String> {
     let mut matches = mappings
         .iter()
         .filter(|mapped| mapped.names().iter().any(|candidate| candidate == name));
@@ -1237,7 +1237,7 @@ mod tests {
                 false,
             ),
         ]));
-        let mapping: iceberg::spec::NameMapping = serde_json::from_str(
+        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping = serde_json::from_str(
             r#"[
                 {"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["old_nested"]}]},
                 {"field-id":3,"names":["old_values"],"fields":[{"field-id":4,"names":["element_old"]}]},
@@ -1263,7 +1263,7 @@ mod tests {
             DataType::Struct(vec![Field::new("missing", DataType::Int32, false)].into()),
             false,
         )]));
-        let mapping: iceberg::spec::NameMapping = serde_json::from_str(
+        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping = serde_json::from_str(
             r#"[{"field-id":1,"names":["old_record"],"fields":[{"field-id":2,"names":["other"]}]}]"#,
         )
         .expect("mapping");
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn name_mapping_treats_variant_physical_children_as_opaque() {
         let schema = Arc::new(Schema::new(vec![physical_variant_field("payload", None)]));
-        let mapping: iceberg::spec::NameMapping =
+        let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping =
             serde_json::from_str(r#"[{"field-id":2,"names":["payload"]}]"#).expect("mapping");
 
         let mapped = apply_name_mapping_to_schema(&schema, &mapping).expect("variant mapping");

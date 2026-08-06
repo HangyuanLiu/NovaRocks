@@ -213,7 +213,7 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 }
 
 pub async fn write_single_deletion_vector_puffin(
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     path: &str,
     referenced_data_file: &str,
     dv: &DeletionVector,
@@ -280,7 +280,7 @@ pub async fn write_single_deletion_vector_puffin(
 }
 
 pub async fn write_multi_deletion_vector_puffin(
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     path: &str,
     inputs: &[DeletionVectorBlobInput],
 ) -> Result<Vec<WrittenPuffinDv>> {
@@ -383,7 +383,7 @@ pub async fn write_multi_deletion_vector_puffin(
 }
 
 pub async fn read_deletion_vector_puffin(
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     path: &str,
     content_offset: i64,
     content_size_in_bytes: i64,
@@ -459,7 +459,7 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::io::FileIO;
+    use novarocks_connector_iceberg::iceberg::io::FileIO;
 
     fn local_file_io(location: &str) -> FileIO {
         crate::connector::iceberg::fs_io::build_file_io_for_location(location, None)

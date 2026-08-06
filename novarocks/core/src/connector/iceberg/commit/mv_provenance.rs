@@ -49,7 +49,7 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::spec::Snapshot;
+use novarocks_connector_iceberg::iceberg::spec::Snapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -236,7 +236,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{Operation, Summary};
+    use novarocks_connector_iceberg::iceberg::spec::{Operation, Summary};
 
     fn sample() -> MvProvenanceV1 {
         MvProvenanceV1 {
@@ -373,10 +373,14 @@ mod tests {
 mod spike_tests {
     use std::collections::HashMap;
 
-    use iceberg::spec::{Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary};
-    use iceberg::table::Table;
-    use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::{Catalog, TableCommit, TableRequirement, TableUpdate};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
+    };
+    use novarocks_connector_iceberg::iceberg::table::Table;
+    use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use novarocks_connector_iceberg::iceberg::{
+        Catalog, TableCommit, TableRequirement, TableUpdate,
+    };
     use uuid::Uuid;
 
     use crate::connector::iceberg::commit::test_helpers::{

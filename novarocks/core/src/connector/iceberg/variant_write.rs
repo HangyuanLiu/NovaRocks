@@ -22,12 +22,12 @@
 //! `VariantValue::serialize` form). Iceberg parquet writers expect the
 //! parent column to be a `StructArray { metadata: BinaryArray (req),
 //! value: BinaryArray (req) }`; this module bridges the two right
-//! before `iceberg::ParquetWriter::write`.
+//! before `novarocks_connector_iceberg::iceberg::ParquetWriter::write`.
 
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
-use iceberg::spec::SchemaRef;
+use novarocks_connector_iceberg::iceberg::spec::SchemaRef;
 
 pub(crate) const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
 
@@ -61,7 +61,7 @@ pub(crate) fn parse_variant_shredding_properties(
     properties: &HashMap<String, String>,
     iceberg_schema: &SchemaRef,
 ) -> Result<VariantShreddingConfig, String> {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
 
     let mut columns_by_name = HashMap::new();
     for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
@@ -335,7 +335,7 @@ fn read_le_u32(data: &[u8], size: u8) -> Result<u32, String> {
 /// schema that correspond to `PrimitiveType::Variant` fields. Order
 /// matches `iceberg_schema.as_struct().fields()`.
 pub(crate) fn variant_field_indices(iceberg_schema: &SchemaRef) -> Vec<usize> {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
     iceberg_schema
         .as_struct()
         .fields()
@@ -518,7 +518,9 @@ mod tests {
 
     #[test]
     fn variant_field_indices_finds_variant_columns() {
-        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            NestedField, PrimitiveType, Schema, Type,
+        };
         use std::sync::Arc;
         let schema = Arc::new(
             Schema::builder()
@@ -537,7 +539,9 @@ mod tests {
 
     #[test]
     fn variant_field_indices_returns_empty_when_no_variants() {
-        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            NestedField, PrimitiveType, Schema, Type,
+        };
         use std::sync::Arc;
         let schema = Arc::new(
             Schema::builder()
@@ -571,10 +575,12 @@ mod tests {
         out
     }
 
-    fn make_iceberg_schema(fields: Vec<iceberg::spec::NestedFieldRef>) -> iceberg::spec::SchemaRef {
+    fn make_iceberg_schema(
+        fields: Vec<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef>,
+    ) -> novarocks_connector_iceberg::iceberg::spec::SchemaRef {
         use std::sync::Arc;
         Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(fields)
                 .build()
@@ -583,17 +589,20 @@ mod tests {
     }
 
     fn make_annotated_arrow_schema(
-        iceberg_schema: &iceberg::spec::SchemaRef,
+        iceberg_schema: &novarocks_connector_iceberg::iceberg::spec::SchemaRef,
     ) -> arrow::datatypes::SchemaRef {
         use std::sync::Arc;
-        Arc::new(iceberg::arrow::schema_to_arrow_schema(iceberg_schema).expect("convert"))
+        Arc::new(
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+                .expect("convert"),
+        )
     }
 
     #[test]
     fn transform_single_variant_column_one_row() {
         use arrow::array::{LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -641,7 +650,7 @@ mod tests {
     fn transform_handles_null_row_with_zero_length_children() {
         use arrow::array::{Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -691,7 +700,7 @@ mod tests {
     fn transform_passes_through_non_variant_columns_unchanged() {
         use arrow::array::{Int32Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -735,7 +744,7 @@ mod tests {
     fn transform_preserves_widened_non_variant_column_type() {
         use arrow::array::{Int64Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         // Annotated schema says id is Int32 (the table column type).
@@ -798,7 +807,7 @@ mod tests {
     fn transform_handles_two_adjacent_variant_columns() {
         use arrow::array::{Array, LargeBinaryArray, RecordBatch};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -836,7 +845,7 @@ mod tests {
     #[test]
     fn parse_variant_shredding_properties_accepts_whitelisted_paths() {
         use arrow::datatypes::{DataType, Field, Fields};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::collections::HashMap;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -866,7 +875,7 @@ mod tests {
 
     #[test]
     fn parse_variant_shredding_properties_rejects_non_variant_column() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::collections::HashMap;
 
         let iceberg_schema = make_iceberg_schema(vec![
@@ -890,7 +899,7 @@ mod tests {
             Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, RecordBatch,
         };
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use parquet::variant::json_to_variant;
         use std::collections::HashMap;
         use std::sync::Arc;

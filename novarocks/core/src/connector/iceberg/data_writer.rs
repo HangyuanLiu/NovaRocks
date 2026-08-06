@@ -24,18 +24,20 @@ use crate::exec::row_position::{
 };
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
-use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::arrow::{
+    RecordBatchPartitionSplitter, schema_to_arrow_schema,
+};
+use novarocks_connector_iceberg::iceberg::spec::{
     DataFile, DataFileBuilder, DataFileFormat, NestedField, PartitionSpecRef, PrimitiveType,
     SchemaRef, TableMetadata, Type,
 };
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
+use novarocks_connector_iceberg::iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use novarocks_connector_iceberg::iceberg::writer::file_writer::ParquetWriterBuilder;
+use novarocks_connector_iceberg::iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use novarocks_connector_iceberg::iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use novarocks_connector_iceberg::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
 
 use super::delete_file::IcebergFileContent;
@@ -108,8 +110,8 @@ impl StagedDataFileWriter {
 }
 
 pub(crate) struct StagedWriteContext {
-    metadata: Arc<iceberg::spec::TableMetadata>,
-    file_io: iceberg::io::FileIO,
+    metadata: Arc<novarocks_connector_iceberg::iceberg::spec::TableMetadata>,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     writer_schema: SchemaRef,
     annotated_schema: arrow::datatypes::SchemaRef,
     variant_input_schema: arrow::datatypes::SchemaRef,
@@ -121,7 +123,9 @@ pub(crate) struct StagedWriteContext {
 }
 
 impl StagedWriteContext {
-    pub(crate) fn from_table(table: &iceberg::table::Table) -> Result<Self, String> {
+    pub(crate) fn from_table(
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
+    ) -> Result<Self, String> {
         let writer_schema = table.metadata().current_schema().clone();
         let annotated_schema = Arc::new(
             schema_to_arrow_schema(&writer_schema)
@@ -131,7 +135,7 @@ impl StagedWriteContext {
     }
 
     fn from_table_with_schema(
-        table: &iceberg::table::Table,
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
         writer_schema: SchemaRef,
         annotated_schema: arrow::datatypes::SchemaRef,
     ) -> Result<Self, String> {
@@ -144,8 +148,8 @@ impl StagedWriteContext {
     }
 
     pub(crate) fn from_parts(
-        metadata: iceberg::spec::TableMetadata,
-        file_io: iceberg::io::FileIO,
+        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+        file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
         writer_schema: SchemaRef,
         annotated_schema: arrow::datatypes::SchemaRef,
     ) -> Result<Self, String> {
@@ -160,8 +164,8 @@ impl StagedWriteContext {
     }
 
     pub(crate) fn from_parts_with_partition_spec_id(
-        metadata: iceberg::spec::TableMetadata,
-        file_io: iceberg::io::FileIO,
+        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+        file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
         writer_schema: SchemaRef,
         annotated_schema: arrow::datatypes::SchemaRef,
         partition_spec_id: i32,
@@ -198,7 +202,7 @@ impl StagedWriteContext {
         self.metadata.as_ref()
     }
 
-    pub(crate) fn file_io(&self) -> &iceberg::io::FileIO {
+    pub(crate) fn file_io(&self) -> &novarocks_connector_iceberg::iceberg::io::FileIO {
         &self.file_io
     }
 
@@ -244,7 +248,9 @@ pub(crate) struct IcebergStreamingDataFileWriter {
 }
 
 impl IcebergStreamingDataFileWriter {
-    pub(crate) fn new(table: iceberg::table::Table) -> Result<Self, String> {
+    pub(crate) fn new(
+        table: novarocks_connector_iceberg::iceberg::table::Table,
+    ) -> Result<Self, String> {
         let ctx = StagedWriteContext::from_table(&table)?;
         let writer = StagedDataFileWriter::new(ctx, StagedWriteOptions::default())?;
         Ok(Self { writer })
@@ -261,7 +267,7 @@ impl IcebergStreamingDataFileWriter {
 }
 
 pub(crate) async fn write_record_batches_as_data_files(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<DataFile>, String> {
     let ctx = StagedWriteContext::from_table(table)?;
@@ -504,7 +510,7 @@ fn u64_stats_to_i64(stats: &HashMap<i32, u64>, field: &str) -> Result<BTreeMap<i
 }
 
 fn datum_bounds_to_bytes(
-    bounds: &HashMap<i32, iceberg::spec::Datum>,
+    bounds: &HashMap<i32, novarocks_connector_iceberg::iceberg::spec::Datum>,
     field: &str,
 ) -> Result<BTreeMap<i32, Vec<u8>>, String> {
     bounds
@@ -558,7 +564,7 @@ fn clone_theta_sketches(
 }
 
 async fn write_record_batches_as_data_files_with_schema(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     batches: impl IntoIterator<Item = RecordBatch>,
     writer_schema: SchemaRef,
     annotated_schema: arrow::datatypes::SchemaRef,
@@ -625,9 +631,9 @@ fn retag_data_file_partition_spec_id(
 
 #[allow(dead_code)]
 pub(crate) async fn write_row_lineage_batches_as_data_files(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     batches: &[RowLineageWriteBatch],
-) -> Result<Vec<iceberg::spec::DataFile>, String> {
+) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
     let writer_schema = build_row_lineage_writer_schema(table.metadata().current_schema())?;
     let annotated_schema = Arc::new(
         schema_to_arrow_schema(&writer_schema)
@@ -1310,7 +1316,7 @@ fn unique_file_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataContentType, NestedField, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{DataContentType, NestedField, Struct};
 
     use super::*;
 
@@ -1364,12 +1370,12 @@ mod tests {
             "{}/custom-data",
             table.metadata().location().trim_end_matches('/')
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             writer_schema.as_ref().clone(),
             table.metadata().default_partition_spec().as_ref().clone(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             table.metadata().location().to_string(),
-            iceberg::spec::FormatVersion::V2,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
             std::collections::HashMap::from([(
                 "write.data.path".to_string(),
                 data_location.clone(),
@@ -1801,12 +1807,12 @@ mod tests {
     }
 
     struct LocalFsTestTable {
-        table: iceberg::table::Table,
+        table: novarocks_connector_iceberg::iceberg::table::Table,
         _dir: tempfile::TempDir,
     }
 
     impl std::ops::Deref for LocalFsTestTable {
-        type Target = iceberg::table::Table;
+        type Target = novarocks_connector_iceberg::iceberg::table::Table;
 
         fn deref(&self) -> &Self::Target {
             &self.table
@@ -1844,7 +1850,7 @@ mod tests {
         let file_io_location = location.clone();
 
         let schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -1853,61 +1859,77 @@ mod tests {
                 .expect("schema"),
         );
         let metadata_builder = if partitioned && partition_spec_id > 0 {
-            let mut builder = iceberg::spec::TableMetadataBuilder::new(
-                schema.as_ref().clone(),
-                iceberg::spec::PartitionSpec::unpartition_spec(),
-                iceberg::spec::SortOrder::unsorted_order(),
-                location,
-                iceberg::spec::FormatVersion::V2,
-                std::collections::HashMap::new(),
-            )
-            .expect("builder");
+            let mut builder =
+                novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
+                    schema.as_ref().clone(),
+                    novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+                    novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
+                    location,
+                    novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
+                    std::collections::HashMap::new(),
+                )
+                .expect("builder");
             for idx in 1..partition_spec_id {
                 let transform = if idx <= 3 {
-                    iceberg::spec::Transform::Bucket((idx + 1) as u32)
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Bucket((idx + 1) as u32)
                 } else {
-                    iceberg::spec::Transform::Truncate((idx - 2) as u32)
+                    novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(
+                        (idx - 2) as u32,
+                    )
                 };
-                let spec = iceberg::spec::UnboundPartitionSpec::builder()
-                    .add_partition_field(1, format!("id_evolved_{idx}"), transform)
-                    .expect("add evolved partition field")
-                    .build();
+                let spec =
+                    novarocks_connector_iceberg::iceberg::spec::UnboundPartitionSpec::builder()
+                        .add_partition_field(1, format!("id_evolved_{idx}"), transform)
+                        .expect("add evolved partition field")
+                        .build();
                 builder = builder
                     .add_default_partition_spec(spec)
                     .expect("add evolved partition spec");
             }
-            let identity_spec = iceberg::spec::UnboundPartitionSpec::builder()
-                .add_partition_field(1, "id", iceberg::spec::Transform::Identity)
-                .expect("add identity partition field")
-                .build();
+            let identity_spec =
+                novarocks_connector_iceberg::iceberg::spec::UnboundPartitionSpec::builder()
+                    .add_partition_field(
+                        1,
+                        "id",
+                        novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
+                    )
+                    .expect("add identity partition field")
+                    .build();
             builder
                 .add_default_partition_spec(identity_spec)
                 .expect("add identity partition spec")
         } else {
             let partition_spec = if partitioned {
-                iceberg::spec::PartitionSpec::builder(schema.clone())
+                novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
                     .with_spec_id(partition_spec_id)
-                    .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
+                    .add_partition_field(
+                        "id",
+                        "id",
+                        novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
+                    )
                     .expect("add partition field")
                     .build()
                     .expect("partition spec")
             } else {
-                iceberg::spec::PartitionSpec::unpartition_spec()
+                novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()
             };
-            iceberg::spec::TableMetadataBuilder::new(
+            novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
                 schema.as_ref().clone(),
                 partition_spec,
-                iceberg::spec::SortOrder::unsorted_order(),
+                novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
                 location,
-                iceberg::spec::FormatVersion::V2,
+                novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
                 std::collections::HashMap::new(),
             )
             .expect("builder")
         };
         let metadata = metadata_builder.build().expect("metadata").metadata;
 
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", name]).expect("table ident"))
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", name])
+                    .expect("table ident"),
+            )
             .file_io(
                 crate::connector::iceberg::fs_io::build_file_io_for_location(
                     &file_io_location,
@@ -2076,11 +2098,11 @@ mod tests {
     fn enriched_row_lineage_columns_reannotate_with_extended_schema() {
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use std::sync::Arc;
 
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(7)
                 .with_fields(vec![
                     NestedField::optional(1, "v", Type::Primitive(PrimitiveType::String)).into(),
@@ -2330,7 +2352,7 @@ mod tests {
     async fn write_variant_column_round_trips_through_local_parquet() {
         use arrow::array::{Int32Array, LargeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs::File;
         use std::sync::Arc;
@@ -2340,7 +2362,7 @@ mod tests {
         let location = format!("file://{}", dir.path().display());
 
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -2349,20 +2371,22 @@ mod tests {
                 .build()
                 .expect("schema"),
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             iceberg_schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             location.clone(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("builder")
         .build()
         .expect("metadata")
         .metadata;
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            )
             .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
@@ -2438,7 +2462,7 @@ mod tests {
     async fn write_variant_column_with_shredding_property_outputs_typed_value() {
         use arrow::array::{ArrayRef, BinaryArray, BinaryViewArray, Int32Array, LargeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use parquet::variant::json_to_variant;
         use std::collections::HashMap;
@@ -2477,7 +2501,7 @@ mod tests {
         let location = format!("file://{}", dir.path().display());
 
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -2486,12 +2510,12 @@ mod tests {
                 .build()
                 .expect("schema"),
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             iceberg_schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             location.clone(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             HashMap::from([(
                 "write.parquet.variant-shredding.v".to_string(),
                 "a bigint".to_string(),
@@ -2501,8 +2525,11 @@ mod tests {
         .build()
         .expect("metadata")
         .metadata;
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "t_shred"]).unwrap())
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t_shred"])
+                    .unwrap(),
+            )
             .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
@@ -2551,7 +2578,7 @@ mod tests {
     async fn standalone_commit_round_trip_preserves_column_bounds() {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        use iceberg::spec::{Datum, NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{Datum, NestedField, PrimitiveType, Type};
         use std::sync::Arc;
         use tempfile::tempdir;
 
@@ -2559,7 +2586,7 @@ mod tests {
         let location = format!("file://{}", dir.path().display());
 
         let iceberg_schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(vec![
                     NestedField::required(1, "k1", Type::Primitive(PrimitiveType::Int)).into(),
@@ -2567,20 +2594,22 @@ mod tests {
                 .build()
                 .expect("schema"),
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             iceberg_schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             location.clone(),
-            iceberg::spec::FormatVersion::V2,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
             std::collections::HashMap::new(),
         )
         .expect("builder")
         .build()
         .expect("metadata")
         .metadata;
-        let table = iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+        let table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            )
             .file_io(crate::connector::iceberg::fs_io::build_file_io_for_location(&location, None))
             .metadata(metadata)
             .build()
@@ -2612,7 +2641,7 @@ mod tests {
 
         let collector = crate::connector::iceberg::commit::IcebergCommitCollector::new(
             crate::connector::iceberg::commit::CommitOpKind::FastAppend,
-            iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+            novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
             None,
             0,
             table.metadata().current_schema().clone(),

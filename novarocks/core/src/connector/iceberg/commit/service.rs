@@ -258,8 +258,8 @@ pub fn classify_commit_error(err: &str) -> CommitFailureKind {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{NestedField, PartitionSpec, Schema, Type};
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PartitionSpec, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
     use std::sync::Arc;
 
     use crate::common::types::UniqueId;
@@ -272,7 +272,7 @@ mod tests {
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
                 "id",
-                Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                Type::Primitive(novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long),
             ))])
             .build()
             .expect("schema");

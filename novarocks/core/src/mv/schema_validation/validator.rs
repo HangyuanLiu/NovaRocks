@@ -77,7 +77,8 @@ pub(crate) fn validate_join_schema_contract(
 
     let mut rebound_columns = Vec::new();
     for (base_fqn, current_base) in bases {
-        if current_base.format_version != iceberg::spec::FormatVersion::V3
+        if current_base.format_version
+            != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
             || !current_base.row_lineage_enabled
         {
             return Err(JoinSchemaValidationError::BaseRowLineageContractBroken {
@@ -119,7 +120,7 @@ pub(crate) fn validate_join_schema_contract(
 fn validate_join_base_schema_contract_for_rebind(
     base_fqn: &str,
     base_contract: &BaseContract,
-    current_schema: &iceberg::spec::Schema,
+    current_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Vec<RebindColumn>, JoinSchemaValidationError> {
     let current_schema = current_schema.as_struct();
     let mut rebound = Vec::new();
@@ -168,7 +169,7 @@ fn validate_join_base_schema_contract_for_rebind(
 
 pub(crate) fn validate_branch_id_field(
     contract: &BranchIdColumnContract,
-    target_schema: &iceberg::spec::Schema,
+    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<(), BranchFieldValidationError> {
     let Some(field) = target_schema
         .as_struct()
@@ -190,7 +191,9 @@ pub(crate) fn validate_branch_id_field(
         return Err(BranchFieldValidationError::NotRequired);
     }
     match field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int) => Ok(()),
+        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        ) => Ok(()),
         other => Err(BranchFieldValidationError::WrongType {
             expected: "Int".to_string(),
             actual: other.to_string(),
@@ -200,8 +203,8 @@ pub(crate) fn validate_branch_id_field(
 
 fn validate_schema_contract_after_identity(
     contract: &MvSchemaContract,
-    base_schema: &iceberg::spec::Schema,
-    target_schema: &iceberg::spec::Schema,
+    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> ContractDecision {
     // Stage 2 fast path.
     if base_schema.schema_id() == contract.base.schema_id_at_create
@@ -243,7 +246,7 @@ fn validate_identity_guards(
             actual: base.table_uuid.clone(),
         });
     }
-    if base.format_version != iceberg::spec::FormatVersion::V3 {
+    if base.format_version != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::BaseRowLineageContractBroken {
             reason: format!(
                 "base table must be Iceberg format v3, found {:?}",
@@ -263,7 +266,7 @@ fn validate_identity_guards(
             actual: target.table_uuid.clone(),
         });
     }
-    if target.format_version != iceberg::spec::FormatVersion::V3 {
+    if target.format_version != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
         return Some(SchemaEvolutionError::TargetRowLineageContractBroken {
             reason: format!(
                 "target table must be Iceberg format v3, found {:?}",
@@ -281,7 +284,7 @@ fn validate_identity_guards(
 
 fn check_base_referenced_fields(
     contract: &MvSchemaContract,
-    base_schema: &iceberg::spec::Schema,
+    base_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Vec<RebindColumn>, SchemaEvolutionError> {
     let current = base_schema.as_struct();
     let mut rebound = Vec::new();
@@ -323,7 +326,7 @@ fn check_base_referenced_fields(
 
 fn check_target_partition_spec(
     contract: &MvSchemaContract,
-    current_spec: &iceberg::spec::PartitionSpec,
+    current_spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
 ) -> Option<SchemaEvolutionError> {
     let Some(expected) = &contract.target.partition else {
         return None;
@@ -395,30 +398,42 @@ fn check_target_partition_spec(
 }
 
 fn partition_transform_contract(
-    transform: &iceberg::spec::Transform,
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
 ) -> Option<MvPartitionTransformContract> {
     match transform {
-        iceberg::spec::Transform::Identity => Some(MvPartitionTransformContract::Identity),
-        iceberg::spec::Transform::Year => Some(MvPartitionTransformContract::Year),
-        iceberg::spec::Transform::Month => Some(MvPartitionTransformContract::Month),
-        iceberg::spec::Transform::Day => Some(MvPartitionTransformContract::Day),
-        iceberg::spec::Transform::Hour => Some(MvPartitionTransformContract::Hour),
-        iceberg::spec::Transform::Bucket(num_buckets) => {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+            Some(MvPartitionTransformContract::Identity)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+            Some(MvPartitionTransformContract::Year)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+            Some(MvPartitionTransformContract::Month)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+            Some(MvPartitionTransformContract::Day)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+            Some(MvPartitionTransformContract::Hour)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
             Some(MvPartitionTransformContract::Bucket {
                 num_buckets: *num_buckets,
             })
         }
-        iceberg::spec::Transform::Truncate(width) => {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
             Some(MvPartitionTransformContract::Truncate { width: *width })
         }
-        iceberg::spec::Transform::Void => Some(MvPartitionTransformContract::Void),
-        iceberg::spec::Transform::Unknown => None,
+        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+            Some(MvPartitionTransformContract::Void)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => None,
     }
 }
 
 fn check_target_schema(
     contract: &MvSchemaContract,
-    target_schema: &iceberg::spec::Schema,
+    target_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Option<SchemaEvolutionError> {
     let current = target_schema.as_struct();
     for tv in &contract.target.visible_columns {
@@ -480,13 +495,16 @@ fn check_target_schema(
         });
     }
     let expected_apply_key_type = match expected.source {
-        ApplyKeySource::BaseRowId => iceberg::spec::PrimitiveType::Long,
+        ApplyKeySource::BaseRowId => {
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long
+        }
         ApplyKeySource::JoinRowKey | ApplyKeySource::GroupRowId => {
-            iceberg::spec::PrimitiveType::String
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String
         }
     };
     match field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(actual) if actual == &expected_apply_key_type => {}
+        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(actual)
+            if actual == &expected_apply_key_type => {}
         other => {
             return Some(SchemaEvolutionError::HiddenApplyKeyContractBroken {
                 reason: format!(
@@ -500,7 +518,7 @@ fn check_target_schema(
 
 fn check_aggregate_state_schema(
     contract: &MvSchemaContract,
-    current: &iceberg::spec::StructType,
+    current: &novarocks_connector_iceberg::iceberg::spec::StructType,
 ) -> Option<SchemaEvolutionError> {
     let aggregate = contract.aggregate.as_ref()?;
     if aggregate.state_layout_version != 1 {
@@ -562,7 +580,9 @@ fn check_aggregate_state_schema(
         });
     }
     match row_id_field.field_type.as_ref() {
-        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String) => {}
+        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+        ) => {}
         other => {
             return Some(SchemaEvolutionError::AggregateStateContractBroken {
                 reason: format!(
@@ -638,9 +658,9 @@ mod tests {
 
     fn test_schema(
         schema_id: i32,
-        fields: Vec<iceberg::spec::NestedField>,
-    ) -> iceberg::spec::Schema {
-        iceberg::spec::Schema::builder()
+        fields: Vec<novarocks_connector_iceberg::iceberg::spec::NestedField>,
+    ) -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(schema_id)
             .with_fields(fields.into_iter().map(Arc::new))
             .build()
@@ -650,10 +670,10 @@ mod tests {
     #[derive(Clone)]
     struct TestCurrentIcebergTable {
         table_uuid: String,
-        format_version: iceberg::spec::FormatVersion,
+        format_version: novarocks_connector_iceberg::iceberg::spec::FormatVersion,
         row_lineage_enabled: bool,
-        schema: iceberg::spec::Schema,
-        default_partition_spec: iceberg::spec::PartitionSpec,
+        schema: novarocks_connector_iceberg::iceberg::spec::Schema,
+        default_partition_spec: novarocks_connector_iceberg::iceberg::spec::PartitionSpec,
     }
 
     impl TestCurrentIcebergTable {
@@ -670,10 +690,10 @@ mod tests {
 
     fn identity_table(
         table_uuid: &str,
-        format_version: iceberg::spec::FormatVersion,
+        format_version: novarocks_connector_iceberg::iceberg::spec::FormatVersion,
         row_lineage_enabled: bool,
     ) -> TestCurrentIcebergTable {
-        use iceberg::spec::{PartitionSpec, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{PartitionSpec, PrimitiveType, Type};
 
         TestCurrentIcebergTable {
             table_uuid: table_uuid.to_string(),
@@ -682,12 +702,12 @@ mod tests {
             schema: test_schema(
                 1,
                 vec![
-                    iceberg::spec::NestedField::required(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                         1,
                         "id",
                         Type::Primitive(PrimitiveType::Int),
                     ),
-                    iceberg::spec::NestedField::required(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                         2,
                         HIDDEN_APPLY_KEY_COLUMN_NAME,
                         Type::Primitive(PrimitiveType::Long),
@@ -820,14 +840,46 @@ mod tests {
             assert_eq!(error.to_string(), expected);
         }
 
-        let good_base = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, true);
-        let good_target = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, true);
-        let base_v2 = identity_table("base-uuid", iceberg::spec::FormatVersion::V2, true);
-        let base_missing = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, false);
-        let base_false = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, false);
-        let target_v2 = identity_table("target-uuid", iceberg::spec::FormatVersion::V2, true);
-        let target_missing = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, false);
-        let target_false = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, false);
+        let good_base = identity_table(
+            "base-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            true,
+        );
+        let good_target = identity_table(
+            "target-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            true,
+        );
+        let base_v2 = identity_table(
+            "base-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
+            true,
+        );
+        let base_missing = identity_table(
+            "base-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            false,
+        );
+        let base_false = identity_table(
+            "base-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            false,
+        );
+        let target_v2 = identity_table(
+            "target-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
+            true,
+        );
+        let target_missing = identity_table(
+            "target-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            false,
+        );
+        let target_false = identity_table(
+            "target-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            false,
+        );
         let identity_cases = [
             (
                 &base_v2,
@@ -870,14 +922,22 @@ mod tests {
 
     #[test]
     fn identity_validation_preserves_first_error_order() {
-        let good_base = identity_table("base-uuid", iceberg::spec::FormatVersion::V3, true);
-        let good_target = identity_table("target-uuid", iceberg::spec::FormatVersion::V3, true);
+        let good_base = identity_table(
+            "base-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            true,
+        );
+        let good_target = identity_table(
+            "target-uuid",
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+            true,
+        );
         let contract = identity_contract(&good_base, &good_target);
 
         let mut base = good_base.clone();
         let mut target = good_target.clone();
         base.table_uuid = "BASE-UUID".to_string();
-        base.format_version = iceberg::spec::FormatVersion::V2;
+        base.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2;
         base.row_lineage_enabled = false;
         target.table_uuid = "other-target".to_string();
         assert_eq!(
@@ -896,7 +956,7 @@ mod tests {
             })
         );
 
-        base.format_version = iceberg::spec::FormatVersion::V3;
+        base.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3;
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
             ContractDecision::Incompatible(SchemaEvolutionError::BaseRowLineageContractBroken {
@@ -914,7 +974,7 @@ mod tests {
         );
 
         target.table_uuid = contract.target.table_uuid.clone();
-        target.format_version = iceberg::spec::FormatVersion::V2;
+        target.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2;
         target.row_lineage_enabled = false;
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
@@ -923,7 +983,7 @@ mod tests {
             })
         );
 
-        target.format_version = iceberg::spec::FormatVersion::V3;
+        target.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3;
         assert_eq!(
             validate_schema_contract(&contract, &base.view(), &target.view()),
             ContractDecision::Incompatible(SchemaEvolutionError::TargetRowLineageContractBroken {
@@ -975,7 +1035,7 @@ mod tests {
 
     #[test]
     fn target_partition_spec_guard_detects_external_transform_change() {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
         };
 
@@ -1031,7 +1091,9 @@ mod tests {
 
     #[test]
     fn partition_compatibility_preserves_strict_field_order() {
-        use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Transform, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            NestedField, PartitionSpec, PrimitiveType, Transform, Type,
+        };
 
         let schema = Arc::new(test_schema(
             1,
@@ -1114,14 +1176,15 @@ mod tests {
             "live partition state must be ignored when no partition contract was persisted"
         );
 
-        let exact_error = |partition: MvPartitionContract,
-                           current: &iceberg::spec::PartitionSpec| {
-            let mut current_contract = minimal_base_row_id_contract();
-            current_contract.target.partition = Some(partition);
-            check_target_partition_spec(&current_contract, current)
-                .expect("partition mismatch")
-                .to_string()
-        };
+        let exact_error =
+            |partition: MvPartitionContract,
+             current: &novarocks_connector_iceberg::iceberg::spec::PartitionSpec| {
+                let mut current_contract = minimal_base_row_id_contract();
+                current_contract.target.partition = Some(partition);
+                check_target_partition_spec(&current_contract, current)
+                    .expect("partition mismatch")
+                    .to_string()
+            };
         let wrap = |reason: &str| {
             format!(
                 "iceberg MV refresh blocked: target partition spec changed externally ({reason}); recreate the MV"
@@ -1196,30 +1259,42 @@ mod tests {
 
     #[test]
     fn supplied_base_schema_drives_base_rebind_decision() {
-        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let base_schema = iceberg::spec::Schema::builder()
+        let base_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                1,
-                "renamed_id",
-                base_type.clone(),
-            ))])
+            .with_fields(vec![Arc::new(
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1,
+                    "renamed_id",
+                    base_type.clone(),
+                ),
+            )])
             .build()
             .expect("base schema");
-        let target_schema = iceberg::spec::Schema::builder()
+        let target_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(11)
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    target_type.clone(),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    HIDDEN_APPLY_KEY_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        target_type.clone(),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("target schema");
@@ -1290,30 +1365,42 @@ mod tests {
 
     #[test]
     fn supplied_base_schema_rejects_referenced_nullability_drift() {
-        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let base_schema = iceberg::spec::Schema::builder()
+        let base_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::optional(
-                1,
-                "id",
-                base_type.clone(),
-            ))])
-            .build()
-            .expect("base schema");
-        let target_schema = iceberg::spec::Schema::builder()
-            .with_schema_id(11)
-            .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
+            .with_fields(vec![Arc::new(
+                novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
                     1,
                     "id",
-                    target_type.clone(),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    HIDDEN_APPLY_KEY_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
+                    base_type.clone(),
+                ),
+            )])
+            .build()
+            .expect("base schema");
+        let target_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+            .with_schema_id(11)
+            .with_fields(vec![
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        target_type.clone(),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("target schema");
@@ -1340,30 +1427,42 @@ mod tests {
 
     #[test]
     fn supplied_base_schema_rebind_payload_includes_base_fqn() {
-        let base_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let base_schema = iceberg::spec::Schema::builder()
+        let base_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                1,
-                "renamed_id",
-                base_type.clone(),
-            ))])
+            .with_fields(vec![Arc::new(
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1,
+                    "renamed_id",
+                    base_type.clone(),
+                ),
+            )])
             .build()
             .expect("base schema");
-        let target_schema = iceberg::spec::Schema::builder()
+        let target_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(11)
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    target_type.clone(),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    HIDDEN_APPLY_KEY_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        target_type.clone(),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        HIDDEN_APPLY_KEY_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("target schema");
@@ -1387,7 +1486,7 @@ mod tests {
 
     #[test]
     fn base_field_compatibility_preserves_tolerance_and_rebind_order() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
 
         let int_type = Type::Primitive(PrimitiveType::Int);
         let long_type = Type::Primitive(PrimitiveType::Long);
@@ -1477,7 +1576,7 @@ mod tests {
 
     #[test]
     fn target_field_compatibility_preserves_nullable_tolerance_and_failures() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
 
         let int_type = Type::Primitive(PrimitiveType::Int);
         let long_type = Type::Primitive(PrimitiveType::Long);
@@ -1577,12 +1676,17 @@ mod tests {
             ContractDecision::CompatibleSafe
         );
 
-        let aggregate_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let aggregate_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
         let mut aggregate_contract = aggregate_schema_contract(aggregate_type.to_string());
         aggregate_contract.target.schema_id_at_create = 11;
         let aggregate_base = test_schema(aggregate_contract.base.schema_id_at_create, Vec::new());
-        let aggregate_target =
-            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        let aggregate_target = aggregate_target_schema(
+            "__agg_state_c",
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+            false,
+        );
         assert_eq!(
             validate_schema_contract_after_identity(
                 &aggregate_contract,
@@ -1597,7 +1701,9 @@ mod tests {
     }
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {
@@ -1649,7 +1755,9 @@ mod tests {
     }
 
     fn join_schema_contract() -> MvSchemaContract {
-        let int_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let int_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
         let left = BaseContract {
             table_fqn: "ice.db.left".to_string(),
             table_uuid: "left-uuid".to_string(),
@@ -1737,44 +1845,54 @@ mod tests {
         table_uuid: &str,
         field_id: i32,
         field_name: &str,
-        field_type: iceberg::spec::Type,
+        field_type: novarocks_connector_iceberg::iceberg::spec::Type,
         required: bool,
     ) -> TestCurrentIcebergTable {
         let field = if required {
-            iceberg::spec::NestedField::required(field_id, field_name, field_type)
+            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                field_id, field_name, field_type,
+            )
         } else {
-            iceberg::spec::NestedField::optional(field_id, field_name, field_type)
+            novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                field_id, field_name, field_type,
+            )
         };
         TestCurrentIcebergTable {
             table_uuid: table_uuid.to_string(),
-            format_version: iceberg::spec::FormatVersion::V3,
+            format_version: novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             row_lineage_enabled: true,
             schema: test_schema(2, vec![field]),
-            default_partition_spec: iceberg::spec::PartitionSpec::unpartition_spec(),
+            default_partition_spec:
+                novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
         }
     }
 
     fn join_target_table() -> TestCurrentIcebergTable {
         TestCurrentIcebergTable {
             table_uuid: "target-uuid".to_string(),
-            format_version: iceberg::spec::FormatVersion::V3,
+            format_version: novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             row_lineage_enabled: true,
             schema: test_schema(
                 2,
                 vec![
-                    iceberg::spec::NestedField::required(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                         1,
                         "left_id",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
                     ),
-                    iceberg::spec::NestedField::required(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                         2,
                         JOIN_APPLY_KEY_COLUMN_NAME,
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
                     ),
                 ],
             ),
-            default_partition_spec: iceberg::spec::PartitionSpec::unpartition_spec(),
+            default_partition_spec:
+                novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
         }
     }
 
@@ -1797,14 +1915,18 @@ mod tests {
             "left-uuid",
             1,
             "renamed_left_id",
-            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+            ),
             true,
         );
         let right = join_base_table(
             "right-uuid",
             2,
             "right_id",
-            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+            ),
             true,
         );
         let target = join_target_table();
@@ -1831,8 +1953,12 @@ mod tests {
 
     #[test]
     fn join_schema_validation_preserves_first_error_and_exact_messages() {
-        let int_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let long_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
+        let int_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let long_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
         let mut contract = join_schema_contract();
         let mut left = join_base_table("left-uuid", 1, "left_id", int_type.clone(), true);
         let mut right = join_base_table("right-uuid", 2, "right_id", int_type.clone(), true);
@@ -1889,7 +2015,7 @@ mod tests {
         assert!(!error.to_string().contains("wrong-target"));
 
         target.table_uuid = "target-uuid".to_string();
-        left.format_version = iceberg::spec::FormatVersion::V2;
+        left.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2;
         let error = validate_test_join(
             &contract,
             "ice.db.missing",
@@ -1904,7 +2030,7 @@ mod tests {
             "iceberg-backed materialized views require base table ice.db.missing to be Iceberg format-version=3 with write.row-lineage=true; upgrade the table or recreate it with TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")"
         );
 
-        left.format_version = iceberg::spec::FormatVersion::V3;
+        left.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3;
         left.row_lineage_enabled = false;
         let error = validate_test_join(
             &contract,
@@ -1970,9 +2096,11 @@ mod tests {
 
         left.schema = test_schema(
             2,
-            vec![iceberg::spec::NestedField::required(
-                1, "left_id", long_type,
-            )],
+            vec![
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1, "left_id", long_type,
+                ),
+            ],
         );
         let error = validate_test_join(
             &contract,
@@ -2000,11 +2128,13 @@ mod tests {
 
         left.schema = test_schema(
             2,
-            vec![iceberg::spec::NestedField::optional(
-                1,
-                "left_id",
-                int_type.clone(),
-            )],
+            vec![
+                novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                    1,
+                    "left_id",
+                    int_type.clone(),
+                ),
+            ],
         );
         let error = validate_test_join(
             &contract,
@@ -2032,9 +2162,13 @@ mod tests {
 
         left.schema = test_schema(
             2,
-            vec![iceberg::spec::NestedField::required(1, "left_id", int_type)],
+            vec![
+                novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                    1, "left_id", int_type,
+                ),
+            ],
         );
-        target.format_version = iceberg::spec::FormatVersion::V2;
+        target.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2;
         contract.target.partition = Some(MvPartitionContract {
             target_spec_id: 1,
             fields: Vec::new(),
@@ -2053,7 +2187,7 @@ mod tests {
             "iceberg MV refresh blocked: target table row-lineage contract broken (target table must be Iceberg format v3, found V2); recreate the MV"
         );
 
-        target.format_version = iceberg::spec::FormatVersion::V3;
+        target.format_version = novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3;
         target.schema = test_schema(2, Vec::new());
         let error = validate_test_join(
             &contract,
@@ -2076,38 +2210,51 @@ mod tests {
             column_name: BRANCH_ID_COLUMN_NAME.to_string(),
             target_field_id: 2,
         };
-        let schema =
-            |field: Option<iceberg::spec::NestedField>| test_schema(2, field.into_iter().collect());
+        let schema = |field: Option<novarocks_connector_iceberg::iceberg::spec::NestedField>| {
+            test_schema(2, field.into_iter().collect())
+        };
         let cases = vec![
             (
                 schema(None),
                 BranchFieldValidationError::Missing { field_id: 2 },
             ),
             (
-                schema(Some(iceberg::spec::NestedField::required(
-                    2,
-                    "renamed_branch",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))),
+                schema(Some(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        "renamed_branch",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )),
                 BranchFieldValidationError::Renamed {
                     expected: BRANCH_ID_COLUMN_NAME.to_string(),
                     actual: "renamed_branch".to_string(),
                 },
             ),
             (
-                schema(Some(iceberg::spec::NestedField::optional(
-                    2,
-                    BRANCH_ID_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))),
+                schema(Some(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                        2,
+                        BRANCH_ID_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )),
                 BranchFieldValidationError::NotRequired,
             ),
             (
-                schema(Some(iceberg::spec::NestedField::required(
-                    2,
-                    BRANCH_ID_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                ))),
+                schema(Some(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        BRANCH_ID_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                )),
                 BranchFieldValidationError::WrongType {
                     expected: "Int".to_string(),
                     actual: "long".to_string(),
@@ -2122,25 +2269,33 @@ mod tests {
 
     #[test]
     fn join_row_key_target_hidden_column_is_accepted() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
-        let target_schema = iceberg::spec::Schema::builder()
+        let target_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(11)
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    target_type.clone(),
-                )),
-                Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    JOIN_APPLY_KEY_COLUMN_NAME,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        target_type.clone(),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        JOIN_APPLY_KEY_COLUMN_NAME,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("target schema");
@@ -2241,14 +2396,19 @@ mod tests {
 
     #[test]
     fn aggregate_state_target_layout_is_accepted() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
-        let target_schema =
-            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::Long, false);
+        let target_schema = aggregate_target_schema(
+            "__agg_state_c",
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+            false,
+        );
         let contract = aggregate_schema_contract(format!("{target_type}"));
 
         let decision =
@@ -2259,14 +2419,19 @@ mod tests {
 
     #[test]
     fn aggregate_state_target_layout_rejects_renamed_state_column() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
-        let target_schema =
-            aggregate_target_schema("renamed_state", iceberg::spec::PrimitiveType::Long, false);
+        let target_schema = aggregate_target_schema(
+            "renamed_state",
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+            false,
+        );
         let contract = aggregate_schema_contract(format!("{target_type}"));
 
         let decision =
@@ -2285,14 +2450,19 @@ mod tests {
 
     #[test]
     fn aggregate_state_target_layout_rejects_type_changed_state_column() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
-        let target_schema =
-            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        let target_schema = aggregate_target_schema(
+            "__agg_state_c",
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+            false,
+        );
         let contract = aggregate_schema_contract(format!("{target_type}"));
 
         let decision =
@@ -2311,14 +2481,19 @@ mod tests {
 
     #[test]
     fn aggregate_state_validation_runs_on_schema_id_fast_path() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![])
             .build()
             .expect("base schema");
-        let target_schema =
-            aggregate_target_schema("__agg_state_c", iceberg::spec::PrimitiveType::String, false);
+        let target_schema = aggregate_target_schema(
+            "__agg_state_c",
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+            false,
+        );
         let mut contract = aggregate_schema_contract(format!("{target_type}"));
         contract.target.schema_id_at_create = 11;
 
@@ -2338,15 +2513,17 @@ mod tests {
 
     #[test]
     fn aggregate_state_target_layout_rejects_nullable_row_id_column() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
         let target_schema = aggregate_target_schema_with_row_id(
             "__agg_state_c",
-            iceberg::spec::PrimitiveType::Long,
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
             false,
             2,
             true,
@@ -2369,15 +2546,17 @@ mod tests {
 
     #[test]
     fn aggregate_state_target_layout_rejects_row_id_that_is_not_hidden_apply_key() {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long);
-        let base_schema = iceberg::spec::Schema::builder()
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+        );
+        let base_schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(7)
             .with_fields(vec![])
             .build()
             .expect("base schema");
         let target_schema = aggregate_target_schema_with_extra_string_column(
             "__agg_state_c",
-            iceberg::spec::PrimitiveType::Long,
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
             "other_key",
             false,
         );
@@ -2404,21 +2583,25 @@ mod tests {
 
     fn aggregate_target_schema_with_extra_string_column(
         state_column_name: &str,
-        state_column_type: iceberg::spec::PrimitiveType,
+        state_column_type: novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
         extra_column_name: &str,
         extra_nullable: bool,
-    ) -> iceberg::spec::Schema {
+    ) -> novarocks_connector_iceberg::iceberg::spec::Schema {
         let extra_field = if extra_nullable {
-            iceberg::spec::NestedField::optional(
+            novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
                 4,
                 extra_column_name,
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                ),
             )
         } else {
-            iceberg::spec::NestedField::required(
+            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                 4,
                 extra_column_name,
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                ),
             )
         };
         let mut fields = aggregate_target_schema(state_column_name, state_column_type, false)
@@ -2426,7 +2609,7 @@ mod tests {
             .fields()
             .to_vec();
         fields.push(Arc::new(extra_field));
-        iceberg::spec::Schema::builder()
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(11)
             .with_fields(fields)
             .build()
@@ -2435,9 +2618,9 @@ mod tests {
 
     fn aggregate_target_schema(
         state_column_name: &str,
-        state_column_type: iceberg::spec::PrimitiveType,
+        state_column_type: novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
         state_column_nullable: bool,
-    ) -> iceberg::spec::Schema {
+    ) -> novarocks_connector_iceberg::iceberg::spec::Schema {
         aggregate_target_schema_with_row_id(
             state_column_name,
             state_column_type,
@@ -2449,38 +2632,55 @@ mod tests {
 
     fn aggregate_target_schema_with_row_id(
         state_column_name: &str,
-        state_column_type: iceberg::spec::PrimitiveType,
+        state_column_type: novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
         state_column_nullable: bool,
         row_id_field_id: i32,
         row_id_nullable: bool,
-    ) -> iceberg::spec::Schema {
-        let state_type = iceberg::spec::Type::Primitive(state_column_type);
+    ) -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        let state_type =
+            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(state_column_type);
         let state_field = if state_column_nullable {
-            iceberg::spec::NestedField::optional(3, state_column_name, state_type)
+            novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                3,
+                state_column_name,
+                state_type,
+            )
         } else {
-            iceberg::spec::NestedField::required(3, state_column_name, state_type)
+            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                3,
+                state_column_name,
+                state_type,
+            )
         };
         let row_id_field = if row_id_nullable {
-            iceberg::spec::NestedField::optional(
+            novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
                 row_id_field_id,
                 GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                ),
             )
         } else {
-            iceberg::spec::NestedField::required(
+            novarocks_connector_iceberg::iceberg::spec::NestedField::required(
                 row_id_field_id,
                 GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                ),
             )
         };
-        iceberg::spec::Schema::builder()
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_schema_id(11)
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "id",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
                 Arc::new(row_id_field),
                 Arc::new(state_field),
             ])

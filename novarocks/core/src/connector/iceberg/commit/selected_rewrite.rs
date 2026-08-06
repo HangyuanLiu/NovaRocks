@@ -12,10 +12,10 @@
 use std::collections::{BTreeSet, HashSet};
 
 use async_trait::async_trait;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     FormatVersion, Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::{TableCommit, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::{TableCommit, TableRequirement, TableUpdate};
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
@@ -77,12 +77,18 @@ impl IcebergCommitAction for SelectedRewriteCommit {
         .await?;
         let live_data = live
             .iter()
-            .filter(|entry| entry.data_file.content_type() == iceberg::spec::DataContentType::Data)
+            .filter(|entry| {
+                entry.data_file.content_type()
+                    == novarocks_connector_iceberg::iceberg::spec::DataContentType::Data
+            })
             .map(|entry| entry.data_file.file_path().to_string())
             .collect::<BTreeSet<_>>();
         let live_deletes = live
             .iter()
-            .filter(|entry| entry.data_file.content_type() != iceberg::spec::DataContentType::Data)
+            .filter(|entry| {
+                entry.data_file.content_type()
+                    != novarocks_connector_iceberg::iceberg::spec::DataContentType::Data
+            })
             .map(|entry| entry.data_file.file_path().to_string())
             .collect::<BTreeSet<_>>();
         if !self.files.data_paths.is_subset(&live_data)
@@ -333,7 +339,7 @@ fn record_manifest(ctx: &CommitCtx<'_>, manifest_paths: &mut Vec<String>, path: 
 fn selected_position_rewrite_summary(
     written: &[WrittenDvFile],
     index: &super::row_delta_dv_metadata::SnapshotIndex,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     base_snapshot_id: Option<i64>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let added_position_deletes = written.iter().try_fold(0_u64, |total, file| {

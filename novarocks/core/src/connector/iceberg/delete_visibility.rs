@@ -23,7 +23,7 @@ use super::catalog::registry;
 
 pub(crate) struct ReferencedDataFilePartition {
     pub(crate) partition_spec_id: i32,
-    pub(crate) partition_values: iceberg::spec::Struct,
+    pub(crate) partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
 }
 
 pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFilePartition>;
@@ -32,7 +32,7 @@ pub(crate) type ReferencedDataFilePartitions = HashMap<String, ReferencedDataFil
 ///
 /// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
 pub(crate) fn load_referenced_data_file_partitions_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: Option<i64>,
 ) -> Result<ReferencedDataFilePartitions, String> {
     let data_files = match snapshot_id {
@@ -63,7 +63,7 @@ pub(crate) fn load_referenced_data_file_partitions_at(
 }
 
 pub(crate) fn load_referenced_data_file_partitions(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<ReferencedDataFilePartitions, String> {
     load_referenced_data_file_partitions_at(table, None)
 }
@@ -107,7 +107,7 @@ pub(crate) type ExistingDeleteVisibilityByDataFile = HashMap<String, ExistingDel
 ///
 /// Uses `snapshot_id` when `Some`, otherwise falls back to the current snapshot.
 pub(crate) fn load_existing_delete_visibility_by_data_file_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: Option<i64>,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
@@ -119,7 +119,7 @@ pub(crate) fn load_existing_delete_visibility_by_data_file_at(
 }
 
 pub(crate) fn load_existing_delete_visibility_by_data_file(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<ExistingDeleteVisibilityByDataFile, String> {
     load_existing_delete_visibility_by_data_file_at(table, None, object_store_config)

@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema};
 use bytes::Bytes;
-use iceberg::Catalog;
-use iceberg::spec::DataFile;
-use iceberg::{NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::spec::DataFile;
+use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 use sha2::{Digest, Sha256};
 
 use crate::connector::backend::ResolvedTable;
@@ -220,7 +220,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
         let fmt = table.metadata().format_version();
-        if fmt != iceberg::spec::FormatVersion::V3 {
+        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
             return Err(format!(
                 "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
                 target_string(target),
@@ -258,7 +258,7 @@ fn prepare_iceberg_distributed_write(
     overwrite_mode: IcebergWriteMode,
     target_ref: &str,
     catalog: Arc<dyn Catalog>,
-    table: iceberg::table::Table,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     table_ident: TableIdent,
     execution: Option<QueryExecutionContext>,
@@ -1061,7 +1061,7 @@ pub(crate) fn build_iceberg_write_plan(
     resolved: &ResolvedTable,
     insert_columns: &[String],
     source: &IcebergWriteInput,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<(sqlparser::ast::Query, IcebergWriteSinkSpec), String> {
     let write_columns = iceberg_insert_columns_from_schema(table.metadata().current_schema())?;
@@ -1078,7 +1078,7 @@ pub(crate) fn build_iceberg_write_plan(
 pub(crate) fn build_insert_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     write_columns: &[ColumnDef],
 ) -> Result<IcebergWriteSinkSpec, String> {
@@ -1095,7 +1095,7 @@ pub(crate) fn build_insert_write_sink_spec(
 pub(crate) fn build_position_delete_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let target_columns = position_delete_sink_input_columns(table.metadata(), &resolved.columns)?;
@@ -1112,7 +1112,7 @@ pub(crate) fn build_position_delete_sink_spec(
 pub(crate) fn build_row_lineage_data_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let target_columns = row_lineage_data_sink_input_columns(&resolved.columns);
@@ -1129,7 +1129,7 @@ pub(crate) fn build_row_lineage_data_sink_spec(
 pub(crate) fn build_equality_delete_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     equality_columns: &[EqualityDeleteColumn],
 ) -> Result<IcebergWriteSinkSpec, String> {
@@ -1161,7 +1161,7 @@ pub(crate) fn build_equality_delete_sink_spec(
 pub(crate) fn build_iceberg_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     mode: IcebergWriteSinkMode,
     target_columns: Vec<ColumnDef>,
@@ -1242,7 +1242,9 @@ fn row_lineage_data_sink_input_columns(target_columns: &[ColumnDef]) -> Vec<Colu
     columns
 }
 
-fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+fn row_lineage_iceberg_schema_def_for_codegen(
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> IcebergSchemaDef {
     let mut out = iceberg_schema_def_for_codegen(schema);
     out.fields.push(IcebergSchemaFieldDef {
         field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
@@ -1282,7 +1284,7 @@ fn write_sink_target_descriptor_columns(
 }
 
 fn position_delete_sink_input_columns(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_columns: &[ColumnDef],
 ) -> Result<Vec<ColumnDef>, String> {
     let mut columns = vec![
@@ -1324,7 +1326,7 @@ fn position_delete_sink_input_columns(
 }
 
 fn build_position_delete_output_descriptor(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_columns: &[ColumnDef],
 ) -> Result<PositionDeleteDescriptorInput, String> {
     let schema = metadata.current_schema();
@@ -1578,9 +1580,9 @@ fn source_index_for_write_column(
 }
 
 pub(crate) fn iceberg_insert_columns_from_schema(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Vec<ColumnDef>, String> {
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema)
+    let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
         .map_err(|e| format!("convert iceberg insert schema to arrow schema failed: {e}"))?;
     arrow_schema
         .fields()
@@ -1590,12 +1592,12 @@ pub(crate) fn iceberg_insert_columns_from_schema(
                 .field_by_name(field.name())
                 .ok_or_else(|| format!("iceberg column `{}` missing from schema", field.name()))?;
             let data_type = match nested.field_type.as_ref() {
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
-                    arrow::datatypes::DataType::LargeBinary
-                }
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
-                    arrow::datatypes::DataType::Binary
-                }
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant,
+                ) => arrow::datatypes::DataType::LargeBinary,
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary,
+                ) => arrow::datatypes::DataType::Binary,
                 _ => field.data_type().clone(),
             };
             Ok(ColumnDef {
@@ -1907,7 +1909,7 @@ fn operation_kind_for_commit_op_kind(kind: CommitOpKind) -> IcebergOperationKind
 }
 
 fn write_base_snapshot_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_ref: &str,
 ) -> Result<Option<i64>, String> {
     if target_ref == "main" {
@@ -1995,7 +1997,7 @@ pub(crate) fn run_select_to_chunks(
 }
 
 pub(crate) struct AbortCleanupOperator {
-    pub(crate) fs: opendal::Operator,
+    pub(crate) fs: novarocks_connector_iceberg::opendal::Operator,
     pub(crate) path_mapper: Option<CleanupPathMapper>,
 }
 
@@ -2053,7 +2055,7 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-    use iceberg::spec::{SnapshotReference, SnapshotRetention};
+    use novarocks_connector_iceberg::iceberg::spec::{SnapshotReference, SnapshotRetention};
     use sqlparser::ast as sqlast;
 
     use novarocks_catalog::schema::ColumnDefault;
@@ -2124,11 +2126,11 @@ mod tests {
         source_column_name: &str,
         source_field_id: i32,
         partition_spec_id: i32,
-    ) -> iceberg::spec::TableMetadata {
+    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
         test_iceberg_metadata_with_partition(
             source_column_name,
             source_column_name,
-            iceberg::spec::Transform::Identity,
+            novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
             source_field_id,
             partition_spec_id,
         )
@@ -2137,39 +2139,52 @@ mod tests {
     fn test_iceberg_metadata_with_partition(
         source_column_name: &str,
         partition_field_name: &str,
-        transform: iceberg::spec::Transform,
+        transform: novarocks_connector_iceberg::iceberg::spec::Transform,
         source_field_id: i32,
         partition_spec_id: i32,
-    ) -> iceberg::spec::TableMetadata {
-        let schema = iceberg::spec::Schema::builder()
+    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
-                Arc::new(iceberg::spec::NestedField::required(
-                    source_field_id,
-                    source_column_name,
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                )),
-                Arc::new(iceberg::spec::NestedField::optional(
-                    source_field_id + 1,
-                    "v",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        source_field_id,
+                        source_column_name,
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                ),
+                Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                        source_field_id + 1,
+                        "v",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("schema");
-        let partition_spec = iceberg::spec::PartitionSpec::builder(Arc::new(schema.clone()))
-            .with_spec_id(partition_spec_id)
-            .add_partition_field(source_column_name, partition_field_name, transform)
-            .expect("partition field")
-            .build()
-            .expect("partition spec");
-        let creation = iceberg::TableCreation::builder()
+        let partition_spec = novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(
+            Arc::new(schema.clone()),
+        )
+        .with_spec_id(partition_spec_id)
+        .add_partition_field(source_column_name, partition_field_name, transform)
+        .expect("partition field")
+        .build()
+        .expect("partition spec");
+        let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
             .name("t".to_string())
             .location("file:///warehouse/db/t".to_string())
             .schema(schema)
             .partition_spec(partition_spec.into_unbound())
-            .format_version(iceberg::spec::FormatVersion::V3)
+            .format_version(novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3)
             .build();
-        let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(creation)
+        let metadata =
+            novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::from_table_creation(
+                creation,
+            )
             .expect("metadata builder")
             .build()
             .expect("metadata")
@@ -2178,10 +2193,10 @@ mod tests {
     }
 
     fn retag_test_metadata_partition_source(
-        metadata: iceberg::spec::TableMetadata,
+        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         source_field_id: i32,
         partition_spec_id: i32,
-    ) -> iceberg::spec::TableMetadata {
+    ) -> novarocks_connector_iceberg::iceberg::spec::TableMetadata {
         // TableMetadataBuilder::from_table_creation intentionally reassigns
         // field and spec ids; this fixture retags serialized metadata so tests
         // can assert planner descriptors carry target-table ids verbatim.
@@ -2260,13 +2275,15 @@ mod tests {
         }
     }
 
-    fn test_iceberg_table(metadata: iceberg::spec::TableMetadata) -> iceberg::table::Table {
-        iceberg::table::Table::builder()
+    fn test_iceberg_table(
+        metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .identifier(TableIdent::new(
                 NamespaceIdent::new("test_db".to_string()),
                 "target_orders".to_string(),
             ))
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("iceberg table")
@@ -2379,7 +2396,7 @@ mod tests {
         let metadata = test_iceberg_metadata_with_partition(
             "id",
             "id_bucket",
-            iceberg::spec::Transform::Bucket(8),
+            novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(8),
             42,
             7,
         );
@@ -2808,23 +2825,35 @@ mod tests {
 
     #[test]
     fn insert_writer_columns_follow_fresh_iceberg_schema_after_external_evolution() {
-        let schema = iceberg::spec::Schema::builder()
+        let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
-                std::sync::Arc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "amount",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                )),
-                std::sync::Arc::new(iceberg::spec::NestedField::required(
-                    2,
-                    "id",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                )),
-                std::sync::Arc::new(iceberg::spec::NestedField::optional(
-                    3,
-                    "category",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                )),
+                std::sync::Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "amount",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ),
+                ),
+                std::sync::Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        2,
+                        "id",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                ),
+                std::sync::Arc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                        3,
+                        "category",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+                        ),
+                    ),
+                ),
             ])
             .build()
             .expect("schema");

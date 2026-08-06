@@ -42,14 +42,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, Operation, PartitionSpecRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -126,12 +128,15 @@ impl TruncateTxnAction {
 
 #[async_trait]
 impl TransactionAction for TruncateTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version == FormatVersion::V1 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "TruncateCommit does not support V1 tables",
             ));
         }
@@ -168,7 +173,8 @@ impl TransactionAction for TruncateTxnAction {
             .cloned()
             .partition(|(df, _, _)| df.content_type() == DataContentType::Data);
 
-        let mut new_manifests: Vec<iceberg::spec::ManifestFile> = Vec::new();
+        let mut new_manifests: Vec<novarocks_connector_iceberg::iceberg::spec::ManifestFile> =
+            Vec::new();
 
         // 3a. Write the data-content deletes manifest if any data files are live.
         if !data_entries.is_empty() {
@@ -379,8 +385,11 @@ fn truncate_summary(
 // the original is `pub(super)`-scoped to `commit::overwrite` and is not
 // visible from sibling submodules. Keep in sync with that definition;
 // promote to `commit::helpers` if a third call site shows up.
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
@@ -411,7 +420,9 @@ mod tests {
         v3_table_with_n_data_files,
     };
     use crate::connector::iceberg::commit::types::CommitOpKind;
-    use iceberg::spec::{DataFileBuilder, DataFileFormat, Operation, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataFileBuilder, DataFileFormat, Operation, Struct,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -559,7 +570,7 @@ mod tests {
     /// the module-level deferral note).
     #[tokio::test]
     async fn write_truncate_deletes_manifest_produces_deletes_typed_manifest() {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             ManifestContentType, NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type,
         };
         use std::sync::Arc;

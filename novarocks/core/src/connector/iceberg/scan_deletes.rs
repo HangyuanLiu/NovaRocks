@@ -25,7 +25,7 @@
 //! registering these as a temp parquet table and running the MV's
 //! SELECT).
 //!
-//! This is the inverse of `iceberg::position_delete`'s scan-time
+//! This is the inverse of `novarocks_connector_iceberg::iceberg::position_delete`'s scan-time
 //! filtering: that module *removes* deleted rows from a scan; we keep
 //! only the deleted rows.
 
@@ -70,7 +70,7 @@ fn normalize_local_fs_path_owned(path: &str) -> Result<String, ChangeError> {
 /// Read every position-delete file in `delete_files` and return, per
 /// referenced data file, the set of positions deleted by those files.
 ///
-/// Equivalent to `iceberg::position_delete::load_position_deletes` run
+/// Equivalent to `novarocks_connector_iceberg::iceberg::position_delete::load_position_deletes` run
 /// once per distinct `data_file_path`, but reads each delete file only
 /// once.
 #[cfg(test)]
@@ -612,7 +612,7 @@ pub(crate) async fn read_dv_positions_per_data_file(
     factory: &novarocks_fs::FsAccessHandle,
 ) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
     use crate::connector::iceberg::commit::read_deletion_vector_puffin_with_range_reader;
-    use iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
     let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
     for r in delete_files {
@@ -667,7 +667,7 @@ pub(crate) async fn read_dv_positions_per_data_file(
 /// to the data files about to be reverse-projected in the current refresh,
 /// keeping the I/O proportional to the touched set.
 pub(crate) fn previously_deleted_positions_at_snapshot<N, P>(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
     factory: &novarocks_fs::FsAccessHandle,
     delete_file_path_normalizer: &N,
@@ -680,7 +680,7 @@ where
     use crate::connector::iceberg::read::{
         IcebergReadDeleteFormat, IcebergReadDeleteKind, build_read_snapshot_at,
     };
-    use iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
     let prior_snapshot = build_read_snapshot_at(table, snapshot_id).map_err(|e| {
         ChangeError::InternalInconsistency(format!(
@@ -839,7 +839,7 @@ where
     F: Fn(&str) -> Option<u64>,
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
     if delete_files.is_empty() {
         return Ok(Vec::new());
@@ -941,7 +941,7 @@ where
     R: Fn(&str) -> Option<i64>,
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
     if delete_files.is_empty() {
         return Ok(Vec::new());
@@ -1030,7 +1030,7 @@ where
     R: Fn(&str) -> Option<crate::connector::iceberg::delta::BaseDataFileLineage>,
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use iceberg::spec::DataFileFormat;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
     if delete_files.is_empty() {
         return Ok(Vec::new());
@@ -1210,7 +1210,7 @@ mod tests {
             .expect("access")
     }
 
-    fn make_local_file_io(location: &str) -> iceberg::io::FileIO {
+    fn make_local_file_io(location: &str) -> novarocks_connector_iceberg::iceberg::io::FileIO {
         crate::connector::iceberg::fs_io::build_file_io_for_location(location, None)
     }
 
@@ -1267,7 +1267,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(3),
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1336,7 +1336,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1376,7 +1376,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1442,7 +1442,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(1),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1484,7 +1484,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1537,7 +1537,7 @@ mod tests {
                 delete_file_size: 0,
                 record_count: Some(1),
                 referenced_data_file: Some(data_uri.to_string()),
-                file_format: iceberg::spec::DataFileFormat::Parquet,
+                file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
                 content_offset: None,
                 content_size_in_bytes: None,
                 partition_values: Vec::new(),
@@ -1547,7 +1547,7 @@ mod tests {
                 delete_file_size: 0,
                 record_count: Some(2),
                 referenced_data_file: Some(data_uri.to_string()),
-                file_format: iceberg::spec::DataFileFormat::Parquet,
+                file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
                 content_offset: None,
                 content_size_in_bytes: None,
                 partition_values: Vec::new(),
@@ -1600,7 +1600,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1638,7 +1638,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1687,7 +1687,7 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: None,
-            file_format: iceberg::spec::DataFileFormat::Parquet,
+            file_format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content_offset: None,
             content_size_in_bytes: None,
             partition_values: Vec::new(),
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn dv_path_reads_positions_from_puffin_file() {
-        use iceberg::spec::DataFileFormat;
+        use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
         use roaring::RoaringTreemap;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1730,7 +1730,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_deletes_merges_v2_parquet_and_v3_puffin_against_same_data_file() {
-        use iceberg::spec::DataFileFormat;
+        use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let data_path = dir.path().join("data.parquet");

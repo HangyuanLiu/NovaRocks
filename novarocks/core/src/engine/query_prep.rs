@@ -67,14 +67,20 @@ pub(crate) fn delete_temp_iceberg_file_for_query(
 /// Project provider metadata into the immutable facts required by SQL
 /// time-travel analysis.  This conversion is intentionally application-owned:
 /// the compiler never receives an Iceberg `TableMetadata` object.
-fn project_iceberg_ref_metadata(metadata: &iceberg::spec::TableMetadata) -> SqlIcebergRefMetadata {
+fn project_iceberg_ref_metadata(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> SqlIcebergRefMetadata {
     let refs = metadata
         .refs()
         .iter()
         .map(|(name, reference)| {
             let kind = match reference.retention {
-                iceberg::spec::SnapshotRetention::Branch { .. } => IcebergRefKind::Branch,
-                iceberg::spec::SnapshotRetention::Tag { .. } => IcebergRefKind::Tag,
+                novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch {
+                    ..
+                } => IcebergRefKind::Branch,
+                novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Tag { .. } => {
+                    IcebergRefKind::Tag
+                }
             };
             (
                 name.clone(),

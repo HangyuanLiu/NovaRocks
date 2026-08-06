@@ -38,14 +38,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, FormatVersion, ManifestContentType, ManifestFile, ManifestWriterBuilder,
     Operation, PartitionSpecRef, Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -146,7 +148,10 @@ struct RowDeltaTxnAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         let new_seq = m.last_sequence_number() + 1;
@@ -307,7 +312,7 @@ async fn write_delete_manifest(
     out_path: &str,
     written: &[WrittenFile],
     partition_spec: PartitionSpecRef,
-    schema: iceberg::spec::SchemaRef,
+    schema: novarocks_connector_iceberg::iceberg::spec::SchemaRef,
     new_seq: i64,
     new_snapshot_id: i64,
     format_version: FormatVersion,
@@ -364,8 +369,8 @@ async fn write_delete_manifest(
 /// `_collector` argument.
 fn written_file_to_iceberg_data_file_minimal(
     f: &WrittenFile,
-) -> Result<iceberg::spec::DataFile, String> {
-    use iceberg::spec::DataFileBuilder;
+) -> Result<novarocks_connector_iceberg::iceberg::spec::DataFile, String> {
+    use novarocks_connector_iceberg::iceberg::spec::DataFileBuilder;
     let mut builder = DataFileBuilder::default();
     builder
         .content(f.content)
@@ -470,15 +475,18 @@ fn group_written_by_spec(written: Vec<WrittenFile>) -> BTreeMap<i32, Vec<Written
     grouped
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use iceberg::spec::{DataContentType, DataFileFormat, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat, Struct};
 
     use super::*;
 
@@ -586,9 +594,9 @@ mod tests {
         use super::super::helpers::finalize_snapshot_summary;
         let file = WrittenFile {
             path: "s3://bucket/table/data/eq-delete.parquet".to_string(),
-            format: iceberg::spec::DataFileFormat::Parquet,
+            format: novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet,
             content: DataContentType::EqualityDeletes,
-            partition_values: iceberg::spec::Struct::empty(),
+            partition_values: novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             partition_spec_id: 0,
             record_count: 5,
             file_size_in_bytes: 128,

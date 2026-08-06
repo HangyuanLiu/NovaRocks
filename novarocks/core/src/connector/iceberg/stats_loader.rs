@@ -28,9 +28,9 @@
 
 use std::collections::HashMap;
 
-use iceberg::io::FileIO;
-use iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, PuffinReader};
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, PuffinReader};
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
 use super::theta_sketch::ThetaSketchHandle;
 
@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap as Map;
 
-    use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
+    use novarocks_connector_iceberg::iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
     use tempfile::tempdir;
 
     /// Build a tiny Puffin file via `PuffinWriter` for round-trip tests.

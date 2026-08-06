@@ -25,15 +25,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
     ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
     SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -162,12 +164,15 @@ struct CowUpdateTxnAction {
 
 #[async_trait]
 impl TransactionAction for CowUpdateTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version != FormatVersion::V3 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "CowUpdateCommit requires an Iceberg v3 table",
             ));
         }
@@ -317,7 +322,7 @@ impl TransactionAction for CowUpdateTxnAction {
                         ))
                     })
                 })
-                .collect::<iceberg::Result<Vec<_>>>()?;
+                .collect::<novarocks_connector_iceberg::iceberg::Result<Vec<_>>>()?;
             let data_manifest = write_added_data_manifest(
                 &self.file_io,
                 &data_manifest_path,
@@ -864,9 +869,9 @@ fn touched_old_file_paths(rewrite: &CowUpdateRewriteSet) -> HashSet<String> {
 }
 
 fn partition_spec_by_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     spec_id: i32,
-) -> iceberg::Result<PartitionSpecRef> {
+) -> novarocks_connector_iceberg::iceberg::Result<PartitionSpecRef> {
     metadata
         .partition_spec_by_id(spec_id)
         .cloned()
@@ -877,18 +882,24 @@ fn partition_spec_by_id(
         })
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
-fn to_iceberg_data_invalid(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::DataInvalid, s)
+fn to_iceberg_data_invalid(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+        s,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{DataFileFormat, Operation, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{DataFileFormat, Operation, Struct};
 
     #[test]
     fn type_compiles() {
@@ -1080,8 +1091,8 @@ mod tests {
     /// Read the single live data file from a table's current snapshot. Panics
     /// unless exactly one live data file is present.
     async fn single_live_data_file(
-        table: &iceberg::table::Table,
-        file_io: &iceberg::io::FileIO,
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
+        file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
     ) -> LiveDataFile {
         let index = build_cow_snapshot_index(table, file_io, &HashSet::new(), "main")
             .await
@@ -1142,7 +1153,9 @@ mod tests {
         }
     }
 
-    async fn read_manifest_list(table: &iceberg::table::Table) -> Vec<iceberg::spec::ManifestFile> {
+    async fn read_manifest_list(
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
+    ) -> Vec<novarocks_connector_iceberg::iceberg::spec::ManifestFile> {
         let snap = table.metadata().current_snapshot().expect("snapshot");
         let bytes = table
             .file_io()
@@ -1151,10 +1164,13 @@ mod tests {
             .read()
             .await
             .expect("read manifest list");
-        iceberg::spec::ManifestList::parse_with_version(&bytes, table.metadata().format_version())
-            .expect("parse manifest list")
-            .entries()
-            .to_vec()
+        novarocks_connector_iceberg::iceberg::spec::ManifestList::parse_with_version(
+            &bytes,
+            table.metadata().format_version(),
+        )
+        .expect("parse manifest list")
+        .entries()
+        .to_vec()
     }
 
     /// Drive a `CowUpdateCommit` through a minimal collector with the given

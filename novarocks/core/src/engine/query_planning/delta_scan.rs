@@ -41,7 +41,7 @@ use crate::sql::planner::table::{ScanSource, SqlScanKind};
 pub(crate) fn freeze_iceberg_delta_runtime_plan(
     table: &IcebergTableInfo,
     entry: &IcebergCatalogEntry,
-    loaded: &iceberg::table::Table,
+    loaded: &novarocks_connector_iceberg::iceberg::table::Table,
     from_snapshot_id: i64,
     to_snapshot_id: i64,
 ) -> Result<IcebergDeltaScanRuntimePlan, String> {

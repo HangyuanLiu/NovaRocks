@@ -18,8 +18,8 @@
 //! Shared utilities for the self-implemented commit-actions
 //! (`RowDeltaCommit` and `OverwriteCommit`).
 
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter, Summary, TableMetadata,
 };
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ pub fn now_ms() -> i64 {
 
 /// Resolve the metadata directory for a table — i.e. the directory containing
 /// `metadata.json`, manifest-list, and manifest avro files.
-pub fn metadata_dir(table: &iceberg::table::Table) -> String {
+pub fn metadata_dir(table: &novarocks_connector_iceberg::iceberg::table::Table) -> String {
     format!("{}/metadata", table.metadata().location())
 }
 
@@ -52,7 +52,7 @@ pub fn metadata_dir(table: &iceberg::table::Table) -> String {
 /// snapshot predates summary totals. A malformed value is an error because
 /// write actions must not guess table-level metrics.
 pub fn current_snapshot_total_records(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
 ) -> Result<Option<u64>, String> {
     snapshot_total_records(
         metadata,
@@ -119,7 +119,9 @@ pub(super) fn snapshot_total_records(
 /// update after custom row-lineage commits, but they do preserve each
 /// snapshot's row-range. Treat the table-level value as a floor and derive the
 /// effective value from the maximum `first_row_id + added_rows` in snapshots.
-pub fn effective_next_row_id(metadata: &iceberg::spec::TableMetadata) -> Result<u64, String> {
+pub fn effective_next_row_id(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+) -> Result<u64, String> {
     let mut next_row_id = metadata.next_row_id();
     for snapshot in metadata.snapshots() {
         if let Some((first_row_id, added_rows)) = snapshot.row_range() {
@@ -209,7 +211,7 @@ pub async fn write_manifest_list(
 /// `ManifestFile` entries. Returns an empty Vec if the table has no current
 /// snapshot.
 pub async fn read_base_manifest_list(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     file_io: &FileIO,
 ) -> Result<Vec<ManifestFile>, String> {
     let m = table.metadata();
@@ -234,8 +236,11 @@ pub(super) async fn read_snapshot_manifest_list(
         .read()
         .await
         .map_err(|e| format!("read manifest_list failed: {e}"))?;
-    let list = iceberg::spec::ManifestList::parse_with_version(&bytes, metadata.format_version())
-        .map_err(|e| format!("parse manifest_list failed: {e}"))?;
+    let list = novarocks_connector_iceberg::iceberg::spec::ManifestList::parse_with_version(
+        &bytes,
+        metadata.format_version(),
+    )
+    .map_err(|e| format!("parse manifest_list failed: {e}"))?;
     Ok(list.entries().to_vec())
 }
 
@@ -386,7 +391,7 @@ fn carry_total(
 #[cfg(test)]
 mod summary_tests {
     use super::*;
-    use iceberg::spec::{Operation, Summary};
+    use novarocks_connector_iceberg::iceberg::spec::{Operation, Summary};
     use std::collections::HashMap;
 
     fn prev(props: &[(&str, &str)]) -> Summary {

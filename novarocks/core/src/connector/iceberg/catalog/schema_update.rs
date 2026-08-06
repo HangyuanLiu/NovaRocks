@@ -19,8 +19,8 @@
 mod tests {
     use super::*;
     use crate::sql::parser::ast::DefaultLiteral;
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_catalog::schema::SqlType;
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::collections::HashMap;
 
     fn schema() -> Schema {
@@ -431,7 +431,9 @@ mod tests {
         )
         .expect("v3 add column");
         let field = updated.field_by_name("c").expect("new field");
-        let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
+        let expected = novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(5),
+        );
         assert_eq!(field.initial_default.as_ref(), Some(&expected));
         assert_eq!(field.write_default.as_ref(), Some(&expected));
     }
@@ -608,7 +610,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_nested_struct() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![
             Arc::new(NestedField::optional(
                 11,
@@ -647,7 +649,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_array_element() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
@@ -668,7 +670,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_map_value() {
-        use iceberg::spec::MapType;
+        use novarocks_connector_iceberg::iceberg::spec::MapType;
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
@@ -695,7 +697,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_map_key() {
-        use iceberg::spec::MapType;
+        use novarocks_connector_iceberg::iceberg::spec::MapType;
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
@@ -723,7 +725,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_list_invalid_descent() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
@@ -744,7 +746,7 @@ mod tests {
 
     #[test]
     fn find_field_by_path_map_invalid_descent() {
-        use iceberg::spec::MapType;
+        use novarocks_connector_iceberg::iceberg::spec::MapType;
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::optional(
                 1,
@@ -787,7 +789,7 @@ mod tests {
 
     #[test]
     fn apply_drop_at_nested_struct() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![
             Arc::new(NestedField::optional(
                 11,
@@ -853,7 +855,7 @@ mod tests {
 
     #[test]
     fn apply_drop_at_into_list_or_map_rejected() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         let element = Arc::new(NestedField::list_element(
             11,
             Type::Primitive(PrimitiveType::Int),
@@ -875,7 +877,7 @@ mod tests {
 
     #[test]
     fn drop_last_field_of_non_nested_struct_is_rejected() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         // STRUCT<v1 INT> — dropping v1 leaves the struct empty.
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
@@ -903,7 +905,7 @@ mod tests {
 
     #[test]
     fn drop_last_field_of_deeply_nested_struct_is_rejected() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         // outer STRUCT<inner STRUCT<leaf INT>> — dropping leaf leaves inner empty.
         let leaf_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             21,
@@ -934,7 +936,7 @@ mod tests {
 
     #[test]
     fn drop_non_last_field_of_struct_succeeds() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         // STRUCT<v1 INT, v2 INT> — dropping v1 still leaves v2.
         let inner = Type::Struct(StructType::new(vec![
             Arc::new(NestedField::optional(
@@ -963,7 +965,7 @@ mod tests {
 
     #[test]
     fn drop_field_from_array_struct_element_succeeds() {
-        use iceberg::spec::{ListType, StructType};
+        use novarocks_connector_iceberg::iceberg::spec::{ListType, StructType};
         // ARRAY<STRUCT<v1 INT, v2 INT>> — dropping v1 still leaves v2 in the element struct.
         // Field IDs: 1=c0, 2=c1, 10=list-element, 11=v1, 12=v2.
         let element_struct = Type::Struct(StructType::new(vec![
@@ -1010,7 +1012,7 @@ mod tests {
 
     #[test]
     fn drop_last_field_from_array_struct_element_is_rejected() {
-        use iceberg::spec::{ListType, StructType};
+        use novarocks_connector_iceberg::iceberg::spec::{ListType, StructType};
         // ARRAY<STRUCT<v1 INT>> — dropping the only field must be rejected.
         // Field IDs: 1=c1, 10=list-element, 11=v1.
         let element_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
@@ -1038,7 +1040,7 @@ mod tests {
 
     #[test]
     fn drop_into_map_still_rejected() {
-        use iceberg::spec::{MapType, StructType};
+        use novarocks_connector_iceberg::iceberg::spec::{MapType, StructType};
         // MAP<STRING, STRUCT<v1 INT>> — dropping into a map must still be rejected.
         // Field IDs: 1=m, 10=map-key, 11=map-value, 20=v1.
         let inner_struct = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
@@ -1068,7 +1070,7 @@ mod tests {
 
     #[test]
     fn apply_rename_at_nested() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "street",
@@ -1106,7 +1108,7 @@ mod tests {
 
     #[test]
     fn apply_rename_at_conflict_with_sibling() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![
             Arc::new(NestedField::optional(
                 11,
@@ -1129,7 +1131,7 @@ mod tests {
 
     #[test]
     fn apply_rename_at_into_list_or_map_rejected() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         let element = Arc::new(NestedField::list_element(
             11,
             Type::Primitive(PrimitiveType::Int),
@@ -1185,7 +1187,7 @@ mod tests {
 
     #[test]
     fn apply_modify_at_nested_struct_int_to_long() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "n",
@@ -1210,7 +1212,7 @@ mod tests {
 
     #[test]
     fn apply_modify_at_array_element() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         let element = Arc::new(NestedField::list_element(
             11,
             Type::Primitive(PrimitiveType::Int),
@@ -1239,7 +1241,7 @@ mod tests {
 
     #[test]
     fn apply_modify_at_map_value() {
-        use iceberg::spec::MapType;
+        use novarocks_connector_iceberg::iceberg::spec::MapType;
         let key = Arc::new(NestedField::map_key_element(
             11,
             Type::Primitive(PrimitiveType::String),
@@ -1431,7 +1433,7 @@ mod tests {
 
     #[test]
     fn apply_add_at_nested_struct() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "street",
@@ -1533,7 +1535,7 @@ mod tests {
 
     #[test]
     fn add_field_to_array_struct_element_succeeds() {
-        use iceberg::spec::{ListType, StructType};
+        use novarocks_connector_iceberg::iceberg::spec::{ListType, StructType};
         // ARRAY<STRUCT<v1 INT, v2 INT>> — add a new field val1 INT to the element struct.
         // Field IDs: 1=c0, 2=c1, 10=list-element, 11=v1, 12=v2.
         let element_struct = Type::Struct(StructType::new(vec![
@@ -1594,7 +1596,7 @@ mod tests {
 
     #[test]
     fn add_field_to_array_of_non_struct_is_rejected() {
-        use iceberg::spec::ListType;
+        use novarocks_connector_iceberg::iceberg::spec::ListType;
         // ARRAY<INT> — adding a field into a non-struct element must be rejected.
         // Field IDs: 1=c1, 10=list-element.
         let element_field = Arc::new(NestedField::list_element(
@@ -1644,7 +1646,7 @@ mod tests {
 
     #[test]
     fn apply_set_nullable_at_nested() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "street",
@@ -1745,7 +1747,7 @@ mod tests {
 
     #[test]
     fn apply_reorder_at_nested_struct() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![
             Arc::new(NestedField::optional(
                 11,
@@ -1774,7 +1776,7 @@ mod tests {
 
     #[test]
     fn apply_reorder_at_after_target_in_different_parent_rejected() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "street",
@@ -1873,7 +1875,7 @@ mod tests {
 
     #[test]
     fn apply_comment_at_nested() {
-        use iceberg::spec::StructType;
+        use novarocks_connector_iceberg::iceberg::spec::StructType;
         let inner = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
             11,
             "street",
@@ -2235,9 +2237,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type};
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::spec::{
+    NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type,
+};
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, TABLE_KEY_COLUMNS_PROPERTY, column_aggregation_property_key,
@@ -2434,7 +2440,11 @@ fn drop_in_type(ty: &Type, segments: &[String], parent_name: &str) -> Result<Typ
                         new_fields.into_iter().map(Arc::new).collect();
                     let mut new_elem = (*l.element_field).clone();
                     new_elem.field_type = Box::new(Type::Struct(StructType::new(arc_fields)));
-                    Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+                    Ok(Type::List(
+                        novarocks_connector_iceberg::iceberg::spec::ListType::new(Arc::new(
+                            new_elem,
+                        )),
+                    ))
                 }
                 _ => Err(format!(
                     "drop path descends into LIST '{parent_name}' whose element is not a STRUCT"
@@ -2612,26 +2622,32 @@ fn modify_in_type(ty: &Type, segments: &[String], new_type: &SqlType) -> Result<
             let widened = widen_type(&l.element_field.field_type, new_type)?;
             let mut new_elem = (*l.element_field).clone();
             new_elem.field_type = Box::new(widened);
-            Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+            Ok(Type::List(
+                novarocks_connector_iceberg::iceberg::spec::ListType::new(Arc::new(new_elem)),
+            ))
         }
         Type::Map(m) => match (head.as_str(), segments.len()) {
             ("value", 1) => {
                 let widened = widen_type(&m.value_field.field_type, new_type)?;
                 let mut new_v = (*m.value_field).clone();
                 new_v.field_type = Box::new(widened);
-                Ok(Type::Map(iceberg::spec::MapType::new(
-                    m.key_field.clone(),
-                    Arc::new(new_v),
-                )))
+                Ok(Type::Map(
+                    novarocks_connector_iceberg::iceberg::spec::MapType::new(
+                        m.key_field.clone(),
+                        Arc::new(new_v),
+                    ),
+                ))
             }
             ("key", 1) => {
                 let widened = widen_type(&m.key_field.field_type, new_type)?;
                 let mut new_k = (*m.key_field).clone();
                 new_k.field_type = Box::new(widened);
-                Ok(Type::Map(iceberg::spec::MapType::new(
-                    Arc::new(new_k),
-                    m.value_field.clone(),
-                )))
+                Ok(Type::Map(
+                    novarocks_connector_iceberg::iceberg::spec::MapType::new(
+                        Arc::new(new_k),
+                        m.value_field.clone(),
+                    ),
+                ))
             }
             _ => Err("map modify must target '<map>.key' or '<map>.value'".to_string()),
         },
@@ -3347,7 +3363,11 @@ fn add_in_type(
                         new_fields.into_iter().map(Arc::new).collect();
                     let mut new_elem = (*l.element_field).clone();
                     new_elem.field_type = Box::new(Type::Struct(StructType::new(arc_fields)));
-                    Ok(Type::List(iceberg::spec::ListType::new(Arc::new(new_elem))))
+                    Ok(Type::List(
+                        novarocks_connector_iceberg::iceberg::spec::ListType::new(Arc::new(
+                            new_elem,
+                        )),
+                    ))
                 }
                 _ => Err(
                     "ADD COLUMN parent path must point to a STRUCT (LIST element is not a STRUCT)"
@@ -3717,15 +3737,26 @@ struct SchemaUpdateTxnAction {
 impl TransactionAction for SchemaUpdateTxnAction {
     async fn commit(
         self: Arc<Self>,
-        table: &iceberg::table::Table,
-    ) -> iceberg::Result<ActionCommit> {
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let metadata = table.metadata();
         let current_schema = metadata.current_schema();
         let new_schema =
-            build_updated_schema(current_schema, metadata.last_column_id(), &self.change)
-                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+            build_updated_schema(current_schema, metadata.last_column_id(), &self.change).map_err(
+                |e| {
+                    novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                        e,
+                    )
+                },
+            )?;
         let property_updates = build_property_updates(metadata.properties(), &self.change)
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+            .map_err(|e| {
+                novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                    e,
+                )
+            })?;
         // Iceberg REST `add-schema` carries `last-column-id` so the server
         // can keep the monotonically-increasing high-watermark even when the
         // new schema dropped the previously-highest field. Compute as
@@ -3737,7 +3768,12 @@ impl TransactionAction for SchemaUpdateTxnAction {
             metadata.last_column_id(),
             next_last_column_id,
         )
-        .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+        .map_err(|e| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                e,
+            )
+        })?;
         let mut updates = vec![
             TableUpdate::AddSchema {
                 schema: new_schema,
@@ -3829,8 +3865,8 @@ pub(crate) fn alter_table_schema(
                             &entry_inner,
                         )
                         .map_err(|e| {
-                            iceberg::Error::new(
-                                iceberg::ErrorKind::Unexpected,
+                            novarocks_connector_iceberg::iceberg::Error::new(
+                                novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                                 format!("build catalog for retry: {e}"),
                             )
                         })?;
@@ -3840,8 +3876,8 @@ pub(crate) fn alter_table_schema(
                         &table_inner,
                     )
                     .map_err(|e| {
-                        iceberg::Error::new(
-                            iceberg::ErrorKind::Unexpected,
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                             format!("reload table for retry: {e}"),
                         )
                     })?;
@@ -3851,7 +3887,10 @@ pub(crate) fn alter_table_schema(
                     }
                     .apply(tx)
                     .map_err(|e| {
-                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            e.to_string(),
+                        )
                     })?;
                     tx.commit(catalog.as_ref()).await.map(|_committed| ())
                 }
@@ -3920,17 +3959,28 @@ pub(crate) fn alter_table_schema_on_entry(
                     let catalog =
                         crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)
                             .map_err(|error| {
-                                iceberg::Error::new(iceberg::ErrorKind::Unexpected, error)
+                                novarocks_connector_iceberg::iceberg::Error::new(
+                                    novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+                                    error,
+                                )
                             })?;
                     let loaded = crate::connector::iceberg::catalog::registry::load_table(
                         &entry, &namespace, &table,
                     )
-                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::Unexpected, error))?;
+                    .map_err(|error| {
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+                            error,
+                        )
+                    })?;
                     let tx = Transaction::new(&loaded.table);
                     let tx = SchemaUpdateTxnAction { change }
                         .apply(tx)
                         .map_err(|error| {
-                            iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                            novarocks_connector_iceberg::iceberg::Error::new(
+                                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                                error.to_string(),
+                            )
                         })?;
                     tx.commit(catalog.as_ref()).await.map(|_| ())
                 }
@@ -4110,7 +4160,7 @@ fn compute_remove_keys(
 
 fn validate_variant_shredding_property_set(
     op: &PropertiesOp,
-    schema: &iceberg::spec::SchemaRef,
+    schema: &novarocks_connector_iceberg::iceberg::spec::SchemaRef,
 ) -> Result<(), String> {
     let PropertiesOp::Set { entries } = op else {
         return Ok(());
@@ -4167,8 +4217,8 @@ pub(crate) fn alter_table_properties_on_entry(
                             &entry_inner,
                         )
                         .map_err(|error| {
-                            iceberg::Error::new(
-                                iceberg::ErrorKind::Unexpected,
+                            novarocks_connector_iceberg::iceberg::Error::new(
+                                novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                                 format!("build catalog for retry: {error}"),
                             )
                         })?;
@@ -4178,8 +4228,8 @@ pub(crate) fn alter_table_properties_on_entry(
                         &table_inner,
                     )
                     .map_err(|error| {
-                        iceberg::Error::new(
-                            iceberg::ErrorKind::Unexpected,
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                             format!("reload table for retry: {error}"),
                         )
                     })?;
@@ -4188,9 +4238,17 @@ pub(crate) fn alter_table_properties_on_entry(
                         &op_inner,
                         loaded.table.metadata().current_schema(),
                     )
-                    .map_err(|error| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error))?;
+                    .map_err(|error| {
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            error,
+                        )
+                    })?;
                     validate_unset_keys_present(&op_inner, &existing).map_err(|error| {
-                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error)
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            error,
+                        )
                     })?;
                     if let PropertiesOp::Unset {
                         if_exists: true, ..
@@ -4215,7 +4273,10 @@ pub(crate) fn alter_table_properties_on_entry(
                         }
                     }
                     let tx = action.apply(tx).map_err(|error| {
-                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, error.to_string())
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            error.to_string(),
+                        )
                     })?;
                     tx.commit(catalog.as_ref()).await.map(|_| ())
                 }
@@ -4311,8 +4372,8 @@ pub(crate) fn alter_table_properties(
                             &entry_inner,
                         )
                         .map_err(|e| {
-                            iceberg::Error::new(
-                                iceberg::ErrorKind::Unexpected,
+                            novarocks_connector_iceberg::iceberg::Error::new(
+                                novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                                 format!("build catalog for retry: {e}"),
                             )
                         })?;
@@ -4322,8 +4383,8 @@ pub(crate) fn alter_table_properties(
                         &table_inner,
                     )
                     .map_err(|e| {
-                        iceberg::Error::new(
-                            iceberg::ErrorKind::Unexpected,
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                             format!("reload table for retry: {e}"),
                         )
                     })?;
@@ -4334,9 +4395,18 @@ pub(crate) fn alter_table_properties(
                         &op_inner,
                         loaded_inner.table.metadata().current_schema(),
                     )
-                    .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
-                    validate_unset_keys_present(&op_inner, &existing)
-                        .map_err(|msg| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, msg))?;
+                    .map_err(|msg| {
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            msg,
+                        )
+                    })?;
+                    validate_unset_keys_present(&op_inner, &existing).map_err(|msg| {
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            msg,
+                        )
+                    })?;
 
                     // Early return for the IF EXISTS no-op case: all requested keys are
                     // already absent from the latest metadata. Avoids an empty metadata
@@ -4366,7 +4436,10 @@ pub(crate) fn alter_table_properties(
                         }
                     }
                     let tx = action.apply(tx).map_err(|e| {
-                        iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string())
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            e.to_string(),
+                        )
                     })?;
                     tx.commit(catalog.as_ref()).await.map(|_| ())
                 }

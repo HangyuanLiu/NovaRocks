@@ -58,7 +58,7 @@ pub(crate) struct IcebergReadFile {
     pub(crate) column_stats: Option<HashMap<String, IcebergColumnStats>>,
     pub(crate) partition_spec_id: Option<i32>,
     pub(crate) partition_key: Option<String>,
-    pub(crate) partition_values: Option<iceberg::spec::Struct>,
+    pub(crate) partition_values: Option<novarocks_connector_iceberg::iceberg::spec::Struct>,
     pub(crate) manifest_path: Option<String>,
     pub(crate) first_row_id: Option<i64>,
     pub(crate) data_sequence_number: Option<i64>,
@@ -155,7 +155,9 @@ impl DeleteApplicabilityIndex {
     }
 }
 
-pub(crate) fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option<String> {
+pub(crate) fn iceberg_partition_key(
+    partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
+) -> Option<String> {
     if partition.fields().is_empty() {
         None
     } else {
@@ -164,11 +166,13 @@ pub(crate) fn iceberg_partition_key(partition: &iceberg::spec::Struct) -> Option
 }
 
 pub(crate) fn build_read_snapshot_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<IcebergReadSnapshot, String> {
     use crate::connector::iceberg::catalog::registry::block_on_iceberg;
-    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFileFormat, ManifestContentType, ManifestStatus,
+    };
 
     let metadata = table.metadata();
     let snapshot = metadata
@@ -431,7 +435,7 @@ pub(crate) fn build_read_snapshot_at(
 }
 
 pub(crate) fn build_read_snapshot(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<IcebergReadSnapshot, String> {
     let metadata = table.metadata();
     match metadata.current_snapshot() {
@@ -583,12 +587,12 @@ mod tests {
 
     #[test]
     fn build_read_snapshot_at_returns_error_for_unknown_snapshot_id() {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
             TableMetadataBuilder, Type,
         };
-        use iceberg::table::Table;
-        use iceberg::{NamespaceIdent, TableIdent};
+        use novarocks_connector_iceberg::iceberg::table::Table;
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
         use std::collections::HashMap;
 
         // Build a minimal TableMetadata with no snapshots.

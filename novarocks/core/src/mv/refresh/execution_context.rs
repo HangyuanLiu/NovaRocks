@@ -59,7 +59,7 @@ pub(crate) struct IcebergMvRefreshContext {
     pub(crate) frozen_base_overlays: Option<
         Arc<Vec<crate::engine::query_planning::catalog_materializer::QueryLocalTableOverlay>>,
     >,
-    pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
+    pub iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     pub affected_partitions: crate::mv::model::AffectedTargetPartitions,
     pub pruning_limits: MvRefreshPruningLimits,
 }
@@ -105,8 +105,8 @@ impl IcebergMvRefreshContext {
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<Self, String> {
         Self::new_with_pruning_limits(
             target,
@@ -137,8 +137,8 @@ impl IcebergMvRefreshContext {
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         Self::new_with_affected_partitions_and_pruning_limits(
@@ -173,8 +173,8 @@ impl IcebergMvRefreshContext {
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
         affected_partitions: crate::mv::model::AffectedTargetPartitions,
     ) -> Result<Self, String> {
         Self::new_with_affected_partitions_and_pruning_limits(
@@ -207,8 +207,8 @@ impl IcebergMvRefreshContext {
         pin: Arc<RefreshSnapshotPin>,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
         affected_partitions: crate::mv::model::AffectedTargetPartitions,
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
@@ -255,8 +255,8 @@ impl IcebergMvRefreshContext {
         target_table_uuid: String,
         iceberg_catalogs: &IcebergCatalogRegistry,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
         affected_partitions: crate::mv::model::AffectedTargetPartitions,
         pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
@@ -513,7 +513,7 @@ fn validate_target_state_branch_scope(
 
 #[cfg(test)]
 fn data_files_at_snapshot(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<Vec<IcebergDataFileInfo>, String> {
     crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
@@ -710,7 +710,7 @@ fn data_file_with_stats_to_info(
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::rewrite::context::IcebergMvRewriteContext;
     use crate::mv::rewrite::context::tests_support::{
@@ -730,8 +730,8 @@ pub(crate) mod tests_support {
     pub(crate) struct TargetLocatorRefreshFixture {
         pub(crate) _warehouse: tempfile::TempDir,
         pub(crate) target_entry: Arc<IcebergCatalogEntry>,
-        pub(crate) iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        pub(crate) target_table: iceberg::table::Table,
+        pub(crate) iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        pub(crate) target_table: novarocks_connector_iceberg::iceberg::table::Table,
         pub(crate) target_snapshot_id: i64,
     }
 
@@ -821,7 +821,7 @@ pub(crate) mod tests_support {
     }
 
     pub(crate) fn rewrite_context_for_target_fixture(
-        target_table: &iceberg::table::Table,
+        target_table: &novarocks_connector_iceberg::iceberg::table::Table,
         target_snapshot_id: Option<i64>,
     ) -> Arc<IcebergMvRewriteContext> {
         let metadata = target_table.metadata();
@@ -896,8 +896,8 @@ pub(crate) mod tests_support {
     pub(crate) fn refresh_context_for_handles(
         rewrite: Arc<IcebergMvRewriteContext>,
         target_entry: Arc<IcebergCatalogEntry>,
-        iceberg_catalog: Arc<dyn iceberg::Catalog>,
-        target_table: iceberg::table::Table,
+        iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
     ) -> IcebergMvRefreshContext {
         let target_bindings =
             IcebergMvTargetBindings::from_rewrite_context(&rewrite, target_entry, target_table)
@@ -918,7 +918,7 @@ pub(crate) mod tests_support {
 
     pub(crate) fn aggregate_target_state_refresh_fixture()
     -> (IcebergMvRefreshContext, SqlMvTargetStateScan) {
-        use iceberg::{NamespaceIdent, TableIdent};
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
             .expect("aggregate target warehouse tempdir")
@@ -934,7 +934,7 @@ pub(crate) mod tests_support {
             )
             .expect("aggregate target entry"),
         );
-        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        let iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
                 .expect("build aggregate target catalog"),
         );
@@ -966,12 +966,13 @@ pub(crate) mod tests_support {
                 .build()
                 .expect("aggregate target schema"),
         );
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()
+                .into_unbound(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             format!("{warehouse}/target/table"),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("aggregate metadata builder")
@@ -981,8 +982,8 @@ pub(crate) mod tests_support {
         let target_uuid = metadata.uuid().to_string();
         let target_schema = metadata.current_schema().clone();
         let target_schema_id = metadata.current_schema_id();
-        let target_table = iceberg::table::Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        let target_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),
@@ -1342,7 +1343,7 @@ pub(crate) mod tests_support {
 mod tests {
     use std::sync::Arc;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::mv::rewrite::context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target_schema,
@@ -1359,7 +1360,7 @@ mod tests {
             table: "MvTable".to_string(),
         };
 
-        use iceberg::{NamespaceIdent, TableIdent};
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
             .expect("target warehouse tempdir")
@@ -1375,7 +1376,7 @@ mod tests {
             )
             .expect("catalog entry"),
         );
-        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        let iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
                 .expect("build hadoop catalog"),
         );
@@ -1411,20 +1412,21 @@ mod tests {
             ])
             .build()
             .expect("schema");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema,
-            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()
+                .into_unbound(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             format!("{warehouse}/target/table"),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("metadata builder")
         .build()
         .expect("metadata")
         .metadata;
-        let target_table = iceberg::table::Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        let target_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("NameSpace".to_string()),
@@ -1583,7 +1585,7 @@ mod tests {
 
     #[test]
     fn target_state_scan_falls_back_without_partition_allow_list() {
-        use iceberg::{NamespaceIdent, TableIdent};
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
         let warehouse_dir = tempfile::TempDir::new()
             .expect("target warehouse tempdir")
@@ -1599,25 +1601,26 @@ mod tests {
             )
             .expect("target entry"),
         );
-        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        let iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&target_entry)
                 .expect("build hadoop catalog"),
         );
         let schema = make_target_schema();
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec()
+                .into_unbound(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             format!("{warehouse}/target/table"),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("metadata builder")
         .build()
         .expect("metadata")
         .metadata;
-        let target_table = iceberg::table::Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        let target_table = novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("db".to_string()),

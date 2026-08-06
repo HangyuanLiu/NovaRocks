@@ -21,7 +21,7 @@
 /// to it (unborn branch). Returns an error when the ref does not exist in the
 /// table metadata.
 pub(crate) fn resolve_branch_head_snapshot_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     branch_name: &str,
 ) -> Result<Option<i64>, String> {
     match metadata.refs().get(branch_name) {

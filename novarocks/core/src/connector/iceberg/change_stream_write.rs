@@ -54,7 +54,7 @@ use novarocks_spi::connector::{ConnectorError, ConnectorWriteOperationId};
 pub(crate) struct IcebergChangeStreamProviderRequest<'a> {
     pub(crate) target: &'a str,
     pub(crate) target_ref: &'a str,
-    pub(crate) table: &'a iceberg::table::Table,
+    pub(crate) table: &'a novarocks_connector_iceberg::iceberg::table::Table,
     pub(crate) entry: &'a IcebergCatalogEntry,
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) operation_id: ConnectorWriteOperationId,
@@ -173,7 +173,7 @@ pub(crate) fn bind_iceberg_change_stream_provider(
 /// base snapshot. Credentials and catalog clients remain on the FE.
 pub(crate) fn frozen_deletion_vector_handle_payload(
     sink_spec: &IcebergWriteSinkSpec,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
 ) -> Result<Bytes, String> {
@@ -196,7 +196,7 @@ pub(crate) fn frozen_deletion_vector_handle_payload(
 
 fn change_stream_writer_handle_payloads(
     topology: &SqlChangeStreamWriteTopology,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     table_bindings: &QueryTableBindingStore,
@@ -267,7 +267,7 @@ pub(crate) fn position_delete_index_storage_config(
 }
 
 fn frozen_deletion_vectors_at_snapshot(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: Option<i64>,
     entry: &IcebergCatalogEntry,
 ) -> Result<HashMap<String, DeletionVector>, String> {

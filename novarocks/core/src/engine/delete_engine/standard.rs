@@ -39,8 +39,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use chrono::NaiveDateTime;
-use iceberg::expr::{Predicate, Reference};
-use iceberg::spec::{Datum, PrimitiveType, Type};
+use novarocks_connector_iceberg::iceberg::expr::{Predicate, Reference};
+use novarocks_connector_iceberg::iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
@@ -133,8 +133,8 @@ pub(crate) fn prepare_delete_statement(
         registry.get(&target.catalog)?
     };
     let catalog = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
@@ -148,7 +148,7 @@ pub(crate) fn prepare_delete_statement(
     // Branch writes require Iceberg v3 (row-lineage semantics).
     if target_ref != "main" {
         let fmt = table.metadata().format_version();
-        if fmt != iceberg::spec::FormatVersion::V3 {
+        if fmt != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3 {
             return Err(format!(
                 "iceberg ref: branch writes require Iceberg v3 tables (table {} is v{})",
                 table_ident, fmt as u8,
@@ -158,7 +158,7 @@ pub(crate) fn prepare_delete_statement(
 
     // 3. Validation.
     let delete_strategy = classify_sql_delete_strategy(&table)?;
-    // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
+    // 4. Validate WHERE → novarocks_connector_iceberg::iceberg::Predicate to surface unsupported clauses
     //    early. The distributed SELECT planner owns scan pruning and existing
     //    delete visibility from this point onward.
     let schema = table.metadata().current_schema();
@@ -348,8 +348,8 @@ impl PreparedDeleteExecution for DistributedDvDeleteWriteExecutor {
 fn prepare_delete_dv_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn iceberg::Catalog>,
-    table: iceberg::table::Table,
+    catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     target_ref: &str,
@@ -404,8 +404,8 @@ fn prepare_delete_dv_write(
             .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
             .collect::<Vec<_>>(),
     ));
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let staging_dir = format!(
@@ -479,8 +479,8 @@ fn prepare_delete_dv_write(
 fn prepare_delete_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn iceberg::Catalog>,
-    table: iceberg::table::Table,
+    catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     collector: Arc<IcebergCommitCollector>,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
@@ -625,14 +625,14 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Translate a `sqlparser::ast::Expr` into an [`iceberg::expr::Predicate`].
+/// Translate a `sqlparser::ast::Expr` into an [`novarocks_connector_iceberg::iceberg::expr::Predicate`].
 ///
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
 fn translate_where(
     expr: &sqlast::Expr,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Predicate, String> {
     match expr {
         sqlast::Expr::BinaryOp { left, op, right } => match op {
@@ -923,7 +923,7 @@ fn expr_to_column_name(expr: &sqlast::Expr) -> Result<String, String> {
 
 fn literal_to_datum(
     expr: &sqlast::Expr,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     column_name: &str,
 ) -> Result<Datum, String> {
     let field = schema
@@ -1032,7 +1032,7 @@ fn literal_to_datum(
 fn collect_position_deletes_from_batch(
     batch: &RecordBatch,
     where_expr: &sqlast::Expr,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
     by_file: &mut BTreeMap<String, Vec<i64>>,
 ) -> Result<(), String> {
@@ -1085,7 +1085,7 @@ fn evaluate_where_at_row(
     expr: &sqlast::Expr,
     batch: &RecordBatch,
     row: usize,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<bool, String> {
     match expr {
         sqlast::Expr::BinaryOp { left, op, right } => match op {
@@ -1206,7 +1206,7 @@ fn column_value_at_row(
     col_name: &str,
     batch: &RecordBatch,
     row: usize,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<Option<CellValue>, String> {
     let field = schema
         .as_struct()
@@ -1280,7 +1280,7 @@ fn compare_cell_to_datum(
     datum: &Datum,
     col_name: &str,
 ) -> Result<std::cmp::Ordering, String> {
-    use iceberg::spec::PrimitiveLiteral;
+    use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
     let lit = datum.literal();
     match (cell, lit) {
         (CellValue::Int(c), PrimitiveLiteral::Int(d)) => Ok(c.cmp(&(*d as i64))),
@@ -1304,7 +1304,7 @@ fn compare_cell_to_scalar_fn_literal(
     cell: &CellValue,
     literal_expr: &sqlast::Expr,
     col_name: &str,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<std::cmp::Ordering, String> {
     match cell {
         CellValue::String(c) => {
@@ -1380,7 +1380,9 @@ mod tests {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::spec::{Literal, NestedField, PrimitiveType, Struct, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        Literal, NestedField, PrimitiveType, Struct, Type,
+    };
     use parquet::arrow::ArrowWriter;
     use sqlparser::ast as sqlast;
 
@@ -1420,8 +1422,8 @@ mod tests {
         writer.close().expect("close delete file");
     }
 
-    fn iceberg_schema() -> iceberg::spec::Schema {
-        iceberg::spec::Schema::builder()
+    fn iceberg_schema() -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
                     1,
@@ -1438,8 +1440,8 @@ mod tests {
             .expect("build iceberg schema")
     }
 
-    fn iceberg_schema_with_variant() -> iceberg::spec::Schema {
-        iceberg::spec::Schema::builder()
+    fn iceberg_schema_with_variant() -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
                     1,
@@ -1755,8 +1757,8 @@ mod tests {
 
     // --------------- Timestamp predicate tests ---------------
 
-    fn iceberg_schema_with_timestamp() -> iceberg::spec::Schema {
-        iceberg::spec::Schema::builder()
+    fn iceberg_schema_with_timestamp() -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
                     1,
@@ -1794,7 +1796,7 @@ mod tests {
         });
         let datum = super::literal_to_datum(&expr, &schema, "ts").expect("parse datetime");
         // 2020-01-01 00:00:00 UTC == 1577836800 seconds == 1577836800_000000 microseconds
-        use iceberg::spec::PrimitiveLiteral;
+        use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
         assert!(
             matches!(datum.literal(), PrimitiveLiteral::Long(us) if *us == 1_577_836_800_000_000),
             "unexpected datum: {datum:?}"
@@ -1809,7 +1811,7 @@ mod tests {
             span: sqlparser::tokenizer::Span::empty(),
         });
         let datum = super::literal_to_datum(&expr, &schema, "ts").expect("parse datetime .5");
-        use iceberg::spec::PrimitiveLiteral;
+        use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
         // .5 seconds == 500_000 microseconds
         assert!(
             matches!(datum.literal(), PrimitiveLiteral::Long(us) if *us == 1_577_836_800_500_000),
@@ -1934,8 +1936,8 @@ mod tests {
 
     // --------------- Scalar-function predicate tests ---------------
 
-    fn iceberg_schema_with_label() -> iceberg::spec::Schema {
-        iceberg::spec::Schema::builder()
+    fn iceberg_schema_with_label() -> novarocks_connector_iceberg::iceberg::spec::Schema {
+        novarocks_connector_iceberg::iceberg::spec::Schema::builder()
             .with_fields(vec![
                 Arc::new(NestedField::required(
                     1,

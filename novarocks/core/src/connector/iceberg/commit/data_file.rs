@@ -16,7 +16,7 @@
 // for the specific language governing permissions and
 // limitations under the License.
 
-//! `WrittenFile` → `iceberg::spec::DataFile` conversion shared across
+//! `WrittenFile` → `novarocks_connector_iceberg::iceberg::spec::DataFile` conversion shared across
 //! all three commit-action implementations.
 //!
 //! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so construction
@@ -27,7 +27,7 @@
 //! iceberg-rust manifest serializer applies the spec's binary single-value
 //! encoding. Empty maps remain at the builder defaults.
 
-use iceberg::spec::{DataFile, DataFileBuilder};
+use novarocks_connector_iceberg::iceberg::spec::{DataFile, DataFileBuilder};
 
 use super::collector::IcebergCommitCollector;
 use super::types::WrittenFile;

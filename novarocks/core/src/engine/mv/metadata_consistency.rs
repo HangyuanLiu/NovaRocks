@@ -85,7 +85,9 @@ mod tests {
     use crate::sql::planner::vocabulary::HIDDEN_APPLY_KEY_COLUMN_NAME;
 
     fn minimal_base_row_id_contract() -> MvSchemaContract {
-        let target_type = iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int);
+        let target_type = novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+        );
         MvSchemaContract {
             contract_version: 1,
             base: BaseContract {

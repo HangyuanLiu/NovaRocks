@@ -25,12 +25,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::DataType;
-use iceberg::Catalog;
-use iceberg::TableIdent;
-use iceberg::spec::DataFile;
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::TableIdent;
+use novarocks_connector_iceberg::iceberg::spec::DataFile;
 #[cfg(test)]
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg::transaction::ApplyTransactionAction;
+use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use novarocks_connector_iceberg::iceberg::transaction::ApplyTransactionAction;
 use serde::{Deserialize, Serialize};
 
 use crate::common::engine_error::EngineError;
@@ -364,8 +364,9 @@ fn prepare_frontend_first_refresh_write(
     })?;
     let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
     let target_schema = target_loaded.table.metadata().current_schema();
-    let target_arrow_schema = iceberg::arrow::schema_to_arrow_schema(target_schema)
-        .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
+    let target_arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(target_schema)
+            .map_err(|error| format!("convert MV first-refresh target schema to Arrow: {error}"))?;
     let target_field_ids = target_schema
         .as_struct()
         .fields()
@@ -2585,8 +2586,8 @@ fn validate_branch_union_aggregate_base_refs(base_refs: &[TableIdentity]) -> Res
 fn validate_aggregate_schema_contract_for_base(
     schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
-    base_table: &iceberg::table::Table,
-    target_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     let mut base_contract = schema_contract.clone();
     if !schema_contract.bases.is_empty() {
@@ -2625,7 +2626,7 @@ fn validate_branch_union_contract(
     target: &IcebergMvTarget,
     schema_contract: &mv_schema::MvSchemaContract,
     query_branch_count: usize,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     if schema_contract.contract_version != 3 {
         return Err(format!(
@@ -2735,8 +2736,8 @@ fn validate_union_projection_schema_contract_for_base(
     schema_contract: &mv_schema::MvSchemaContract,
     branch_count: usize,
     base_ref: &TableIdentity,
-    base_table: &iceberg::table::Table,
-    target_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     if schema_contract.contract_version != 1 {
         return Err(format!(
@@ -3131,7 +3132,7 @@ pub(crate) fn sync_iceberg_mv_descriptor(
     }
     let descriptor_properties = descriptor.to_storage_properties()?;
     let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-    let tx = iceberg::transaction::Transaction::new(&loaded.table);
+    let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
     let mut action = tx.update_table_properties();
     for (key, value) in descriptor_properties {
         action = action.set(key, value);
@@ -4170,7 +4171,7 @@ fn base_contract(
 }
 
 fn base_fields_from_current_schema(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Vec<mv_schema::BaseFieldRecord> {
     schema
         .as_struct()
@@ -4189,7 +4190,7 @@ fn base_fields_from_current_schema(
 /// the application boundary. The SQL analyzer never retains the provider
 /// schema object or consults it after this conversion.
 fn sql_mv_lineage_schema(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
     crate::sql::analyzer::mv_lineage::SqlMvLineageSchema {
         fields: schema
@@ -4385,7 +4386,7 @@ fn target_partition_contract(
 }
 
 fn target_partition_contract_from_table(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<mv_schema::MvPartitionContract, String> {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
@@ -4413,24 +4414,36 @@ fn target_partition_contract_from_table(
 }
 
 fn mv_partition_transform_contract(
-    transform: &iceberg::spec::Transform,
+    transform: &novarocks_connector_iceberg::iceberg::spec::Transform,
 ) -> Result<mv_schema::MvPartitionTransformContract, String> {
     match transform {
-        iceberg::spec::Transform::Identity => Ok(mv_schema::MvPartitionTransformContract::Identity),
-        iceberg::spec::Transform::Year => Ok(mv_schema::MvPartitionTransformContract::Year),
-        iceberg::spec::Transform::Month => Ok(mv_schema::MvPartitionTransformContract::Month),
-        iceberg::spec::Transform::Day => Ok(mv_schema::MvPartitionTransformContract::Day),
-        iceberg::spec::Transform::Hour => Ok(mv_schema::MvPartitionTransformContract::Hour),
-        iceberg::spec::Transform::Bucket(num_buckets) => {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Identity => {
+            Ok(mv_schema::MvPartitionTransformContract::Identity)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Year => {
+            Ok(mv_schema::MvPartitionTransformContract::Year)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Month => {
+            Ok(mv_schema::MvPartitionTransformContract::Month)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Day => {
+            Ok(mv_schema::MvPartitionTransformContract::Day)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Hour => {
+            Ok(mv_schema::MvPartitionTransformContract::Hour)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(num_buckets) => {
             Ok(mv_schema::MvPartitionTransformContract::Bucket {
                 num_buckets: *num_buckets,
             })
         }
-        iceberg::spec::Transform::Truncate(width) => {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width) => {
             Ok(mv_schema::MvPartitionTransformContract::Truncate { width: *width })
         }
-        iceberg::spec::Transform::Void => Ok(mv_schema::MvPartitionTransformContract::Void),
-        iceberg::spec::Transform::Unknown => {
+        novarocks_connector_iceberg::iceberg::spec::Transform::Void => {
+            Ok(mv_schema::MvPartitionTransformContract::Void)
+        }
+        novarocks_connector_iceberg::iceberg::spec::Transform::Unknown => {
             Err("iceberg MV target partition contract cannot persist unknown transform".to_string())
         }
     }
@@ -4618,7 +4631,7 @@ fn load_iceberg_mv_target(
 ) -> Result<
     (
         crate::connector::iceberg::catalog::IcebergCatalogEntry,
-        Arc<dyn iceberg::Catalog>,
+        Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     ),
     String,
@@ -4640,7 +4653,7 @@ fn load_iceberg_mv_target(
 fn reload_iceberg_mv_target_table(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target: &IcebergMvTarget,
-) -> Result<iceberg::table::Table, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
     entry.invalidate_table_cache(&target.namespace, &target.table);
     crate::connector::iceberg::catalog::load_table(entry, &target.namespace, &target.table)
         .map(|loaded| loaded.table)
@@ -4654,7 +4667,7 @@ fn iceberg_mv_table_ident(target: &IcebergMvTarget) -> Result<TableIdent, String
 fn validate_target_snapshot(
     target: &IcebergMvTarget,
     mv_definition: &StoredMvDefinition,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
@@ -4671,7 +4684,9 @@ fn validate_target_snapshot(
 /// definition is durable. It is a staging-branch base, not a completed MV
 /// refresh, so the definition deliberately continues to record no refreshed
 /// target snapshot until first refresh publishes data.
-fn is_empty_target_bootstrap_snapshot(table: &iceberg::table::Table) -> bool {
+fn is_empty_target_bootstrap_snapshot(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> bool {
     table.metadata().current_snapshot().is_some_and(|snapshot| {
         snapshot.parent_snapshot_id().is_none()
             && snapshot
@@ -5635,7 +5650,7 @@ fn rebind_mv_definition_before_refresh_derivation(
     state: &Arc<StandaloneState>,
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<StoredMvDefinition, IcebergMvRefreshExecutionError> {
     let Some(contract) = mv_definition.schema_contract.as_ref() else {
         return Ok(mv_definition.clone());
@@ -5685,8 +5700,8 @@ fn refresh_iceberg_union_projection_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -5962,8 +5977,8 @@ fn refresh_iceberg_aggregate_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -6078,8 +6093,8 @@ fn refresh_single_aggregate_iceberg_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -6348,8 +6363,8 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -6625,8 +6640,8 @@ fn refresh_join_aggregate_iceberg_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -6870,7 +6885,10 @@ fn plan_multi_base_affected_partitions<'a>(
     base_refs: &[TableIdentity],
     previous_snapshots: &BTreeMap<String, i64>,
     current_snapshots: &BTreeMap<String, Option<i64>>,
-    mut table_for_base: impl FnMut(&TableIdentity) -> Option<&'a iceberg::table::Table>,
+    mut table_for_base: impl FnMut(
+        &TableIdentity,
+    )
+        -> Option<&'a novarocks_connector_iceberg::iceberg::table::Table>,
     context: &str,
 ) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
@@ -6938,7 +6956,7 @@ fn plan_aggregate_mv_affected_partitions(
     mode: RefreshMode,
     previous_snapshot_id: Option<i64>,
     current_snapshot_id: Option<i64>,
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> crate::mv::model::AffectedTargetPartitions {
     match mode {
         RefreshMode::Noop => noop_affected_partitions(schema_contract),
@@ -7054,7 +7072,7 @@ fn refresh_execution_definition_fingerprint(
 
 fn build_refresh_state_baseline(
     mv_definition: &StoredMvDefinition,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<RefreshStateBaseline, String> {
@@ -7539,7 +7557,7 @@ pub(crate) fn plan_iceberg_mv_refresh_with_connector_context(
 fn plan_iceberg_union_projection_mv_refresh(
     state: &Arc<StandaloneState>,
     iceberg_target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target: MvTarget,
     stmt: &RefreshMaterializedViewStmt,
     current_catalog: Option<&str>,
@@ -7723,7 +7741,7 @@ fn plan_iceberg_union_projection_mv_refresh(
 fn plan_iceberg_all_bases_aggregate_mv_refresh(
     state: &Arc<StandaloneState>,
     iceberg_target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target: MvTarget,
     stmt: &RefreshMaterializedViewStmt,
     current_catalog: Option<&str>,
@@ -7870,7 +7888,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
 fn plan_iceberg_aggregate_mv_refresh(
     state: &Arc<StandaloneState>,
     iceberg_target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target: MvTarget,
     stmt: &RefreshMaterializedViewStmt,
     current_catalog: Option<&str>,
@@ -8174,8 +8192,8 @@ struct ValidatedIcebergRefreshRuntime {
     target: IcebergMvTarget,
     mv_definition: StoredMvDefinition,
     target_entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: Arc<dyn iceberg::Catalog>,
-    target_table: iceberg::table::Table,
+    iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: novarocks_connector_iceberg::iceberg::table::Table,
     base_refs: Vec<TableIdentity>,
 }
 
@@ -8481,8 +8499,8 @@ fn build_validated_refresh_context(
     base_refs: Arc<[TableIdentity]>,
     execution: &IcebergValidatedRefreshExecution<'_>,
     target_entry: Arc<crate::connector::iceberg::catalog::IcebergCatalogEntry>,
-    iceberg_catalog: Arc<dyn iceberg::Catalog>,
-    target_table: iceberg::table::Table,
+    iceberg_catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<IcebergMvRefreshContext, String> {
     let RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids,
@@ -9540,10 +9558,10 @@ fn record_iceberg_mv_operation_finalize_failure(
 /// Delete manifests are ignored: they may target a different spec than the
 /// default and are irrelevant to the default-spec question.
 fn data_manifest_unanimous_partition_spec_id(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<Option<i32>, String> {
-    use iceberg::spec::ManifestContentType;
+    use novarocks_connector_iceberg::iceberg::spec::ManifestContentType;
 
     let metadata = table.metadata();
     let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
@@ -9599,7 +9617,7 @@ fn data_manifest_unanimous_partition_spec_id(
 fn restore_repartition_default_spec_from_intent(
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     intent: &MvRepartitionOperationIntent,
     reference_snapshot_id: Option<i64>,
 ) -> Result<(), String> {
@@ -9638,7 +9656,7 @@ fn restore_repartition_default_spec_from_recovery_intent(
     refresh: &StoredMvRefresh,
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     reference_snapshot_id: Option<i64>,
 ) -> Result<(), String> {
     let Some(intent) = load_repartition_operation_intent_for_recovery(state, refresh)? else {
@@ -9661,7 +9679,9 @@ fn restore_repartition_default_spec_from_recovery_intent(
 /// [`crate::engine::mv::recovery::classify_staging_branch`]: the storage
 /// table's own parent chain is the source of truth for whether a staging
 /// snapshot was ever published, independent of any SQLite ledger state.
-fn main_ancestor_snapshot_ids(table: &iceberg::table::Table) -> Vec<i64> {
+fn main_ancestor_snapshot_ids(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Vec<i64> {
     let metadata = table.metadata();
     let mut ancestors = Vec::new();
     let mut cursor = metadata.current_snapshot().map(|s| s.snapshot_id());
@@ -9715,8 +9735,8 @@ fn reconcile_iceberg_mv_refresh(
     refresh: StoredMvRefresh,
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    _catalog: &Arc<dyn iceberg::Catalog>,
-    table: &iceberg::table::Table,
+    _catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     if matches!(
@@ -9827,7 +9847,7 @@ fn rollback_iceberg_mv_staging_branch(
     refresh: &StoredMvRefresh,
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     staging_branch: &str,
     staging_snapshot_id: i64,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -9866,7 +9886,7 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
     refresh: &StoredMvRefresh,
     target: &IcebergMvTarget,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     let main = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let main_carries_refresh = match main {
@@ -9891,7 +9911,7 @@ fn converge_iceberg_mv_refresh_without_staging_branch(
 }
 
 fn snapshot_id_matches_refresh_marker(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
     refresh: &StoredMvRefresh,
 ) -> Result<bool, String> {
@@ -10456,7 +10476,7 @@ fn finalize_iceberg_mv_refresh_with_partition_contract(
 fn advance_lake_watermark_via_data_free_snapshot(
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     mv_definition: &StoredMvDefinition,
     refresh_id: i64,
     new_base_snapshots: &BTreeMap<String, i64>,
@@ -10527,7 +10547,7 @@ fn advance_lake_watermark_via_data_free_snapshot(
             .load_table(&ident)
             .await
             .map_err(|e| format!("load mv target for data-free watermark append failed: {e}"))?;
-        let tx = iceberg::transaction::Transaction::new(&table);
+        let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&table);
         // Data-free fast append: NO add_data_files, only the provenance summary.
         // This advances the current snapshot while preserving existing data
         // files. The crate transaction's commit runs the CAS/retry loop against
@@ -11758,7 +11778,7 @@ enum RebuildChunkPayload {
 }
 
 struct PreparedRebuildChunkWrite {
-    data_files: Vec<iceberg::spec::DataFile>,
+    data_files: Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>,
     total_rows: i64,
     base_snapshots: BTreeMap<String, i64>,
     base_table_uuids: BTreeMap<String, String>,
@@ -11792,7 +11812,7 @@ impl RebuildChunkPayload {
 
     async fn prepare_write(
         self,
-        table: &iceberg::table::Table,
+        table: &novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<PreparedRebuildChunkWrite, String> {
         match self {
             Self::FullRefresh(payload) => {
@@ -11837,7 +11857,7 @@ fn commit_rebuild_payload(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     expected_main_snapshot_id: Option<i64>,
     staging_branch: &str,
     refresh_id: i64,
@@ -12061,7 +12081,7 @@ fn commit_repartition_rebuild_payload(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     expected_main_snapshot_id: Option<i64>,
     staging_branch: &str,
     refresh_id: i64,
@@ -12092,7 +12112,7 @@ fn rebuild_iceberg_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
     expected_main_snapshot_id: Option<i64>,
     staging_branch: &str,
     refresh_id: i64,
@@ -12228,7 +12248,7 @@ async fn finalize_mv_branch_commit_outcome(
 }
 
 async fn commit_overwrite_iceberg_mv_with_ref(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
@@ -12251,7 +12271,7 @@ async fn commit_overwrite_iceberg_mv_with_ref(
 }
 
 async fn commit_iceberg_mv_target_files(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
@@ -12273,7 +12293,7 @@ async fn commit_iceberg_mv_target_files(
 
 #[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_target_files_with_ref(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
@@ -12351,7 +12371,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) async fn commit_iceberg_mv_with_populated_collector(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
@@ -12385,7 +12405,7 @@ pub(crate) async fn commit_iceberg_mv_with_populated_collector(
 
 #[allow(clippy::too_many_arguments)]
 async fn commit_iceberg_mv_apply_with_ref(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
@@ -12469,7 +12489,7 @@ async fn commit_iceberg_mv_apply_with_ref(
 
 fn inject_iceberg_mv_data_file_reports(
     collector: &IcebergCommitCollector,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     data_files: Vec<DataFile>,
 ) -> Result<(), String> {
     let default_spec_id = metadata.default_partition_spec_id();
@@ -12488,7 +12508,7 @@ fn derive_refresh_contract_for_strategy_dispatch(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<
     (
@@ -12557,7 +12577,7 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
     mv_definition: &StoredMvDefinition,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Option<String>, String> {
     let Some(schema_contract) = mv_definition.schema_contract.as_ref() else {
         return Ok(None);
@@ -12631,14 +12651,16 @@ pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, 
     Ok(*query)
 }
 
-fn expected_main_snapshot_id_from_table(table: &iceberg::table::Table) -> Option<i64> {
+fn expected_main_snapshot_id_from_table(
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
+) -> Option<i64> {
     table.metadata().current_snapshot().map(|s| s.snapshot_id())
 }
 
 fn ensure_schema_contract_compatible_for_refresh(
     schema_contract: &mv_schema::MvSchemaContract,
-    base_table: &iceberg::table::Table,
-    target_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     match validate_current_schema_contract(schema_contract, base_table, target_table) {
         ContractDecision::Incompatible(err) => Err(format!("{err}")),
@@ -12652,7 +12674,7 @@ fn validate_repartition_schema_contract(
     state: &Arc<StandaloneState>,
     schema_contract: &mv_schema::MvSchemaContract,
     base_refs: &[TableIdentity],
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     if schema_contract.join.is_some() {
         let [left_ref, right_ref] = base_refs else {
@@ -12729,8 +12751,8 @@ fn validate_repartition_schema_contract(
 fn validate_aggregate_repartition_schema_contract_for_base(
     schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
-    base_table: &iceberg::table::Table,
-    target_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     validate_aggregate_schema_contract_for_base(
         schema_contract,
@@ -12753,8 +12775,8 @@ fn validate_aggregate_repartition_schema_contract_for_base(
 fn validate_repartition_base_schema_contract(
     schema_contract: &mv_schema::MvSchemaContract,
     base_ref: &TableIdentity,
-    base_table: &iceberg::table::Table,
-    target_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), String> {
     let mut base_contract = schema_contract.clone();
     base_contract.base = schema_contract
@@ -12781,8 +12803,8 @@ fn refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -13152,9 +13174,9 @@ fn build_join_projection_repartition_context(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
     target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
-    target_table: &iceberg::table::Table,
-    schema_validation_target_table: &iceberg::table::Table,
+    iceberg_catalog: &Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
+    schema_validation_target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_catalog: Option<&str>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
@@ -15665,7 +15687,7 @@ fn build_join_delta_coalesce_catalog(
     state: &Arc<StandaloneState>,
     branches: &[crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan],
     target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_snapshot_id: Option<i64>,
 ) -> Result<crate::sql::catalog::local::PlannerMemoryCatalog, String> {
     let mut catalog = crate::sql::catalog::local::PlannerMemoryCatalog::default();
@@ -15704,7 +15726,7 @@ fn register_join_delta_target_locator(
     catalog: &mut crate::sql::catalog::local::PlannerMemoryCatalog,
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_snapshot_id: Option<i64>,
 ) -> Result<(), String> {
     catalog.create_database(&target.namespace)?;
@@ -15719,7 +15741,7 @@ fn register_join_delta_target_locator(
 fn build_join_delta_target_locator_table_def(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     target_snapshot_id: Option<i64>,
 ) -> Result<crate::sql::planner::table::TableDef, String> {
     let _ = (state, target, target_table, target_snapshot_id);
@@ -15943,7 +15965,7 @@ fn imv_change_stream_writer_abort_result_for_test(
 fn execute_imv_change_stream_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    table: iceberg::table::Table,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     op_kind: CommitOpKind,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
@@ -15974,7 +15996,7 @@ fn execute_imv_change_stream_write(
 fn execute_imv_change_stream_writer(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
@@ -16144,7 +16166,7 @@ fn execute_imv_change_stream_writer(
 fn prepare_imv_change_stream_writer(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     ident: &TableIdent,
     refresh_plan: ImvRefreshPlannedChangeStream<'_>,
     target_ref: &str,
@@ -17006,7 +17028,7 @@ fn incremental_refresh_iceberg_mv(
     base_ref: &TableIdentity,
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
-    base_table: &iceberg::table::Table,
+    base_table: &novarocks_connector_iceberg::iceberg::table::Table,
     current_table_uuid: &str,
     full_rebuild_select: FullRebuildSelectPreparation<'_>,
     options: RewriteMergeRefreshOptions,
@@ -17661,9 +17683,9 @@ fn incremental_refresh_iceberg_mv_with_changes(
 /// Iceberg field ids that the `ParquetWriterBuilder` requires (it matches
 /// columns by field-id metadata by default).
 pub(crate) async fn write_chunks_as_iceberg_data_files(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     chunks: &[crate::exec::chunk::Chunk],
-) -> Result<Vec<iceberg::spec::DataFile>, String> {
+) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
     write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
 }
 
@@ -18361,9 +18383,9 @@ mod tests {
     }
 
     fn branch_field_test_table(
-        branch_field: Option<iceberg::spec::NestedField>,
-    ) -> iceberg::table::Table {
-        use iceberg::spec::{
+        branch_field: Option<novarocks_connector_iceberg::iceberg::spec::NestedField>,
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
+        use novarocks_connector_iceberg::iceberg::spec::{
             FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
             TableMetadataBuilder, Type,
         };
@@ -18394,19 +18416,25 @@ mod tests {
         .build()
         .expect("branch field table metadata")
         .metadata;
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .identifier(
-                iceberg::TableIdent::from_strs(["db", "branch_target"])
-                    .expect("branch field table ident"),
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs([
+                    "db",
+                    "branch_target",
+                ])
+                .expect("branch field table ident"),
             )
-            .file_io(iceberg::io::FileIO::new_with_fs())
+            .file_io(novarocks_connector_iceberg::iceberg::io::FileIO::new_with_fs())
             .metadata(metadata)
             .build()
             .expect("branch field test table")
     }
 
-    fn branch_field_cases() -> Vec<(iceberg::table::Table, &'static str)> {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+    fn branch_field_cases() -> Vec<(
+        novarocks_connector_iceberg::iceberg::table::Table,
+        &'static str,
+    )> {
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
 
         vec![
             (branch_field_test_table(None), "missing"),
@@ -20194,7 +20222,7 @@ mod tests {
         mv_name: &str,
     ) -> Vec<(i32, String, i64, i32)> {
         use futures::StreamExt;
-        use iceberg::arrow::ArrowReaderBuilder;
+        use novarocks_connector_iceberg::iceberg::arrow::ArrowReaderBuilder;
 
         let entry = {
             let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
@@ -20810,7 +20838,7 @@ mod tests {
         descriptor.package_id = package_id.to_string();
         let descriptor_properties = descriptor.to_storage_properties()?;
         let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-        let tx = iceberg::transaction::Transaction::new(&loaded.table);
+        let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
         let mut action = tx.update_table_properties();
         for (key, value) in descriptor_properties {
             action = action.set(key, value);
@@ -20839,7 +20867,7 @@ mod tests {
         };
         let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
         let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
-        let tx = iceberg::transaction::Transaction::new(&loaded.table);
+        let tx = novarocks_connector_iceberg::iceberg::transaction::Transaction::new(&loaded.table);
         let tx = tx
             .update_table_properties()
             .set(
@@ -21306,7 +21334,7 @@ mod tests {
         catalog: &str,
         namespace: &str,
         table: &str,
-    ) -> iceberg::table::Table {
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
         let entry = {
             let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get(catalog).expect("catalog")
@@ -21935,7 +21963,7 @@ mod tests {
                 .expect("load target table");
         assert_eq!(
             loaded.table.metadata().format_version(),
-            iceberg::spec::FormatVersion::V3
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
         );
         assert_eq!(
             loaded
@@ -22247,7 +22275,7 @@ mod tests {
                 for manifest_entry in manifest.entries() {
                     if manifest_entry.is_alive()
                         && manifest_entry.data_file().content_type()
-                            == iceberg::spec::DataContentType::Data
+                            == novarocks_connector_iceberg::iceberg::spec::DataContentType::Data
                     {
                         count += 1;
                     }
@@ -22707,10 +22735,16 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "id_bucket_16");
         assert_eq!(fields[0].source_id, 1);
-        assert_eq!(fields[0].transform, iceberg::spec::Transform::Bucket(16));
+        assert_eq!(
+            fields[0].transform,
+            novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(16)
+        );
         assert_eq!(fields[1].name, "name_truncate_8");
         assert_eq!(fields[1].source_id, 2);
-        assert_eq!(fields[1].transform, iceberg::spec::Transform::Truncate(8));
+        assert_eq!(
+            fields[1].transform,
+            novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(8)
+        );
         let definition = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv definition");
         let stored_partition = definition.partition_spec.expect("stored partition spec");
@@ -22784,7 +22818,7 @@ mod tests {
         assert_eq!(spec.fields()[0].name, "name_truncate_2");
         assert_eq!(
             spec.fields()[0].transform,
-            iceberg::spec::Transform::Truncate(2)
+            novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(2)
         );
         let descriptor =
             MvDescriptorV1::from_storage_properties(loaded.table.metadata().properties())
@@ -28472,7 +28506,7 @@ mod tests {
 
     #[test]
     fn arrow_int8_int16_promote_to_iceberg_int() {
-        use iceberg::spec::PrimitiveType;
+        use novarocks_connector_iceberg::iceberg::spec::PrimitiveType;
         assert_eq!(
             arrow_data_type_to_iceberg_primitive(&DataType::Int8).unwrap(),
             PrimitiveType::Int
@@ -28518,29 +28552,38 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
 
-            let schema = iceberg::spec::Schema::builder()
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_fields(vec![
-                    StdArc::new(iceberg::spec::NestedField::required(
-                        1,
-                        "k",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                    )),
-                    StdArc::new(iceberg::spec::NestedField::optional(
-                        2,
-                        "v",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                    )),
+                    StdArc::new(
+                        novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                            1,
+                            "k",
+                            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                            ),
+                        ),
+                    ),
+                    StdArc::new(
+                        novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                            2,
+                            "v",
+                            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                            ),
+                        ),
+                    ),
                 ])
                 .build()
                 .unwrap();
 
-            let creation = iceberg::TableCreation::builder()
+            let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
                 .name("t".to_string())
                 .schema(schema)
                 .build();
@@ -28627,26 +28670,33 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
-            let schema = iceberg::spec::Schema::builder()
-                .with_fields(vec![StdArc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "k",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))])
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                .with_fields(vec![StdArc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "k",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )])
                 .build()
                 .unwrap();
             let table = catalog
                 .create_table(
                     &ns,
-                    iceberg::TableCreation::builder()
+                    novarocks_connector_iceberg::iceberg::TableCreation::builder()
                         .name("t".to_string())
                         .schema(schema)
-                        .format_version(iceberg::spec::FormatVersion::V3)
+                        .format_version(
+                            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+                        )
                         .properties([("write.row-lineage".to_string(), "true".to_string())])
                         .build(),
                 )
@@ -28762,26 +28812,33 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
-            let schema = iceberg::spec::Schema::builder()
-                .with_fields(vec![StdArc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "k",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))])
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                .with_fields(vec![StdArc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "k",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )])
                 .build()
                 .unwrap();
             catalog
                 .create_table(
                     &ns,
-                    iceberg::TableCreation::builder()
+                    novarocks_connector_iceberg::iceberg::TableCreation::builder()
                         .name("t".to_string())
                         .schema(schema)
-                        .format_version(iceberg::spec::FormatVersion::V3)
+                        .format_version(
+                            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+                        )
                         .properties([("write.row-lineage".to_string(), "true".to_string())])
                         .build(),
                 )
@@ -28833,26 +28890,33 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let staging_branch = "__nova_cleanup_failure";
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
-            let schema = iceberg::spec::Schema::builder()
-                .with_fields(vec![StdArc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "k",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))])
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                .with_fields(vec![StdArc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "k",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )])
                 .build()
                 .unwrap();
             let table = catalog
                 .create_table(
                     &ns,
-                    iceberg::TableCreation::builder()
+                    novarocks_connector_iceberg::iceberg::TableCreation::builder()
                         .name("t".to_string())
                         .schema(schema)
-                        .format_version(iceberg::spec::FormatVersion::V3)
+                        .format_version(
+                            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
+                        )
                         .properties([("write.row-lineage".to_string(), "true".to_string())])
                         .build(),
                 )
@@ -28923,7 +28987,9 @@ mod tests {
         use crate::connector::iceberg::catalog::registry::{
             build_catalog_entry, build_iceberg_catalog,
         };
-        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Struct,
+        };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = format!("file://{}/wh", dir.path().display());
@@ -28940,23 +29006,28 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
-            let schema = iceberg::spec::Schema::builder()
-                .with_fields(vec![StdArc::new(iceberg::spec::NestedField::required(
-                    1,
-                    "k",
-                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                ))])
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
+                .with_fields(vec![StdArc::new(
+                    novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                        1,
+                        "k",
+                        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                        ),
+                    ),
+                )])
                 .build()
                 .unwrap();
             let table = catalog
                 .create_table(
                     &ns,
-                    iceberg::TableCreation::builder()
+                    novarocks_connector_iceberg::iceberg::TableCreation::builder()
                         .name("mv_target".to_string())
                         .schema(schema)
                         .build(),
@@ -29003,7 +29074,7 @@ mod tests {
         use crate::connector::iceberg::catalog::registry::{
             build_catalog_entry, build_iceberg_catalog,
         };
-        use iceberg::spec::{Transform, UnboundPartitionSpec};
+        use novarocks_connector_iceberg::iceberg::spec::{Transform, UnboundPartitionSpec};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = format!("file://{}/wh", dir.path().display());
@@ -29020,24 +29091,33 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            let ns = novarocks_connector_iceberg::iceberg::NamespaceIdent::from_strs(["test_ns"])
+                .unwrap();
             catalog
                 .create_namespace(&ns, std::collections::HashMap::new())
                 .await
                 .unwrap();
 
-            let schema = iceberg::spec::Schema::builder()
+            let schema = novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_fields(vec![
-                    StdArc::new(iceberg::spec::NestedField::required(
-                        1,
-                        "k",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-                    )),
-                    StdArc::new(iceberg::spec::NestedField::optional(
-                        2,
-                        "v",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
-                    )),
+                    StdArc::new(
+                        novarocks_connector_iceberg::iceberg::spec::NestedField::required(
+                            1,
+                            "k",
+                            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int,
+                            ),
+                        ),
+                    ),
+                    StdArc::new(
+                        novarocks_connector_iceberg::iceberg::spec::NestedField::optional(
+                            2,
+                            "v",
+                            novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                                novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long,
+                            ),
+                        ),
+                    ),
                 ])
                 .build()
                 .unwrap();
@@ -29047,7 +29127,7 @@ mod tests {
                 .unwrap()
                 .build();
 
-            let creation = iceberg::TableCreation::builder()
+            let creation = novarocks_connector_iceberg::iceberg::TableCreation::builder()
                 .name("t".to_string())
                 .schema(schema)
                 .partition_spec(partition_spec)

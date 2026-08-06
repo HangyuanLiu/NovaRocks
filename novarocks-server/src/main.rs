@@ -247,8 +247,12 @@ fn run_standalone_be_role(
     if let Some(warn) = be_role_start_warning(port_override) {
         eprintln!("WARN: {warn}");
     }
-    novarocks_backend::run_backend_server(novarocks_backend::BackendServerConfig { config: cfg })
-        .map_err(|error| anyhow::anyhow!("role=be: {error}"))
+    let execution_installers = composition::compose_backend_execution_installers(&cfg)?;
+    novarocks_backend::run_backend_server(novarocks_backend::BackendServerConfig {
+        config: cfg,
+        execution_installers,
+    })
+    .map_err(|error| anyhow::anyhow!("role=be: {error}"))
 }
 
 fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()> {
@@ -270,10 +274,13 @@ fn run_standalone_server_cli(cli: StandaloneServerCliArgs) -> anyhow::Result<()>
         cfg,
         cli.mysql_port,
         move |cfg, port| {
+            let state_store_host_config = composition::state_store_host_config(&cfg);
             novarocks_frontend::run_frontend_server(novarocks_frontend::FrontendServerConfig {
                 config: cfg,
                 config_path: frontend_config_path,
                 port_override: port,
+                connector_control_factories: Vec::new(),
+                state_store_host_config,
             })
             .map_err(|error| anyhow::anyhow!("{error}"))
         },

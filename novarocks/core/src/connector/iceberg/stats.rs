@@ -310,7 +310,7 @@ fn iceberg_table_info_for_stats(
     namespace: &str,
     table: &str,
     loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
 ) -> Result<IcebergTableInfo, StatsProviderError> {
     let metadata = loaded.table.metadata();
     Ok(IcebergTableInfo {
@@ -330,15 +330,16 @@ fn iceberg_table_info_for_stats(
 }
 
 fn columns_for_stats_schema(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     catalog: &str,
     namespace: &str,
     table: &str,
     snapshot_id: i64,
 ) -> Result<Vec<ColumnDef>, StatsProviderError> {
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(schema).map_err(|err| {
-        StatsProviderError::Metadata(format!("convert snapshot schema to Arrow failed: {err}"))
-    })?;
+    let arrow_schema = novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(schema)
+        .map_err(|err| {
+            StatsProviderError::Metadata(format!("convert snapshot schema to Arrow failed: {err}"))
+        })?;
     arrow_schema
         .fields()
         .iter()
@@ -350,10 +351,10 @@ fn columns_for_stats_schema(
                 ))
             })?;
             let data_type = match iceberg_field.field_type.as_ref() {
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Variant) => {
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant) => {
                     DataType::LargeBinary
                 }
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Binary) => {
+                novarocks_connector_iceberg::iceberg::spec::Type::Primitive(novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary) => {
                     DataType::Binary
                 }
                 _ => field.data_type().clone(),
@@ -395,13 +396,14 @@ pub(crate) fn load_iceberg_puffin_ndv(
     let Some(serialized) = info.serialized_metadata.as_ref() else {
         return empty;
     };
-    let metadata: iceberg::spec::TableMetadata = match serde_json::from_str(serialized) {
-        Ok(m) => m,
-        Err(err) => {
-            tracing::debug!(error = %err, "iceberg ndv: parse table metadata json failed");
-            return empty;
-        }
-    };
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        match serde_json::from_str(serialized) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::debug!(error = %err, "iceberg ndv: parse table metadata json failed");
+                return empty;
+            }
+        };
     let Some(snapshot) = metadata.current_snapshot() else {
         return empty;
     };
@@ -420,20 +422,21 @@ fn load_iceberg_puffin_ndv_for_snapshot(
     let Some(serialized) = info.serialized_metadata.as_ref() else {
         return empty;
     };
-    let metadata: iceberg::spec::TableMetadata = match serde_json::from_str(serialized) {
-        Ok(m) => m,
-        Err(err) => {
-            tracing::debug!(error = %err, "iceberg ndv: parse table metadata json failed");
-            return empty;
-        }
-    };
+    let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+        match serde_json::from_str(serialized) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::debug!(error = %err, "iceberg ndv: parse table metadata json failed");
+                return empty;
+            }
+        };
     load_iceberg_puffin_ndv_from_metadata(info, cloud_properties, &metadata, snapshot_id)
 }
 
 fn load_iceberg_puffin_ndv_from_metadata(
     info: &IcebergTableInfo,
     cloud_properties: &BTreeMap<String, String>,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
     use crate::connector::iceberg::stats_loader::StatsLoader;
@@ -466,9 +469,9 @@ fn load_iceberg_puffin_ndv_from_metadata(
 
 fn load_iceberg_puffin_ndv_from_metadata_with_file_io(
     info: &IcebergTableInfo,
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     snapshot_id: i64,
-    file_io: &iceberg::io::FileIO,
+    file_io: &novarocks_connector_iceberg::iceberg::io::FileIO,
 ) -> (HashMap<String, f64>, HashMap<String, i32>) {
     use crate::connector::iceberg::stats_loader::StatsLoader;
     use crate::runtime::global_async_runtime::data_block_on;
@@ -515,7 +518,7 @@ fn load_iceberg_puffin_ndv_from_field_map(
 fn build_stats_file_io(
     location: &str,
     cloud_properties: &BTreeMap<String, String>,
-) -> Result<iceberg::io::FileIO, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO, String> {
     let scheme = location.split("://").next().unwrap_or("");
     let is_s3 = matches!(scheme, "s3" | "s3a" | "oss");
     if !is_s3 {

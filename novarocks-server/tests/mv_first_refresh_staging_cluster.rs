@@ -410,6 +410,8 @@ query_lifecycle_fault_dir = "{}"
             config,
             config_path: Some(config_file.path().to_path_buf()),
             port_override: None,
+            connector_control_factories: Vec::new(),
+            state_store_host_config: None,
         },
         async move {
             let _ = shutdown_rx.await;

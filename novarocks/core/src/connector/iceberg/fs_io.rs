@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use iceberg::io::{
+use novarocks_connector_iceberg::iceberg::io::{
     FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage,
     StorageConfig, StorageFactory,
 };
-use iceberg::{Error, ErrorKind, Result};
-use opendal::Operator;
+use novarocks_connector_iceberg::iceberg::{Error, ErrorKind, Result};
+use novarocks_connector_iceberg::opendal::Operator;
 use serde::{Deserialize, Serialize};
 
 use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
@@ -280,7 +280,7 @@ impl FileRead for IcebergFsFileRead {
 }
 
 struct IcebergFsFileWrite {
-    writer: Option<opendal::Writer>,
+    writer: Option<novarocks_connector_iceberg::opendal::Writer>,
 }
 
 impl std::fmt::Debug for IcebergFsFileWrite {

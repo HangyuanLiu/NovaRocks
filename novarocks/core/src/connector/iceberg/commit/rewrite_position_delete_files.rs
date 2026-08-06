@@ -26,13 +26,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType,
     ManifestFile, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Struct, Summary,
 };
-use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
+};
 use uuid::Uuid;
 
 use super::helpers::{
@@ -115,7 +117,7 @@ async fn run_one_attempt(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     options: RewritePositionDeleteOptions,
-) -> Result<RewritePositionDeleteOutcome, iceberg::Error> {
+) -> Result<RewritePositionDeleteOutcome, novarocks_connector_iceberg::iceberg::Error> {
     let table = catalog.load_table(&table_ident).await?;
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -131,16 +133,24 @@ async fn run_one_attempt(
         return Ok(RewritePositionDeleteOutcome::default());
     }
     if metadata.format_version() != FormatVersion::V3 {
-        return Err(iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
+        return Err(novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
             "rewrite_position_delete_files requires an Iceberg v3 table for Puffin deletion vector rewrite",
         ));
     }
-    let total_records = rewrite_total_records(
-        current_snapshot_total_records(metadata)
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?,
-    )
-    .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+    let total_records =
+        rewrite_total_records(current_snapshot_total_records(metadata).map_err(|e| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                e,
+            )
+        })?)
+        .map_err(|e| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                e,
+            )
+        })?;
 
     let new_seq = metadata.last_sequence_number() + 1;
     let new_snapshot_id = generate_snapshot_id();
@@ -597,19 +607,19 @@ struct RewriteArtifacts {
 }
 
 struct AttemptFailure {
-    error: iceberg::Error,
+    error: novarocks_connector_iceberg::iceberg::Error,
     cleanup_artifacts: bool,
 }
 
 impl AttemptFailure {
-    fn cleanup(error: iceberg::Error) -> Self {
+    fn cleanup(error: novarocks_connector_iceberg::iceberg::Error) -> Self {
         Self {
             error,
             cleanup_artifacts: true,
         }
     }
 
-    fn from_catalog_commit_error(error: iceberg::Error) -> Self {
+    fn from_catalog_commit_error(error: novarocks_connector_iceberg::iceberg::Error) -> Self {
         Self {
             cleanup_artifacts: should_cleanup_catalog_commit_error(&error),
             error,
@@ -620,7 +630,7 @@ impl AttemptFailure {
 #[derive(Debug)]
 struct RewriteArtifactCleanupError {
     path: String,
-    source: iceberg::Error,
+    source: novarocks_connector_iceberg::iceberg::Error,
 }
 
 impl RewriteArtifacts {
@@ -691,8 +701,10 @@ impl RewriteArtifacts {
     }
 }
 
-fn should_cleanup_catalog_commit_error(err: &iceberg::Error) -> bool {
-    if is_retryable_commit_conflict(err) || err.kind() != iceberg::ErrorKind::Unexpected {
+fn should_cleanup_catalog_commit_error(err: &novarocks_connector_iceberg::iceberg::Error) -> bool {
+    if is_retryable_commit_conflict(err)
+        || err.kind() != novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected
+    {
         return true;
     }
 
@@ -975,9 +987,9 @@ fn group_written_dvs_by_partition_spec(
 }
 
 fn partition_spec_by_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     spec_id: i32,
-) -> iceberg::Result<PartitionSpecRef> {
+) -> novarocks_connector_iceberg::iceberg::Result<PartitionSpecRef> {
     metadata
         .partition_spec_by_id(spec_id)
         .cloned()
@@ -1092,8 +1104,11 @@ fn parse_usize_option(key: &str, value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
@@ -1135,11 +1150,11 @@ mod tests {
 
     #[test]
     fn v2_position_delete_detection_rejects_parquet_delete_file() {
-        let file = iceberg::spec::DataFileBuilder::default()
-            .content(iceberg::spec::DataContentType::PositionDeletes)
+        let file = novarocks_connector_iceberg::iceberg::spec::DataFileBuilder::default()
+            .content(novarocks_connector_iceberg::iceberg::spec::DataContentType::PositionDeletes)
             .file_path("file:///tmp/delete.parquet".to_string())
-            .file_format(iceberg::spec::DataFileFormat::Parquet)
-            .partition(iceberg::spec::Struct::empty())
+            .file_format(novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet)
+            .partition(novarocks_connector_iceberg::iceberg::spec::Struct::empty())
             .record_count(1)
             .file_size_in_bytes(64)
             .build()
@@ -1153,7 +1168,11 @@ mod tests {
         let referenced = "file:///tmp/data.parquet";
         let groups = BTreeMap::from([(
             referenced.to_string(),
-            test_candidate_group(referenced, 0, iceberg::spec::Struct::empty()),
+            test_candidate_group(
+                referenced,
+                0,
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+            ),
         )]);
 
         let err = validate_candidate_groups_against_live_data(&groups, &HashMap::new())
@@ -1168,11 +1187,19 @@ mod tests {
         let referenced = "file:///tmp/data.parquet";
         let groups = BTreeMap::from([(
             referenced.to_string(),
-            test_candidate_group(referenced, 0, iceberg::spec::Struct::empty()),
+            test_candidate_group(
+                referenced,
+                0,
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+            ),
         )]);
         let live = HashMap::from([(
             referenced.to_string(),
-            test_live_data_entry(referenced, 7, iceberg::spec::Struct::empty()),
+            test_live_data_entry(
+                referenced,
+                7,
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+            ),
         )]);
 
         let err = validate_candidate_groups_against_live_data(&groups, &live)
@@ -1210,7 +1237,7 @@ mod tests {
             DataContentType::PositionDeletes,
             DataFileFormat::Puffin,
             0,
-            iceberg::spec::Struct::empty(),
+            novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             10,
             Some(20),
         );
@@ -1225,7 +1252,7 @@ mod tests {
                     DataContentType::PositionDeletes,
                     DataFileFormat::Puffin,
                     0,
-                    iceberg::spec::Struct::empty(),
+                    novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                     11,
                     Some(21),
                 ),
@@ -1244,7 +1271,7 @@ mod tests {
                     DataContentType::PositionDeletes,
                     DataFileFormat::Puffin,
                     1,
-                    iceberg::spec::Struct::empty(),
+                    novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                     10,
                     Some(22),
                 ),
@@ -1296,7 +1323,7 @@ mod tests {
                 DataContentType::PositionDeletes,
                 DataFileFormat::Puffin,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 31,
                 Some(41),
             ),
@@ -1306,7 +1333,7 @@ mod tests {
                 DataContentType::PositionDeletes,
                 DataFileFormat::Puffin,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 31,
                 Some(42),
             ),
@@ -1316,7 +1343,7 @@ mod tests {
                 DataContentType::PositionDeletes,
                 DataFileFormat::Puffin,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 51,
                 Some(61),
             ),
@@ -1326,7 +1353,7 @@ mod tests {
                 DataContentType::EqualityDeletes,
                 DataFileFormat::Parquet,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 71,
                 Some(81),
             ),
@@ -1337,18 +1364,26 @@ mod tests {
             DataContentType::PositionDeletes,
             DataFileFormat::Puffin,
             0,
-            iceberg::spec::Struct::empty(),
+            novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
             91,
             Some(101),
         )];
         let live_data = HashMap::from([
             (
                 data_a.to_string(),
-                test_live_data_entry(data_a, 0, iceberg::spec::Struct::empty()),
+                test_live_data_entry(
+                    data_a,
+                    0,
+                    novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+                ),
             ),
             (
                 data_b.to_string(),
-                test_live_data_entry(data_b, 0, iceberg::spec::Struct::empty()),
+                test_live_data_entry(
+                    data_b,
+                    0,
+                    novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+                ),
             ),
         ]);
 
@@ -1412,13 +1447,23 @@ mod tests {
         let mut live_data = HashMap::new();
         record_live_data_file(
             &mut live_data,
-            test_live_data_entry(data, 0, iceberg::spec::Struct::empty()).data_file,
+            test_live_data_entry(
+                data,
+                0,
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+            )
+            .data_file,
             0,
         )
         .unwrap();
         let err = record_live_data_file(
             &mut live_data,
-            test_live_data_entry(data, 0, iceberg::spec::Struct::empty()).data_file,
+            test_live_data_entry(
+                data,
+                0,
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
+            )
+            .data_file,
             0,
         )
         .unwrap_err();
@@ -1497,7 +1542,7 @@ mod tests {
                     vec![test_live_delete_entry_from_written_dv(
                         &written_a,
                         0,
-                        iceberg::spec::Struct::empty(),
+                        novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                         11,
                         Some(21),
                     )],
@@ -1511,7 +1556,7 @@ mod tests {
                     vec![test_live_delete_entry_from_written_dv(
                         &written_b,
                         0,
-                        iceberg::spec::Struct::empty(),
+                        novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                         12,
                         Some(22),
                     )],
@@ -1600,14 +1645,14 @@ mod tests {
             test_live_delete_entry_from_written_dv(
                 &written_a,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 11,
                 Some(21),
             ),
             test_live_delete_entry_from_written_dv(
                 &written_b,
                 0,
-                iceberg::spec::Struct::empty(),
+                novarocks_connector_iceberg::iceberg::spec::Struct::empty(),
                 12,
                 Some(22),
             ),
@@ -1618,22 +1663,28 @@ mod tests {
 
     #[test]
     fn catalog_commit_error_cleanup_policy_preserves_only_unknown_results() {
-        let conflict = iceberg::Error::new(
-            iceberg::ErrorKind::PreconditionFailed,
+        let conflict = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
             "Requirement failed: AssertRefSnapshotIdMatch",
         );
         assert!(should_cleanup_catalog_commit_error(&conflict));
 
-        let invalid = iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "bad metadata");
+        let invalid = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+            "bad metadata",
+        );
         assert!(should_cleanup_catalog_commit_error(&invalid));
 
-        let wrapped_conflict = iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
+        let wrapped_conflict = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
             "catalog commit conflict on AssertRefSnapshotIdMatch",
         );
         assert!(should_cleanup_catalog_commit_error(&wrapped_conflict));
 
-        let unknown = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection reset");
+        let unknown = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+            "connection reset",
+        );
         assert!(!should_cleanup_catalog_commit_error(&unknown));
     }
 
@@ -1668,7 +1719,7 @@ mod tests {
     fn test_candidate_group(
         referenced_data_file: &str,
         partition_spec_id: i32,
-        partition: iceberg::spec::Struct,
+        partition: novarocks_connector_iceberg::iceberg::spec::Struct,
     ) -> CandidateGroup {
         CandidateGroup::new(
             referenced_data_file.to_string(),
@@ -1684,7 +1735,7 @@ mod tests {
     fn test_live_delete_entry(
         referenced_data_file: &str,
         partition_spec_id: i32,
-        partition: iceberg::spec::Struct,
+        partition: novarocks_connector_iceberg::iceberg::spec::Struct,
     ) -> LiveDeleteEntry {
         test_live_delete_entry_with(
             &format!("file:///tmp/delete-{partition_spec_id}.puffin"),
@@ -1704,11 +1755,11 @@ mod tests {
         content: DataContentType,
         format: DataFileFormat,
         partition_spec_id: i32,
-        partition: iceberg::spec::Struct,
+        partition: novarocks_connector_iceberg::iceberg::spec::Struct,
         sequence_number: i64,
         file_sequence_number: Option<i64>,
     ) -> LiveDeleteEntry {
-        let data_file = iceberg::spec::DataFileBuilder::default()
+        let data_file = novarocks_connector_iceberg::iceberg::spec::DataFileBuilder::default()
             .content(content)
             .file_path(delete_file_path.to_string())
             .file_format(format)
@@ -1745,11 +1796,11 @@ mod tests {
     fn test_live_delete_entry_from_written_dv(
         written: &WrittenPuffinDv,
         partition_spec_id: i32,
-        partition: iceberg::spec::Struct,
+        partition: novarocks_connector_iceberg::iceberg::spec::Struct,
         sequence_number: i64,
         file_sequence_number: Option<i64>,
     ) -> LiveDeleteEntry {
-        let data_file = iceberg::spec::DataFileBuilder::default()
+        let data_file = novarocks_connector_iceberg::iceberg::spec::DataFileBuilder::default()
             .content(DataContentType::PositionDeletes)
             .file_path(written.path.clone())
             .file_format(DataFileFormat::Puffin)
@@ -1776,12 +1827,12 @@ mod tests {
     fn test_live_data_entry(
         path: &str,
         partition_spec_id: i32,
-        partition: iceberg::spec::Struct,
+        partition: novarocks_connector_iceberg::iceberg::spec::Struct,
     ) -> LiveDataEntry {
-        let data_file = iceberg::spec::DataFileBuilder::default()
-            .content(iceberg::spec::DataContentType::Data)
+        let data_file = novarocks_connector_iceberg::iceberg::spec::DataFileBuilder::default()
+            .content(novarocks_connector_iceberg::iceberg::spec::DataContentType::Data)
             .file_path(path.to_string())
-            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .file_format(novarocks_connector_iceberg::iceberg::spec::DataFileFormat::Parquet)
             .partition(partition)
             .partition_spec_id(partition_spec_id)
             .record_count(1)
@@ -1794,8 +1845,10 @@ mod tests {
         }
     }
 
-    fn test_partition(value: i32) -> iceberg::spec::Struct {
-        iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(value))])
+    fn test_partition(value: i32) -> novarocks_connector_iceberg::iceberg::spec::Struct {
+        novarocks_connector_iceberg::iceberg::spec::Struct::from_iter([Some(
+            novarocks_connector_iceberg::iceberg::spec::Literal::int(value),
+        )])
     }
 
     fn fake_manifest(path: &str, spec_id: i32, content: ManifestContentType) -> ManifestFile {

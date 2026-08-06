@@ -35,7 +35,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use base64::Engine;
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::data_type::AsBytes;
@@ -62,7 +62,9 @@ pub(crate) fn build_position_delete_data_file_partition_index(
     table_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
 ) -> Result<HashMap<String, PositionDeleteDataFilePartition>, String> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, ManifestContentType, ManifestStatus,
+    };
 
     let Some(snapshot_id) = target_snapshot_id.or_else(|| metadata.current_snapshot_id()) else {
         return Ok(HashMap::new());
@@ -149,7 +151,7 @@ impl IcebergSinkPlan {
         let writer_schema = Arc::new(iceberg_schema_from_arrow_schema(&self.target_schema)?);
         let metadata = self.build_target_table_metadata(writer_schema.as_ref())?;
         let annotated_schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(&writer_schema)
+            novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(&writer_schema)
                 .map_err(|e| format!("convert staged iceberg schema to arrow failed: {e}"))?,
         );
         let file_io = build_staged_file_io(&self.data_location, self.object_store_s3.as_ref())?;
@@ -165,8 +167,8 @@ impl IcebergSinkPlan {
 
     fn build_target_table_metadata(
         &self,
-        writer_schema: &iceberg::spec::Schema,
-    ) -> Result<iceberg::spec::TableMetadata, String> {
+        writer_schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+    ) -> Result<novarocks_connector_iceberg::iceberg::spec::TableMetadata, String> {
         let partition_spec = build_staged_partition_spec(
             writer_schema,
             self.target_partition_spec_id,
@@ -180,12 +182,12 @@ impl IcebergSinkPlan {
             .map(|metadata| metadata.properties().clone())
             .unwrap_or_default();
         properties.insert("write.data.path".to_string(), self.data_location.clone());
-        iceberg::spec::TableMetadataBuilder::new(
+        novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             writer_schema.clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::unpartition_spec(),
+            novarocks_connector_iceberg::iceberg::spec::SortOrder::unsorted_order(),
             self.table_location.clone(),
-            iceberg::spec::FormatVersion::V2,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V2,
             properties,
         )
         .map_err(|e| format!("build staged iceberg table metadata failed: {e}"))?
@@ -206,17 +208,17 @@ impl IcebergSinkPlan {
 }
 
 fn delete_target_snapshot_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_snapshot_id: Option<i64>,
 ) -> Option<i64> {
     target_snapshot_id.or_else(|| metadata.current_snapshot_id())
 }
 
 fn retag_default_partition_spec_id(
-    metadata: iceberg::spec::TableMetadata,
+    metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_spec_id: i32,
     partition_column_names: &[String],
-) -> Result<iceberg::spec::TableMetadata, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::TableMetadata, String> {
     // iceberg-rust may assign a fresh spec id when adding a partition spec to
     // synthetic metadata. Writer reports must carry the target table's real
     // spec id so the commit collector can decode descriptors against target
@@ -254,8 +256,9 @@ fn retag_default_partition_spec_id(
     );
     *specs = vec![desired_spec];
 
-    let metadata = serde_json::from_value::<iceberg::spec::TableMetadata>(value)
-        .map_err(|e| format!("deserialize staged iceberg table metadata failed: {e}"))?;
+    let metadata =
+        serde_json::from_value::<novarocks_connector_iceberg::iceberg::spec::TableMetadata>(value)
+            .map_err(|e| format!("deserialize staged iceberg table metadata failed: {e}"))?;
     let spec = metadata.partition_spec_by_id(target_spec_id).ok_or_else(|| {
         format!(
             "staged iceberg table metadata failed to retag default partition spec id to {target_spec_id}"
@@ -298,7 +301,7 @@ fn partition_spec_names_match(spec: &serde_json::Value, partition_column_names: 
 }
 
 fn partition_spec_ref_names_match(
-    spec: &iceberg::spec::PartitionSpecRef,
+    spec: &novarocks_connector_iceberg::iceberg::spec::PartitionSpecRef,
     partition_column_names: &[String],
 ) -> bool {
     spec.fields().len() == partition_column_names.len()
@@ -406,7 +409,7 @@ struct PartitionKey {
 struct PartitionGroup {
     indices: Vec<u32>,
     partition_spec_id: i32,
-    partition_values: iceberg::spec::Struct,
+    partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
 }
 
 pub(crate) struct ParquetWriteResult {
@@ -512,13 +515,15 @@ fn data_type_contains_largeint(data_type: &DataType) -> bool {
     }
 }
 
-fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
+fn iceberg_schema_from_arrow_schema(
+    schema: &Schema,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Schema, String> {
     let fields = schema
         .fields()
         .iter()
         .map(|field| iceberg_nested_field_from_arrow_field(field.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    iceberg::spec::Schema::builder()
+    novarocks_connector_iceberg::iceberg::spec::Schema::builder()
         .with_schema_id(1)
         .with_fields(fields)
         .build()
@@ -527,15 +532,17 @@ fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Sc
 
 fn iceberg_nested_field_from_arrow_field(
     field: &Field,
-) -> Result<iceberg::spec::NestedFieldRef, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef, String> {
     let field_id = arrow_field_id(field)?;
     let field_type = iceberg_type_from_arrow_type(field.data_type())?;
-    Ok(Arc::new(iceberg::spec::NestedField::new(
-        field_id,
-        field.name(),
-        field_type,
-        !field.is_nullable(),
-    )))
+    Ok(Arc::new(
+        novarocks_connector_iceberg::iceberg::spec::NestedField::new(
+            field_id,
+            field.name(),
+            field_type,
+            !field.is_nullable(),
+        ),
+    ))
 }
 
 fn arrow_field_id(field: &Field) -> Result<i32, String> {
@@ -586,9 +593,13 @@ fn row_lineage_row_id_index(schema: &Schema) -> Result<usize, String> {
     Err("iceberg row-lineage sink missing reserved _row_id field".to_string())
 }
 
-fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::Type, String> {
+fn iceberg_type_from_arrow_type(
+    data_type: &DataType,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Type, String> {
     use arrow::datatypes::TimeUnit;
-    use iceberg::spec::{ListType, MapType, PrimitiveType, StructType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        ListType, MapType, PrimitiveType, StructType, Type,
+    };
 
     let primitive = match data_type {
         DataType::Boolean => Some(PrimitiveType::Boolean),
@@ -657,12 +668,12 @@ fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::T
 }
 
 fn build_staged_partition_spec(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     partition_spec_id: i32,
     source_column_names: &[String],
     partition_column_names: &[String],
     transform_exprs: &[String],
-) -> Result<iceberg::spec::UnboundPartitionSpec, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::UnboundPartitionSpec, String> {
     if source_column_names.len() != partition_column_names.len()
         || source_column_names.len() != transform_exprs.len()
     {
@@ -674,8 +685,8 @@ fn build_staged_partition_spec(
         ));
     }
 
-    let mut builder =
-        iceberg::spec::UnboundPartitionSpec::builder().with_spec_id(partition_spec_id);
+    let mut builder = novarocks_connector_iceberg::iceberg::spec::UnboundPartitionSpec::builder()
+        .with_spec_id(partition_spec_id);
     for ((source_name, partition_name), transform_expr) in source_column_names
         .iter()
         .zip(partition_column_names.iter())
@@ -697,21 +708,23 @@ fn build_staged_partition_spec(
     Ok(builder.build())
 }
 
-fn parse_staged_partition_transform(raw: &str) -> Result<iceberg::spec::Transform, String> {
+fn parse_staged_partition_transform(
+    raw: &str,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Transform, String> {
     let normalized = raw.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "identity" => Ok(iceberg::spec::Transform::Identity),
-        "year" => Ok(iceberg::spec::Transform::Year),
-        "month" => Ok(iceberg::spec::Transform::Month),
-        "day" => Ok(iceberg::spec::Transform::Day),
-        "hour" => Ok(iceberg::spec::Transform::Hour),
-        "void" => Ok(iceberg::spec::Transform::Void),
+        "identity" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Identity),
+        "year" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Year),
+        "month" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Month),
+        "day" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Day),
+        "hour" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Hour),
+        "void" => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Void),
         _ => {
             if let Some(width) = parse_transform_arg(&normalized, "bucket")? {
-                return Ok(iceberg::spec::Transform::Bucket(width));
+                return Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(width));
             }
             if let Some(width) = parse_transform_arg(&normalized, "truncate")? {
-                return Ok(iceberg::spec::Transform::Truncate(width));
+                return Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(width));
             }
             Err(format!(
                 "unsupported iceberg partition transform for staged sink writer: {raw}"
@@ -743,7 +756,7 @@ fn parse_transform_arg(raw: &str, name: &str) -> Result<Option<u32>, String> {
 pub(crate) fn build_staged_file_io(
     data_location: &str,
     s3_config: Option<&IcebergSinkObjectStoreConfig>,
-) -> Result<iceberg::io::FileIO, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO, String> {
     if novarocks_fs::is_object_store_location_parse_only(data_location)
         .map_err(|e| format!("parse staged iceberg data_location {data_location}: {e}"))?
     {
@@ -1265,7 +1278,14 @@ fn iceberg_partition_key_for_row(
     transform_exprs: &[String],
     partition_arrays: &[ArrayRef],
     row: usize,
-) -> Result<(String, String, iceberg::spec::Struct), String> {
+) -> Result<
+    (
+        String,
+        String,
+        novarocks_connector_iceberg::iceberg::spec::Struct,
+    ),
+    String,
+> {
     if partition_column_names.len() != transform_exprs.len()
         || partition_arrays.len() != partition_column_names.len()
     {
@@ -1294,7 +1314,7 @@ fn iceberg_partition_key_for_row(
     Ok((
         path,
         nulls,
-        iceberg::spec::Struct::from_iter(partition_values),
+        novarocks_connector_iceberg::iceberg::spec::Struct::from_iter(partition_values),
     ))
 }
 
@@ -1302,19 +1322,23 @@ fn iceberg_partition_literal(
     transform: &str,
     array: &ArrayRef,
     row: usize,
-) -> Result<iceberg::spec::Literal, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Literal, String> {
     match transform {
         "year" | "month" | "hour" | "bucket" => {
             let value = array_value_as_i64(array, row)?;
             let value = i32::try_from(value)
                 .map_err(|_| format!("{transform} transform value out of INT range"))?;
-            Ok(iceberg::spec::Literal::int(value))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::int(
+                value,
+            ))
         }
         "day" => {
             let value = array_value_as_i64(array, row)?;
             let days =
                 i32::try_from(value).map_err(|_| "day transform value out of range".to_string())?;
-            Ok(iceberg::spec::Literal::date(days))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::date(
+                days,
+            ))
         }
         "truncate" | "identity" => column_literal(array, row),
         other => Err(format!("unsupported iceberg partition transform: {other}")),
@@ -1473,107 +1497,134 @@ fn column_value(array: &ArrayRef, row: usize) -> Result<String, String> {
     }
 }
 
-fn column_literal(array: &ArrayRef, row: usize) -> Result<iceberg::spec::Literal, String> {
+fn column_literal(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Literal, String> {
     match array.data_type() {
         DataType::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .ok_or_else(|| "expected BOOLEAN array".to_string())?;
-            Ok(iceberg::spec::Literal::bool(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::bool(
+                arr.value(row),
+            ))
         }
         DataType::Int8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
                 .ok_or_else(|| "expected TINYINT array".to_string())?;
-            Ok(iceberg::spec::Literal::int(i32::from(arr.value(row))))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::int(
+                i32::from(arr.value(row)),
+            ))
         }
         DataType::Int16 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
                 .ok_or_else(|| "expected SMALLINT array".to_string())?;
-            Ok(iceberg::spec::Literal::int(i32::from(arr.value(row))))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::int(
+                i32::from(arr.value(row)),
+            ))
         }
         DataType::Int32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| "expected INT array".to_string())?;
-            Ok(iceberg::spec::Literal::int(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::int(
+                arr.value(row),
+            ))
         }
         DataType::Int64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "expected BIGINT array".to_string())?;
-            Ok(iceberg::spec::Literal::long(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::long(
+                arr.value(row),
+            ))
         }
         DataType::Float32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
                 .ok_or_else(|| "expected FLOAT array".to_string())?;
-            Ok(iceberg::spec::Literal::float(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::float(
+                arr.value(row),
+            ))
         }
         DataType::Float64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
                 .ok_or_else(|| "expected DOUBLE array".to_string())?;
-            Ok(iceberg::spec::Literal::double(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::double(
+                arr.value(row),
+            ))
         }
         DataType::Date32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Date32Array>()
                 .ok_or_else(|| "expected DATE array".to_string())?;
-            Ok(iceberg::spec::Literal::date(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::date(
+                arr.value(row),
+            ))
         }
         DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Time64MicrosecondArray>()
                 .ok_or_else(|| "expected TIME array".to_string())?;
-            Ok(iceberg::spec::Literal::time(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::time(
+                arr.value(row),
+            ))
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| "expected DATETIME array".to_string())?;
-            Ok(iceberg::spec::Literal::timestamp(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::timestamp(arr.value(row)))
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(_)) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| "expected TIMESTAMP array".to_string())?;
-            Ok(iceberg::spec::Literal::timestamptz(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::timestamptz(arr.value(row)))
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .ok_or_else(|| "expected TIMESTAMP_NS array".to_string())?;
-            Ok(iceberg::spec::Literal::Primitive(
-                iceberg::spec::PrimitiveLiteral::Long(arr.value(row)),
-            ))
+            Ok(
+                novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Long(
+                        arr.value(row),
+                    ),
+                ),
+            )
         }
         DataType::Utf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| "expected VARCHAR array".to_string())?;
-            Ok(iceberg::spec::Literal::string(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::string(
+                arr.value(row),
+            ))
         }
         DataType::Binary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| "expected BINARY array".to_string())?;
-            Ok(iceberg::spec::Literal::binary(
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::binary(
                 arr.value(row).iter().copied(),
             ))
         }
@@ -1582,7 +1633,7 @@ fn column_literal(array: &ArrayRef, row: usize) -> Result<iceberg::spec::Literal
                 .as_any()
                 .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
                 .ok_or_else(|| "expected FIXED array".to_string())?;
-            Ok(iceberg::spec::Literal::fixed(
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::fixed(
                 arr.value(row).iter().copied(),
             ))
         }
@@ -1591,7 +1642,7 @@ fn column_literal(array: &ArrayRef, row: usize) -> Result<iceberg::spec::Literal
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| "expected DECIMAL array".to_string())?;
-            Ok(iceberg::spec::Literal::decimal(arr.value(row)))
+            Ok(novarocks_connector_iceberg::iceberg::spec::Literal::decimal(arr.value(row)))
         }
         other => Err(format!(
             "unsupported iceberg partition column type: {other:?}"

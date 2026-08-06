@@ -23,9 +23,53 @@ use anyhow::Context;
 use novarocks::common::app_config::NovaRocksConfig;
 use novarocks::query_execution::backend::BackendTopologyPort;
 use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
+use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
 use novarocks_frontend::FrontendServerConfig;
+use novarocks_spi::connector::ConnectorExecutionInstaller;
 
 const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+pub fn compose_backend_execution_installers(
+    config: &NovaRocksConfig,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
+    let iceberg_installers = novarocks::connector::compose_backend_connector_execution_installers(
+        config.connector.object_store_config().map_err(|error| {
+            anyhow::anyhow!("resolve connector startup object-store binding: {error}")
+        })?,
+    )
+    .map_err(|error| anyhow::anyhow!("compose Iceberg execution installers: {error}"))?;
+    let expected = novarocks_spi::connector::ConnectorProviderId::parse(
+        novarocks_connector_iceberg::PROVIDER_ID,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid composed provider ID: {error}"))?;
+    let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
+        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new(
+            StarRocksExecutionBindings::new(),
+        ))];
+    for installer in &iceberg_installers {
+        if installer.provider_id() != &expected {
+            anyhow::bail!(
+                "composed connector execution installer has provider `{}`; expected `{}`",
+                installer.provider_id().as_str(),
+                expected.as_str()
+            );
+        }
+    }
+    installers.extend(iceberg_installers);
+    Ok(installers)
+}
+
+pub fn state_store_host_config(
+    config: &NovaRocksConfig,
+) -> Option<novarocks_state_store::StateStoreHostConfig> {
+    config
+        .state_store
+        .clone()
+        .map(|state_store| novarocks_state_store::StateStoreHostConfig {
+            state_store,
+            foundationdb_client: config.foundationdb_client.clone(),
+        })
+}
 
 pub fn run_all_in_one(
     config: NovaRocksConfig,
@@ -63,13 +107,17 @@ where
         config: config.clone(),
         config_path: config_path.clone(),
         port_override,
+        connector_control_factories: Vec::new(),
+        state_store_host_config: state_store_host_config(&config),
     };
     let frontend = novarocks_frontend::open_frontend_application_for_server(&frontend_config)
         .await
         .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
+    let execution_installers = compose_backend_execution_installers(&config)?;
     let mut backend = match BackendApplicationHost::open_with_terminal_ingress(
         BackendServerConfig {
             config: config.clone(),
+            execution_installers,
         },
         Some(frontend.terminal_ingress()),
     ) {

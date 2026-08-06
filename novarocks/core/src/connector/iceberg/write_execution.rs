@@ -462,7 +462,7 @@ impl ConnectorBatchWriter for IcebergDataBatchWriter {
 
 struct IcebergEqualityDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     staging_dir: String,
     partition_spec_id: i32,
     columns: Vec<super::commit::EqualityDeleteColumn>,
@@ -489,7 +489,7 @@ struct IcebergPositionDeleteStagedFileOwned {
 
 struct IcebergPositionDeleteBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     object_store_s3: Option<IcebergSinkObjectStoreConfig>,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
@@ -731,7 +731,7 @@ impl ConnectorBatchWriter for IcebergPositionDeleteBatchWriter {
 /// delete file is opened on the BE.
 struct IcebergDeletionVectorBatchWriter {
     writer: novarocks_spi::connector::ConnectorWriterIdentity,
-    file_io: iceberg::io::FileIO,
+    file_io: novarocks_connector_iceberg::iceberg::io::FileIO,
     handle: IcebergPositionDeleteHandle,
     request: ConnectorOpenWriterRequest,
     pending: BTreeMap<String, DeletionVector>,

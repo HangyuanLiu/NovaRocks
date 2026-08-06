@@ -38,9 +38,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use iceberg::io::FileIO;
-use iceberg::spec::TableMetadata;
-use iceberg::{Catalog, TableIdent};
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 
 use super::snapshot_lifecycle_helpers::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
@@ -335,7 +335,7 @@ async fn list_files_opendal(
 
         let entries = match op.list(&prefix).await {
             Ok(e) => e,
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+            Err(e) if e.kind() == novarocks_connector_iceberg::opendal::ErrorKind::NotFound => {
                 // Directory does not exist — skip, not an error.
                 continue;
             }
@@ -354,7 +354,7 @@ async fn list_files_opendal(
                 .map_err(|e| format!("format scanned location {}: {e}", entry.path()))?;
 
             // last_modified from opendal metadata; None → conservatively skip.
-            // opendal::raw::Timestamp wraps jiff::Timestamp; use into_inner() +
+            // novarocks_connector_iceberg::opendal::raw::Timestamp wraps jiff::Timestamp; use into_inner() +
             // as_millisecond() to get epoch-ms.
             let last_modified_ms = entry
                 .metadata()
@@ -503,7 +503,7 @@ async fn build_dv_index_from_metadata(
     metadata: &TableMetadata,
     file_io: &FileIO,
     snapshot_ids: &HashSet<i64>,
-) -> Result<HashMap<String, HashSet<String>>, iceberg::Error> {
+) -> Result<HashMap<String, HashSet<String>>, novarocks_connector_iceberg::iceberg::Error> {
     let mut idx: HashMap<String, HashSet<String>> = HashMap::new();
     for sid in snapshot_ids {
         let Some(snapshot) = metadata.snapshot_by_id(*sid) else {
@@ -547,19 +547,19 @@ mod tests {
     async fn build_local_table_with_n_appends(
         n: usize,
     ) -> (
-        Arc<dyn iceberg::Catalog>,
-        iceberg::TableIdent,
+        Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>,
+        novarocks_connector_iceberg::iceberg::TableIdent,
         tempfile::TempDir,
     ) {
         use crate::connector::iceberg::commit::action::{CommitCtx, IcebergCommitAction};
         use crate::connector::iceberg::commit::collector::IcebergCommitCollector;
         use crate::connector::iceberg::commit::fast_append::FastAppendCommit;
         use crate::connector::iceberg::commit::types::{CommitOpKind, WrittenFile};
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
             Struct, Type,
         };
-        use iceberg::{NamespaceIdent, TableCreation};
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableCreation};
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let warehouse_path = tmpdir.path().to_str().expect("path").to_string();
@@ -568,7 +568,7 @@ mod tests {
 
         let file_io =
             crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
-        let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri.clone(),
@@ -588,7 +588,10 @@ mod tests {
             .build()
             .expect("build schema");
 
-        let table_ident = iceberg::TableIdent::new(namespace.clone(), "test_table".to_string());
+        let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+            namespace.clone(),
+            "test_table".to_string(),
+        );
         let table = catalog
             .create_table(
                 &namespace,
@@ -864,7 +867,7 @@ mod tests {
         crate::connector::iceberg::commit::statistics::commit_statistics_file(
             &table,
             catalog.as_ref(),
-            iceberg::spec::StatisticsFile {
+            novarocks_connector_iceberg::iceberg::spec::StatisticsFile {
                 snapshot_id,
                 statistics_path: stats_path.clone(),
                 file_size_in_bytes: 21,
@@ -926,8 +929,10 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_no_snapshot_table_succeeds() {
-        use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-        use iceberg::{NamespaceIdent, TableCreation};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema, Type,
+        };
+        use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableCreation};
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let warehouse_path = tmpdir.path().to_str().expect("path").to_string();
@@ -935,7 +940,7 @@ mod tests {
 
         let file_io =
             crate::connector::iceberg::fs_io::build_file_io_for_location(&warehouse_uri, None);
-        let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        let catalog: Arc<dyn novarocks_connector_iceberg::iceberg::Catalog> = Arc::new(
             crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
                 file_io,
                 warehouse_uri,
@@ -955,7 +960,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let table_ident = iceberg::TableIdent::new(namespace.clone(), "empty_table".to_string());
+        let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+            namespace.clone(),
+            "empty_table".to_string(),
+        );
         catalog
             .create_table(
                 &namespace,
@@ -1091,8 +1099,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_listing_finds_orphan_file() {
-        use opendal::Operator;
-        use opendal::services::Fs;
+        use novarocks_connector_iceberg::opendal::Operator;
+        use novarocks_connector_iceberg::opendal::services::Fs;
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let root = tmpdir.path().to_str().expect("utf8 path").to_string();

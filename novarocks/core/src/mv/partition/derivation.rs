@@ -63,7 +63,7 @@ pub(crate) enum AffectedPartitionError {
         want: String,
         got: String,
     },
-    /// `iceberg::transform::create_transform_function(...).transform(array)`
+    /// `novarocks_connector_iceberg::iceberg::transform::create_transform_function(...).transform(array)`
     /// itself returned an error.
     TransformFailed { field: String, source: String },
 }
@@ -103,16 +103,20 @@ impl std::error::Error for AffectedPartitionError {}
 pub(crate) fn contract_transform_to_iceberg(
     transform: &mv_schema::MvPartitionTransformContract,
     field: &str,
-) -> Result<iceberg::spec::Transform, AffectedPartitionError> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Transform, AffectedPartitionError> {
     use mv_schema::MvPartitionTransformContract as C;
     match transform {
-        C::Identity => Ok(iceberg::spec::Transform::Identity),
-        C::Year => Ok(iceberg::spec::Transform::Year),
-        C::Month => Ok(iceberg::spec::Transform::Month),
-        C::Day => Ok(iceberg::spec::Transform::Day),
-        C::Hour => Ok(iceberg::spec::Transform::Hour),
-        C::Bucket { num_buckets } => Ok(iceberg::spec::Transform::Bucket(*num_buckets)),
-        C::Truncate { width } => Ok(iceberg::spec::Transform::Truncate(*width)),
+        C::Identity => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Identity),
+        C::Year => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Year),
+        C::Month => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Month),
+        C::Day => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Day),
+        C::Hour => Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Hour),
+        C::Bucket { num_buckets } => {
+            Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(*num_buckets))
+        }
+        C::Truncate { width } => {
+            Ok(novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(*width))
+        }
         C::Void => Err(AffectedPartitionError::TransformUnsupported {
             field: field.to_string(),
             transform: "void".to_string(),
@@ -136,7 +140,7 @@ pub(crate) struct PartitionDerivationField {
     pub source_target_field_id: i32,
     /// Position in `contract.target.visible_columns` (== output column index).
     pub output_index: usize,
-    pub transform: iceberg::spec::Transform,
+    pub transform: novarocks_connector_iceberg::iceberg::spec::Transform,
 }
 
 /// Resolve the contract-level partition derivation spec.
@@ -210,7 +214,7 @@ pub(crate) fn resolve_partition_derivation_spec(
 pub(crate) struct BoundPartitionField {
     pub partition_field_name: String,
     pub column_name: String,
-    pub transform: iceberg::spec::Transform,
+    pub transform: novarocks_connector_iceberg::iceberg::spec::Transform,
 }
 
 /// Bind a resolved spec to an aggregate layout (steps 3-4 of the original
@@ -339,13 +343,13 @@ fn evaluate_partition_record_batch_into(
             }
         })?;
         let array = batch.column(col_index).clone();
-        let xform =
-            iceberg::transform::create_transform_function(&field.transform).map_err(|e| {
-                AffectedPartitionError::TransformFailed {
-                    field: field.partition_field_name.clone(),
-                    source: e.to_string(),
-                }
-            })?;
+        let xform = novarocks_connector_iceberg::iceberg::transform::create_transform_function(
+            &field.transform,
+        )
+        .map_err(|e| AffectedPartitionError::TransformFailed {
+            field: field.partition_field_name.clone(),
+            source: e.to_string(),
+        })?;
         let out = xform
             .transform(array)
             .map_err(|e| AffectedPartitionError::TransformFailed {
@@ -594,31 +598,31 @@ mod tests {
         for (input, expect) in [
             (
                 MvPartitionTransformContract::Identity,
-                iceberg::spec::Transform::Identity,
+                novarocks_connector_iceberg::iceberg::spec::Transform::Identity,
             ),
             (
                 MvPartitionTransformContract::Year,
-                iceberg::spec::Transform::Year,
+                novarocks_connector_iceberg::iceberg::spec::Transform::Year,
             ),
             (
                 MvPartitionTransformContract::Month,
-                iceberg::spec::Transform::Month,
+                novarocks_connector_iceberg::iceberg::spec::Transform::Month,
             ),
             (
                 MvPartitionTransformContract::Day,
-                iceberg::spec::Transform::Day,
+                novarocks_connector_iceberg::iceberg::spec::Transform::Day,
             ),
             (
                 MvPartitionTransformContract::Hour,
-                iceberg::spec::Transform::Hour,
+                novarocks_connector_iceberg::iceberg::spec::Transform::Hour,
             ),
             (
                 MvPartitionTransformContract::Bucket { num_buckets: 8 },
-                iceberg::spec::Transform::Bucket(8),
+                novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(8),
             ),
             (
                 MvPartitionTransformContract::Truncate { width: 16 },
-                iceberg::spec::Transform::Truncate(16),
+                novarocks_connector_iceberg::iceberg::spec::Transform::Truncate(16),
             ),
         ] {
             let result =
@@ -766,7 +770,10 @@ mod tests {
         assert_eq!(spec.fields[0].partition_field_name, "region");
         assert_eq!(spec.fields[0].source_target_field_id, 11);
         assert_eq!(spec.fields[0].output_index, 0);
-        assert_eq!(spec.fields[0].transform, iceberg::spec::Transform::Identity);
+        assert_eq!(
+            spec.fields[0].transform,
+            novarocks_connector_iceberg::iceberg::spec::Transform::Identity
+        );
     }
 
     #[test]
@@ -981,7 +988,7 @@ mod tests {
         // the client-side path's stringification must agree, so MvPartitionKey
         // values from base manifests and from delta chunks compare equal.
         use arrow::array::ArrayRef;
-        use iceberg::spec::PrimitiveLiteral;
+        use novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral;
 
         // (manifest literal, builder of a 1-row Arrow array carrying the same value)
         let cases: Vec<(PrimitiveLiteral, ArrayRef)> = vec![
@@ -1021,18 +1028,26 @@ mod tests {
         }
     }
 
-    fn manifest_primitive_to_string(lit: &iceberg::spec::PrimitiveLiteral) -> String {
+    fn manifest_primitive_to_string(
+        lit: &novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral,
+    ) -> String {
         // Helper that mirrors `change_partition_value` from changes.rs for the
         // primitive subset this property test exercises. If `change_partition_value`
         // ever changes its stringification rule, this helper must be updated and
         // the property test will catch the divergence in `arrow_array_row_to_partition_value`.
         match lit {
-            iceberg::spec::PrimitiveLiteral::Boolean(v) => v.to_string(),
-            iceberg::spec::PrimitiveLiteral::Int(v) => v.to_string(),
-            iceberg::spec::PrimitiveLiteral::Long(v) => v.to_string(),
-            iceberg::spec::PrimitiveLiteral::Float(v) => v.0.to_string(),
-            iceberg::spec::PrimitiveLiteral::Double(v) => v.0.to_string(),
-            iceberg::spec::PrimitiveLiteral::String(v) => v.clone(),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Boolean(v) => {
+                v.to_string()
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(v) => v.to_string(),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Long(v) => v.to_string(),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Float(v) => {
+                v.0.to_string()
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Double(v) => {
+                v.0.to_string()
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::String(v) => v.clone(),
             _ => unreachable!("only the primitives this test exercises are listed above"),
         }
     }
@@ -1234,9 +1249,10 @@ mod tests {
         // and assert the derivation produced exactly those.
         let arr: arrow::array::ArrayRef =
             StdArcFixture::new(StringArray::from(vec![Some("east"), Some("west")]));
-        let xform =
-            iceberg::transform::create_transform_function(&iceberg::spec::Transform::Bucket(8))
-                .expect("transform");
+        let xform = novarocks_connector_iceberg::iceberg::transform::create_transform_function(
+            &novarocks_connector_iceberg::iceberg::spec::Transform::Bucket(8),
+        )
+        .expect("transform");
         let out = xform.transform(arr).expect("apply");
         let expected: Vec<String> = (0..out.len())
             .map(|i| {

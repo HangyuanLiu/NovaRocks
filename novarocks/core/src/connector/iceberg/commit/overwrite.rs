@@ -40,15 +40,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestList,
     ManifestStatus, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -161,7 +163,10 @@ struct OverwriteTxnAction {
 
 #[async_trait]
 impl TransactionAction for OverwriteTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         let new_seq = m.last_sequence_number() + 1;
@@ -629,7 +634,7 @@ pub(super) async fn write_added_data_manifest(
 }
 
 pub(super) fn build_minimal_data_file(f: &WrittenFile) -> Result<DataFile, String> {
-    use iceberg::spec::DataFileBuilder;
+    use novarocks_connector_iceberg::iceberg::spec::DataFileBuilder;
     let mut builder = DataFileBuilder::default();
     builder
         .content(f.content)
@@ -713,8 +718,11 @@ fn overwrite_summary(
     p
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[allow(dead_code)]
@@ -731,12 +739,12 @@ mod enumerate_tests {
     //! TRUNCATE plan), where a real iceberg backend produces all four
     //! content types.
     use super::*;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
         TableMetadataBuilder, Type,
     };
-    use iceberg::table::Table;
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::table::Table;
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
     use std::collections::HashMap;
 
     fn build_empty_table() -> Table {
@@ -774,7 +782,9 @@ mod enumerate_tests {
     #[test]
     fn overwrite_summary_includes_removed_files_size_and_finalizes_totals() {
         use super::super::helpers::finalize_snapshot_summary;
-        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Struct,
+        };
 
         let mut builder = DataFileBuilder::default();
         builder

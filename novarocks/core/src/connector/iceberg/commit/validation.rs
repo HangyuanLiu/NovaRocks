@@ -22,8 +22,8 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use iceberg::spec::FormatVersion;
-use iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::spec::FormatVersion;
+use novarocks_connector_iceberg::iceberg::table::Table;
 
 use super::types::{
     IcebergSqlDeleteStrategy, IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE,
@@ -67,7 +67,7 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
 // Wired in by later tasks (insert/overwrite/update/delete planning).
 #[allow(dead_code)]
 pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     for f in metadata.default_partition_spec().fields() {
@@ -95,7 +95,7 @@ pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> 
 // Wired in by later tasks (insert/overwrite/update/delete planning).
 #[allow(dead_code)]
 pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     for f in metadata.default_sort_order().fields.iter() {
@@ -335,21 +335,21 @@ pub fn match_select_schema_to_table(
 }
 
 /// Returns `true` when `arrow_ty` and `iceberg_ty` represent the same logical
-/// type. Delegates to `iceberg::arrow::type_to_arrow_type` so there is one
+/// type. Delegates to `novarocks_connector_iceberg::iceberg::arrow::type_to_arrow_type` so there is one
 /// canonical mapping. On conversion error (unknown / complex type), returns
 /// `false` (conservative reject).
 fn arrow_iceberg_types_compatible(
     arrow_ty: &arrow::datatypes::DataType,
-    iceberg_ty: &iceberg::spec::Type,
+    iceberg_ty: &novarocks_connector_iceberg::iceberg::spec::Type,
 ) -> bool {
-    use iceberg::spec::{PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
     if matches!(iceberg_ty, Type::Primitive(PrimitiveType::Variant)) {
         // NovaRocks execution layer carries variants as LargeBinary
         // (see src/lower/compat/type_lowering.rs:89,170). The full struct shape
         // is materialized later by transform_variant_columns_for_write.
         return matches!(arrow_ty, arrow::datatypes::DataType::LargeBinary);
     }
-    match iceberg::arrow::type_to_arrow_type(iceberg_ty) {
+    match novarocks_connector_iceberg::iceberg::arrow::type_to_arrow_type(iceberg_ty) {
         Ok(expected) => &expected == arrow_ty,
         Err(_) => false,
     }
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn default_sort_order_resolvable_ok_for_unsorted_table() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         let table = make_table_with(
             vec![NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into()],
             vec![],
@@ -490,20 +490,21 @@ mod tests {
     }
 
     fn make_table_with(
-        fields: Vec<iceberg::spec::NestedFieldRef>,
-        partition_fields: Vec<iceberg::spec::PartitionField>,
-        sort_fields: Vec<iceberg::spec::SortField>,
-    ) -> iceberg::table::Table {
+        fields: Vec<novarocks_connector_iceberg::iceberg::spec::NestedFieldRef>,
+        partition_fields: Vec<novarocks_connector_iceberg::iceberg::spec::PartitionField>,
+        sort_fields: Vec<novarocks_connector_iceberg::iceberg::spec::SortField>,
+    ) -> novarocks_connector_iceberg::iceberg::table::Table {
         use std::sync::Arc;
         let schema = Arc::new(
-            iceberg::spec::Schema::builder()
+            novarocks_connector_iceberg::iceberg::spec::Schema::builder()
                 .with_schema_id(1)
                 .with_fields(fields)
                 .build()
                 .expect("schema"),
         );
         let mut spec_builder =
-            iceberg::spec::PartitionSpec::builder(schema.clone()).with_spec_id(0);
+            novarocks_connector_iceberg::iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0);
         for f in partition_fields {
             // Resolve source field name from source_id; the vendored
             // `add_partition_field` API takes (source_name, target_name, transform).
@@ -517,25 +518,27 @@ mod tests {
                 .expect("add");
         }
         let partition_spec = spec_builder.build().expect("spec");
-        let mut order_builder = iceberg::spec::SortOrder::builder();
+        let mut order_builder = novarocks_connector_iceberg::iceberg::spec::SortOrder::builder();
         for f in sort_fields {
             order_builder = order_builder.with_sort_field(f).clone();
         }
         let sort_order = order_builder.build_unbound().expect("sort");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
+        let metadata = novarocks_connector_iceberg::iceberg::spec::TableMetadataBuilder::new(
             schema.as_ref().clone(),
             partition_spec,
             sort_order,
             "file:///tmp/x".to_string(),
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
             std::collections::HashMap::new(),
         )
         .expect("builder")
         .build()
         .expect("metadata")
         .metadata;
-        iceberg::table::Table::builder()
-            .identifier(iceberg::TableIdent::from_strs(["d", "t"]).unwrap())
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
+            .identifier(
+                novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["d", "t"]).unwrap(),
+            )
             .file_io(
                 crate::connector::iceberg::fs_io::build_file_io_for_location("file:///tmp/x", None),
             )
@@ -546,7 +549,9 @@ mod tests {
 
     #[test]
     fn ensure_no_variant_in_partition_spec_rejects_variant_partition_column() {
-        use iceberg::spec::{NestedField, PartitionField, PrimitiveType, Transform, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            NestedField, PartitionField, PrimitiveType, Transform, Type,
+        };
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -567,7 +572,7 @@ mod tests {
 
     #[test]
     fn ensure_no_variant_in_partition_spec_accepts_clean_table() {
-        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Type};
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -581,7 +586,7 @@ mod tests {
 
     #[test]
     fn ensure_no_variant_in_sort_order_rejects_variant_sort_column() {
-        use iceberg::spec::{
+        use novarocks_connector_iceberg::iceberg::spec::{
             NestedField, NullOrder, PrimitiveType, SortDirection, SortField, Transform, Type,
         };
         let table = make_table_with(
@@ -605,7 +610,7 @@ mod tests {
     #[test]
     fn variant_iceberg_type_matches_largebinary_arrow_type() {
         use arrow::datatypes::DataType;
-        use iceberg::spec::{PrimitiveType, Type};
+        use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, Type};
         let iceberg_ty = Type::Primitive(PrimitiveType::Variant);
         assert!(arrow_iceberg_types_compatible(
             &DataType::LargeBinary,

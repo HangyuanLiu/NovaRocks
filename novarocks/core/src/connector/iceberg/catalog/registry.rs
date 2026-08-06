@@ -30,13 +30,13 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataFile, FormatVersion, ListType, Literal as IcebergLiteral, MapType, NestedField,
     PrimitiveLiteral, PrimitiveType, Schema, StructType, TableMetadata, Transform, Type,
 };
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
+use novarocks_connector_iceberg::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
@@ -108,7 +108,7 @@ pub(crate) struct IcebergCatalogEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergLoadedTable {
-    pub table: iceberg::table::Table,
+    pub table: novarocks_connector_iceberg::iceberg::table::Table,
     pub columns: Vec<ColumnDef>,
     pub logical_types: HashMap<String, SqlType>,
     pub key_desc: Option<TableKeyDesc>,
@@ -460,7 +460,8 @@ pub(crate) fn drop_namespace(
         block_on_iceberg(async {
             match op.delete(&root_marker_key).await {
                 Ok(()) => {}
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+                Err(err)
+                    if err.kind() == novarocks_connector_iceberg::opendal::ErrorKind::NotFound => {}
                 Err(err) => {
                     return Err(format!(
                         "delete namespace root marker {root_marker_key}: {err}"
@@ -469,7 +470,11 @@ pub(crate) fn drop_namespace(
             }
             match op.delete(&marker_key).await {
                 Ok(()) => Ok(()),
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
+                Err(err)
+                    if err.kind() == novarocks_connector_iceberg::opendal::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
                 Err(err) => Err(format!("delete namespace marker {marker_key}: {err}")),
             }
         })?
@@ -535,7 +540,7 @@ fn s3_table_name_from_list_entry(ns_prefix: &str, entry_name: &str) -> Option<St
 }
 
 async fn s3_table_has_metadata(
-    op: &opendal::Operator,
+    op: &novarocks_connector_iceberg::opendal::Operator,
     ns_prefix: &str,
     table_name: &str,
 ) -> Result<bool, String> {
@@ -693,7 +698,7 @@ fn validate_create_table_variant_shredding_properties(
 
 fn purge_s3_table_prefix_before_create(
     entry: &IcebergCatalogEntry,
-    catalog: &dyn iceberg::Catalog,
+    catalog: &dyn novarocks_connector_iceberg::iceberg::Catalog,
     namespace: &NamespaceIdent,
     table_name: &str,
 ) -> Result<(), String> {
@@ -724,7 +729,7 @@ pub(crate) fn alter_partition_spec(
     table_name: &str,
     stmt: crate::sql::parser::ast::AlterIcebergPartitionSpecStmt,
 ) -> Result<(), String> {
-    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+    use novarocks_connector_iceberg::iceberg::{TableCommit, TableRequirement, TableUpdate};
 
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
@@ -781,7 +786,7 @@ pub(crate) fn replace_default_partition_spec(
     namespace_name: &str,
     table_name: &str,
     fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
-) -> Result<iceberg::table::Table, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
     replace_default_partition_spec_impl(entry, namespace_name, table_name, fields, None)
 }
 
@@ -791,7 +796,7 @@ pub(crate) fn replace_default_partition_spec_with_expected_default(
     table_name: &str,
     fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
     expected_default_spec_id: i32,
-) -> Result<iceberg::table::Table, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
     replace_default_partition_spec_impl(
         entry,
         namespace_name,
@@ -807,8 +812,8 @@ fn replace_default_partition_spec_impl(
     table_name: &str,
     fields: &[crate::sql::parser::ast::IcebergPartitionFieldExpr],
     expected_default_spec_id: Option<i32>,
-) -> Result<iceberg::table::Table, String> {
-    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
+    use novarocks_connector_iceberg::iceberg::{TableCommit, TableRequirement, TableUpdate};
 
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
@@ -860,8 +865,8 @@ pub(crate) fn set_default_partition_spec_id(
     table_name: &str,
     expected_default_spec_id: i32,
     default_spec_id: i32,
-) -> Result<iceberg::table::Table, String> {
-    use iceberg::{TableCommit, TableRequirement, TableUpdate};
+) -> Result<novarocks_connector_iceberg::iceberg::table::Table, String> {
+    use novarocks_connector_iceberg::iceberg::{TableCommit, TableRequirement, TableUpdate};
 
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
@@ -996,8 +1001,9 @@ pub(crate) fn load_table(
         let (metadata_file_name, metadata_bytes) =
             latest_table_metadata_file_s3(entry, &ns_name, &tbl_name)?;
 
-        let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
-            .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
+        let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+            serde_json::from_slice(&metadata_bytes)
+                .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
 
         let warehouse_trimmed = entry.warehouse_uri.trim_end_matches('/');
         let metadata_location =
@@ -1006,7 +1012,7 @@ pub(crate) fn load_table(
         let file_io =
             fs_io::build_file_io_for_location(&entry.warehouse_uri, entry.s3_config.as_ref());
 
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(file_io)
             .metadata(Arc::new(metadata))
             .identifier(
@@ -1025,12 +1031,13 @@ pub(crate) fn load_table(
             .unwrap_or(&metadata_location);
         let metadata_bytes =
             std::fs::read(metadata_path).map_err(|e| format!("read local metadata file: {e}"))?;
-        let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
-            .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
+        let metadata: novarocks_connector_iceberg::iceberg::spec::TableMetadata =
+            serde_json::from_slice(&metadata_bytes)
+                .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
 
         let file_io = fs_io::build_file_io_for_location(&entry.warehouse_uri, None);
 
-        iceberg::table::Table::builder()
+        novarocks_connector_iceberg::iceberg::table::Table::builder()
             .file_io(file_io)
             .metadata(Arc::new(metadata))
             .identifier(
@@ -1212,7 +1219,12 @@ pub(crate) fn insert_rows(
     block_on_iceberg(async {
         let data_files = write_record_batches_as_data_files(&loaded.table, [batch])
             .await
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+            .map_err(|e| {
+                novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                    e,
+                )
+            })?;
         if classify_iceberg_write_mode(&loaded.table) == IcebergWriteMode::RowLineageV3 {
             commit_v3_insert_rows_with_fast_append(
                 &loaded.table,
@@ -1221,7 +1233,12 @@ pub(crate) fn insert_rows(
                 data_files,
             )
             .await
-            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+            .map_err(|e| {
+                novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                    e,
+                )
+            })?;
             Ok(loaded.table.clone())
         } else {
             let tx = Transaction::new(&loaded.table);
@@ -1238,7 +1255,7 @@ pub(crate) fn insert_rows(
 }
 
 async fn commit_v3_insert_rows_with_fast_append(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
     data_files: Vec<DataFile>,
@@ -1335,7 +1352,7 @@ pub(crate) struct DataFileWithStats {
         Option<HashMap<String, crate::connector::iceberg::scan_model::IcebergColumnStats>>,
     pub partition_spec_id: Option<i32>,
     pub partition_key: Option<String>,
-    pub partition_values: Option<iceberg::spec::Struct>,
+    pub partition_values: Option<novarocks_connector_iceberg::iceberg::spec::Struct>,
     pub manifest_path: Option<String>,
     pub partition_field_values:
         Vec<crate::connector::iceberg::scan_model::IcebergPartitionFieldValue>,
@@ -1351,7 +1368,7 @@ pub(crate) struct DataFileWithStats {
 fn iceberg_partition_field_values(
     metadata: &TableMetadata,
     spec_id: i32,
-    partition: &iceberg::spec::Struct,
+    partition: &novarocks_connector_iceberg::iceberg::spec::Struct,
 ) -> Result<Vec<crate::connector::iceberg::scan_model::IcebergPartitionFieldValue>, String> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
         return Err(format!(
@@ -1447,9 +1464,11 @@ fn equality_delete_column_names_for_field_ids(
 }
 
 pub(crate) fn current_equality_delete_column_names(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<String>, String> {
-    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFileFormat, ManifestContentType, ManifestStatus,
+    };
 
     let metadata = table.metadata();
     let snapshot = match metadata.current_snapshot() {
@@ -1513,7 +1532,7 @@ pub(crate) fn current_equality_delete_column_names(
 /// manifest, and collects per-column stats (null counts, column sizes,
 /// lower/upper bounds) mapped to column names via the snapshot's own schema.
 pub(crate) fn extract_data_files_with_stats_at(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
     let metadata = table.metadata();
@@ -1562,7 +1581,7 @@ pub(crate) fn extract_data_files_with_stats_at(
 ///
 /// If no snapshot exists the result is an empty vec.
 pub(crate) fn extract_data_files_with_stats(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
     match table.metadata().current_snapshot() {
         Some(s) => extract_data_files_with_stats_at(table, s.snapshot_id()),
@@ -1920,9 +1939,9 @@ pub(crate) fn build_hadoop_catalog(
 #[allow(dead_code)] // Wired to engine flows in a follow-up; covered by mockito tests for now.
 pub(crate) async fn build_rest_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<iceberg_catalog_rest::RestCatalog, String> {
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_rest::{
+) -> Result<novarocks_connector_iceberg::iceberg_catalog_rest::RestCatalog, String> {
+    use novarocks_connector_iceberg::iceberg::CatalogBuilder;
+    use novarocks_connector_iceberg::iceberg_catalog_rest::{
         REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
     };
 
@@ -1970,9 +1989,9 @@ pub(crate) async fn build_rest_catalog(
 /// through [`build_iceberg_catalog`], which wraps this with `block_on_iceberg`.
 pub(crate) async fn build_hms_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<iceberg_catalog_hms::HmsCatalog, String> {
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_hms::{
+) -> Result<novarocks_connector_iceberg::iceberg_catalog_hms::HmsCatalog, String> {
+    use novarocks_connector_iceberg::iceberg::CatalogBuilder;
+    use novarocks_connector_iceberg::iceberg_catalog_hms::{
         HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
         HmsCatalogBuilder, THRIFT_TRANSPORT_BUFFERED, THRIFT_TRANSPORT_FRAMED,
     };
@@ -2027,7 +2046,7 @@ pub(crate) async fn build_hms_catalog(
 
 fn build_storage_factory_for_entry(
     entry: &IcebergCatalogEntry,
-) -> Result<Arc<dyn iceberg::io::StorageFactory>, String> {
+) -> Result<Arc<dyn novarocks_connector_iceberg::iceberg::io::StorageFactory>, String> {
     Ok(fs_io::build_storage_factory_for_location(
         &entry.warehouse_uri,
         entry.s3_config.as_ref(),
@@ -2044,19 +2063,19 @@ fn build_storage_factory_for_entry(
 #[allow(dead_code)] // Will replace explicit build_hadoop_catalog calls in a follow-up.
 pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<Arc<dyn iceberg::Catalog>, String> {
+) -> Result<Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>, String> {
     match entry.kind {
         IcebergCatalogKind::Hadoop => {
             let hadoop = build_hadoop_catalog(entry)?;
-            Ok(Arc::new(hadoop) as Arc<dyn iceberg::Catalog>)
+            Ok(Arc::new(hadoop) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
         }
         IcebergCatalogKind::Rest => {
             let rest = block_on_iceberg(async { build_rest_catalog(entry).await })??;
-            Ok(Arc::new(rest) as Arc<dyn iceberg::Catalog>)
+            Ok(Arc::new(rest) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
         }
         IcebergCatalogKind::Hive => {
             let hms = block_on_iceberg(async { build_hms_catalog(entry).await })??;
-            Ok(Arc::new(hms) as Arc<dyn iceberg::Catalog>)
+            Ok(Arc::new(hms) as Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>)
         }
     }
 }
@@ -2084,9 +2103,9 @@ pub(crate) fn table_exists_typed(
 /// under the opaque handle it issued.
 #[derive(Clone)]
 pub(crate) struct RestStagedTableCreate {
-    pub catalog: Arc<iceberg_catalog_rest::RestCatalog>,
-    pub table: iceberg::table::Table,
-    pub initialization_updates: Vec<iceberg::TableUpdate>,
+    pub catalog: Arc<novarocks_connector_iceberg::iceberg_catalog_rest::RestCatalog>,
+    pub table: novarocks_connector_iceberg::iceberg::table::Table,
+    pub initialization_updates: Vec<novarocks_connector_iceberg::iceberg::TableUpdate>,
 }
 
 #[derive(Debug)]
@@ -2172,17 +2191,17 @@ pub(crate) fn prepare_rest_staged_table(
                 ))
             })?
             .map_err(|error| match error {
-                iceberg_catalog_rest::StagedCreateError::Conflict(error) => {
+                novarocks_connector_iceberg::iceberg_catalog_rest::StagedCreateError::Conflict(error) => {
                     RestStagedPrepareFailure::Conflict(format!(
                         "prepare staged REST table: {error}"
                     ))
                 }
-                iceberg_catalog_rest::StagedCreateError::KnownNotDispatched(error) => {
+                novarocks_connector_iceberg::iceberg_catalog_rest::StagedCreateError::KnownNotDispatched(error) => {
                     RestStagedPrepareFailure::KnownUncommitted(format!(
                         "prepare staged REST table: {error}"
                     ))
                 }
-                iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(error) => {
+                novarocks_connector_iceberg::iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(error) => {
                     RestStagedPrepareFailure::CommitUnknown(format!(
                         "prepare staged REST table: {error}"
                     ))
@@ -2190,9 +2209,11 @@ pub(crate) fn prepare_rest_staged_table(
             })?;
     let (table, mut initialization_updates) = staged.into_parts();
     if !publication_properties.is_empty() {
-        initialization_updates.push(iceberg::TableUpdate::SetProperties {
-            updates: publication_properties,
-        });
+        initialization_updates.push(
+            novarocks_connector_iceberg::iceberg::TableUpdate::SetProperties {
+                updates: publication_properties,
+            },
+        );
     }
     Ok(RestStagedTableCreate {
         catalog,
@@ -3608,9 +3629,11 @@ mod s3_listing_tests {
 
     #[test]
     fn s3_table_metadata_probe_skips_non_table_prefixes() {
-        let op = opendal::Operator::new(opendal::services::Memory::default())
-            .expect("build memory object store")
-            .finish();
+        let op = novarocks_connector_iceberg::opendal::Operator::new(
+            novarocks_connector_iceberg::opendal::services::Memory::default(),
+        )
+        .expect("build memory object store")
+        .finish();
         block_on_iceberg(async {
             op.write(
                 "warehouse/root/analytics/orders/metadata/v1.metadata.json",
@@ -3820,7 +3843,9 @@ mod table_property_tests {
         let schema =
             build_iceberg_schema_for_test(&columns, FormatVersion::V3).expect("v3 + default ok");
         let field = schema.field_by_name("c").expect("c");
-        let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
+        let expected = novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(5),
+        );
         assert_eq!(field.initial_default.as_ref(), Some(&expected));
         assert_eq!(field.write_default.as_ref(), Some(&expected));
     }
@@ -3903,7 +3928,9 @@ mod build_literal_array_tests {
 
         assert_eq!(
             column_def_arrow_type_for_iceberg_field(
-                &iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Timestamptz),
+                &novarocks_connector_iceberg::iceberg::spec::Type::Primitive(
+                    novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Timestamptz
+                ),
                 &source,
                 None,
             ),
@@ -4103,15 +4130,15 @@ mod rest_catalog_tests {
     //! Mocked unit tests for the REST catalog wiring. These tests use
     //! `mockito` to stand up a fake REST endpoint locally so we can verify
     //! the property-parsing → `IcebergCatalogEntry` → `build_iceberg_catalog`
-    //! → `Arc<dyn iceberg::Catalog>` chain without depending on a Docker
+    //! → `Arc<dyn novarocks_connector_iceberg::iceberg::Catalog>` chain without depending on a Docker
     //! container or external service.
     //!
     //! The mock pattern mirrors `iceberg-catalog-rest`'s own internal tests
     //! (see its `src/catalog.rs` `mod tests` block).
     use std::sync::Arc;
 
-    use iceberg::{Catalog, NamespaceIdent};
     use mockito::Server;
+    use novarocks_connector_iceberg::iceberg::{Catalog, NamespaceIdent};
 
     use super::{
         IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_catalog_entry,

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks::query_execution::service::QueryExecutionService;
+use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_state_store::{
     StateStoreHost, StateStoreHostConfig, builtin_state_store_provider_registry,
@@ -57,6 +58,7 @@ pub enum FrontendApplicationErrorKind {
     TableMaintenanceServiceOpen,
     MvServiceOpen,
     StatisticsApplicationServiceOpen,
+    ConnectorControlHost,
     ClusterBackendOpen,
     CoordinatorOpen,
     Server,
@@ -166,8 +168,24 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
     ) -> Result<Self, FrontendApplicationError> {
+        Self::open_with_factories(config, execution, backend, Vec::new()).await
+    }
+
+    pub async fn open_with_factories(
+        config: Option<StateStoreHostConfig>,
+        execution: FrontendExecutionConfig,
+        backend: ClusterBackendOpenConfig,
+        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+    ) -> Result<Self, FrontendApplicationError> {
         let mut host = Self {
-            connector_control: Arc::new(ConnectorControlHost::new()),
+            connector_control: Arc::new(
+                ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::ConnectorControlHost,
+                        error,
+                    )
+                })?,
+            ),
             statistics_service: None,
             dml_service: None,
             statistics_application_service: None,
@@ -440,6 +458,13 @@ impl FrontendApplicationHost {
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
         Arc::clone(&self.connector_control)
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+    }
+
+    pub fn connector_control_factory_resolver(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver> {
+        Arc::clone(&self.connector_control)
+            as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>
     }
 
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {

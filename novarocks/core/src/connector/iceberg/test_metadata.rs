@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
     SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadata, TableMetadataBuilder,
     Type,

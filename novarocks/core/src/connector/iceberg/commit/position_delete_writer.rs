@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use iceberg::io::FileIO;
-use iceberg::spec::{DataContentType, DataFileFormat};
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{DataContentType, DataFileFormat};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -52,7 +52,7 @@ const FIELD_ID_POS: i32 = 2147483545;
 pub struct PositionDeleteGroup {
     pub referenced_data_file: String,
     pub partition_spec_id: i32,
-    pub partition_values: iceberg::spec::Struct,
+    pub partition_values: novarocks_connector_iceberg::iceberg::spec::Struct,
     /// Sorted in ascending `pos` order (the writer enforces this).
     pub positions: Vec<i64>,
 }

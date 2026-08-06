@@ -17,8 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::spec::{Snapshot, SnapshotReference};
-use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::spec::{Snapshot, SnapshotReference};
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
+};
 
 pub const MV_REFRESH_ID_PROP: &str = "novarocks.mv.refresh_id";
 pub const MV_ID_PROP: &str = "novarocks.mv.id";
@@ -145,9 +147,9 @@ fn build_publish_commit(ident: TableIdent, plan: &MvRefreshPublishPlan) -> Table
         .ident(ident)
         .updates(vec![TableUpdate::SetSnapshotRef {
             ref_name: "main".to_string(),
-            reference: iceberg::spec::SnapshotReference {
+            reference: novarocks_connector_iceberg::iceberg::spec::SnapshotReference {
                 snapshot_id: plan.staging_snapshot_id,
-                retention: iceberg::spec::SnapshotRetention::Branch {
+                retention: novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch {
                     min_snapshots_to_keep: None,
                     max_snapshot_age_ms: None,
                     max_ref_age_ms: None,
@@ -170,7 +172,7 @@ fn build_publish_commit(ident: TableIdent, plan: &MvRefreshPublishPlan) -> Table
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{Operation, SnapshotRetention, Summary};
+    use novarocks_connector_iceberg::iceberg::spec::{Operation, SnapshotRetention, Summary};
 
     #[test]
     fn marker_round_trips_through_snapshot_summary() {

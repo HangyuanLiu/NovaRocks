@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use iceberg::spec::DataFileFormat;
+use novarocks_connector_iceberg::iceberg::spec::DataFileFormat;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
     ConnectorReaderMetricsSnapshot,

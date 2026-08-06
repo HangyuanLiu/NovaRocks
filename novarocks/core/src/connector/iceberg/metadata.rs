@@ -34,7 +34,7 @@ use novarocks_spi::connector::{
     ConnectorSplit, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-use iceberg::spec::{SnapshotRetention, TableMetadata};
+use novarocks_connector_iceberg::iceberg::spec::{SnapshotRetention, TableMetadata};
 
 use crate::common::ids::SlotId;
 use crate::connector::runtime::ConnectorReadScanSource;

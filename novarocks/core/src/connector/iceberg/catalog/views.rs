@@ -22,11 +22,13 @@
 
 use std::collections::HashMap;
 
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::spec::{
     NestedField, Schema, SqlViewRepresentation, ViewMetadata, ViewRepresentation,
     ViewRepresentations, ViewVersion,
 };
-use iceberg::{Catalog, NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement};
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement,
+};
 
 use super::registry::{
     IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_iceberg_catalog,

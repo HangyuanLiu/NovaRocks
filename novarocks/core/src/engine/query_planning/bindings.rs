@@ -307,7 +307,9 @@ pub(crate) fn sql_ukfk_facts_from_admitted_table(table: &IcebergTableInfo) -> Sq
     let Some(serialized) = table.serialized_metadata.as_deref() else {
         return SqlUkFkTableFacts::default();
     };
-    let Ok(metadata) = serde_json::from_str::<iceberg::spec::TableMetadata>(serialized) else {
+    let Ok(metadata) = serde_json::from_str::<
+        novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    >(serialized) else {
         return SqlUkFkTableFacts::default();
     };
     let properties = metadata

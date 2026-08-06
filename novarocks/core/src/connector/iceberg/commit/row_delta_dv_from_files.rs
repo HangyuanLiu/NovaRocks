@@ -27,14 +27,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFileFormat, FormatVersion, ManifestFile, Operation, SchemaRef, Snapshot,
     SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -177,12 +179,15 @@ struct RowDeltaDvFromFilesTxnAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaDvFromFilesTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version != FormatVersion::V3 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "RowDeltaDvFromFilesCommit requires an Iceberg v3 table",
             ));
         }
@@ -728,7 +733,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
 
-    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Struct,
+    };
     use uuid::Uuid;
 
     use super::super::action::CommitCtx;
@@ -1034,7 +1041,10 @@ mod tests {
         let delete_manifests = manifest_list
             .entries()
             .iter()
-            .filter(|manifest| manifest.content == iceberg::spec::ManifestContentType::Deletes)
+            .filter(|manifest| {
+                manifest.content
+                    == novarocks_connector_iceberg::iceberg::spec::ManifestContentType::Deletes
+            })
             .collect::<Vec<_>>();
         assert_eq!(delete_manifests.len(), 1);
         let manifest = delete_manifests[0]

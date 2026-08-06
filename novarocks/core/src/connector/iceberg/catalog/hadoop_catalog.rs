@@ -29,10 +29,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{TableMetadata, TableMetadataBuilder};
-use iceberg::table::Table;
-use iceberg::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{TableMetadata, TableMetadataBuilder};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::{
     Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
     TableIdent,
 };

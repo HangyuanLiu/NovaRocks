@@ -25,12 +25,12 @@
 
 use std::collections::HashMap;
 
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Literal, ManifestContentType, ManifestStatus,
     PrimitiveLiteral, TableMetadata,
 };
-use iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::table::Table;
 use serde_json::{Value, json};
 
 use crate::connector::iceberg::IcebergMetadataTableType;

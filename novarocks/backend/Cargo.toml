@@ -10,8 +10,6 @@ doctest = false
 [dependencies]
 novarocks = { path = "../core" }
 novarocks-execution = { path = "../execution" }
-novarocks-connector-starrocks = { path = "../connector/starrocks" }
-novarocks-fs = { path = "../fs" }
 novarocks-protocol = { path = "../protocol" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"
@@ -19,7 +17,6 @@ arrow = "58.2.0"
 arrow-buffer = "58.2.0"
 async-trait = "0.1"
 axum = "0.7"
-iceberg = "0.9.0"
 novarocks-types = { path = "../types" }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 prost = "0.13"

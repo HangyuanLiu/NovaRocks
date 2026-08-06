@@ -686,7 +686,7 @@ pub(crate) fn build_iceberg_default_array(
 ) -> Result<ArrayRef, String> {
     use crate::connector::iceberg::default_value::literal_to_constant_array;
     use crate::connector::iceberg::schema::ICEBERG_INITIAL_DEFAULT_META_KEY;
-    use iceberg::spec::Literal;
+    use novarocks_connector_iceberg::iceberg::spec::Literal;
 
     let Some(json) = target_field
         .metadata()
@@ -722,9 +722,13 @@ pub(crate) fn build_iceberg_default_array(
     literal_to_constant_array(&literal, target_field.data_type(), row_count)
 }
 
-fn arrow_type_to_iceberg_type(data_type: &DataType) -> Result<iceberg::spec::Type, String> {
+fn arrow_type_to_iceberg_type(
+    data_type: &DataType,
+) -> Result<novarocks_connector_iceberg::iceberg::spec::Type, String> {
     use arrow::datatypes::TimeUnit;
-    use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        ListType, MapType, NestedField, PrimitiveType, Type,
+    };
     Ok(match data_type {
         DataType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         DataType::Int32 => Type::Primitive(PrimitiveType::Int),

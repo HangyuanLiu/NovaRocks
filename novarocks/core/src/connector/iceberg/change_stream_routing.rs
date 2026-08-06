@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use iceberg::spec::TableMetadata;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 
 use crate::connector::iceberg::commit::{IcebergCommitCollector, WrittenFile};
 use crate::connector::iceberg::report::IcebergWriterReport;
@@ -233,12 +233,12 @@ mod tests {
 
     use std::sync::Arc;
 
-    use iceberg::TableCreation;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::TableCreation;
+    use novarocks_connector_iceberg::iceberg::spec::{
         DataContentType, FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
         TableMetadataBuilder, Type,
     };
-    use iceberg::{NamespaceIdent, TableIdent};
+    use novarocks_connector_iceberg::iceberg::{NamespaceIdent, TableIdent};
 
     use crate::common::types::UniqueId;
     use crate::connector::iceberg::commit::CommitOpKind;

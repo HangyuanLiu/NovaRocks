@@ -18,20 +18,32 @@
 //! Deterministic Iceberg literal JSON serialization for native protobuf fields.
 
 pub(crate) fn serialize_iceberg_literal_json(
-    literal: &iceberg::spec::Literal,
+    literal: &novarocks_connector_iceberg::iceberg::spec::Literal,
 ) -> Result<String, String> {
     match literal {
-        iceberg::spec::Literal::Primitive(prim) => match prim {
-            iceberg::spec::PrimitiveLiteral::Boolean(b) => Ok(b.to_string()),
-            iceberg::spec::PrimitiveLiteral::Int(v) => Ok(v.to_string()),
-            iceberg::spec::PrimitiveLiteral::Long(v) => Ok(v.to_string()),
-            iceberg::spec::PrimitiveLiteral::Float(v) => Ok(v.0.to_string()),
-            iceberg::spec::PrimitiveLiteral::Double(v) => Ok(v.0.to_string()),
-            iceberg::spec::PrimitiveLiteral::Int128(v) => Ok(v.to_string()),
-            iceberg::spec::PrimitiveLiteral::String(s) => {
+        novarocks_connector_iceberg::iceberg::spec::Literal::Primitive(prim) => match prim {
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Boolean(b) => {
+                Ok(b.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int(v) => {
+                Ok(v.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Long(v) => {
+                Ok(v.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Float(v) => {
+                Ok(v.0.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Double(v) => {
+                Ok(v.0.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Int128(v) => {
+                Ok(v.to_string())
+            }
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::String(s) => {
                 serde_json::to_string(s).map_err(|e| format!("serialize String default: {e}"))
             }
-            iceberg::spec::PrimitiveLiteral::Binary(b) => {
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveLiteral::Binary(b) => {
                 let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
                 serde_json::to_string(&hex).map_err(|e| format!("serialize Binary default: {e}"))
             }

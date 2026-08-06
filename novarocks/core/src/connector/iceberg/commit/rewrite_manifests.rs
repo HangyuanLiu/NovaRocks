@@ -34,12 +34,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
     ManifestWriterBuilder, Operation, SnapshotReference, SnapshotRetention, Summary,
 };
-use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
+};
 
 use super::data_file::clone_data_file_with_first_row_id;
 use super::helpers::{
@@ -104,7 +106,7 @@ pub(crate) async fn run_rewrite_manifests_once_with_marker(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     marker: Option<String>,
-) -> Result<RewriteManifestsOutcome, iceberg::Error> {
+) -> Result<RewriteManifestsOutcome, novarocks_connector_iceberg::iceberg::Error> {
     run_rewrite_manifests_one_attempt(catalog, table_ident, marker).await
 }
 
@@ -112,7 +114,7 @@ async fn run_rewrite_manifests_one_attempt(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     marker: Option<String>,
-) -> Result<RewriteManifestsOutcome, iceberg::Error> {
+) -> Result<RewriteManifestsOutcome, novarocks_connector_iceberg::iceberg::Error> {
     let table = catalog.load_table(&table_ident).await?;
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -201,8 +203,8 @@ async fn run_rewrite_manifests_one_attempt(
     )
     .await
     .map_err(|e| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
+        novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
             format!("write_manifest_list for REWRITE MANIFESTS: {e}"),
         )
     })?;
@@ -249,7 +251,7 @@ async fn run_rewrite_manifests_one_attempt(
         additional_properties,
     };
 
-    let snapshot_builder = iceberg::spec::Snapshot::builder()
+    let snapshot_builder = novarocks_connector_iceberg::iceberg::spec::Snapshot::builder()
         .with_snapshot_id(new_snapshot_id)
         .with_parent_snapshot_id(Some(current.snapshot_id()))
         .with_sequence_number(new_seq)
@@ -303,10 +305,13 @@ async fn run_rewrite_manifests_one_attempt(
     Ok(outcome)
 }
 
-fn checked_i32_metric(value: usize, name: &str) -> Result<i32, iceberg::Error> {
+fn checked_i32_metric(
+    value: usize,
+    name: &str,
+) -> Result<i32, novarocks_connector_iceberg::iceberg::Error> {
     i32::try_from(value).map_err(|_| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
+        novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
             format!("rewrite_manifests metric `{name}` overflow"),
         )
     })
@@ -344,12 +349,12 @@ pub(crate) fn group_manifests_by_spec_and_content(
 /// and all DataFile v3 row-lineage fields via ManifestWriter::add_existing_file).
 async fn merge_manifest_group(
     file_io: &FileIO,
-    table_metadata: &iceberg::spec::TableMetadata,
+    table_metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     group: &[ManifestFile],
     new_manifest_path: &str,
     new_snapshot_id: i64,
     format_version: FormatVersion,
-) -> Result<ManifestFile, iceberg::Error> {
+) -> Result<ManifestFile, novarocks_connector_iceberg::iceberg::Error> {
     // All manifests in the group share the same partition_spec_id and content.
     let spec_id = group[0].partition_spec_id;
     let content = group[0].content;
@@ -358,8 +363,8 @@ async fn merge_manifest_group(
     let partition_spec = table_metadata
         .partition_spec_by_id(spec_id)
         .ok_or_else(|| {
-            iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 format!("partition_spec_id {spec_id} not found in table metadata"),
             )
         })?
@@ -454,13 +459,19 @@ async fn merge_manifest_group(
             cumulative_offset += record_count;
 
             let data_file =
-                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id)
-                    .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id).map_err(
+                    |e| {
+                        novarocks_connector_iceberg::iceberg::Error::new(
+                            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
+                            e,
+                        )
+                    },
+                )?;
             writer
                 .add_existing_file(data_file, snap_id, seq, file_seq)
                 .map_err(|e| {
-                    iceberg::Error::new(
-                        iceberg::ErrorKind::DataInvalid,
+                    novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                         format!("ManifestWriter::add_existing_file: {e}"),
                     )
                 })?;
@@ -472,7 +483,9 @@ async fn merge_manifest_group(
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{ManifestContentType, ManifestStatus, Operation};
+    use novarocks_connector_iceberg::iceberg::spec::{
+        ManifestContentType, ManifestStatus, Operation,
+    };
 
     use super::*;
     use crate::connector::iceberg::commit::test_helpers::{
@@ -887,9 +900,9 @@ mod tests {
     /// which is sufficient for `add_existing_file` validation.
     async fn write_test_manifest_with_data_file(
         file_io: &FileIO,
-        metadata: &iceberg::spec::TableMetadata,
+        metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         manifest_path: &str,
-        data_file: iceberg::spec::DataFile,
+        data_file: novarocks_connector_iceberg::iceberg::spec::DataFile,
     ) -> ManifestFile {
         let partition_spec = metadata.default_partition_spec().as_ref().clone();
         let schema = metadata.current_schema().clone();
@@ -919,7 +932,9 @@ mod tests {
     #[tokio::test]
     async fn merge_manifest_group_preserves_non_none_first_row_id() {
         // Build a minimal V3 table fixture so we have real file IO backed by a local Hadoop catalog.
-        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Struct,
+        };
 
         let fixture = empty_v3_iceberg_table().await;
         let metadata = fixture.table.metadata().clone();
@@ -972,7 +987,7 @@ mod tests {
             &group,
             &merged_path,
             999i64, // new_snapshot_id
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
         )
         .await
         .expect("merge_manifest_group");
@@ -1022,13 +1037,15 @@ mod tests {
     /// `manifest.first_row_id` from the snapshot's `row_lineage_first_row_id`.
     async fn write_test_manifest_none_first_row_id(
         file_io: &FileIO,
-        metadata: &iceberg::spec::TableMetadata,
+        metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         manifest_path: &str,
         file_path: &str,
         record_count: u64,
         manifest_first_row_id: u64,
     ) -> ManifestFile {
-        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, Struct,
+        };
         let data_file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path(file_path.to_string())
@@ -1105,7 +1122,7 @@ mod tests {
             &group,
             &merged_path,
             999i64,
-            iceberg::spec::FormatVersion::V3,
+            novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3,
         )
         .await
         .expect("merge_manifest_group");
@@ -1170,7 +1187,7 @@ mod tests {
     /// After REWRITE MANIFESTS (with the fix), the data file has an explicit `first_row_id`.
     /// In both cases the effective value must be the same.
     async fn collect_live_entry_info(
-        metadata: &iceberg::spec::TableMetadata,
+        metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
         file_io: &FileIO,
     ) -> Vec<(String, Option<i64>)> {
         let Some(current) = metadata.current_snapshot() else {

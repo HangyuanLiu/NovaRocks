@@ -24,8 +24,8 @@
 /// Whether an iceberg-rust commit error represents a transient table-requirement
 /// conflict that warrants a retry (after re-loading the table). Network / IO /
 /// data-invalid / programmer errors are non-retryable.
-pub fn is_retryable_commit_conflict(err: &iceberg::Error) -> bool {
-    use iceberg::ErrorKind;
+pub fn is_retryable_commit_conflict(err: &novarocks_connector_iceberg::iceberg::Error) -> bool {
+    use novarocks_connector_iceberg::iceberg::ErrorKind;
     match err.kind() {
         ErrorKind::CatalogCommitConflicts => true,
         ErrorKind::PreconditionFailed => {
@@ -56,9 +56,9 @@ pub const COMMIT_RETRY_BACKOFF_MS: [u64; 3] = [10, 100, 500];
 pub async fn commit_with_retry<F, Fut>(mut do_attempt: F) -> Result<(), String>
 where
     F: FnMut(usize) -> Fut,
-    Fut: std::future::Future<Output = Result<(), iceberg::Error>>,
+    Fut: std::future::Future<Output = Result<(), novarocks_connector_iceberg::iceberg::Error>>,
 {
-    let mut last_err: Option<iceberg::Error> = None;
+    let mut last_err: Option<novarocks_connector_iceberg::iceberg::Error> = None;
     for attempt in 0..COMMIT_RETRY_MAX_ATTEMPTS {
         match do_attempt(attempt).await {
             Ok(()) => return Ok(()),
@@ -91,8 +91,8 @@ mod tests {
 
     #[test]
     fn retryable_classifies_current_schema_id_mismatch() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::PreconditionFailed,
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
             "Requirement failed: AssertCurrentSchemaIdMatch{current_schema_id=2}",
         );
         assert!(is_retryable_commit_conflict(&e));
@@ -100,8 +100,8 @@ mod tests {
 
     #[test]
     fn retryable_classifies_last_assigned_field_id_mismatch() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::PreconditionFailed,
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
             "Requirement failed: AssertLastAssignedFieldIdMatch{last_assigned_field_id=12}",
         );
         assert!(is_retryable_commit_conflict(&e));
@@ -109,8 +109,8 @@ mod tests {
 
     #[test]
     fn retryable_classifies_ref_snapshot_id_mismatch() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::PreconditionFailed,
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
             "Requirement failed: AssertRefSnapshotIdMatch{ref=main, snapshot_id=null}",
         );
         assert!(is_retryable_commit_conflict(&e));
@@ -118,8 +118,8 @@ mod tests {
 
     #[test]
     fn retryable_classifies_catalog_commit_conflicts_kind() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::CatalogCommitConflicts,
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::CatalogCommitConflicts,
             "concurrent commit",
         );
         assert!(is_retryable_commit_conflict(&e));
@@ -127,14 +127,17 @@ mod tests {
 
     #[test]
     fn retryable_rejects_unrelated_io_error() {
-        let e = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "connection refused");
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+            "connection refused",
+        );
         assert!(!is_retryable_commit_conflict(&e));
     }
 
     #[test]
     fn retryable_rejects_data_invalid_error() {
-        let e = iceberg::Error::new(
-            iceberg::ErrorKind::DataInvalid,
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
             "schema rebuild failed: column already exists",
         );
         assert!(!is_retryable_commit_conflict(&e));
@@ -142,7 +145,10 @@ mod tests {
 
     #[test]
     fn retryable_rejects_precondition_with_unrelated_message() {
-        let e = iceberg::Error::new(iceberg::ErrorKind::PreconditionFailed, "table is read-only");
+        let e = novarocks_connector_iceberg::iceberg::Error::new(
+            novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
+            "table is read-only",
+        );
         assert!(!is_retryable_commit_conflict(&e));
     }
 
@@ -152,7 +158,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
-            async { Ok::<(), iceberg::Error>(()) }
+            async { Ok::<(), novarocks_connector_iceberg::iceberg::Error>(()) }
         })
         .await;
         assert!(res.is_ok());
@@ -167,8 +173,8 @@ mod tests {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n == 0 {
-                    Err(iceberg::Error::new(
-                        iceberg::ErrorKind::PreconditionFailed,
+                    Err(novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                         "Requirement failed: AssertCurrentSchemaIdMatch{...}",
                     ))
                 } else {
@@ -188,8 +194,8 @@ mod tests {
         let res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::CatalogCommitConflicts,
+                Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::CatalogCommitConflicts,
                     "concurrent commit detected",
                 ))
             }
@@ -208,8 +214,8 @@ mod tests {
         let res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::Unexpected,
+                Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                     "connection refused",
                 ))
             }
@@ -228,8 +234,8 @@ mod tests {
             seen_inner.lock().unwrap().push(attempt);
             async move {
                 if attempt < 2 {
-                    Err(iceberg::Error::new(
-                        iceberg::ErrorKind::PreconditionFailed,
+                    Err(novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                         "Requirement failed: AssertCurrentSchemaIdMatch{...}",
                     ))
                 } else {
@@ -261,8 +267,8 @@ mod tests {
         let res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::PreconditionFailed,
+                Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                     "Requirement failed: AssertCurrentSchemaIdMatch{...}",
                 ))
             }
@@ -281,8 +287,8 @@ mod tests {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n == 0 {
-                    Err(iceberg::Error::new(
-                        iceberg::ErrorKind::PreconditionFailed,
+                    Err(novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                         "Requirement failed: AssertCurrentSchemaIdMatch{current_schema_id=2}",
                     ))
                 } else {
@@ -304,8 +310,8 @@ mod tests {
         let _res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::PreconditionFailed,
+                Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                     "Requirement failed: AssertCurrentSchemaIdMatch{...}",
                 ))
             }
@@ -332,8 +338,8 @@ mod tests {
         let res = commit_with_retry(|_attempt| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
-                Err(iceberg::Error::new(
-                    iceberg::ErrorKind::Unexpected,
+                Err(novarocks_connector_iceberg::iceberg::Error::new(
+                    novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
                     "connection refused",
                 ))
             }
@@ -356,8 +362,8 @@ mod tests {
             seen.lock().unwrap().push(attempt);
             async move {
                 if attempt < 1 {
-                    Err(iceberg::Error::new(
-                        iceberg::ErrorKind::PreconditionFailed,
+                    Err(novarocks_connector_iceberg::iceberg::Error::new(
+                        novarocks_connector_iceberg::iceberg::ErrorKind::PreconditionFailed,
                         "Requirement failed: AssertCurrentSchemaIdMatch{...}",
                     ))
                 } else {

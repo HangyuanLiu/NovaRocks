@@ -24,8 +24,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use iceberg::Catalog;
-use iceberg::spec::{FormatVersion, PrimitiveType, Type};
+use novarocks_connector_iceberg::iceberg::Catalog;
+use novarocks_connector_iceberg::iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
@@ -82,8 +82,8 @@ pub(crate) fn prepare_equality_delete_statement(
         registry.get(&target.catalog)?
     };
     let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
@@ -195,7 +195,7 @@ fn prepare_equality_delete_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn Catalog>,
-    table: iceberg::table::Table,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     current_snapshot_id: Option<i64>,
     delete_columns: &[EqualityDeleteColumn],
@@ -244,8 +244,8 @@ fn prepare_equality_delete_distributed_write(
     )?;
 
     let metadata = table.metadata();
-    let table_ident = iceberg::TableIdent::new(
-        iceberg::NamespaceIdent::new(target.namespace.clone()),
+    let table_ident = novarocks_connector_iceberg::iceberg::TableIdent::new(
+        novarocks_connector_iceberg::iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
     );
     let staging_dir = format!(
@@ -420,7 +420,7 @@ fn sql_identifier(name: &str) -> String {
 }
 
 fn build_equality_delete_batch(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     column_names: &[String],
     rows: &[Vec<Literal>],
 ) -> Result<(Vec<EqualityDeleteColumn>, RecordBatch), String> {
@@ -794,7 +794,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array, StringArray};
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_connector_iceberg::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use crate::sql::parser::ast::Literal;
 

@@ -126,7 +126,7 @@ pub(crate) fn validate_reserved_projection_output_names(
 }
 
 pub(crate) fn find_apply_key_field_id_by_column(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
 ) -> Result<i32, String> {
     let mut matches = table
@@ -150,11 +150,11 @@ pub(crate) fn find_apply_key_field_id_by_column(
 }
 
 pub(crate) fn ensure_base_row_lineage_contract(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     base_fqn: &str,
 ) -> Result<(), String> {
     let metadata = table.metadata();
-    if metadata.format_version() != iceberg::spec::FormatVersion::V3
+    if metadata.format_version() != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
         || !row_lineage_property_enabled(metadata.properties())
     {
         return Err(format!(
@@ -174,7 +174,7 @@ fn row_lineage_property_enabled(props: &std::collections::HashMap<String, String
 
 pub(crate) fn expose_physical_apply_key_for_locator_registration(
     mut table_def: crate::sql::planner::table::TableDef,
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     apply_key_column: &str,
 ) -> Result<crate::sql::planner::table::TableDef, String> {
     let has_file = table_def
@@ -204,12 +204,13 @@ pub(crate) fn expose_physical_apply_key_for_locator_registration(
 }
 
 fn iceberg_column_def_for_locator(
-    target_table: &iceberg::table::Table,
+    target_table: &novarocks_connector_iceberg::iceberg::table::Table,
     column_name: &str,
 ) -> Result<novarocks_catalog::schema::ColumnDef, String> {
     let iceberg_schema = target_table.metadata().current_schema();
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
+    let arrow_schema =
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .map_err(|e| format!("convert iceberg target schema to arrow schema failed: {e}"))?;
     let field = arrow_schema
         .fields()
         .iter()
@@ -252,14 +253,14 @@ pub(crate) struct IcebergMvTargetRuntimeBinding {
     target_table_uuid: String,
     target_snapshot_id: Option<i64>,
     target_entry: Arc<IcebergCatalogEntry>,
-    target_table: iceberg::table::Table,
+    target_table: novarocks_connector_iceberg::iceberg::table::Table,
 }
 
 impl IcebergMvTargetRuntimeBinding {
     fn from_rewrite_context(
         rewrite: &IcebergMvRewriteContext,
         target_entry: Arc<IcebergCatalogEntry>,
-        target_table: iceberg::table::Table,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
         let actual_uuid = metadata.uuid().to_string();
@@ -291,7 +292,7 @@ impl IcebergMvTargetRuntimeBinding {
         &self.target_entry
     }
 
-    pub(crate) fn target_table(&self) -> &iceberg::table::Table {
+    pub(crate) fn target_table(&self) -> &novarocks_connector_iceberg::iceberg::table::Table {
         &self.target_table
     }
 
@@ -469,7 +470,7 @@ impl IcebergMvTargetBindings {
     pub(crate) fn from_rewrite_context(
         rewrite: &IcebergMvRewriteContext,
         target_entry: Arc<IcebergCatalogEntry>,
-        target_table: iceberg::table::Table,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
     ) -> Result<Self, String> {
         let runtime = Arc::new(IcebergMvTargetRuntimeBinding::from_rewrite_context(
             rewrite,
@@ -494,7 +495,7 @@ impl IcebergMvTargetBindings {
 }
 
 fn validate_physical_field_identity(
-    schema: &iceberg::spec::Schema,
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
     field_id: i32,
     column_name: &str,
     role: &str,
@@ -531,7 +532,9 @@ fn data_file_with_stats_to_info(
     }
 }
 
-fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+fn iceberg_schema_def(
+    schema: &novarocks_connector_iceberg::iceberg::spec::Schema,
+) -> IcebergSchemaDef {
     IcebergSchemaDef {
         fields: schema
             .as_struct()
@@ -542,7 +545,9 @@ fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
     }
 }
 
-fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDef {
+fn iceberg_field_def(
+    field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
+) -> IcebergSchemaFieldDef {
     let initial_default_json = field.initial_default.as_ref().and_then(|literal| {
         literal
             .clone()
@@ -568,21 +573,23 @@ fn iceberg_field_def(field: &iceberg::spec::NestedField) -> IcebergSchemaFieldDe
     }
 }
 
-fn iceberg_type_children(ty: &iceberg::spec::Type) -> Vec<IcebergSchemaFieldDef> {
+fn iceberg_type_children(
+    ty: &novarocks_connector_iceberg::iceberg::spec::Type,
+) -> Vec<IcebergSchemaFieldDef> {
     match ty {
-        iceberg::spec::Type::Struct(struct_ty) => struct_ty
+        novarocks_connector_iceberg::iceberg::spec::Type::Struct(struct_ty) => struct_ty
             .fields()
             .iter()
             .map(|field| iceberg_field_def(field.as_ref()))
             .collect(),
-        iceberg::spec::Type::List(list_ty) => {
+        novarocks_connector_iceberg::iceberg::spec::Type::List(list_ty) => {
             vec![iceberg_field_def(list_ty.element_field.as_ref())]
         }
-        iceberg::spec::Type::Map(map_ty) => vec![
+        novarocks_connector_iceberg::iceberg::spec::Type::Map(map_ty) => vec![
             iceberg_field_def(map_ty.key_field.as_ref()),
             iceberg_field_def(map_ty.value_field.as_ref()),
         ],
-        iceberg::spec::Type::Primitive(_) => vec![],
+        novarocks_connector_iceberg::iceberg::spec::Type::Primitive(_) => vec![],
     }
 }
 
@@ -612,7 +619,7 @@ mod tests {
     struct TargetFixture {
         _warehouse: tempfile::TempDir,
         target_entry: Arc<IcebergCatalogEntry>,
-        target_table: iceberg::table::Table,
+        target_table: novarocks_connector_iceberg::iceberg::table::Table,
         target_snapshot_id: Option<i64>,
     }
 
@@ -723,7 +730,7 @@ mod tests {
         }
     }
 
-    fn field_id(table: &iceberg::table::Table, name: &str) -> i32 {
+    fn field_id(table: &novarocks_connector_iceberg::iceberg::table::Table, name: &str) -> i32 {
         table
             .metadata()
             .current_schema()

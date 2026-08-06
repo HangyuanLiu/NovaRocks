@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use novarocks_connector_iceberg::iceberg::{Catalog, NamespaceIdent, TableIdent};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -222,7 +222,13 @@ impl RegisteredIcebergDataMutationBackend {
         &self,
         namespace: &str,
         table: &str,
-    ) -> Result<(IcebergCatalogEntry, iceberg::table::Table), ConnectorError> {
+    ) -> Result<
+        (
+            IcebergCatalogEntry,
+            novarocks_connector_iceberg::iceberg::table::Table,
+        ),
+        ConnectorError,
+    > {
         let entry = self.entry()?;
         entry.invalidate_table_cache(namespace, table);
         let loaded = load_table(&entry, namespace, table).map_err(map_provider_error)?;
@@ -301,7 +307,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             }
             ConnectorDataMutationOperation::Truncate { target_ref, .. } => {
                 if target_ref.as_ref() != "main"
-                    && metadata.format_version() != iceberg::spec::FormatVersion::V3
+                    && metadata.format_version()
+                        != novarocks_connector_iceberg::iceberg::spec::FormatVersion::V3
                 {
                     return Err(invalid(
                         "Iceberg branch TRUNCATE requires a format-v3 table",
@@ -466,7 +473,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 .table
                 .metadata()
                 .properties()
-                .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+                .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
                 .map(|mapping| super::catalog::add_files::canonical_name_mapping(mapping))
                 .transpose()
                 .map_err(|error| {
@@ -965,7 +972,7 @@ fn validate_evidence_request(
 }
 
 fn validate_frozen_table(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     payload: &IcebergDataMutationPlanPayloadV1,
 ) -> Result<(), ConnectorError> {
     let metadata = table.metadata();
@@ -984,7 +991,7 @@ fn validate_frozen_table(
 }
 
 fn validate_no_duplicate_data_files(
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
     manifest: &AddFilesManifest,
 ) -> Result<(), ConnectorError> {
     let live = super::catalog::registry::extract_data_files_with_stats(table)
@@ -1007,7 +1014,13 @@ fn validate_no_duplicate_data_files(
 
 fn build_abort_cleanup(
     entry: &IcebergCatalogEntry,
-) -> Result<(opendal::Operator, Option<CleanupPathMapper>), ConnectorError> {
+) -> Result<
+    (
+        novarocks_connector_iceberg::opendal::Operator,
+        Option<CleanupPathMapper>,
+    ),
+    ConnectorError,
+> {
     if let Some(s3_config) = entry.object_store_config() {
         let access = fs_io::resolve_access_for_location(&entry.warehouse_uri, Some(s3_config))
             .map_err(|error| {
@@ -1040,7 +1053,7 @@ fn build_abort_cleanup(
 fn ensure_hadoop_registration(
     entry: &IcebergCatalogEntry,
     catalog: &dyn Catalog,
-    table: &iceberg::table::Table,
+    table: &novarocks_connector_iceberg::iceberg::table::Table,
 ) -> Result<(), ConnectorError> {
     if entry.uses_remote_catalog() {
         return Ok(());
@@ -1061,7 +1074,7 @@ fn ensure_hadoop_registration(
 }
 
 fn target_snapshot_id(
-    metadata: &iceberg::spec::TableMetadata,
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
     target_ref: &str,
 ) -> Result<Option<i64>, ConnectorError> {
     if target_ref == "main" {

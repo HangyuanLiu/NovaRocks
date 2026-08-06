@@ -42,9 +42,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use iceberg::io::FileIO;
-use iceberg::spec::{Snapshot, TableMetadata};
-use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{Snapshot, TableMetadata};
+use novarocks_connector_iceberg::iceberg::{
+    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
+};
 
 use super::retry::commit_with_retry;
 use super::snapshot_lifecycle_helpers::{
@@ -125,7 +127,7 @@ pub(crate) async fn run_expire_snapshots_once_with_marker(
     table_ident: TableIdent,
     params: ExpireParams,
     marker: Option<String>,
-) -> Result<ExpireOutcome, iceberg::Error> {
+) -> Result<ExpireOutcome, novarocks_connector_iceberg::iceberg::Error> {
     run_expire_one_attempt(
         &catalog,
         &table_ident,
@@ -136,7 +138,7 @@ pub(crate) async fn run_expire_snapshots_once_with_marker(
     .await
 }
 
-/// Single attempt body; returns an `iceberg::Error` on failure so
+/// Single attempt body; returns an `novarocks_connector_iceberg::iceberg::Error` on failure so
 /// `commit_with_retry` can classify it as retryable or not.
 async fn run_expire_one_attempt(
     catalog: &Arc<dyn Catalog>,
@@ -144,7 +146,7 @@ async fn run_expire_one_attempt(
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
     marker: Option<&str>,
-) -> Result<ExpireOutcome, iceberg::Error> {
+) -> Result<ExpireOutcome, novarocks_connector_iceberg::iceberg::Error> {
     let table = catalog.load_table(table_ident).await?;
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -315,7 +317,7 @@ async fn build_dv_index_from_metadata(
     metadata: &TableMetadata,
     file_io: &FileIO,
     snapshot_ids: &HashSet<i64>,
-) -> Result<HashMap<String, HashSet<String>>, iceberg::Error> {
+) -> Result<HashMap<String, HashSet<String>>, novarocks_connector_iceberg::iceberg::Error> {
     let mut idx: HashMap<String, HashSet<String>> = HashMap::new();
     for sid in snapshot_ids {
         let Some(snapshot) = metadata.snapshot_by_id(*sid) else {

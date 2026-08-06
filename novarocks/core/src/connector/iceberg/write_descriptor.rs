@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iceberg::spec::{Literal, PrimitiveLiteral, Struct, TableMetadata, Type};
+use novarocks_connector_iceberg::iceberg::spec::{
+    Literal, PrimitiveLiteral, Struct, TableMetadata, Type,
+};
 
 const MAX_TIME_MICROS: i64 = 24 * 60 * 60 * 1_000_000 - 1;
 
@@ -113,7 +115,9 @@ pub(crate) fn encode_partition_descriptor(
             }),
             Some(Literal::Primitive(primitive)) => {
                 let field_type = partition_type.fields()[idx].field_type.as_ref();
-                let iceberg::spec::Type::Primitive(primitive_type) = field_type else {
+                let novarocks_connector_iceberg::iceberg::spec::Type::Primitive(primitive_type) =
+                    field_type
+                else {
                     return Err(IcebergWriteDescriptorError::DecodeFailed {
                         index: idx,
                         message: format!("partition field type is not primitive: {field_type:?}"),
@@ -187,20 +191,23 @@ pub(crate) fn decode_partition_descriptor(
             .datum_bytes
             .ok_or(IcebergWriteDescriptorError::MissingPayload { index: idx })?;
         let field_type = partition_type.fields()[idx].field_type.as_ref();
-        let iceberg::spec::Type::Primitive(primitive_type) = field_type else {
+        let novarocks_connector_iceberg::iceberg::spec::Type::Primitive(primitive_type) =
+            field_type
+        else {
             return Err(IcebergWriteDescriptorError::DecodeFailed {
                 index: idx,
                 message: format!("partition field type is not primitive: {field_type:?}"),
             });
         };
         validate_descriptor_payload_bytes(&bytes, primitive_type, idx)?;
-        let datum =
-            iceberg::spec::Datum::try_from_bytes(&bytes, primitive_type.clone()).map_err(|e| {
-                IcebergWriteDescriptorError::DecodeFailed {
-                    index: idx,
-                    message: e.to_string(),
-                }
-            })?;
+        let datum = novarocks_connector_iceberg::iceberg::spec::Datum::try_from_bytes(
+            &bytes,
+            primitive_type.clone(),
+        )
+        .map_err(|e| IcebergWriteDescriptorError::DecodeFailed {
+            index: idx,
+            message: e.to_string(),
+        })?;
         let literal = datum.literal().clone();
         validate_decoded_primitive_literal(&literal, primitive_type, idx)?;
         decoded.push(Some(Literal::Primitive(literal)));
@@ -211,7 +218,7 @@ pub(crate) fn decode_partition_descriptor(
 
 fn primitive_literal_to_iceberg_bytes(
     literal: &PrimitiveLiteral,
-    primitive_type: &iceberg::spec::PrimitiveType,
+    primitive_type: &novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
 ) -> Result<Vec<u8>, String> {
     if !primitive_type.compatible(literal) {
         return Err(format!(
@@ -220,14 +227,21 @@ fn primitive_literal_to_iceberg_bytes(
     }
 
     let bytes = match (literal, primitive_type) {
-        (PrimitiveLiteral::Boolean(val), iceberg::spec::PrimitiveType::Boolean) => {
+        (
+            PrimitiveLiteral::Boolean(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Boolean,
+        ) => {
             vec![u8::from(*val)]
         }
         (
             PrimitiveLiteral::Int(val),
-            iceberg::spec::PrimitiveType::Int | iceberg::spec::PrimitiveType::Date,
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int
+            | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Date,
         ) => val.to_le_bytes().to_vec(),
-        (PrimitiveLiteral::Long(val), iceberg::spec::PrimitiveType::Time) => {
+        (
+            PrimitiveLiteral::Long(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Time,
+        ) => {
             if !time_micros_in_range(*val) {
                 return Err(format!(
                     "partition time literal {val} is outside valid Iceberg time range 0..={MAX_TIME_MICROS}"
@@ -237,23 +251,32 @@ fn primitive_literal_to_iceberg_bytes(
         }
         (
             PrimitiveLiteral::Long(val),
-            iceberg::spec::PrimitiveType::Long
-            | iceberg::spec::PrimitiveType::Timestamp
-            | iceberg::spec::PrimitiveType::Timestamptz
-            | iceberg::spec::PrimitiveType::TimestampNs
-            | iceberg::spec::PrimitiveType::TimestamptzNs,
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long
+            | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Timestamp
+            | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Timestamptz
+            | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::TimestampNs
+            | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::TimestamptzNs,
         ) => val.to_le_bytes().to_vec(),
-        (PrimitiveLiteral::Float(val), iceberg::spec::PrimitiveType::Float) => {
-            val.0.to_le_bytes().to_vec()
-        }
-        (PrimitiveLiteral::Double(val), iceberg::spec::PrimitiveType::Double) => {
-            val.0.to_le_bytes().to_vec()
-        }
-        (PrimitiveLiteral::String(val), iceberg::spec::PrimitiveType::String) => {
-            val.as_bytes().to_vec()
-        }
-        (PrimitiveLiteral::Binary(val), iceberg::spec::PrimitiveType::Binary) => val.clone(),
-        (PrimitiveLiteral::Binary(val), iceberg::spec::PrimitiveType::Fixed(len)) => {
+        (
+            PrimitiveLiteral::Float(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Float,
+        ) => val.0.to_le_bytes().to_vec(),
+        (
+            PrimitiveLiteral::Double(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Double,
+        ) => val.0.to_le_bytes().to_vec(),
+        (
+            PrimitiveLiteral::String(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String,
+        ) => val.as_bytes().to_vec(),
+        (
+            PrimitiveLiteral::Binary(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary,
+        ) => val.clone(),
+        (
+            PrimitiveLiteral::Binary(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Fixed(len),
+        ) => {
             let expected = usize::try_from(*len)
                 .map_err(|_| format!("fixed length {len} cannot fit in usize"))?;
             if val.len() != expected {
@@ -264,12 +287,15 @@ fn primitive_literal_to_iceberg_bytes(
             }
             val.clone()
         }
-        (PrimitiveLiteral::UInt128(val), iceberg::spec::PrimitiveType::Uuid) => {
-            val.to_be_bytes().to_vec()
-        }
+        (
+            PrimitiveLiteral::UInt128(val),
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Uuid,
+        ) => val.to_be_bytes().to_vec(),
         (
             PrimitiveLiteral::Int128(val),
-            iceberg::spec::PrimitiveType::Decimal { precision, .. },
+            novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Decimal {
+                precision, ..
+            },
         ) => {
             let required_bytes = Type::decimal_required_bytes(*precision).map_err(|_| {
                 format!("PrimitiveType Decimal must has valid precision but got {precision}")
@@ -301,11 +327,11 @@ fn primitive_literal_to_iceberg_bytes(
 
 fn validate_descriptor_payload_bytes(
     bytes: &[u8],
-    primitive_type: &iceberg::spec::PrimitiveType,
+    primitive_type: &novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
     index: usize,
 ) -> Result<(), IcebergWriteDescriptorError> {
     match primitive_type {
-        iceberg::spec::PrimitiveType::Boolean => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Boolean => {
             if bytes.len() != 1 {
                 return Err(IcebergWriteDescriptorError::DecodeFailed {
                     index,
@@ -325,12 +351,12 @@ fn validate_descriptor_payload_bytes(
                 });
             }
         }
-        iceberg::spec::PrimitiveType::Int
-        | iceberg::spec::PrimitiveType::Date
-        | iceberg::spec::PrimitiveType::Float => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Int
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Date
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Float => {
             validate_exact_payload_len(bytes, 4, index)?;
         }
-        iceberg::spec::PrimitiveType::Time => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Time => {
             validate_exact_payload_len(bytes, 8, index)?;
             let value = i64::from_le_bytes(bytes.try_into().map_err(|_| {
                 IcebergWriteDescriptorError::DecodeFailed {
@@ -348,25 +374,26 @@ fn validate_descriptor_payload_bytes(
                 });
             }
         }
-        iceberg::spec::PrimitiveType::Long
-        | iceberg::spec::PrimitiveType::Timestamp
-        | iceberg::spec::PrimitiveType::Timestamptz
-        | iceberg::spec::PrimitiveType::TimestampNs
-        | iceberg::spec::PrimitiveType::TimestamptzNs
-        | iceberg::spec::PrimitiveType::Double => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Long
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Timestamp
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Timestamptz
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::TimestampNs
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::TimestamptzNs
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Double => {
             validate_exact_payload_len(bytes, 8, index)?;
         }
-        iceberg::spec::PrimitiveType::Uuid => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Uuid => {
             validate_exact_payload_len(bytes, 16, index)?;
         }
-        iceberg::spec::PrimitiveType::String | iceberg::spec::PrimitiveType::Binary => {}
-        iceberg::spec::PrimitiveType::Variant => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::String
+        | novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Binary => {}
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Variant => {
             return Err(IcebergWriteDescriptorError::DecodeFailed {
                 index,
                 message: "partition descriptor does not support variant payload".to_string(),
             });
         }
-        iceberg::spec::PrimitiveType::Fixed(len) => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Fixed(len) => {
             let expected =
                 usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {
                     index,
@@ -382,7 +409,9 @@ fn validate_descriptor_payload_bytes(
                 });
             }
         }
-        iceberg::spec::PrimitiveType::Decimal { precision, .. } => {
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Decimal {
+            precision, ..
+        } => {
             let required_bytes = Type::decimal_required_bytes(*precision).map_err(|_| {
                 IcebergWriteDescriptorError::DecodeFailed {
                     index,
@@ -428,12 +457,12 @@ fn time_micros_in_range(value: i64) -> bool {
 
 fn validate_decoded_primitive_literal(
     literal: &PrimitiveLiteral,
-    primitive_type: &iceberg::spec::PrimitiveType,
+    primitive_type: &novarocks_connector_iceberg::iceberg::spec::PrimitiveType,
     index: usize,
 ) -> Result<(), IcebergWriteDescriptorError> {
     if let (
         PrimitiveLiteral::Int128(value),
-        iceberg::spec::PrimitiveType::Decimal { precision, .. },
+        novarocks_connector_iceberg::iceberg::spec::PrimitiveType::Decimal { precision, .. },
     ) = (literal, primitive_type)
     {
         if !decimal_unscaled_fits_precision(*value, *precision) {
@@ -477,8 +506,8 @@ fn i128_to_be_bytes_min(value: i128) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::TableCreation;
-    use iceberg::spec::{
+    use novarocks_connector_iceberg::iceberg::TableCreation;
+    use novarocks_connector_iceberg::iceberg::spec::{
         FormatVersion, Literal, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType,
         Schema, TableMetadataBuilder, Transform, Type,
     };

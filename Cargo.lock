@@ -3151,9 +3151,6 @@ dependencies = [
  "futures",
  "hashbrown 0.14.5",
  "hex",
- "iceberg",
- "iceberg-catalog-hms",
- "iceberg-catalog-rest",
  "libc",
  "libm",
  "md-5",
@@ -3161,6 +3158,7 @@ dependencies = [
  "mysql",
  "mysql_common 0.32.4",
  "novarocks-catalog",
+ "novarocks-connector-iceberg",
  "novarocks-execution",
  "novarocks-fs",
  "novarocks-protocol",
@@ -3171,7 +3169,6 @@ dependencies = [
  "num-traits",
  "num_cpus",
  "once_cell",
- "opendal",
  "opensrv-mysql",
  "openssl",
  "orc-rust",
@@ -3213,11 +3210,8 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
- "iceberg",
  "novarocks",
- "novarocks-connector-starrocks",
  "novarocks-execution",
- "novarocks-fs",
  "novarocks-protocol",
  "novarocks-spi",
  "novarocks-types",
@@ -3237,6 +3231,18 @@ name = "novarocks-catalog"
 version = "0.1.0"
 dependencies = [
  "arrow",
+]
+
+[[package]]
+name = "novarocks-connector-iceberg"
+version = "0.1.0"
+dependencies = [
+ "iceberg",
+ "iceberg-catalog-hms",
+ "iceberg-catalog-rest",
+ "novarocks-fs",
+ "novarocks-spi",
+ "opendal",
 ]
 
 [[package]]
@@ -3344,8 +3350,10 @@ dependencies = [
  "mysql",
  "novarocks",
  "novarocks-backend",
+ "novarocks-connector-iceberg",
+ "novarocks-connector-starrocks",
  "novarocks-frontend",
- "novarocks-fs",
+ "novarocks-spi",
  "novarocks-state-store",
  "reqwest",
  "tempfile",

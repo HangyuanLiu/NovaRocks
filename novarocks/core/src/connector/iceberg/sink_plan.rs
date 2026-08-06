@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::SchemaRef;
-use iceberg::spec::{Struct, TableMetadata};
+use novarocks_connector_iceberg::iceberg::spec::{Struct, TableMetadata};
 use parquet::basic::Compression;
 
 use crate::connector::iceberg::commit::EqualityDeleteColumn;

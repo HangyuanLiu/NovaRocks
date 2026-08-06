@@ -35,15 +35,17 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use iceberg::io::FileIO;
-use iceberg::spec::{
+use novarocks_connector_iceberg::iceberg::io::FileIO;
+use novarocks_connector_iceberg::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestList,
     ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef, Snapshot, SnapshotReference,
     SnapshotRetention, Struct, Summary,
 };
-use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
-use iceberg::{TableRequirement, TableUpdate};
+use novarocks_connector_iceberg::iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
+};
+use novarocks_connector_iceberg::iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
@@ -186,12 +188,15 @@ impl OverwritePartitionsTxnAction {
 
 #[async_trait]
 impl TransactionAction for OverwritePartitionsTxnAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+    async fn commit(
+        self: Arc<Self>,
+        table: &Table,
+    ) -> novarocks_connector_iceberg::iceberg::Result<ActionCommit> {
         let m = table.metadata();
         let format_version = m.format_version();
         if format_version == FormatVersion::V1 {
-            return Err(iceberg::Error::new(
-                iceberg::ErrorKind::DataInvalid,
+            return Err(novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::DataInvalid,
                 "OverwritePartitionsCommit does not support V1 tables",
             ));
         }
@@ -295,7 +300,8 @@ impl TransactionAction for OverwritePartitionsTxnAction {
         }
 
         // 3. Write manifests. Order: surviving → deleted → added.
-        let mut new_manifests: Vec<iceberg::spec::ManifestFile> = Vec::new();
+        let mut new_manifests: Vec<novarocks_connector_iceberg::iceberg::spec::ManifestFile> =
+            Vec::new();
 
         // 3a. EXISTING-Data manifest for surviving data files.
         if !surviving_data.is_empty() {
@@ -527,7 +533,7 @@ pub(super) async fn write_existing_data_manifest(
     schema: SchemaRef,
     new_snapshot_id: i64,
     format_version: FormatVersion,
-) -> Result<iceberg::spec::ManifestFile, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::ManifestFile, String> {
     let output_file = file_io
         .new_output(out_path)
         .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
@@ -578,7 +584,7 @@ pub(super) async fn write_existing_deletes_manifest(
     schema: SchemaRef,
     new_snapshot_id: i64,
     format_version: FormatVersion,
-) -> Result<iceberg::spec::ManifestFile, String> {
+) -> Result<novarocks_connector_iceberg::iceberg::spec::ManifestFile, String> {
     let output_file = file_io
         .new_output(out_path)
         .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
@@ -771,8 +777,11 @@ fn overwrite_partitions_summary(
     p
 }
 
-fn to_iceberg_unexpected(s: String) -> iceberg::Error {
-    iceberg::Error::new(iceberg::ErrorKind::Unexpected, s)
+fn to_iceberg_unexpected(s: String) -> novarocks_connector_iceberg::iceberg::Error {
+    novarocks_connector_iceberg::iceberg::Error::new(
+        novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+        s,
+    )
 }
 
 #[cfg(test)]
@@ -781,7 +790,7 @@ mod tests {
     use crate::connector::iceberg::commit::test_helpers::{
         run_overwrite_partitions_commit, v3_partitioned_table_with_data,
     };
-    use iceberg::spec::Operation;
+    use novarocks_connector_iceberg::iceberg::spec::Operation;
 
     #[test]
     fn type_is_send_sync() {
@@ -842,7 +851,9 @@ mod tests {
     #[tokio::test]
     async fn overwrite_partitions_replaces_one_partition_preserves_others() {
         use crate::connector::iceberg::commit::overwrite::enumerate_live_all_files;
-        use iceberg::spec::{DataFileFormat, Literal, PrimitiveLiteral, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{
+            DataFileFormat, Literal, PrimitiveLiteral, Struct,
+        };
         use std::collections::HashMap;
 
         let mut fixture = v3_partitioned_table_with_data().await;
@@ -1044,7 +1055,7 @@ mod tests {
         use crate::connector::iceberg::partition_spec::{
             PartitionMatch, partition_match_in_touched,
         };
-        use iceberg::spec::{Literal, PrimitiveLiteral, Struct};
+        use novarocks_connector_iceberg::iceberg::spec::{Literal, PrimitiveLiteral, Struct};
 
         let base_partition = Struct::from_iter([Some(Literal::Primitive(
             PrimitiveLiteral::String("us".to_string()),

@@ -23,8 +23,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use bytes::Bytes;
-use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct, Type};
-use iceberg::table::Table;
+use novarocks_connector_iceberg::iceberg::spec::{
+    DataContentType, DataFileBuilder, DataFileFormat, Struct, Type,
+};
+use novarocks_connector_iceberg::iceberg::table::Table;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use sha2::{Digest, Sha256};
@@ -73,7 +75,9 @@ pub(crate) struct AddFilesManifest {
 }
 
 impl AddFilesManifest {
-    pub(crate) fn to_data_files(&self) -> Result<Vec<iceberg::spec::DataFile>, String> {
+    pub(crate) fn to_data_files(
+        &self,
+    ) -> Result<Vec<novarocks_connector_iceberg::iceberg::spec::DataFile>, String> {
         self.records
             .iter()
             .map(|record| {
@@ -101,13 +105,15 @@ pub(crate) fn plan_manifest_for_table(
         return Err("ADD FILES supports only unpartitioned Iceberg tables".to_string());
     }
     let target_schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(|error| format!("convert ADD FILES target schema: {error}"))?,
+        novarocks_connector_iceberg::iceberg::arrow::schema_to_arrow_schema(
+            table.metadata().current_schema(),
+        )
+        .map_err(|error| format!("convert ADD FILES target schema: {error}"))?,
     );
     let canonical_name_mapping = table
         .metadata()
         .properties()
-        .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+        .get(novarocks_connector_iceberg::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
         .map(|mapping| canonical_name_mapping(mapping))
         .transpose()?;
     let default_ids = initial_default_ids(table.metadata().current_schema().as_struct());
@@ -144,7 +150,7 @@ fn plan_manifest(
 ) -> Result<AddFilesManifest, String> {
     let mapping = canonical_name_mapping
         .as_deref()
-        .map(serde_json::from_str::<iceberg::spec::NameMapping>)
+        .map(serde_json::from_str::<novarocks_connector_iceberg::iceberg::spec::NameMapping>)
         .transpose()
         .map_err(|error| format!("decode canonical ADD FILES name mapping: {error}"))?;
     if let Some(mapping) = mapping.as_ref() {
@@ -611,11 +617,11 @@ fn validate_schema(
 }
 
 fn validate_name_mapping_for_target(
-    mapping: &iceberg::spec::NameMapping,
+    mapping: &novarocks_connector_iceberg::iceberg::spec::NameMapping,
     target: &SchemaRef,
 ) -> Result<(), String> {
     fn collect_mapping_ids(
-        fields: &[iceberg::spec::MappedField],
+        fields: &[novarocks_connector_iceberg::iceberg::spec::MappedField],
         output: &mut HashSet<i32>,
     ) -> Result<(), String> {
         for field in fields {
@@ -721,8 +727,13 @@ fn read_type_compatible(source: &DataType, target: &DataType) -> bool {
     }
 }
 
-fn initial_default_ids(schema: &iceberg::spec::StructType) -> HashSet<i32> {
-    fn visit(field: &iceberg::spec::NestedField, ids: &mut HashSet<i32>) {
+fn initial_default_ids(
+    schema: &novarocks_connector_iceberg::iceberg::spec::StructType,
+) -> HashSet<i32> {
+    fn visit(
+        field: &novarocks_connector_iceberg::iceberg::spec::NestedField,
+        ids: &mut HashSet<i32>,
+    ) {
         if field.initial_default.is_some() {
             ids.insert(field.id);
         }
@@ -751,8 +762,9 @@ pub(crate) fn canonical_name_mapping(raw: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
     validate_mapping_json(&value)?;
-    let mapping: iceberg::spec::NameMapping = serde_json::from_value(value)
-        .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
+    let mapping: novarocks_connector_iceberg::iceberg::spec::NameMapping =
+        serde_json::from_value(value)
+            .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
     serde_json::to_string(&mapping)
         .map_err(|error| format!("encode canonical schema.name-mapping.default: {error}"))
 }
@@ -1008,23 +1020,25 @@ mod tests {
             field_with_id("id", 1, DataType::Int32, false),
             field_with_id("note", 2, DataType::Utf8, true),
         ]));
-        let complete: iceberg::spec::NameMapping = serde_json::from_str(
-            r#"[{"field-id":1,"names":["old_id"]},{"field-id":2,"names":["old_note"]}]"#,
-        )
-        .expect("mapping");
+        let complete: novarocks_connector_iceberg::iceberg::spec::NameMapping =
+            serde_json::from_str(
+                r#"[{"field-id":1,"names":["old_id"]},{"field-id":2,"names":["old_note"]}]"#,
+            )
+            .expect("mapping");
         validate_name_mapping_for_target(&complete, &target).expect("complete mapping");
 
-        let incomplete: iceberg::spec::NameMapping =
+        let incomplete: novarocks_connector_iceberg::iceberg::spec::NameMapping =
             serde_json::from_str(r#"[{"field-id":1,"names":["old_id"]}]"#).expect("mapping");
         assert!(
             validate_name_mapping_for_target(&incomplete, &target)
                 .expect_err("incomplete mapping")
                 .contains("missing=[2]")
         );
-        let unknown: iceberg::spec::NameMapping = serde_json::from_str(
-            r#"[{"field-id":1,"names":["old_id"]},{"field-id":9,"names":["extra"]}]"#,
-        )
-        .expect("mapping");
+        let unknown: novarocks_connector_iceberg::iceberg::spec::NameMapping =
+            serde_json::from_str(
+                r#"[{"field-id":1,"names":["old_id"]},{"field-id":9,"names":["extra"]}]"#,
+            )
+            .expect("mapping");
         assert!(
             validate_name_mapping_for_target(&unknown, &target)
                 .expect_err("unknown mapping ID")

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-use iceberg::spec::{PrimitiveType, TableMetadata, Type};
+use novarocks_connector_iceberg::iceberg::spec::{PrimitiveType, TableMetadata, Type};
 
 use novarocks_spi::connector::{
     ConnectorControlResolver, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricState,
