@@ -24,8 +24,8 @@ use super::{
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
     ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsResolver,
     ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
@@ -56,6 +56,164 @@ pub trait ConnectorExecutionDistribution: Send + Sync {
         &self,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError>;
+}
+
+/// Process-local input used by a frontend composition root when a catalog
+/// attachment is created or restored. Properties are intentionally kept out of
+/// the native wire contract; the provider uses them to resolve local clients
+/// and credentials before returning a control binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorControlFactoryRequest {
+    provider_id: ConnectorProviderId,
+    instance_id: ConnectorInstanceId,
+    properties: Vec<(String, String)>,
+}
+
+impl ConnectorControlFactoryRequest {
+    pub fn try_new(
+        provider_id: ConnectorProviderId,
+        instance_id: ConnectorInstanceId,
+        properties: Vec<(String, String)>,
+    ) -> Result<Self, ConnectorError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, _) in &properties {
+            if key.trim().is_empty() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector catalog property key must not be empty",
+                ));
+            }
+            if !seen.insert(key.as_str()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("duplicate connector catalog property: {key}"),
+                ));
+            }
+        }
+        Ok(Self {
+            provider_id,
+            instance_id,
+            properties,
+        })
+    }
+
+    pub fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
+    }
+
+    pub fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
+    }
+
+    pub fn properties(&self) -> &[(String, String)] {
+        &self.properties
+    }
+
+    pub fn into_properties(self) -> Vec<(String, String)> {
+        self.properties
+    }
+}
+
+/// The result of provider-local control construction. Durable properties are
+/// the only attachment properties that the application owner may persist;
+/// credentials, tokens, and process-local client handles must never be
+/// returned in this field.
+pub struct ConnectorControlCreation {
+    binding: ConnectorControlBinding,
+    durable_properties: Vec<(String, String)>,
+}
+
+impl ConnectorControlCreation {
+    pub fn try_new(
+        request: &ConnectorControlFactoryRequest,
+        binding: ConnectorControlBinding,
+        durable_properties: Vec<(String, String)>,
+    ) -> Result<Self, ConnectorError> {
+        let descriptor = binding.descriptor();
+        if descriptor.provider_id != *request.provider_id()
+            || descriptor.instance_id != *request.instance_id()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector control factory returned a binding for a different owner",
+            ));
+        }
+        validate_durable_properties(&durable_properties)?;
+        Ok(Self {
+            binding,
+            durable_properties,
+        })
+    }
+
+    pub fn binding(&self) -> &ConnectorControlBinding {
+        &self.binding
+    }
+
+    pub fn durable_properties(&self) -> &[(String, String)] {
+        &self.durable_properties
+    }
+
+    pub fn into_parts(self) -> (ConnectorControlBinding, Vec<(String, String)>) {
+        (self.binding, self.durable_properties)
+    }
+}
+
+fn validate_durable_properties(properties: &[(String, String)]) -> Result<(), ConnectorError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, _) in properties {
+        if key.trim().is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "durable connector property key must not be empty",
+            ));
+        }
+        if !seen.insert(key.as_str()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("duplicate durable connector property: {key}"),
+            ));
+        }
+        let normalized = key.to_ascii_lowercase();
+        if [
+            "password",
+            "secret",
+            "token",
+            "credential",
+            "access-key",
+            "access_key",
+            "private-key",
+            "private_key",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("credential-like property cannot be durable: {key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Provider-owned factory for one frontend control generation.
+pub trait ConnectorControlFactory: Send + Sync {
+    fn provider_id(&self) -> &ConnectorProviderId;
+
+    fn create_control(
+        &self,
+        request: ConnectorControlFactoryRequest,
+    ) -> Result<ConnectorControlCreation, ConnectorError>;
+}
+
+/// Narrow frontend port used by Core restore and attachment code. The
+/// resolver owns provider lookup, duplicate rejection, and returned-binding
+/// validation; Core only submits this typed request.
+pub trait ConnectorControlFactoryResolver: Send + Sync {
+    fn create_control(
+        &self,
+        request: ConnectorControlFactoryRequest,
+    ) -> Result<ConnectorControlCreation, ConnectorError>;
 }
 
 /// A control-plane Connector generation. Metadata, scan planning, and
