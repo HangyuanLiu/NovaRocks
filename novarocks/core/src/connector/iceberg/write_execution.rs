@@ -128,10 +128,9 @@ impl IcebergDataWriteExecution {
             None,
         )
         .map_err(|message| error(ConnectorErrorKind::Unsupported, message))?;
-        plan.object_store_s3 = self
-            .binding
-            .write_object_store_config(&plan.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        plan.object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &plan.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let report_file_format = plan.report_file_format.clone();
         let context = plan
             .build_staged_write_context()
@@ -158,10 +157,9 @@ impl IcebergDataWriteExecution {
             request.expected_schema.clone(),
         )
         .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergEqualityDeleteBatchWriter {
@@ -185,10 +183,9 @@ impl IcebergDataWriteExecution {
         let handle =
             position_delete_handle_from_payload(request.handle.payload(), &request.expected_schema)
                 .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&handle.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &handle.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergPositionDeleteBatchWriter {
@@ -218,10 +215,9 @@ impl IcebergDataWriteExecution {
                 "deletion-vector adapter received a non-DV handle",
             ));
         }
-        let object_store_s3 = self
-            .binding
-            .write_object_store_config(&handle.data_location)
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let object_store_s3 =
+            super::provider::write_object_store_config(&self.binding, &handle.data_location)
+                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let file_io = build_staged_file_io(&handle.data_location, object_store_s3.as_ref())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Box::new(IcebergDeletionVectorBatchWriter {

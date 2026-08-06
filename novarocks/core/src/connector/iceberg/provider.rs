@@ -30,10 +30,8 @@ use bytes::Bytes;
 use novarocks_catalog::schema::SqlType;
 use novarocks_connector_iceberg::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use novarocks_fs::{
-    FileCancellation, FileError, FileErrorKind, FileIdentity, FileIoRuntime, FileReadContext,
-    FileTaskSpawner, FsAccessHandle, FsAccessResolver, ParquetMetadataInspection,
-    ParquetStatisticsSortOrder, ParquetStatisticsValue, TokioFileIoRuntime, TokioFileTaskSpawner,
-    inspect_parquet_metadata,
+    FileCancellation, FileError, FileErrorKind, FileIdentity, ParquetMetadataInspection,
+    ParquetStatisticsSortOrder, ParquetStatisticsValue, inspect_parquet_metadata,
 };
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorCatalogMutation,
@@ -422,156 +420,38 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
 /// Process-startup binding for a read-only Iceberg execution instance.
 ///
 /// This type intentionally owns only a locally-composed access binding.  It
-/// has no catalog registry or metadata capability, because BE execution must
-/// consume the fully planned provider split rather than reconnecting a
-/// catalog.
-#[derive(Clone)]
-pub struct IcebergReadBinding {
-    access_binding: String,
-    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-    access_resolver: FsAccessResolver,
-    file_runtime: Arc<dyn FileIoRuntime>,
-    file_task_spawner: Arc<dyn FileTaskSpawner>,
-}
+/// Core application adapter around the provider-owned process-local binding.
+/// Core adds only the writer-specific object-store projection below; access
+/// resolution and file-runtime ownership remain in the provider crate.
+pub use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 
-impl std::fmt::Debug for IcebergReadBinding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("IcebergReadBinding")
-            .field("access_binding", &self.access_binding)
-            .field(
-                "object_store_config",
-                &self.object_store_config.as_ref().map(|_| "<redacted>"),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl IcebergReadBinding {
-    pub fn default_binding(
-        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-    ) -> Result<Self, ConnectorError> {
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-            FALLBACK_RUNTIME
-                .get_or_init(|| {
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Iceberg fallback Tokio runtime must initialize")
-                })
-                .handle()
-                .clone()
-        });
-        Ok(Self::new(
-            object_store_config,
-            Arc::new(TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(TokioFileTaskSpawner::new(handle)),
-        ))
-    }
-
-    pub fn new(
-        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-        file_runtime: Arc<dyn FileIoRuntime>,
-        file_task_spawner: Arc<dyn FileTaskSpawner>,
-    ) -> Self {
-        Self {
-            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
-            object_store_config,
-            access_resolver: FsAccessResolver::new(),
-            file_runtime,
-            file_task_spawner,
-        }
-    }
-
-    pub(crate) fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
-        self.access_resolver
-            .resolve_location(location, self.object_store_config.as_ref())
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })
-    }
-
-    pub(crate) fn resolve_access_for_locations<I, S>(
-        &self,
-        locations: I,
-    ) -> Result<FsAccessHandle, ConnectorError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.access_resolver
-            .resolve_locations(locations, self.object_store_config.as_ref())
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })
-    }
-
-    pub(crate) fn file_read_context(
-        &self,
-        cancellation: novarocks_fs::FileCancellation,
-        deadline: std::time::Instant,
-    ) -> Result<FileReadContext, ConnectorError> {
-        Ok(FileReadContext {
-            cancellation,
-            deadline: Some(deadline),
-            runtime: Arc::clone(&self.file_runtime),
-            task_spawner: Arc::clone(&self.file_task_spawner),
-        })
-    }
-
-    pub(crate) fn file_size(
-        &self,
-        path: &str,
-        access: &FsAccessHandle,
-        context: &FileReadContext,
-    ) -> Result<u64, ConnectorError> {
-        let file = access
-            .bind_location(path, FileIdentity::new(path, 0, None))
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })?;
-        let cancellation = context.cancellation.clone();
-        context
-            .runtime
-            .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
-                    .with_retryable_before_progress()
-            })
-    }
-
-    /// Recreate provider-private writer storage configuration from the BE
-    /// startup binding. Credentials remain local to the exact incarnation.
-    pub(crate) fn write_object_store_config(
-        &self,
-        data_location: &str,
-    ) -> Result<Option<super::sink_plan::IcebergSinkObjectStoreConfig>, String> {
-        let Some(bucket) =
-            super::changes::expected_object_store_bucket_from_location(data_location)?
-        else {
-            return Ok(None);
-        };
-        let config = self.object_store_config.as_ref().ok_or_else(|| {
-            format!(
-                "Iceberg connector writer needs a startup object-store binding for bucket {bucket}"
-            )
-        })?;
-        Ok(Some(super::sink_plan::IcebergSinkObjectStoreConfig {
-            endpoint: config.endpoint.clone(),
-            bucket,
-            access_key_id: config.access_key_id.clone(),
-            access_key_secret: config.access_key_secret.clone(),
-            session_token: config.session_token.clone(),
-            region: config.region.clone(),
-            enable_path_style_access: config.enable_path_style_access,
-            retry_max_times: config.retry_max_times,
-            retry_min_delay_ms: config.retry_min_delay_ms,
-            retry_max_delay_ms: config.retry_max_delay_ms,
-            timeout_ms: config.timeout_ms,
-            io_timeout_ms: config.io_timeout_ms,
-        }))
-    }
+/// Recreate the Core writer's provider-private storage configuration from a
+/// BE startup binding. Credentials remain local to the exact incarnation.
+pub(crate) fn write_object_store_config(
+    binding: &IcebergReadBinding,
+    data_location: &str,
+) -> Result<Option<super::sink_plan::IcebergSinkObjectStoreConfig>, String> {
+    let Some(bucket) = super::changes::expected_object_store_bucket_from_location(data_location)?
+    else {
+        return Ok(None);
+    };
+    let config = binding.object_store_config().ok_or_else(|| {
+        format!("Iceberg connector writer needs a startup object-store binding for bucket {bucket}")
+    })?;
+    Ok(Some(super::sink_plan::IcebergSinkObjectStoreConfig {
+        endpoint: config.endpoint.clone(),
+        bucket,
+        access_key_id: config.access_key_id.clone(),
+        access_key_secret: config.access_key_secret.clone(),
+        session_token: config.session_token.clone(),
+        region: config.region.clone(),
+        enable_path_style_access: config.enable_path_style_access,
+        retry_max_times: config.retry_max_times,
+        retry_min_delay_ms: config.retry_min_delay_ms,
+        retry_max_delay_ms: config.retry_max_delay_ms,
+        timeout_ms: config.timeout_ms,
+        io_timeout_ms: config.io_timeout_ms,
+    }))
 }
 
 /// Startup-composed installer for Iceberg read-only instances.  The payload
@@ -618,7 +498,7 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
                 ),
             ));
         }
-        if payload.access_binding != self.binding.access_binding {
+        if payload.access_binding != self.binding.access_binding() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg declaration access binding does not match BE startup binding",
