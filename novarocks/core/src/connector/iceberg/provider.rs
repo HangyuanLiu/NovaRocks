@@ -2231,7 +2231,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
                     };
                     let loaded = load_table(&entry, &table.namespace, &table.table)
                         .map_err(map_iceberg_error)?;
-                    let action = lower_ref_action(
+                    let action = novarocks_connector_iceberg::commit::lower_ref_action(
                         action,
                         loaded.table.metadata(),
                         &table.namespace,
@@ -3530,124 +3530,6 @@ pub(crate) fn lower_partition(
         ConnectorPartitionTransform::Void { column } => IcebergPartitionFieldExpr::Void {
             column: column.to_string(),
         },
-    })
-}
-
-fn lower_ref_action(
-    action: novarocks_spi::connector::ConnectorRefAction,
-    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-    namespace: &str,
-    table: &str,
-    catalog: &str,
-) -> Result<novarocks_connector_iceberg::commit::RefActionPlan, ConnectorError> {
-    use novarocks_spi::connector::{ConnectorRefAction, ConnectorRefKind};
-
-    fn assert_kind(
-        metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
-        name: &str,
-        expected: ConnectorRefKind,
-    ) -> Result<(), ConnectorError> {
-        let Some(existing) = metadata.refs().get(name) else {
-            return Ok(());
-        };
-        let actual = match existing.retention {
-            novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Branch { .. } => {
-                ConnectorRefKind::Branch
-            }
-            novarocks_connector_iceberg::iceberg::spec::SnapshotRetention::Tag { .. } => {
-                ConnectorRefKind::Tag
-            }
-        };
-        if actual == expected {
-            return Ok(());
-        }
-        Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            format!("Iceberg ref `{name}` has a different kind"),
-        ))
-    }
-
-    let action = match action {
-        ConnectorRefAction::Create {
-            kind,
-            name,
-            snapshot_id,
-            policy,
-        } => {
-            if name.eq_ignore_ascii_case("main") {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg ref `main` is reserved",
-                ));
-            }
-            assert_kind(metadata, &name, kind)?;
-            let snapshot_id = match snapshot_id.or_else(|| metadata.current_snapshot_id()) {
-                Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_some() => snapshot_id,
-                _ => {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::NotFound,
-                        "Iceberg ref create requires an existing snapshot",
-                    ));
-                }
-            };
-            let (replace, if_not_exists) = match policy {
-                CreateOrReplacePolicy::FailIfExists => (false, false),
-                CreateOrReplacePolicy::NoOpIfExists => (false, true),
-                CreateOrReplacePolicy::ReplaceIfExists => (true, false),
-            };
-            match kind {
-                ConnectorRefKind::Branch => {
-                    novarocks_connector_iceberg::commit::RefAction::CreateBranch {
-                        name: name.to_string(),
-                        snapshot_id,
-                        replace,
-                        if_not_exists,
-                    }
-                }
-                ConnectorRefKind::Tag => {
-                    novarocks_connector_iceberg::commit::RefAction::CreateTag {
-                        name: name.to_string(),
-                        snapshot_id,
-                        replace,
-                        if_not_exists,
-                    }
-                }
-            }
-        }
-        ConnectorRefAction::Drop { kind, name, policy } => {
-            if name.eq_ignore_ascii_case("main") {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg ref `main` is reserved",
-                ));
-            }
-            assert_kind(metadata, &name, kind)?;
-            let if_exists = policy == DropPolicy::NoOpIfMissing;
-            match kind {
-                ConnectorRefKind::Branch => {
-                    novarocks_connector_iceberg::commit::RefAction::DropBranch {
-                        name: name.to_string(),
-                        if_exists,
-                    }
-                }
-                ConnectorRefKind::Tag => novarocks_connector_iceberg::commit::RefAction::DropTag {
-                    name: name.to_string(),
-                    if_exists,
-                },
-            }
-        }
-        ConnectorRefAction::FastForwardBranch { .. } => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "guarded MV publication bypassed its provider commit path",
-            ));
-        }
-    };
-    Ok(novarocks_connector_iceberg::commit::RefActionPlan {
-        catalog: catalog.to_string(),
-        namespace: namespace.to_string(),
-        table: table.to_string(),
-        action,
     })
 }
 

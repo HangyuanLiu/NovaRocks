@@ -25,4 +25,6 @@ pub mod ref_action;
 pub mod statistics;
 
 pub use abort::{AbortLog, CleanupError};
-pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
+pub use ref_action::{
+    RefAction, RefActionOutcome, RefActionPlan, execute_ref_action, lower_ref_action,
+};
