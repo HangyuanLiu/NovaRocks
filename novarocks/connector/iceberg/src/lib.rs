@@ -32,6 +32,7 @@ pub mod default_value;
 pub mod delete_file;
 pub mod delta;
 pub mod file_reader;
+pub mod fs_io;
 pub mod ref_snapshot;
 pub mod scan_model;
 pub mod theta_sketch;

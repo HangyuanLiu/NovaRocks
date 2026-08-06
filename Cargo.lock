@@ -3238,6 +3238,7 @@ name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "datasketches",
  "iceberg",
@@ -3252,6 +3253,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "typetag",
  "uuid",
 ]
 
