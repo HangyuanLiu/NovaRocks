@@ -54,9 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::connector::iceberg::commit::mv_refresh_ref::{
-    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP,
-};
+use novarocks_connector_iceberg::commit::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
 
 pub const MV_PROVENANCE_V1_PROP: &str = "novarocks.mv.provenance.v1";
 pub const MV_PROVENANCE_VERSION: u16 = 1;

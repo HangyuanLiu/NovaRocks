@@ -21,10 +21,16 @@
 //! depend on Core SQL, execution, or application state.
 
 pub mod abort;
+pub mod mv_refresh_ref;
 pub mod ref_action;
 pub mod statistics;
 
 pub use abort::{AbortLog, CleanupError};
+pub use mv_refresh_ref::{
+    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
+    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
+    snapshot_matches_refresh_marker,
+};
 pub use ref_action::{
     RefAction, RefActionOutcome, RefActionPlan, execute_ref_action, lower_ref_action,
 };

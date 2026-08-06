@@ -30,7 +30,6 @@ pub mod expire_snapshots;
 mod fast_append;
 mod helpers;
 pub(crate) mod mv_provenance;
-mod mv_refresh_ref;
 mod overwrite;
 mod overwrite_partitions;
 mod position_delete_writer;
@@ -61,7 +60,7 @@ pub use data_file::written_file_to_iceberg_data_file;
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use fast_append::FastAppendCommit;
 pub(crate) use fast_append::{StagedFastAppendAction, build_staged_fast_append_action};
-pub use mv_refresh_ref::{
+pub use novarocks_connector_iceberg::commit::{
     MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
     MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
     snapshot_matches_refresh_marker,
