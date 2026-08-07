@@ -705,6 +705,15 @@ Use the generic skills-only plugin under `.agents/skills/dev-workflow/`:
 - `dev-workflow-finish`: publish and archive only when authorized.
 
 Codex discovers the project-local skill sources directly under `.agents/skills/`.
+Claude Code loads the same bundle as a project plugin via
+`.agents/skills/dev-workflow/.claude-plugin/` (`plugin.json` plus a
+self-hosting `marketplace.json`), registered through
+`extraKnownMarketplaces`/`enabledPlugins` in `.claude/settings.json` —
+analogous to how the `adr` skill is exposed via the `.claude/skills/adr`
+symlink. Claude Code resolves that plugin path against the primary checkout,
+not a nested `.claude/worktrees/<name>` worktree, so a plugin-manifest change
+only takes effect for worktree sessions once the primary checkout has it
+(e.g. after merge).
 
 Do not skip the accepted-design and approved-plan gates. Sub-agents are allowed
 in every stage when they provide useful parallel investigation, independent
