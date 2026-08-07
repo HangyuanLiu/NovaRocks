@@ -681,8 +681,8 @@ Durable design decisions, philosophies, and their honestly-recorded trade-offs l
 Before changing architecture-level behavior, check the index for the affected domain.
 Any PR that embodies a new design decision or accepts a compromise must add or
 supersede an ADR — use the `/adr` skill (`.agents/skills/adr/`, exposed directly
-to Codex and to Claude Code via the `.claude/skills/adr` symlink), which embeds the
-template, numbering, supersede, and collision-renumbering rules.
+to Codex and to Claude Code via the `.claude/skills` → `.agents/skills` symlink),
+which embeds the template, numbering, supersede, and collision-renumbering rules.
 
 ---
 

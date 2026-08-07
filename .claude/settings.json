@@ -13,5 +13,16 @@
         ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "novarocks-dev-workflow": {
+      "source": {
+        "source": "directory",
+        "path": "./.agents/skills/dev-workflow"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "dev-workflow@novarocks-dev-workflow": true
   }
 }
