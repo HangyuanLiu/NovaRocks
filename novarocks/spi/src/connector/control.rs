@@ -27,9 +27,9 @@ use super::{
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
     ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
-    ConnectorWriteResolver,
+    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -812,6 +812,27 @@ impl ConnectorControlPlanningLease {
             drop(retained_planning_lease)
         })
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
+    }
+
+    /// Derive a statistics lease from this retained control generation.
+    ///
+    /// Statistics collection first asks the provider to pin a data version and
+    /// then executes a normal connector read.  Both operations must therefore
+    /// be fenced by the same generation; acquiring a new statistics or
+    /// planning lease between them could silently mix provider incarnations.
+    pub fn derive_statistics_lease(&self) -> Result<ConnectorStatisticsLease, ConnectorError> {
+        let statistics = self.binding.statistics().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no statistics capability",
+            )
+        })?;
+        let descriptor = self.binding.descriptor().clone();
+        let incarnation = self.binding.incarnation();
+        let retained_planning_lease = self.clone();
+        ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
+            drop(retained_planning_lease)
+        })
     }
 
     /// Derive a catalog-mutation lease from this retained planning generation.

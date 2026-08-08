@@ -35,9 +35,9 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlResolver,
-    ConnectorReadSelector, ConnectorRequestContext, ConnectorSplitPlanningRequest,
-    ConnectorStatisticsLease, StatisticsCollectionPlan, StatisticsCollectionResult,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlPlanningLease,
+    ConnectorControlResolver, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorSplitPlanningRequest, StatisticsCollectionPlan, StatisticsCollectionResult,
     StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
     StatisticsMetricRequest, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
     StatisticsMissingKind, StatisticsProvenance,
@@ -215,31 +215,12 @@ impl StatisticsCollectionProgram {
 /// connector generation live until the normal execution-binding barrier has
 /// consumed the declaration.
 pub(crate) fn prepare_statistics_connector_read(
-    controls: &dyn ConnectorControlResolver,
+    lease: ConnectorControlPlanningLease,
     topology: &BackendTopologySnapshot,
     program: &StatisticsCollectionProgram,
     context: ConnectorRequestContext,
-    expected_statistics_lease: Option<&ConnectorStatisticsLease>,
 ) -> Result<PlannedConnectorRead, DistributedQueryError> {
-    let target_parallelism = NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
-        DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "statistics collection requires at least one live backend",
-        )
-    })?;
-    let lease = controls
-        .acquire_current(program.plan.table().owner())
-        .map_err(connector_planning_error)?;
-    if let Some(expected) = expected_statistics_lease {
-        if lease.binding().descriptor() != expected.descriptor()
-            || lease.binding().incarnation() != expected.incarnation()
-        {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Rejected,
-                "statistics connector generation changed after collection preparation; retry against a new table pin",
-            ));
-        }
-    }
+    let target_parallelism = statistics_target_parallelism(topology)?;
     if lease.binding().descriptor().instance_id != *program.plan.table().owner() {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
@@ -312,6 +293,17 @@ pub(crate) fn prepare_statistics_connector_read(
     })
 }
 
+fn statistics_target_parallelism(
+    topology: &BackendTopologySnapshot,
+) -> Result<NonZeroUsize, DistributedQueryError> {
+    NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "statistics collection requires at least one live backend",
+        )
+    })
+}
+
 /// Compile an already-pinned connector statistics program into a normal
 /// native distributed request.  Preparation receives the opaque read produced
 /// above through a one-shot resolver; it cannot reopen the provider catalog or
@@ -324,14 +316,13 @@ pub(crate) fn build_statistics_collection_request(
     execution: &crate::query_execution::request_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     program: StatisticsCollectionProgram,
-    expected_statistics_lease: Option<&ConnectorStatisticsLease>,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
     let read = prepare_statistics_connector_read(
-        controls,
+        planning_lease,
         execution.topology(),
         &program,
         context.clone(),
-        expected_statistics_lease,
     )?;
     let table_bindings = Arc::new(
         crate::engine::query_planning::bindings::QueryTableBindingStore::try_new()
@@ -1868,16 +1859,7 @@ mod tests {
 
     #[test]
     fn connector_preparation_rejects_empty_topology_without_local_fallback() {
-        let resolver = crate::connector::FixtureControlResolver::new(
-            crate::connector::ConnectorRegistry::new(),
-        );
-        let error = match prepare_statistics_connector_read(
-            &resolver,
-            &BackendTopologySnapshot::empty(7),
-            &program_for_preparation(),
-            connector_context(),
-            None,
-        ) {
+        let error = match statistics_target_parallelism(&BackendTopologySnapshot::empty(7)) {
             Ok(_) => panic!("statistics collection cannot run without a live backend"),
             Err(error) => error,
         };
