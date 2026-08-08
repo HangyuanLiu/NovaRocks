@@ -53,9 +53,9 @@ pub mod deployment {
 }
 
 pub mod exec {
-    pub use crate::runtime_filter::exec::{
-        membership_delta, membership_predicate, ordered_range_predicate,
-    };
+    pub use crate::runtime_filter::exec::membership_delta;
+    #[cfg(test)]
+    pub use crate::runtime_filter::exec::{membership_predicate, ordered_range_predicate};
 }
 
 pub mod materializer {
