@@ -313,7 +313,7 @@ fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
         Err(error) => error,
     };
     assert!(
-        error.contains("snapshot 12 has no admitted file set"),
+        error.contains("snapshot 12 has no admitted connector materialization"),
         "{error}"
     );
 }

@@ -8790,6 +8790,17 @@ fn planned_table_files_fixture_binding(
     }
 
     fn fixture_read_schema_for_table(table: &str) -> SchemaRef {
+        if table == "mv_branch_target" {
+            return Arc::new(Schema::new(vec![
+                Field::new("__branch_id__", DataType::Int32, false),
+                Field::new("__nova_join_row_key", DataType::Utf8, false),
+                Field::new("__nova_base_row_id", DataType::Int64, false),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ]));
+        }
         if matches!(table, "l" | "r" | "mv") {
             return Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),

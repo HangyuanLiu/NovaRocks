@@ -146,10 +146,17 @@ fn fragment_build_reports_missing_delta_resolver_before_encoding() {
         },
     );
 
+    let connectors = ConnectorRegistry::new();
+    crate::connector::iceberg::provider::register_planned_files_fixture(
+        &connectors,
+        "test_catalog",
+        Vec::new(),
+        None,
+    );
     let err = match build_for_test(TestBuildRequest::result(
         &plan,
         &EmptyCatalog,
-        &ConnectorRegistry::new(),
+        &connectors,
         None,
     )) {
         Ok(_) => panic!("delta scan without resolver must fail during preparation"),

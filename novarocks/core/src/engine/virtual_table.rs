@@ -527,6 +527,8 @@ mod tests {
             .expect("registry lock")
             .create_catalog(catalog_name, &properties)
             .expect("register catalog");
+        crate::engine::register_iceberg_control_binding(&state, catalog_name)
+            .expect("register catalog control binding");
         let _ = entry;
         state
     }
@@ -617,6 +619,7 @@ mod tests {
         let state = Arc::new(StandaloneState {
             catalog_service: Arc::clone(&base_state.catalog_service),
             iceberg_catalogs: Arc::clone(&base_state.iceberg_catalogs),
+            connector_control: Arc::clone(&base_state.connector_control),
             system_catalog: Arc::new(EchoSchemaNames::default()),
             ..StandaloneState::default()
         });

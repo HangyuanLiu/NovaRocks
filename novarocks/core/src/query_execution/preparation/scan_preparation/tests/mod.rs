@@ -119,11 +119,8 @@ fn fixture_query_table_bindings_with_materialized_files(
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),
     );
-    if matches!(
-        source.kind,
-        SqlScanKind::ConnectorRead | SqlScanKind::Delta { .. }
-    ) {
-        // These source kinds are supplied by their dedicated resolver tests;
+    if matches!(source.kind, SqlScanKind::ConnectorRead) {
+        // This source kind is supplied by its dedicated resolver tests;
         // no catalog admission is expected before resolver dispatch.
         return store;
     }
@@ -133,6 +130,11 @@ fn fixture_query_table_bindings_with_materialized_files(
                 .expect("fixture catalog must be a valid connector instance"),
         )
         .ok();
+    if planning_lease.is_none() && matches!(&source.kind, SqlScanKind::Delta { .. }) {
+        // Resolver-only negative tests deliberately omit connector admission so
+        // they can assert the resolver error before generic read planning.
+        return store;
+    }
     let source = source.clone();
     let planner = scan.table.clone();
 
