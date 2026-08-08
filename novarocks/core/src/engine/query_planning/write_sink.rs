@@ -27,9 +27,7 @@ use std::collections::BTreeMap;
 use arrow::datatypes::DataType;
 use novarocks_catalog::schema::ColumnDef;
 
-use super::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
-};
+use super::bindings::{QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore};
 use crate::sql::analysis::TypedExpr;
 use crate::sql::binding::SqlTableBindingId;
 use crate::sql::planner::distributed::write::contract::{

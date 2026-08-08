@@ -75,6 +75,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
             projection,
             static_predicates: Vec::new(),
             selector: ConnectorReadSelector::Current,
+            purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
             limit: None,
             batch,
             context: context.clone(),

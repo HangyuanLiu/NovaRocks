@@ -665,7 +665,11 @@ fn validate_resolved_execution_kind(
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(execution, ResolvedScanExecution::IcebergFiles(_))
+                matches!(
+                    execution,
+                    ResolvedScanExecution::IcebergFiles(_)
+                        | ResolvedScanExecution::AdmittedConnectorRead(_)
+                )
             }
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
                 matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
@@ -685,7 +689,9 @@ fn validate_resolved_execution_kind(
                 "IcebergFiles or AdmittedConnectorRead"
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => "IcebergFiles",
+            | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+                "IcebergFiles or AdmittedConnectorRead"
+            }
         },
     };
     Err(format!(
@@ -711,9 +717,10 @@ fn reject_target_equality_deletes(
         _ => return Ok(()),
     };
     let ResolvedScanExecution::IcebergFiles(files) = execution else {
-        return Err(format!(
-            "Iceberg {target_kind} scan node_id={node_id} requires IcebergFiles execution"
-        ));
+        // Query-local neutral reads are deliberately opaque to Core. The
+        // provider validates any delete visibility encoded in the handle
+        // while planning its split set.
+        return Ok(());
     };
     if files.files.iter().any(|file| {
         file.delete_files.iter().any(|delete| {

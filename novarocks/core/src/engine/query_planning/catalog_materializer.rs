@@ -455,9 +455,6 @@ mod tests {
     use super::*;
     use crate::sql::catalog::PlannerTableProvider;
     use crate::sql::planner::table::ScanSource;
-    use novarocks_connector_iceberg::scan_model::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
-    };
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         SqlTableBindingId::new(
@@ -487,18 +484,6 @@ mod tests {
     }
 
     fn frozen_overlay_binding(binding: SqlTableBindingId) -> QueryTableBinding {
-        let table = IcebergTableInfo {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: "orders".to_string(),
-            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            current_snapshot_id: Some(7),
-            schema_id: 1,
-            location: "file:///tmp/orders".to_string(),
-            schema: IcebergSchemaDef { fields: vec![] },
-            serialized_metadata: None,
-            serialized_metadata_rows: None,
-        };
         let planner = TableDef {
             name: "__nr_cow_orders".to_string(),
             columns: vec![],
@@ -519,11 +504,7 @@ mod tests {
             resolved: ResolvedAnalyzerTable::from_planner(Some("ice"), "db", planner),
             statistics_pin: None,
             planning_lease: None,
-            scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                table,
-                files: vec![],
-                binding: IcebergDataFileBinding::ExplicitFiles,
-            }),
+            scan_materialization: None,
             iceberg_write_table: None,
             mv_target_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
@@ -635,12 +616,13 @@ mod tests {
             source.kind,
             crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
         ));
-        assert!(matches!(
+        assert!(
             bindings
                 .scan_materialization(source.binding)
-                .expect("binding materialization"),
-            Some(QueryScanMaterialization::IcebergDataFiles { .. })
-        ));
+                .expect("binding materialization")
+                .is_none(),
+            "analysis-only overlays do not manufacture a provider read handle"
+        );
         assert!(
             service
                 .local()

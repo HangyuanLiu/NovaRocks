@@ -564,6 +564,7 @@ fn installed_iceberg_instance_reads_a_planned_split_without_catalog_metadata() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -732,6 +733,7 @@ fn iceberg_instance_resolves_metadata_and_plans_a_snapshot_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -817,6 +819,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
@@ -930,6 +933,7 @@ fn drop_recreate_with_same_snapshot_id_rejects_stale_split() {
                 projection: vec![0],
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch: ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),

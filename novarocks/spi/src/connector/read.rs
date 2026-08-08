@@ -39,6 +39,17 @@ pub enum ConnectorReadSelector {
     TimestampMicros(i64),
 }
 
+/// SQL-owned intent for a provider-neutral read. Providers may use this to
+/// reject read handles that are valid for ordinary scans but unsafe for a
+/// specialized consumer, without exposing provider payloads to Core.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConnectorReadPurpose {
+    #[default]
+    Query,
+    MvTargetState,
+    MvTargetLocator,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorBatchBudget {
     pub max_rows: NonZeroUsize,
@@ -50,6 +61,7 @@ pub struct ConnectorBeginScanRequest {
     pub projection: Vec<usize>,
     pub static_predicates: Vec<ConnectorStaticPredicate>,
     pub selector: ConnectorReadSelector,
+    pub purpose: ConnectorReadPurpose,
     pub limit: Option<u64>,
     pub batch: ConnectorBatchBudget,
     pub context: ConnectorRequestContext,

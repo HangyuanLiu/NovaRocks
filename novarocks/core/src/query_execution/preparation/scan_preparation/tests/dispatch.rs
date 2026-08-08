@@ -17,7 +17,10 @@
 
 use super::super::collect_scan_bindings;
 use super::*;
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution,
+};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -92,10 +95,20 @@ impl ScanBindingResolver for JoinRefreshDeltaResolver {
 fn collect_coalesce_scan_tables(
     node: &crate::sql::planner::distributed::DistributedNode,
     scans: &mut std::collections::BTreeMap<String, crate::sql::planner::table::TableDef>,
+    frozen_snapshots: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<i64>>,
     node_ids: &mut Vec<i32>,
 ) {
     if let DistributedNodeKind::Scan(scan) = &node.payload {
         let ScanSource::Sql(source) = &scan.table.source;
+        if let crate::sql::planner::table::SqlScanKind::FrozenInputSet {
+            version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
+        } = &source.kind
+        {
+            frozen_snapshots
+                .entry(source.table.table.clone())
+                .or_default()
+                .insert(*snapshot_id);
+        }
         let previous = scans.insert(source.table.table.clone(), scan.table.clone());
         if let Some(previous) = previous {
             let ScanSource::Sql(previous) = &previous.source;
@@ -113,41 +126,33 @@ fn collect_coalesce_scan_tables(
         node_ids.push(node.node_id);
     }
     for child in &node.children {
-        collect_coalesce_scan_tables(child, scans, node_ids);
+        collect_coalesce_scan_tables(child, scans, frozen_snapshots, node_ids);
     }
 }
 
-fn coalesce_iceberg_table(
+fn coalesce_materialization(
     table: &crate::sql::planner::table::TableDef,
-    table_uuid: Option<&str>,
-    current_snapshot_id: Option<i64>,
-) -> IcebergTableInfo {
-    IcebergTableInfo {
-        catalog: "ice".to_string(),
-        namespace: "db".to_string(),
-        table: table.name.clone(),
-        table_uuid: table_uuid.map(str::to_string),
-        current_snapshot_id,
-        schema_id: 1,
-        location: format!("s3://sqlx2-coalesce/{}", table.name),
-        schema: IcebergSchemaDef {
-            fields: table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(ordinal, column)| IcebergSchemaFieldDef {
-                    field_id: i32::try_from(ordinal + 1).expect("coalesce fixture schema field id"),
-                    name: column.name.clone(),
-                    initial_default: None,
-                    write_default: None,
-                    initial_default_json: None,
-                    write_default_json: None,
-                    children: Vec::new(),
-                })
-                .collect(),
-        },
-        serialized_metadata: None,
-        serialized_metadata_rows: None,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+) -> crate::engine::query_planning::bindings::QueryScanMaterialization {
+    let metadata = planning_lease
+        .binding()
+        .metadata()
+        .load_table(ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse("ice").expect("fixture catalog"),
+                namespace: Arc::from("db"),
+                table: Arc::from(table.name.as_str()),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: crate::connector::test_request_context(),
+        })
+        .expect("fixture read admission");
+    crate::engine::query_planning::bindings::QueryScanMaterialization {
+        table: metadata.table,
+        schema: metadata.schema,
+        selector: ConnectorReadSelector::Current,
+        statistics_pin: None,
+        planning_lease,
     }
 }
 
@@ -155,7 +160,38 @@ fn coalesce_binding(
     table: crate::sql::planner::table::TableDef,
     materialization: crate::engine::query_planning::bindings::QueryScanMaterialization,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    frozen_snapshot_ids: &std::collections::BTreeSet<i64>,
 ) -> crate::engine::query_planning::bindings::QueryTableBinding {
+    let mv_target_read = match &table.source {
+        ScanSource::Sql(source) => match &source.kind {
+            crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => Some(
+                crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                    full: materialization.clone(),
+                    affected_partitions: materialization.clone(),
+                    target_table_uuid: facts.target_table_uuid.clone(),
+                    frozen_snapshot_id: facts.target_snapshot_id,
+                },
+            ),
+            crate::sql::planner::table::SqlScanKind::MvTargetLocator { facts } => Some(
+                crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                    full: materialization.clone(),
+                    affected_partitions: materialization.clone(),
+                    target_table_uuid: facts.target_table_uuid.clone(),
+                    frozen_snapshot_id: facts.target_snapshot_id,
+                },
+            ),
+            _ => None,
+        },
+        _ => None,
+    };
+    let frozen_snapshot_materializations = frozen_snapshot_ids
+        .iter()
+        .map(|snapshot_id| {
+            let mut frozen = materialization.clone();
+            frozen.selector = ConnectorReadSelector::SnapshotId(*snapshot_id);
+            (*snapshot_id, frozen)
+        })
+        .collect();
     crate::engine::query_planning::bindings::QueryTableBinding {
         resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
             Some("ice"),
@@ -166,8 +202,8 @@ fn coalesce_binding(
         planning_lease: Some(planning_lease),
         scan_materialization: Some(materialization),
         iceberg_write_table: None,
-        mv_target_read: None,
-        frozen_snapshot_materializations: std::collections::BTreeMap::new(),
+        mv_target_read,
+        frozen_snapshot_materializations,
         delta_runtime_plans: std::collections::BTreeMap::new(),
     }
 }
@@ -191,9 +227,15 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         .expect("coalesce fixture distributed plan");
 
     let mut scan_tables = std::collections::BTreeMap::new();
+    let mut frozen_snapshots = std::collections::BTreeMap::new();
     let mut scan_node_ids = Vec::new();
     for fragment in distributed.fragments() {
-        collect_coalesce_scan_tables(&fragment.root, &mut scan_tables, &mut scan_node_ids);
+        collect_coalesce_scan_tables(
+            &fragment.root,
+            &mut scan_tables,
+            &mut frozen_snapshots,
+            &mut scan_node_ids,
+        );
     }
     assert_eq!(scan_node_ids.len(), 9, "coalesce fixture scan count");
     assert_eq!(scan_tables.len(), 3, "coalesce fixture binding identities");
@@ -209,6 +251,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     let lease = controls
         .acquire_current(&ConnectorInstanceId::parse("ice").expect("fixture connector"))
         .expect("fixture planning lease");
+    let no_frozen_snapshots = std::collections::BTreeSet::new();
 
     let left = scan_tables.remove("l").expect("left base scan");
     let left_id = bindings
@@ -216,12 +259,9 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
             assert_eq!(id, tokens.left);
             Ok(coalesce_binding(
                 left.clone(),
-                QueryScanMaterialization::IcebergDataFiles {
-                    table: coalesce_iceberg_table(&left, Some("uuid-l"), Some(22)),
-                    files: vec![data_file("s3://sqlx2-coalesce/l.parquet")],
-                    binding: IcebergDataFileBinding::CurrentSnapshot,
-                },
+                coalesce_materialization(&left, lease.clone()),
                 lease.clone(),
+                frozen_snapshots.get("l").unwrap_or(&no_frozen_snapshots),
             ))
         })
         .expect("left binding");
@@ -231,12 +271,9 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
             assert_eq!(id, tokens.right);
             Ok(coalesce_binding(
                 right.clone(),
-                QueryScanMaterialization::IcebergDataFiles {
-                    table: coalesce_iceberg_table(&right, Some("uuid-r"), Some(44)),
-                    files: vec![data_file("s3://sqlx2-coalesce/r.parquet")],
-                    binding: IcebergDataFileBinding::CurrentSnapshot,
-                },
+                coalesce_materialization(&right, lease.clone()),
                 lease.clone(),
+                frozen_snapshots.get("r").unwrap_or(&no_frozen_snapshots),
             ))
         })
         .expect("right binding");
@@ -248,17 +285,9 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
                 assert_eq!(id, tokens.target);
                 Ok(coalesce_binding(
                     target.clone(),
-                    QueryScanMaterialization::IcebergMvTarget {
-                        table: coalesce_iceberg_table(&target, Some("uuid-tgt"), Some(99)),
-                        files: vec![data_file("s3://sqlx2-coalesce/mv.parquet")],
-                        binding: IcebergDataFileBinding::CurrentSnapshot,
-                        target_table_uuid: "uuid-tgt".to_string(),
-                        frozen_snapshot_id: Some(99),
-                        target_state_partition_filter:
-                            crate::mv::model::TargetPartitionFilter::None,
-                        target_partition_contract: None,
-                    },
+                    coalesce_materialization(&target, lease.clone()),
                     lease.clone(),
+                    frozen_snapshots.get("mv").unwrap_or(&no_frozen_snapshots),
                 ))
             },
         )
@@ -395,6 +424,20 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                         version: crate::sql::planner::table::SqlTableVersionSelector::Current,
                     },
                 ));
+                let metadata = lease
+                    .binding()
+                    .metadata()
+                    .load_table(ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: ConnectorInstanceId::parse(&table.catalog)
+                                .expect("fixture catalog instance"),
+                            namespace: Arc::from(table.namespace.as_str()),
+                            table: Arc::from(table.table.as_str()),
+                        },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: crate::connector::test_request_context(),
+                    })
+                    .expect("fixture read admission");
                 let binding = crate::engine::query_planning::bindings::QueryTableBinding {
                     resolved: crate::sql::catalog::ResolvedAnalyzerTable::from_planner(
                         Some(&table.catalog),
@@ -404,10 +447,12 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                     statistics_pin: None,
                     planning_lease: Some(lease.clone()),
                     scan_materialization: Some(
-                        crate::engine::query_planning::bindings::QueryScanMaterialization::IcebergDataFiles {
-                            table: table.clone(),
-                            files: vec![data_file("s3://bucket/stale-plan-carrier.parquet")],
-                            binding: IcebergDataFileBinding::CurrentSnapshot,
+                        crate::engine::query_planning::bindings::QueryScanMaterialization {
+                            table: metadata.table,
+                            schema: metadata.schema,
+                            selector: ConnectorReadSelector::Current,
+                            statistics_pin: None,
+                            planning_lease: lease.clone(),
                         },
                     ),
                     iceberg_write_table: None,

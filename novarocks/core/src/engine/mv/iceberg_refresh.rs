@@ -21674,13 +21674,16 @@ mod tests {
             .expect("frozen overlay must retain planning lease");
         assert_eq!(lease.binding().incarnation(), original_incarnation);
         assert_ne!(lease.binding().incarnation(), replacement_incarnation);
-        let Some(QueryScanMaterialization::IcebergDataFiles { table, .. }) = bindings
+        let Some(materialization) = bindings
             .scan_materialization(source.binding)
             .expect("read frozen overlay materialization")
         else {
-            panic!("frozen overlay must retain Iceberg data-file facts");
+            panic!("frozen overlay must retain a connector read handle");
         };
-        assert_eq!(table.current_snapshot_id, Some(frozen_snapshot_id));
+        assert_eq!(
+            materialization.selector,
+            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(frozen_snapshot_id)
+        );
     }
 
     fn create_mv_and_refresh_once(

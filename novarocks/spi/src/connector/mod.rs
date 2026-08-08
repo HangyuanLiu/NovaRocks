@@ -149,9 +149,9 @@ pub use predicate::{
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
-    ConnectorOpenReaderRequest, ConnectorReadSelector, ConnectorReaderMetricsSnapshot,
-    ConnectorScan, ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult,
+    ConnectorOpenReaderRequest, ConnectorReadPurpose, ConnectorReadSelector,
+    ConnectorReaderMetricsSnapshot, ConnectorScan, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
 };
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,

@@ -80,8 +80,8 @@ fn prepare_scan_bindings_with_materialized_files(
 }
 
 /// The shared fixture deliberately allocates the same token that the SQL
-/// test scan carrier embeds.  Concrete Iceberg files remain in the
-/// application-owned store, never in `TableDef::source`.
+/// test scan carrier embeds. Concrete Iceberg files remain in the
+/// provider-owned opaque handle, never in `TableDef::source`.
 fn fixture_query_table_bindings(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
@@ -96,7 +96,7 @@ fn fixture_query_table_bindings(
 fn fixture_query_table_bindings_with_materialized_files(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-    materialized_files: Vec<IcebergDataFileInfo>,
+    _materialized_files: Vec<IcebergDataFileInfo>,
 ) -> crate::engine::query_planning::bindings::QueryTableBindingStore {
     use crate::engine::query_planning::bindings::{
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
@@ -124,7 +124,6 @@ fn fixture_query_table_bindings_with_materialized_files(
         .ok();
     let source = source.clone();
     let planner = scan.table.clone();
-    let materialized_table = iceberg_table_for_planner(&planner);
 
     let store = QueryTableBindingStore::try_new_with_scope_for_test(
         NonZeroU64::new(1).expect("fixture scope"),

@@ -36,9 +36,7 @@ use crate::sql::planner::table::{
     SqlUkFkTableFacts,
 };
 use arrow::datatypes::SchemaRef;
-use novarocks_connector_iceberg::scan_model::{
-    IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
-};
+use novarocks_connector_iceberg::scan_model::IcebergTableInfo;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
 };

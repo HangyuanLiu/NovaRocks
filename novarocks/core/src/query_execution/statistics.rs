@@ -244,6 +244,7 @@ pub(crate) fn prepare_statistics_connector_read(
                 projection: program.plan.scan_projection(),
                 static_predicates: Vec::new(),
                 selector: ConnectorReadSelector::Current,
+                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
                 limit: None,
                 batch,
                 context: context.clone(),

@@ -48,7 +48,7 @@ use novarocks_spi::connector::{
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest,
     ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference, ConnectorReadPurpose,
     ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
     ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
@@ -97,6 +97,10 @@ use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
     IcebergPhysicalPredicateOp, IcebergPhysicalPredicateValue,
+};
+#[cfg(test)]
+use novarocks_connector_iceberg::scan_model::{
+    IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -4783,6 +4787,26 @@ impl ConnectorScanPlanning for IcebergControlProvider {
         let mut table = self.table_payload(table)?;
         let entry = self.entry(self.instance_id.as_str())?;
         self.hydrate_frozen_rewrite_source(&entry, &mut table)?;
+        if let Some(target_kind) = match request.purpose {
+            ConnectorReadPurpose::MvTargetState => Some("target-state"),
+            ConnectorReadPurpose::MvTargetLocator => Some("target-locator"),
+            ConnectorReadPurpose::Query => None,
+        } {
+            let files = table
+                .explicit_files
+                .as_deref()
+                .unwrap_or(&table.prepared_files);
+            if files.iter().any(|file| {
+                file.delete_files
+                    .iter()
+                    .any(|delete| delete.file_content == IcebergDeleteFileContent::Equality)
+            }) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("Iceberg {target_kind} scan does not support equality deletes yet"),
+                ));
+            }
+        }
         let output_schema = match table
             .frozen_rewrite
             .as_ref()
@@ -6952,6 +6976,7 @@ fn plan_native_iceberg_read_with_bound_lease(
                     })
                     .map(ConnectorReadSelector::SnapshotId)
                     .unwrap_or(ConnectorReadSelector::Current),
+                purpose: ConnectorReadPurpose::Query,
                 limit: None,
                 batch: novarocks_spi::connector::ConnectorBatchBudget {
                     max_rows: NonZeroUsize::new(4096).expect("batch rows are nonzero"),
@@ -8606,6 +8631,63 @@ fn planned_table_files_fixture_binding(
     files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
     seen_projections: Option<Arc<std::sync::Mutex<Vec<Vec<usize>>>>>,
 ) -> ConnectorControlBinding {
+    fn fixture_read_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new("v", DataType::LargeBinary, false),
+            Field::new("__nova_join_row_key", DataType::Utf8, false),
+            Field::new("_file", DataType::Utf8, false),
+            Field::new("_pos", DataType::Int64, false),
+            Field::new("_row_id", DataType::Int64, false),
+            Field::new("_last_updated_sequence_number", DataType::Int64, true),
+        ]))
+    }
+
+    fn fixture_read_schema_for_table(table: &str) -> SchemaRef {
+        if matches!(table, "l" | "r" | "mv") {
+            return Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, true),
+                Field::new("__nova_join_row_key", DataType::Utf8, false),
+                Field::new("_file", DataType::Utf8, false),
+                Field::new("_pos", DataType::Int64, false),
+                Field::new("_row_id", DataType::Int64, false),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ]));
+        }
+        fixture_read_schema()
+    }
+
+    fn fixture_table_info(catalog: &str, namespace: &str, table: &str) -> IcebergTableInfo {
+        let fields = fixture_read_schema_for_table(table)
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| IcebergSchemaFieldDef {
+                field_id: i32::try_from(ordinal + 1).expect("fixture schema field ID"),
+                name: field.name().to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                write_default_json: None,
+                children: Vec::new(),
+            })
+            .collect();
+        IcebergTableInfo {
+            catalog: catalog.to_string(),
+            namespace: namespace.to_string(),
+            table: table.to_string(),
+            table_uuid: Some(format!("fixture-{table}")),
+            current_snapshot_id: Some(1),
+            schema_id: 1,
+            location: format!("s3://fixture/{namespace}/{table}"),
+            schema: IcebergSchemaDef { fields },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
     struct Fixture {
         instance_id: ConnectorInstanceId,
         files_by_table: std::collections::HashMap<String, Vec<IcebergDataFileInfo>>,
@@ -8629,6 +8711,27 @@ fn planned_table_files_fixture_binding(
                 ));
             }
             let table: TablePayload = decode_payload(table.payload(), "fixture table handle")?;
+            let schema = fixture_read_schema_for_table(&table.table);
+            if let Some(target_kind) = match request.purpose {
+                ConnectorReadPurpose::MvTargetState => Some("target-state"),
+                ConnectorReadPurpose::MvTargetLocator => Some("target-locator"),
+                ConnectorReadPurpose::Query => None,
+            } {
+                let files = table
+                    .explicit_files
+                    .as_deref()
+                    .unwrap_or(&table.prepared_files);
+                if files.iter().any(|file| {
+                    file.delete_files
+                        .iter()
+                        .any(|delete| delete.file_content == IcebergDeleteFileContent::Equality)
+                }) {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        format!("Iceberg {target_kind} scan does not support equality deletes yet"),
+                    ));
+                }
+            }
             if let Some(seen) = &self.seen_projections {
                 seen.lock()
                     .expect("fixture projection lock")
@@ -8636,6 +8739,22 @@ fn planned_table_files_fixture_binding(
             }
             let (physical_predicates, predicate_dispositions) =
                 negotiate_static_predicates(&table, &request.static_predicates);
+            let projection = if request.projection.is_empty() {
+                (0..schema.fields().len()).collect::<Vec<_>>()
+            } else {
+                request.projection.clone()
+            };
+            let fields = projection
+                .iter()
+                .map(|ordinal| {
+                    schema.fields().get(*ordinal).cloned().ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            format!("fixture projection index {ordinal} is outside its schema"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(ConnectorScan {
                 handle: ConnectorScanHandle::try_new(
                     self.instance_id.clone(),
@@ -8653,7 +8772,7 @@ fn planned_table_files_fixture_binding(
                         request.context.max_handle_payload_bytes(),
                     )?,
                 )?,
-                output_schema: Arc::new(Schema::empty()),
+                output_schema: Arc::new(Schema::new(fields)),
                 predicate_dispositions,
             })
         }
@@ -8775,12 +8894,50 @@ fn planned_table_files_fixture_binding(
 
         fn load_table(
             &self,
-            _: ConnectorTableRequest,
+            request: ConnectorTableRequest,
         ) -> Result<ConnectorTableMetadata, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "planned-files fixture does not implement metadata",
-            ))
+            if request.table.instance_id != self.instance_id {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "planned-files fixture received a table for another connector",
+                ));
+            }
+            let files = self
+                .files_by_table
+                .get(request.table.table.as_ref())
+                .or_else(|| self.files_by_table.get("*"))
+                .cloned()
+                .unwrap_or_default();
+            let payload = TablePayload {
+                namespace: request.table.namespace.to_string(),
+                table: request.table.table.to_string(),
+                table_info: Some(fixture_table_info(
+                    self.instance_id.as_str(),
+                    request.table.namespace.as_ref(),
+                    request.table.table.as_ref(),
+                )),
+                metadata_columns: Vec::new(),
+                metadata_table_type: None,
+                prepared_files: files,
+                explicit_files: None,
+                logical_type_columns: BTreeMap::new(),
+                hidden_columns: Vec::new(),
+                frozen_rewrite: None,
+            };
+            Ok(ConnectorTableMetadata {
+                identity: request.table.clone(),
+                schema: fixture_read_schema_for_table(request.table.table.as_ref()),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(
+                    self.instance_id.clone(),
+                    encode_payload(
+                        &payload,
+                        "planned-files fixture table handle",
+                        request.context.max_handle_payload_bytes(),
+                    )?,
+                )?,
+            })
         }
     }
 

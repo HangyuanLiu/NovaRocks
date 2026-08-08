@@ -17,8 +17,8 @@
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorReadSelector, ConnectorSplitPlanningRequest,
-    ConnectorStaticPredicate, normalize_predicate_dispositions,
+    ConnectorPredicateDispositionKind, ConnectorReadPurpose, ConnectorReadSelector,
+    ConnectorSplitPlanningRequest, ConnectorStaticPredicate, normalize_predicate_dispositions,
 };
 
 use crate::engine::query_planning::bindings::QueryScanMaterialization;
@@ -169,6 +169,7 @@ pub(super) fn plan_connector_read(
                 projection: projection.clone(),
                 static_predicates: static_predicates.clone(),
                 selector: *selector,
+                purpose: connector_read_purpose(scan),
                 limit: None,
                 batch,
                 context: context.clone(),
@@ -221,6 +222,19 @@ pub(super) fn plan_connector_read(
         planning_lease: planning_lease.clone(),
         read_session: split_result.session,
     })
+}
+
+fn connector_read_purpose(scan: &PlanScanNode) -> ConnectorReadPurpose {
+    let ScanSource::Sql(source) = &scan.table.source;
+    match source.kind {
+        crate::sql::planner::table::SqlScanKind::MvTargetState { .. } => {
+            ConnectorReadPurpose::MvTargetState
+        }
+        crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
+            ConnectorReadPurpose::MvTargetLocator
+        }
+        _ => ConnectorReadPurpose::Query,
+    }
 }
 
 /// Plans every Iceberg snapshot-delta role through opaque provider-owned

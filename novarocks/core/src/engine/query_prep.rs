@@ -768,9 +768,9 @@ mod tests {
     #[test]
     fn delta_table_builder_accepts_empty_iceberg_storage() {
         // The IVM-A1 delta source `stamp_delta_table_def_change_ops`
-        // requires the base table to be backed by `IcebergDataFiles`
-        // (real or synthetic). An empty Iceberg snapshot legitimately
-        // produces `IcebergDataFiles { files: vec![] }` (see
+        // requires the base table to be backed by an admitted connector read
+        // handle. An empty Iceberg snapshot legitimately
+        // produces an opaque connector read whose split plan is empty (see
         // `connector/iceberg/catalog/backend.rs::empty_iceberg_scan_source`);
         // ensure that path round-trips correctly when stamping with an
         // empty change-op slice.
