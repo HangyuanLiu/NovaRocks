@@ -37,7 +37,7 @@ use crate::sql::planner::table::SqlTableIdentity;
 /// physical-planning fact: it identifies output columns, never provider
 /// metadata or a connector handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConnectorWriteInputBinding {
+pub enum ConnectorWriteInputBinding {
     RootOutputByOrdinal,
     OutputOrdinals(Vec<usize>),
 }

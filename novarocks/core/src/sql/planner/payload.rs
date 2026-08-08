@@ -26,7 +26,7 @@ use crate::sql::planner::table::TableDef;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct PlanScanNode {
+pub struct PlanScanNode {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
@@ -120,7 +120,7 @@ pub(crate) struct PlanTableFunctionNode {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlanRowCountAssertion {
+pub enum PlanRowCountAssertion {
     Eq,
     Ne,
     Lt,

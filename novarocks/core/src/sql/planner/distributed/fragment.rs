@@ -27,7 +27,7 @@ use crate::sql::planner::runtime_filter::graph::RuntimeFilterGraphData;
 pub type FragmentId = u32;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum PartitionKind {
+pub enum PartitionKind {
     Unpartitioned,
     Random,
     Hash,
@@ -83,7 +83,7 @@ impl DataPartition {
 
 /// Planner-owned fragment sink intent lowered by codegen.
 #[derive(Clone, Debug)]
-pub(crate) enum DataSink {
+pub enum DataSink {
     Result,
     Noop,
     Statistics(novarocks_spi::connector::StatisticsMetricRequest),
@@ -92,7 +92,7 @@ pub(crate) enum DataSink {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlanFragment {
+pub struct PlanFragment {
     pub fragment_id: FragmentId,
     pub root: DistributedNode,
     pub data_partition: DataPartition,

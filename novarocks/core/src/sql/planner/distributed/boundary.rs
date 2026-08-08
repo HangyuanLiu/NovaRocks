@@ -77,7 +77,7 @@ impl ExecutionColumnId {
 /// preserved in the sealed plan so CGO-9C can resume allocating internal
 /// occurrences from exactly where boundary derivation stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecutionColumnIdAllocator {
+pub struct ExecutionColumnIdAllocator {
     next: u32,
 }
 
@@ -176,14 +176,14 @@ pub(crate) struct BoundaryContract {
 /// The full set of boundary contracts for a sealed distributed plan, in
 /// deterministic derivation order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BoundaryCatalog {
+pub struct BoundaryCatalog {
     contracts: Vec<BoundaryContract>,
 }
 
 impl BoundaryCatalog {
     /// All contracts in canonical derivation order (fragment sink boundaries in
     /// fragment order, then per-edge send/receive boundaries in edge order).
-    pub(crate) fn contracts(&self) -> &[BoundaryContract] {
+    pub fn contracts(&self) -> &[BoundaryContract] {
         &self.contracts
     }
 }

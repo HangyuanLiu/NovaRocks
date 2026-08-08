@@ -43,7 +43,7 @@ use arrow::datatypes::DataType;
 /// and represented through output metadata or ordinary Project adapters before
 /// the optimizer sees the plan.
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) struct ColumnId(pub u32);
+pub struct ColumnId(pub u32);
 
 impl ColumnId {
     /// Sentinel value used only during bootstrapping or when a real id is not

@@ -33,7 +33,7 @@ use super::fragment::{DataPartition, FragmentId};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct ExchangeReceiver {
+pub struct ExchangeReceiver {
     pub partition: DataPartition,
     pub source_fragment_id: FragmentId,
     pub output_columns: Vec<OutputColumn>,
@@ -43,7 +43,7 @@ pub(crate) struct ExchangeReceiver {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) enum ExchangeFlavor {
+pub enum ExchangeFlavor {
     Distribution,
     LimitOffset {
         limit: Option<i64>,
@@ -69,7 +69,7 @@ pub(crate) enum ExchangeFlavor {
 /// conversion and must be rewritten before fragmentation.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) enum DistributedNodeKind {
+pub enum DistributedNodeKind {
     Scan(PlanScanNode),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
@@ -156,7 +156,7 @@ pub(crate) fn distributed_kind_from_physical(
     }
 }
 
-pub(crate) fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanKind {
+pub fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanKind {
     match kind {
         DistributedNodeKind::Scan(node) => PhysicalPlanKind::Scan(node.clone()),
         DistributedNodeKind::Filter(node) => PhysicalPlanKind::Filter(node.clone()),
@@ -184,7 +184,7 @@ pub(crate) fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> Physic
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct DistributedNode {
+pub struct DistributedNode {
     pub node_id: i32,
     pub fragment_id: FragmentId,
     pub tuple_ids: Vec<i32>,

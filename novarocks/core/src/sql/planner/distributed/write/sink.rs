@@ -78,7 +78,7 @@ impl ConnectorWritePlanInput {
 /// the FE control binding for one exact writer identity; generic planner code
 /// does not inspect its provider payload.
 #[derive(Clone, Debug)]
-pub(crate) struct ConnectorWriteFragmentSink {
+pub struct ConnectorWriteFragmentSink {
     /// Absent only in a frontend-side template before exact placement freezes
     /// the writer identity. A submitted native fragment always carries one.
     pub(crate) handle: Option<ConnectorWriterHandle>,

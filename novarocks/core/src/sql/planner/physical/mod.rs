@@ -17,12 +17,12 @@
 
 //! Planner-owned physical stage IR and vocabulary.
 
-mod node;
+pub(crate) mod node;
 pub(crate) mod runtime_filter;
 pub(crate) mod runtime_filter_placement;
 mod stats;
 pub(super) mod topn_runtime_filter_placement;
-mod vocab;
+pub(crate) mod vocab;
 
 pub(crate) use node::*;
 pub(crate) use runtime_filter::JoinExecutionMode;
@@ -31,4 +31,6 @@ pub(crate) use stats::{
     MAX_ROW_COUNT, PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic,
     PlannerConfidence, PlannerCostEstimate,
 };
-pub(crate) use vocab::{AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase};
+pub(crate) use vocab::{
+    AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase,
+};

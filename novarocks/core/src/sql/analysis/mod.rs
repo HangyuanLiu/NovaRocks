@@ -48,7 +48,7 @@ pub(crate) struct ResolvedQuery {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SortItem {
+pub struct SortItem {
     pub expr: TypedExpr,
     pub asc: bool,
     pub nulls_first: bool,

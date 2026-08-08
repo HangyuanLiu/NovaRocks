@@ -88,7 +88,7 @@ pub(crate) struct PhysicalNestLoopJoinNode {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PlanSetOpKind {
+pub enum PlanSetOpKind {
     UnionAll,
     UnionDistinct,
     Intersect,
@@ -146,7 +146,7 @@ pub(crate) struct PhysicalPlanNode {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) enum PhysicalPlanKind {
+pub enum PhysicalPlanKind {
     Scan(PlanScanNode),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
@@ -209,7 +209,7 @@ pub(crate) struct RedistributeNode {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RedistributeMode {
+pub enum RedistributeMode {
     Gather,
     Hash {
         cols: Vec<ColumnId>,
