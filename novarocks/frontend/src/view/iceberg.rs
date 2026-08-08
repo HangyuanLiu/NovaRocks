@@ -77,7 +77,6 @@ pub(super) fn resolve_external_target_parts(
         database: normalize_identifier(&database)?,
         view: normalize_identifier(&view)?,
     };
-    engine.validate_iceberg_catalog(&target.catalog)?;
     Ok(Some(target))
 }
 
@@ -172,12 +171,17 @@ pub(super) fn show_create_view(
     let Some(target) = resolve_external_target(engine, &name, context)? else {
         return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
     };
-    let view = engine.load_external_view(&target)?.ok_or_else(|| {
-        format!(
-            "unknown view: {}.{}.{}",
-            target.catalog, target.database, target.view
-        )
-    })?;
+    let connector_context = context
+        .connector_context
+        .ok_or_else(|| "SHOW CREATE VIEW requires connector request context".to_string())?;
+    let view = engine
+        .load_external_view(&target, connector_context)?
+        .ok_or_else(|| {
+            format!(
+                "unknown view: {}.{}.{}",
+                target.catalog, target.database, target.view
+            )
+        })?;
     let columns = view
         .column_names
         .iter()

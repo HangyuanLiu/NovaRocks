@@ -270,8 +270,11 @@ impl FrontendViewService {
         let mut names = match active_external_catalog {
             Some(catalog) => {
                 let catalog = normalize_identifier(catalog)?;
-                engine.validate_iceberg_catalog(&catalog)?;
-                engine.list_external_views(&catalog, &normalized_database)?
+                let connector_context = context.connector_context.ok_or_else(|| {
+                    "SHOW VIEWS for an external catalog requires connector request context"
+                        .to_string()
+                })?;
+                engine.list_external_views(&catalog, &normalized_database, connector_context)?
             }
             None => self
                 .registry

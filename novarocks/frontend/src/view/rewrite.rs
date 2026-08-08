@@ -18,7 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use novarocks::engine::view::{
-    ResolvedExternalView, ViewEngine, ViewRequestContext, ViewSqlDialect, ViewTarget,
+    ExternalViewResolution, ResolvedExternalView, ViewEngine, ViewRequestContext, ViewSqlDialect,
+    ViewTarget,
 };
 use sqlparser::ast as sqlast;
 use sqlparser::parser::Parser;
@@ -278,12 +279,16 @@ fn expand_external_table_factor(
             let Some(connector_context) = context.connector_context else {
                 return Err("external view rewrite requires connector request context".to_string());
             };
-            match engine.table_exists(&target, connector_context) {
-                Ok(true) | Err(_) => return Ok(()),
-                Ok(false) => {}
-            }
-            let Some(view) = engine.load_external_view(&target)? else {
-                return Ok(());
+            let view = match engine.resolve_external_view(&target, connector_context) {
+                Ok(ExternalViewResolution::Table | ExternalViewResolution::Missing) => {
+                    return Ok(());
+                }
+                Ok(ExternalViewResolution::View(view)) => view,
+                // A failed table probe historically left the relation for the
+                // normal catalog path.  Preserve that behavior while making
+                // an undeclared view capability an explicit admission error.
+                Err(error) if !error.starts_with("Unsupported:") => return Ok(()),
+                Err(error) => return Err(error),
             };
             let key = (
                 target.catalog.clone(),
@@ -358,12 +363,9 @@ fn external_rewrite_candidate(
     parts: &[String],
     context: ViewRequestContext<'_>,
 ) -> Option<ViewTarget> {
-    let target = resolve_external_target_parts(engine, parts, context)
+    resolve_external_target_parts(engine, parts, context)
         .ok()
-        .flatten()?;
-    engine
-        .is_rest_iceberg_catalog(&target.catalog)
-        .then_some(target)
+        .flatten()
 }
 
 fn parse_external_view_sql(

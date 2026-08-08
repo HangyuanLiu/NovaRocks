@@ -25,6 +25,7 @@
 //! tables, which the standard SQL pipeline handles like ordinary relations.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -111,11 +112,10 @@ fn rewrite_table_factor(
             // For `default_catalog` (the local catalog), we look up the provider
             // in the registry and scan it against the local InMemoryCatalog.
             //
-            // For any other 3-part name where the catalog is a registered external
-            // Iceberg catalog, we intercept `information_schema.schemata` and
-            // enumerate that catalog's databases directly, bypassing the Iceberg
-            // table load path that would otherwise fail with a "no metadata files"
-            // error.
+            // For any other 3-part name with an admitted external connector,
+            // intercept `information_schema.schemata` through its exact control
+            // generation.  This bypasses the provider table-load path, which
+            // cannot represent a catalog namespace scan.
             //
             // We do NOT match plain 1-part references because the session's current
             // database may legitimately shadow them with a real table.
@@ -129,17 +129,28 @@ fn rewrite_table_factor(
                         && tbl.eq_ignore_ascii_case("schemata") =>
                 {
                     // External catalog 3-part name: `<cat>.information_schema.schemata`.
-                    // Check whether <cat> is a registered Iceberg catalog; if so,
-                    // enumerate its databases. If not, leave the reference alone so
-                    // downstream resolvers can emit "unknown catalog".
-                    let registry = state
-                        .iceberg_catalogs
-                        .read()
-                        .expect("iceberg catalog registry read lock");
-                    match registry.get(cat) {
-                        Ok(entry) => {
-                            let databases =
-                                crate::connector::iceberg::catalog::list_namespaces(&entry)?;
+                    // Unknown catalogs remain untouched so downstream resolution
+                    // preserves its normal error. Every successful admission keeps
+                    // one lease for the complete namespace lookup.
+                    let context = crate::connector::connector_request_context(
+                        None,
+                        Arc::new(AtomicBool::new(false)),
+                    )?;
+                    match crate::connector::acquire_metadata_planning_lease(
+                        state.connector_control.as_ref(),
+                        cat,
+                    ) {
+                        Ok(lease) => {
+                            let namespaces =
+                                crate::connector::metadata_list_namespaces_with_planning_lease(
+                                    lease, context,
+                                )?;
+                            let mut databases = namespaces
+                                .into_iter()
+                                .map(|namespace| namespace.namespace.to_string())
+                                .collect::<Vec<_>>();
+                            databases.sort();
+                            databases.dedup();
                             let inputs = crate::engine::system_catalog::SystemCatalogInputs {
                                 catalog_name: cat,
                                 schema_names: &databases,

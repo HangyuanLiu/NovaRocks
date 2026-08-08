@@ -1191,19 +1191,18 @@ pub(crate) fn execute_drop_table_statement(
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
             if target.backend_name == "iceberg"
-                && state
-                    .iceberg_catalogs
-                    .read()
-                    .expect("iceberg catalog registry read")
-                    .get(&target.catalog)
-                    .and_then(|entry| {
-                        crate::connector::iceberg::catalog::views::view_exists(
-                            &entry,
-                            &target.namespace,
-                            &target.table,
-                        )
-                    })
-                    .unwrap_or(false)
+                && matches!(
+                    <crate::engine::StandaloneState as crate::engine::view::ViewEngine>::resolve_external_view(
+                        state,
+                        &crate::engine::view::ViewTarget {
+                            catalog: target.catalog.clone(),
+                            database: target.namespace.clone(),
+                            view: target.table.clone(),
+                        },
+                        connector_context,
+                    ),
+                    Ok(crate::engine::view::ExternalViewResolution::View(_))
+                )
             {
                 return Err(format!(
                     "{}.{}.{} is a view, use DROP VIEW",

@@ -42,33 +42,37 @@ use novarocks_spi::connector::{
     ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorExecutionInstaller, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
-    ConnectorPartitionTransform, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorReadSelector, ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
-    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
-    ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
-    ConnectorScanUnitFactsMissingReason, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListNamespacesRequest,
+    ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPartitionTransform,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorRefAction, ConnectorRefKind,
+    ConnectorRefreshPublicationGuard, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanUnitColumn,
+    ConnectorScanUnitColumnDomain, ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsEvidence, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
     ConnectorStagedPublicationBaseFact, ConnectorStagedPublicationCleanupReceipt,
     ConnectorStagedPublicationCleanupRequest, ConnectorStagedPublicationDescriptor,
     ConnectorStagedPublicationDisposition, ConnectorStagedPublicationObservation,
     ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
     ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
     ConnectorStatistics, ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorTableResolution, CreateOrReplacePolicy, CreatePolicy, DropPolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, StatisticsAccuracy, StatisticsCollection, StatisticsCollectionPlan,
-    StatisticsCollectionRequest, StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
-    normalize_predicate_dispositions, validate_static_predicates,
+    ConnectorTableResolution, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
+    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsAccuracy,
+    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
+    StatisticsCoverage, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsProvenance, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest, StatisticsReadRequest, StatisticsReader, StatisticsReceipt,
+    StatisticsReconcileRequest, StatisticsScanColumn, normalize_predicate_dispositions,
+    validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -77,7 +81,7 @@ use super::catalog::IcebergCatalogEntry;
 use super::catalog::backend::iceberg_schema_def_for_codegen;
 use super::catalog::registry::{
     IcebergCatalogRegistry, create_namespace, create_table, drop_namespace, drop_table,
-    extract_data_files_with_stats_at, list_tables, load_table, namespace_exists,
+    extract_data_files_with_stats_at, list_namespaces, list_tables, load_table, namespace_exists,
 };
 use super::catalog::views;
 use super::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
@@ -1001,7 +1005,8 @@ impl IcebergControlProvider {
             Some(write),
             Some(provider.clone()),
         )?
-        .try_with_staged_publication_recovery(Some(provider))
+        .try_with_staged_publication_recovery(Some(provider.clone()))?
+        .try_with_view_metadata(Some(provider))
     }
 
     fn entry(&self, catalog: &str) -> Result<IcebergCatalogEntry, ConnectorError> {
@@ -3786,6 +3791,25 @@ impl ConnectorMetadata for IcebergControlProvider {
         &self.instance_id
     }
 
+    fn list_namespaces(
+        &self,
+        request: ConnectorListNamespacesRequest,
+    ) -> Result<Vec<novarocks_spi::connector::ConnectorNamespaceIdentity>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        ensure_owner(&request.instance_id, &self.instance_id)?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        list_namespaces(&entry)
+            .map_err(map_iceberg_error)?
+            .into_iter()
+            .map(|namespace| {
+                Ok(novarocks_spi::connector::ConnectorNamespaceIdentity {
+                    instance_id: self.instance_id.clone(),
+                    namespace: Arc::from(namespace),
+                })
+            })
+            .collect()
+    }
+
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.validate_context(&request.context)?;
         ensure_owner(&request.namespace.instance_id, &self.instance_id)?;
@@ -3822,6 +3846,18 @@ impl ConnectorMetadata for IcebergControlProvider {
                 })
             })
             .collect()
+    }
+
+    fn read_reference_facts(
+        &self,
+        request: ConnectorReadReferenceFactsRequest,
+    ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+        self.validate_context(&request.context)?;
+        ensure_owner(&request.table.instance_id, &self.instance_id)?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded = load_table(&entry, &request.table.namespace, &request.table.table)
+            .map_err(map_iceberg_error)?;
+        iceberg_read_reference_facts(loaded.table.metadata(), &request.context)
     }
 
     fn load_table(
@@ -3870,6 +3906,138 @@ impl ConnectorMetadata for IcebergControlProvider {
             )?,
         })
     }
+}
+
+impl ConnectorViewMetadata for IcebergControlProvider {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn view_exists(&self, request: ConnectorViewRequest) -> Result<bool, ConnectorError> {
+        self.validate_context(&request.context)?;
+        ensure_owner(&request.view.instance_id, &self.instance_id)?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        views::view_exists(&entry, &request.view.namespace, &request.view.view)
+            .map_err(map_iceberg_error)
+    }
+
+    fn load_view(
+        &self,
+        request: ConnectorViewRequest,
+    ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        self.validate_context(&request.context)?;
+        ensure_owner(&request.view.instance_id, &self.instance_id)?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        let loaded = views::load_view(&entry, &request.view.namespace, &request.view.view)
+            .map_err(map_iceberg_error)?;
+        iceberg_view_metadata_value(
+            self.instance_id.clone(),
+            request.view.namespace,
+            request.view.view,
+            loaded,
+            &request.context,
+        )
+    }
+
+    fn list_views(
+        &self,
+        request: ConnectorListViewsRequest,
+    ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+        self.validate_context(&request.context)?;
+        ensure_owner(&request.namespace.instance_id, &self.instance_id)?;
+        let entry = self.entry(self.instance_id.as_str())?;
+        views::list_views(&entry, &request.namespace.namespace)
+            .map_err(map_iceberg_error)?
+            .into_iter()
+            .map(|view| {
+                Ok(ConnectorViewIdentity {
+                    instance_id: self.instance_id.clone(),
+                    namespace: request.namespace.namespace.clone(),
+                    view: Arc::from(view),
+                })
+            })
+            .collect()
+    }
+}
+
+fn iceberg_read_reference_facts(
+    metadata: &novarocks_connector_iceberg::iceberg::spec::TableMetadata,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
+    ConnectorReadReferenceFacts::try_new(
+        metadata
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect(),
+        metadata
+            .history()
+            .iter()
+            .map(|entry| ConnectorReadSnapshotLogEntry {
+                snapshot_id: entry.snapshot_id,
+                timestamp_millis: entry.timestamp_ms(),
+            })
+            .collect(),
+        metadata
+            .refs()
+            .iter()
+            .map(|(name, reference)| ConnectorReadNamedReference {
+                name: Arc::from(name.as_str()),
+                kind: if reference.is_branch() {
+                    ConnectorReadReferenceKind::Branch
+                } else {
+                    ConnectorReadReferenceKind::Tag
+                },
+                snapshot_id: reference.snapshot_id,
+            })
+            .collect(),
+        metadata.current_snapshot_id(),
+        context,
+    )
+}
+
+fn iceberg_view_metadata_value(
+    instance_id: ConnectorInstanceId,
+    namespace: Arc<str>,
+    view: Arc<str>,
+    loaded: views::LoadedIcebergView,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+    if !loaded
+        .dialect
+        .eq_ignore_ascii_case(views::VIEW_DIALECT_STARROCKS)
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "Iceberg view {namespace}.{view} uses unsupported SQL dialect {}",
+                loaded.dialect
+            ),
+        ));
+    }
+    ConnectorViewMetadataValue::try_new(
+        ConnectorViewIdentity {
+            instance_id,
+            namespace,
+            view,
+        },
+        ConnectorViewDefinition {
+            dialect: ConnectorViewDialect::StarRocks,
+            sql: Arc::from(loaded.sql),
+        },
+        Arc::from(loaded.default_namespace),
+        loaded.column_names.into_iter().map(Arc::from).collect(),
+        loaded.comment.map(Arc::from),
+        loaded
+            .properties
+            .into_iter()
+            .map(|(key, value)| (Arc::from(key), Arc::from(value)))
+            .collect(),
+        context,
+    )
 }
 
 impl StatisticsReader for IcebergControlProvider {
@@ -6822,6 +6990,7 @@ fn map_iceberg_error(error: String) -> ConnectorError {
         // interpret it as absence, rather than turning CREATE IF NOT EXISTS
         // (and ordinary CREATE) into an internal error before dispatch.
         || normalized.contains("unknown table")
+        || normalized.contains("unknown view")
         || normalized.contains("no metadata files")
         // The local Hadoop catalog uses this normalized absence error when
         // probing a table's metadata directory.  Catalog mutations perform
@@ -6879,6 +7048,12 @@ mod tests {
     #[test]
     fn unknown_table_catalog_error_is_not_found() {
         let error = map_iceberg_error("unknown table: analytics.orders".to_string());
+        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    }
+
+    #[test]
+    fn spi5b_unknown_view_catalog_error_is_not_found() {
+        let error = map_iceberg_error("unknown view: analytics.v_orders".to_string());
         assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
     }
 
@@ -6943,6 +7118,108 @@ mod tests {
             max_total_payload_bytes,
         )
         .expect("connector request context")
+    }
+
+    #[test]
+    fn spi5b_reference_facts_preserve_snapshots_history_and_ref_kinds() {
+        use novarocks_connector_iceberg::iceberg::spec::{SnapshotReference, SnapshotRetention};
+
+        let metadata = super::super::test_metadata::metadata_with_two_snapshots()
+            .into_builder(None)
+            .set_ref(
+                "release-1",
+                SnapshotReference::new(
+                    1,
+                    SnapshotRetention::Tag {
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .expect("set tag ref")
+            .build()
+            .expect("build tagged metadata")
+            .metadata;
+        let facts =
+            iceberg_read_reference_facts(&metadata, &context_with_payload_budgets(1024, 4096))
+                .expect("reference facts");
+
+        assert_eq!(facts.snapshot_ids(), &[1, 2]);
+        assert_eq!(facts.current_snapshot_id(), Some(2));
+        assert_eq!(
+            facts
+                .snapshot_log()
+                .iter()
+                .map(|entry| (entry.snapshot_id, entry.timestamp_millis))
+                .collect::<Vec<_>>(),
+            vec![(1, 1_700_000_000_000), (2, 1_700_000_001_000)]
+        );
+        assert_eq!(
+            facts
+                .named_references()
+                .iter()
+                .map(|reference| (
+                    reference.name.as_ref(),
+                    reference.kind,
+                    reference.snapshot_id
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("main", ConnectorReadReferenceKind::Branch, 2),
+                ("release-1", ConnectorReadReferenceKind::Tag, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn spi5b_view_metadata_rejects_non_starrocks_dialect() {
+        let loaded = views::LoadedIcebergView {
+            sql: "SELECT 1".to_string(),
+            dialect: "spark".to_string(),
+            default_namespace: "analytics".to_string(),
+            column_names: vec!["one".to_string()],
+            comment: None,
+            properties: HashMap::new(),
+        };
+        let error = iceberg_view_metadata_value(
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            Arc::from("analytics"),
+            Arc::from("v_one"),
+            loaded,
+            &context_with_payload_budgets(1024, 4096),
+        )
+        .expect_err("unsupported dialect");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn spi5b_view_metadata_preserves_sorted_properties() {
+        let loaded = views::LoadedIcebergView {
+            sql: "SELECT id FROM orders".to_string(),
+            dialect: views::VIEW_DIALECT_STARROCKS.to_string(),
+            default_namespace: "analytics".to_string(),
+            column_names: vec!["id".to_string()],
+            comment: Some("orders view".to_string()),
+            properties: HashMap::from([
+                ("z-key".to_string(), "z-value".to_string()),
+                ("a-key".to_string(), "a-value".to_string()),
+            ]),
+        };
+        let view = iceberg_view_metadata_value(
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            Arc::from("analytics"),
+            Arc::from("v_orders"),
+            loaded,
+            &context_with_payload_budgets(1024, 4096),
+        )
+        .expect("view metadata");
+        assert_eq!(view.definition.dialect, ConnectorViewDialect::StarRocks);
+        assert_eq!(
+            view.properties
+                .iter()
+                .map(|(key, value)| (key.as_ref(), value.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![("a-key", "a-value"), ("z-key", "z-value")]
+        );
     }
 
     fn write_single_row_group_parquet(path: &Path, row_count: usize) -> i64 {

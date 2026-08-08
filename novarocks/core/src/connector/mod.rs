@@ -46,8 +46,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorCancellation, ConnectorInstanceId, ConnectorListNamespacesRequest,
+    ConnectorNamespaceIdentity, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
 
 struct RequestConnectorCancellation {
@@ -234,6 +236,18 @@ pub(crate) fn metadata_table_exists(
     table: &str,
 ) -> Result<bool, String> {
     let binding = metadata_binding(controls, catalog)?;
+    metadata_table_exists_with_planning_lease(binding, context, namespace, table)
+}
+
+/// Resolve table existence through an admission-frozen planning lease.  A
+/// caller that performs a table-or-view decision must retain this lease for
+/// every metadata lookup in that decision.
+pub(crate) fn metadata_table_exists_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     binding
         .binding()
@@ -245,6 +259,47 @@ pub(crate) fn metadata_table_exists(
                 table: Arc::from(table),
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Enumerate namespaces through an admission-frozen connector control lease.
+/// Ordering and duplicate handling stay application-owned so providers only
+/// expose their authoritative catalog facts.
+pub(crate) fn metadata_list_namespaces_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .list_namespaces(ConnectorListNamespacesRequest {
+            instance_id,
+            context,
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Read immutable branch/tag/snapshot facts through the same exact lease that
+/// admitted the table.  SQL owns the projection of these neutral facts.
+pub(crate) fn metadata_read_reference_facts_with_planning_lease(
+    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+) -> Result<ConnectorReadReferenceFacts, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    binding
+        .binding()
+        .metadata()
+        .read_reference_facts(ConnectorReadReferenceFactsRequest {
+            table: ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
             context,
         })
         .map_err(|error| error.to_string())
