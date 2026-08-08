@@ -181,7 +181,6 @@ use novarocks_catalog::identifier::{TableIdentity, normalize_identifier};
 use novarocks_connector_iceberg::commit::{
     MV_PROVENANCE_VERSION, MvProvenanceV1, ProvenanceBase, RefreshTechnique,
 };
-use novarocks_connector_iceberg::scan_model::IcebergDataFileBinding;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorExecutionBindingKey, ConnectorInstanceId,
 };
@@ -14442,46 +14441,36 @@ fn freeze_imv_base_query_local_overlays_from_captured_inputs(
         if !seen.insert(identity) {
             continue;
         }
-        let catalog_key = normalize_identifier(&base.catalog)?;
-        let entry = base_catalog_entries.get(&catalog_key).ok_or_else(|| {
-            format!(
-                "IMV query binding is missing frozen catalog entry for {}",
-                base.fqn()
-            )
-        })?;
-        let loaded =
-            crate::connector::iceberg::catalog::load_table(entry, &base.namespace, &base.table)?;
-        let files = crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
-            &loaded.table,
-            snapshot_id,
-        )?
-        .into_iter()
-        .map(
-            crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info,
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&base.catalog)
+            .map_err(|error| error.to_string())?;
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            state.connector_control.as_ref(),
+            &instance_id,
         )
-        .collect();
-        let mut materialization =
-            crate::connector::iceberg::provider::load_schema_materialization_with_lease(
-                state.connector_control.as_ref(),
+        .map_err(|error| error.to_string())?;
+        let materialization =
+            crate::connector::iceberg::provider::load_snapshot_materialization_from_exact_lease(
+                planning_lease,
                 connector_context.clone(),
-                &base.catalog,
                 &base.namespace,
                 &base.table,
-            )?;
-        if materialization.table.current_snapshot_id != Some(snapshot_id) {
-            return Err(format!(
-                "IMV query binding for {} changed after snapshot pin: expected snapshot {}, got {:?}",
-                base.fqn(),
                 snapshot_id,
-                materialization.table.current_snapshot_id
-            ));
-        }
-        materialization.table.current_snapshot_id = Some(snapshot_id);
-        materialization.files = files;
-        materialization.binding = IcebergDataFileBinding::ExplicitFiles;
+            )?;
         let mut frozen_snapshot_ids = std::collections::BTreeSet::from([snapshot_id]);
         let mut delta_runtime_plans = BTreeMap::new();
         if let Some(previous_snapshot_id) = previous_snapshot_ids.get(&base.fqn()) {
+            let catalog_key = normalize_identifier(&base.catalog)?;
+            let entry = base_catalog_entries.get(&catalog_key).ok_or_else(|| {
+                format!(
+                    "IMV query binding is missing frozen catalog entry for {}",
+                    base.fqn()
+                )
+            })?;
+            let loaded = crate::connector::iceberg::catalog::load_table(
+                entry,
+                &base.namespace,
+                &base.table,
+            )?;
             frozen_snapshot_ids.insert(*previous_snapshot_id);
             let runtime_plan =
                 crate::engine::query_planning::delta_scan::freeze_iceberg_delta_runtime_plan(

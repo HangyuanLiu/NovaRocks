@@ -6653,8 +6653,31 @@ pub(crate) fn load_time_travel_materialization_with_lease(
     table: &str,
     snapshot_id: i64,
 ) -> Result<IcebergQueryTableMaterialization, String> {
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let planning_lease = controls
+        .acquire_current(&instance_id)
+        .map_err(|error| error.to_string())?;
+    load_snapshot_materialization_from_exact_lease(
+        planning_lease,
+        context,
+        namespace,
+        table,
+        snapshot_id,
+    )
+}
+
+/// Freeze a snapshot selector against the supplied exact provider generation.
+/// The provider retains the opaque table handle and resolves its own snapshot
+/// files at scan planning; Core receives only the selector and SQL facts.
+pub(crate) fn load_snapshot_materialization_from_exact_lease(
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    snapshot_id: i64,
+) -> Result<IcebergQueryTableMaterialization, String> {
     let mut materialization =
-        load_schema_materialization_with_lease(controls, context, catalog, namespace, table)?;
+        load_schema_materialization_from_exact_lease(planning_lease, context, namespace, table)?;
     materialization.table.current_snapshot_id = Some(snapshot_id);
     materialization.binding = IcebergDataFileBinding::ExplicitFiles;
     materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
