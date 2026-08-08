@@ -2836,6 +2836,7 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "kill_fe_after_control_ready_count",
         "restart_be_after_init_ack_index",
         "kill_query_after_control_ready_count",
+        "kill_query_after_be_log_contains",
         "fail_stage_prepare_ordinal",
         "drop_next_stage_ack_be_index",
         "drop_next_start_ack_be_index",

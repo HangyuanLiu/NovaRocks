@@ -134,6 +134,7 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
+        || meta.kill_query_after_be_log_contains.is_some()
         || meta.fail_stage_prepare_ordinal.is_some()
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
@@ -181,6 +182,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
+        || meta.kill_query_after_be_log_contains.is_some()
         || meta.fail_stage_prepare_ordinal.is_some()
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
@@ -228,6 +230,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.kill_fe_after_control_ready_count.is_some(),
         meta.restart_be_after_init_ack_index.is_some(),
         meta.kill_query_after_control_ready_count.is_some(),
+        meta.kill_query_after_be_log_contains.is_some(),
         meta.fail_stage_prepare_ordinal.is_some(),
         meta.drop_next_stage_ack_be_index.is_some(),
         meta.drop_next_start_ack_be_index.is_some(),
@@ -416,7 +419,7 @@ pub(crate) fn execute_with_post_fragment_start_fault<T, F>(
 where
     F: FnOnce() -> T,
 {
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum PostQueryFault {
         KillBackend(usize),
         ReleaseFragmentFailure(usize),
@@ -424,6 +427,10 @@ where
         RestartBackendAfterInitAck(usize),
         KillQueryAfterControlReady {
             ready_count: usize,
+            connection_id: u32,
+        },
+        KillQueryAfterBeLogContains {
+            pattern: String,
             connection_id: u32,
         },
         KillQueryAtLifecyclePhase {
@@ -452,6 +459,10 @@ where
             fe_crash: bool,
             marker_count: u64,
         },
+        BeLogPattern {
+            pattern: String,
+            counts: Vec<usize>,
+        },
     }
 
     let faults = [
@@ -477,6 +488,16 @@ where
                     })
             })
             .transpose()?,
+        meta.kill_query_after_be_log_contains.as_deref().map(|pattern| {
+            query_connection_id
+                .map(|connection_id| PostQueryFault::KillQueryAfterBeLogContains {
+                    pattern: pattern.to_string(),
+                    connection_id,
+                })
+                .ok_or_else(|| anyhow::anyhow!(
+                    "kill_query_after_be_log_contains requires the target query connection id"
+                ))
+        }).transpose()?,
         meta.kill_query_at_lifecycle_phase
             .map(|phase| {
                 query_connection_id
@@ -501,7 +522,7 @@ where
         }
         bail!("a SQL step may configure at most one post-query lifecycle fault");
     };
-    let fault = *fault;
+    let fault = fault.clone();
     let baseline = {
         let server = server
             .lock()
@@ -509,7 +530,7 @@ where
         if !server.supports_fault_injection() {
             bail!("post-query faults require a mutable cross-process server handle");
         }
-        match fault {
+        match fault.clone() {
             PostQueryFault::KillBackend(index) => {
                 if index >= server.be_count() {
                     bail!(
@@ -548,6 +569,15 @@ where
                 ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
                 coordinator_lost: Vec::new(),
             },
+            PostQueryFault::KillQueryAfterBeLogContains { pattern, .. } => {
+                let counts = (0..server.be_count())
+                    .map(|index| server.be_log_count(index, &pattern))
+                    .collect::<Result<Vec<_>>>()?;
+                FaultBaseline::BeLogPattern {
+                    pattern,
+                    counts,
+                }
+            }
             PostQueryFault::RestartBackendAfterInitAck(index) => {
                 if index >= server.be_count() {
                     bail!(
@@ -627,10 +657,10 @@ where
                             > *marker_count as usize
                     }
                     FaultBaseline::FrontendReady { ready_count, .. } => {
-                        let target = match fault {
-                            PostQueryFault::KillFrontendAfterControlReady(target) => target,
+                        let target = match &fault {
+                            PostQueryFault::KillFrontendAfterControlReady(target) => *target,
                             PostQueryFault::KillQueryAfterControlReady { ready_count, .. } => {
-                                ready_count
+                                *ready_count
                             }
                             _ => unreachable!(
                                 "frontend baseline pairs with ControlReady-driven fault"
@@ -653,6 +683,16 @@ where
                         lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase, *fe_crash)?
                             > *marker_count as usize
                     }
+                    FaultBaseline::BeLogPattern { pattern, counts } => (0..server.be_count())
+                        .zip(counts)
+                        .map(|(index, baseline)| {
+                            server
+                                .be_log_count(index, pattern)
+                                .map(|current| current > *baseline)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .any(|ready| ready),
                 }
             };
             if ready {
@@ -664,7 +704,7 @@ where
                 let mut server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                let mut evidence_execution = match (&baseline, fault) {
+                let mut evidence_execution = match (&baseline, &fault) {
                     (
                         FaultBaseline::FrontendReady { ready_count, .. },
                         PostQueryFault::KillFrontendAfterControlReady(_)
@@ -690,7 +730,7 @@ where
                     _ => None,
                 };
                 let action_result = (|| -> Result<()> {
-                    match fault {
+                    match fault.clone() {
                         PostQueryFault::KillBackend(index) => server.kill_be(index)?,
                         PostQueryFault::ReleaseFragmentFailure(index) => {
                             server.release_fragment_executor_failure(index)?
@@ -743,6 +783,9 @@ where
                             );
                         }
                         PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
+                            server.kill_query_until(connection_id, deadline)?
+                        }
+                        PostQueryFault::KillQueryAfterBeLogContains { connection_id, .. } => {
                             server.kill_query_until(connection_id, deadline)?
                         }
                         PostQueryFault::KillQueryAtLifecyclePhase {
@@ -824,9 +867,10 @@ where
                     );
                 }
                 if matches!(
-                    fault,
+                    &fault,
                     PostQueryFault::KillFrontendAfterControlReady(_)
                         | PostQueryFault::KillQueryAfterControlReady { .. }
+                        | PostQueryFault::KillQueryAfterBeLogContains { .. }
                         | PostQueryFault::KillFrontendAtLifecyclePhase(
                             crate::types::QueryLifecyclePhase::TerminalRetained
                         )
@@ -858,7 +902,7 @@ where
                         deadline,
                         &mut deadline_cancel_sent,
                     )?;
-                    let evidence_ready = match fault {
+                    let evidence_ready = match &fault {
                         PostQueryFault::KillFrontendAfterControlReady(_)
                         | PostQueryFault::KillQueryAfterControlReady { .. }
                         | PostQueryFault::KillFrontendAtLifecyclePhase(

@@ -280,6 +280,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                 })?;
                 meta.kill_query_after_control_ready_count = Some(value);
             }
+            "kill_query_after_be_log_contains" => {
+                if raw_value.is_empty() {
+                    bail!("kill_query_after_be_log_contains must not be empty");
+                }
+                meta.kill_query_after_be_log_contains = Some(raw_value);
+            }
             "fail_stage_prepare_ordinal" => {
                 let value = raw_value
                     .parse::<usize>()
@@ -533,6 +539,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
+        kill_query_after_be_log_contains: override_meta
+            .kill_query_after_be_log_contains
+            .clone()
+            .or_else(|| base.kill_query_after_be_log_contains.clone()),
         fail_stage_prepare_ordinal: override_meta
             .fail_stage_prepare_ordinal
             .or(base.fail_stage_prepare_ordinal),
@@ -1031,6 +1041,7 @@ mod opt5_directive_tests {
             "-- @kill_fe_after_control_ready_count=3".to_string(),
             "-- @restart_be_after_init_ack_index=0".to_string(),
             "-- @kill_query_after_control_ready_count=2".to_string(),
+            "-- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
             "-- @fail_stage_prepare_ordinal=2".to_string(),
             "-- @drop_next_stage_ack_be_index=1".to_string(),
             "-- @drop_next_start_ack_be_index=2".to_string(),
@@ -1050,6 +1061,10 @@ mod opt5_directive_tests {
         assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
         assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
         assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
+        assert_eq!(
+            meta.kill_query_after_be_log_contains.as_deref(),
+            Some("split_id=iceberg-metadata-0")
+        );
         assert_eq!(meta.fail_stage_prepare_ordinal, Some(2));
         assert_eq!(meta.drop_next_stage_ack_be_index, Some(1));
         assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
@@ -1296,6 +1311,7 @@ mod opt5_directive_tests {
             kill_fe_after_control_ready_count: Some(2),
             restart_be_after_init_ack_index: Some(0),
             kill_query_after_control_ready_count: Some(1),
+            kill_query_after_be_log_contains: Some("reader-open".to_string()),
             fail_stage_prepare_ordinal: Some(2),
             drop_next_stage_ack_be_index: Some(0),
             drop_next_start_ack_be_index: Some(1),
@@ -1314,6 +1330,10 @@ mod opt5_directive_tests {
         assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
         assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
         assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
+        assert_eq!(
+            inherited.kill_query_after_be_log_contains.as_deref(),
+            Some("reader-open")
+        );
         assert_eq!(inherited.fail_stage_prepare_ordinal, Some(2));
         assert_eq!(inherited.drop_next_stage_ack_be_index, Some(0));
         assert_eq!(inherited.drop_next_start_ack_be_index, Some(1));
@@ -1340,6 +1360,7 @@ mod opt5_directive_tests {
             kill_fe_after_control_ready_count: Some(3),
             restart_be_after_init_ack_index: Some(2),
             kill_query_after_control_ready_count: Some(3),
+            kill_query_after_be_log_contains: Some("metadata-open".to_string()),
             fail_stage_prepare_ordinal: Some(4),
             drop_next_stage_ack_be_index: Some(2),
             drop_next_start_ack_be_index: Some(0),
@@ -1356,6 +1377,10 @@ mod opt5_directive_tests {
         assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
         assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
         assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
+        assert_eq!(
+            overridden.kill_query_after_be_log_contains.as_deref(),
+            Some("metadata-open")
+        );
         assert_eq!(overridden.fail_stage_prepare_ordinal, Some(4));
         assert_eq!(overridden.drop_next_stage_ack_be_index, Some(2));
         assert_eq!(overridden.drop_next_start_ack_be_index, Some(0));
