@@ -56,7 +56,6 @@ use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::exec::execution_final_domain::final_domain_payload;
 #[cfg(test)]
 use crate::runtime_filter::port::identity::PartitionId;
 use crate::runtime_filter::port::producer::ProducerFailureReason;
@@ -1210,14 +1209,13 @@ impl AggregateProcessorOperator {
         let max_domain_canonical_bytes = self.max_domain_canonical_bytes.ok_or_else(|| {
             "aggregate final-domain canonical domain budget is missing".to_string()
         })?;
-        let domain = match final_domain::extract_final_aggregate_domain(
+        let (data_type, array) = match final_domain::extract_final_aggregate_key(
             self.key_table
                 .as_ref()
                 .map(|table| table.key_columns())
                 .unwrap_or(&[]),
-            max_domain_canonical_bytes,
         ) {
-            Ok(domain) => domain,
+            Ok(key) => key,
             Err(final_domain::FinalAggregateDomainError::ResourceOrSize) => {
                 self.fail_final_domain();
                 return Ok(());
@@ -1229,12 +1227,27 @@ impl AggregateProcessorOperator {
             .take()
             .expect("checked aggregate final-domain committer");
         #[cfg(test)]
-        let observed_domain = domain.clone();
-        let domain = final_domain_payload(
-            domain,
-            partition.contract_digest,
+        let observed_domain = final_domain::extract_final_aggregate_domain(
+            self.key_table
+                .as_ref()
+                .map(|table| table.key_columns())
+                .unwrap_or(&[]),
             max_domain_canonical_bytes,
         )?;
+        let domain = match execution::contribution::encode_final_domain_from_array(
+            &data_type,
+            partition.contract_digest,
+            &array,
+            max_domain_canonical_bytes,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            execution::contribution::FinalDomainArrayEncodingOutcome::FinalDomain(domain) => domain,
+            execution::contribution::FinalDomainArrayEncodingOutcome::Unavailable(_) => {
+                self.fail_final_domain();
+                return Ok(());
+            }
+        };
         if let Err(error) = partition.committer.seal(domain) {
             if error.kind() == execution::RuntimeFilterContractViolationKind::SessionClosed {
                 return Ok(());

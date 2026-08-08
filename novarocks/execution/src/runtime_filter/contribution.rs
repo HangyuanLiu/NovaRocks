@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     RuntimeFilterContractViolationKind, RuntimeFilterContribution as ExecutionContribution,
-    RuntimeFilterContributionKind, RuntimeFilterExecutionContract, RuntimeFilterProducerContract,
-    RuntimeFilterProducerKind,
+    RuntimeFilterContributionKind, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
+    RuntimeFilterProducerContract, RuntimeFilterProducerKind,
 };
 
 pub const FINGERPRINT_VERSION_TAG: &[u8] = b"novarocks.runtime-filter.value-domain-delta.v1";
@@ -1193,6 +1193,85 @@ impl fmt::Display for MembershipContributionEncodingError {
 }
 impl Error for MembershipContributionEncodingError {}
 
+/// The result of deriving a canonical final-domain payload from a finalized
+/// aggregate key column. The budget applies to exactly the canonical domain
+/// bytes retained by `RuntimeFilterFinalDomain`; a fence is not serialized
+/// into this payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValueDomainArrayEncodingOutcome {
+    ValueDomain(ValueDomainDelta),
+    Unavailable(MembershipContributionEncodingUnavailable),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FinalDomainArrayEncodingOutcome {
+    FinalDomain(RuntimeFilterFinalDomain),
+    Unavailable(MembershipContributionEncodingUnavailable),
+}
+
+/// Derive one typed membership domain from an Arrow column under the frozen
+/// data type. This has no producer/session authority and is therefore usable
+/// by FinalDomain after its aggregate has been sealed.
+pub fn derive_value_domain_from_array(
+    data_type: &DataType,
+    array: &ArrayRef,
+    max_canonical_bytes: usize,
+) -> Result<ValueDomainArrayEncodingOutcome, MembershipContributionEncodingError> {
+    if array.data_type() != data_type {
+        return Err(MembershipContributionEncodingError::TypeMismatch {
+            expected: data_type.clone(),
+            actual: array.data_type().clone(),
+        });
+    }
+    let domain = value_domain_from_array(array.as_ref(), data_type)?;
+    match encode_value_domain(&domain, max_canonical_bytes) {
+        Ok(_) => Ok(ValueDomainArrayEncodingOutcome::ValueDomain(domain)),
+        Err(
+            ContributionCodecError::EncodedSizeExceeded
+            | ContributionCodecError::ResourceLimit
+            | ContributionCodecError::LengthOverflow,
+        ) => Ok(ValueDomainArrayEncodingOutcome::Unavailable(
+            MembershipContributionEncodingUnavailable::ResourceOrSize,
+        )),
+        Err(error) => Err(contract_error(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            error.to_string(),
+        )),
+    }
+}
+
+/// Encode a sealed FinalDomain value directly from Arrow data. The returned
+/// payload is canonical typed-domain bytes; `fence_digest` is intentionally
+/// carried only by the execution final-domain wrapper and is validated by the
+/// participant-owned completion authority.
+pub fn encode_final_domain_from_array(
+    data_type: &DataType,
+    fence_digest: [u8; 32],
+    array: &ArrayRef,
+    max_canonical_bytes: usize,
+) -> Result<FinalDomainArrayEncodingOutcome, MembershipContributionEncodingError> {
+    let outcome = derive_value_domain_from_array(data_type, array, max_canonical_bytes)?;
+    match outcome {
+        ValueDomainArrayEncodingOutcome::Unavailable(reason) => {
+            Ok(FinalDomainArrayEncodingOutcome::Unavailable(reason))
+        }
+        ValueDomainArrayEncodingOutcome::ValueDomain(domain) => {
+            let typed = RuntimeFilterFinalDomain::from_value_domain(
+                &domain,
+                fence_digest,
+                max_canonical_bytes,
+            )
+            .map_err(|error| {
+                contract_error(
+                    RuntimeFilterContractViolationKind::ContractMismatch,
+                    error.to_string(),
+                )
+            })?;
+            Ok(FinalDomainArrayEncodingOutcome::FinalDomain(typed))
+        }
+    }
+}
+
 /// Encode one complete Arrow membership build input against a frozen producer
 /// contract. A contribution either fits in its entirety or produces the
 /// typed unavailable outcome; the encoder never submits a partial domain.
@@ -1887,6 +1966,31 @@ mod tests {
         assert_eq!(
             encode_membership_contributions(&producer, &input, 1).unwrap(),
             MembershipContributionEncodingOutcome::Unavailable(
+                MembershipContributionEncodingUnavailable::ResourceOrSize
+            ),
+        );
+    }
+
+    #[test]
+    fn final_domain_array_encoder_uses_the_exact_canonical_domain_budget() {
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), None, Some(1), Some(2)]));
+
+        let FinalDomainArrayEncodingOutcome::FinalDomain(final_domain) =
+            encode_final_domain_from_array(&DataType::Int32, [4; 32], &input, usize::MAX).unwrap()
+        else {
+            panic!("the full final-domain payload fits");
+        };
+        let expected = encode_value_domain(
+            &ValueDomainDelta::new(MembershipValues::int32([1, 2]), true),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(final_domain.canonical_bytes().as_ref(), expected.as_slice());
+        assert_eq!(final_domain.contract_digest(), [4; 32]);
+
+        assert_eq!(
+            encode_final_domain_from_array(&DataType::Int32, [4; 32], &input, 1).unwrap(),
+            FinalDomainArrayEncodingOutcome::Unavailable(
                 MembershipContributionEncodingUnavailable::ResourceOrSize
             ),
         );

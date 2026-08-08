@@ -15,22 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
+use arrow::array::ArrayRef;
+#[cfg(test)]
 use arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
+#[cfg(test)]
+use arrow::datatypes::TimeUnit;
 
 use crate::exec::hash_table::key_column::KeyColumn;
+use crate::runtime_filter::exec::membership_delta::MembershipEncodingError;
+#[cfg(test)]
 use crate::runtime_filter::exec::membership_delta::{
-    MembershipDeltaEncoder, MembershipEncodingError, MembershipEncodingOutcome,
+    MembershipDeltaEncoder, MembershipEncodingOutcome,
 };
+#[cfg(test)]
 use crate::runtime_filter::port::value_domain::{
     CanonicalF32, CanonicalF64, MembershipValues, ValueDomainDelta,
 };
@@ -96,6 +104,41 @@ impl fmt::Display for FinalAggregateDomainError {
 
 impl Error for FinalAggregateDomainError {}
 
+/// Materializes the one install-frozen membership key from finalized aggregate
+/// state. Canonical domain construction belongs to Execution; Core only
+/// validates the aggregate's kernel shape and transfers its Arrow column.
+pub(crate) fn extract_final_aggregate_key(
+    final_key_columns: &[KeyColumn],
+) -> Result<(DataType, ArrayRef), FinalAggregateDomainError> {
+    let [final_key_column] = final_key_columns else {
+        return Err(FinalAggregateDomainError::MembershipKeyCount {
+            actual: final_key_columns.len(),
+        });
+    };
+    let expected_rows = final_key_row_count(final_key_column)?;
+    let expected_type = final_key_column.data_type();
+    let array = final_key_column
+        .to_array()
+        .map_err(FinalAggregateDomainError::FinalKeyMaterialization)?;
+    if array.len() != expected_rows {
+        return Err(FinalAggregateDomainError::FinalKeyRowCountMismatch {
+            expected: expected_rows,
+            actual: array.len(),
+        });
+    }
+    if array.data_type() != &expected_type {
+        return Err(FinalAggregateDomainError::FinalKeyTypeMismatch {
+            expected: expected_type,
+            actual: array.data_type().clone(),
+        });
+    }
+    Ok((expected_type, array))
+}
+
+/// Test-only legacy projection retained to verify Core aggregate fixtures
+/// against the pre-RFO-7A domain shape. Production uses
+/// `extract_final_aggregate_key` and Execution's typed final-domain encoder.
+#[cfg(test)]
 /// Encodes the one install-frozen membership key from finalized aggregate state.
 ///
 /// Callers must invoke this while the final aggregate's `KeyTable` still owns its
@@ -147,6 +190,7 @@ pub(crate) fn extract_final_aggregate_domain(
     Ok(deltas.pop().expect("one final aggregate domain delta"))
 }
 
+#[cfg(test)]
 fn ensure_distinct_domain_fits(
     array: &dyn Array,
     data_type: &DataType,
@@ -319,6 +363,7 @@ fn ensure_distinct_domain_fits(
     Ok(())
 }
 
+#[cfg(test)]
 fn invalid_array(data_type: &DataType, detail: String) -> FinalAggregateDomainError {
     FinalAggregateDomainError::MembershipEncoding(MembershipEncodingError::InvalidArray {
         data_type: data_type.clone(),
@@ -326,6 +371,7 @@ fn invalid_array(data_type: &DataType, detail: String) -> FinalAggregateDomainEr
     })
 }
 
+#[cfg(test)]
 fn downcast_array<'a, T: Array + 'static>(
     array: &'a dyn Array,
     data_type: &DataType,
@@ -338,6 +384,7 @@ fn downcast_array<'a, T: Array + 'static>(
     })
 }
 
+#[cfg(test)]
 fn ensure_distinct_values<T, I, F>(
     values: I,
     mut scalar_bytes: F,
@@ -363,6 +410,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn reserve_distinct<T: Ord>(
     distinct: &mut BTreeSet<T>,
     value: T,
@@ -384,6 +432,7 @@ fn reserve_distinct<T: Ord>(
     Ok(())
 }
 
+#[cfg(test)]
 fn ensure_fixed_width_distinct<A>(
     array: &A,
     scalar_bytes: usize,
@@ -401,6 +450,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn ensure_timestamp_distinct<A>(
     array: &dyn Array,
     data_type: &DataType,
@@ -418,12 +468,14 @@ where
     )
 }
 
+#[cfg(test)]
 trait FinalDomainValueAt {
     type Value: Ord;
 
     fn value_at(&self, row: usize) -> Self::Value;
 }
 
+#[cfg(test)]
 macro_rules! final_domain_value_at {
     ($array:ty, $value:ty) => {
         impl FinalDomainValueAt for $array {
@@ -436,14 +488,23 @@ macro_rules! final_domain_value_at {
     };
 }
 
+#[cfg(test)]
 final_domain_value_at!(Int8Array, i8);
+#[cfg(test)]
 final_domain_value_at!(Int16Array, i16);
+#[cfg(test)]
 final_domain_value_at!(Int32Array, i32);
+#[cfg(test)]
 final_domain_value_at!(Int64Array, i64);
+#[cfg(test)]
 final_domain_value_at!(Date32Array, i32);
+#[cfg(test)]
 final_domain_value_at!(TimestampSecondArray, i64);
+#[cfg(test)]
 final_domain_value_at!(TimestampMillisecondArray, i64);
+#[cfg(test)]
 final_domain_value_at!(TimestampMicrosecondArray, i64);
+#[cfg(test)]
 final_domain_value_at!(TimestampNanosecondArray, i64);
 
 fn final_key_row_count(final_key_column: &KeyColumn) -> Result<usize, FinalAggregateDomainError> {

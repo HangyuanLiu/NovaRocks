@@ -38,9 +38,10 @@ use crate::runtime_filter::codec::contribution::ContributionCodecError;
 use crate::runtime_filter::exec::membership_delta::{
     MembershipDeltaEncoder, MembershipEncodingOutcome,
 };
-use crate::runtime_filter::model::contract::NullSemantics;
 #[cfg(test)]
-use crate::runtime_filter::model::contract::{BindingId, CompletionRequirement, ContributionKind};
+use crate::runtime_filter::model::contract::BindingId;
+use crate::runtime_filter::model::contract::NullSemantics;
+use crate::runtime_filter::model::contract::{CompletionRequirement, ContributionKind};
 use crate::runtime_filter::port::artifact::ArtifactMembershipSchema;
 use crate::runtime_filter::port::identity::PartitionId;
 #[cfg(test)]
