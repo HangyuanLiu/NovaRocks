@@ -11,7 +11,7 @@ provenance:
   - "discussion: 2026-08-04 runtime-filter scan-domain evaluation boundary"
 code-anchors:
   - "novarocks/execution/src/runtime_filter/scan_domain.rs (evaluate_scan_unit)"
-  - "novarocks/core/src/runtime_filter/exec/execution_predicate.rs (NativeExecutionPredicate)"
+  - "novarocks/core/src/exec/operators/scan/runner.rs (ScanSourceOperator::evaluate_scan_unit)"
 ---
 
 ## 问题
@@ -46,5 +46,5 @@ Capability 仍由 Core concrete predicate 实现，因为现有 retained artifac
 
 - 需要 compound/multi-column domain、prefix/collation 或 Decimal/timestamp-with-timezone 比较时，先新增 execution-owned typed capability 和完整的跨层类型证明。
 - provider facts 需要额外 identity、统计版本或安全边界才能保持 sealed correctness 时，先扩展 SPI immutable facts，再评估 evaluator 输入。
-- RFO-8 建立 Backend observation store 时，保持 outcome 代数不变，只在 adapter 后聚合；若 store 反向要求 Execution 依赖 Backend，应拒绝该设计。
-- KRN-5 将 scan runner 移出 Core 时，将 Core predicate adapter 与 runner 一并迁移，避免保留第二个 evaluator owner。
+- 建立 Backend observation store 时，保持 outcome 代数不变，只在 adapter 后聚合；若 store 反向要求 Execution 依赖 Backend，应拒绝该设计。
+- 将 scan runner 移出 Core 时，将 Core predicate adapter 与 runner 一并迁移，避免保留第二个 evaluator owner。
