@@ -180,18 +180,9 @@ fn prepare_scan_node(
                     connector @ QueryScanMaterialization::ConnectorRead { .. } => {
                         ResolvedScanExecution::AdmittedConnectorRead(connector)
                     }
-                    QueryScanMaterialization::IcebergDataFiles {
-                        table,
-                        files,
-                        binding,
-                    } => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-                        table,
-                        files,
-                        binding,
-                    }),
                     _ => {
                         return Err(format!(
-                            "SQL data scan binding for '{}.{}.{}' has non-data materialization",
+                            "SQL data scan binding for '{}.{}.{}' is missing its admitted connector read",
                             source.table.catalog, source.table.namespace, source.table.table
                         ));
                     }
