@@ -112,7 +112,7 @@ pub(crate) fn plan_frozen_rewrite_connector_read(
         // This clone is derived from the composite rewrite lease, so the
         // generic ensure barrier retains the same exact generation without a
         // later current-generation lookup.
-        planning_lease: Some(lease.planning_lease()),
+        planning_lease: lease.planning_lease(),
         read_session: split_result.session,
     })
 }

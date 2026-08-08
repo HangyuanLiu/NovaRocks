@@ -188,7 +188,7 @@ fn planned_connector_read_for_test()
             max_rows: NonZeroUsize::new(1024).expect("nonzero rows"),
             max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
         },
-        planning_lease: None,
+        planning_lease: crate::connector::iceberg::provider::fixture_planning_lease("ice"),
         read_session: None,
     }
 }

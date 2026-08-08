@@ -8453,6 +8453,22 @@ pub(crate) fn register_planned_table_files_fixture(
     ));
 }
 
+/// A real control lease for protocol encoders that do not invoke planning but
+/// must still model the mandatory execution-lifetime generation fence.
+#[cfg(test)]
+pub(crate) fn fixture_planning_lease(
+    catalog: &str,
+) -> novarocks_spi::connector::ConnectorControlPlanningLease {
+    novarocks_spi::connector::ConnectorControlPlanningLease::new(
+        Arc::new(planned_table_files_fixture_binding(
+            catalog,
+            std::collections::HashMap::new(),
+            None,
+        )),
+        || {},
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn register_planned_table_files_control_fixture(
     controls: &dyn novarocks_spi::connector::ConnectorControlRegistry,

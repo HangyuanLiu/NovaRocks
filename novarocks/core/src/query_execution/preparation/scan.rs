@@ -102,7 +102,7 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) batch: ConnectorBatchBudget,
     /// Keeps the exact FE control generation alive through the BE ensure
     /// barrier. It is never encoded into a fragment carrier.
-    pub(crate) planning_lease: Option<ConnectorControlPlanningLease>,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
     /// FE-local remote read ownership. This never enters a native carrier.
     pub(crate) read_session: Option<novarocks_spi::connector::ConnectorReadSessionLease>,
 }

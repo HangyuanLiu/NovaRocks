@@ -453,8 +453,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         .connector_read(0, 10)
         .expect("prepared connector read")
         .planning_lease
-        .as_ref()
-        .expect("prepared read must retain planning lease");
+        .clone();
     assert_eq!(
         retained.binding().incarnation(),
         lease.binding().incarnation(),

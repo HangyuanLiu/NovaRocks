@@ -95,7 +95,7 @@ pub(super) fn plan_iceberg_connector_read(
         predicate_dispositions,
         residual_predicates,
         batch: planned.batch,
-        planning_lease: Some(planned.planning_lease),
+        planning_lease: planned.planning_lease,
         read_session: None,
     })
 }
@@ -218,7 +218,7 @@ pub(super) fn plan_connector_read(
         predicate_dispositions,
         residual_predicates,
         batch,
-        planning_lease: Some(planning_lease.clone()),
+        planning_lease: planning_lease.clone(),
         read_session: split_result.session,
     })
 }
@@ -263,7 +263,7 @@ pub(super) fn plan_iceberg_delta_connector_read(
         predicate_dispositions: Vec::new(),
         residual_predicates: predicates.to_vec(),
         batch: planned.batch,
-        planning_lease: Some(planned.planning_lease),
+        planning_lease: planned.planning_lease,
         read_session: None,
     })
 }

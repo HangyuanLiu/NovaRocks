@@ -487,6 +487,7 @@ fn resolved_data_delta() -> ResolvedScanExecution {
         ResolvedScanExecution::IcebergDelta(delta) => delta,
         ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
+        ResolvedScanExecution::AdmittedConnectorRead(_) => unreachable!("fixture is delta"),
     };
     delta.runtime_plan.change_files = vec![novarocks_connector_iceberg::delta::DeltaSourceFile {
         path: "s3://bucket/delta-added.parquet".to_string(),
