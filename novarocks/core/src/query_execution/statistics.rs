@@ -504,7 +504,7 @@ fn admit_statistics_scan_binding(
                     planning_lease: None,
                     scan_materialization: None,
                     iceberg_write_table: None,
-                    frozen_snapshot_files: BTreeMap::new(),
+                    frozen_snapshot_materializations: BTreeMap::new(),
                     delta_runtime_plans: BTreeMap::new(),
                 })
             },

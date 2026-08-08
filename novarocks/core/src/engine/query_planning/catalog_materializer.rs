@@ -56,7 +56,7 @@ pub(crate) fn iceberg_query_binding_from_materialization(
         sql_table_name,
         binding,
         BTreeMap::new(),
-        BTreeMap::new(),
+        std::collections::BTreeSet::new(),
     )
 }
 
@@ -73,10 +73,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
         (i64, i64),
         crate::query_execution::preparation::scan::IcebergDeltaScanRuntimePlan,
     >,
-    mut frozen_snapshot_files: BTreeMap<
-        i64,
-        Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
-    >,
+    mut frozen_snapshot_ids: std::collections::BTreeSet<i64>,
 ) -> Result<QueryTableBinding, String> {
     use crate::sql::planner::table::{
         ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
@@ -127,10 +124,25 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
                 materialization.table.table
             )
         })?;
-        frozen_snapshot_files
-            .entry(snapshot_id)
-            .or_insert_with(|| materialization.files.clone());
+        frozen_snapshot_ids.insert(snapshot_id);
     }
+    let frozen_snapshot_materializations = frozen_snapshot_ids
+        .into_iter()
+        .map(|snapshot_id| {
+            (
+                snapshot_id,
+                QueryScanMaterialization::ConnectorRead {
+                    table: materialization.read_table.clone(),
+                    schema: materialization.read_schema.clone(),
+                    selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                        snapshot_id,
+                    ),
+                    statistics_pin: materialization.statistics_pin.clone(),
+                    planning_lease: materialization.planning_lease.clone(),
+                },
+            )
+        })
+        .collect();
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
         statistics_pin: materialization.statistics_pin.clone(),
@@ -143,7 +155,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
             planning_lease: materialization.planning_lease.clone(),
         }),
         iceberg_write_table: Some(materialization.table),
-        frozen_snapshot_files,
+        frozen_snapshot_materializations,
         delta_runtime_plans,
     })
 }
@@ -512,7 +524,7 @@ mod tests {
                 binding: IcebergDataFileBinding::ExplicitFiles,
             }),
             iceberg_write_table: None,
-            frozen_snapshot_files: BTreeMap::new(),
+            frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
     }

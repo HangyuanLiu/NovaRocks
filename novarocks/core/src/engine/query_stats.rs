@@ -344,7 +344,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 planning_lease: materialization.planning_lease,
             }),
             iceberg_write_table: None,
-            frozen_snapshot_files: std::collections::BTreeMap::new(),
+            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     }

@@ -65,7 +65,6 @@ pub(crate) enum ResolvedScanExecution {
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
     IcebergFiles(ResolvedIcebergFileScan),
-    IcebergMetadata(ResolvedIcebergMetadataScan),
     IcebergDelta(ResolvedIcebergDeltaScan),
 }
 
@@ -74,16 +73,6 @@ pub(crate) struct ResolvedIcebergFileScan {
     pub table: IcebergTableInfo,
     pub files: Vec<IcebergDataFileInfo>,
     pub binding: IcebergDataFileBinding,
-}
-
-/// FE-local recovery of one metadata-table materialization.  This remains
-/// outside SQL artifacts and is encoded only at the native application edge.
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedIcebergMetadataScan {
-    pub table: IcebergTableInfo,
-    pub metadata_table_type: crate::sql::planner::table::SqlMetadataTableKind,
-    pub serialized_table: String,
-    pub metadata_payload: Option<String>,
 }
 
 #[derive(Clone, Debug)]

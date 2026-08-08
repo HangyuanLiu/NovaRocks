@@ -29,33 +29,6 @@ use crate::sql::planner::table::ScanSource;
 
 use super::projection::effective_scan_column_names;
 
-pub(crate) fn build_iceberg_metadata_scan_range_params()
--> crate::runtime::scan_range::ScanRangeParams {
-    use crate::runtime::scan_range::{FileFormat, FileScanRange, ScanRangeParams};
-
-    ScanRangeParams::file(FileScanRange {
-        file_format: FileFormat::Parquet,
-        full_path: Some("iceberg-metadata".to_string()),
-        relative_path: None,
-        table_id: None,
-        offset: 0,
-        length: 0,
-        file_length: 0,
-        delete_files: Vec::new(),
-        deletion_vector_descriptor: None,
-        first_row_id: None,
-        data_sequence_number: None,
-        modification_time: None,
-        datacache_options: None,
-        candidate_node: None,
-        included_positions: Vec::new(),
-        serialized_split: Some(String::new()),
-        use_iceberg_jni_metadata_reader: true,
-        ivm_change_op: None,
-        file_pruning_min_max_values: None,
-    })
-}
-
 /// Plans executable opaque splits through the real Iceberg connector instance.
 /// Native scheduling owns only the resulting SPI identities and byte-size
 /// hints; it must not lower these splits back into `FileScanRange`.

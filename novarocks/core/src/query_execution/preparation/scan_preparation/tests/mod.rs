@@ -102,7 +102,10 @@ fn fixture_query_table_bindings_with_materialized_files(
         QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
     };
     use crate::sql::planner::table::{SqlScanKind, SqlScanSource, SqlTableIdentity};
-    use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution,
+    };
 
     let scan = plan
         .fragments()
@@ -181,15 +184,42 @@ fn fixture_query_table_bindings_with_materialized_files(
                         },
                     },
                 };
-                let frozen_snapshot_files = match &source.kind {
+                let frozen_snapshot_materializations = match &source.kind {
                     SqlScanKind::FrozenInputSet {
                         version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(
                             snapshot_id,
                         ),
-                    } => std::collections::BTreeMap::from([(
-                        *snapshot_id,
-                        materialized_files.clone(),
-                    )]),
+                    } => {
+                        let lease = planning_lease.clone().ok_or_else(|| {
+                            "frozen scan fixture must acquire an exact connector lease".to_string()
+                        })?;
+                        let metadata = lease
+                            .binding()
+                            .metadata()
+                            .load_table(ConnectorTableRequest {
+                                table: ConnectorTableIdentity {
+                                    instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                        .expect("fixture catalog must be valid"),
+                                    namespace: Arc::from(source.table.namespace.as_str()),
+                                    table: Arc::from(source.table.table.as_str()),
+                                },
+                                resolution: ConnectorTableResolution::StrictBaseTable,
+                                context: crate::connector::test_request_context(),
+                            })
+                            .map_err(|error| error.to_string())?;
+                        std::collections::BTreeMap::from([(
+                            *snapshot_id,
+                            QueryScanMaterialization::ConnectorRead {
+                                table: metadata.table,
+                                schema: metadata.schema,
+                                selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
+                                    *snapshot_id,
+                                ),
+                                statistics_pin: None,
+                                planning_lease: lease,
+                            },
+                        )])
+                    }
                     _ => std::collections::BTreeMap::new(),
                 };
                 Ok(QueryTableBinding {
@@ -202,7 +232,7 @@ fn fixture_query_table_bindings_with_materialized_files(
                     planning_lease: planning_lease.clone(),
                     scan_materialization: Some(scan_materialization),
                     iceberg_write_table: None,
-                    frozen_snapshot_files,
+                    frozen_snapshot_materializations,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })
             },
@@ -456,7 +486,6 @@ fn resolved_data_delta() -> ResolvedScanExecution {
     let mut delta = match resolved_delta() {
         ResolvedScanExecution::IcebergDelta(delta) => delta,
         ResolvedScanExecution::IcebergFiles(_) => unreachable!("fixture is delta"),
-        ResolvedScanExecution::IcebergMetadata(_) => unreachable!("fixture is delta"),
         ResolvedScanExecution::ConnectorRead => unreachable!("fixture is delta"),
     };
     delta.runtime_plan.change_files = vec![novarocks_connector_iceberg::delta::DeltaSourceFile {

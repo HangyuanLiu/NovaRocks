@@ -631,7 +631,6 @@ fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
         ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
         ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
-        ResolvedScanExecution::IcebergMetadata(_) => "LegacyIcebergMetadata",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",
     }
 }

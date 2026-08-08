@@ -335,7 +335,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
                     novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             }),
             iceberg_write_table: Some(table),
-            frozen_snapshot_files: std::collections::BTreeMap::new(),
+            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
     })

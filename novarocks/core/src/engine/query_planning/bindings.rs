@@ -213,7 +213,7 @@ pub(crate) struct QueryTableBinding {
     ///
     /// The map is query-local and shares the binding's planning lease; it is
     /// never populated by a later catalog lookup.
-    pub(crate) frozen_snapshot_files: BTreeMap<i64, Vec<IcebergDataFileInfo>>,
+    pub(crate) frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
     /// Exact snapshot-window physical facts admitted for a SQL delta scan.
     /// They remain application-owned and are retrieved only through this
     /// binding's request-local token during preparation.
@@ -243,16 +243,6 @@ pub(crate) enum QueryScanMaterialization {
         table: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,
         binding: IcebergDataFileBinding,
-    },
-    /// Exact provider facts for one metadata alias.  These are intentionally
-    /// retained outside the SQL plan: the compiler sees only `SqlMetadata`
-    /// plus this binding token, while preparation/native assembly recover the
-    /// unchanged Iceberg carrier from the same request-local store.
-    IcebergMetadata {
-        table: IcebergTableInfo,
-        metadata_table_type: SqlMetadataTableKind,
-        serialized_table: String,
-        metadata_payload: Option<String>,
     },
     /// Exact target facts retained for one MV refresh.  SQL sees the binding
     /// token and target-state/locator facts only; the provider table, frozen
@@ -287,7 +277,6 @@ impl std::fmt::Debug for QueryScanMaterialization {
                 .field("selector", selector)
                 .finish_non_exhaustive(),
             Self::IcebergDataFiles { .. } => formatter.write_str("IcebergDataFiles(..)"),
-            Self::IcebergMetadata { .. } => formatter.write_str("IcebergMetadata(..)"),
             Self::IcebergMvTarget { .. } => formatter.write_str("IcebergMvTarget(..)"),
         }
     }
@@ -311,7 +300,7 @@ impl QueryTableBinding {
             planning_lease: None,
             scan_materialization: None,
             iceberg_write_table: None,
-            frozen_snapshot_files: BTreeMap::new(),
+            frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
     }
@@ -532,29 +521,15 @@ impl QueryTableBindingStore {
         snapshot_id: i64,
     ) -> Result<QueryScanMaterialization, String> {
         let binding = self.binding(id)?;
-        let files = binding.frozen_snapshot_files.get(&snapshot_id).cloned().ok_or_else(|| {
+        binding
+            .frozen_snapshot_materializations
+            .get(&snapshot_id)
+            .cloned()
+            .ok_or_else(|| {
             format!(
-                "SQL frozen snapshot {snapshot_id} has no admitted file set for its request-local binding"
+                "SQL frozen snapshot {snapshot_id} has no admitted connector materialization for its request-local binding"
             )
-        })?;
-        let Some(QueryScanMaterialization::IcebergDataFiles {
-            table,
-            binding: file_binding,
-            ..
-        }) = binding.scan_materialization.as_ref()
-        else {
-            return Err(
-                "SQL frozen snapshot binding has no admitted Iceberg data materialization"
-                    .to_string(),
-            );
-        };
-        let mut table = table.clone();
-        table.current_snapshot_id = Some(snapshot_id);
-        Ok(QueryScanMaterialization::IcebergDataFiles {
-            table,
-            files,
-            binding: *file_binding,
-        })
+            })
     }
 
     /// Return the immutable bindings captured during admission.  The caller
