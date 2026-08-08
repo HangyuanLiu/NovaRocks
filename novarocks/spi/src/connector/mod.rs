@@ -36,6 +36,7 @@ mod scalar;
 mod staged_create;
 mod staged_publication_recovery;
 mod statistics;
+mod view_metadata;
 mod write;
 
 pub mod conformance;
@@ -107,8 +108,10 @@ pub use handle::{
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
+    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorReadNamedReference,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSnapshotLogEntry, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableRequest, ConnectorTableResolution,
 };
 pub use metadata_maintenance::{
@@ -186,6 +189,10 @@ pub use statistics::{
     StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsProvenance,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
     StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsScanColumn,
+};
+pub use view_metadata::{
+    ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,
+    ConnectorViewRequest,
 };
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorBatchWriter, ConnectorOpenWriterRequest,

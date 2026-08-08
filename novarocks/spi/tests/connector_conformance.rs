@@ -31,17 +31,20 @@ use novarocks_spi::connector::{
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorReaderMetricsSnapshot, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateColumn,
-    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStatistics,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorListViewsRequest,
+    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry,
+    ConnectorReaderMetricsSnapshot, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsMissingReason, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
+    ConnectorStaticPredicateKind, ConnectorStatistics, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ConnectorViewIdentity,
+    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
     ExternalMutationOutcome, StatisticsEvidence, StatisticsReadRequest,
     normalize_predicate_dispositions, validate_static_predicates,
 };
@@ -736,6 +739,169 @@ fn control_binding_rejects_statistics_owned_by_another_generation() {
         .kind(),
         ConnectorErrorKind::InvalidRequest
     );
+}
+
+fn spi5b_context(
+    max_total_payload_bytes: usize,
+) -> novarocks_spi::connector::ConnectorRequestContext {
+    novarocks_spi::connector::ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        Arc::new(NeverCancelled),
+        max_total_payload_bytes,
+        max_total_payload_bytes,
+    )
+    .expect("SPI-5B request context")
+}
+
+#[test]
+fn spi5b_reference_facts_sort_and_validate_references_against_snapshots() {
+    let facts = ConnectorReadReferenceFacts::try_new(
+        vec![7, 3],
+        vec![
+            ConnectorReadSnapshotLogEntry {
+                snapshot_id: 7,
+                timestamp_millis: 20,
+            },
+            ConnectorReadSnapshotLogEntry {
+                snapshot_id: 3,
+                timestamp_millis: 10,
+            },
+        ],
+        vec![
+            ConnectorReadNamedReference {
+                name: Arc::from("main"),
+                kind: ConnectorReadReferenceKind::Branch,
+                snapshot_id: 7,
+            },
+            ConnectorReadNamedReference {
+                name: Arc::from("release"),
+                kind: ConnectorReadReferenceKind::Tag,
+                snapshot_id: 3,
+            },
+        ],
+        Some(7),
+        &spi5b_context(4096),
+    )
+    .expect("well-formed reference facts");
+
+    assert_eq!(facts.snapshot_ids(), &[3, 7]);
+    assert_eq!(
+        facts
+            .snapshot_log()
+            .iter()
+            .map(|entry| entry.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![3, 7]
+    );
+    assert_eq!(
+        facts
+            .named_references()
+            .iter()
+            .map(|reference| reference.name.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["main", "release"]
+    );
+    assert_eq!(facts.current_snapshot_id(), Some(7));
+
+    assert_eq!(
+        ConnectorReadReferenceFacts::try_new(
+            vec![3],
+            vec![],
+            vec![ConnectorReadNamedReference {
+                name: Arc::from("missing"),
+                kind: ConnectorReadReferenceKind::Branch,
+                snapshot_id: 99,
+            }],
+            None,
+            &spi5b_context(4096),
+        )
+        .expect_err("references to an unknown snapshot must fail")
+        .kind(),
+        ConnectorErrorKind::CorruptData
+    );
+}
+
+#[test]
+fn spi5b_reference_facts_enforce_the_request_total_payload_budget() {
+    assert_eq!(
+        ConnectorReadReferenceFacts::try_new(
+            vec![1],
+            vec![],
+            vec![ConnectorReadNamedReference {
+                name: Arc::from("reference-name-that-does-not-fit"),
+                kind: ConnectorReadReferenceKind::Branch,
+                snapshot_id: 1,
+            }],
+            Some(1),
+            &spi5b_context(32),
+        )
+        .expect_err("facts must honor the request total payload budget")
+        .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+}
+
+struct OwnerViewMetadata {
+    descriptor: ConnectorInstanceDescriptor,
+    incarnation: ConnectorInstanceIncarnation,
+}
+
+impl ConnectorViewMetadata for OwnerViewMetadata {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn view_exists(&self, _: ConnectorViewRequest) -> Result<bool, ConnectorError> {
+        unreachable!("control binding construction must not resolve views")
+    }
+
+    fn load_view(
+        &self,
+        _: ConnectorViewRequest,
+    ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        unreachable!("control binding construction must not resolve views")
+    }
+
+    fn list_views(
+        &self,
+        _: ConnectorListViewsRequest,
+    ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
+        unreachable!("control binding construction must not resolve views")
+    }
+}
+
+#[test]
+fn spi5b_control_binding_rejects_view_capability_owned_by_another_generation() {
+    let descriptor = descriptor("file");
+    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let binding = ConnectorControlBinding::try_new(
+        descriptor.clone(),
+        incarnation,
+        Arc::new(OwnerMetadata::new("file")),
+        Arc::new(OwnerPlanning {
+            instance_id: descriptor.instance_id.clone(),
+        }),
+        Arc::new(OwnerDistribution {
+            descriptor: descriptor.clone(),
+            incarnation,
+        }),
+        None,
+    )
+    .expect("base binding");
+    let foreign = Arc::new(OwnerViewMetadata {
+        descriptor,
+        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+    });
+
+    let error = match binding.try_with_view_metadata(Some(foreign)) {
+        Ok(_) => panic!("a host must not attach a foreign view capability"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
 }
 
 struct OwnerDataMutation {

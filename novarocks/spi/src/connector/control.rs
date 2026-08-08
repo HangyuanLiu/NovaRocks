@@ -28,7 +28,8 @@ use super::{
     ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
     ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorWriteControl, ConnectorWriteLease, ConnectorWriteResolver,
+    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorWriteResolver,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -234,6 +235,7 @@ pub struct ConnectorControlBinding {
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
+    view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
 impl ConnectorControlBinding {
@@ -417,6 +419,7 @@ impl ConnectorControlBinding {
             write,
             statistics,
             staged_publication_recovery: None,
+            view_metadata: None,
         })
     }
 
@@ -659,6 +662,27 @@ impl ConnectorControlBinding {
 
     pub fn statistics(&self) -> Option<&Arc<dyn ConnectorStatistics>> {
         self.statistics.as_ref()
+    }
+
+    pub fn view_metadata(&self) -> Option<&Arc<dyn ConnectorViewMetadata>> {
+        self.view_metadata.as_ref()
+    }
+
+    /// Attaches the optional view metadata capability to this exact control
+    /// generation after the common mandatory capabilities have been validated.
+    pub fn try_with_view_metadata(
+        mut self,
+        view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(capability) = &view_metadata {
+            super::view_metadata::validate_view_metadata_owner(
+                &self.descriptor,
+                self.incarnation,
+                capability.as_ref(),
+            )?;
+        }
+        self.view_metadata = view_metadata;
+        Ok(self)
     }
 
     /// Installs the provider-owned historical staged-publication inspector.
