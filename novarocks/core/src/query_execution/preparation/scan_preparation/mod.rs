@@ -452,62 +452,29 @@ fn resolve_frozen_mv_target_scan(
             "SQL MV {lane} scan node_id={node_id} has binding token but no query-local binding store"
         )
     })?;
-    let materialization = query_table_bindings
-        .scan_materialization(source.binding)?
-        .ok_or_else(|| {
-            format!(
-                "SQL MV {lane} scan binding for '{}.{}.{}' has no frozen target materialization",
-                source.table.catalog, source.table.namespace, source.table.table
-            )
-        })?;
-    let QueryScanMaterialization::IcebergMvTarget {
-        table,
-        files,
-        binding,
-        target_table_uuid,
-        frozen_snapshot_id,
-        target_state_partition_filter,
-        target_partition_contract,
-    } = materialization
-    else {
-        return Err(format!(
-            "SQL MV {lane} scan binding for '{}.{}.{}' has non-target materialization",
+    let binding = query_table_bindings.binding(source.binding)?;
+    let materialization = binding.mv_target_read.as_ref().ok_or_else(|| {
+        format!(
+            "SQL MV {lane} scan binding for '{}.{}.{}' has no frozen target materialization",
             source.table.catalog, source.table.namespace, source.table.table
-        ));
-    };
-    if !table.catalog.eq_ignore_ascii_case(&source.table.catalog)
-        || !table
-            .namespace
-            .eq_ignore_ascii_case(&source.table.namespace)
-        || !table.table.eq_ignore_ascii_case(&source.table.table)
+        )
+    })?;
+    if materialization.target_table_uuid != expected_uuid
+        || materialization.frozen_snapshot_id != expected_snapshot_id
     {
-        return Err(format!(
-            "SQL MV {lane} scan node_id={node_id} identity does not match its frozen target binding"
-        ));
-    }
-    if target_table_uuid != expected_uuid || frozen_snapshot_id != expected_snapshot_id {
         return Err(format!(
             "SQL MV {lane} scan node_id={node_id} target UUID or snapshot does not match its frozen binding"
         ));
     }
-    let files = match target_state_partition_constraint {
+    let connector_read = match target_state_partition_constraint {
         Some(
             crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired,
-        ) => filter_frozen_mv_target_state_files(
-            files,
-            &target_state_partition_filter,
-            target_partition_contract.as_ref(),
-            node_id,
-        )?,
+        ) => &materialization.affected_partitions,
         Some(crate::sql::planner::table::SqlMvTargetStatePartitionConstraint::Unpartitioned)
-        | None => files,
+        | None => &materialization.full,
     };
-    Ok(ResolvedScanExecution::IcebergFiles(
-        ResolvedIcebergFileScan {
-            table,
-            files,
-            binding,
-        },
+    Ok(ResolvedScanExecution::AdmittedConnectorRead(
+        connector_read.clone(),
     ))
 }
 
@@ -516,7 +483,7 @@ fn resolve_frozen_mv_target_scan(
 /// an allow-list; the keys and partition contract remain application-owned
 /// binding facts.  This must not consult a catalog, a provider, or a current
 /// connector generation.
-fn filter_frozen_mv_target_state_files(
+pub(crate) fn filter_frozen_mv_target_state_files(
     files: Vec<novarocks_connector_iceberg::scan_model::IcebergDataFileInfo>,
     filter: &crate::mv::model::TargetPartitionFilter,
     contract: Option<&crate::mv::persistence::schema::MvPartitionContract>,

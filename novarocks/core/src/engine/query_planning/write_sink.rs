@@ -333,6 +333,7 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
             // prove admission; the provider-owned write table below is the
             // exact SQL write-target contract.
             scan_materialization: None,
+            mv_target_read: None,
             iceberg_write_table: Some(table),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),

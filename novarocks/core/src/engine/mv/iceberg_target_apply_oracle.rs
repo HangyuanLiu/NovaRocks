@@ -925,6 +925,7 @@ fn framework_locator_query_local_overlay(
                         binding: IcebergDataFileBinding::ExplicitFiles,
                     }),
                     iceberg_write_table: None,
+                    mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 })

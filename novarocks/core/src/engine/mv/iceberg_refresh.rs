@@ -62,7 +62,8 @@ use crate::engine::mv::schema_validation_adapter::{
     validate_current_join_schema_contract, validate_current_schema_contract,
 };
 use crate::engine::query_planning::bindings::{
-    QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
+    MvTargetReadAdmission, QueryScanMaterialization, QueryTableBinding, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{
@@ -14253,11 +14254,57 @@ pub(crate) fn bind_imv_target_query_table_in_store(
     let target = &refresh.rewrite.target;
     let target_table_uuid = refresh.rewrite.target_table_uuid.clone();
     let frozen_snapshot_id = refresh.rewrite.target_snapshot_id;
+    let planning_lease = planning_lease.cloned().ok_or_else(|| {
+        "IMV target admission requires an exact connector control planning lease".to_string()
+    })?;
+    let context = refresh_connector_context(refresh)?.clone();
+    let materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_from_exact_lease(
+            planning_lease.clone(),
+            context,
+            &target.namespace,
+            &target.table,
+        )?;
+    if materialization.table.table_uuid.as_deref() != Some(target_table_uuid.as_str())
+        || materialization.table.current_snapshot_id != frozen_snapshot_id
+    {
+        return Err(format!(
+            "IMV target changed after admission: expected uuid={target_table_uuid} snapshot={frozen_snapshot_id:?}, got uuid={:?} snapshot={:?}",
+            materialization.table.table_uuid, materialization.table.current_snapshot_id,
+        ));
+    }
     let table = refresh.target_bindings.runtime().table_info()?;
     let files = refresh
         .target_bindings
         .runtime()
         .data_files_at_frozen_snapshot()?;
+    let selector = frozen_snapshot_id
+        .map(novarocks_spi::connector::ConnectorReadSelector::SnapshotId)
+        .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
+    let full_materialization = materialization.with_frozen_files(files.clone(), selector)?;
+    let affected_files =
+        crate::query_execution::preparation::scan_preparation::filter_frozen_mv_target_state_files(
+            files,
+            &refresh.affected_partitions_to_target_partition_filter(),
+            refresh.rewrite.schema_contract.target.partition.as_ref(),
+            0,
+        )?;
+    let affected_materialization = materialization.with_frozen_files(affected_files, selector)?;
+    let to_read = |materialization: &crate::connector::iceberg::provider::IcebergQueryTableMaterialization| {
+        QueryScanMaterialization::ConnectorRead {
+            table: materialization.read_table.clone(),
+            schema: materialization.read_schema.clone(),
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin.clone(),
+            planning_lease: materialization.planning_lease.clone(),
+        }
+    };
+    let mv_target_read = MvTargetReadAdmission {
+        full: to_read(&full_materialization),
+        affected_partitions: to_read(&affected_materialization),
+        target_table_uuid: target_table_uuid.clone(),
+        frozen_snapshot_id,
+    };
     let key = QueryTableBindingKey::mv_target(
         &target.catalog,
         &target.namespace,
@@ -14309,17 +14356,9 @@ pub(crate) fn bind_imv_target_query_table_in_store(
             // optimizer statistics are resolved for this target as a side
             // channel during refresh preparation.
             statistics_pin: None,
-            planning_lease: planning_lease.cloned(),
-            scan_materialization: Some(QueryScanMaterialization::IcebergMvTarget {
-                table: table.clone(),
-                files: files.clone(),
-                binding: IcebergDataFileBinding::ExplicitFiles,
-                target_table_uuid: target_table_uuid.clone(),
-                frozen_snapshot_id,
-                target_state_partition_filter: refresh
-                    .affected_partitions_to_target_partition_filter(),
-                target_partition_contract: refresh.rewrite.schema_contract.target.partition.clone(),
-            }),
+            planning_lease: Some(planning_lease),
+            scan_materialization: Some(mv_target_read.full.clone()),
+            mv_target_read: Some(mv_target_read),
             iceberg_write_table: Some(table.clone()),
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
@@ -15092,7 +15131,19 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
     };
     ctx.connector_context = Some(connector_context.clone());
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store(&ctx, &bindings, None)?;
+    let target_materialization =
+        crate::connector::iceberg::provider::load_schema_materialization_with_lease(
+            state.connector_control.as_ref(),
+            connector_context.clone(),
+            &ctx.rewrite.target.catalog,
+            &ctx.rewrite.target.namespace,
+            &ctx.rewrite.target.table,
+        )?;
+    let target_binding = bind_imv_target_query_table_in_store(
+        &ctx,
+        &bindings,
+        Some(&target_materialization.planning_lease),
+    )?;
     let catalog_service_snapshot = crate::engine::catalog_service_snapshot(state);
     let overlays = freeze_imv_base_query_local_overlays(state, &ctx)?;
     let materializer = crate::engine::query_planning::catalog_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(

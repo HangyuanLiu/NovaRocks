@@ -166,6 +166,7 @@ fn coalesce_binding(
         planning_lease: Some(planning_lease),
         scan_materialization: Some(materialization),
         iceberg_write_table: None,
+        mv_target_read: None,
         frozen_snapshot_materializations: std::collections::BTreeMap::new(),
         delta_runtime_plans: std::collections::BTreeMap::new(),
     }
@@ -410,6 +411,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
                         },
                     ),
                     iceberg_write_table: None,
+                    mv_target_read: None,
                     frozen_snapshot_materializations: std::collections::BTreeMap::new(),
                     delta_runtime_plans: std::collections::BTreeMap::new(),
                 };

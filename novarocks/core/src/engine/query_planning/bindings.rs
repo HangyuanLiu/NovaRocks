@@ -202,6 +202,10 @@ pub(crate) struct QueryTableBinding {
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
     pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+    /// MV target SQL facts plus the two admitted opaque read authorities. A
+    /// target-state scan may choose the pre-filtered read, while its locator
+    /// always uses the full read; neither lane receives provider file facts.
+    pub(crate) mv_target_read: Option<MvTargetReadAdmission>,
     /// Provider-private facts retained only for terminal write projection.
     /// Read preparation must use `scan_materialization`'s opaque handle.
     pub(crate) iceberg_write_table:
@@ -266,6 +270,14 @@ pub(crate) enum QueryScanMaterialization {
     },
 }
 
+#[derive(Clone)]
+pub(crate) struct MvTargetReadAdmission {
+    pub(crate) full: QueryScanMaterialization,
+    pub(crate) affected_partitions: QueryScanMaterialization,
+    pub(crate) target_table_uuid: String,
+    pub(crate) frozen_snapshot_id: Option<i64>,
+}
+
 impl std::fmt::Debug for QueryScanMaterialization {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -299,6 +311,7 @@ impl QueryTableBinding {
             statistics_pin: None,
             planning_lease: None,
             scan_materialization: None,
+            mv_target_read: None,
             iceberg_write_table: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),

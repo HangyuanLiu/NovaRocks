@@ -154,6 +154,7 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
             statistics_pin: materialization.statistics_pin.clone(),
             planning_lease: materialization.planning_lease.clone(),
         }),
+        mv_target_read: None,
         iceberg_write_table: Some(materialization.table),
         frozen_snapshot_materializations,
         delta_runtime_plans,
@@ -524,6 +525,7 @@ mod tests {
                 binding: IcebergDataFileBinding::ExplicitFiles,
             }),
             iceberg_write_table: None,
+            mv_target_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }
