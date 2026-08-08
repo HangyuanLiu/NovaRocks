@@ -33,8 +33,7 @@ use super::projection::effective_scan_column_names;
 /// Native scheduling owns only the resulting SPI identities and byte-size
 /// hints; it must not lower these splits back into `FileScanRange`.
 pub(super) fn plan_iceberg_connector_read(
-    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    exact_lease: Option<novarocks_spi::connector::ConnectorControlPlanningLease>,
+    exact_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
     scan: &PlanScanNode,
     execution: &ResolvedScanExecution,
@@ -64,34 +63,17 @@ pub(super) fn plan_iceberg_connector_read(
     } else {
         requested_projection
     };
-    let planned = match exact_lease {
-        Some(lease) => crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
-            lease,
-            context,
-            &files.table,
-            files.binding,
-            &files.files,
-            &projection,
-            static_predicates.clone(),
-            target_parallelism,
-            max_split_bytes,
-        )?,
-        // Callers that construct plans outside SQL compilation (test-only
-        // native encoding fixtures and legacy internal statistics plans) do
-        // not own a query catalog binding. Production SQL preparation passes
-        // an exact lease above and never reaches this fallback.
-        None => crate::connector::iceberg::provider::plan_native_iceberg_read(
-            controls,
-            context,
-            &files.table,
-            files.binding,
-            &files.files,
-            &projection,
-            static_predicates.clone(),
-            target_parallelism,
-            max_split_bytes,
-        )?,
-    };
+    let planned = crate::connector::iceberg::provider::plan_native_iceberg_read_with_lease(
+        exact_lease,
+        context,
+        &files.table,
+        files.binding,
+        &files.files,
+        &projection,
+        static_predicates.clone(),
+        target_parallelism,
+        max_split_bytes,
+    )?;
     let predicate_dispositions =
         normalize_predicate_dispositions(&static_predicates, &planned.scan.predicate_dispositions)
             .map_err(|error| format!("Iceberg connector static predicate response: {error}"))?;

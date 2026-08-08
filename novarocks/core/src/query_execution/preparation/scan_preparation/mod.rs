@@ -362,11 +362,14 @@ fn prepare_scan_node(
                     lower_static_connector_predicates(scan, &connector_schema_fields)
                 })
                 .unwrap_or_default();
-            let exact_lease = query_table_bindings
-                .map(|bindings| exact_query_binding_lease_for_source(bindings, &scan.table.source))
-                .transpose()?;
+            let query_table_bindings = query_table_bindings.ok_or_else(|| {
+                format!(
+                    "Iceberg file scan node_id={node_id} has no query-local binding store with an exact planning lease"
+                )
+            })?;
+            let exact_lease =
+                exact_query_binding_lease_for_source(query_table_bindings, &scan.table.source)?;
             let planned = plan_iceberg_connector_read(
-                controls,
                 exact_lease,
                 context.clone(),
                 scan,
