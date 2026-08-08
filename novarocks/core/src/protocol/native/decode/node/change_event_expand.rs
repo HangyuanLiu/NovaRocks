@@ -29,8 +29,8 @@ use crate::exec::node::change_event_expand::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::protocol::common::error::FieldPath;
-use crate::sql::common::ChangeStreamBranchKind;
 use novarocks_protocol::plan;
+use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 pub(super) fn lower_change_event_expand_node(
     node: &plan::DistributedNode,

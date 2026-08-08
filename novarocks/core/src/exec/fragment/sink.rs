@@ -23,7 +23,6 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::change_op::ChangeStreamBranchKind;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
@@ -32,6 +31,7 @@ use crate::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::{
     ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
+use novarocks_types::change_stream::ChangeStreamBranchKind;
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
@@ -685,17 +685,11 @@ pub fn build_change_stream_split_predicate(
     branch_kind: ChangeStreamBranchKind,
 ) -> Result<ExprId, ExecPlanBuildError> {
     use crate::exec::expr::{ExprNode, LiteralValue};
-    use crate::sql::common::{
-        CHANGE_OP_DELETE, CHANGE_OP_INSERT, DATA_ROUTE_FRESH, DATA_ROUTE_REUSE,
-    };
 
+    let route_key = branch_kind.route_key();
     let operation = arena.push_typed(ExprNode::SlotId(change_op_slot_id), DataType::Int8);
-    let expected_operation = match branch_kind {
-        ChangeStreamBranchKind::DeleteDv => CHANGE_OP_DELETE,
-        ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData => CHANGE_OP_INSERT,
-    };
     let operation_literal = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Int8(expected_operation as i8)),
+        ExprNode::Literal(LiteralValue::Int8(route_key.change_op() as i8)),
         DataType::Int8,
     );
     let operation_matches = arena.push_typed(
@@ -703,12 +697,12 @@ pub fn build_change_stream_split_predicate(
         DataType::Boolean,
     );
 
-    let route_matches = match branch_kind {
-        ChangeStreamBranchKind::DeleteDv => data_route_slot_id.map(|route_slot| {
+    let route_matches = match route_key.data_route() {
+        None => data_route_slot_id.map(|route_slot| {
             let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
             arena.push_typed(ExprNode::IsNull(route), DataType::Boolean)
         }),
-        ChangeStreamBranchKind::ReuseData | ChangeStreamBranchKind::FreshData => {
+        Some(expected_route) => {
             let route_slot = data_route_slot_id.ok_or_else(|| {
                 ExecPlanBuildError::new(
                     ExecPlanInvariant::Sink,
@@ -716,11 +710,6 @@ pub fn build_change_stream_split_predicate(
                 )
             })?;
             let route = arena.push_typed(ExprNode::SlotId(route_slot), DataType::Int32);
-            let expected_route = match branch_kind {
-                ChangeStreamBranchKind::ReuseData => DATA_ROUTE_REUSE,
-                ChangeStreamBranchKind::FreshData => DATA_ROUTE_FRESH,
-                ChangeStreamBranchKind::DeleteDv => unreachable!(),
-            };
             let route_literal = arena.push_typed(
                 ExprNode::Literal(LiteralValue::Int32(expected_route)),
                 DataType::Int32,

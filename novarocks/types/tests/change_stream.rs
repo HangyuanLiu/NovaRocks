@@ -15,36 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::ids::SlotId;
-use crate::exec::chunk::ChunkSchemaRef;
-use crate::exec::expr::ExprId;
 use novarocks_types::change_stream::ChangeStreamBranchKind;
 
-use super::ExecNode;
+#[test]
+fn branch_kinds_have_stable_immutable_route_keys() {
+    let cases = [
+        (ChangeStreamBranchKind::DeleteDv, -1, None),
+        (ChangeStreamBranchKind::ReuseData, 1, Some(1)),
+        (ChangeStreamBranchKind::FreshData, 1, Some(2)),
+    ];
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ChangeEventExpandNode {
-    pub input: Box<ExecNode>,
-    pub node_id: i32,
-    pub events: Vec<ChangeEventRuntimeSpec>,
-    pub output_slot_ids: Vec<SlotId>,
-    pub output_chunk_schema: ChunkSchemaRef,
-    pub change_op_slot_id: SlotId,
-    pub data_route_slot_id: Option<SlotId>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ChangeEventRuntimeSpec {
-    pub predicate: Option<ExprId>,
-    pub branch_kind: ChangeStreamBranchKind,
-    pub assignments: Vec<ChangeEventRuntimeOutputExpr>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ChangeEventRuntimeOutputExpr {
-    pub output_slot_id: SlotId,
-    pub expr: Option<ExprId>,
+    for (branch_kind, change_op, data_route) in cases {
+        let route_key = branch_kind.route_key();
+        assert_eq!(route_key.change_op(), change_op);
+        assert_eq!(route_key.data_route(), data_route);
+    }
 }
