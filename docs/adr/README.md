@@ -111,6 +111,7 @@ code-anchors:
 
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
+- ADR-0041 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（active）
 
 ### runtime-role
 

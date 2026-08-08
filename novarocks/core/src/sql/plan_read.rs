@@ -16,6 +16,7 @@
 // under the License.
 
 //! Read-only public projections of a sealed distributed SQL plan.
+// Design: ADR-0041 (docs/adr/ADR-0041-sealed-distributed-plan-read-contract.md)
 //!
 //! This is the single public SQL plan reading surface. Construction, draft
 //! mutation, sealing, and validation remain private to the SQL compiler.
