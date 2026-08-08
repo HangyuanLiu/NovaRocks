@@ -293,7 +293,10 @@ impl NativeFragmentService {
             .map_err(NativeFragmentIngressError::new)?;
         let query_mem_tracker = admission.query_mem_tracker();
         let fragment_mem_tracker = admission.fragment_mem_tracker();
-        let failure_injection_eligible = !request.uses_result_sink();
+        // Staged execution can safely rendezvous after Start even when this
+        // is the root result fragment: the runner-owned trigger is consumed
+        // only after the gate releases and never exists in production.
+        let failure_injection_eligible = true;
         let event_sink = crate::fragment::lifecycle_fragment_event_sink(
             Arc::clone(&self.lifecycle),
             execution_id,

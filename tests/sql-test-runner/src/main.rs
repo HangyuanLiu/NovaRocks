@@ -2849,6 +2849,7 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "stop_query_control_heartbeat_after_stage_be_index",
         "hold_start_until_early_ingress",
         "query_control_fragment_backend_limit",
+        "fail_fragment_after_start_be_index",
     ];
     sql.lines().any(|line| {
         let line = line.trim_start();
@@ -3815,6 +3816,9 @@ mod tests {
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @hold_start_until_early_ingress=true\nSELECT 1;"
+        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(
+            "-- @fail_fragment_after_start_be_index=1\nSELECT 1;"
         ));
         assert!(!sql_text_has_query_lifecycle_fault_directive(
             "-- query-control-heartbeat-loss is only a case name\nSELECT 1;"
