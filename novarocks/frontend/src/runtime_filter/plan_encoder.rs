@@ -287,6 +287,7 @@ mod tests {
     use novarocks::runtime_filter_transition::model::contract::{NullOrder, SortDirection};
     use novarocks::runtime_filter_transition::port::ordered_bound::RuntimeOrderKey;
     use novarocks_protocol::common;
+    use novarocks_protocol::plan::RuntimeFilterScanDomainTarget;
     use plan::runtime_filter_binding::Role;
     use plan::runtime_filter_consumer_activation::Kind as ActivationKind;
     use plan::runtime_filter_reduction_contract::Kind as ReductionKind;
