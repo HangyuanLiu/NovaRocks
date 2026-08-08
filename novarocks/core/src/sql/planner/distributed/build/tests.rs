@@ -136,7 +136,7 @@ fn activation_neutral_graph_structure<A>(
                     RuntimeFilterBindingRoleData::Consumer(consumer) => {
                         ActivationNeutralBindingRoleStructure::Consumer {
                             capabilities: consumer.capabilities.clone(),
-                            target: consumer.target,
+                            target: consumer.target.clone(),
                         }
                     }
                 },
@@ -1040,7 +1040,15 @@ fn aggregate_topn_runtime_filter_materializes_ordered_live_graph() {
     let RuntimeFilterBindingRole::Consumer(requirement) = &consumer.role else {
         unreachable!("filtered to a consumer")
     };
-    assert_eq!(requirement.target, ConsumerBindingTarget::SourceBoundary);
+    let ConsumerBindingTarget::SourceBoundary {
+        scan_domain: Some(target),
+    } = &requirement.target
+    else {
+        panic!("scan-column probe must freeze a Route C semantic target");
+    };
+    assert_eq!(target.column_id, ColumnId::new_for_test(1));
+    assert_eq!(target.data_type, DataType::Int64);
+    assert!(!target.nullable);
     assert_eq!(
         requirement.activation,
         ConsumerActivation::NonBlockingLive {
@@ -1436,7 +1444,7 @@ fn draft_runtime_filter_population_preserves_join_structure_without_sealed_activ
     let consumer_target = sealed_graph
         .bindings()
         .find_map(|binding| match &binding.role {
-            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer.target),
+            RuntimeFilterBindingRole::Consumer(consumer) => Some(consumer.target.clone()),
             RuntimeFilterBindingRole::Producer(_) => None,
         })
         .expect("sealed consumer target");

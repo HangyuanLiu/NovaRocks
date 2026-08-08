@@ -19,6 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use arrow::datatypes::DataType;
+
+use crate::query_execution::preparation::scan::ScanExecutionBindings;
 use crate::runtime_filter::deployment::planning_adapter;
 use crate::runtime_filter::port::artifact::{ArtifactMembershipSchema, ArtifactSchemaDigest};
 use crate::runtime_filter::port::ordered_bound::{
@@ -36,7 +39,7 @@ use crate::sql::planner::runtime_filter::contract::{
 };
 use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ProducerBindingTarget, RuntimeFilterBindingRole,
-    RuntimeFilterBindingSpec, RuntimeFilterGraph,
+    RuntimeFilterBindingSpec, RuntimeFilterGraph, RuntimeFilterSemanticScanDomainTarget,
 };
 
 #[derive(Clone, Debug)]
@@ -149,13 +152,38 @@ pub(crate) enum PreparedRuntimeFilterBindingRole {
     Consumer {
         capabilities: BTreeSet<ArtifactCapability>,
         activation: ConsumerActivation,
-        target: ConsumerBindingTarget,
+        target: PreparedRuntimeFilterConsumerTarget,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedRuntimeFilterConsumerTarget {
+    DirectInput {
+        input_ordinal: usize,
+    },
+    SourceBoundary {
+        scan_domain: Option<PreparedRuntimeFilterScanDomainTarget>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedRuntimeFilterScanDomainTarget {
+    pub(crate) field_ordinal: u32,
+    pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
 }
 
 pub(super) fn materialize_runtime_filter_binding_tables(
     graph: &RuntimeFilterGraph,
     fragments: &[PlanFragment],
+) -> Result<BTreeMap<FragmentId, RuntimeFilterBindingTable>, String> {
+    materialize_runtime_filter_binding_tables_with_scan_bindings(graph, fragments, None)
+}
+
+pub(super) fn materialize_runtime_filter_binding_tables_with_scan_bindings(
+    graph: &RuntimeFilterGraph,
+    fragments: &[PlanFragment],
+    scan_bindings: Option<&ScanExecutionBindings>,
 ) -> Result<BTreeMap<FragmentId, RuntimeFilterBindingTable>, String> {
     let mut tables = BTreeMap::new();
     for fragment in fragments {
@@ -180,6 +208,7 @@ pub(super) fn materialize_runtime_filter_binding_tables(
 
     fn visit(
         graph: &RuntimeFilterGraph,
+        scan_bindings: Option<&ScanExecutionBindings>,
         pending: &mut BTreeMap<BindingId, &RuntimeFilterBindingSpec>,
         table: &mut RuntimeFilterBindingTable,
         node: &crate::sql::planner::distributed::DistributedNode,
@@ -260,7 +289,13 @@ pub(super) fn materialize_runtime_filter_binding_tables(
                     PreparedRuntimeFilterBindingRole::Consumer {
                         capabilities: requirement.capabilities.clone(),
                         activation: requirement.activation,
-                        target: requirement.target,
+                        target: materialize_consumer_target(
+                            *binding_id,
+                            binding.location.fragment_id,
+                            binding.location.node_id,
+                            &requirement.target,
+                            scan_bindings,
+                        )?,
                     }
                 }
             };
@@ -282,7 +317,7 @@ pub(super) fn materialize_runtime_filter_binding_tables(
             }
         }
         for child in &node.children {
-            visit(graph, pending, table, child)?;
+            visit(graph, scan_bindings, pending, table, child)?;
         }
         Ok(())
     }
@@ -291,7 +326,7 @@ pub(super) fn materialize_runtime_filter_binding_tables(
         let table = tables
             .get_mut(&fragment.fragment_id)
             .expect("table was initialized from the same fragment list");
-        visit(graph, &mut pending, table, &fragment.root)?;
+        visit(graph, scan_bindings, &mut pending, table, &fragment.root)?;
     }
     if let Some((binding_id, binding)) = pending.first_key_value() {
         return Err(format!(
@@ -302,6 +337,125 @@ pub(super) fn materialize_runtime_filter_binding_tables(
         ));
     }
     Ok(tables)
+}
+
+fn materialize_consumer_target(
+    binding_id: BindingId,
+    fragment_id: crate::sql::planner::runtime_filter::contract::PlanFragmentId,
+    node_id: PlanNodeId,
+    target: &ConsumerBindingTarget,
+    scan_bindings: Option<&ScanExecutionBindings>,
+) -> Result<PreparedRuntimeFilterConsumerTarget, String> {
+    match target {
+        ConsumerBindingTarget::DirectInput { input_ordinal } => {
+            Ok(PreparedRuntimeFilterConsumerTarget::DirectInput {
+                input_ordinal: *input_ordinal,
+            })
+        }
+        ConsumerBindingTarget::SourceBoundary { scan_domain } => {
+            let scan_domain = scan_domain
+                .as_ref()
+                .map(|target| {
+                    materialize_scan_domain_target(
+                        binding_id,
+                        fragment_id,
+                        node_id,
+                        target,
+                        scan_bindings,
+                    )
+                })
+                .transpose()?;
+            Ok(PreparedRuntimeFilterConsumerTarget::SourceBoundary { scan_domain })
+        }
+    }
+}
+
+fn materialize_scan_domain_target(
+    binding_id: BindingId,
+    fragment_id: crate::sql::planner::runtime_filter::contract::PlanFragmentId,
+    node_id: PlanNodeId,
+    target: &RuntimeFilterSemanticScanDomainTarget,
+    scan_bindings: Option<&ScanExecutionBindings>,
+) -> Result<PreparedRuntimeFilterScanDomainTarget, String> {
+    let scan_bindings = scan_bindings.ok_or_else(|| {
+        format!(
+            "runtime filter binding id={} has a Route C semantic target without pinned scan bindings",
+            binding_id.get()
+        )
+    })?;
+    let binding = scan_bindings.binding(node_id.get()).ok_or_else(|| {
+        format!(
+            "runtime filter binding id={} Route C target has no pinned scan binding for node_id={}",
+            binding_id.get(),
+            node_id.get()
+        )
+    })?;
+    let read = scan_bindings
+        .connector_read(fragment_id.get(), node_id.get())
+        .ok_or_else(|| {
+            format!(
+                "runtime filter binding id={} Route C target requires a pinned connector read for fragment_id={} node_id={}",
+                binding_id.get(),
+                fragment_id.get(),
+                node_id.get()
+            )
+        })?;
+    let physical = binding
+        .physical_columns
+        .iter()
+        .filter(|column| column.planner.column_id == target.column_id)
+        .collect::<Vec<_>>();
+    let [physical] = physical.as_slice() else {
+        return Err(format!(
+            "runtime filter binding id={} Route C target column id {} does not resolve to exactly one pinned physical scan output",
+            binding_id.get(),
+            target.column_id
+        ));
+    };
+    if physical.planner.data_type != target.data_type
+        || physical.planner.nullable != target.nullable
+        || physical.source.data_type != target.data_type
+        || physical.source.nullable != target.nullable
+    {
+        return Err(format!(
+            "runtime filter binding id={} Route C target column '{}' type/nullability drifted from its pinned scan binding",
+            binding_id.get(),
+            physical.source.name
+        ));
+    }
+    let output_matches = read
+        .scan
+        .output_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(&physical.source.name))
+        .collect::<Vec<_>>();
+    let [(output_ordinal, output)] = output_matches.as_slice() else {
+        return Err(format!(
+            "runtime filter binding id={} Route C target source column '{}' does not resolve to exactly one pinned connector output",
+            binding_id.get(),
+            physical.source.name
+        ));
+    };
+    if output.data_type() != &target.data_type || output.is_nullable() != target.nullable {
+        return Err(format!(
+            "runtime filter binding id={} Route C target source column '{}' type/nullability drifted from pinned connector output",
+            binding_id.get(),
+            physical.source.name
+        ));
+    }
+    let field_ordinal = *read.provider_field_ordinals.get(*output_ordinal).ok_or_else(|| {
+        format!(
+            "runtime filter binding id={} Route C target connector output ordinal {} has no pinned provider ordinal",
+            binding_id.get(), output_ordinal
+        )
+    })?;
+    Ok(PreparedRuntimeFilterScanDomainTarget {
+        field_ordinal,
+        data_type: target.data_type.clone(),
+        nullable: target.nullable,
+    })
 }
 
 fn validate_expression_type(
@@ -395,6 +549,7 @@ mod tests {
     use crate::runtime_filter::port::ordered_bound::RuntimeOrderContract;
     use crate::runtime_filter::port::topk_summary::RuntimeTopKSummaryContract;
     use crate::sql::analysis::{ExprKind, LiteralValue};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, PlanFragment,
     };
@@ -412,7 +567,7 @@ mod tests {
     use crate::sql::planner::runtime_filter::graph::{
         ApplyPoint, ConsumerBindingTarget, ConsumerRequirement, PlanLocation, ProducerRequirement,
         RuntimeFilterBindingRole, RuntimeFilterBindingSpec, RuntimeFilterChannelSpec,
-        RuntimeFilterGraph,
+        RuntimeFilterGraph, RuntimeFilterSemanticScanDomainTarget,
     };
 
     fn expression(value: i64) -> TypedExpr {
@@ -624,7 +779,7 @@ mod tests {
                 activation: ConsumerActivation::NonBlockingLive {
                     late_apply: LateApplyGranularity::Batch,
                 },
-                target: ConsumerBindingTarget::SourceBoundary,
+                target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
             }),
         }
     }
@@ -712,6 +867,43 @@ mod tests {
             duplicate_error.contains("binding id=7 is attached more than once"),
             "{duplicate_error}"
         );
+    }
+
+    #[test]
+    fn route_c_semantic_target_requires_pinned_scan_bindings() {
+        let channel_id = ChannelId::new(9);
+        let producer_id = BindingId::new(7);
+        let consumer_id = BindingId::new(8);
+        let mut consumer = consumer_binding(consumer_id, channel_id, 1, 11);
+        let RuntimeFilterBindingRole::Consumer(requirement) = &mut consumer.role else {
+            unreachable!("fixture is a consumer");
+        };
+        requirement.target = ConsumerBindingTarget::SourceBoundary {
+            scan_domain: Some(RuntimeFilterSemanticScanDomainTarget {
+                column_id: ColumnId::new_for_test(4),
+                data_type: DataType::Int64,
+                nullable: false,
+            }),
+        };
+        let graph = graph_with(
+            vec![membership_channel(channel_id)],
+            vec![producer_binding(producer_id, channel_id, 1, 10), consumer],
+        );
+
+        let error = materialize_runtime_filter_binding_tables(
+            &graph,
+            &[fragment(
+                1,
+                node_with_children(
+                    1,
+                    10,
+                    vec![producer_id],
+                    vec![node(1, 11, vec![consumer_id])],
+                ),
+            )],
+        )
+        .expect_err("Route C target cannot use an unpinned provider read");
+        assert!(error.contains("without pinned scan bindings"), "{error}");
     }
 
     #[test]

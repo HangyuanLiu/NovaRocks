@@ -31,7 +31,7 @@ use novarocks_protocol::{common, expr};
 use super::projection::PreparedFragmentSet;
 use super::runtime_filter_binding::{
     PreparedReductionContract, PreparedRuntimeFilterBinding, PreparedRuntimeFilterBindingRole,
-    PreparedRuntimeFilterContract,
+    PreparedRuntimeFilterConsumerTarget, PreparedRuntimeFilterContract,
 };
 
 #[derive(Clone, Copy)]
@@ -167,7 +167,7 @@ impl<'a> RuntimeFilterBindingFacts<'a> {
                     .map(RuntimeFilterArtifactCapability::from_sql)
                     .collect(),
                 activation: RuntimeFilterConsumerActivation::from_sql(*activation),
-                target: RuntimeFilterConsumerTarget::from_sql(*target),
+                target: RuntimeFilterConsumerTarget::from_prepared(target),
             },
         }
     }
@@ -354,21 +354,57 @@ impl RuntimeFilterProducerTarget {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum RuntimeFilterConsumerTarget {
     DirectInputOrdinal(u32),
-    SourceBoundary,
+    SourceBoundary {
+        scan_domain_target: Option<RuntimeFilterScanDomainTarget>,
+    },
 }
 
 impl RuntimeFilterConsumerTarget {
-    fn from_sql(value: ConsumerBindingTarget) -> Self {
+    fn from_prepared(value: &PreparedRuntimeFilterConsumerTarget) -> Self {
         match value {
-            ConsumerBindingTarget::DirectInput { input_ordinal } => Self::DirectInputOrdinal(
-                u32::try_from(input_ordinal).expect("sealed input ordinal fits u32"),
-            ),
-            ConsumerBindingTarget::SourceBoundary => Self::SourceBoundary,
+            PreparedRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
+                Self::DirectInputOrdinal(
+                    u32::try_from(*input_ordinal).expect("sealed input ordinal fits u32"),
+                )
+            }
+            PreparedRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
+                Self::SourceBoundary {
+                    scan_domain_target: scan_domain.as_ref().map(|target| {
+                        RuntimeFilterScanDomainTarget {
+                            field_ordinal: target.field_ordinal,
+                            r#type: encode_type(&target.data_type)
+                                .expect("sealed scan-domain type is encodable"),
+                            nullable: target.nullable,
+                        }
+                    }),
+                }
+            }
         }
     }
+
+    // Deployment compilation consumes lifecycle/placement facts only.  Its
+    // view exists before pinned scan preparation and must never manufacture a
+    // Route C physical target from semantic SQL identity.
+    fn from_unprepared_sql(value: &ConsumerBindingTarget) -> Self {
+        match value {
+            ConsumerBindingTarget::DirectInput { input_ordinal } => Self::DirectInputOrdinal(
+                u32::try_from(*input_ordinal).expect("sealed input ordinal fits u32"),
+            ),
+            ConsumerBindingTarget::SourceBoundary { .. } => Self::SourceBoundary {
+                scan_domain_target: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeFilterScanDomainTarget {
+    pub field_ordinal: u32,
+    pub r#type: common::TypeDesc,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -790,7 +826,7 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                         .map(RuntimeFilterArtifactCapability::from_sql)
                         .collect(),
                     activation: RuntimeFilterConsumerActivation::from_sql(requirement.activation),
-                    target: RuntimeFilterConsumerTarget::from_sql(requirement.target),
+                    target: RuntimeFilterConsumerTarget::from_unprepared_sql(&requirement.target),
                 }
             }
         }

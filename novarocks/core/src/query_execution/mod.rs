@@ -43,8 +43,8 @@ pub use preparation::runtime_filter_view::{
     RuntimeFilterFrontierEdgeFacts, RuntimeFilterJoinProgressFacts,
     RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity, RuntimeFilterNullOrder,
     RuntimeFilterNullSemantics, RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts,
-    RuntimeFilterProducerTarget, RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
-    RuntimeFilterValidatedPlacementFacts,
+    RuntimeFilterProducerTarget, RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget,
+    RuntimeFilterSortDirection, RuntimeFilterValidatedPlacementFacts,
 };
 pub mod prepared_write;
 pub(crate) mod profile;

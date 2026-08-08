@@ -112,9 +112,19 @@ fn encode_runtime_filter_binding(
                         )
                     })?,
                 ),
-                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary => {
-                    plan::runtime_filter_consumer_role::Target::SourceBoundary(true)
-                }
+                crate::sql::planner::runtime_filter::graph::ConsumerBindingTarget::SourceBoundary {
+                    scan_domain,
+                } => plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
+                    plan::RuntimeFilterSourceBoundaryTarget {
+                        scan_domain_target: scan_domain.as_ref().map(|target| {
+                            Ok(plan::RuntimeFilterScanDomainTarget {
+                                field_ordinal: target.column_id,
+                                r#type: Some(encode_type(&target.data_type)?),
+                                nullable: target.nullable,
+                            })
+                        }).transpose()?,
+                    },
+                ),
             }),
         }),
     });

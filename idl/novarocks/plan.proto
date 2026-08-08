@@ -270,10 +270,27 @@ message RuntimeFilterProducerRole {
 message RuntimeFilterConsumerRole {
   repeated RuntimeFilterArtifactCapability capabilities = 1;
   RuntimeFilterConsumerActivation activation = 2;
+  // Field 4 used to carry a lossy source-boundary boolean.  It was published
+  // before Route C gained an explicit scan-domain contract, so never reuse
+  // either the field number or name.
+  reserved 4;
+  reserved "source_boundary";
   oneof target {
     uint32 direct_input_ordinal = 3;
-    bool source_boundary = 4;
+    RuntimeFilterSourceBoundaryTarget source_boundary_target = 5;
   }
+}
+
+// A source boundary can remain a normal row-filter boundary, or can carry an
+// exact, FE-pinned provider field for Route C scan-unit evaluation.
+message RuntimeFilterSourceBoundaryTarget {
+  RuntimeFilterScanDomainTarget scan_domain_target = 1;
+}
+
+message RuntimeFilterScanDomainTarget {
+  uint32 field_ordinal = 1;
+  common.TypeDesc type = 2;
+  bool nullable = 3;
 }
 
 enum RuntimeFilterContributionKind {

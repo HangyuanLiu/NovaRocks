@@ -31,6 +31,7 @@ use crate::sql::planner::runtime_filter::graph::{
     ApplyPoint, ConsumerBindingTarget, ConsumerRequirementData, PlanLocation,
     ProducerBindingTarget, ProducerRequirement, RuntimeFilterBindingRoleData,
     RuntimeFilterBindingSpecData, RuntimeFilterChannelSpec, RuntimeFilterGraphData,
+    RuntimeFilterSemanticScanDomainTarget,
 };
 
 use crate::sql::planner::distributed::activation_decision::DraftRuntimeFilterGraph;
@@ -737,7 +738,9 @@ fn resolved_consumer_binding(
     expression: TypedExpr,
 ) -> Result<ResolvedConsumerBinding, ()> {
     let target = if node.children.is_empty() {
-        ConsumerBindingTarget::SourceBoundary
+        ConsumerBindingTarget::SourceBoundary {
+            scan_domain: scan_domain_target(node, &expression),
+        }
     } else {
         let inputs = bindings
             .node_input_columns
@@ -776,6 +779,33 @@ fn resolved_consumer_binding(
         fragment_id: node.fragment_id,
         expression,
         target,
+    })
+}
+
+/// Route C starts only at a scan leaf whose already-rewritten consumer
+/// expression is precisely one user-visible scan output.  Anything less
+/// exact remains an ordinary source boundary and is still eligible for the
+/// normal row-filter path.
+fn scan_domain_target(
+    node: &DistributedNode,
+    expression: &TypedExpr,
+) -> Option<RuntimeFilterSemanticScanDomainTarget> {
+    let DistributedNodeKind::Scan(scan) = &node.payload else {
+        return None;
+    };
+    let ExprKind::ColumnRef { column_id, .. } = &expression.kind else {
+        return None;
+    };
+    let output = scan.columns.iter().find(|output| {
+        output.column_id == *column_id
+            && !output.is_internal
+            && output.data_type == expression.data_type
+            && output.nullable == expression.nullable
+    })?;
+    Some(RuntimeFilterSemanticScanDomainTarget {
+        column_id: output.column_id,
+        data_type: output.data_type.clone(),
+        nullable: output.nullable,
     })
 }
 
@@ -1439,7 +1469,7 @@ mod tests {
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
-                        target: ConsumerBindingTarget::SourceBoundary,
+                        target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
                         capabilities: BTreeSet::from([ArtifactCapability::OrderedRange]),
                         activation: live,
                     }],
@@ -1475,7 +1505,7 @@ mod tests {
                     consumers: vec![RuntimeFilterConsumerCandidate {
                         location: location(2),
                         expression: expression(),
-                        target: ConsumerBindingTarget::SourceBoundary,
+                        target: ConsumerBindingTarget::SourceBoundary { scan_domain: None },
                         capabilities: BTreeSet::from([
                             ArtifactCapability::Membership,
                             ArtifactCapability::EmptyDomain,

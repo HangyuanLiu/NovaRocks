@@ -1099,7 +1099,7 @@ impl SnapshotPredicateCompiler {
         binding_id: execution::RuntimeFilterBindingId,
         contract_digest: [u8; 32],
     ) -> Result<Arc<execution::RuntimeFilterSnapshot>, execution::UnavailableReason> {
-        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = match self {
+        let native_predicate = match self {
             Self::Membership {
                 data_type,
                 null_semantics,
@@ -1129,12 +1129,18 @@ impl SnapshotPredicateCompiler {
                 )))
             }
         };
-        Ok(Arc::new(execution::RuntimeFilterSnapshot::new(
-            binding_id,
-            execution::LogicalVersion::new(bundle.version().get()),
-            contract_digest,
-            predicate,
-        )))
+        let predicate: Arc<dyn execution::RuntimeFilterPredicate> = native_predicate.clone();
+        let scan_domain: Arc<dyn execution::scan_domain::RuntimeFilterScanDomainPredicate> =
+            native_predicate;
+        Ok(Arc::new(
+            execution::RuntimeFilterSnapshot::with_scan_domain(
+                binding_id,
+                execution::LogicalVersion::new(bundle.version().get()),
+                contract_digest,
+                predicate,
+                Some(scan_domain),
+            ),
+        ))
     }
 }
 

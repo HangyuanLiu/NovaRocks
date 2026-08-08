@@ -763,7 +763,7 @@ fn attach_leaf_consumers(
                 ),
             ));
         };
-        if *target != DecodedConsumerBindingTarget::SourceBoundary {
+        if !matches!(target, DecodedConsumerBindingTarget::SourceBoundary { .. }) {
             return Err(super::NativeFragmentDecodeError::inconsistent(
                 path.clone().field("runtime_filter_binding_ids"),
                 format!(
@@ -1295,13 +1295,26 @@ fn consumer_spec(
     let DecodedBindingRole::Consumer {
         capabilities,
         activation,
-        ..
+        target,
     } = &binding.role
     else {
         return Err(format!(
             "native runtime-filter binding_id={} expected consumer role",
             binding.binding_id
         ));
+    };
+    let scan_domain = match target {
+        DecodedConsumerBindingTarget::DirectInput { .. } => None,
+        DecodedConsumerBindingTarget::SourceBoundary { scan_domain } => scan_domain.as_ref().map(|target| {
+            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanDomainBinding::new(
+                novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(binding.binding_id),
+                novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanDomainTarget::new(
+                    target.field_ordinal,
+                    target.data_type.clone(),
+                    target.nullable,
+                ),
+            )
+        }),
     };
     Ok(RuntimeFilterConsumerBinding {
         binding_id: binding.binding_id,
@@ -1311,6 +1324,7 @@ fn consumer_spec(
         capabilities: capabilities.clone(),
         contract: native_contract(&binding.contract),
         reduction: native_reduction(&binding.reduction),
+        scan_domain,
     })
 }
 
@@ -2233,7 +2247,7 @@ mod tests {
         let DecodedBindingRole::Consumer { target, .. } = &mut binding.role else {
             unreachable!("dormant_consumer always returns a consumer")
         };
-        *target = DecodedConsumerBindingTarget::SourceBoundary;
+        *target = DecodedConsumerBindingTarget::SourceBoundary { scan_domain: None };
         binding
     }
 
@@ -2438,9 +2452,13 @@ mod tests {
                             plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true),
                         ),
                     }),
-                    target: Some(plan::runtime_filter_consumer_role::Target::SourceBoundary(
-                        true,
-                    )),
+                    target: Some(
+                        plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
+                            plan::RuntimeFilterSourceBoundaryTarget {
+                                scan_domain_target: None,
+                            },
+                        ),
+                    ),
                 },
             )),
         }

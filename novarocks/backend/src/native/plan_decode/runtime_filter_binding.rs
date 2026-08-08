@@ -22,6 +22,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
+use arrow::datatypes::DataType;
 use novarocks::exec::node::runtime_filter::{
     ArtifactCapability, ArtifactMembershipSchema, ComparatorDigest, CompletionFenceKind,
     CompletionRequirement, ConsumerActivation, ContributionKind, LateApplyGranularity, NullOrder,
@@ -74,10 +75,23 @@ pub(crate) enum DecodedBindingRole {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedConsumerBindingTarget {
-    DirectInput { input_ordinal: usize },
-    SourceBoundary,
+    DirectInput {
+        input_ordinal: usize,
+    },
+    SourceBoundary {
+        scan_domain: Option<DecodedRuntimeFilterScanDomainTarget>,
+    },
+}
+
+/// A Route C target is deliberately decoded before the execution node is
+/// built.  The backend never infers it from a connector schema or catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
+    pub(crate) field_ordinal: u32,
+    pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1016,16 +1030,32 @@ fn decode_role(
                         })?,
                     }
                 }
-                plan::runtime_filter_consumer_role::Target::SourceBoundary(true) => {
-                    DecodedConsumerBindingTarget::SourceBoundary
-                }
-                plan::runtime_filter_consumer_role::Target::SourceBoundary(false) => {
-                    return Err(NativeFragmentDecodeError::invalid_value(
-                        target_path.field("source_boundary"),
-                        format!(
-                            "native runtime-filter consumer binding_id={binding_id} source boundary marker must be true"
-                        ),
-                    ));
+                plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(target) => {
+                    let scan_domain = target.scan_domain_target.as_ref().map(|target| {
+                        let path = target_path.clone().field("source_boundary_target").field("scan_domain_target");
+                        let wire_type = target.r#type.as_ref().ok_or_else(|| {
+                            NativeFragmentDecodeError::missing(
+                                path.clone().field("type"),
+                                format!(
+                                    "native runtime-filter consumer binding_id={binding_id} Route C target is missing type"
+                                ),
+                            )
+                        })?;
+                        let data_type = crate::native::type_decode::decode_type(wire_type).map_err(|error| {
+                            NativeFragmentDecodeError::invalid_value(
+                                path.clone().field("type"),
+                                format!(
+                                    "native runtime-filter consumer binding_id={binding_id} Route C target has invalid type: {error}"
+                                ),
+                            )
+                        })?;
+                        Ok::<_, NativeFragmentDecodeError>(DecodedRuntimeFilterScanDomainTarget {
+                            field_ordinal: target.field_ordinal,
+                            data_type,
+                            nullable: target.nullable,
+                        })
+                    }).transpose()?;
+                    DecodedConsumerBindingTarget::SourceBoundary { scan_domain }
                 }
             };
             Ok(DecodedBindingRole::Consumer {

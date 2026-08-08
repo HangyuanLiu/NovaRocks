@@ -24,7 +24,9 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::profile::RuntimeProfile;
-use novarocks_spi::connector::{ConnectorExecutionBinding, ConnectorSplit};
+use novarocks_spi::connector::{
+    ConnectorExecutionBinding, ConnectorPreparedScanUnit, ConnectorSplit,
+};
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -314,6 +316,15 @@ pub trait ScanOp: Send + Sync {
     /// Return the storage-tablet identity associated with a provider-neutral
     /// scheduled split, when that split participates in lake row positioning.
     fn storage_tablet_id(&self, _morsel: &ScanMorsel) -> Result<Option<i64>, String> {
+        Ok(None)
+    }
+
+    /// Exposes only the sealed unit identity/domain facts to the scan runner.
+    /// Reader handles and provider payload remain owned by the connector op.
+    fn prepared_scan_unit(
+        &self,
+        _morsel: &ScanMorsel,
+    ) -> Result<Option<ConnectorPreparedScanUnit>, String> {
         Ok(None)
     }
 }

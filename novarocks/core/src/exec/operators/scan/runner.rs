@@ -888,6 +888,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         }
     }
 
@@ -1060,6 +1061,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let blocking_subscription: Arc<dyn BlockingSnapshotSubscription> =
             Arc::new(PublishedBlockingSubscription(
@@ -1095,6 +1097,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let live = Arc::new(ControllableOrderedLiveSubscription::new());
         let typed: Arc<dyn NonBlockingLiveSubscription> = live.clone();

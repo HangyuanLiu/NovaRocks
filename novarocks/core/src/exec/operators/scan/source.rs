@@ -1192,6 +1192,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         };
         let ordered = RuntimeFilterConsumerBinding {
             binding_id: 2,
@@ -1207,6 +1208,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let op: Arc<dyn ScanOp> = Arc::new(PlainScanOp::new());
         let mut scan = ScanNode::new_for_test(Arc::clone(&op))
@@ -1255,6 +1257,7 @@ mod tests {
                 schema_digest: membership_schema.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::SetUnion,
+            scan_domain: None,
         }]);
 
         ScanSourceFactory::new_native(scan, op, Arc::new(arena))
@@ -1296,6 +1299,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         }]);
         let factory =
             ScanSourceFactory::new_native(scan, op, Arc::new(arena)).expect("native scan factory");
@@ -1361,6 +1365,7 @@ mod tests {
                     order_contract_digest: order.digest().bytes(),
                 },
                 reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+                scan_domain: None,
             }]);
             assert!(
                 ScanSourceFactory::new_native(scan, op, Arc::new(arena))
@@ -1407,6 +1412,7 @@ mod tests {
                 order_contract_digest: order.digest().bytes(),
             },
             reduction: RuntimeFilterExecutionReduction::TightenOrderedBound,
+            scan_domain: None,
         };
         let idle = Arc::new(IdleOrderedLiveSubscription {
             polls: AtomicUsize::new(0),

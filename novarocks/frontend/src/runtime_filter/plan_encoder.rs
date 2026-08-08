@@ -262,8 +262,18 @@ fn encode_role(
                 RuntimeFilterConsumerTarget::DirectInputOrdinal(ordinal) => {
                     plan::runtime_filter_consumer_role::Target::DirectInputOrdinal(ordinal)
                 }
-                RuntimeFilterConsumerTarget::SourceBoundary => {
-                    plan::runtime_filter_consumer_role::Target::SourceBoundary(true)
+                RuntimeFilterConsumerTarget::SourceBoundary { scan_domain_target } => {
+                    plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
+                        plan::RuntimeFilterSourceBoundaryTarget {
+                            scan_domain_target: scan_domain_target.map(|target| {
+                                plan::RuntimeFilterScanDomainTarget {
+                                    field_ordinal: target.field_ordinal,
+                                    r#type: Some(target.r#type),
+                                    nullable: target.nullable,
+                                }
+                            }),
+                        },
+                    )
                 }
             }),
         }),
@@ -276,6 +286,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks::runtime_filter_transition::model::contract::{NullOrder, SortDirection};
     use novarocks::runtime_filter_transition::port::ordered_bound::RuntimeOrderKey;
+    use novarocks_protocol::common;
     use plan::runtime_filter_binding::Role;
     use plan::runtime_filter_consumer_activation::Kind as ActivationKind;
     use plan::runtime_filter_reduction_contract::Kind as ReductionKind;
@@ -510,7 +521,9 @@ mod tests {
             let Role::Consumer(live) = encode_role(RuntimeFilterBindingRoleFacts::Consumer {
                 capabilities: vec![RuntimeFilterArtifactCapability::Membership],
                 activation: RuntimeFilterConsumerActivation::NonBlockingLive(granularity),
-                target: RuntimeFilterConsumerTarget::SourceBoundary,
+                target: RuntimeFilterConsumerTarget::SourceBoundary {
+                    scan_domain_target: None,
+                },
             })
             .expect("live consumer") else {
                 panic!("consumer role");
@@ -521,10 +534,38 @@ mod tests {
             );
             assert_eq!(
                 live.target,
-                Some(plan::runtime_filter_consumer_role::Target::SourceBoundary(
-                    true
-                ))
+                Some(
+                    plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(
+                        plan::RuntimeFilterSourceBoundaryTarget {
+                            scan_domain_target: None,
+                        }
+                    )
+                )
             );
         }
+
+        let Role::Consumer(route_c) = encode_role(RuntimeFilterBindingRoleFacts::Consumer {
+            capabilities: vec![RuntimeFilterArtifactCapability::Membership],
+            activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+            target: RuntimeFilterConsumerTarget::SourceBoundary {
+                scan_domain_target: Some(RuntimeFilterScanDomainTarget {
+                    field_ordinal: 17,
+                    r#type: common::TypeDesc { kind: None },
+                    nullable: true,
+                }),
+            },
+        })
+        .expect("Route C consumer role") else {
+            panic!("consumer role");
+        };
+        let Some(plan::runtime_filter_consumer_role::Target::SourceBoundaryTarget(target)) =
+            route_c.target
+        else {
+            panic!("structured source-boundary target");
+        };
+        let target = target.scan_domain_target.expect("Route C target");
+        assert_eq!(target.field_ordinal, 17);
+        assert_eq!(target.nullable, true);
+        assert!(target.r#type.is_some());
     }
 }

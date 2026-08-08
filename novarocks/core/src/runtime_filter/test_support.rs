@@ -334,7 +334,7 @@ fn consumer_binding(
         role: sql_graph::RuntimeFilterBindingRole::Consumer(sql_graph::ConsumerRequirement {
             capabilities,
             activation,
-            target: sql_graph::ConsumerBindingTarget::SourceBoundary,
+            target: sql_graph::ConsumerBindingTarget::SourceBoundary { scan_domain: None },
         }),
     }
 }
@@ -807,7 +807,7 @@ pub fn compiled_three_backend_all_of_plan() -> RuntimeFilterDeploymentPlan {
             role: sql_graph::RuntimeFilterBindingRole::Consumer(sql_graph::ConsumerRequirement {
                 capabilities,
                 activation: sql_contract::ConsumerActivation::BlockingSnapshot,
-                target: sql_graph::ConsumerBindingTarget::SourceBoundary,
+                target: sql_graph::ConsumerBindingTarget::SourceBoundary { scan_domain: None },
             }),
         })
         .expect("insert three-backend consumer");
