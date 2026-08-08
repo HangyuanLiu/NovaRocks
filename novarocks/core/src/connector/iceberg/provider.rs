@@ -1808,11 +1808,12 @@ impl IcebergControlProvider {
                 nullable: field.is_nullable(),
             })
             .collect::<Vec<_>>();
-        super::schema::build_projected_output_schema_from_scan_model(
+        let schema = super::schema::build_projected_output_schema_from_scan_model(
             &iceberg_schema_def_for_codegen(loaded.table.metadata().current_schema()),
             &columns,
         )
-        .map_err(|error| internal(format!("build Iceberg projected schema: {error}")))
+        .map_err(|error| internal(format!("build Iceberg projected schema: {error}")))?;
+        preserve_hidden_sql_field_metadata(schema, &fields)
     }
 
     fn frozen_data_rewrite_schema(
@@ -5669,6 +5670,46 @@ fn iceberg_metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, Co
         .collect()
 }
 
+/// The scan-model projection builder preserves Iceberg field IDs, while the
+/// connector owns whether a field is visible to SQL.  Carry provider-owned
+/// hidden-field metadata through that projection so control consumers such as
+/// ANALYZE do not treat row-identity fields as table columns.
+fn preserve_hidden_sql_field_metadata(
+    schema: SchemaRef,
+    source_fields: &[Arc<Field>],
+) -> Result<SchemaRef, ConnectorError> {
+    if schema.fields().len() != source_fields.len() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg projected schema lost a source field",
+        ));
+    }
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(source_fields)
+        .map(|(projected, source)| {
+            let hidden = source
+                .metadata()
+                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            if !hidden {
+                return projected.clone();
+            }
+            let mut metadata = projected.metadata().clone();
+            metadata.insert(
+                novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                "true".to_string(),
+            );
+            Arc::new(projected.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
 fn is_iceberg_metadata_column(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
@@ -7448,6 +7489,44 @@ mod tests {
                 .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
                 .is_some_and(|value| value == "true")
         }));
+    }
+
+    #[test]
+    fn spi5b_projected_schema_retains_hidden_sql_field_metadata() {
+        let source_fields = vec![
+            Arc::new(Field::new("id", DataType::Int64, false)),
+            Arc::new(
+                Field::new("_file", DataType::Utf8, false).with_metadata(HashMap::from([(
+                    novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL.to_string(),
+                    "true".to_string(),
+                )])),
+            ),
+        ];
+        let projected = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_file", DataType::Utf8, false),
+        ]));
+
+        let schema = preserve_hidden_sql_field_metadata(projected, &source_fields)
+            .expect("projected schema preserves connector visibility metadata");
+
+        assert!(
+            schema
+                .field_with_name("id")
+                .expect("id field")
+                .metadata()
+                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .is_none()
+        );
+        assert_eq!(
+            schema
+                .field_with_name("_file")
+                .expect("file field")
+                .metadata()
+                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+                .map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]

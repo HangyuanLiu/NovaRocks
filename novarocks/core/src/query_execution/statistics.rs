@@ -27,8 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -1047,6 +1048,12 @@ fn array_hashes(array: &ArrayRef) -> Result<Vec<u64>, DistributedQueryError> {
         }
         return Ok(values);
     }
+    if let Some(array) = array.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        for value in array.iter().flatten() {
+            values.push(statistics_value_hash(value));
+        }
+        return Ok(values);
+    }
     Err(contract_violation(
         "statistics Theta collection does not support the requested Arrow type",
     ))
@@ -1797,7 +1804,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use arrow::array::Int64Array;
+    use arrow::array::{FixedSizeBinaryBuilder, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
@@ -1867,6 +1874,21 @@ mod tests {
         };
         assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
         assert!(error.message().contains("at least one live backend"));
+    }
+
+    #[test]
+    fn spi5b_theta_hashes_fixed_size_binary_values() {
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 16);
+        builder.append_value([0_u8; 16]).expect("first fixed value");
+        builder
+            .append_value([1_u8; 16])
+            .expect("second fixed value");
+        builder.append_null();
+        let hashes = array_hashes(&(Arc::new(builder.finish()) as ArrayRef))
+            .expect("fixed-size binary values are hashable");
+
+        assert_eq!(hashes.len(), 2);
+        assert_ne!(hashes[0], hashes[1]);
     }
 
     #[test]
