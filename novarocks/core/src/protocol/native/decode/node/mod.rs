@@ -42,6 +42,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::runtime_filter::model::contract::{ConsumerActivation, LateApplyGranularity};
+
 use self::common::*;
 
 use super::layout::Layout;
