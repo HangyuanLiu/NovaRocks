@@ -45,6 +45,9 @@ use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array};
 use arrow::compute::filter_record_batch;
+use novarocks_execution::runtime_filter::scan_domain::{
+    RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitInput, evaluate_scan_unit,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -199,7 +202,7 @@ impl ScanAsyncRunner {
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
-                let late_prune = ScanMorselPruneDecision::Keep;
+                let late_prune = self.evaluate_scan_unit(&morsel)?;
                 if late_prune == ScanMorselPruneDecision::Skip {
                     self.late_pruned_units = self.late_pruned_units.saturating_add(1);
                     if let Some(profiles) = self.profiles.as_ref() {
@@ -312,6 +315,39 @@ impl ScanAsyncRunner {
                 }
             }
         }
+    }
+
+    fn evaluate_scan_unit(
+        &mut self,
+        morsel: &ScanMorsel,
+    ) -> Result<ScanMorselPruneDecision, String> {
+        let Some(unit) = self.op.prepared_scan_unit(morsel)? else {
+            return Ok(ScanMorselPruneDecision::Keep);
+        };
+        let mut bindings = self
+            .native_runtime_filter_consumers
+            .as_ref()
+            .map(RuntimeFilterConsumerSet::scan_domain_snapshots)
+            .unwrap_or_default();
+        if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
+            bindings.extend(consumers.scan_domain_snapshots()?);
+        }
+        bindings.sort_by_key(|(binding, _)| binding.binding_id());
+        for (binding, snapshot) in bindings {
+            let outcome = evaluate_scan_unit(
+                &binding,
+                snapshot.as_deref(),
+                RuntimeFilterScanUnitInput::from_prepared(&unit),
+            )
+            .map_err(|error| error.to_string())?;
+            if matches!(
+                outcome.effect().map(|effect| effect.decision()),
+                Some(RuntimeFilterScanUnitDecision::Pruned)
+            ) {
+                return Ok(ScanMorselPruneDecision::Skip);
+            }
+        }
+        Ok(ScanMorselPruneDecision::Keep)
     }
 
     #[cfg(test)]

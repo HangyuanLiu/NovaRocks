@@ -127,6 +127,36 @@ impl Clone for NativeOrderedLiveConsumerSet {
 }
 
 impl NativeOrderedLiveConsumerSet {
+    pub(crate) fn scan_domain_snapshots(
+        &self,
+    ) -> Result<
+        Vec<(
+            execution::scan_domain::RuntimeFilterScanDomainBinding,
+            Option<Arc<execution::RuntimeFilterSnapshot>>,
+        )>,
+        String,
+    > {
+        self.poll_updates()?;
+        let bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("native ordered RF consumer lock");
+        Ok(bindings
+            .iter()
+            .filter_map(|binding| {
+                let target = binding.spec.scan_domain.clone()?;
+                let snapshot = match &binding.state {
+                    NativeOrderedLiveBindingState::BoundExecutionLive {
+                        latest_snapshot, ..
+                    } => latest_snapshot.clone(),
+                    _ => None,
+                };
+                Some((target, snapshot))
+            })
+            .collect())
+    }
+
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
@@ -709,6 +739,28 @@ enum NativeConsumerTestSubscription {
 }
 
 impl RuntimeFilterConsumerSet {
+    pub(crate) fn scan_domain_snapshots(
+        &self,
+    ) -> Vec<(
+        execution::scan_domain::RuntimeFilterScanDomainBinding,
+        Option<Arc<execution::RuntimeFilterSnapshot>>,
+    )> {
+        let bindings = self.inner.bindings.lock().expect("native RF consumer lock");
+        bindings
+            .iter()
+            .filter_map(|binding| {
+                let target = binding.spec.scan_domain.clone()?;
+                let snapshot = match &binding.state {
+                    NativeConsumerBindingState::Active(NativeConsumerPredicate::Execution(
+                        snapshot,
+                    )) => Some(Arc::clone(snapshot)),
+                    _ => None,
+                };
+                Some((target, snapshot))
+            })
+            .collect()
+    }
+
     pub(crate) fn from_plan(
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
