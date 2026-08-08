@@ -34,17 +34,14 @@ use crate::runtime::profile::{
     OperatorProfiles, ProfileUnit, RUNTIME_FILTER_INPUT_ROWS, RUNTIME_FILTER_OUTPUT_ROWS,
 };
 use crate::runtime::runtime_state::RuntimeState;
-use crate::runtime_filter::exec::membership_predicate::MembershipPredicateContract;
 #[cfg(test)]
 use crate::runtime_filter::exec::membership_predicate::{
-    NativeRuntimeFilterPredicate, PredicateEvaluationError,
-};
-use crate::runtime_filter::exec::ordered_range_predicate::{
-    NativeOrderedRangePredicate, OrderedRangePredicateContract,
+    MembershipPredicateContract, NativeRuntimeFilterPredicate, PredicateEvaluationError,
 };
 #[cfg(test)]
 use crate::runtime_filter::exec::ordered_range_predicate::{
-    OrderedPredicateCompileError, OrderedPredicateEvaluationError,
+    NativeOrderedRangePredicate, OrderedPredicateCompileError, OrderedPredicateEvaluationError,
+    OrderedRangePredicateContract,
 };
 use crate::runtime_filter::model::contract::{
     ArtifactCapability, ChannelId, ComparatorDigest, ConsumerActivation, LateApplyGranularity,
@@ -1593,7 +1590,12 @@ fn validate_plan_specs(
                 spec.binding_id()
             ));
         }
-        membership_predicate_contract_with_arena(spec, arena)?;
+        if arena.data_type(spec.expr_id).is_none() {
+            return Err(format!(
+                "native Join runtime-filter binding_id={} expression is missing",
+                spec.binding_id()
+            ));
+        }
     }
     Ok(())
 }
@@ -1634,11 +1636,22 @@ fn validate_ordered_live_plan_specs(
                 spec.binding_id()
             ));
         }
-        ordered_predicate_contract_with_arena(spec, arena, LogicalVersion::FIRST)?;
+        let RuntimeFilterExecutionContract::Ordered { keys, .. } = spec.execution_contract() else {
+            unreachable!("ordered contract was checked above");
+        };
+        if keys.len() != 1
+            || arena.data_type(spec.expr_id) != keys.first().map(|key| key.data_type())
+        {
+            return Err(format!(
+                "native ordered runtime-filter binding_id={} expression does not match its frozen single-key contract",
+                spec.binding_id()
+            ));
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn ordered_runtime_contract(
     spec: &RuntimeFilterConsumerBinding,
 ) -> Result<Arc<RuntimeOrderContract>, String> {
@@ -1691,28 +1704,6 @@ fn ordered_runtime_contract(
     Ok(rebuilt)
 }
 
-fn ordered_predicate_contract_with_arena(
-    spec: &RuntimeFilterConsumerBinding,
-    arena: &ExprArena,
-    version: LogicalVersion,
-) -> Result<OrderedRangePredicateContract, String> {
-    let contract = ordered_runtime_contract(spec)?;
-    let expression_type = arena.data_type(spec.expr_id).ok_or_else(|| {
-        format!(
-            "native ordered runtime-filter expression {:?} is missing",
-            spec.expr_id
-        )
-    })?;
-    if expression_type != contract.keys()[0].data_type() {
-        return Err(format!(
-            "native ordered runtime-filter binding_id={} expression type does not match its order key",
-            spec.binding_id()
-        ));
-    }
-    OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id()), contract, version)
-        .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
-}
-
 #[cfg(test)]
 fn ordered_predicate_contract_with_version(
     spec: &RuntimeFilterConsumerBinding,
@@ -1721,50 +1712,6 @@ fn ordered_predicate_contract_with_version(
     let contract = ordered_runtime_contract(spec)?;
     OrderedRangePredicateContract::new(ChannelId::new(spec.channel_id()), contract, version)
         .map_err(|error| format!("invalid native ordered predicate contract: {error:?}"))
-}
-
-fn membership_predicate_contract_with_arena(
-    spec: &RuntimeFilterConsumerBinding,
-    arena: &ExprArena,
-) -> Result<MembershipPredicateContract, String> {
-    let RuntimeFilterExecutionContract::Membership {
-        canonical_schema,
-        schema_digest,
-    } = spec.execution_contract()
-    else {
-        return Err(format!(
-            "native Join runtime-filter binding_id={} requires a Membership contract",
-            spec.binding_id()
-        ));
-    };
-    let view = ArtifactMembershipSchema::view(canonical_schema)
-        .map_err(|error| format!("invalid native membership schema: {error:?}"))?;
-    let data_type = arena
-        .data_type(spec.expr_id)
-        .ok_or_else(|| {
-            format!(
-                "native runtime-filter expression {:?} is missing",
-                spec.expr_id
-            )
-        })?
-        .clone();
-    let rebuilt = ArtifactMembershipSchema::new(&data_type, view.null_semantics())
-        .map_err(|error| format!("invalid native membership expression type: {error:?}"))?;
-    if rebuilt.canonical_bytes() != canonical_schema.as_ref()
-        || rebuilt.digest().bytes() != *schema_digest
-    {
-        return Err(format!(
-            "native runtime-filter binding_id={} expression type/null contract does not match its canonical schema",
-            spec.binding_id()
-        ));
-    }
-    MembershipPredicateContract::join(
-        ChannelId::new(spec.channel_id()),
-        data_type,
-        view.null_semantics(),
-        LogicalVersion::FIRST,
-    )
-    .map_err(|error| format!("invalid native Join predicate contract: {error:?}"))
 }
 
 #[cfg(test)]
