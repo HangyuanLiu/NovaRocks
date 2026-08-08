@@ -5419,6 +5419,12 @@ pub(crate) struct IcebergQueryTableMaterialization {
     pub(crate) schema_id: Option<i32>,
     pub(crate) columns: Vec<novarocks_catalog::schema::ColumnDef>,
     pub(crate) iceberg_row_lineage_metadata_columns: Vec<novarocks_catalog::schema::ColumnDef>,
+    /// The sole read authority handed back to the application boundary.  The
+    /// provider may still inspect its payload while deriving SQL-owned facts,
+    /// but Core receives this handle as opaque input to generic scan planning.
+    pub(crate) read_table: ConnectorTableHandle,
+    pub(crate) read_schema: SchemaRef,
+    pub(crate) read_selector: ConnectorReadSelector,
     pub(crate) table: novarocks_connector_iceberg::scan_model::IcebergTableInfo,
     pub(crate) files: Vec<IcebergDataFileInfo>,
     pub(crate) binding: IcebergDataFileBinding,
@@ -6360,6 +6366,7 @@ pub(crate) fn load_time_travel_materialization_with_lease(
         load_schema_materialization_with_lease(controls, context, catalog, namespace, table)?;
     materialization.table.current_snapshot_id = Some(snapshot_id);
     materialization.binding = IcebergDataFileBinding::ExplicitFiles;
+    materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot_id);
     materialization.files.clear();
     Ok(materialization)
 }
@@ -6421,6 +6428,20 @@ fn materialization_from_metadata(
             table: metadata.table.clone(),
             data_version,
         });
+    let read_selector = match binding {
+        IcebergDataFileBinding::CurrentSnapshot => ConnectorReadSelector::Current,
+        IcebergDataFileBinding::ExplicitFiles => ConnectorReadSelector::SnapshotId(
+            decode_payload::<TablePayload>(metadata.table.payload(), "table handle")
+                .map_err(|error| error.to_string())?
+                .table_info
+                .as_ref()
+                .and_then(|table| table.current_snapshot_id)
+                .ok_or_else(|| {
+                    "frozen Iceberg table materialization is missing its snapshot identity"
+                        .to_string()
+                })?,
+        ),
+    };
     let payload: TablePayload = decode_payload(metadata.table.payload(), "table handle")
         .map_err(|error| error.to_string())?;
     let table = payload
@@ -6440,6 +6461,9 @@ fn materialization_from_metadata(
         schema_id,
         columns,
         iceberg_row_lineage_metadata_columns: iceberg_metadata_columns(&payload.metadata_columns)?,
+        read_table: metadata.table,
+        read_schema: metadata.schema,
+        read_selector,
         table,
         files: payload.prepared_files,
         binding,

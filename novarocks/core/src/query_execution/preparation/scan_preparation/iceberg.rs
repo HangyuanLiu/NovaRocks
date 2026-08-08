@@ -16,10 +16,12 @@
 // under the License.
 
 use novarocks_spi::connector::{
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticPredicate,
-    normalize_predicate_dispositions,
+    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorReadSelector, ConnectorSplitPlanningRequest,
+    ConnectorStaticPredicate, normalize_predicate_dispositions,
 };
 
+use crate::engine::query_planning::bindings::QueryScanMaterialization;
 use crate::query_execution::preparation::scan::{PlannedConnectorRead, ResolvedScanExecution};
 use crate::sql::analysis::TypedExpr;
 use crate::sql::planner::payload::PlanScanNode;
@@ -140,6 +142,129 @@ pub(super) fn plan_iceberg_connector_read(
         batch: planned.batch,
         planning_lease: Some(planned.planning_lease),
         read_session: None,
+    })
+}
+
+/// Plan an admitted connector read without decoding or reconstructing a
+/// provider handle.  Projection ordinals are derived exclusively from the
+/// schema frozen by `ConnectorMetadata::load_table`; a missing or ambiguous
+/// column is a preparation error rather than an opportunity for Core to map
+/// provider field identities.
+pub(super) fn plan_connector_read(
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    scan: &PlanScanNode,
+    materialization: &QueryScanMaterialization,
+    static_predicates: Vec<ConnectorStaticPredicate>,
+    target_parallelism: std::num::NonZeroUsize,
+    max_split_bytes: Option<std::num::NonZeroU64>,
+) -> Result<PlannedConnectorRead, String> {
+    let QueryScanMaterialization::ConnectorRead {
+        table,
+        schema,
+        selector,
+        planning_lease,
+        ..
+    } = materialization
+    else {
+        return Err(
+            "generic connector planning requires a connector-read materialization".to_string(),
+        );
+    };
+    let projection_names = effective_scan_column_names(scan);
+    let mut projection = Vec::with_capacity(projection_names.len());
+    for name in projection_names {
+        let mut matching = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name().eq_ignore_ascii_case(&name));
+        let Some((ordinal, _)) = matching.next() else {
+            return Err(format!(
+                "connector read schema is missing projected column '{name}'"
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(format!(
+                "connector read schema has ambiguous projected column '{name}'"
+            ));
+        }
+        projection.push(ordinal);
+    }
+    let binding = planning_lease.binding();
+    if table.owner() != &binding.descriptor().instance_id {
+        return Err(
+            "connector read table handle owner does not match its planning lease".to_string(),
+        );
+    }
+    let declaration = binding
+        .execution_declaration(&context)
+        .map_err(|error| error.to_string())?;
+    let batch = ConnectorBatchBudget {
+        max_rows: std::num::NonZeroUsize::new(4096).expect("batch rows are nonzero"),
+        max_bytes: std::num::NonZeroUsize::new(
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .expect("batch bytes are nonzero"),
+    };
+    let connector_scan = binding
+        .planning()
+        .begin_scan(
+            table,
+            ConnectorBeginScanRequest {
+                projection: projection.clone(),
+                static_predicates: static_predicates.clone(),
+                selector: *selector,
+                limit: None,
+                batch,
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let expected_fields = projection
+        .iter()
+        .map(|ordinal| schema.fields()[*ordinal].clone())
+        .collect::<Vec<_>>();
+    if connector_scan.output_schema.fields().as_ref() != expected_fields.as_slice() {
+        return Err(
+            "connector read returned a schema that does not match the admitted projection"
+                .to_string(),
+        );
+    }
+    let predicate_dispositions = normalize_predicate_dispositions(
+        &static_predicates,
+        &connector_scan.predicate_dispositions,
+    )
+    .map_err(|error| format!("connector static predicate response: {error}"))?;
+    let residual_predicates = residual_predicates(&scan.predicates, &predicate_dispositions)?;
+    let split_result = binding
+        .planning()
+        .plan_splits(
+            &connector_scan.handle,
+            ConnectorSplitPlanningRequest {
+                target_parallelism,
+                max_split_bytes,
+                context,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if split_result
+        .splits
+        .iter()
+        .any(|split| split.owner() != &binding.descriptor().instance_id)
+    {
+        return Err("connector read planned a split for another instance".to_string());
+    }
+    Ok(PlannedConnectorRead {
+        declaration,
+        scan: connector_scan,
+        splits: split_result.splits,
+        planning_metrics: split_result.metrics,
+        static_predicates,
+        predicate_dispositions,
+        residual_predicates,
+        batch,
+        planning_lease: Some(planning_lease.clone()),
+        read_session: split_result.session,
     })
 }
 

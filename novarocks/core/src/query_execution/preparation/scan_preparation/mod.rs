@@ -32,7 +32,9 @@ mod pruning;
 mod static_predicate;
 
 pub(crate) use iceberg::build_iceberg_metadata_scan_range_params;
-use iceberg::{plan_iceberg_connector_read, plan_iceberg_delta_connector_read};
+use iceberg::{
+    plan_connector_read, plan_iceberg_connector_read, plan_iceberg_delta_connector_read,
+};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
 use static_predicate::lower_static_connector_predicates;
 
@@ -175,22 +177,26 @@ fn prepare_scan_node(
                             source.table.catalog, source.table.namespace, source.table.table
                         )
                     })?;
-                let QueryScanMaterialization::IcebergDataFiles {
-                    table,
-                    files,
-                    binding,
-                } = materialization
-                else {
-                    return Err(format!(
-                        "SQL data scan binding for '{}.{}.{}' has non-data materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    ));
-                };
-                ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
-                    table,
-                    files,
-                    binding,
-                })
+                match materialization {
+                    connector @ QueryScanMaterialization::ConnectorRead { .. } => {
+                        ResolvedScanExecution::AdmittedConnectorRead(connector)
+                    }
+                    QueryScanMaterialization::IcebergDataFiles {
+                        table,
+                        files,
+                        binding,
+                    } => ResolvedScanExecution::IcebergFiles(ResolvedIcebergFileScan {
+                        table,
+                        files,
+                        binding,
+                    }),
+                    _ => {
+                        return Err(format!(
+                            "SQL data scan binding for '{}.{}.{}' has non-data materialization",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ));
+                    }
+                }
             }
             crate::sql::planner::table::SqlScanKind::FrozenInputSet {
                 version: crate::sql::planner::table::SqlTableVersionSelector::Snapshot(snapshot_id),
@@ -241,24 +247,28 @@ fn prepare_scan_node(
                             source.table.catalog, source.table.namespace, source.table.table
                         )
                     })?;
-                let QueryScanMaterialization::IcebergMetadata {
-                    table,
-                    metadata_table_type,
-                    serialized_table,
-                    metadata_payload,
-                } = materialization
-                else {
-                    return Err(format!(
-                        "SQL metadata scan binding for '{}.{}.{}' has non-metadata materialization",
-                        source.table.catalog, source.table.namespace, source.table.table
-                    ));
-                };
-                ResolvedScanExecution::IcebergMetadata(ResolvedIcebergMetadataScan {
-                    table,
-                    metadata_table_type,
-                    serialized_table,
-                    metadata_payload,
-                })
+                match materialization {
+                    connector @ QueryScanMaterialization::ConnectorRead { .. } => {
+                        ResolvedScanExecution::AdmittedConnectorRead(connector)
+                    }
+                    QueryScanMaterialization::IcebergMetadata {
+                        table,
+                        metadata_table_type,
+                        serialized_table,
+                        metadata_payload,
+                    } => ResolvedScanExecution::IcebergMetadata(ResolvedIcebergMetadataScan {
+                        table,
+                        metadata_table_type,
+                        serialized_table,
+                        metadata_payload,
+                    }),
+                    _ => {
+                        return Err(format!(
+                            "SQL metadata scan binding for '{}.{}.{}' has non-metadata materialization",
+                            source.table.catalog, source.table.namespace, source.table.table
+                        ));
+                    }
+                }
             }
             crate::sql::planner::table::SqlScanKind::MvTargetState { facts } => {
                 resolve_frozen_mv_target_scan(
@@ -326,6 +336,33 @@ fn prepare_scan_node(
                     )
                 })?;
             (Vec::new(), Vec::new(), Some(read))
+        }
+        ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
+            let static_predicates = options
+                .enable_connector_static_predicate_pushdown
+                .then(|| {
+                    let QueryScanMaterialization::ConnectorRead { schema, .. } = materialization
+                    else {
+                        return Vec::new();
+                    };
+                    let connector_schema_fields = schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>();
+                    lower_static_connector_predicates(scan, &connector_schema_fields)
+                })
+                .unwrap_or_default();
+            let planned = plan_connector_read(
+                context.clone(),
+                scan,
+                materialization,
+                static_predicates,
+                options.connector_target_parallelism,
+                options.connector_max_split_bytes,
+            )
+            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
+            (Vec::new(), Vec::new(), Some(planned))
         }
         ResolvedScanExecution::IcebergFiles(files) => {
             // Design: ADR-0018 (docs/adr/ADR-0018-static-connector-predicate-disposition.md)
@@ -681,13 +718,23 @@ fn validate_resolved_execution_kind(
                 matches!(execution, ResolvedScanExecution::IcebergDelta(_))
             }
             crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                matches!(
+                    execution,
+                    ResolvedScanExecution::IcebergFiles(_)
+                        | ResolvedScanExecution::AdmittedConnectorRead(_)
+                )
+            }
+            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => {
                 matches!(execution, ResolvedScanExecution::IcebergFiles(_))
             }
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => {
-                matches!(execution, ResolvedScanExecution::IcebergMetadata(_))
+                matches!(
+                    execution,
+                    ResolvedScanExecution::IcebergMetadata(_)
+                        | ResolvedScanExecution::AdmittedConnectorRead(_)
+                )
             }
         },
     };
@@ -700,8 +747,10 @@ fn validate_resolved_execution_kind(
             crate::sql::planner::table::SqlScanKind::Delta { .. } => "IcebergDelta",
             crate::sql::planner::table::SqlScanKind::Metadata { .. } => "IcebergMetadata",
             crate::sql::planner::table::SqlScanKind::Data { .. }
-            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. }
-            | crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
+            | crate::sql::planner::table::SqlScanKind::FrozenInputSet { .. } => {
+                "IcebergFiles or AdmittedConnectorRead"
+            }
+            crate::sql::planner::table::SqlScanKind::MvTargetState { .. }
             | crate::sql::planner::table::SqlScanKind::MvTargetLocator { .. } => "IcebergFiles",
         },
     };

@@ -590,7 +590,11 @@ fn scan_binding_for_source<'a>(
             | table_model::SqlScanKind::FrozenInputSet { .. }
             | table_model::SqlScanKind::MvTargetState { .. }
             | table_model::SqlScanKind::MvTargetLocator { .. } => {
-                matches!(binding.execution, ResolvedScanExecution::IcebergFiles(_))
+                matches!(
+                    binding.execution,
+                    ResolvedScanExecution::IcebergFiles(_)
+                        | ResolvedScanExecution::AdmittedConnectorRead(_)
+                )
             }
             table_model::SqlScanKind::Metadata { .. } => {
                 matches!(binding.execution, ResolvedScanExecution::IcebergMetadata(_))
@@ -624,6 +628,7 @@ fn scan_source_kind(source: &table_model::ScanSource) -> &'static str {
 fn resolved_execution_kind(execution: &ResolvedScanExecution) -> &'static str {
     match execution {
         ResolvedScanExecution::ConnectorRead => "ConnectorRead",
+        ResolvedScanExecution::AdmittedConnectorRead(_) => "AdmittedConnectorRead",
         ResolvedScanExecution::IcebergFiles(_) => "IcebergFiles",
         ResolvedScanExecution::IcebergMetadata(_) => "IcebergMetadata",
         ResolvedScanExecution::IcebergDelta(_) => "IcebergDelta",

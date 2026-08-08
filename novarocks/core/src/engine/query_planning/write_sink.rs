@@ -120,11 +120,7 @@ pub(crate) fn sql_write_plan_input_from_admitted_binding(
     if captured.planning_lease.is_none() {
         return Err("SQL write target binding is missing its admission planning lease".to_string());
     }
-    let materialization = captured
-        .scan_materialization
-        .as_ref()
-        .ok_or_else(|| "SQL write target binding is missing admitted provider facts".to_string())?;
-    let table = admitted_iceberg_table(materialization)?;
+    let table = admitted_iceberg_table(&captured)?;
     let identity = SqlTableIdentity {
         catalog: table.catalog.clone(),
         namespace: table.namespace.clone(),
@@ -196,11 +192,7 @@ pub(crate) fn sql_write_plan_input_for_admitted_target(
     root_output_exprs: Option<Vec<TypedExpr>>,
 ) -> Result<SqlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
-    let materialization = captured
-        .scan_materialization
-        .as_ref()
-        .ok_or_else(|| "SQL write target binding is missing admitted provider facts".to_string())?;
-    let table = admitted_iceberg_table(materialization)?;
+    let table = admitted_iceberg_table(&captured)?;
     let metadata = admitted_iceberg_metadata(table)?;
     let input_columns =
         admitted_write_input_columns(mode, &captured.resolved.planner.columns, &metadata)?;
@@ -337,11 +329,12 @@ pub(crate) fn admit_frozen_iceberg_write_target_materialization(
             statistics_pin: None,
             planning_lease: Some(planning_lease),
             scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-                table,
+                table: table.clone(),
                 files: Vec::new(),
                 binding:
                     novarocks_connector_iceberg::scan_model::IcebergDataFileBinding::CurrentSnapshot,
             }),
+            iceberg_write_table: Some(table),
             frozen_snapshot_files: std::collections::BTreeMap::new(),
             delta_runtime_plans: std::collections::BTreeMap::new(),
         })
@@ -375,11 +368,7 @@ pub(crate) fn iceberg_write_sink_spec_from_admitted_sql_input(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let captured = bindings.binding(input.contract.target.binding)?;
-    let materialization = captured
-        .scan_materialization
-        .as_ref()
-        .ok_or_else(|| "SQL write target binding is missing admitted provider facts".to_string())?;
-    let table = admitted_iceberg_table(materialization)?.clone();
+    let table = admitted_iceberg_table(&captured)?.clone();
     let metadata = admitted_iceberg_metadata(&table)?;
     if !table
         .catalog
@@ -499,13 +488,12 @@ fn admitted_iceberg_metadata(
 }
 
 fn admitted_iceberg_table(
-    materialization: &QueryScanMaterialization,
+    binding: &QueryTableBinding,
 ) -> Result<&novarocks_connector_iceberg::scan_model::IcebergTableInfo, String> {
-    match materialization {
-        QueryScanMaterialization::IcebergDataFiles { table, .. }
-        | QueryScanMaterialization::IcebergMvTarget { table, .. } => Ok(table),
-        _ => Err("SQL write target binding is not an admitted Iceberg table".to_string()),
-    }
+    binding
+        .iceberg_write_table
+        .as_ref()
+        .ok_or_else(|| "SQL write target binding is not an admitted Iceberg table".to_string())
 }
 
 fn admitted_write_input_columns(

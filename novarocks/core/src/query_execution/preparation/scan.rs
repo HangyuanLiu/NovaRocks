@@ -23,6 +23,7 @@ use novarocks_spi::connector::{
     ConnectorStaticPredicate,
 };
 
+use crate::engine::query_planning::bindings::QueryScanMaterialization;
 use crate::runtime::scan_range::ScanRangeParams;
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::TypedExpr;
@@ -60,6 +61,9 @@ pub(crate) trait ScanBindingResolver: Send + Sync {
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedScanExecution {
     ConnectorRead,
+    /// A query-local opaque read admission.  Core may inspect only its SPI
+    /// schema and selector while preparation asks the exact lease to plan it.
+    AdmittedConnectorRead(QueryScanMaterialization),
     IcebergFiles(ResolvedIcebergFileScan),
     IcebergMetadata(ResolvedIcebergMetadataScan),
     IcebergDelta(ResolvedIcebergDeltaScan),

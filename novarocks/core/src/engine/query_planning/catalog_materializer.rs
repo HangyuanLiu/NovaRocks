@@ -133,13 +133,16 @@ pub(crate) fn iceberg_query_binding_from_materialization_with_delta_plans(
     }
     Ok(QueryTableBinding {
         resolved: ResolvedAnalyzerTable::from_planner(Some(catalog), namespace, planner),
-        statistics_pin: materialization.statistics_pin,
-        planning_lease: Some(materialization.planning_lease),
-        scan_materialization: Some(QueryScanMaterialization::IcebergDataFiles {
-            table: materialization.table,
-            files: materialization.files,
-            binding: materialization.binding,
+        statistics_pin: materialization.statistics_pin.clone(),
+        planning_lease: Some(materialization.planning_lease.clone()),
+        scan_materialization: Some(QueryScanMaterialization::ConnectorRead {
+            table: materialization.read_table,
+            schema: materialization.read_schema,
+            selector: materialization.read_selector,
+            statistics_pin: materialization.statistics_pin.clone(),
+            planning_lease: materialization.planning_lease.clone(),
         }),
+        iceberg_write_table: Some(materialization.table),
         frozen_snapshot_files,
         delta_runtime_plans,
     })
@@ -508,6 +511,7 @@ mod tests {
                 files: vec![],
                 binding: IcebergDataFileBinding::ExplicitFiles,
             }),
+            iceberg_write_table: None,
             frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }

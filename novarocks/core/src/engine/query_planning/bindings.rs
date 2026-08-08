@@ -35,8 +35,12 @@ use crate::sql::planner::table::{
     ScanSource, SqlMetadataTableKind, SqlScanKind, SqlScanSource, SqlTableIdentity,
     SqlUkFkTableFacts,
 };
+use arrow::datatypes::SchemaRef;
 use novarocks_connector_iceberg::scan_model::{
     IcebergDataFileBinding, IcebergDataFileInfo, IcebergTableInfo,
+};
+use novarocks_spi::connector::{
+    ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
 };
 
 static NEXT_BINDING_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -198,6 +202,10 @@ pub(crate) struct QueryTableBinding {
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
     pub(crate) scan_materialization: Option<QueryScanMaterialization>,
+    /// Provider-private facts retained only for terminal write projection.
+    /// Read preparation must use `scan_materialization`'s opaque handle.
+    pub(crate) iceberg_write_table:
+        Option<novarocks_connector_iceberg::scan_model::IcebergTableInfo>,
     /// Exact file sets captured for the snapshot selectors emitted by one
     /// admitted logical plan.  A binding can serve both sides of an IMV
     /// from/to comparison, so the primary materialization alone is not
@@ -221,6 +229,16 @@ pub(crate) struct QueryTableBinding {
 /// request-local binding token rather than from a planner table.
 #[derive(Clone)]
 pub(crate) enum QueryScanMaterialization {
+    /// Provider-neutral scan authority.  The handle is opaque to Core; the
+    /// schema is the single projection-ordinal authority and the lease keeps
+    /// the exact control generation alive until native preparation finishes.
+    ConnectorRead {
+        table: ConnectorTableHandle,
+        schema: SchemaRef,
+        selector: ConnectorReadSelector,
+        statistics_pin: Option<ResolvedTableStatisticsPin>,
+        planning_lease: ConnectorControlPlanningLease,
+    },
     IcebergDataFiles {
         table: IcebergTableInfo,
         files: Vec<IcebergDataFileInfo>,
@@ -258,6 +276,23 @@ pub(crate) enum QueryScanMaterialization {
     },
 }
 
+impl std::fmt::Debug for QueryScanMaterialization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectorRead {
+                table, selector, ..
+            } => formatter
+                .debug_struct("ConnectorRead")
+                .field("owner", table.owner())
+                .field("selector", selector)
+                .finish_non_exhaustive(),
+            Self::IcebergDataFiles { .. } => formatter.write_str("IcebergDataFiles(..)"),
+            Self::IcebergMetadata { .. } => formatter.write_str("IcebergMetadata(..)"),
+            Self::IcebergMvTarget { .. } => formatter.write_str("IcebergMvTarget(..)"),
+        }
+    }
+}
+
 impl QueryTableBinding {
     pub(crate) fn local(mut resolved: ResolvedAnalyzerTable, binding: SqlTableBindingId) -> Self {
         let identity = &resolved.catalog.identity;
@@ -275,6 +310,7 @@ impl QueryTableBinding {
             statistics_pin: None,
             planning_lease: None,
             scan_materialization: None,
+            iceberg_write_table: None,
             frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         }

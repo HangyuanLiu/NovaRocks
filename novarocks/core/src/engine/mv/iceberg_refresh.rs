@@ -14318,6 +14318,7 @@ pub(crate) fn bind_imv_target_query_table_in_store(
                     .affected_partitions_to_target_partition_filter(),
                 target_partition_contract: refresh.rewrite.schema_contract.target.partition.clone(),
             }),
+            iceberg_write_table: Some(table.clone()),
             frozen_snapshot_files: BTreeMap::new(),
             delta_runtime_plans: BTreeMap::new(),
         })
