@@ -137,7 +137,6 @@ fn fixture_query_table_bindings_with_materialized_files(
                 &source.table.table,
             ),
             |binding| {
-                let table = materialized_table.clone();
                 let mut resolved_planner = planner.clone();
                 resolved_planner.source = ScanSource::Sql(SqlScanSource::new(
                     binding,
@@ -148,41 +147,29 @@ fn fixture_query_table_bindings_with_materialized_files(
                     },
                     source.kind.clone(),
                 ));
-                let scan_materialization = match &source.kind {
-                    SqlScanKind::MvTargetState { facts } => {
-                        QueryScanMaterialization::IcebergMvTarget {
-                            table,
-                            files: materialized_files.clone(),
-                            binding: IcebergDataFileBinding::CurrentSnapshot,
-                            target_table_uuid: facts.target_table_uuid.clone(),
-                            frozen_snapshot_id: facts.target_snapshot_id,
-                            target_state_partition_filter:
-                                crate::mv::model::TargetPartitionFilter::None,
-                            target_partition_contract: None,
-                        }
-                    }
-                    SqlScanKind::MvTargetLocator { facts } => {
-                        QueryScanMaterialization::IcebergMvTarget {
-                            table,
-                            files: materialized_files.clone(),
-                            binding: IcebergDataFileBinding::CurrentSnapshot,
-                            target_table_uuid: facts.target_table_uuid.clone(),
-                            frozen_snapshot_id: facts.target_snapshot_id,
-                            target_state_partition_filter:
-                                crate::mv::model::TargetPartitionFilter::None,
-                            target_partition_contract: None,
-                        }
-                    }
-                    _ => QueryScanMaterialization::IcebergDataFiles {
-                        table,
-                        files: materialized_files.clone(),
-                        binding: match &source.kind {
-                            SqlScanKind::FrozenInputSet { .. } => {
-                                IcebergDataFileBinding::ExplicitFiles
-                            }
-                            _ => IcebergDataFileBinding::CurrentSnapshot,
+                let lease = planning_lease.clone().ok_or_else(|| {
+                    "scan fixture must acquire an exact connector lease".to_string()
+                })?;
+                let metadata = lease
+                    .binding()
+                    .metadata()
+                    .load_table(ConnectorTableRequest {
+                        table: ConnectorTableIdentity {
+                            instance_id: ConnectorInstanceId::parse(&source.table.catalog)
+                                .expect("fixture catalog must be valid"),
+                            namespace: Arc::from(source.table.namespace.as_str()),
+                            table: Arc::from(source.table.table.as_str()),
                         },
-                    },
+                        resolution: ConnectorTableResolution::StrictBaseTable,
+                        context: crate::connector::test_request_context(),
+                    })
+                    .map_err(|error| error.to_string())?;
+                let scan_materialization = QueryScanMaterialization::ConnectorRead {
+                    table: metadata.table,
+                    schema: metadata.schema,
+                    selector: novarocks_spi::connector::ConnectorReadSelector::Current,
+                    statistics_pin: None,
+                    planning_lease: lease.clone(),
                 };
                 let frozen_snapshot_materializations = match &source.kind {
                     SqlScanKind::FrozenInputSet {
@@ -230,8 +217,19 @@ fn fixture_query_table_bindings_with_materialized_files(
                     ),
                     statistics_pin: None,
                     planning_lease: planning_lease.clone(),
-                    scan_materialization: Some(scan_materialization),
-                    mv_target_read: None,
+                    scan_materialization: Some(scan_materialization.clone()),
+                    mv_target_read: match &source.kind {
+                        SqlScanKind::MvTargetState { facts }
+                        | SqlScanKind::MvTargetLocator { facts } => Some(
+                            crate::engine::query_planning::bindings::MvTargetReadAdmission {
+                                full: scan_materialization.clone(),
+                                affected_partitions: scan_materialization.clone(),
+                                target_table_uuid: facts.target_table_uuid.clone(),
+                                frozen_snapshot_id: facts.target_snapshot_id,
+                            },
+                        ),
+                        _ => None,
+                    },
                     iceberg_write_table: None,
                     frozen_snapshot_materializations,
                     delta_runtime_plans: std::collections::BTreeMap::new(),
